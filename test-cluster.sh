@@ -41,7 +41,7 @@ rpc() {
     echo
 }
 
-export RUST_LOG=debug 
+#export RUST_LOG=debug 
 
 echo "Killing all running raft-key-value"
 

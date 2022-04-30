@@ -43,7 +43,7 @@ pub async fn start_example_raft_node(node_id: ExampleNodeId, http_addr: String) 
 
     // Create the network layer that will connect and communicate the raft instances and
     // will be used in conjunction with the store created above.
-    let network = ExampleNetwork {};
+    let network = ExampleNetwork::new();
 
     // Create a local raft instance.
     let raft = Raft::new(node_id, config.clone(), network, store.clone());

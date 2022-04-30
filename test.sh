@@ -59,7 +59,7 @@ place_order() {
     echo "Data written"
 }
 
-get_matrics() {
+get_metrics() {
     echo "Get metrics from the leader"
     echo
     rpc 2100$1/metrics
@@ -84,19 +84,22 @@ start_node() {
     nohup ./target/debug/raft-key-value  --id $1 --http-addr 127.0.0.1:2100$1 > n1.log &
 }
 
-export RUST_LOG=debug 
+#export RUST_LOG=debug 
 
 echo "Run command $1"
 case $1 in
 "place-order")
     place_order $2
     ;;
-"matrics")
-    get_matrics $2
+"metrics")
+    get_metrics $2
     ;;
 
 "kill-node")
     kill_node $2
+    ;;
+"kill")
+    kill
     ;;
 "start-node")
     start_node $2

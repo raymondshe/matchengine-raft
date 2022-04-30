@@ -1,3 +1,6 @@
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use openraft::error::AppendEntriesError;
 use openraft::error::InstallSnapshotError;
@@ -20,11 +23,21 @@ use serde::Serialize;
 use crate::ExampleNodeId;
 use crate::ExampleTypeConfig;
 
-pub struct ExampleNetwork {}
+pub struct ExampleNetwork {
+    pub clients: Arc<HashMap<String, reqwest::Client>>,
+}
+
 
 impl ExampleNetwork {
+
+    pub fn new() -> Self {
+        Self {
+            clients: Arc::new(HashMap::new()),
+        }
+    }
+
     pub async fn send_rpc<Req, Resp, Err>(
-        &self,
+        &mut self,
         target: ExampleNodeId,
         target_node: Option<&Node>,
         uri: &str,
@@ -38,7 +51,10 @@ impl ExampleNetwork {
         let addr = target_node.map(|x| &x.addr).unwrap();
 
         let url = format!("http://{}/{}", addr, uri);
-        let client = reqwest::Client::new();
+
+        let clients = Arc::get_mut(&mut self.clients).unwrap();
+
+        let client = clients.entry(url.clone()).or_insert(reqwest::Client::new());
 
         let resp = client.post(url).json(&req).send().await.map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
 
@@ -55,7 +71,7 @@ impl RaftNetworkFactory<ExampleTypeConfig> for ExampleNetwork {
 
     async fn connect(&mut self, target: ExampleNodeId, node: Option<&Node>) -> Self::Network {
         ExampleNetworkConnection {
-            owner: ExampleNetwork {},
+            owner: ExampleNetwork::new(),
             target,
             target_node: node.cloned(),
         }
