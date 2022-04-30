@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use actix_web::middleware;
 use actix_web::middleware::Logger;
@@ -7,6 +8,7 @@ use actix_web::App;
 use actix_web::HttpServer;
 use openraft::Config;
 use openraft::Raft;
+
 
 use crate::app::ExampleApp;
 use crate::network::api;
@@ -76,7 +78,7 @@ pub async fn start_example_raft_node(node_id: ExampleNodeId, http_addr: String) 
             .service(api::write)
             .service(api::read)
             .service(api::consistent_read)
-    });
+    }).keep_alive(Duration::from_secs(5));
 
     let x = server.bind(http_addr)?;
 

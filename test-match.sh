@@ -55,7 +55,7 @@ do
     JSON+="$i"
     JSON+='} }}'
     echo $JSON
-    rpc 21003/write "$JSON"
+    rpc 21001/write "$JSON"
 done 
 
 echo "Data written"

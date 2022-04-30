@@ -127,6 +127,7 @@ impl ExampleStateMachine {
                 self.data = content.data.clone();
                 self.orderbook.asks.clear();
                 self.orderbook.bids.clear();
+                self.orderbook.sequance = content.sequance;
             
             for order in content.orders.clone()  {
                 self.orderbook.insert_order(&order);

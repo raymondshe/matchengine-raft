@@ -198,7 +198,9 @@ impl OrderBook {
         }
     }
 
+    #[tracing::instrument(level = "trace", skip(self))]
     pub fn insert_order(&mut self, order: &Order) {
+        tracing::debug!("insert_order: [{:?}, +oo)", order);
         match order.side {
             OrderSide::Buy => {
                 self.bids.insert(BidKey{price: order.price, sequance: order.sequance}, order.clone());
