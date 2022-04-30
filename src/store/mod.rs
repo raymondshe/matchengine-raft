@@ -31,7 +31,21 @@ use crate::ExampleNodeId;
 use crate::ExampleTypeConfig;
 use crate::matchengine::OrderBook;
 use crate::matchengine::Order;
- 
+pub mod store;
+pub mod log;
+pub mod config;
+use crate::store::config::Config;
+use tokio::io::{self, AsyncWriteExt};
+use tokio::fs::File;
+
+#[derive(Debug)]
+pub struct ExampleSnapshot {
+    pub meta: SnapshotMeta<ExampleNodeId>,
+
+    /// The data of the state machine at the time of this snapshot.
+    pub data: Vec<u8>,
+}
+
 /**
  * Here you will set the types of request that will interact with the raft nodes.
  * For example the `Set` will be used to write data (key and value) to the raft database.
@@ -56,14 +70,6 @@ pub enum ExampleRequest {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ExampleResponse {
     pub value: Option<String>,
-}
-
-#[derive(Debug)]
-pub struct ExampleSnapshot {
-    pub meta: SnapshotMeta<ExampleNodeId>,
-
-    /// The data of the state machine at the time of this snapshot.
-    pub data: Vec<u8>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]
@@ -135,12 +141,13 @@ impl ExampleStateMachine {
     }
 }
 
+
 #[derive(Debug, Default)]
 pub struct ExampleStore {
     last_purged_log_id: RwLock<Option<LogId<ExampleNodeId>>>,
 
     /// The Raft log.
-    log: RwLock<BTreeMap<u64, Entry<ExampleTypeConfig>>>,
+    pub log: RwLock<BTreeMap<u64, Entry<ExampleTypeConfig>>>,
 
     /// The Raft state machine.
     pub state_machine: RwLock<ExampleStateMachine>,
@@ -151,6 +158,8 @@ pub struct ExampleStore {
     snapshot_idx: Arc<Mutex<u64>>,
 
     current_snapshot: RwLock<Option<ExampleSnapshot>>,
+
+    config : Config
 }
 
 #[async_trait]
@@ -266,9 +275,20 @@ impl RaftStorage<ExampleTypeConfig> for Arc<ExampleStore> {
         entries: &[&Entry<ExampleTypeConfig>],
     ) -> Result<(), StorageError<ExampleNodeId>> {
         let mut log = self.log.write().await;
+
+        let mut write = false;
+
         for entry in entries {
             log.insert(entry.log_id.index, (*entry).clone());
+            if entry.log_id.index % self.config.snapshot_per_events as u64 == 1 { write = true };
         }
+/*
+        if write {
+            let mut s = Arc::clone(&self);
+            //s.build_snapshot().await?;
+            self.write_file().await.unwrap();
+        }
+*/
         Ok(())
     }
 
@@ -402,11 +422,15 @@ impl RaftStorage<ExampleTypeConfig> for Arc<ExampleStore> {
             
             let mut state_machine = self.state_machine.write().await;
             *state_machine = updated_state_machine;
+
         }
 
         // Update current snapshot.
-        let mut current_snapshot = self.current_snapshot.write().await;
-        *current_snapshot = Some(new_snapshot);
+        {
+            let mut current_snapshot = self.current_snapshot.write().await;
+            *current_snapshot = Some(new_snapshot);
+        }
+        self.write_file().await.unwrap();
         Ok(StateMachineChanges {
             last_applied: meta.last_log_id,
             is_snapshot: true,

@@ -84,7 +84,7 @@ start_node() {
     nohup ./target/debug/raft-key-value  --id $1 --http-addr 127.0.0.1:2100$1 > n1.log &
 }
 
-#export RUST_LOG=debug 
+export RUST_LOG=debug 
 
 echo "Run command $1"
 case $1 in
