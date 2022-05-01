@@ -12,7 +12,6 @@ use openraft::AnyError;
 use openraft::EffectiveMembership;
 use openraft::Entry;
 use openraft::EntryPayload;
-use openraft::ErrorSubject;
 use openraft::ErrorVerb;
 use openraft::LogId;
 use openraft::RaftLogReader;
@@ -22,6 +21,7 @@ use openraft::SnapshotMeta;
 use openraft::StateMachineChanges;
 use openraft::StorageError;
 use openraft::StorageIOError;
+use openraft::ErrorSubject;
 use openraft::Vote;
 use serde::Deserialize;
 use serde::Serialize;
@@ -37,6 +37,7 @@ pub mod config;
 use crate::store::config::Config;
 use tokio::io::{self, AsyncWriteExt};
 use tokio::fs::File;
+use sled::Db;
 
 #[derive(Debug)]
 pub struct ExampleSnapshot {
@@ -149,6 +150,8 @@ pub struct ExampleStore {
     /// The Raft log.
     pub log: RwLock<BTreeMap<u64, Entry<ExampleTypeConfig>>>,
 
+    pub sled : RwLock<Option<sled::Db>>,
+
     /// The Raft state machine.
     pub state_machine: RwLock<ExampleStateMachine>,
 
@@ -159,7 +162,9 @@ pub struct ExampleStore {
 
     current_snapshot: RwLock<Option<ExampleSnapshot>>,
 
-    config : Config
+    config : Config,
+
+    pub node_id: ExampleNodeId,
 }
 
 #[async_trait]
@@ -274,21 +279,13 @@ impl RaftStorage<ExampleTypeConfig> for Arc<ExampleStore> {
         &mut self,
         entries: &[&Entry<ExampleTypeConfig>],
     ) -> Result<(), StorageError<ExampleNodeId>> {
+
+        self.write_log(entries).await;
+
         let mut log = self.log.write().await;
-
-        let mut write = false;
-
         for entry in entries {
             log.insert(entry.log_id.index, (*entry).clone());
-            if entry.log_id.index % self.config.snapshot_per_events as u64 == 1 { write = true };
         }
-/*
-        if write {
-            let mut s = Arc::clone(&self);
-            //s.build_snapshot().await?;
-            self.write_file().await.unwrap();
-        }
-*/
         Ok(())
     }
 

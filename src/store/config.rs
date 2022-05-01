@@ -9,10 +9,10 @@ pub struct Config {
     #[clap(long, env = "RAFT_SNAPSHOT_PATH", default_value = "/tmp/snapshot")]
     pub snapshot_path: String,
     
-    #[clap(long, env = "RAFT_SNAPSHOT_PREFIX", default_value = "match")]
-    pub snapshot_prefix: String,
+    #[clap(long, env = "RAFT_INSTANCE_PREFIX", default_value = "match")]
+    pub instance_prefix: String,
 
-    #[clap(long, env = "RAFT_SNAPSHOT_PATH", default_value = "/tmp/journal")]
+    #[clap(long, env = "RAFT_JOURNAL_PATH", default_value = "/tmp/journal")]
     pub journal_path: String,
 
     #[clap(long, env = "RAFT_SNAPSHOT_PER_EVENTS", default_value = "500")]

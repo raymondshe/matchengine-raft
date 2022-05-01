@@ -21,7 +21,7 @@ impl ExampleStore {
             Some(snapshot) => {
                 let file_name = format!(
                     "{}/{}-{}-{}-{}.bin",
-                    self.config.snapshot_path, self.config.snapshot_prefix,
+                    self.config.snapshot_path, self.config.instance_prefix,
                     snapshot.meta.last_log_id.leader_id, snapshot.meta.last_log_id.index, snapshot.meta.snapshot_id
                 );
                 tracing::debug!("write_file: [{:?}, +oo)", file_name);

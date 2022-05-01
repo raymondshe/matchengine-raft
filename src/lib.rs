@@ -39,8 +39,10 @@ pub async fn start_example_raft_node(node_id: ExampleNodeId, http_addr: String) 
     let config = Arc::new(Config::default().validate().unwrap());
 
     // Create a instance of where the Raft data will be stored.
-    let store = Arc::new(ExampleStore::default());
-
+    let mut es = ExampleStore::default();
+    es.node_id = node_id;
+    let store = Arc::new(es);
+    
     // Create the network layer that will connect and communicate the raft instances and
     // will be used in conjunction with the store created above.
     let network = ExampleNetwork::new();
