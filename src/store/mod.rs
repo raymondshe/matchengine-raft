@@ -35,9 +35,6 @@ pub mod store;
 pub mod log;
 pub mod config;
 use crate::store::config::Config;
-use tokio::io::{self, AsyncWriteExt};
-use tokio::fs::File;
-use sled::Db;
 
 #[derive(Debug)]
 pub struct ExampleSnapshot {
@@ -308,11 +305,16 @@ impl RaftStorage<ExampleTypeConfig> for Arc<ExampleStore> {
     #[tracing::instrument(level = "debug", skip(self))]
     async fn purge_logs_upto(&mut self, log_id: LogId<ExampleNodeId>) -> Result<(), StorageError<ExampleNodeId>> {
         tracing::debug!("delete_log: [{:?}, +oo)", log_id);
-
         {
             let mut ld = self.last_purged_log_id.write().await;
             assert!(*ld <= Some(log_id));
             *ld = Some(log_id);
+        }
+
+        if log_id.index % self.config.snapshot_per_events as u64 == 1 {
+            self.build_snapshot().await?;
+            self.write_file().await.unwrap();
+            self.purge_logfile_upto(log_id).await?;
         }
 
         {
@@ -419,7 +421,6 @@ impl RaftStorage<ExampleTypeConfig> for Arc<ExampleStore> {
             
             let mut state_machine = self.state_machine.write().await;
             *state_machine = updated_state_machine;
-
         }
 
         // Update current snapshot.
@@ -438,6 +439,8 @@ impl RaftStorage<ExampleTypeConfig> for Arc<ExampleStore> {
     async fn get_current_snapshot(
         &mut self,
     ) -> Result<Option<Snapshot<ExampleTypeConfig, Self::SnapshotData>>, StorageError<ExampleNodeId>> {
+        tracing::debug!("get_current_snapshot: start");
+
         match &*self.current_snapshot.read().await {
             Some(snapshot) => {
                 let data = snapshot.data.clone();
@@ -446,7 +449,45 @@ impl RaftStorage<ExampleTypeConfig> for Arc<ExampleStore> {
                     snapshot: Box::new(Cursor::new(data)),
                 }))
             }
-            None => Ok(None),
+            None => {
+                let data = self.read_file().await;
+                tracing::debug!("get_current_snapshot: data = {:?}",data);
+
+                let data = match data {
+                    Ok(c) => c,
+                    Err(e) => return Ok(None),
+                };
+                
+                let content : StateMachineContent = 
+                serde_json::from_slice(&data).unwrap();
+
+                let last_applied_log = content.last_applied_log.unwrap();
+                tracing::debug!("get_current_snapshot: last_applied_log = {:?}",last_applied_log);
+
+                let snapshot_idx = {
+                    let mut l = self.snapshot_idx.lock().unwrap();
+                    *l += 1;
+                    *l
+                };
+        
+                let snapshot_id = format!(
+                    "{}-{}-{}",
+                    last_applied_log.leader_id, last_applied_log.index, snapshot_idx
+                );
+                tracing::debug!("get_current_snapshot: {}",snapshot_id);
+
+                let meta = SnapshotMeta {
+                    last_log_id: last_applied_log,
+                    snapshot_id: snapshot_id,
+                };
+
+                //self.install_snapshot(&meta, Box::new(Cursor::new(data.clone()))).await?;
+
+                Ok(Some(Snapshot {
+                    meta: meta,
+                    snapshot: Box::new(Cursor::new(data)),
+                }))
+            }
         }
     }
 

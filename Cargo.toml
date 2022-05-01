@@ -32,6 +32,7 @@ tracing = "0.1.29"
 tracing-futures = "0.2.4"
 uuid = { version = "0.8.1", features = ["v4"] }
 sled = "0.34.7"
+walkdir = "2.3.2"
 
 [dev-dependencies]
 anyhow = "1.0.32"

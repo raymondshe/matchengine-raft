@@ -39,6 +39,26 @@ rpc() {
     echo
 }
 
+build_cluster() {
+    echo "Adding node 2 and node 3 as learners, to receive log from leader node 1"
+    echo
+    if test $1 -ne 1 
+    then
+        rpc 2100$1/add-learner       '[1, "127.0.0.1:21001"]'
+        echo "Node 1 added as leaner"
+    fi
+    if test $1 -ne 2 
+    then
+        rpc 2100$1/add-learner       '[2, "127.0.0.1:21002"]'
+        echo "Node 2 added as leaner"
+    fi
+    if test $1 -ne 3
+    then
+        rpc 2100$1/add-learner       '[3, "127.0.0.1:21003"]'
+        echo "Node 3 added as leaner"
+    fi
+}
+
 place_order() {
 ##############################################################{
     echo "Place order on leader"
@@ -106,6 +126,9 @@ case $1 in
     ;;
 "get-seq")
     rpc 2100$2/read  '"orderbook_sequance"'
+    ;;
+"build-cluster")
+    build_cluster $2
     ;;
   *)
     "Nothing is done!"
