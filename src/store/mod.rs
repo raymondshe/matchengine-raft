@@ -277,7 +277,7 @@ impl RaftStorage<ExampleTypeConfig> for Arc<ExampleStore> {
         entries: &[&Entry<ExampleTypeConfig>],
     ) -> Result<(), StorageError<ExampleNodeId>> {
 
-        self.write_log(entries).await;
+        self.append_to_log_file(entries).await;
 
         let mut log = self.log.write().await;
         for entry in entries {
@@ -292,6 +292,8 @@ impl RaftStorage<ExampleTypeConfig> for Arc<ExampleStore> {
         log_id: LogId<ExampleNodeId>,
     ) -> Result<(), StorageError<ExampleNodeId>> {
         tracing::debug!("delete_log: [{:?}, +oo)", log_id);
+
+        self.delete_conflict_logs_since_file(log_id).await?;
 
         let mut log = self.log.write().await;
         let keys = log.range(log_id.index..).map(|(k, _v)| *k).collect::<Vec<_>>();
@@ -314,7 +316,7 @@ impl RaftStorage<ExampleTypeConfig> for Arc<ExampleStore> {
         if log_id.index % self.config.snapshot_per_events as u64 == 1 {
             self.build_snapshot().await?;
             self.write_file().await.unwrap();
-            self.purge_logfile_upto(log_id).await?;
+            self.purge_logfile_upto_file(log_id).await;
         }
 
         {
@@ -455,7 +457,7 @@ impl RaftStorage<ExampleTypeConfig> for Arc<ExampleStore> {
 
                 let data = match data {
                     Ok(c) => c,
-                    Err(e) => return Ok(None),
+                    Err(e) => return Ok(None)
                 };
                 
                 let content : StateMachineContent = 

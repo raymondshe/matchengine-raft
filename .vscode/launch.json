@@ -1,0 +1,95 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "raft-key-value",
+            "program": "${workspaceFolder}/target/debug/raft-key-value",
+            "args": ["--id", "1", "--http-addr", "127.0.0.1:21001" ],
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "RUST_LOG": "debug",
+                "RUST_BACKTRACE=1": "1"
+            }
+        },
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug unit tests in library 'example-raft-key-value'",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--no-run",
+                    "--lib",
+                    "--package=example-raft-key-value"
+                ],
+                "filter": {
+                    "name": "example-raft-key-value",
+                    "kind": "lib"
+                }
+            },
+            "args": [],
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug executable 'raft-key-value'",
+            "cargo": {
+                "args": [
+                    "build",
+                    "--bin=raft-key-value",
+                    "--package=example-raft-key-value"
+                ],
+                "filter": {
+                    "name": "raft-key-value",
+                    "kind": "bin"
+                }
+            },
+            "args": [],
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug unit tests in executable 'raft-key-value'",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--no-run",
+                    "--bin=raft-key-value",
+                    "--package=example-raft-key-value"
+                ],
+                "filter": {
+                    "name": "raft-key-value",
+                    "kind": "bin"
+                }
+            },
+            "args": [],
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug integration test 'cluster'",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--no-run",
+                    "--test=cluster",
+                    "--package=example-raft-key-value"
+                ],
+                "filter": {
+                    "name": "cluster",
+                    "kind": "test"
+                }
+            },
+            "args": [],
+            "cwd": "${workspaceFolder}"
+        }
+    ]
+}

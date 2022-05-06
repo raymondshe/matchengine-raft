@@ -42,6 +42,9 @@ rpc() {
 build_cluster() {
     echo "Adding node 2 and node 3 as learners, to receive log from leader node 1"
     echo
+    rpc 2100$1/init '{}'
+    echo "Node $1 added as leaner"
+
     if test $1 -ne 1 
     then
         rpc 2100$1/add-learner       '[1, "127.0.0.1:21001"]'
@@ -85,7 +88,6 @@ get_metrics() {
     rpc 2100$1/metrics
 }
 
-
 kill_node() {
     case $1 in 
     "1")
@@ -105,6 +107,8 @@ start_node() {
 }
 
 export RUST_LOG=debug 
+export RUST_LIB_BACKTRACE=1
+export RUST_BACKTRACE=1
 
 echo "Run command $1"
 case $1 in

@@ -4,8 +4,9 @@ use openraft::SnapshotMeta;
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt,self, AsyncWriteExt};
 use walkdir::WalkDir;
-use openraft::LogId;
-use crate::store::StateMachineContent;
+use std::io::Error;
+use std::io::ErrorKind;
+
 
 #[derive(Debug)]
 pub struct ExampleSnapshot {
@@ -39,7 +40,10 @@ impl ExampleStore {
 
     #[tracing::instrument(level = "debug", skip(self))]
     pub async fn read_file(&self) -> io::Result<Vec<u8>> {
-        let latest_file = self.latest_snapshot_file().await.unwrap();
+        let latest_file = match self.latest_snapshot_file().await {
+            Ok(file) => file,
+            _ => return Err(Error::new(ErrorKind::NotFound,"No snapshot files")),
+        };
         tracing::debug!("read_file: {}", latest_file);
 
         let file = File::open(&latest_file).await;
