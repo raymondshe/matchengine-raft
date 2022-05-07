@@ -65,12 +65,11 @@ impl ExampleStore {
     }
 
     #[tracing::instrument(level = "debug", skip(self))]
-    async fn try_get_log_entries<RB: RangeBounds<u64> + Clone + Debug + Send + Sync>(
-        &mut self,
+    pub async fn try_get_log_entries_file<RB: RangeBounds<u64> + Clone + Debug + Send + Sync>(
+        &self,
         range: RB,
     ) -> Result<Vec<Entry<ExampleTypeConfig>>, StorageError<ExampleNodeId>> {
-        tracing::debug!("get_log_state: start");
-
+        
         let sled = self.sled.read().await;
         match &*sled {
             Some (db) => {

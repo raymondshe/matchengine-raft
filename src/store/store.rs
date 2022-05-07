@@ -57,6 +57,7 @@ impl ExampleStore {
         Ok(data)
     }
 
+    #[tracing::instrument(level = "debug", skip(self))]
     pub async fn latest_snapshot_file(&self) -> Result<String, ()> {
         let mut max_index: u64 = 0;
         let mut latest_snapshot_file: String= String::from("");
@@ -72,16 +73,28 @@ impl ExampleStore {
             let ext = s1.next();
             match ext.unwrap() {
                 "bin" => {
-                    let mut s2 = file.unwrap().split("-");
-                    let prefix = s2.next();
-                    if prefix.unwrap() != self.config.instance_prefix {
-                        continue;
+                    tracing::debug!("file: {:?}", file);
+                    let mut s3 = file.unwrap().split("+");
+                    let prefix = s3.next();
+
+                    match prefix {
+                        Some(p) => if p != self.config.instance_prefix {
+                                continue
+                        }
+                        None => continue
                     }
+                    let node_id = s3.next().unwrap();
+                    if node_id != self.node_id.to_string() {continue};
+                    let snapshot_id = s3.next().unwrap();
+ 
+                    let mut s2 = snapshot_id.split("-");
+                    //TODO:
+                    let term_id = s2.next();
                     let node_id = s2.next();
-                    if node_id.unwrap() != self.node_id.to_string() {
-                        continue;
-                    }
-                    let index = u64::from_str_radix(s2.next().unwrap(), 10).unwrap();
+                    let index = s2.next();
+                    let snapshot_id = s2.next();
+                    
+                    let index = u64::from_str_radix(index.unwrap(), 10).unwrap();
                     if index > max_index {
                         max_index = index;
                         latest_snapshot_file = f_name;

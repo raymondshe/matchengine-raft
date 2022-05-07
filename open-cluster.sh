@@ -68,9 +68,9 @@ sleep 1
 echo "Initialize server 1 as a single-node cluster"
 sleep 2
 echo
-rpc 21001/init '{}'
+#rpc 21001/init '{}'
 
-echo "Server 1 is a leader now"
+#echo "Server 1 is a leader now"
 
 sleep 2
 

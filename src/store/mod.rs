@@ -187,9 +187,12 @@ impl RaftLogReader<ExampleTypeConfig> for Arc<ExampleStore> {
         &mut self,
         range: RB,
     ) -> Result<Vec<Entry<ExampleTypeConfig>>, StorageError<ExampleNodeId>> {
+        self.try_get_log_entries_file(range).await
+        /*
         let log = self.log.read().await;
         let response = log.range(range.clone()).map(|(_, val)| val.clone()).collect::<Vec<_>>();
         Ok(response)
+        */
     }
 }
 
