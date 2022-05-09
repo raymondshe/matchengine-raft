@@ -24,11 +24,10 @@ fn to_array<T, const N: usize>(v: Vec<T>) -> [T; N] {
 }
 
 impl ExampleStore {
-
     #[tracing::instrument(level = "debug", skip(self))]
-    async fn get_log_state(&mut self) -> Result<LogState<ExampleTypeConfig>, StorageError<ExampleNodeId>> {
+    async fn get_log_state_file(&mut self) -> Result<LogState<ExampleTypeConfig>, StorageError<ExampleNodeId>> {
         // TODO: Seems not right. Need to handle LogId
-        tracing::debug!("get_log_state: start");
+        tracing::debug!("get_log_state_file: start");
 
         let sled = self.sled.read().await;
         let last = match &*sled {
@@ -37,7 +36,6 @@ impl ExampleStore {
 
                 let last_entry : Entry<ExampleTypeConfig> = 
                     serde_json::from_slice(last_entry.unwrap().1.as_ref()).unwrap();
-                
                 Some(last_entry.log_id)
             },
             None => None
@@ -60,7 +58,7 @@ impl ExampleStore {
             last_log_id: last,
         };
 
-        tracing::debug!("get_log_state: {:?}", log_state);
+        tracing::debug!("get_log_state_file: {:?}", log_state);
         Ok(log_state)
     }
 
@@ -69,7 +67,7 @@ impl ExampleStore {
         &self,
         range: RB,
     ) -> Result<Vec<Entry<ExampleTypeConfig>>, StorageError<ExampleNodeId>> {
-        
+
         let sled = self.sled.read().await;
         match &*sled {
             Some (db) => {

@@ -333,11 +333,43 @@ impl RaftStorage<ExampleTypeConfig> for Arc<ExampleStore> {
 
         Ok(())
     }
-
+    
+    #[tracing::instrument(level = "debug", skip(self))]
     async fn last_applied_state(
         &mut self,
     ) -> Result<(Option<LogId<ExampleNodeId>>, EffectiveMembership<ExampleNodeId>), StorageError<ExampleNodeId>> {
+        tracing::debug!("last_applied_state: start");
+        // 1. Load Current Snapshot
+        let snapshot = self.get_current_snapshot().await;
+        
+        // 2. Install current Snapshot to state machine
+        let start_idx = match snapshot {
+            Ok(Some(sn)) => {
+                self.install_snapshot(&sn.meta, sn.snapshot ).await?; 
+                let state_machine = self.state_machine.read().await;
+                let last_applied = state_machine.last_applied_log;
+                match last_applied {
+                    Some(l) => l.index,
+                    _ => 0
+                } 
+            }
+            _ => 0
+        };
+        
+         // 3. Apply all logs to statemachine wi ch is bigger than snapshot log ids'
+         match self.try_get_log_entries_file((start_idx+1)..).await  {
+            Ok(entries) => {
+                let entries: Vec<&openraft::Entry<ExampleTypeConfig>> = entries.iter().collect();
+                tracing::info!("last_applied_state: entry {:?}", entries);
+                self.apply_to_state_machine(entries.as_slice()).await?;
+                ()
+            },
+            _ => ()
+         }
+
+        // 4 return
         let state_machine = self.state_machine.read().await;
+        tracing::info!("last_applied_state: {:?} {:?}", state_machine.last_applied_log, state_machine.last_membership);
         Ok((state_machine.last_applied_log, state_machine.last_membership.clone()))
     }
 
@@ -455,8 +487,8 @@ impl RaftStorage<ExampleTypeConfig> for Arc<ExampleStore> {
                 }))
             }
             None => {
-                let data = self.read_file().await;
-                tracing::debug!("get_current_snapshot: data = {:?}",data);
+                let data = self.read_snapshot_file().await;
+                //tracing::debug!("get_current_snapshot: data = {:?}",data);
 
                 let data = match data {
                     Ok(c) => c,
@@ -479,14 +511,15 @@ impl RaftStorage<ExampleTypeConfig> for Arc<ExampleStore> {
                     "{}-{}-{}",
                     last_applied_log.leader_id, last_applied_log.index, snapshot_idx
                 );
-                tracing::debug!("get_current_snapshot: {}",snapshot_id);
-
+                
                 let meta = SnapshotMeta {
                     last_log_id: last_applied_log,
                     snapshot_id: snapshot_id,
                 };
 
                 //self.install_snapshot(&meta, Box::new(Cursor::new(data.clone()))).await?;
+
+                tracing::debug!("get_current_snapshot: meta {:?}",meta);
 
                 Ok(Some(Snapshot {
                     meta: meta,

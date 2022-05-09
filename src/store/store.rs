@@ -39,7 +39,7 @@ impl ExampleStore {
     }
 
     #[tracing::instrument(level = "debug", skip(self))]
-    pub async fn read_file(&self) -> io::Result<Vec<u8>> {
+    pub async fn read_snapshot_file(&self) -> io::Result<Vec<u8>> {
         let latest_file = match self.latest_snapshot_file().await {
             Ok(file) => file,
             _ => return Err(Error::new(ErrorKind::NotFound,"No snapshot files")),

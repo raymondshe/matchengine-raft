@@ -103,7 +103,16 @@ kill_node() {
 }
 
 start_node() {
-    nohup ./target/debug/raft-key-value  --id $1 --http-addr 127.0.0.1:2100$1 > n1.log &
+    nohup ./target/debug/raft-key-value  --id $1 --http-addr 127.0.0.1:2100$1 > n$1.log &
+}
+
+change_membership () {
+
+echo "Changing membership from [1] to 3 nodes cluster: [$1]"
+echo
+rpc 21001/change-membership '[1]'
+echo "Membership changed"
+
 }
 
 export RUST_LOG=debug 
@@ -133,6 +142,9 @@ case $1 in
     ;;
 "build-cluster")
     build_cluster $2
+    ;;
+"change-membership")
+	change_membership $2
     ;;
   *)
     "Nothing is done!"
