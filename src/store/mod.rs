@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::io::Cursor;
-use std::ops::RangeBounds;
+use std::ops::{Bound, RangeBounds};
 use std::sync::Arc;
 use std::sync::Mutex;
 
@@ -26,15 +26,17 @@ use openraft::Vote;
 use serde::Deserialize;
 use serde::Serialize;
 use tokio::sync::RwLock;
+use sled::{Db, IVec};
 
 use crate::ExampleNodeId;
 use crate::ExampleTypeConfig;
 use crate::matchengine::OrderBook;
 use crate::matchengine::Order;
-pub mod store;
-pub mod log;
 pub mod config;
+pub mod store;
+
 use crate::store::config::Config;
+use rand::Rng;
 
 #[derive(Debug)]
 pub struct ExampleSnapshot {
@@ -140,14 +142,12 @@ impl ExampleStateMachine {
 }
 
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ExampleStore {
     last_purged_log_id: RwLock<Option<LogId<ExampleNodeId>>>,
 
     /// The Raft log.
-    pub log: RwLock<BTreeMap<u64, Entry<ExampleTypeConfig>>>,
-
-    pub sled : RwLock<Option<sled::Db>>,
+    pub log: sled::Tree,//RwLock<BTreeMap<u64, Entry<StorageRaftTypeConfig>>>,
 
     /// The Raft state machine.
     pub state_machine: RwLock<ExampleStateMachine>,
@@ -164,11 +164,71 @@ pub struct ExampleStore {
     pub node_id: ExampleNodeId,
 }
 
+
+fn get_sled_db(config: Config, node_id: ExampleNodeId) -> Db {
+    let db_path = format!(
+        "{}/{}-{}.binlog",
+        config.journal_path, config.instance_prefix, node_id
+    );
+    let db = sled::open(db_path.clone()).unwrap();
+    tracing::debug!("last_applied_state: created log at: {:?}", db_path);
+    db
+}
+
+impl ExampleStore {
+    pub fn mock_state_open(
+        open: Option<()>,
+        create: Option<()>,
+    ) -> u64 {
+        let (id, _is_open) = match (open, create) {
+            (Some(_), Some(_)) => (1, false),
+            (Some(_), None) => {
+                panic!("Err(MetaError::MetaStoreNotFound)");
+            }
+            (None, Some(_)) => (1, false),
+            (None, None) => panic!("no open no create"),
+        };
+
+        id
+    }
+    
+    pub fn open_create(
+        node_id: ExampleNodeId
+    ) -> ExampleStore {
+        tracing::info!("open_create, node_id: {}", node_id);
+
+        let config = Config::default();
+
+        let db = get_sled_db(config.clone(), node_id);
+
+        let mut rng = rand::thread_rng();
+        let log = db.open_tree(format!("trytry{}", rng.gen::<u32>())).unwrap();
+
+        let current_snapshot = RwLock::new(None);
+
+        ExampleStore {
+            last_purged_log_id: Default::default(),
+            config: config,
+            node_id: node_id,
+            log,
+            state_machine: Default::default(),
+            vote: Default::default(),
+            snapshot_idx: Arc::new(Mutex::new(0)),
+            current_snapshot,
+        }
+    }
+}
+
+
 #[async_trait]
 impl RaftLogReader<ExampleTypeConfig> for Arc<ExampleStore> {
     async fn get_log_state(&mut self) -> Result<LogState<ExampleTypeConfig>, StorageError<ExampleNodeId>> {
-        let log = self.log.read().await;
-        let last = log.iter().rev().next().map(|(_, ent)| ent.log_id);
+        let log = &self.log;
+        let last = log.iter()
+                      .rev()
+                      .next()
+                      .map(|res| res.unwrap()).map(|(_, val)|
+            serde_json::from_slice::<Entry<ExampleTypeConfig>>(&*val).unwrap().log_id);
 
         let last_purged = *self.last_purged_log_id.read().await;
 
@@ -183,16 +243,34 @@ impl RaftLogReader<ExampleTypeConfig> for Arc<ExampleStore> {
         })
     }
 
+
     async fn try_get_log_entries<RB: RangeBounds<u64> + Clone + Debug + Send + Sync>(
         &mut self,
         range: RB,
     ) -> Result<Vec<Entry<ExampleTypeConfig>>, StorageError<ExampleNodeId>> {
-        self.try_get_log_entries_file(range).await
-        /*
-        let log = self.log.read().await;
-        let response = log.range(range.clone()).map(|(_, val)| val.clone()).collect::<Vec<_>>();
+        let log = &self.log;
+        let response = log.range(transform_range_bound(range))
+                          .map(|res| res.unwrap())
+                          .map(|(_, val)|
+                              serde_json::from_slice::<Entry<ExampleTypeConfig>>(&*val).unwrap())
+                          .collect();
+
         Ok(response)
-        */
+    }
+}
+
+fn transform_range_bound<RB: RangeBounds<u64> + Clone + Debug + Send + Sync>(range: RB) -> (Bound<IVec>, Bound<IVec>) {
+    (serialize_bound(&range.start_bound()), serialize_bound(&range.end_bound()))
+}
+
+
+fn serialize_bound(
+    v: &Bound<&u64>,
+) -> Bound<IVec> {
+    match v {
+        Bound::Included(v) => Bound::Included(IVec::from(&v.to_be_bytes())),
+        Bound::Excluded(v) => Bound::Excluded(IVec::from(&v.to_be_bytes())),
+        Bound::Unbounded => Bound::Unbounded
     }
 }
 
@@ -207,11 +285,7 @@ impl RaftSnapshotBuilder<ExampleTypeConfig, Cursor<Vec<u8>>> for Arc<ExampleStor
         {
             // Serialize the data of the state machine.
             let state_machine = self.state_machine.read().await;
-
-            // ** Content for snapshot
-            let content = state_machine.to_content();
-            
-            data = serde_json::to_vec(&content)
+            data = serde_json::to_vec(&*state_machine)
                 .map_err(|e| StorageIOError::new(ErrorSubject::StateMachine, ErrorVerb::Read, AnyError::new(&e)))?;
 
             last_applied_log = state_machine.last_applied_log;
@@ -250,6 +324,8 @@ impl RaftSnapshotBuilder<ExampleTypeConfig, Cursor<Vec<u8>>> for Arc<ExampleStor
             *current_snapshot = Some(snapshot);
         }
 
+        self.write_file().await.unwrap();
+
         Ok(Snapshot {
             meta,
             snapshot: Box::new(Cursor::new(data)),
@@ -274,17 +350,18 @@ impl RaftStorage<ExampleTypeConfig> for Arc<ExampleStore> {
         Ok(*self.vote.read().await)
     }
 
+    async fn get_log_reader(&mut self) -> Self::LogReader {
+        self.clone()
+    }
+
     #[tracing::instrument(level = "trace", skip(self, entries))]
     async fn append_to_log(
         &mut self,
         entries: &[&Entry<ExampleTypeConfig>],
     ) -> Result<(), StorageError<ExampleNodeId>> {
-
-        self.append_to_log_file(entries).await;
-
-        let mut log = self.log.write().await;
+        let log = &self.log;
         for entry in entries {
-            log.insert(entry.log_id.index, (*entry).clone());
+            log.insert(entry.log_id.index.to_be_bytes(), IVec::from(serde_json::to_vec(&*entry).unwrap())).unwrap();
         }
         Ok(())
     }
@@ -296,12 +373,12 @@ impl RaftStorage<ExampleTypeConfig> for Arc<ExampleStore> {
     ) -> Result<(), StorageError<ExampleNodeId>> {
         tracing::debug!("delete_log: [{:?}, +oo)", log_id);
 
-        self.delete_conflict_logs_since_file(log_id).await?;
-
-        let mut log = self.log.write().await;
-        let keys = log.range(log_id.index..).map(|(k, _v)| *k).collect::<Vec<_>>();
+        let log = &self.log;
+        let keys = log.range(transform_range_bound(log_id.index..))
+                      .map(|res| res.unwrap())
+                      .map(|(k, _v)| k); //TODO Why originally used collect instead of the iter.
         for key in keys {
-            log.remove(&key);
+            log.remove(&key).unwrap();
         }
 
         Ok(())
@@ -310,66 +387,31 @@ impl RaftStorage<ExampleTypeConfig> for Arc<ExampleStore> {
     #[tracing::instrument(level = "debug", skip(self))]
     async fn purge_logs_upto(&mut self, log_id: LogId<ExampleNodeId>) -> Result<(), StorageError<ExampleNodeId>> {
         tracing::debug!("delete_log: [{:?}, +oo)", log_id);
+
         {
             let mut ld = self.last_purged_log_id.write().await;
             assert!(*ld <= Some(log_id));
             *ld = Some(log_id);
         }
 
-        if log_id.index % self.config.snapshot_per_events as u64 == 1 {
-            self.build_snapshot().await?;
-            self.write_file().await.unwrap();
-            self.purge_logfile_upto_file(log_id).await;
-        }
-
         {
-            let mut log = self.log.write().await;
+            let log = &self.log;
 
-            let keys = log.range(..=log_id.index).map(|(k, _v)| *k).collect::<Vec<_>>();
+            let keys = log.range(transform_range_bound(..=log_id.index))
+                          .map(|res| res.unwrap())
+                          .map(|(k, _)| k);
             for key in keys {
-                log.remove(&key);
+                log.remove(&key).unwrap();
             }
         }
 
         Ok(())
     }
-    
-    #[tracing::instrument(level = "debug", skip(self))]
+
     async fn last_applied_state(
         &mut self,
     ) -> Result<(Option<LogId<ExampleNodeId>>, EffectiveMembership<ExampleNodeId>), StorageError<ExampleNodeId>> {
-        tracing::debug!("last_applied_state: start");
-        // 1. Load Current Snapshot
-        let snapshot = self.get_current_snapshot().await;
-        
-        // 2. Install current Snapshot to state machine
-        let start_idx = match snapshot {
-            Ok(Some(sn)) => {
-                self.install_snapshot(&sn.meta, sn.snapshot ).await?; 
-                let state_machine = self.state_machine.read().await;
-                let last_applied = state_machine.last_applied_log;
-                match last_applied {
-                    Some(l) => l.index,
-                    _ => 0
-                } 
-            }
-            _ => 0
-        };
-        
-         // 3. Apply all logs to statemachine wi ch is bigger than snapshot log ids'
-         match self.try_get_log_entries_file((start_idx+1)..).await  {
-            Ok(entries) => {
-                let entries: Vec<&openraft::Entry<ExampleTypeConfig>> = entries.iter().collect();
-                tracing::info!("last_applied_state: entry {:?}", entries);
-                self.apply_to_state_machine(entries.as_slice()).await?;
-                ()
-            },
-            _ => ()
-         }
-
-        // 4 return
         let state_machine = self.state_machine.read().await;
-        tracing::info!("last_applied_state: {:?} {:?}", state_machine.last_applied_log, state_machine.last_membership);
         Ok((state_machine.last_applied_log, state_machine.last_membership.clone()))
     }
 
@@ -403,13 +445,13 @@ impl RaftStorage<ExampleTypeConfig> for Arc<ExampleStore> {
                             value: Some(o.sequance.to_string()),
                         })
                     }
-                    
+
                     ExampleRequest::Cancel { order } => {
                         sm.orderbook.cancle(order);
                         res.push(ExampleResponse {
                             value: Some("OK".to_string()),
                         })
-                    }                    
+                    }
                 },
                 EntryPayload::Membership(ref mem) => {
                     sm.last_membership = EffectiveMembership::new(Some(entry.log_id), mem.clone());
@@ -418,6 +460,10 @@ impl RaftStorage<ExampleTypeConfig> for Arc<ExampleStore> {
             };
         }
         Ok(res)
+    }
+
+    async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
+        self.clone()
     }
 
     #[tracing::instrument(level = "trace", skip(self))]
@@ -443,29 +489,21 @@ impl RaftStorage<ExampleTypeConfig> for Arc<ExampleStore> {
 
         // Update the state machine.
         {
-            let content : StateMachineContent = 
-            serde_json::from_slice(&new_snapshot.data).map_err(|e| {
-                StorageIOError::new(
-                    ErrorSubject::Snapshot(new_snapshot.meta.clone()),
-                    ErrorVerb::Read,
-                    AnyError::new(&e),
-                )
-            })?;
-
-            // ** Build from content **
-            let mut updated_state_machine = ExampleStateMachine::default();
-            updated_state_machine.from_content(&content);
-            
+            let updated_state_machine: ExampleStateMachine =
+                serde_json::from_slice(&new_snapshot.data).map_err(|e| {
+                    StorageIOError::new(
+                        ErrorSubject::Snapshot(new_snapshot.meta.clone()),
+                        ErrorVerb::Read,
+                        AnyError::new(&e),
+                    )
+                })?;
             let mut state_machine = self.state_machine.write().await;
             *state_machine = updated_state_machine;
         }
 
         // Update current snapshot.
-        {
-            let mut current_snapshot = self.current_snapshot.write().await;
-            *current_snapshot = Some(new_snapshot);
-        }
-        self.write_file().await.unwrap();
+        let mut current_snapshot = self.current_snapshot.write().await;
+        *current_snapshot = Some(new_snapshot);
         Ok(StateMachineChanges {
             last_applied: meta.last_log_id,
             is_snapshot: true,
@@ -476,8 +514,6 @@ impl RaftStorage<ExampleTypeConfig> for Arc<ExampleStore> {
     async fn get_current_snapshot(
         &mut self,
     ) -> Result<Option<Snapshot<ExampleTypeConfig, Self::SnapshotData>>, StorageError<ExampleNodeId>> {
-        tracing::debug!("get_current_snapshot: start");
-
         match &*self.current_snapshot.read().await {
             Some(snapshot) => {
                 let data = snapshot.data.clone();
@@ -486,54 +522,7 @@ impl RaftStorage<ExampleTypeConfig> for Arc<ExampleStore> {
                     snapshot: Box::new(Cursor::new(data)),
                 }))
             }
-            None => {
-                let data = self.read_snapshot_file().await;
-                //tracing::debug!("get_current_snapshot: data = {:?}",data);
-
-                let data = match data {
-                    Ok(c) => c,
-                    Err(e) => return Ok(None)
-                };
-                
-                let content : StateMachineContent = 
-                serde_json::from_slice(&data).unwrap();
-
-                let last_applied_log = content.last_applied_log.unwrap();
-                tracing::debug!("get_current_snapshot: last_applied_log = {:?}",last_applied_log);
-
-                let snapshot_idx = {
-                    let mut l = self.snapshot_idx.lock().unwrap();
-                    *l += 1;
-                    *l
-                };
-        
-                let snapshot_id = format!(
-                    "{}-{}-{}",
-                    last_applied_log.leader_id, last_applied_log.index, snapshot_idx
-                );
-                
-                let meta = SnapshotMeta {
-                    last_log_id: last_applied_log,
-                    snapshot_id: snapshot_id,
-                };
-
-                //self.install_snapshot(&meta, Box::new(Cursor::new(data.clone()))).await?;
-
-                tracing::debug!("get_current_snapshot: meta {:?}",meta);
-
-                Ok(Some(Snapshot {
-                    meta: meta,
-                    snapshot: Box::new(Cursor::new(data)),
-                }))
-            }
+            None => Ok(None),
         }
-    }
-
-    async fn get_log_reader(&mut self) -> Self::LogReader {
-        self.clone()
-    }
-
-    async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
-        self.clone()
     }
 }

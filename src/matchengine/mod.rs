@@ -200,7 +200,7 @@ impl OrderBook {
 
     #[tracing::instrument(level = "trace", skip(self))]
     pub fn insert_order(&mut self, order: &Order) {
-        tracing::debug!("insert_order: [{:?}, +oo)", order);
+        //tracing::debug!("insert_order: {:?})", order);
         match order.side {
             OrderSide::Buy => {
                 self.bids.insert(BidKey{price: order.price, sequance: order.sequance}, order.clone());
@@ -393,19 +393,22 @@ mod tests {
     #[test]
     fn order_replace() {
         let mut ob = OrderBook::new();
-        let mut o1 = Order::new(OrderSide::Sell, 100.22, 20.0, 1);
+        let mut o1 = Order::new(OrderSide::Sell, 100.22, 22.0, 1);
         let o2 = Order::new(OrderSide::Buy, 100.22, 10.0, 1);
+
+        let o3 = Order::new(OrderSide::Sell, 100.22, 12.0, 0);
 
         ob.place_order(&mut o1);
         assert_eq!(ob.best_ask(), Some(&o1));
         ob.match_bid_order(&o2);
-        assert_eq!(ob.best_ask(), Some(&o2));
-
+        assert_eq!(ob.best_ask(), Some(&o3));
+        /*
         let serialized = serde_json::to_string(&ob).unwrap();
         println!("serialized = {}", serialized);
     
         let deserialized: OrderBook = serde_json::from_str(&serialized).unwrap();
         println!("deserialized = {:?}", deserialized);
+        */
     }
 
 }

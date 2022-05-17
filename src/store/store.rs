@@ -1,12 +1,20 @@
-use crate::store::ExampleStore;
-use crate::ExampleNodeId;
-use openraft::SnapshotMeta;
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt,self, AsyncWriteExt};
+use tokio::fs::OpenOptions;
+
 use walkdir::WalkDir;
 use std::io::Error;
 use std::io::ErrorKind;
+use std::io::Cursor;
 
+use openraft::storage::Snapshot;
+use openraft::SnapshotMeta;
+use openraft::StorageError;
+
+use crate::ExampleTypeConfig;
+use crate::store::ExampleStore;
+use crate::ExampleNodeId;
+use crate::store::StateMachineContent;
 
 #[derive(Debug)]
 pub struct ExampleSnapshot {
@@ -17,9 +25,11 @@ pub struct ExampleSnapshot {
 }
 
 impl ExampleStore {
+
     #[tracing::instrument(level = "debug", skip(self))]
     pub async fn write_file(&self) -> io::Result<()> {
         tracing::debug!("write_file: start");
+
         match &*self.current_snapshot.read().await {
             Some(snapshot) => {
                 let file_name = format!(
@@ -30,8 +40,11 @@ impl ExampleStore {
                     snapshot.meta.snapshot_id
                 );
                 tracing::debug!("write_file: [{:?}, +oo)", file_name);
-                let mut file = File::create(file_name).await?;
-                file.write_all(snapshot.data.as_slice()).await?;
+                let file = OpenOptions::new().write(true).create_new(true).open(file_name).await;
+                match file {
+                    Ok(mut file) => file.write_all(snapshot.data.as_slice()).await?,
+                    Err(_e) => (), // TODO: we need to change index and write to another file.
+                }
             }
             None => (),
         }
@@ -108,6 +121,63 @@ impl ExampleStore {
                 self.config.snapshot_path, latest_snapshot_file))   
         } else {
             Err(())
+        }
+    }
+
+    #[tracing::instrument(level = "trace", skip(self))]
+    pub async fn load_latest_snapshot(
+        &self,
+    ) -> Result<Option<Snapshot<ExampleTypeConfig, Cursor<Vec<u8>>>>, StorageError<ExampleNodeId>> {
+        tracing::debug!("load_latest_snapshot: start");
+
+        match &*self.current_snapshot.read().await {
+            Some(snapshot) => {
+                let data = snapshot.data.clone();
+                Ok(Some(Snapshot {
+                    meta: snapshot.meta.clone(),
+                    snapshot: Box::new(Cursor::new(data)),
+                }))
+            }
+            None => {
+                let data = self.read_snapshot_file().await;
+                //tracing::debug!("get_current_snapshot: data = {:?}",data);
+
+                let data = match data {
+                    Ok(c) => c,
+                    Err(_e) => return Ok(None)
+                };
+                
+                let content : StateMachineContent = 
+                serde_json::from_slice(&data).unwrap();
+
+                let last_applied_log = content.last_applied_log.unwrap();
+                tracing::debug!("load_latest_snapshot: last_applied_log = {:?}",last_applied_log);
+
+                let snapshot_idx = {
+                    let mut l = self.snapshot_idx.lock().unwrap();
+                    *l += 1;
+                    *l
+                };
+        
+                let snapshot_id = format!(
+                    "{}-{}-{}",
+                    last_applied_log.leader_id, last_applied_log.index, snapshot_idx
+                );
+                
+                let meta = SnapshotMeta {
+                    last_log_id: last_applied_log,
+                    snapshot_id: snapshot_id,
+                };
+
+                //self.install_snapshot(&meta, Box::new(Cursor::new(data.clone()))).await?;
+
+                tracing::debug!("load_latest_snapshot: meta {:?}",meta);
+
+                Ok(Some(Snapshot {
+                    meta: meta,
+                    snapshot: Box::new(Cursor::new(data)),
+                }))
+            }
         }
     }
 }

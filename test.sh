@@ -115,6 +115,15 @@ echo "Membership changed"
 
 }
 
+clean() {
+    echo "Cleaning"
+    surname=`date -Iseconds`
+    mv /tmp/snapshot /tmp/snapshot.$surname
+    mkdir -p /tmp/snapshot
+    mv /tmp/journal /tmp/journal.$sername
+    mkdir -p /tmp/journal 
+}
+
 export RUST_LOG=debug 
 export RUST_LIB_BACKTRACE=1
 export RUST_BACKTRACE=1
@@ -145,6 +154,10 @@ case $1 in
     ;;
 "change-membership")
 	change_membership $2
+    ;;
+
+"clean")
+    clean
     ;;
   *)
     "Nothing is done!"
