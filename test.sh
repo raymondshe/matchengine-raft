@@ -120,7 +120,7 @@ clean() {
     surname=`date -Iseconds`
     mv /tmp/snapshot /tmp/snapshot.$surname
     mkdir -p /tmp/snapshot
-    mv /tmp/journal /tmp/journal.$sername
+    mv /tmp/journal /tmp/journal.$surname
     mkdir -p /tmp/journal 
 }
 

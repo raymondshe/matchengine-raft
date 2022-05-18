@@ -8,6 +8,7 @@ use actix_web::App;
 use actix_web::HttpServer;
 use openraft::Config;
 use openraft::Raft;
+use openraft::SnapshotPolicy;
 
 
 use crate::app::ExampleApp;
@@ -18,6 +19,7 @@ use crate::network::raft_network_impl::ExampleNetwork;
 use crate::store::ExampleRequest;
 use crate::store::ExampleResponse;
 use crate::store::ExampleStore;
+//use crate::store::Restore;
 
 pub mod app;
 pub mod client;
@@ -36,15 +38,22 @@ pub type ExampleRaft = Raft<ExampleTypeConfig, ExampleNetwork, Arc<ExampleStore>
 
 pub async fn start_example_raft_node(node_id: ExampleNodeId, http_addr: String) -> std::io::Result<()> {
     // Create a configuration for the raft instance.
-    let config = Arc::new(Config::default().validate().unwrap());
+
+    let mut config = Config::default().validate().unwrap();
+    config.snapshot_policy = SnapshotPolicy::LogsSinceLast(500);
+    config.max_applied_log_to_keep = 20000;
+    config.install_snapshot_timeout = 400;
+    let config = Arc::new(config);
 
     // Create a instance of where the Raft data will be stored.
     let es = ExampleStore::open_create(node_id);
     
-    es.load_latest_snapshot().await.unwrap();
+    //es.load_latest_snapshot().await.unwrap();
 
     let store = Arc::new(es);
     
+    //store.restore().await;
+
     // Create the network layer that will connect and communicate the raft instances and
     // will be used in conjunction with the store created above.
     let network = ExampleNetwork::new();

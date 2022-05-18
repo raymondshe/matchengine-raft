@@ -139,10 +139,40 @@ impl PartialOrd for AskKey {
     }
 }
 
+
+pub mod vectorize {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::iter::FromIterator;
+
+    pub fn serialize<'a, T, K, V, S>(target: T, ser: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+        T: IntoIterator<Item = (&'a K, &'a V)>,
+        K: Serialize + 'a,
+        V: Serialize + 'a,
+    {
+        let container: Vec<_> = target.into_iter().collect();
+        serde::Serialize::serialize(&container, ser)
+    }
+
+    pub fn deserialize<'de, T, K, V, D>(des: D) -> Result<T, D::Error>
+    where
+        D: Deserializer<'de>,
+        T: FromIterator<(K, V)>,
+        K: Deserialize<'de>,
+        V: Deserialize<'de>,
+    {
+        let container: Vec<_> = serde::Deserialize::deserialize(des)?;
+        Ok(T::from_iter(container.into_iter()))
+    }
+}
+
 /// main OrderBook structure
 #[derive(Clone, Default, Serialize, Deserialize, Debug)]
 pub struct OrderBook {
+    #[serde(with = "vectorize")]
     pub bids: BTreeMap<BidKey, Order>,
+    #[serde(with = "vectorize")]
     pub asks: BTreeMap<AskKey, Order>,
     pub sequance: u64,
 }

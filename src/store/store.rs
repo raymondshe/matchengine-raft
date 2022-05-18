@@ -14,7 +14,7 @@ use openraft::StorageError;
 use crate::ExampleTypeConfig;
 use crate::store::ExampleStore;
 use crate::ExampleNodeId;
-use crate::store::StateMachineContent;
+use crate::store::ExampleStateMachine;
 
 #[derive(Debug)]
 pub struct ExampleSnapshot {
@@ -27,8 +27,8 @@ pub struct ExampleSnapshot {
 impl ExampleStore {
 
     #[tracing::instrument(level = "debug", skip(self))]
-    pub async fn write_file(&self) -> io::Result<()> {
-        tracing::debug!("write_file: start");
+    pub async fn write_snapshot(&self) -> io::Result<()> {
+        tracing::debug!("write_snapshot: start");
 
         match &*self.current_snapshot.read().await {
             Some(snapshot) => {
@@ -39,7 +39,7 @@ impl ExampleStore {
                     self.node_id,
                     snapshot.meta.snapshot_id
                 );
-                tracing::debug!("write_file: [{:?}, +oo)", file_name);
+                tracing::debug!("write_snapshot: [{:?}, +oo)", file_name);
                 let file = OpenOptions::new().write(true).create_new(true).open(file_name).await;
                 match file {
                     Ok(mut file) => file.write_all(snapshot.data.as_slice()).await?,
@@ -147,7 +147,7 @@ impl ExampleStore {
                     Err(_e) => return Ok(None)
                 };
                 
-                let content : StateMachineContent = 
+                let content : ExampleStateMachine = 
                 serde_json::from_slice(&data).unwrap();
 
                 let last_applied_log = content.last_applied_log.unwrap();

@@ -36,7 +36,6 @@ pub mod config;
 pub mod store;
 
 use crate::store::config::Config;
-use rand::Rng;
 
 #[derive(Debug)]
 pub struct ExampleSnapshot {
@@ -153,7 +152,7 @@ pub struct ExampleStore {
     pub state_machine: RwLock<ExampleStateMachine>,
 
     /// The current granted vote.
-    vote: RwLock<Option<Vote<ExampleNodeId>>>,
+    vote: sled::Tree,
 
     snapshot_idx: Arc<Mutex<u64>>,
 
@@ -171,27 +170,11 @@ fn get_sled_db(config: Config, node_id: ExampleNodeId) -> Db {
         config.journal_path, config.instance_prefix, node_id
     );
     let db = sled::open(db_path.clone()).unwrap();
-    tracing::debug!("last_applied_state: created log at: {:?}", db_path);
+    tracing::debug!("get_sled_db: created log at: {:?}", db_path);
     db
 }
 
 impl ExampleStore {
-    pub fn mock_state_open(
-        open: Option<()>,
-        create: Option<()>,
-    ) -> u64 {
-        let (id, _is_open) = match (open, create) {
-            (Some(_), Some(_)) => (1, false),
-            (Some(_), None) => {
-                panic!("Err(MetaError::MetaStoreNotFound)");
-            }
-            (None, Some(_)) => (1, false),
-            (None, None) => panic!("no open no create"),
-        };
-
-        id
-    }
-    
     pub fn open_create(
         node_id: ExampleNodeId
     ) -> ExampleStore {
@@ -201,8 +184,9 @@ impl ExampleStore {
 
         let db = get_sled_db(config.clone(), node_id);
 
-        let mut rng = rand::thread_rng();
-        let log = db.open_tree(format!("trytry{}", rng.gen::<u32>())).unwrap();
+        let log = db.open_tree(format!("journal_entities_{}", node_id)).unwrap();
+
+        let vote = db.open_tree(format!("votes_{}", node_id)).unwrap();
 
         let current_snapshot = RwLock::new(None);
 
@@ -212,16 +196,59 @@ impl ExampleStore {
             node_id: node_id,
             log,
             state_machine: Default::default(),
-            vote: Default::default(),
+            vote: vote,
             snapshot_idx: Arc::new(Mutex::new(0)),
             current_snapshot,
         }
     }
 }
 
+//Store trait for restore things from snapshot and log
+#[async_trait]
+pub trait Restore {
+    async fn restore(&mut self);
+}
+
+#[async_trait]
+impl Restore for Arc<ExampleStore> {
+    #[tracing::instrument(level = "trace", skip(self))]
+    async fn restore(&mut self) {
+        tracing::debug!("restore");
+        let log = &self.log;
+
+        let first = log.iter()
+        .next()
+        .map(|res| res.unwrap()).map(|(_, val)|
+            serde_json::from_slice::<Entry<ExampleTypeConfig>>(&*val).unwrap().log_id);
+
+        match first {
+            Some(x) => {
+                tracing::debug!("restore: first log id = {:?}", x);
+                let mut ld = self.last_purged_log_id.write().await;
+                *ld = Some(x);
+                //Log got purged so, we can't recover from full log
+                if x.index > 0 {return;}
+            },
+            None => {return;}
+        }
+
+        // Recover from full log status
+        let entities: Vec<Entry<ExampleTypeConfig>>  = log.range(transform_range_bound(..))
+            .map(|res| res.unwrap()).map(|(_, val)|
+                serde_json::from_slice::<Entry<ExampleTypeConfig>>(&*val).unwrap().clone())
+            .collect();
+
+        self.apply_to_state_machine(&entities.iter().collect::<Vec<_>>()).await.unwrap();
+        {
+            let mut sm = self.state_machine.write().await;
+            sm.last_applied_log = None;
+        }
+    }
+}
 
 #[async_trait]
 impl RaftLogReader<ExampleTypeConfig> for Arc<ExampleStore> {
+    #[tracing::instrument(level = "trace", skip(self))]
     async fn get_log_state(&mut self) -> Result<LogState<ExampleTypeConfig>, StorageError<ExampleNodeId>> {
         let log = &self.log;
         let last = log.iter()
@@ -236,7 +263,7 @@ impl RaftLogReader<ExampleTypeConfig> for Arc<ExampleStore> {
             None => last_purged,
             Some(x) => Some(x),
         };
-
+        tracing::debug!("get_log_state: last_purged = {:?}, last = {:?}", last_purged, last);
         Ok(LogState {
             last_purged_log_id: last_purged,
             last_log_id: last,
@@ -273,6 +300,8 @@ fn serialize_bound(
         Bound::Unbounded => Bound::Unbounded
     }
 }
+
+
 
 #[async_trait]
 impl RaftSnapshotBuilder<ExampleTypeConfig, Cursor<Vec<u8>>> for Arc<ExampleStore> {
@@ -324,7 +353,7 @@ impl RaftSnapshotBuilder<ExampleTypeConfig, Cursor<Vec<u8>>> for Arc<ExampleStor
             *current_snapshot = Some(snapshot);
         }
 
-        self.write_file().await.unwrap();
+        self.write_snapshot().await.unwrap();
 
         Ok(Snapshot {
             meta,
@@ -341,13 +370,16 @@ impl RaftStorage<ExampleTypeConfig> for Arc<ExampleStore> {
 
     #[tracing::instrument(level = "trace", skip(self))]
     async fn save_vote(&mut self, vote: &Vote<ExampleNodeId>) -> Result<(), StorageError<ExampleNodeId>> {
-        let mut v = self.vote.write().await;
-        *v = Some(*vote);
+        self.vote.insert(b"vote", IVec::from(serde_json::to_vec(vote).unwrap())).unwrap();
         Ok(())
     }
 
     async fn read_vote(&mut self) -> Result<Option<Vote<ExampleNodeId>>, StorageError<ExampleNodeId>> {
-        Ok(*self.vote.read().await)
+        let value = self.vote.get(b"vote").unwrap();
+        match value {
+            None => {Ok(None)},
+            Some(val) =>  {Ok(Some(serde_json::from_slice::<Vote<ExampleNodeId>>(&*val).unwrap()))}
+        }
     }
 
     async fn get_log_reader(&mut self) -> Self::LogReader {
