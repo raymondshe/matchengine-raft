@@ -546,6 +546,8 @@ impl RaftStorage<ExampleTypeConfig> for Arc<ExampleStore> {
     async fn get_current_snapshot(
         &mut self,
     ) -> Result<Option<Snapshot<ExampleTypeConfig, Self::SnapshotData>>, StorageError<ExampleNodeId>> {
+        tracing::debug!("get_current_snapshot: start");
+
         match &*self.current_snapshot.read().await {
             Some(snapshot) => {
                 let data = snapshot.data.clone();
@@ -554,7 +556,44 @@ impl RaftStorage<ExampleTypeConfig> for Arc<ExampleStore> {
                     snapshot: Box::new(Cursor::new(data)),
                 }))
             }
-            None => Ok(None),
+            None => {
+                let data = self.read_snapshot_file().await;
+                //tracing::debug!("get_current_snapshot: data = {:?}",data);
+
+                let data = match data {
+                    Ok(c) => c,
+                    Err(_e) => return Ok(None)
+                };
+                
+                let content : ExampleStateMachine = 
+                serde_json::from_slice(&data).unwrap();
+
+                let last_applied_log = content.last_applied_log.unwrap();
+                tracing::debug!("get_current_snapshot: last_applied_log = {:?}",last_applied_log);
+
+                let snapshot_idx = {
+                    let mut l = self.snapshot_idx.lock().unwrap();
+                    *l += 1;
+                    *l
+                };
+        
+                let snapshot_id = format!(
+                    "{}-{}-{}",
+                    last_applied_log.leader_id, last_applied_log.index, snapshot_idx
+                );
+                
+                let meta = SnapshotMeta {
+                    last_log_id: last_applied_log,
+                    snapshot_id: snapshot_id,
+                };
+
+                tracing::debug!("get_current_snapshot: meta {:?}",meta);
+
+                Ok(Some(Snapshot {
+                    meta: meta,
+                    snapshot: Box::new(Cursor::new(data)),
+                }))
+            }
         }
     }
 }

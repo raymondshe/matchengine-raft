@@ -243,7 +243,7 @@ impl OrderBook {
 
     #[tracing::instrument(level = "trace", skip(self))]
     pub fn place_order(&mut self, order: &mut Order) -> Vec<MatchResult> {
-        tracing::debug!("place_order: [{:?}, +oo)", order);
+        //tracing::debug!("place_order: [{:?}, +oo)", order);
         order.sequance = self.sequance;
         self.sequance += 1;
 
