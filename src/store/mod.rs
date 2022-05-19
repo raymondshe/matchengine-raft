@@ -227,11 +227,18 @@ impl Restore for Arc<ExampleStore> {
                 let mut ld = self.last_purged_log_id.write().await;
                 *ld = Some(x);
                 //Log got purged so, we can't recover from full log
-                if x.index > 0 {return;}
+                //if x.index > 0 {return;}
             },
-            None => {return;}
+            None => {}
         }
 
+        let snapshot = self.get_current_snapshot().await.unwrap();
+
+        match snapshot {
+            Some (ss) => {self.install_snapshot(&ss.meta, ss.snapshot).await.unwrap();},
+            None => {}
+        }
+/*
         // Recover from full log status
         let entities: Vec<Entry<ExampleTypeConfig>>  = log.range(transform_range_bound(..))
             .map(|res| res.unwrap()).map(|(_, val)|
@@ -242,7 +249,7 @@ impl Restore for Arc<ExampleStore> {
         {
             let mut sm = self.state_machine.write().await;
             sm.last_applied_log = None;
-        }
+        }*/
     }
 }
 
