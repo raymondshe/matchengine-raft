@@ -43,6 +43,7 @@ pub async fn start_example_raft_node(node_id: ExampleNodeId, http_addr: String) 
     config.snapshot_policy = SnapshotPolicy::LogsSinceLast(500);
     config.max_applied_log_to_keep = 20000;
     config.install_snapshot_timeout = 400;
+    
     let config = Arc::new(config);
 
     // Create a instance of where the Raft data will be stored.
