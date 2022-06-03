@@ -216,7 +216,7 @@ impl Restore for Arc<ExampleStore> {
         tracing::debug!("restore");
         let log = &self.log;
 
-        let first = log.iter()
+        let first = log.iter().rev()
         .next()
         .map(|res| res.unwrap()).map(|(_, val)|
             serde_json::from_slice::<Entry<ExampleTypeConfig>>(&*val).unwrap().log_id);
@@ -226,8 +226,6 @@ impl Restore for Arc<ExampleStore> {
                 tracing::debug!("restore: first log id = {:?}", x);
                 let mut ld = self.last_purged_log_id.write().await;
                 *ld = Some(x);
-                //Log got purged so, we can't recover from full log
-                //if x.index > 0 {return;}
             },
             None => {}
         }
@@ -238,18 +236,6 @@ impl Restore for Arc<ExampleStore> {
             Some (ss) => {self.install_snapshot(&ss.meta, ss.snapshot).await.unwrap();},
             None => {}
         }
-/*
-        // Recover from full log status
-        let entities: Vec<Entry<ExampleTypeConfig>>  = log.range(transform_range_bound(..))
-            .map(|res| res.unwrap()).map(|(_, val)|
-                serde_json::from_slice::<Entry<ExampleTypeConfig>>(&*val).unwrap().clone())
-            .collect();
-
-        self.apply_to_state_machine(&entities.iter().collect::<Vec<_>>()).await.unwrap();
-        {
-            let mut sm = self.state_machine.write().await;
-            sm.last_applied_log = None;
-        }*/
     }
 }
 
