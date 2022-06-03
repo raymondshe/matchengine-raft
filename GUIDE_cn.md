@@ -71,19 +71,14 @@ Raft有两个重要的组成部分：
 ```rust
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum ExampleRequest {
-
     Set { key: String, value: String },
-
     Place { order: Order },
-
     Cancel { order: Order}
-
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]pub struct ExampleResponse {
-
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ExampleResponse {
     pub value: Option<String>,
-
 }
 ```
 
@@ -104,19 +99,14 @@ RaftStorage 定义了下面一些API
 
 * 读写Raft状态，比方说 term，vote (term：任期，vote：投票结果）
 
-
 ```rust
 fn save_vote(vote:&Vote) 
 fn read_vote() -> Result<Option<Vote>>
 ```
 
- 
-
-
 * 读写日志
 
 ```rust 
-
 fn get_log_state() -> Result<LogState> fn try_get_log_entries(range) -> Result<Vec<Entry>> 
 fn append_to_log(entries) 
 fn delete_conflict_logs_since(since:LogId) 
