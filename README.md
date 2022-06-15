@@ -1,4 +1,11 @@
+# Match Engine Raft
+This is a folk from [example-raft-kv](https://github.com/datafuselabs/openraft/tree/main/example-raft-kv) project from [openraft](https://github.com/datafuselabs/openraft). It's a demostration of openraft storage for snapshot/log on disk.
+
+For chinese guide please click [here](./GUIDE_cn.md). It's more uptodated. 
+
 # Example distributed key-value store built upon openraft.
+
+
 
 It is an example of how to build a real-world key-value store with `openraft`.
 Includes:
