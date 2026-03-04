@@ -37,77 +37,111 @@ pub mod store;
 
 use crate::store::config::Config;
 
-#[derive(Debug)]
+/// A snapshot of the Raft state machine.
+///
+/// Contains both the metadata about when the snapshot was taken and
+/// the serialized state machine data itself.
+#[derive(Debug, Clone)]
 pub struct ExampleSnapshot {
+    /// Metadata about this snapshot, including the last log ID applied.
     pub meta: SnapshotMeta<ExampleNodeId>,
 
-    /// The data of the state machine at the time of this snapshot.
+    /// The serialized data of the state machine at the time of this snapshot.
     pub data: Vec<u8>,
 }
 
-/**
- * Here you will set the types of request that will interact with the raft nodes.
- * For example the `Set` will be used to write data (key and value) to the raft database.
- * The `AddNode` will append a new node to the current existing shared list of nodes.
- * You will want to add any request that can write data in all nodes here.
- */
+/// Application requests that can be applied to the Raft state machine.
+///
+/// These requests are submitted through the `/write` API endpoint and
+/// go through the Raft consensus protocol before being applied to the
+/// state machine on all nodes.
+///
+/// # Variants
+///
+/// * `Set` - Stores a key-value pair in the KV store
+/// * `Place` - Adds an order to the order book
+/// * `Cancel` - Removes an order from the order book
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum ExampleRequest {
+    /// Store a key-value pair in the distributed KV store.
     Set { key: String, value: String },
+    /// Place a new order in the matching engine.
     Place { order: Order },
+    /// Cancel an existing order from the matching engine.
     Cancel { order: Order}
 }
 
-/**
- * Here you will defined what type of answer you expect from reading the data of a node.
- * In this example it will return a optional value from a given key in
- * the `ExampleRequest.Set`.
- *
- * TODO: SHould we explain how to create multiple `AppDataResponse`?
- *
- */
+/// Response returned from applying a request to the state machine.
+///
+/// This is the result of a successful write operation, containing
+/// any output from applying the request.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ExampleResponse {
+    /// The value returned from the state machine application, if any.
     pub value: Option<String>,
 }
 
+/// Serialized form of the state machine for snapshot storage.
+///
+/// This structure captures the entire state of the application in a
+/// format that can be easily serialized to JSON and written to disk.
+/// It is used for creating and restoring from snapshots.
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]
 pub struct StateMachineContent {
+    /// The last log ID that was applied to the state machine.
     pub last_applied_log: Option<LogId<ExampleNodeId>>,
 
+    /// The last known cluster membership configuration.
     // TODO: it should not be Option.
     pub last_membership: EffectiveMembership<ExampleNodeId>,
 
-    /// Application data.
+    /// Application KV store data.
     pub data: BTreeMap<String, String>,
 
+    /// All active orders in the order book (both bids and asks).
     // ** Orderbook
     pub orders: Vec<Order>,
 
+    /// The current sequence number for order placement.
     pub sequance: u64
 }
 
-/**
- * Here defines a state machine of the raft, this state represents a copy of the data
- * between each node. Note that we are using `serde` to serialize the `data`, which has
- * a implementation to be serialized. Note that for this test we set both the key and
- * value as String, but you could set any type of value that has the serialization impl.
- */
+/// The in-memory state machine of the Raft system.
+///
+/// This struct holds the complete state of the application, including:
+/// - The Raft protocol state (last applied log, membership)
+/// - The application KV store
+/// - The order book matching engine
+///
+/// This state is replicated across all nodes in the cluster and
+/// can be snapshotted to disk for efficient recovery.
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]
 pub struct ExampleStateMachine {
+    /// The ID of the last log entry applied to this state machine.
     pub last_applied_log: Option<LogId<ExampleNodeId>>,
 
+    /// The last known cluster membership configuration.
     // TODO: it should not be Option.
     pub last_membership: EffectiveMembership<ExampleNodeId>,
 
-    /// Application data.
+    /// Application KV store data - arbitrary string key-value pairs.
     pub data: BTreeMap<String, String>,
 
+    /// The order book for the matching engine.
     // ** Orderbook
     pub orderbook: OrderBook,
 }
 
 impl ExampleStateMachine {
+    /// Converts the state machine to a serializable content format.
+    ///
+    /// This method extracts the data from the state machine and
+    /// arranges it into a format suitable for JSON serialization.
+    /// The order book is flattened into a single vector of orders.
+    ///
+    /// # Returns
+    ///
+    /// A `StateMachineContent` containing all the state machine data.
     pub fn to_content(&self) -> StateMachineContent {
         let mut content = StateMachineContent {
             last_applied_log: self.last_applied_log,
@@ -125,6 +159,15 @@ impl ExampleStateMachine {
         return content;
     }
 
+    /// Rebuilds the state machine from serialized content.
+    ///
+    /// This method restores the state machine from data that was
+    /// previously serialized. It reconstructs the order book by
+    /// re-inserting all the orders.
+    ///
+    /// # Arguments
+    ///
+    /// * `content` - The serialized state machine content to restore from
     pub fn from_content(&mut self, content: &StateMachineContent) {
             // ** Build from content **
                 self.last_applied_log = content.last_applied_log;
@@ -133,7 +176,7 @@ impl ExampleStateMachine {
                 self.orderbook.asks.clear();
                 self.orderbook.bids.clear();
                 self.orderbook.sequance = content.sequance;
-            
+
             for order in content.orders.clone()  {
                 self.orderbook.insert_order(&order);
             }
@@ -141,40 +184,92 @@ impl ExampleStateMachine {
 }
 
 
+/// The persistent storage implementation for Raft.
+///
+/// This struct implements the `RaftStorage` trait and provides durable
+/// storage for all Raft state:
+/// - Log entries (stored in Sled)
+/// - Vote information (stored in Sled)
+/// - State machine (in-memory with file-based snapshots)
+///
+/// The storage uses Sled for fast, durable key-value storage of logs
+/// and votes, and the filesystem for storing complete state machine snapshots.
 #[derive(Debug)]
 pub struct ExampleStore {
+    /// The ID of the last log entry that was purged from storage.
     last_purged_log_id: RwLock<Option<LogId<ExampleNodeId>>>,
 
-    /// The Raft log.
+    /// The Raft log entries stored in Sled.
+    ///
+    /// Logs are keyed by log index (as big-endian bytes) for efficient
+    /// range scans. Values are serialized Entry objects.
     pub log: sled::Tree,//RwLock<BTreeMap<u64, Entry<StorageRaftTypeConfig>>>,
 
-    /// The Raft state machine.
+    /// The in-memory Raft state machine.
+    ///
+    /// This is kept in memory for fast access, but is periodically
+    /// snapshotted to disk for durability.
     pub state_machine: RwLock<ExampleStateMachine>,
 
-    /// The current granted vote.
+    /// The current granted vote, stored in Sled.
+    ///
+    /// This persists vote information across restarts to ensure
+    /// election safety (a node won't vote twice in the same term).
     vote: sled::Tree,
 
+    /// Counter for generating unique snapshot IDs.
     snapshot_idx: Arc<Mutex<u64>>,
 
+    /// The most recently built or installed snapshot, if any.
     current_snapshot: RwLock<Option<ExampleSnapshot>>,
 
+    /// Configuration for paths and snapshot behavior.
     config : Config,
 
+    /// The ID of the node this storage belongs to.
     pub node_id: ExampleNodeId,
 }
 
-
+/// Opens or creates a Sled database for the given node.
+///
+/// This helper function ensures the journal directory exists and
+/// opens (or creates) the Sled database at the configured path.
+///
+/// # Arguments
+///
+/// * `config` - Storage configuration with paths
+/// * `node_id` - ID of the node this database is for
+///
+/// # Returns
+///
+/// An open Sled database handle
 fn get_sled_db(config: Config, node_id: ExampleNodeId) -> Db {
     let db_path = format!(
         "{}/{}-{}.binlog",
         config.journal_path, config.instance_prefix, node_id
     );
-    let db = sled::open(db_path.clone()).unwrap();
+    // Ensure journal directory exists
+    let _ = std::fs::create_dir_all(&config.journal_path);
+    let db = sled::open(db_path.clone()).expect("failed to open sled database");
     tracing::debug!("get_sled_db: created log at: {:?}", db_path);
     db
 }
 
 impl ExampleStore {
+    /// Opens or creates storage for a given node.
+    ///
+    /// This method:
+    /// 1. Creates or opens the Sled database
+    /// 2. Opens or creates the log and vote trees
+    /// 3. Initializes the in-memory state machine
+    ///
+    /// # Arguments
+    ///
+    /// * `node_id` - The ID of the node this storage is for
+    ///
+    /// # Returns
+    ///
+    /// A new ExampleStore instance ready for use
     pub fn open_create(
         node_id: ExampleNodeId
     ) -> ExampleStore {
@@ -203,23 +298,41 @@ impl ExampleStore {
     }
 }
 
+/// Trait for restoring state from persistent storage.
+///
+/// This trait provides a method to load existing state from disk
+/// when a node starts up.
 //Store trait for restore things from snapshot and log
 #[async_trait]
 pub trait Restore {
+    /// Restores the storage state from disk.
+    ///
+    /// This method should be called once at node startup to:
+    /// 1. Load the latest snapshot (if any)
+    /// 2. Replay any log entries after the snapshot
+    /// 3. Bring the state machine up to date
     async fn restore(&mut self);
 }
 
 #[async_trait]
 impl Restore for Arc<ExampleStore> {
+    /// Restores the storage state when a node starts up.
+    ///
+    /// Currently this:
+    /// 1. Finds the last log entry to determine the purged log state
+    /// 2. Loads and installs the latest snapshot (if any)
     #[tracing::instrument(level = "trace", skip(self))]
     async fn restore(&mut self) {
         tracing::debug!("restore");
         let log = &self.log;
 
         let first = log.iter().rev()
-        .next()
-        .map(|res| res.unwrap()).map(|(_, val)|
-            serde_json::from_slice::<Entry<ExampleTypeConfig>>(&*val).unwrap().log_id);
+            .next()
+            .and_then(|res| res.ok())
+            .and_then(|(_, val)| {
+                serde_json::from_slice::<Entry<ExampleTypeConfig>>(&*val).ok()
+            })
+            .map(|entry| entry.log_id);
 
         match first {
             Some(x) => {
@@ -230,11 +343,11 @@ impl Restore for Arc<ExampleStore> {
             None => {}
         }
 
-        let snapshot = self.get_current_snapshot().await.unwrap();
-
-        match snapshot {
-            Some (ss) => {self.install_snapshot(&ss.meta, ss.snapshot).await.unwrap();},
-            None => {}
+        match self.get_current_snapshot().await {
+            Ok(Some(ss)) => {
+                let _ = self.install_snapshot(&ss.meta, ss.snapshot).await;
+            },
+            _ => {}
         }
     }
 }
@@ -245,10 +358,13 @@ impl RaftLogReader<ExampleTypeConfig> for Arc<ExampleStore> {
     async fn get_log_state(&mut self) -> Result<LogState<ExampleTypeConfig>, StorageError<ExampleNodeId>> {
         let log = &self.log;
         let last = log.iter()
-                      .rev()
-                      .next()
-                      .map(|res| res.unwrap()).map(|(_, val)|
-            serde_json::from_slice::<Entry<ExampleTypeConfig>>(&*val).unwrap().log_id);
+            .rev()
+            .next()
+            .and_then(|res| res.ok())
+            .and_then(|(_, val)| {
+                serde_json::from_slice::<Entry<ExampleTypeConfig>>(&*val).ok()
+            })
+            .map(|entry| entry.log_id);
 
         let last_purged = *self.last_purged_log_id.read().await;
 
@@ -263,17 +379,17 @@ impl RaftLogReader<ExampleTypeConfig> for Arc<ExampleStore> {
         })
     }
 
-
     async fn try_get_log_entries<RB: RangeBounds<u64> + Clone + Debug + Send + Sync>(
         &mut self,
         range: RB,
     ) -> Result<Vec<Entry<ExampleTypeConfig>>, StorageError<ExampleNodeId>> {
         let log = &self.log;
         let response = log.range(transform_range_bound(range))
-                          .map(|res| res.unwrap())
-                          .map(|(_, val)|
-                              serde_json::from_slice::<Entry<ExampleTypeConfig>>(&*val).unwrap())
-                          .collect();
+            .filter_map(|res| res.ok())
+            .filter_map(|(_, val)| {
+                serde_json::from_slice::<Entry<ExampleTypeConfig>>(&*val).ok()
+            })
+            .collect();
 
         Ok(response)
     }
@@ -315,7 +431,14 @@ impl RaftSnapshotBuilder<ExampleTypeConfig, Cursor<Vec<u8>>> for Arc<ExampleStor
 
         let last_applied_log = match last_applied_log {
             None => {
-                panic!("can not compact empty state machine");
+                return Err(StorageIOError::new(
+                    ErrorSubject::StateMachine,
+                    ErrorVerb::Read,
+                    AnyError::new(&std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "can not compact empty state machine"
+                    )),
+                ).into());
             }
             Some(x) => x,
         };
@@ -336,17 +459,22 @@ impl RaftSnapshotBuilder<ExampleTypeConfig, Cursor<Vec<u8>>> for Arc<ExampleStor
             snapshot_id,
         };
 
-        let snapshot = ExampleSnapshot {
-            meta: meta.clone(),
-            data: data.clone(),
-        };
-
+        // Store snapshot first (no clone)
         {
             let mut current_snapshot = self.current_snapshot.write().await;
-            *current_snapshot = Some(snapshot);
+            *current_snapshot = Some(ExampleSnapshot {
+                meta: meta.clone(),
+                data: data.clone(),
+            });
         }
 
-        self.write_snapshot().await.unwrap();
+        self.write_snapshot().await.map_err(|e| {
+            StorageIOError::new(
+                ErrorSubject::Snapshot(meta.clone()),
+                ErrorVerb::Write,
+                AnyError::new(&e),
+            )
+        })?;
 
         Ok(Snapshot {
             meta,
@@ -363,15 +491,43 @@ impl RaftStorage<ExampleTypeConfig> for Arc<ExampleStore> {
 
     #[tracing::instrument(level = "trace", skip(self))]
     async fn save_vote(&mut self, vote: &Vote<ExampleNodeId>) -> Result<(), StorageError<ExampleNodeId>> {
-        self.vote.insert(b"vote", IVec::from(serde_json::to_vec(vote).unwrap())).unwrap();
+        let vote_bytes = serde_json::to_vec(vote).map_err(|e| {
+            StorageIOError::new(
+                ErrorSubject::Vote,
+                ErrorVerb::Write,
+                AnyError::new(&e),
+            )
+        })?;
+        self.vote.insert(b"vote", IVec::from(vote_bytes)).map_err(|e| {
+            StorageIOError::new(
+                ErrorSubject::Vote,
+                ErrorVerb::Write,
+                AnyError::new(&e),
+            )
+        })?;
         Ok(())
     }
 
     async fn read_vote(&mut self) -> Result<Option<Vote<ExampleNodeId>>, StorageError<ExampleNodeId>> {
-        let value = self.vote.get(b"vote").unwrap();
+        let value = self.vote.get(b"vote").map_err(|e| {
+            StorageIOError::new(
+                ErrorSubject::Vote,
+                ErrorVerb::Read,
+                AnyError::new(&e),
+            )
+        })?;
         match value {
-            None => {Ok(None)},
-            Some(val) =>  {Ok(Some(serde_json::from_slice::<Vote<ExampleNodeId>>(&*val).unwrap()))}
+            None => Ok(None),
+            Some(val) => {
+                let vote = serde_json::from_slice::<Vote<ExampleNodeId>>(&*val).map_err(|e| {
+                    StorageIOError::new(
+                        ErrorSubject::Vote,
+                        ErrorVerb::Read,
+                        AnyError::new(&e),
+                    )
+                })?;
+                Ok(Some(vote))
+            }
         }
     }
 
@@ -386,7 +542,20 @@ impl RaftStorage<ExampleTypeConfig> for Arc<ExampleStore> {
     ) -> Result<(), StorageError<ExampleNodeId>> {
         let log = &self.log;
         for entry in entries {
-            log.insert(entry.log_id.index.to_be_bytes(), IVec::from(serde_json::to_vec(&*entry).unwrap())).unwrap();
+            let entry_bytes = serde_json::to_vec(&*entry).map_err(|e| {
+                StorageIOError::new(
+                    ErrorSubject::Log(entry.log_id),
+                    ErrorVerb::Write,
+                    AnyError::new(&e),
+                )
+            })?;
+            log.insert(entry.log_id.index.to_be_bytes(), IVec::from(entry_bytes)).map_err(|e| {
+                StorageIOError::new(
+                    ErrorSubject::Log(entry.log_id),
+                    ErrorVerb::Write,
+                    AnyError::new(&e),
+                )
+            })?;
         }
         Ok(())
     }
@@ -399,11 +568,19 @@ impl RaftStorage<ExampleTypeConfig> for Arc<ExampleStore> {
         tracing::debug!("delete_log: [{:?}, +oo)", log_id);
 
         let log = &self.log;
-        let keys = log.range(transform_range_bound(log_id.index..))
-                      .map(|res| res.unwrap())
-                      .map(|(k, _v)| k); //TODO Why originally used collect instead of the iter.
+        let keys: Vec<_> = log.range(transform_range_bound(log_id.index..))
+            .filter_map(|res| res.ok())
+            .map(|(k, _v)| k)
+            .collect();
+
         for key in keys {
-            log.remove(&key).unwrap();
+            log.remove(&key).map_err(|e| {
+                StorageIOError::new(
+                    ErrorSubject::Log(log_id),
+                    ErrorVerb::Delete,
+                    AnyError::new(&e),
+                )
+            })?;
         }
 
         Ok(())
@@ -415,18 +592,27 @@ impl RaftStorage<ExampleTypeConfig> for Arc<ExampleStore> {
 
         {
             let mut ld = self.last_purged_log_id.write().await;
-            assert!(*ld <= Some(log_id));
+            if let Some(last) = *ld {
+                debug_assert!(last <= log_id, "cannot purge logs before last purged");
+            }
             *ld = Some(log_id);
         }
 
         {
             let log = &self.log;
+            let keys: Vec<_> = log.range(transform_range_bound(..=log_id.index))
+                .filter_map(|res| res.ok())
+                .map(|(k, _)| k)
+                .collect();
 
-            let keys = log.range(transform_range_bound(..=log_id.index))
-                          .map(|res| res.unwrap())
-                          .map(|(k, _)| k);
             for key in keys {
-                log.remove(&key).unwrap();
+                log.remove(&key).map_err(|e| {
+                    StorageIOError::new(
+                        ErrorSubject::Log(log_id),
+                        ErrorVerb::Delete,
+                        AnyError::new(&e),
+                    )
+                })?;
             }
         }
 
@@ -465,14 +651,14 @@ impl RaftStorage<ExampleTypeConfig> for Arc<ExampleStore> {
                     }
                     ExampleRequest::Place { order } => {
                         let mut o = order.clone();
-                        let mr = sm.orderbook.place_order(&mut o);
+                        let _mr = sm.orderbook.place_order(&mut o);
                         res.push(ExampleResponse {
                             value: Some(o.sequance.to_string()),
                         })
                     }
 
                     ExampleRequest::Cancel { order } => {
-                        sm.orderbook.cancle(order);
+                        sm.orderbook.cancel(order);
                         res.push(ExampleResponse {
                             value: Some("OK".to_string()),
                         })
@@ -550,40 +736,49 @@ impl RaftStorage<ExampleTypeConfig> for Arc<ExampleStore> {
                 }))
             }
             None => {
-                let data = self.read_snapshot_file().await;
-                //tracing::debug!("get_current_snapshot: data = {:?}",data);
-
-                let data = match data {
+                let data = match self.read_snapshot_file().await {
                     Ok(c) => c,
                     Err(_e) => return Ok(None)
                 };
-                
-                let content : ExampleStateMachine = 
-                serde_json::from_slice(&data).unwrap();
 
-                let last_applied_log = content.last_applied_log.unwrap();
-                tracing::debug!("get_current_snapshot: last_applied_log = {:?}",last_applied_log);
+                let content: ExampleStateMachine = match serde_json::from_slice(&data) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::error!("get_current_snapshot: failed to deserialize snapshot: {}", e);
+                        return Ok(None);
+                    }
+                };
+
+                let last_applied_log = match content.last_applied_log {
+                    Some(log) => log,
+                    None => {
+                        tracing::error!("get_current_snapshot: snapshot missing last_applied_log");
+                        return Ok(None);
+                    }
+                };
+
+                tracing::debug!("get_current_snapshot: last_applied_log = {:?}", last_applied_log);
 
                 let snapshot_idx = {
                     let mut l = self.snapshot_idx.lock().unwrap();
                     *l += 1;
                     *l
                 };
-        
+
                 let snapshot_id = format!(
                     "{}-{}-{}",
                     last_applied_log.leader_id, last_applied_log.index, snapshot_idx
                 );
-                
+
                 let meta = SnapshotMeta {
                     last_log_id: last_applied_log,
-                    snapshot_id: snapshot_id,
+                    snapshot_id,
                 };
 
-                tracing::debug!("get_current_snapshot: meta {:?}",meta);
+                tracing::debug!("get_current_snapshot: meta {:?}", meta);
 
                 Ok(Some(Snapshot {
-                    meta: meta,
+                    meta,
                     snapshot: Box::new(Cursor::new(data)),
                 }))
             }

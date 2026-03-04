@@ -199,7 +199,7 @@ src/
 │   └── mod.rs
 └── store/
     ├── mod.rs               # State machine definition
-    ├── store.rs             # RaftStorage implementation
+    ├── store.rs             # Snapshot file I/O operations
     └── config.rs            # Storage configuration
 ```
 
@@ -248,9 +248,9 @@ Adding a node to a cluster involves 3 steps:
 
 ### Raft Internal APIs
 
-- `POST /raft/append` - Append entries RPC
-- `POST /raft/snapshot` - Install snapshot RPC
-- `POST /raft/vote` - Request vote RPC
+- `POST /raft-append` - Append entries RPC
+- `POST /raft-snapshot` - Install snapshot RPC
+- `POST /raft-vote` - Request vote RPC
 
 ### Admin APIs
 

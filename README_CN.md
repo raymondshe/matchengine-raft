@@ -199,7 +199,7 @@ src/
 │   └── mod.rs
 └── store/
     ├── mod.rs               # 状态机定义
-    ├── store.rs             # RaftStorage 实现
+    ├── store.rs             # 快照文件 I/O 操作
     └── config.rs            # 存储配置
 ```
 
@@ -248,9 +248,9 @@ config.install_snapshot_timeout = 400;
 
 ### Raft 内部 API
 
-- `POST /raft/append` - 追加条目 RPC
-- `POST /raft/snapshot` - 安装快照 RPC
-- `POST /raft/vote` - 请求投票 RPC
+- `POST /raft-append` - 追加条目 RPC
+- `POST /raft-snapshot` - 安装快照 RPC
+- `POST /raft-vote` - 请求投票 RPC
 
 ### 管理 API
 
