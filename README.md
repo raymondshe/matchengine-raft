@@ -1,135 +1,285 @@
 # Match Engine Raft
-This is a folk from [example-raft-kv](https://github.com/datafuselabs/openraft/tree/main/example-raft-kv) project from [openraft](https://github.com/datafuselabs/openraft). It's a demostration of openraft storage for snapshot/log on disk.
 
-For chinese guide please click [here](./GUIDE_cn.md). It's more uptodated. 
+A practical implementation of a distributed key-value store and matching engine built upon [OpenRaft](https://github.com/datafuselabs/openraft). This project demonstrates how to implement persistent storage for Raft logs and snapshots on disk using [Sled](https://github.com/spacejam/sled) as the underlying storage engine.
 
-# Example distributed key-value store built upon openraft.
+> **Note**: For a more detailed guide in Chinese, please refer to [GUIDE_cn.md](./GUIDE_cn.md).
 
+## Table of Contents
 
+- [Features](#features)
+- [Architecture Overview](#architecture-overview)
+- [Getting Started](#getting-started)
+- [Running the Cluster](#running-the-cluster)
+- [Project Structure](#project-structure)
+- [Storage Implementation](#storage-implementation)
+- [Cluster Management](#cluster-management)
+- [API Reference](#api-reference)
 
-It is an example of how to build a real-world key-value store with `openraft`.
-Includes:
-- An in-memory `RaftStorage` implementation [store](./src/store/store.rs).
+## Features
 
-- A server is based on [actix-web](https://docs.rs/actix-web/4.0.0-rc.2).  
-  Includes:
-  - raft-internal network APIs for replication and voting.
-  - Admin APIs to add nodes, change-membership etc.
-  - Application APIs to write a value by key or read a value by key.
+- **Persistent Raft Storage**: Raft logs and state are persisted using Sled, a high-performance embedded key-value store
+- **Snapshot Management**: State machine snapshots are stored as files on disk for efficient recovery
+- **Matching Engine**: Includes a simple order book matching engine as an example application
+- **HTTP Server**: Built with [Actix-web](https://docs.rs/actix-web) providing both internal Raft APIs and external application APIs
+- **Smart Client**: A Rust client that automatically tracks and redirects requests to the current leader
 
-- Client and `RaftNetwork`([rpc](./src/network/raft_network_impl)) are built upon [reqwest](https://docs.rs/reqwest).
+## Architecture Overview
 
-  [ExampleClient](./src/client.rs) is a minimal raft client in rust to talk to a raft cluster.
-  - It includes application API `write()` and `read()`, and administrative API `init()`, `add_learner()`, `change_membership()`, `metrics()`.
-  - This client tracks the last known leader id, a write operation(such as `write()` or `change_membership()`) will be redirected to the leader on client side.
+This project extends the [example-raft-kv](https://github.com/datafuselabs/openraft/tree/main/example-raft-kv) with persistent storage capabilities:
 
-## Run it
+```
+                    ┌─────────────────────────────────────────┐
+                    │           Application Layer              │
+                    │  (KV Store + Order Book Matching Engine)│
+                    └─────────────────────┬───────────────────┘
+                                          │
+                    ┌─────────────────────▼───────────────────┐
+                    │           OpenRaft Core                  │
+                    │  (Consensus, Replication, Leadership)   │
+                    └─────────────────────┬───────────────────┘
+                                          │
+              ┌───────────────────────────┼───────────────────────────┐
+              │                           │                           │
+    ┌─────────▼─────────┐     ┌─────────▼─────────┐     ┌─────────▼─────────┐
+    │   RaftStorage     │     │   RaftNetwork     │     │   HTTP Server      │
+    │  (Sled + Files)   │     │  (Reqwest Client) │     │  (Actix-web)       │
+    └───────────────────┘     └───────────────────┘     └───────────────────┘
+```
 
-There is a example in bash script and an example in rust:
+### Key Components
 
-- [test-cluster.sh](./test-cluster.sh) shows a simulation of 3 nodes running and sharing data,
-  It only uses `curl` and shows the communication between a client and the cluster in plain HTTP messages.
-  You can run the cluster demo with:
+1. **RaftStorage Implementation** ([`store/`](./src/store/))
+   - Raft logs and votes stored in Sled
+   - State machine in memory with file-based snapshots
+   - Automatic snapshot creation every 500 log entries
 
-  ```shell
-  ./test-cluster.sh
-  ```
+2. **Network Layer** ([`network/`](./src/network/))
+   - Internal Raft RPC for replication and voting
+   - Connection pooling for efficient node-to-node communication
+   - Management APIs for cluster administration
 
-- [test_cluster.rs](./tests/cluster/test_cluster.rs) does almost the same as `test-cluster.sh` but in rust
-  with the `ExampleClient`.
+3. **Matching Engine** ([`matchengine/`](./src/matchengine/))
+   - Order book with bids and asks
+   - Example of a real-world state machine application
 
-  Run it with `cargo test`.
+## Getting Started
 
+### Prerequisites
 
-if you want to compile the application, run:
+- Rust 1.60 or later
+- Cargo
+
+### Building
 
 ```shell
 cargo build
 ```
 
-(If you append `--release` to make it compile in production, but we don't recommend to use
-this project in production yet.)
+> **Note**: Append `--release` for production builds, but this project is primarily intended as an example and not recommended for production use without further hardening.
 
-## What the test script does
+## Running the Cluster
 
-To run it, get the binary `raft-key-value` inside `target/debug` and run:
+### Quick Start with Test Script
 
-```shell
-./raft-key-value --id 1 --http-addr 127.0.0.1:21001
-```
-
-It will start a node.
-
-To start the following nodes:
+The easiest way to see the cluster in action is to run the provided test script:
 
 ```shell
-./raft-key-value --id 2 --http-addr 127.0.0.1:21002
+./test-cluster.sh
 ```
 
-You can continue replicating the nodes by changing the `id` and `http-addr`.
+This script demonstrates a 3-node cluster using only `curl` commands, showing the HTTP communication between client and cluster.
 
-After that, call the first node created:
+### Using the Rust Test
 
-```
-POST - 127.0.0.1:21001/init
-```
-
-It will define the first node created as the leader.
-
-Then you need to inform to the leader that these nodes are learners:
-
-```
-POST - 127.0.0.1:21001/add-learner '[2, "127.0.0.1:21002"]'
-POST - 127.0.0.1:21001/add-learner '[3, "127.0.0.1:21003"]'
+```shell
+cargo test
 ```
 
-Now you need to tell the leader to add all learners as members of the cluster:
+This runs the same scenario as `test-cluster.sh` but using the Rust `ExampleClient`.
 
-```
-POST - 127.0.0.1:21001/change-membership  "[1, 2, 3]"
-```
+### Manual Cluster Setup
 
-Write some data in any of the nodes:
+#### 1. Start Nodes
 
-```
-POST - 127.0.0.1:21001/write  "{"Set":{"key":"foo","value":"bar"}}"
-```
+Start the first node:
 
-Read the data from any node:
-
-```
-POST - 127.0.0.1:21002/read  "foo"
+```shell
+./target/debug/raft-key-value --id 1 --http-addr 127.0.0.1:21001
 ```
 
-You should be able to read that on the another instance even if you did not sync any data!
+Start additional nodes (in separate terminals):
 
+```shell
+./target/debug/raft-key-value --id 2 --http-addr 127.0.0.1:21002
+./target/debug/raft-key-value --id 3 --http-addr 127.0.0.1:21003
+```
 
-## How it's structured.
+#### 2. Initialize the Cluster
 
-The application is separated in 4 modules:
+```shell
+curl -X POST http://127.0.0.1:21001/init
+```
 
- - `bin`: You can find the `main()` function in [main](./src/bin/main.rs) the file where the setup for the server happens.
- - `network`: You can find the [api](./src/network/api.rs) that implements the endpoints used by the public API and [rpc](./src/network/raft_network_impl) where all the raft communication from the node happens. [management](./src/network/management.rs) is where all the administration endpoints are present, those are used to add orremove nodes, promote and more. [raft](./src/network/raft.rs) is where all the communication are received from other nodes.
- - `store`: You can find the file [store](./src/store/mod.rs) where all the key-value implementation is done. Here is where your data application will be managed.
+This initializes node 1 as the leader.
 
-## Where is my data?
+#### 3. Add Learners
 
-The data is store inside state machines, each state machine represents a point of data and
-raft enforces that all nodes have the same data in synchronization. You can have a look of
-the struct [ExampleStateMachine](./src/store/mod.rs)
+```shell
+curl -X POST -H "Content-Type: application/json" \
+  -d '[2, "127.0.0.1:21002"]' \
+  http://127.0.0.1:21001/add-learner
 
-## Cluster management
+curl -X POST -H "Content-Type: application/json" \
+  -d '[3, "127.0.0.1:21003"]' \
+  http://127.0.0.1:21001/add-learner
+```
 
-The raft itself does not store node addresses.
-But in a real-world application, the implementation of `RaftNetwork` needs to know the addresses.
+#### 4. Change Membership
 
-Thus, in this example application:
+```shell
+curl -X POST -H "Content-Type: application/json" \
+  -d '[1, 2, 3]' \
+  http://127.0.0.1:21001/change-membership
+```
 
-- The storage layer has to store nodes' information.
-- The network layer keeps a reference to the store so that it is able to get the address of a target node to send RPC to.
+#### 5. Write and Read Data
 
-To add a node to a cluster, it includes 3 steps:
+Write data:
 
-- Write a `node` through raft protocol to the storage.
-- Add the node as a `Learner` to let it start receiving replication data from the leader.
-- Invoke `change-membership` to change the learner node to a member.
+```shell
+curl -X POST -H "Content-Type: application/json" \
+  -d '{"Set":{"key":"foo","value":"bar"}}' \
+  http://127.0.0.1:21001/write
+```
+
+Read data from any node:
+
+```shell
+curl -X POST -H "Content-Type: application/json" \
+  -d '"foo"' \
+  http://127.0.0.1:21002/read
+```
+
+You should be able to read the data from any node!
+
+### Using the Helper Script
+
+The project also includes `test.sh` for more convenient cluster management:
+
+```shell
+# Start a node
+./test.sh start-node 1
+
+# Build the cluster
+./test.sh build-cluster
+
+# Check metrics
+./test.sh metrics 1
+
+# Clean up
+./test.sh clean
+```
+
+## Project Structure
+
+```
+src/
+├── bin/
+│   └── main.rs              # Server entry point
+├── client.rs                # Example Raft client
+├── lib.rs                   # Library with server setup
+├── app.rs                   # Application state
+├── matchengine/
+│   └── mod.rs               # Order book matching engine
+├── network/
+│   ├── api.rs               # Application HTTP endpoints
+│   ├── management.rs        # Admin HTTP endpoints
+│   ├── raft.rs              # Raft internal RPC endpoints
+│   ├── raft_network_impl.rs # RaftNetwork implementation
+│   └── mod.rs
+└── store/
+    ├── mod.rs               # State machine definition
+    ├── store.rs             # RaftStorage implementation
+    └── config.rs            # Storage configuration
+```
+
+## Storage Implementation
+
+### RaftStorage Trait
+
+The `RaftStorage` trait implementation is the core of this project. It handles:
+
+1. **Raft State**: Stored in Sled using dedicated keys
+2. **Logs**: Stored in Sled with log index as key
+3. **State Machine**: In-memory with file-based snapshots
+4. **Votes**: Persisted in Sled to ensure election safety
+
+### Snapshot Configuration
+
+```rust
+let mut config = Config::default().validate().unwrap();
+config.snapshot_policy = SnapshotPolicy::LogsSinceLast(500);
+config.max_applied_log_to_keep = 20000;
+config.install_snapshot_timeout = 400;
+```
+
+- A snapshot is created every 500 log entries
+- Up to 20,000 log entries are kept before purging
+- Snapshot files are stored on disk with metadata in the filename
+
+### Data Recovery
+
+On startup, the store:
+1. Loads the latest snapshot from disk
+2. Replays any remaining logs from Sled
+3. Restores the state machine to the latest state
+
+## Cluster Management
+
+Adding a node to a cluster involves 3 steps:
+
+1. **Write the node info** through the Raft protocol to storage
+2. **Add as Learner** to let it start receiving replication data from the leader
+3. **Change membership** to promote the learner to a full voting member
+
+> **Note**: Raft itself does not store node addresses. This implementation stores node information in the storage layer, and the network layer references the store to lookup target node addresses.
+
+## API Reference
+
+### Raft Internal APIs
+
+- `POST /raft/append` - Append entries RPC
+- `POST /raft/snapshot` - Install snapshot RPC
+- `POST /raft/vote` - Request vote RPC
+
+### Admin APIs
+
+- `POST /init` - Initialize a single-node cluster
+- `POST /add-learner` - Add a learner node
+- `POST /change-membership` - Change cluster membership
+- `GET /metrics` - Get Raft metrics
+
+### Application APIs
+
+- `POST /write` - Write data to the state machine
+- `POST /read` - Read data from the state machine (local read)
+- `POST /consistent_read` - Consistent read (goes through leader)
+
+## Future Work
+
+- [ ] Optimize serialization (replace JSON with Protobuf/Avro)
+- [ ] Improve network layer with gRPC
+- [ ] Add matching result distribution via message queues
+- [ ] Implement more matching algorithms
+- [ ] Add comprehensive testing and benchmarking
+- [ ] Enhance client library
+
+## Credits
+
+This project is a fork from [example-raft-kv](https://github.com/datafuselabs/openraft/tree/main/example-raft-kv) in the [OpenRaft](https://github.com/datafuselabs/openraft) project.
+
+Special thanks to the Databend community and Zhang Yanpo for their support.
+
+## License
+
+Please refer to the original OpenRaft project for licensing information.
