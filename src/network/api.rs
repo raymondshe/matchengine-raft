@@ -52,7 +52,7 @@ pub async fn write(app: Data<ExampleApp>, req: Json<ExampleRequest>) -> actix_we
 ///
 /// Special keys:
 /// - `orderbook_orders`: Returns all orders in the order book as JSON
-/// - `orderbook_sequance`: Returns the current sequence number
+/// - `orderbook_sequence`: Returns the current sequence number
 /// - Any other key: Returns the value from the KV store
 ///
 /// # Returns
@@ -64,7 +64,9 @@ pub async fn read(app: Data<ExampleApp>, req: Json<String>) -> actix_web::Result
     let key = req.0;
     let value = match key.as_str() {
         "orderbook_orders" => serde_json::to_string(&state_machine.to_content().orders).unwrap_or_default(),
-        "orderbook_sequance" => state_machine.orderbook.sequance.to_string(),
+        "orderbook_sequence" => state_machine.orderbook.sequence.to_string(),
+        // Backward compatibility
+        "orderbook_sequance" => state_machine.orderbook.sequence.to_string(),
         _ => state_machine.data.get(&key).cloned().unwrap_or_default(),
     };
     let res: Result<String, Infallible> = Ok(value);

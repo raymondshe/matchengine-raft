@@ -103,7 +103,7 @@ pub struct StateMachineContent {
     pub orders: Vec<Order>,
 
     /// The current sequence number for order placement.
-    pub sequance: u64
+    pub sequence: u64
 }
 
 /// The in-memory state machine of the Raft system.
@@ -147,8 +147,8 @@ impl ExampleStateMachine {
             last_applied_log: self.last_applied_log,
             last_membership: self.last_membership.clone(),
             data: self.data.clone(),
-            orders: vec!(),
-            sequance: self.orderbook.sequance
+            orders: Vec::new(),
+            sequence: self.orderbook.sequence
         };
 
         let mut bids: Vec<Order> = self.orderbook.bids.values().cloned().collect();
@@ -156,7 +156,7 @@ impl ExampleStateMachine {
 
         content.orders.append(&mut bids);
         content.orders.append(&mut asks);
-        return content;
+        content
     }
 
     /// Rebuilds the state machine from serialized content.
@@ -175,10 +175,10 @@ impl ExampleStateMachine {
                 self.data = content.data.clone();
                 self.orderbook.asks.clear();
                 self.orderbook.bids.clear();
-                self.orderbook.sequance = content.sequance;
+                self.orderbook.sequence = content.sequence;
 
-            for order in content.orders.clone()  {
-                self.orderbook.insert_order(&order);
+            for order in &content.orders {
+                self.orderbook.insert_order(order);
             }
     }
 }
@@ -653,7 +653,7 @@ impl RaftStorage<ExampleTypeConfig> for Arc<ExampleStore> {
                         let mut o = order.clone();
                         let _mr = sm.orderbook.place_order(&mut o);
                         res.push(ExampleResponse {
-                            value: Some(o.sequance.to_string()),
+                            value: Some(o.sequence.to_string()),
                         })
                     }
 

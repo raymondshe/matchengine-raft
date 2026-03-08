@@ -110,11 +110,7 @@ impl ExampleStore {
         };
         tracing::debug!("read_file: {}", latest_file);
 
-        let file = File::open(&latest_file).await;
-        let mut file = match file {
-            Ok(file) => file,
-            Err(e) => return Err(e),
-        };
+        let mut file = File::open(&latest_file).await?;
         let mut data = Vec::new();
         file.read_to_end(&mut data).await?;
 
@@ -153,12 +149,12 @@ impl ExampleStore {
             .filter(|e| !e.file_type().is_dir())
         {
             let f_name = String::from(entry.file_name().to_string_lossy());
-            let mut s1 = f_name.split('.');
-            let file = match s1.next() {
+            let mut parts = f_name.split('.');
+            let file_stem = match parts.next() {
                 Some(f) => f,
                 None => continue,
             };
-            let ext = match s1.next() {
+            let ext = match parts.next() {
                 Some(e) => e,
                 None => continue,
             };
@@ -167,9 +163,9 @@ impl ExampleStore {
                 continue;
             }
 
-            tracing::debug!("file: {:?}", file);
-            let mut s3 = file.split('+');
-            let prefix = match s3.next() {
+            tracing::debug!("file: {:?}", file_stem);
+            let mut filename_parts = file_stem.split('+');
+            let prefix = match filename_parts.next() {
                 Some(p) => p,
                 None => continue,
             };
@@ -178,7 +174,7 @@ impl ExampleStore {
                 continue;
             }
 
-            let node_id_str = match s3.next() {
+            let node_id_str = match filename_parts.next() {
                 Some(n) => n,
                 None => continue,
             };
@@ -187,16 +183,16 @@ impl ExampleStore {
                 continue;
             }
 
-            let snapshot_id = match s3.next() {
+            let snapshot_id = match filename_parts.next() {
                 Some(s) => s,
                 None => continue,
             };
 
-            let mut s2 = snapshot_id.split('-');
+            let mut snapshot_parts = snapshot_id.split('-');
             // Skip term_id and node_id parts, get to the index
-            let _ = s2.next(); // term_id
-            let _ = s2.next(); // node_id
-            let index_str = match s2.next() {
+            let _ = snapshot_parts.next(); // term_id
+            let _ = snapshot_parts.next(); // node_id
+            let index_str = match snapshot_parts.next() {
                 Some(i) => i,
                 None => continue,
             };

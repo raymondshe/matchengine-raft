@@ -51,7 +51,7 @@ pub struct Order {
     ///
     /// This ensures price-time priority - orders with lower sequence
     /// numbers are matched first at the same price level.
-    pub sequance: u64,
+    pub sequence: u64,
 }
 
 impl Order {
@@ -62,19 +62,19 @@ impl Order {
     /// * `side` - Whether this is a Buy or Sell order
     /// * `price` - The price level for the limit order
     /// * `size` - The quantity to trade
-    /// * `sequance` - Sequence number for price-time priority
+    /// * `sequence` - Sequence number for price-time priority
     ///
     /// # Returns
     ///
     /// A new Order instance with OrderType::Limit.
-    pub fn new(side: OrderSide, price: f64, size: f64, sequance: u64) -> Self {
+    pub fn new(side: OrderSide, price: f64, size: f64, sequence: u64) -> Self {
         Self {
             id: 0,
             side: side,
             live: OrderType::Limit, // TODO: More types
             price: price,
             volume: size,
-            sequance: sequance,
+            sequence: sequence,
         }
     }
 }
@@ -82,7 +82,7 @@ impl Order {
 /// Equality comparison for orders based on sequence, price, and volume.
 impl PartialEq for Order {
     fn eq(&self, other: &Self) -> bool {
-        (self.sequance == other.sequance)
+        (self.sequence == other.sequence)
             && (self.price == other.price)
             && (self.volume == other.volume)
     }
@@ -100,13 +100,13 @@ pub struct BidKey {
     /// The price level of this bid order.
     pub price: f64,
     /// Sequence number for FIFO ordering at the same price level.
-    pub sequance: u64,
+    pub sequence: u64,
 }
 
 /// Equality for BidKey based solely on sequence number.
 impl PartialEq for BidKey {
     fn eq(&self, other: &Self) -> bool {
-        self.sequance == other.sequance
+        self.sequence == other.sequence
     }
 }
 
@@ -126,9 +126,9 @@ impl Ord for BidKey {
         } else if self.price > other.price {
             Ordering::Less
         } else {
-            if self.sequance > other.sequance {
+            if self.sequence > other.sequence {
                 Ordering::Greater
-            } else if self.sequance < other.sequance {
+            } else if self.sequence < other.sequence {
                 Ordering::Less
             } else {
                 Ordering::Equal
@@ -152,15 +152,15 @@ impl PartialOrd for BidKey {
 #[derive(Debug, Clone, Copy,Serialize, Deserialize)]
 pub struct AskKey {
     /// The price level of this ask order.
-    pub price : f64,
+    pub price: f64,
     /// Sequence number for FIFO ordering at the same price level.
-    pub sequance : u64,
+    pub sequence: u64,
 }
 
 /// Equality for AskKey based solely on sequence number.
 impl PartialEq for AskKey {
     fn eq(&self, other: &Self) -> bool {
-        self.sequance == other.sequance
+        self.sequence == other.sequence
     }
 }
 
@@ -180,9 +180,9 @@ impl Ord for AskKey {
         } else if self.price > other.price {
             Ordering::Greater
         } else {
-            if self.sequance > other.sequance {
+            if self.sequence > other.sequence {
                 Ordering::Greater
-            } else if self.sequance < other.sequance {
+            } else if self.sequence < other.sequence {
                 Ordering::Less
             } else {
                 Ordering::Equal
@@ -254,7 +254,7 @@ pub struct OrderBook {
     #[serde(with = "vectorize")]
     pub asks: BTreeMap<AskKey, Order>,
     /// Sequence counter for assigning order sequence numbers.
-    pub sequance: u64,
+    pub sequence: u64,
 }
 
 /// Represents the result of a successful order match.
@@ -304,7 +304,7 @@ impl OrderBook {
         Self {
             bids: BTreeMap::new(),
             asks: BTreeMap::new(),
-            sequance: 0,
+            sequence: 0,
         }
     }
 
@@ -344,10 +344,10 @@ impl OrderBook {
         //tracing::debug!("insert_order: {:?})", order);
         match order.side {
             OrderSide::Buy => {
-                self.bids.insert(BidKey{price: order.price, sequance: order.sequance}, order.clone());
+                self.bids.insert(BidKey{price: order.price, sequence: order.sequence}, order.clone());
             }
             OrderSide::Sell => {
-                self.asks.insert(AskKey{price: order.price, sequance: order.sequance}, order.clone());
+                self.asks.insert(AskKey{price: order.price, sequence: order.sequence}, order.clone());
             }
         }
     }
@@ -371,8 +371,8 @@ impl OrderBook {
     #[tracing::instrument(level = "trace", skip(self))]
     pub fn place_order(&mut self, order: &mut Order) -> Vec<MatchResult> {
         //tracing::debug!("place_order: [{:?}, +oo)", order);
-        order.sequance = self.sequance;
-        self.sequance += 1;
+        order.sequence = self.sequence;
+        self.sequence += 1;
 
         match order.side {
             OrderSide::Buy => {
@@ -396,20 +396,14 @@ impl OrderBook {
     pub fn cancel(&mut self, order: &Order) -> Option<Order>{
         match order.side {
             OrderSide::Buy => {
-                let key = BidKey{price: order.price,sequance: order.sequance};
+                let key = BidKey{price: order.price, sequence: order.sequence};
                 return self.bids.remove(&key);
             }
             OrderSide::Sell => {
-                let key = AskKey{price: order.price,sequance: order.sequance};
+                let key = AskKey{price: order.price, sequence: order.sequence};
                 return self.asks.remove(&key);
             }
         }
-    }
-
-    /// Deprecated: Use `cancel` instead
-    #[deprecated(note = "Use `cancel` instead")]
-    pub fn cancle(&mut self, order: &Order) -> Option<Order> {
-        self.cancel(order)
     }
 
     /// Attempts to match a buy (bid) order against the ask side of the book.
@@ -440,7 +434,7 @@ impl OrderBook {
                         let mut remaining_order = order.clone();
                         remaining_order.volume = remaining_volume;
                         self.bids.insert(
-                            BidKey{price: order.price, sequance: order.sequance},
+                            BidKey{price: order.price, sequence: order.sequence},
                             remaining_order
                         );
                     }
@@ -453,7 +447,7 @@ impl OrderBook {
                             let mut remaining_order = order.clone();
                             remaining_order.volume = remaining_volume;
                             self.bids.insert(
-                                BidKey{ price: order.price, sequance: order.sequance },
+                                BidKey{ price: order.price, sequence: order.sequence },
                                 remaining_order
                             );
                         }
@@ -472,17 +466,17 @@ impl OrderBook {
                             OrderSide::Sell,
                             best_ask.price,
                             best_ask.volume - match_volume,
-                            best_ask.sequance,
+                            best_ask.sequence,
                         );
                         self.asks.insert(
-                            AskKey{ price: new_best_ask.price, sequance: new_best_ask.sequance},
+                            AskKey{ price: new_best_ask.price, sequence: new_best_ask.sequence},
                             new_best_ask
                         );
                         // Fully matched
                         break;
                     } else {
                         // Remove the fully matched ask
-                        let akey = AskKey{price: key.price, sequance: key.sequance};
+                        let akey = AskKey{price: key.price, sequence: key.sequence};
                         self.asks.remove(&akey);
                         remaining_volume -= match_volume;
                         // Continue matching with next ask
@@ -522,7 +516,7 @@ impl OrderBook {
                         let mut remaining_order = order.clone();
                         remaining_order.volume = remaining_volume;
                         self.asks.insert(
-                            AskKey{price: order.price, sequance: order.sequance},
+                            AskKey{price: order.price, sequence: order.sequence},
                             remaining_order
                         );
                     }
@@ -535,7 +529,7 @@ impl OrderBook {
                             let mut remaining_order = order.clone();
                             remaining_order.volume = remaining_volume;
                             self.asks.insert(
-                                AskKey{price: order.price, sequance: order.sequance},
+                                AskKey{price: order.price, sequence: order.sequence},
                                 remaining_order
                             );
                         }
@@ -554,17 +548,17 @@ impl OrderBook {
                             order.side,
                             best_bid.price,
                             best_bid.volume - match_volume,
-                            best_bid.sequance,
+                            best_bid.sequence,
                         );
                         self.bids.insert(
-                            BidKey{price: new_best_bid.price, sequance: new_best_bid.sequance},
+                            BidKey{price: new_best_bid.price, sequence: new_best_bid.sequence},
                             new_best_bid
                         );
                         // Fully matched
                         break;
                     } else {
                         // Remove the fully matched bid
-                        let akey = BidKey{price: key.price, sequance: key.sequance};
+                        let akey = BidKey{price: key.price, sequence: key.sequence};
                         self.bids.remove(&akey);
                         remaining_volume -= match_volume;
                         // Continue matching with next bid
