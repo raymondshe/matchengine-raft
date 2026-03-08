@@ -545,7 +545,7 @@ impl OrderBook {
                     if best_bid.volume > remaining_volume {
                         // Update the best bid with remaining volume
                         let new_best_bid = Order::new(
-                            order.side,
+                            OrderSide::Buy,
                             best_bid.price,
                             best_bid.volume - match_volume,
                             best_bid.sequence,
