@@ -1,221 +1,170 @@
 use std::collections::BTreeSet;
+use std::fmt;
 use std::sync::Arc;
 use std::sync::Mutex;
 
-use openraft::error::AddLearnerError;
-use openraft::error::CheckIsLeaderError;
-use openraft::error::ClientWriteError;
-use openraft::error::ForwardToLeader;
-use openraft::error::Infallible;
-use openraft::error::InitializeError;
-use openraft::error::NetworkError;
-use openraft::error::RPCError;
-use openraft::error::RemoteError;
-use openraft::raft::AddLearnerResponse;
-use openraft::raft::ClientWriteResponse;
+use openraft::BasicNode;
 use openraft::RaftMetrics;
+use openraft::RaftTypeConfig;
+use openraft::TryAsRef;
+use openraft::errors::ClientWriteError;
+use openraft::errors::ForwardToLeader;
+use openraft::errors::Infallible;
+use openraft::errors::InitializeError;
+use openraft::errors::LinearizableReadError;
+use openraft::errors::NetworkError;
+use openraft::errors::RPCError;
+use openraft::errors::Unreachable;
+use openraft::raft::ClientWriteResponse;
 use reqwest::Client;
-use serde::de::DeserializeOwned;
-use serde::Deserialize;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 
-use crate::ExampleNodeId;
-use crate::ExampleRequest;
-use crate::ExampleTypeConfig;
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct FollowerReadError {
+    pub message: String,
+}
 
-/// Empty payload for requests that don't need any data.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Empty {}
+impl fmt::Display for FollowerReadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
 
-/// A smart client for interacting with the Raft cluster.
-///
-/// This client automatically tracks the current leader and redirects
-/// requests as needed. If a request is sent to a non-leader node, the
-/// client will automatically update its leader information and retry.
-pub struct ExampleClient {
-    /// The current leader node to send requests to.
+impl std::error::Error for FollowerReadError {}
+
+pub struct ExampleClient<C>
+where C: RaftTypeConfig
+{
+    /// The leader node to send request to.
     ///
-    /// All write requests must be sent to the leader in a Raft cluster.
-    /// This field is updated automatically when a `ForwardToLeader` error
-    /// is received from a node.
-    pub leader: Arc<Mutex<(ExampleNodeId, String)>>,
+    /// All traffic should be sent to the leader in a cluster.
+    pub leader: Arc<Mutex<(C::NodeId, String)>>,
 
-    /// The underlying HTTP client used for making requests.
     pub inner: Client,
 }
 
-impl ExampleClient {
-    /// Creates a new client with an initial known leader.
-    ///
-    /// The client will start by sending requests to the specified leader,
-    /// but will automatically update to the actual leader if it receives
-    /// a `ForwardToLeader` error response.
-    ///
-    /// # Arguments
-    ///
-    /// * `leader_id` - The ID of the initial known leader node
-    /// * `leader_addr` - The network address (host:port) of the initial leader
-    pub fn new(leader_id: ExampleNodeId, leader_addr: String) -> Self {
+impl<C> ExampleClient<C>
+where C: RaftTypeConfig<Node = BasicNode>
+{
+    /// Create a client with a leader node id and a node manager to get node address by node id.
+    pub fn new(leader_id: C::NodeId, leader_addr: String) -> Self {
         Self {
             leader: Arc::new(Mutex::new((leader_id, leader_addr))),
-            inner: reqwest::Client::new(),
+            inner: Client::builder().no_proxy().build().unwrap(),
         }
     }
 
     // --- Application API
 
-    /// Submits a write request to the Raft cluster.
+    /// Submit a write request to the raft cluster.
     ///
-    /// The request will go through the Raft consensus protocol: it will be
-    /// replicated to a quorum of nodes and then applied to the state machine
-    /// before a response is returned. This ensures strong consistency.
+    /// The request will be processed by raft protocol: it will be replicated to a quorum and then
+    /// will be applied to state machine.
     ///
-    /// # Arguments
-    ///
-    /// * `req` - The request to apply (Set, Place, or Cancel)
-    ///
-    /// # Returns
-    ///
-    /// The result of applying the request, including the log ID and
-    /// membership configuration at the time of application.
-    pub async fn write(
-        &self,
-        req: &ExampleRequest,
-    ) -> Result<ClientWriteResponse<ExampleTypeConfig>, RPCError<ExampleTypeConfig, ClientWriteError<ExampleNodeId>>>
-    {
-        self.send_rpc_to_leader("write", Some(req)).await
+    /// The result of applying the request will be returned.
+    pub async fn write(&self, req: &C::D) -> Result<Result<ClientWriteResponse<C>, ClientWriteError<C>>, RPCError<C>> {
+        self.send_with_forwarding("write", Some(req), 3).await
     }
 
-    /// Reads a value from the state machine with possible stale data.
+    /// Read value by key, in an inconsistent mode.
     ///
-    /// This method reads directly from whichever node is currently believed
-    /// to be the leader, without verifying leadership. It may return stale
-    /// data if a new leader has been elected but the client hasn't learned
-    /// about it yet.
-    ///
-    /// # Arguments
-    ///
-    /// * `req` - The key to read, or special keys like "orderbook_orders"
-    ///
-    /// # Returns
-    ///
-    /// The value as a string, or an empty string if not found.
-    pub async fn read(&self, req: &String) -> Result<String, RPCError<ExampleTypeConfig, Infallible>> {
-        self.do_send_rpc_to_leader("read", Some(req)).await
+    /// This method may return stale value because it does not force to read on a legal leader.
+    pub async fn read(&self, req: &String) -> Result<String, RPCError<C>> {
+        let res = self.send::<_, _, Infallible>("read", Some(req)).await?;
+        Ok(res.unwrap())
     }
 
-    /// Reads a value with linearizable consistency.
+    /// Consistent Read value by key, in an inconsistent mode.
     ///
-    /// This method first verifies that the node is still the leader before
-    /// returning data. This ensures the read is consistent with all previous
-    /// writes, but incurs additional latency from the leader check.
-    ///
-    /// # Arguments
-    ///
-    /// * `req` - The key to read
-    ///
-    /// # Returns
-    ///
-    /// The value as a string, or an error if the node is not the leader.
-    pub async fn consistent_read(
+    /// This method MUST return consistent value or LinearizableReadError.
+    pub async fn linearizable_read(
         &self,
         req: &String,
-    ) -> Result<String, RPCError<ExampleTypeConfig, CheckIsLeaderError<ExampleNodeId>>> {
-        self.do_send_rpc_to_leader("consistent_read", Some(req)).await
+    ) -> Result<Result<String, LinearizableReadError<C>>, RPCError<C>> {
+        self.send_with_forwarding("linearizable_read", Some(req), 0).await
+    }
+
+    /// Same as linearizable_read() but will automatically forward the request to the current leader
+    /// if the node is not a leader.
+    pub async fn linearizable_read_auto_forward(
+        &self,
+        req: &String,
+    ) -> Result<Result<String, LinearizableReadError<C>>, RPCError<C>> {
+        self.send_with_forwarding("linearizable_read", Some(req), 3).await
+    }
+
+    /// Perform a linearizable read on a follower.
+    ///
+    /// This method demonstrates follower reads: it fetches a linearizer from the leader,
+    /// waits for the local state machine to catch up, then reads from the local state machine.
+    ///
+    /// Returns the value if successful, or an error from the follower.
+    pub async fn follower_read(&self, req: &String) -> Result<Result<String, FollowerReadError>, RPCError<C>> {
+        self.send("follower_read", Some(req)).await
     }
 
     // --- Cluster management API
 
-    /// Initializes a single-node Raft cluster.
+    /// Initialize a cluster of only the node that receives this request.
     ///
-    /// This must be called once on a fresh cluster to bootstrap the Raft
-    /// protocol. It creates an initial configuration with only this node
-    /// and marks it as the leader.
-    ///
-    /// After initialization, new nodes can be added with `add_learner`
-    /// followed by `change_membership`.
-    pub async fn init(&self) -> Result<(), RPCError<ExampleTypeConfig, InitializeError<ExampleNodeId>>> {
-        self.do_send_rpc_to_leader("init", Some(&Empty {})).await
+    /// This is the first step to initialize a cluster.
+    /// With a initialized cluster, new node can be added with [`write`].
+    /// Then setup replication with [`add_learner`].
+    /// Then make the new node a member with [`change_membership`].
+    pub async fn init(&self) -> Result<Result<(), InitializeError<C>>, RPCError<C>> {
+        self.send("init", Some::<&[(); 0]>(&[])).await
     }
 
-    /// Adds a node as a learner (non-voting member).
+    /// Add a node as learner.
     ///
-    /// A learner receives log replication from the leader but does not
-    /// participate in quorum decisions or leader elections. This allows
-    /// the new node to catch up with the leader's state before being
-    /// promoted to a full voting member.
-    ///
-    /// # Arguments
-    ///
-    /// * `req` - A tuple of (node_id, address) for the new learner
+    /// The node to add has to exist, i.e., being added with `write(ExampleRequest::AddNode{})`
     pub async fn add_learner(
         &self,
-        req: (ExampleNodeId, String),
-    ) -> Result<AddLearnerResponse<ExampleNodeId>, RPCError<ExampleTypeConfig, AddLearnerError<ExampleNodeId>>> {
-        self.send_rpc_to_leader("add-learner", Some(&req)).await
+        req: (C::NodeId, String),
+    ) -> Result<Result<ClientWriteResponse<C>, ClientWriteError<C>>, RPCError<C>> {
+        self.send_with_forwarding("add-learner", Some(&req), 0).await
     }
 
-    /// Changes the cluster membership to the specified set of nodes.
+    /// Change membership to the specified set of nodes.
     ///
-    /// This reconfigures which nodes are voting members of the cluster.
-    /// All nodes in the new membership must have already been added as
-    /// learners and caught up with replication.
-    ///
-    /// Members not in the new set will be removed from the cluster.
-    ///
-    /// # Arguments
-    ///
-    /// * `req` - The set of node IDs that should be voting members
+    /// All nodes in `req` have to be already added as learner with [`add_learner`],
+    /// or an error [`LearnerNotFound`] will be returned.
     pub async fn change_membership(
         &self,
-        req: &BTreeSet<ExampleNodeId>,
-    ) -> Result<ClientWriteResponse<ExampleTypeConfig>, RPCError<ExampleTypeConfig, ClientWriteError<ExampleNodeId>>>
-    {
-        self.send_rpc_to_leader("change-membership", Some(req)).await
+        req: &BTreeSet<C::NodeId>,
+    ) -> Result<Result<ClientWriteResponse<C>, ClientWriteError<C>>, RPCError<C>> {
+        self.send_with_forwarding("change-membership", Some(req), 0).await
     }
 
-    /// Gets the current metrics from the Raft node.
+    /// Get the metrics about the cluster.
     ///
-    /// Metrics include comprehensive status information such as:
-    /// - Current leader ID
-    /// - Current term
-    /// - Last applied log index
-    /// - Cluster membership configuration
-    /// - Replication status for each follower
-    ///
-    /// This is useful for monitoring and debugging the cluster.
-    pub async fn metrics(&self) -> Result<RaftMetrics<ExampleTypeConfig>, RPCError<ExampleTypeConfig, Infallible>> {
-        self.do_send_rpc_to_leader("metrics", None::<&()>).await
+    /// Metrics contains various information about the cluster, such as current leader,
+    /// membership config, replication status etc.
+    /// See [`RaftMetrics`].
+    pub async fn metrics(&self) -> Result<RaftMetrics<C>, RPCError<C>> {
+        let res = self.send::<_, _, Infallible>("metrics", None::<&()>).await?;
+        Ok(res.unwrap())
     }
 
     // --- Internal methods
 
-    /// Sends an RPC request to the currently known leader.
+    /// Send RPC to leader node without retry.
     ///
-    /// This is the low-level method that sends an HTTP request without
-    /// any automatic retry or leader redirection.
-    ///
-    /// If `req` is `Some`, sends a POST request with the serialized JSON.
-    /// If `req` is `None`, sends a GET request.
-    ///
-    /// # Arguments
-    ///
-    /// * `uri` - The URI path to send the request to
-    /// * `req` - Optional request payload to serialize as JSON
-    async fn do_send_rpc_to_leader<Req, Resp, Err>(
-        &self,
-        uri: &str,
-        req: Option<&Req>,
-    ) -> Result<Resp, RPCError<ExampleTypeConfig, Err>>
+    /// It sends out a POST request if `req` is Some. Otherwise a GET request.
+    /// The remote endpoint must respond a reply in form of `Result<Resp, Err>`.
+    async fn send<Req, Resp, Err>(&self, uri: &str, req: Option<&Req>) -> Result<Result<Resp, Err>, RPCError<C>>
     where
-        Req: Serialize + 'static,
+        Req: Serialize + fmt::Debug + 'static,
         Resp: Serialize + DeserializeOwned,
         Err: std::error::Error + Serialize + DeserializeOwned,
     {
-        let (leader_id, url) = {
+        tracing::debug!("client-http: start, send to {}; request: {:?}", uri, req);
+
+        let (_leader_id, url) = {
             let t = self.leader.lock().unwrap();
             let target_addr = &t.1;
-            (t.0, format!("http://{}/{}", target_addr, uri))
+            (t.0.clone(), format!("http://{}/{}", target_addr, uri))
         };
 
         let resp = if let Some(r) = req {
@@ -224,14 +173,27 @@ impl ExampleClient {
                 url,
                 serde_json::to_string_pretty(&r).unwrap()
             );
+            tracing::debug!(
+                ">>> client send request to {}: {}",
+                url,
+                serde_json::to_string_pretty(&r).unwrap()
+            );
             self.inner.post(url.clone()).json(r)
         } else {
             println!(">>> client send request to {}", url,);
+            tracing::debug!(">>> client send request to {}", url,);
             self.inner.get(url.clone())
         }
         .send()
         .await
-        .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
+        .map_err(|e| {
+            if e.is_connect() {
+                // `Unreachable` informs the caller to backoff for a short while to avoid error log flush.
+                RPCError::Unreachable(Unreachable::new(&e))
+            } else {
+                RPCError::Network(NetworkError::new(&e))
+            }
+        })?;
 
         let res: Result<Resp, Err> = resp.json().await.map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
         println!(
@@ -240,67 +202,54 @@ impl ExampleClient {
             serde_json::to_string_pretty(&res).unwrap()
         );
 
-        res.map_err(|e| RPCError::RemoteError(RemoteError::new(leader_id, e)))
+        Ok(res)
     }
 
-    /// Sends a request to the leader with automatic redirection and retry.
+    /// Try the best to send a request to the leader.
     ///
-    /// This method wraps `do_send_rpc_to_leader` with automatic leader
-    /// discovery and retry logic. If the contacted node is not the leader,
-    /// it extracts the leader information from the `ForwardToLeader` error,
-    /// updates its internal leader tracking, and retries.
+    /// If the target node is not a leader, a `ForwardToLeader` error will be
+    /// returned and this client will retry at most `retry` times to contact the updated leader.
     ///
-    /// Retries at most 3 times before giving up.
-    ///
-    /// # Arguments
-    ///
-    /// * `uri` - The URI path to send the request to
-    /// * `req` - Optional request payload to serialize as JSON
-    async fn send_rpc_to_leader<Req, Resp, Err>(
+    /// `retry==0` means no retry is made after the first failure.
+    async fn send_with_forwarding<Req, Resp, Err>(
         &self,
         uri: &str,
         req: Option<&Req>,
-    ) -> Result<Resp, RPCError<ExampleTypeConfig, Err>>
+        mut retry: usize,
+    ) -> Result<Result<Resp, Err>, RPCError<C>>
     where
-        Req: Serialize + 'static,
+        Req: Serialize + fmt::Debug + 'static,
         Resp: Serialize + DeserializeOwned,
-        Err: std::error::Error + Serialize + DeserializeOwned + TryInto<ForwardToLeader<ExampleNodeId>> + Clone,
+        Err: std::error::Error + Serialize + DeserializeOwned + TryAsRef<ForwardToLeader<C>> + Clone,
     {
-        // Retry at most 3 times to find a valid leader.
-        let mut n_retry = 3;
-
         loop {
-            let res: Result<Resp, RPCError<ExampleTypeConfig, Err>> = self.do_send_rpc_to_leader(uri, req).await;
+            let res: Result<Resp, Err> = self.send(uri, req).await?;
 
             let rpc_err = match res {
-                Ok(x) => return Ok(x),
+                Ok(x) => return Ok(Ok(x)),
                 Err(rpc_err) => rpc_err,
             };
 
-            if let RPCError::RemoteError(remote_err) = &rpc_err {
-                let forward_err_res =
-                    <Err as TryInto<ForwardToLeader<ExampleNodeId>>>::try_into(remote_err.source.clone());
-
-                if let Ok(ForwardToLeader {
-                    leader_id: Some(leader_id),
-                    leader_node: Some(leader_node),
-                    ..
-                }) = forward_err_res
+            if let Some(ForwardToLeader {
+                leader_id: Some(leader_id),
+                leader_node: Some(leader_node),
+                ..
+            }) = rpc_err.try_as_ref()
+            {
+                // Update target to the new leader.
                 {
-                    // Update target to the new leader.
-                    {
-                        let mut t = self.leader.lock().unwrap();
-                        *t = (leader_id, leader_node.addr);
-                    }
+                    let mut t = self.leader.lock().unwrap();
+                    let api_addr = leader_node.addr.clone();
+                    *t = (leader_id.clone(), api_addr);
+                }
 
-                    n_retry -= 1;
-                    if n_retry > 0 {
-                        continue;
-                    }
+                if retry > 0 {
+                    retry -= 1;
+                    continue;
                 }
             }
 
-            return Err(rpc_err);
+            return Ok(Err(rpc_err));
         }
     }
 }

@@ -1,121 +1,100 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 
+use actix_web::Responder;
 use actix_web::get;
 use actix_web::post;
-use actix_web::web;
 use actix_web::web::Data;
-use actix_web::Responder;
-use openraft::error::Infallible;
-use openraft::Node;
+use actix_web::web::Json;
+use openraft::BasicNode;
+use openraft::LogId;
 use openraft::RaftMetrics;
-use web::Json;
+use openraft::ReadPolicy;
+use openraft::async_runtime::WatchReceiver;
+use openraft::errors::Infallible;
+use openraft::errors::decompose::DecomposeResult;
+use serde::Deserialize;
+use serde::Serialize;
 
-use crate::app::ExampleApp;
 use crate::ExampleNodeId;
 use crate::ExampleTypeConfig;
+use crate::app::ExampleApp;
 
-// --- Cluster management endpoints
-//
-// These endpoints are used to administer the Raft cluster, including
-// initializing the cluster, adding/removing nodes, and monitoring status.
+/// Serializable representation of linearizer data for follower reads
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LinearizerData {
+    pub node_id: ExampleNodeId,
+    pub read_log_id: LogId<ExampleTypeConfig>,
+    pub applied: Option<LogId<ExampleTypeConfig>>,
+}
 
-/// Adds a node as a **Learner** to the cluster.
+// --- Cluster management
+
+/// Add a node as **Learner**.
 ///
-/// A Learner receives log replication from the leader but does not vote
-/// in leader elections or participate in quorum decisions. This is the
-/// first step in adding a new node to the cluster - it allows the new
-/// node to catch up with the leader's state before being promoted to
-/// a full voting member.
-///
-/// # Arguments
-///
-/// * A tuple of `(node_id, address)` where address is in "host:port" format
-///
-/// # Returns
-///
-/// The result of adding the learner, including information about whether
-/// the node is already known or newly added.
+/// A Learner receives log replication from the leader but does not vote.
+/// This should be done before adding a node as a member into the cluster
+/// (by calling `change-membership`)
 #[post("/add-learner")]
-pub async fn add_learner(
-    app: Data<ExampleApp>,
-    req: Json<(ExampleNodeId, String)>,
-) -> actix_web::Result<impl Responder> {
-    let node_id = req.0 .0;
-    let node = Node {
-        addr: req.0 .1.clone(),
-        ..Default::default()
-    };
-    let res = app.raft.add_learner(node_id, Some(node), true).await;
+pub async fn add_learner(app: Data<ExampleApp>, req: Json<(ExampleNodeId, String)>) -> actix_web::Result<impl Responder> {
+    let node_id = req.0.0;
+    let node = BasicNode { addr: req.0.1.clone() };
+    let res = app.raft.add_learner(node_id, node, true).await.decompose().unwrap();
     Ok(Json(res))
 }
 
-/// Changes cluster membership by promoting learners or removing members.
-///
-/// This endpoint reconfigures the set of voting members in the cluster.
-/// All nodes in the new membership set must have already been added as
-/// learners and caught up with replication.
-///
-/// Membership changes happen safely in two phases to ensure consensus
-/// is maintained throughout the transition.
-///
-/// # Arguments
-///
-/// * A set of node IDs that should be the new voting members
-///
-/// # Returns
-///
-/// The result of the membership change, including the final configuration.
+/// Changes specified learners to members, or remove members.
 #[post("/change-membership")]
-pub async fn change_membership(
-    app: Data<ExampleApp>,
-    req: Json<BTreeSet<ExampleNodeId>>,
-) -> actix_web::Result<impl Responder> {
-    let res = app.raft.change_membership(req.0, true, false).await;
+pub async fn change_membership(app: Data<ExampleApp>, req: Json<BTreeSet<ExampleNodeId>>) -> actix_web::Result<impl Responder> {
+    let res = app.raft.change_membership(req.0, false).await.decompose().unwrap();
     Ok(Json(res))
 }
 
-/// Initializes a single-node cluster.
-///
-/// This must be called once on a fresh cluster to bootstrap the Raft
-/// protocol. It creates an initial cluster configuration containing only
-/// this node and marks it as the leader.
-///
-/// Once initialized, additional nodes can be added using `add-learner`
-/// followed by `change-membership`.
-///
-/// # Returns
-///
-/// The result of initialization - will fail if the cluster is already initialized.
+/// Initialize a single-node cluster if the `req` is empty vec.
+/// Otherwise initialize a cluster with the `req` specified vec of node-id and node-address
 #[post("/init")]
-pub async fn init(app: Data<ExampleApp>) -> actix_web::Result<impl Responder> {
+pub async fn init(app: Data<ExampleApp>, req: Json<Vec<(ExampleNodeId, String)>>) -> actix_web::Result<impl Responder> {
     let mut nodes = BTreeMap::new();
-    nodes.insert(app.id, Node {
-        addr: app.addr.clone(),
-        data: Default::default(),
-    });
-    let res = app.raft.initialize(nodes).await;
+    if req.0.is_empty() {
+        nodes.insert(app.id, BasicNode { addr: app.addr.clone() });
+    } else {
+        for (id, addr) in req.0.into_iter() {
+            nodes.insert(id, BasicNode { addr });
+        }
+    };
+    let res = app.raft.initialize(nodes).await.decompose().unwrap();
     Ok(Json(res))
 }
 
-/// Gets the latest metrics about this Raft node.
-///
-/// Metrics include information like:
-/// - Current leader ID
-/// - Current term
-/// - Last applied log index
-/// - Cluster membership configuration
-/// - Replication status for each follower
-///
-/// This endpoint is useful for monitoring the health and status of the cluster.
-///
-/// # Returns
-///
-/// A `RaftMetrics` structure with comprehensive status information.
+/// Get the latest metrics of the cluster
 #[get("/metrics")]
 pub async fn metrics(app: Data<ExampleApp>) -> actix_web::Result<impl Responder> {
-    let metrics = app.raft.metrics().borrow().clone();
+    let metrics = app.raft.metrics().borrow_watched().clone();
 
     let res: Result<RaftMetrics<ExampleTypeConfig>, Infallible> = Ok(metrics);
     Ok(Json(res))
+}
+
+/// Get linearizer data for performing linearizable reads on followers
+///
+/// This endpoint is used by followers to obtain linearizer data from the leader.
+/// The follower can then reconstruct a Linearizer and wait for its local state
+/// machine to catch up before performing a linearizable read.
+#[post("/get_linearizer")]
+pub async fn get_linearizer(app: Data<ExampleApp>) -> actix_web::Result<impl Responder> {
+    let linearizer = app.raft.get_read_linearizer(ReadPolicy::ReadIndex).await.decompose().unwrap();
+
+    let data = match linearizer {
+        Ok(lin) => {
+            let data = LinearizerData {
+                node_id: *lin.node_id(),
+                read_log_id: *lin.read_log_id(),
+                applied: lin.applied().cloned(),
+            };
+            Ok(data)
+        }
+        Err(e) => Err(e),
+    };
+
+    Ok(Json(data))
 }

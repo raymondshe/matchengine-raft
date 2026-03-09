@@ -4,13 +4,13 @@ set -o errexit
 
 kill() {
     if [ "$(uname)" = "Darwin" ]; then
-        SERVICE='raft-key-value'
+        SERVICE='matchengine-raft'
         if pgrep -xq -- "${SERVICE}"; then
             pkill -f "${SERVICE}"
         fi
     else
         set +e # killall will error if finds no process to kill
-        killall raft-key-value
+        killall matchengine-raft
         set -e
     fi
 }

@@ -1,10 +1,6 @@
-use std::sync::Arc;
-
-use openraft::Config;
-
 use crate::ExampleNodeId;
 use crate::ExampleRaft;
-use crate::ExampleStore;
+use crate::StateMachineStore;
 
 /// Application state that holds all core components of a Raft node.
 ///
@@ -33,15 +29,8 @@ pub struct ExampleApp {
     /// log replication, and consensus management.
     pub raft: ExampleRaft,
 
-    /// The persistent storage layer for Raft logs and state machine.
+    /// The state machine storage.
     ///
-    /// This wraps the Sled database and snapshot file management, providing
-    /// durable storage for all Raft state.
-    pub store: Arc<ExampleStore>,
-
-    /// The Raft configuration parameters.
-    ///
-    /// Contains settings like snapshot policy, election timeout, and other
-    /// Raft-specific tuning parameters.
-    pub config: Arc<Config>,
+    /// This wraps the state machine implementation with our matching engine.
+    pub state_machine_store: StateMachineStore,
 }

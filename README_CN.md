@@ -104,14 +104,14 @@ cargo test
 启动第一个节点：
 
 ```shell
-./target/debug/raft-key-value --id 1 --http-addr 127.0.0.1:21001
+./target/debug/matchengine-raft --id 1 --http-addr 127.0.0.1:21001
 ```
 
 启动其他节点（在不同的终端中）：
 
 ```shell
-./target/debug/raft-key-value --id 2 --http-addr 127.0.0.1:21002
-./target/debug/raft-key-value --id 3 --http-addr 127.0.0.1:21003
+./target/debug/matchengine-raft --id 2 --http-addr 127.0.0.1:21002
+./target/debug/matchengine-raft --id 3 --http-addr 127.0.0.1:21003
 ```
 
 #### 2. 初始化集群
@@ -198,8 +198,11 @@ src/
 │   ├── raft_network_impl.rs # RaftNetwork 实现
 │   └── mod.rs
 └── store/
-    ├── mod.rs               # 状态机定义
+    ├── mod.rs               # 存储模块
+    ├── log_store.rs         # Raft 日志存储实现
+    ├── state_machine.rs     # 状态机实现
     ├── store.rs             # 快照文件 I/O 操作
+    ├── types.rs             # 存储类型
     └── config.rs            # 存储配置
 ```
 

@@ -6,13 +6,13 @@ cargo build
 
 kill() {
     if [ "$(uname)" = "Darwin" ]; then
-        SERVICE='raft-key-value'
+        SERVICE='matchengine-raft'
         if pgrep -xq -- "${SERVICE}"; then
             pkill -f "${SERVICE}"
         fi
     else
         set +e # killall will error if finds no process to kill
-        killall raft-key-value
+        killall matchengine-raft
         set -e
     fi
 }
@@ -44,23 +44,23 @@ rpc() {
 export RUST_LOG=debug 
 export RAFT_HEARTBEAT_INTERVAL=100
 
-echo "Killing all running raft-key-value"
+echo "Killing all running matchengine-raft"
 
 kill
 
 sleep 1
 
-echo "Start 3 uninitialized raft-key-value servers..."
+echo "Start 3 uninitialized matchengine-raft servers..."
 
-nohup ./target/debug/raft-key-value  --id 1 --http-addr 127.0.0.1:21001 > n1.log &
+nohup ./target/debug/matchengine-raft  --id 1 --http-addr 127.0.0.1:21001 > n1.log &
 sleep 1
 echo "Server 1 started"
 
-nohup ./target/debug/raft-key-value  --id 2 --http-addr 127.0.0.1:21002 > n2.log &
+nohup ./target/debug/matchengine-raft  --id 2 --http-addr 127.0.0.1:21002 > n2.log &
 sleep 1
 echo "Server 2 started"
 
-nohup ./target/debug/raft-key-value  --id 3 --http-addr 127.0.0.1:21003 > n3.log &
+nohup ./target/debug/matchengine-raft  --id 3 --http-addr 127.0.0.1:21003 > n3.log &
 sleep 1
 echo "Server 3 started"
 sleep 1

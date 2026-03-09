@@ -1,176 +1,121 @@
-use async_trait::async_trait;
-use openraft::error::AppendEntriesError;
-use openraft::error::InstallSnapshotError;
-use openraft::error::NetworkError;
-use openraft::error::RPCError;
-use openraft::error::RemoteError;
-use openraft::error::VoteError;
+use std::fmt::Display;
+
+use openraft::BasicNode;
+use openraft::RaftTypeConfig;
+use openraft::errors::Infallible;
+use openraft::errors::InstallSnapshotError;
+use openraft::errors::NetworkError;
+use openraft::errors::RPCError;
+use openraft::errors::RaftError;
+use openraft::errors::RemoteError;
+use openraft::errors::Unreachable;
+use openraft::network::RPCOption;
+use openraft::network::RaftNetworkFactory;
 use openraft::raft::AppendEntriesRequest;
 use openraft::raft::AppendEntriesResponse;
 use openraft::raft::InstallSnapshotRequest;
 use openraft::raft::InstallSnapshotResponse;
 use openraft::raft::VoteRequest;
 use openraft::raft::VoteResponse;
-use openraft::Node;
-use openraft::RaftNetwork;
-use openraft::RaftNetworkFactory;
-use serde::de::DeserializeOwned;
+use openraft_legacy::prelude::*;
+use reqwest::Client;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
+use tokio::io::AsyncRead;
+use tokio::io::AsyncSeek;
+use tokio::io::AsyncWrite;
 
-use crate::ExampleNodeId;
-use crate::ExampleTypeConfig;
+pub struct NetworkFactory {}
 
-/// Network factory for creating connections to other Raft nodes.
-///
-/// This struct implements `RaftNetworkFactory` and is responsible for
-/// creating connections to target nodes when Raft needs to send RPCs.
-/// It maintains a reqwest HTTP client for making requests.
-pub struct ExampleNetwork {
-    /// The HTTP client used for all outgoing RPC requests.
-    client: reqwest::Client,
+impl<C> RaftNetworkFactory<C> for NetworkFactory
+where
+    C: RaftTypeConfig<Node = BasicNode>,
+    // RaftNetwork requires the snapshot to be a file-like object that can be seeked, read from, and written to.
+    <C as RaftTypeConfig>::SnapshotData: AsyncRead + AsyncWrite + AsyncSeek + Unpin,
+{
+    type Network = Adapter<C, Network<C>>;
+
+    #[tracing::instrument(level = "debug", skip_all)]
+    async fn new_client(&mut self, target: C::NodeId, node: &BasicNode) -> Self::Network {
+        let addr = node.addr.clone();
+
+        let client = Client::builder().no_proxy().build().unwrap();
+
+        Network { addr, client, target }.into_v2()
+    }
 }
 
-impl ExampleNetwork {
-    /// Creates a new network factory with a fresh HTTP client.
-    pub fn new() -> Self {
-        Self {
-            client: reqwest::Client::new(),
-        }
-    }
+pub struct Network<C>
+where C: RaftTypeConfig
+{
+    addr: String,
+    client: Client,
+    target: C::NodeId,
+}
 
-    /// Sends an RPC request to a target node.
-    ///
-    /// This is the generic method used by all Raft RPC types. It:
-    /// 1. Resolves the target node's address
-    /// 2. Serializes the request as JSON
-    /// 3. Sends an HTTP POST request
-    /// 4. Deserializes the response
-    ///
-    /// # Arguments
-    ///
-    /// * `target` - The ID of the target node
-    /// * `target_node` - Optional node information containing the address
-    /// * `uri` - The URI path for the specific RPC endpoint
-    /// * `req` - The request payload to send
-    ///
-    /// # Returns
-    ///
-    /// The response from the target node, or an error if the RPC fails.
-    pub async fn send_rpc<Req, Resp, Err>(
-        &mut self,
-        target: ExampleNodeId,
-        target_node: Option<&Node>,
-        uri: &str,
-        req: Req,
-    ) -> Result<Resp, RPCError<ExampleTypeConfig, Err>>
+impl<C> Network<C>
+where C: RaftTypeConfig
+{
+    async fn request<Req, Resp, Err>(&mut self, uri: impl Display, req: Req) -> Result<Result<Resp, Err>, RPCError<C>>
     where
-        Req: Serialize,
-        Err: std::error::Error + DeserializeOwned,
-        Resp: DeserializeOwned,
+        Req: Serialize + 'static,
+        Resp: Serialize + DeserializeOwned,
+        Err: std::error::Error + Serialize + DeserializeOwned,
     {
-        let addr = match target_node {
-            Some(node) => &node.addr,
-            None => {
-                return Err(RPCError::Network(NetworkError::new(&std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    format!("target node {} not found", target)
-                ))));
+        let url = format!("http://{}/{}", self.addr, uri);
+
+        let resp = self.client.post(url.clone()).json(&req).send().await.map_err(|e| {
+            if e.is_connect() {
+                // `Unreachable` informs the caller to backoff for a short while to avoid error log flush.
+                RPCError::Unreachable(Unreachable::new(&e))
+            } else {
+                RPCError::Network(NetworkError::new(&e))
             }
-        };
+        })?;
 
-        let url = format!("http://{}/{}", addr, uri);
+        let res: Result<Resp, Err> = resp.json().await.map_err(|e| NetworkError::new(&e))?;
 
-        let resp = self.client.post(url).json(&req).send().await
-            .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
-
-        let res: Result<Resp, Err> = resp.json().await
-            .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
-
-        res.map_err(|e| RPCError::RemoteError(RemoteError::new(target, e)))
+        Ok(res)
     }
 }
 
-impl Default for ExampleNetwork {
-    /// Creates a default network factory.
-    fn default() -> Self {
-        Self::new()
+#[allow(clippy::blocks_in_conditions)]
+impl<C> RaftNetwork<C> for Network<C>
+where C: RaftTypeConfig
+{
+    #[tracing::instrument(level = "debug", skip_all, err(Debug))]
+    async fn append_entries(
+        &mut self,
+        req: AppendEntriesRequest<C>,
+        _option: RPCOption,
+    ) -> Result<AppendEntriesResponse<C>, RPCError<C, RaftError<C>>> {
+        let res = self.request::<_, _, Infallible>("append", req).await.map_err(RPCError::with_raft_error)?;
+        Ok(res.unwrap())
     }
-}
 
-/// Factory implementation for creating Raft network connections.
-///
-/// This implementation creates a new `ExampleNetworkConnection` for each
-/// target node. Each connection gets its own HTTP client instance.
-// NOTE: This could be implemented also on `Arc<ExampleNetwork>`, but since it's empty, implemented directly.
-#[async_trait]
-impl RaftNetworkFactory<ExampleTypeConfig> for ExampleNetwork {
-    type Network = ExampleNetworkConnection;
-
-    /// Creates a new connection to a specific target node.
-    ///
-    /// This method is called by Raft when it needs to communicate with
-    /// another node in the cluster.
-    async fn connect(&mut self, target: ExampleNodeId, node: Option<&Node>) -> Self::Network {
-        ExampleNetworkConnection {
-            owner: ExampleNetwork::new(),
-            target,
-            target_node: node.cloned(),
+    #[tracing::instrument(level = "debug", skip_all, err(Debug))]
+    async fn install_snapshot(
+        &mut self,
+        req: InstallSnapshotRequest<C>,
+        _option: RPCOption,
+    ) -> Result<InstallSnapshotResponse<C>, RPCError<C, RaftError<C, InstallSnapshotError>>> {
+        let res = self.request("snapshot", req).await.map_err(RPCError::with_raft_error)?;
+        match res {
+            Ok(resp) => Ok(resp),
+            Err(e) => Err(RPCError::RemoteError(RemoteError::new(
+                self.target.clone(),
+                RaftError::APIError(e),
+            ))),
         }
     }
-}
 
-/// A dedicated connection to a specific Raft node.
-///
-/// This struct implements `RaftNetwork` and provides the methods for
-/// sending the three types of Raft RPCs: append_entries, install_snapshot,
-/// and vote. Each connection is bound to a specific target node.
-pub struct ExampleNetworkConnection {
-    /// The network instance that created this connection.
-    owner: ExampleNetwork,
-    /// The ID of the target node this connection is for.
-    target: ExampleNodeId,
-    /// Optional cached node information including the address.
-    target_node: Option<Node>,
-}
-
-/// Network implementation for sending Raft RPCs to a specific node.
-///
-/// This implementation delegates to the generic `send_rpc` method on the
-/// owner network instance, providing the appropriate URI for each RPC type.
-#[async_trait]
-impl RaftNetwork<ExampleTypeConfig> for ExampleNetworkConnection {
-    /// Sends an append entries RPC to the target node.
-    ///
-    /// This is used by the leader to replicate log entries and send
-    /// heartbeats to followers.
-    async fn send_append_entries(
+    #[tracing::instrument(level = "debug", skip_all, err(Debug))]
+    async fn vote(
         &mut self,
-        req: AppendEntriesRequest<ExampleTypeConfig>,
-    ) -> Result<AppendEntriesResponse<ExampleNodeId>, RPCError<ExampleTypeConfig, AppendEntriesError<ExampleNodeId>>>
-    {
-        self.owner.send_rpc(self.target, self.target_node.as_ref(), "raft-append", req).await
-    }
-
-    /// Sends an install snapshot RPC to the target node.
-    ///
-    /// This is used by the leader to send entire state machine snapshots
-    /// to followers that are too far behind to catch up with just logs.
-    async fn send_install_snapshot(
-        &mut self,
-        req: InstallSnapshotRequest<ExampleTypeConfig>,
-    ) -> Result<InstallSnapshotResponse<ExampleNodeId>, RPCError<ExampleTypeConfig, InstallSnapshotError<ExampleNodeId>>>
-    {
-        self.owner.send_rpc(self.target, self.target_node.as_ref(), "raft-snapshot", req).await
-    }
-
-    /// Sends a vote request RPC to the target node.
-    ///
-    /// This is used by candidates during leader elections to request
-    /// votes from other nodes in the cluster.
-    async fn send_vote(
-        &mut self,
-        req: VoteRequest<ExampleNodeId>,
-    ) -> Result<VoteResponse<ExampleNodeId>, RPCError<ExampleTypeConfig, VoteError<ExampleNodeId>>> {
-        self.owner.send_rpc(self.target, self.target_node.as_ref(), "raft-vote", req).await
+        req: VoteRequest<C>,
+        _option: RPCOption,
+    ) -> Result<VoteResponse<C>, RPCError<C, RaftError<C>>> {
+        let res = self.request::<_, _, Infallible>("vote", req).await.map_err(RPCError::with_raft_error)?;
+        Ok(res.unwrap())
     }
 }

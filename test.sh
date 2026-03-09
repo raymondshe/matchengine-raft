@@ -4,13 +4,13 @@ set -o errexit
 
 kill() {
     if [ "$(uname)" = "Darwin" ]; then
-        SERVICE='raft-key-value'
+        SERVICE='matchengine-raft'
         if pgrep -xq -- "${SERVICE}"; then
             pkill -f "${SERVICE}"
         fi
     else
         set +e # killall will error if finds no process to kill
-        killall raft-key-value
+        killall matchengine-raft
         set -e
     fi
 }
@@ -91,19 +91,19 @@ get_metrics() {
 kill_node() {
     case $1 in 
     "1")
-        pkill -f 'raft-key-value --id 1'
+        pkill -f 'matchengine-raft --id 1'
         ;;
     "2")
-        pkill -f 'raft-key-value --id 2'
+        pkill -f 'matchengine-raft --id 2'
         ;;
     "3")
-        pkill -f 'raft-key-value --id 3'
+        pkill -f 'matchengine-raft --id 3'
         ;;
     esac
 }
 
 start_node() {
-    nohup ./target/debug/raft-key-value  --id $1 --http-addr 127.0.0.1:2100$1 > n$1.log &
+    nohup ./target/debug/matchengine-raft  --id $1 --http-addr 127.0.0.1:2100$1 > n$1.log &
 }
 
 change_membership () {

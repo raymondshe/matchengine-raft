@@ -7,8 +7,8 @@
         {
             "type": "lldb",
             "request": "launch",
-            "name": "raft-key-value",
-            "program": "${workspaceFolder}/target/debug/raft-key-value",
+            "name": "matchengine-raft",
+            "program": "${workspaceFolder}/target/debug/matchengine-raft",
             "args": ["--id", "1", "--http-addr", "127.0.0.1:21001" ],
             "cwd": "${workspaceFolder}",
             "env": {
@@ -19,16 +19,16 @@
         {
             "type": "lldb",
             "request": "launch",
-            "name": "Debug unit tests in library 'example-raft-key-value'",
+            "name": "Debug unit tests in library 'matchengine-raft'",
             "cargo": {
                 "args": [
                     "test",
                     "--no-run",
                     "--lib",
-                    "--package=example-raft-key-value"
+                    "--package=matchengine-raft"
                 ],
                 "filter": {
-                    "name": "example-raft-key-value",
+                    "name": "matchengine-raft",
                     "kind": "lib"
                 }
             },
@@ -38,15 +38,15 @@
         {
             "type": "lldb",
             "request": "launch",
-            "name": "Debug executable 'raft-key-value'",
+            "name": "Debug executable 'matchengine-raft'",
             "cargo": {
                 "args": [
                     "build",
-                    "--bin=raft-key-value",
-                    "--package=example-raft-key-value"
+                    "--bin=matchengine-raft",
+                    "--package=matchengine-raft"
                 ],
                 "filter": {
-                    "name": "raft-key-value",
+                    "name": "matchengine-raft",
                     "kind": "bin"
                 }
             },
@@ -56,16 +56,16 @@
         {
             "type": "lldb",
             "request": "launch",
-            "name": "Debug unit tests in executable 'raft-key-value'",
+            "name": "Debug unit tests in executable 'matchengine-raft'",
             "cargo": {
                 "args": [
                     "test",
                     "--no-run",
-                    "--bin=raft-key-value",
-                    "--package=example-raft-key-value"
+                    "--bin=matchengine-raft",
+                    "--package=matchengine-raft"
                 ],
                 "filter": {
-                    "name": "raft-key-value",
+                    "name": "matchengine-raft",
                     "kind": "bin"
                 }
             },
@@ -81,7 +81,7 @@
                     "test",
                     "--no-run",
                     "--test=cluster",
-                    "--package=example-raft-key-value"
+                    "--package=matchengine-raft"
                 ],
                 "filter": {
                     "name": "cluster",

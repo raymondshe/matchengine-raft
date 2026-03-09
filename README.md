@@ -104,14 +104,14 @@ This runs the same scenario as `test-cluster.sh` but using the Rust `ExampleClie
 Start the first node:
 
 ```shell
-./target/debug/raft-key-value --id 1 --http-addr 127.0.0.1:21001
+./target/debug/matchengine-raft --id 1 --http-addr 127.0.0.1:21001
 ```
 
 Start additional nodes (in separate terminals):
 
 ```shell
-./target/debug/raft-key-value --id 2 --http-addr 127.0.0.1:21002
-./target/debug/raft-key-value --id 3 --http-addr 127.0.0.1:21003
+./target/debug/matchengine-raft --id 2 --http-addr 127.0.0.1:21002
+./target/debug/matchengine-raft --id 3 --http-addr 127.0.0.1:21003
 ```
 
 #### 2. Initialize the Cluster
@@ -198,8 +198,11 @@ src/
 │   ├── raft_network_impl.rs # RaftNetwork implementation
 │   └── mod.rs
 └── store/
-    ├── mod.rs               # State machine definition
+    ├── mod.rs               # Storage module
+    ├── log_store.rs         # Raft log storage implementation
+    ├── state_machine.rs     # State machine implementation
     ├── store.rs             # Snapshot file I/O operations
+    ├── types.rs             # Storage types
     └── config.rs            # Storage configuration
 ```
 
