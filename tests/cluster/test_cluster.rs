@@ -4,10 +4,10 @@ use std::panic::PanicHookInfo;
 use std::thread;
 use std::time::Duration;
 
-use example_raft_key_value::client::ExampleClient;
-use example_raft_key_value::start_example_raft_node;
-use example_raft_key_value::store::ExampleRequest;
-use example_raft_key_value::ExampleTypeConfig;
+use matchengine_raft::client::ExampleClient;
+use matchengine_raft::start_example_raft_node;
+use matchengine_raft::store::ExampleRequest;
+use matchengine_raft::ExampleTypeConfig;
 use maplit::btreemap;
 use maplit::btreeset;
 use openraft::BasicNode;

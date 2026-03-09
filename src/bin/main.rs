@@ -1,6 +1,6 @@
 use clap::Parser;
 use env_logger::Env;
-use example_raft_key_value::start_example_raft_node;
+use matchengine_raft::start_example_raft_node;
 
 #[derive(Parser, Clone, Debug)]
 #[clap(author, version, about, long_about = None)]
