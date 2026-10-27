@@ -53,6 +53,10 @@ Single-crate Rust project (edition 2024): a Raft-replicated KV store + order-boo
 
 ## Matching-engine quirks
 
+- `OrderBook::place_order` stops matching as soon as the taker's remaining volume reaches zero, and
+  a partially filled maker is updated in place so its `id`, `side`, `live` and `sequence` survive.
+  `Order::new` still hardcodes `id: 0`, so do not use it to rebuild a resting order. Regression
+  tests: `exact_fill_*`, `partial_fill_preserves_maker_identity` in `src/matchengine/mod.rs`.
 - `Order` deserializes `sequence`; the scripts now send `sequence` too. `Order::sequence` is still
   required by the deserializer even though `place_order()` overwrites it.
 - `/read` special keys: `orderbook_orders`, and `orderbook_sequence` (misspelled variant `orderbook_sequance` also accepted).

@@ -415,6 +415,10 @@ impl OrderBook {
     /// 4. If the ask has remaining volume, updates it and stops
     /// 5. If the order can't be fully matched, adds the remainder to the bid side
     ///
+    /// The loop stops as soon as the taker's remaining volume reaches zero, so
+    /// an exhausted taker never emits a zero-quantity trade or touches a later
+    /// ask. Partially filled asks are updated in place to keep their identity.
+    ///
     /// # Arguments
     ///
     /// * `order` - The buy order to match
@@ -426,31 +430,29 @@ impl OrderBook {
         let mut results = Vec::new();
         let mut remaining_volume = order.volume;
 
-        loop {
+        // Stop as soon as the taker is exhausted: a zero-volume taker must not
+        // "match" the next ask and rewrite it.
+        while remaining_volume > 0.0 {
             match self.asks.iter().next() {
                 None => {
                     // No more asks to match, add remaining to bids
-                    if remaining_volume > 0.0 {
-                        let mut remaining_order = order.clone();
-                        remaining_order.volume = remaining_volume;
-                        self.bids.insert(
-                            BidKey{price: order.price, sequence: order.sequence},
-                            remaining_order
-                        );
-                    }
+                    let mut remaining_order = order.clone();
+                    remaining_order.volume = remaining_volume;
+                    self.bids.insert(
+                        BidKey{price: order.price, sequence: order.sequence},
+                        remaining_order
+                    );
                     break;
                 }
                 Some((key, best_ask)) => {
                     if best_ask.price > order.price {
                         // Best ask price is too high, add remaining to bids
-                        if remaining_volume > 0.0 {
-                            let mut remaining_order = order.clone();
-                            remaining_order.volume = remaining_volume;
-                            self.bids.insert(
-                                BidKey{ price: order.price, sequence: order.sequence },
-                                remaining_order
-                            );
-                        }
+                        let mut remaining_order = order.clone();
+                        remaining_order.volume = remaining_volume;
+                        self.bids.insert(
+                            BidKey{ price: order.price, sequence: order.sequence },
+                            remaining_order
+                        );
                         break;
                     }
 
@@ -461,18 +463,13 @@ impl OrderBook {
                     results.push(MatchResult::new(&temp_order, &best_ask, match_volume));
 
                     if best_ask.volume > remaining_volume {
-                        // Update the best ask with remaining volume
-                        let new_best_ask = Order::new(
-                            OrderSide::Sell,
-                            best_ask.price,
-                            best_ask.volume - match_volume,
-                            best_ask.sequence,
-                        );
-                        self.asks.insert(
-                            AskKey{ price: new_best_ask.price, sequence: new_best_ask.sequence},
-                            new_best_ask
-                        );
-                        // Fully matched
+                        // Partially filled: shrink the maker in place so it keeps
+                        // its identity (id, side, live and sequence).
+                        let akey = AskKey{price: key.price, sequence: key.sequence};
+                        let mut new_best_ask = *best_ask;
+                        new_best_ask.volume = best_ask.volume - match_volume;
+                        self.asks.insert(akey, new_best_ask);
+                        // Taker fully matched
                         break;
                     } else {
                         // Remove the fully matched ask
@@ -497,6 +494,10 @@ impl OrderBook {
     /// 4. If the bid has remaining volume, updates it and stops
     /// 5. If the order can't be fully matched, adds the remainder to the ask side
     ///
+    /// The loop stops as soon as the taker's remaining volume reaches zero, so
+    /// an exhausted taker never emits a zero-quantity trade or touches a later
+    /// bid. Partially filled bids are updated in place to keep their identity.
+    ///
     /// # Arguments
     ///
     /// * `order` - The sell order to match
@@ -508,31 +509,29 @@ impl OrderBook {
         let mut results = Vec::new();
         let mut remaining_volume = order.volume;
 
-        loop {
+        // Stop as soon as the taker is exhausted: a zero-volume taker must not
+        // "match" the next bid and rewrite it.
+        while remaining_volume > 0.0 {
             match self.bids.iter().next() {
                 None => {
                     // No more bids to match, add remaining to asks
-                    if remaining_volume > 0.0 {
+                    let mut remaining_order = order.clone();
+                    remaining_order.volume = remaining_volume;
+                    self.asks.insert(
+                        AskKey{price: order.price, sequence: order.sequence},
+                        remaining_order
+                    );
+                    break;
+                }
+                Some((key, best_bid)) => {
+                    if best_bid.price < order.price {
+                        // Best bid price is too low, add remaining to asks
                         let mut remaining_order = order.clone();
                         remaining_order.volume = remaining_volume;
                         self.asks.insert(
                             AskKey{price: order.price, sequence: order.sequence},
                             remaining_order
                         );
-                    }
-                    break;
-                }
-                Some((key, best_bid)) => {
-                    if best_bid.price < order.price {
-                        // Best bid price is too low, add remaining to asks
-                        if remaining_volume > 0.0 {
-                            let mut remaining_order = order.clone();
-                            remaining_order.volume = remaining_volume;
-                            self.asks.insert(
-                                AskKey{price: order.price, sequence: order.sequence},
-                                remaining_order
-                            );
-                        }
                         break;
                     }
 
@@ -543,18 +542,13 @@ impl OrderBook {
                     results.push(MatchResult::new(&temp_order, &best_bid, match_volume));
 
                     if best_bid.volume > remaining_volume {
-                        // Update the best bid with remaining volume
-                        let new_best_bid = Order::new(
-                            OrderSide::Buy,
-                            best_bid.price,
-                            best_bid.volume - match_volume,
-                            best_bid.sequence,
-                        );
-                        self.bids.insert(
-                            BidKey{price: new_best_bid.price, sequence: new_best_bid.sequence},
-                            new_best_bid
-                        );
-                        // Fully matched
+                        // Partially filled: shrink the maker in place so it keeps
+                        // its identity (id, side, live and sequence).
+                        let akey = BidKey{price: key.price, sequence: key.sequence};
+                        let mut new_best_bid = *best_bid;
+                        new_best_bid.volume = best_bid.volume - match_volume;
+                        self.bids.insert(akey, new_best_bid);
+                        // Taker fully matched
                         break;
                     } else {
                         // Remove the fully matched bid
@@ -617,6 +611,182 @@ mod tests {
         assert_eq!(ob.best_ask(), Some(&o1));
         ob.place_order(&mut o4);
         assert_eq!(ob.best_ask(), Some(&o4));
+    }
+
+    /// Builds a resting limit order with an explicit identity, so tests can
+    /// assert that matching never rewrites it.
+    fn resting_order(side: OrderSide, price: f64, volume: f64, id: u64) -> Order {
+        Order {
+            live: OrderType::Limit,
+            side,
+            price,
+            volume,
+            id,
+            sequence: 0,
+        }
+    }
+
+    /// Regression test for issue #1.
+    ///
+    /// A sell that exactly consumes the best bid must produce exactly one fill
+    /// and must leave the next bid untouched. Before the fix the matcher did an
+    /// extra loop turn, emitted a zero-quantity `MatchResult` against bid #2 and
+    /// re-stored it through `Order::new`, which reset its `id` to 0.
+    #[test]
+    fn exact_fill_does_not_emit_phantom_or_corrupt_bystander_bid() {
+        let mut ob = OrderBook::new();
+        let mut b1 = resting_order(OrderSide::Buy, 100.0, 10.0, 1);
+        let mut b2 = resting_order(OrderSide::Buy, 100.0, 10.0, 2);
+        ob.place_order(&mut b1);
+        ob.place_order(&mut b2);
+
+        let mut s = resting_order(OrderSide::Sell, 100.0, 10.0, 3);
+        let trades = ob.place_order(&mut s);
+
+        assert_eq!(trades.len(), 1, "only bid #1 should fill, got {:?}", trades);
+        assert_eq!(trades[0].maker.id, 1);
+        assert_eq!(trades[0].taker.id, 3);
+        assert_eq!(trades[0].matches, 10.0);
+        assert!(trades.iter().all(|t| t.matches > 0.0), "phantom fill: {:?}", trades);
+
+        let bystander = ob.best_bid().expect("bid #2 must still rest");
+        assert_eq!(bystander.id, 2, "bystander id must not be reset");
+        assert_eq!(bystander.volume, 10.0);
+        assert_eq!(bystander.sequence, 1);
+        assert!(matches!(bystander.side, OrderSide::Buy));
+        assert!(matches!(bystander.live, OrderType::Limit));
+        assert_eq!(ob.bids.len(), 1);
+    }
+
+    /// Mirror of the bid case for a buy that exactly consumes the best ask.
+    #[test]
+    fn exact_fill_does_not_emit_phantom_or_corrupt_bystander_ask() {
+        let mut ob = OrderBook::new();
+        let mut a1 = resting_order(OrderSide::Sell, 100.0, 10.0, 1);
+        let mut a2 = resting_order(OrderSide::Sell, 100.0, 10.0, 2);
+        ob.place_order(&mut a1);
+        ob.place_order(&mut a2);
+
+        let mut b = resting_order(OrderSide::Buy, 100.0, 10.0, 3);
+        let trades = ob.place_order(&mut b);
+
+        assert_eq!(trades.len(), 1, "only ask #1 should fill, got {:?}", trades);
+        assert_eq!(trades[0].maker.id, 1);
+        assert_eq!(trades[0].taker.id, 3);
+        assert_eq!(trades[0].matches, 10.0);
+        assert!(trades.iter().all(|t| t.matches > 0.0), "phantom fill: {:?}", trades);
+
+        let bystander = ob.best_ask().expect("ask #2 must still rest");
+        assert_eq!(bystander.id, 2, "bystander id must not be reset");
+        assert_eq!(bystander.volume, 10.0);
+        assert_eq!(bystander.sequence, 1);
+        assert!(matches!(bystander.side, OrderSide::Sell));
+        assert!(matches!(bystander.live, OrderType::Limit));
+        assert_eq!(ob.asks.len(), 1);
+    }
+
+    /// A genuine partial fill must only shrink the maker's volume. The old code
+    /// rebuilt the maker with `Order::new`, which discarded its `id`.
+    #[test]
+    fn partial_fill_preserves_maker_identity() {
+        let mut ob = OrderBook::new();
+        let mut maker = resting_order(OrderSide::Sell, 100.22, 22.0, 7);
+        ob.place_order(&mut maker);
+
+        let mut taker = resting_order(OrderSide::Buy, 100.22, 10.0, 8);
+        let trades = ob.place_order(&mut taker);
+
+        assert_eq!(trades.len(), 1);
+        assert_eq!(trades[0].maker.id, 7);
+        assert_eq!(trades[0].matches, 10.0);
+
+        let rest = ob.best_ask().expect("the remainder must rest as an ask");
+        assert_eq!(rest.id, 7, "partial fill must keep the maker id");
+        assert_eq!(rest.volume, 12.0);
+        assert_eq!(rest.sequence, 0);
+        assert_eq!(rest.price, 100.22);
+        assert!(matches!(rest.side, OrderSide::Sell));
+        assert!(matches!(rest.live, OrderType::Limit));
+    }
+
+    /// An exact fill must stop matching even when deeper price levels would
+    /// still cross the taker. The larger order behind must stay untouched.
+    #[test]
+    fn exact_fill_stops_before_deeper_levels() {
+        // Sell taker fills bid #1 at 100 but is priced through bid #2 at 99.
+        let mut ob = OrderBook::new();
+        let mut b1 = resting_order(OrderSide::Buy, 100.0, 10.0, 1);
+        let mut b2 = resting_order(OrderSide::Buy, 99.0, 20.0, 2);
+        ob.place_order(&mut b1);
+        ob.place_order(&mut b2);
+
+        let mut s = resting_order(OrderSide::Sell, 99.0, 10.0, 3);
+        let trades = ob.place_order(&mut s);
+
+        assert_eq!(trades.len(), 1, "deeper bid must not be touched: {:?}", trades);
+        assert_eq!((trades[0].maker.id, trades[0].matches), (1, 10.0));
+
+        let deeper = ob.best_bid().expect("bid #2 must still rest");
+        assert_eq!(deeper.id, 2, "deeper bid id must not be reset");
+        assert_eq!(deeper.volume, 20.0);
+        assert_eq!(deeper.sequence, 1);
+        assert_eq!(ob.bids.len(), 1);
+
+        // Buy taker fills ask #1 at 100 but is priced through ask #2 at 101.
+        let mut ob = OrderBook::new();
+        let mut a1 = resting_order(OrderSide::Sell, 100.0, 10.0, 1);
+        let mut a2 = resting_order(OrderSide::Sell, 101.0, 20.0, 2);
+        ob.place_order(&mut a1);
+        ob.place_order(&mut a2);
+
+        let mut b = resting_order(OrderSide::Buy, 101.0, 10.0, 3);
+        let trades = ob.place_order(&mut b);
+
+        assert_eq!(trades.len(), 1, "deeper ask must not be touched: {:?}", trades);
+        assert_eq!((trades[0].maker.id, trades[0].matches), (1, 10.0));
+
+        let deeper = ob.best_ask().expect("ask #2 must still rest");
+        assert_eq!(deeper.id, 2, "deeper ask id must not be reset");
+        assert_eq!(deeper.volume, 20.0);
+        assert_eq!(deeper.sequence, 1);
+        assert_eq!(ob.asks.len(), 1);
+    }
+
+    /// A taker that consumes every level exactly empties the book without
+    /// emitting a trailing zero-quantity fill.
+    #[test]
+    fn full_sweep_leaves_book_empty_without_phantom_trades() {
+        let mut ob = OrderBook::new();
+        let mut b1 = resting_order(OrderSide::Buy, 100.0, 10.0, 1);
+        let mut b2 = resting_order(OrderSide::Buy, 99.0, 5.0, 2);
+        ob.place_order(&mut b1);
+        ob.place_order(&mut b2);
+
+        let mut s = resting_order(OrderSide::Sell, 99.0, 15.0, 3);
+        let trades = ob.place_order(&mut s);
+
+        assert_eq!(
+            trades.iter().map(|t| (t.maker.id, t.matches)).collect::<Vec<_>>(),
+            vec![(1, 10.0), (2, 5.0)]
+        );
+        assert!(ob.best_bid().is_none(), "fully swept book must be empty");
+        assert_eq!(ob.bids.len(), 0);
+
+        let mut ob = OrderBook::new();
+        let mut a1 = resting_order(OrderSide::Sell, 100.0, 10.0, 1);
+        let mut a2 = resting_order(OrderSide::Sell, 101.0, 5.0, 2);
+        ob.place_order(&mut a1);
+        ob.place_order(&mut a2);
+
+        let mut b = resting_order(OrderSide::Buy, 101.0, 15.0, 3);
+        let trades = ob.place_order(&mut b);
+
+        assert_eq!(
+            trades.iter().map(|t| (t.maker.id, t.matches)).collect::<Vec<_>>(),
+            vec![(1, 10.0), (2, 5.0)]
+        );
+        assert!(ob.best_ask().is_none(), "fully swept book must be empty");
+        assert_eq!(ob.asks.len(), 0);
     }
 
     /// Tests that a partially filled order has its remaining quantity updated in the book.

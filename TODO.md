@@ -35,6 +35,11 @@ The dead sled file `src/store/store.rs` was deleted.
 - [ ] Replace `.decompose().unwrap()` in `src/network/api.rs` and `src/network/management.rs` with real error handling. Today a request that must be forwarded to the leader panics the worker instead of returning the forward hint.
 - [ ] `src/network/api.rs:96` — `linearizer.await_ready(...).unwrap()` can panic; return the error to the caller.
 - [x] Scripts now send the correct `sequence` field.
+- [x] Fix issue #1: `place_order` no longer emits a phantom zero-quantity
+  `MatchResult` when the taker is exactly filled, and partially filled makers are
+  shrunk in place instead of rebuilt with `Order::new` (which reset `id` to 0).
+  Covered by `exact_fill_*`, `partial_fill_preserves_maker_identity` and
+  `full_sweep_leaves_book_empty_without_phantom_trades` in `src/matchengine/mod.rs`.
 - [ ] `Order::sequence` is still required by the deserializer even though `place_order()` overwrites
   it; make it optional (`#[serde(default)]`) so clients need not send a value the engine ignores.
 - [ ] Collapse the three duplicated `orderbook_sequance` compatibility arms in
