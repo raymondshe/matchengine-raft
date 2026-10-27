@@ -408,17 +408,7 @@ gRPC 传输在 `--http-addr` 端口 + 1000 上暴露相同操作（`AppendEntrie
 `22001-22003`），快照测试使用 `21101-21102`，重启测试使用 `21201-21202`，撮合结果测试使用
 `21301`；重跑前请先停止残留进程（`pkill -f matchengine-raft`）。
 
-## 未来工作
-
-- [x] 优化序列化 —— Raft RPC 在 protobuf 信封内使用 `postcard`（公共 API 仍为 JSON）
-- [x] 使用 gRPC 改进网络层 —— tonic 传输，支持流式追加和分块快照
-- [x] 添加全面测试 —— 存储、快照、集群与重启覆盖
-- [ ] 按 `docs/TRANSPORTS.md` 构建 HTTP/JSON 与 gRPC 的基准测试工具
-- [ ] 为 gRPC 监听器配置 TLS/mTLS
-- [x] 撮合结果接入可替换的 `MatchResultSink` —— `fill`/`rested`/`cancelled` 事件带 `(log_index, ordinal)` id，并提供 `--match-event-log` JSONL 文件 sink 用于调试
-- [ ] 将撮合结果可靠地分发给订单/清结算系统 —— `/write` 响应返回事件、带 `/events` 游标读取的复制事件日志、幂等提交；设计见 `docs/MATCH_RESULTS.md`（阶段 1b–3）
-- [ ] 实现更多撮合算法（市价单、整数 tick 价格）
-- [ ] 增强客户端库并添加端到端延迟基准
+已知差距与路线图统一记录在 [`TODO.md`](./TODO.md)。
 
 ## 致谢
 

@@ -430,17 +430,7 @@ Every integration test uses a unique temporary data directory. The cluster test 
 and the match-result test `21301`; stop leftover processes (`pkill -f matchengine-raft`) before
 rerunning.
 
-## Future Work
-
-- [x] Optimize serialization — Raft RPCs use `postcard` inside protobuf envelopes (the public API stays JSON)
-- [x] Improve network layer with gRPC — tonic transport with streaming appends and chunked snapshots
-- [x] Add comprehensive testing — storage, snapshot, cluster and restart coverage
-- [ ] Add the HTTP/JSON vs gRPC benchmark harness described in `docs/TRANSPORTS.md`
-- [ ] Configure TLS/mTLS for the gRPC listener
-- [x] Route match results through a pluggable `MatchResultSink` — `fill`/`rested`/`cancelled` events with `(log_index, ordinal)` ids, and a `--match-event-log` JSONL file sink for debugging
-- [ ] Deliver match results durably to order/clearing systems — events in the `/write` response, a replicated event log with `/events` cursor reads, and idempotent submission; design in `docs/MATCH_RESULTS.md` (phases 1b–3)
-- [ ] Implement more matching algorithms (market orders, integer tick prices)
-- [ ] Enhance client library and add end-to-end latency benchmarks
+Known gaps and the roadmap are tracked in [`TODO.md`](./TODO.md).
 
 ## Credits
 

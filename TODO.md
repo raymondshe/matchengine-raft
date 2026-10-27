@@ -1,6 +1,6 @@
 # TODO
 
-Current snapshot of known gaps. Priorities assume the goal is to finish the openraft 0.10 port and restore the features the README advertises. See `AGENTS.md` for day-to-day commands and branch state.
+Current snapshot of known gaps. Priorities assume the goal is to finish the openraft 0.10 port and restore the features the README advertises. This file is the working TODO list and roadmap: the `Future Work` lists that used to live in `README.md` / `README_CN.md` were folded into the sections below. See `AGENTS.md` for day-to-day commands and branch state.
 
 ## 1. openraft 0.10 migration — done in code, two loose ends
 
@@ -104,7 +104,7 @@ vote/committed persistence, snapshot build/install/reopen) and `tests/cluster/te
 - [ ] `Cargo.lock` is in `.gitignore` but the crate produces a binary — usually committed for binaries. Decide one way.
 - [ ] `src/lib.rs` starts with `#![allow(clippy::uninlined_format_args)]`; fix the lints and drop the allow.
 
-## 9. Matching engine (from README "Future Work" + found in code)
+## 9. Matching engine
 
 - [x] Route match results through a replaceable `MatchResultSink` (`MatchEvent` with
   `(log_index, ordinal)` ids; `Noop`/`Memory`/`File` sinks; `--match-event-log` file log for
@@ -139,3 +139,8 @@ Remaining:
 - [ ] Implement `pre_vote` and `transfer_leader` RPCs if openraft enables those paths; both currently use trait defaults.
 - [ ] Consider streaming snapshot bytes into the state machine instead of buffering the whole snapshot in memory; the current in-memory state machine requires a contiguous buffer anyway. The gRPC receiver also accepts an unbounded chunk total, so a hostile peer can force allocation up to its own message cap.
 - [ ] A gRPC server task that dies is only logged (`src/lib.rs`); the HTTP API keeps serving while peers can no longer reach this node. Decide whether that should stop the process.
+
+## 11. Client library and benchmarks
+
+- [ ] Harden `src/client.rs` before it is used outside the examples: retry/backoff on transient RPC errors, configurable timeouts, and a typed error for "no known leader" instead of a bare message.
+- [ ] Add end-to-end latency benchmarks (submit → commit → apply → response) next to the transport harness in §10, so matching and replication costs can be separated.
