@@ -10,10 +10,10 @@ use openraft::errors::decompose::DecomposeResult;
 use openraft::raft::linearizable_read::Linearizer;
 use web::Json;
 
-use crate::ExampleTypeConfig;
-use crate::app::ExampleApp;
+use crate::MatchEngineTypeConfig;
+use crate::app::MatchEngineApp;
 use crate::client::FollowerReadError;
-use crate::store::ExampleRequest;
+use crate::store::MatchEngineRequest;
 
 /**
  * Application API endpoints for interacting with the Raft state machine.
@@ -40,7 +40,7 @@ use crate::store::ExampleRequest;
 /// The result of applying the request, or an error if the node is not
 /// the leader or the write fails.
 #[post("/write")]
-pub async fn write(app: Data<ExampleApp>, req: Json<ExampleRequest>) -> actix_web::Result<impl Responder> {
+pub async fn write(app: Data<MatchEngineApp>, req: Json<MatchEngineRequest>) -> actix_web::Result<impl Responder> {
     let response = app.raft.client_write(req.0).await.decompose().unwrap();
     Ok(Json(response))
 }
@@ -61,7 +61,7 @@ pub async fn write(app: Data<ExampleApp>, req: Json<ExampleRequest>) -> actix_we
 ///
 /// The requested value, or an empty string if the key doesn't exist.
 #[post("/read")]
-pub async fn read(app: Data<ExampleApp>, req: Json<String>) -> actix_web::Result<impl Responder> {
+pub async fn read(app: Data<MatchEngineApp>, req: Json<String>) -> actix_web::Result<impl Responder> {
     let inner = app.state_machine_store.inner().lock().await;
     let key = req.0;
     let value = match key.as_str() {
@@ -88,7 +88,7 @@ pub async fn read(app: Data<ExampleApp>, req: Json<String>) -> actix_web::Result
 /// This provides strong consistency guarantees but may be slower than
 /// a local read.
 #[post("/linearizable_read")]
-pub async fn linearizable_read(app: Data<ExampleApp>, req: Json<String>) -> actix_web::Result<impl Responder> {
+pub async fn linearizable_read(app: Data<MatchEngineApp>, req: Json<String>) -> actix_web::Result<impl Responder> {
     let ret = app.raft.get_read_linearizer(ReadPolicy::ReadIndex).await.decompose().unwrap();
 
     match ret {
@@ -107,7 +107,7 @@ pub async fn linearizable_read(app: Data<ExampleApp>, req: Json<String>) -> acti
                 _ => inner.state_machine_data.data.get(&key).cloned().unwrap_or_default(),
             };
 
-            let res: Result<String, LinearizableReadError<ExampleTypeConfig>> = Ok(value);
+            let res: Result<String, LinearizableReadError<MatchEngineTypeConfig>> = Ok(value);
             Ok(Json(res))
         }
         Err(e) => Ok(Json(Err(e))),
@@ -123,7 +123,7 @@ pub async fn linearizable_read(app: Data<ExampleApp>, req: Json<String>) -> acti
 /// 3. Wait for local state machine to catch up to the linearizer's read_log_id
 /// 4. Read from local state machine
 #[post("/follower_read")]
-pub async fn follower_read(app: Data<ExampleApp>, req: Json<String>) -> actix_web::Result<impl Responder> {
+pub async fn follower_read(app: Data<MatchEngineApp>, req: Json<String>) -> actix_web::Result<impl Responder> {
     // 1. Get current leader
     let leader_id = match app.raft.current_leader().await {
         Some(id) => id,
@@ -159,7 +159,7 @@ pub async fn follower_read(app: Data<ExampleApp>, req: Json<String>) -> actix_we
         }
     };
 
-    let linearizer_data_result: Result<crate::network::management::LinearizerData, LinearizableReadError<ExampleTypeConfig>> =
+    let linearizer_data_result: Result<crate::network::management::LinearizerData, LinearizableReadError<MatchEngineTypeConfig>> =
         match response.json().await {
             Ok(result) => result,
             Err(e) => {

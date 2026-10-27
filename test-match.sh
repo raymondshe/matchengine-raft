@@ -44,18 +44,14 @@ export RUST_LOG=debug
 ##############################################################{
 echo "Place order on leader"
 sleep 1
-for i in {1..1500}
+i=1
+while [ "$i" -le 1500 ]
 do
     echo
-    JSON='{"Place": { "order": {"live": "Limit", "side": "Buy", "price": 400'
-    JSON+="$i.0,"
-    JSON+='"volume": 4.4, "id": '
-    JSON+="$i,"
-    JSON+=' "sequance": '
-    JSON+="$i"
-    JSON+='} }}'
-    echo $JSON
+    JSON='{"Place": { "order": {"live": "Limit", "side": "Buy", "price": 400'"$i"'.0, "volume": 4.4, "id": '"$i"', "sequence": '"$i"' } }}'
+    echo "$JSON"
     rpc 21001/write "$JSON"
-done 
+    i=$((i + 1))
+done
 
 echo "Data written"

@@ -1,0 +1,61 @@
+syntax = "proto3";
+
+package matchengine.raft.v1;
+
+// The Raft peer-to-peer transport.
+//
+// Request and response bodies are `postcard`-encoded openraft types carried in the
+// `payload` bytes fields. The envelope stays protobuf so gRPC owns framing,
+// multiplexing, deadlines and streaming; the payload stays binary so the Raft
+// hot path does not pay for JSON.
+service RaftService {
+  // Unary AppendEntries. Used for single requests and by transports that do not
+  // pipeline.
+  rpc AppendEntries(AppendRequest) returns (AppendResponse);
+
+  // Unary RequestVote / PreVote.
+  rpc Vote(VoteCallRequest) returns (VoteCallResponse);
+
+  // Streamed full-snapshot install. The first chunk carries `vote` and `meta`;
+  // every chunk carries `data`, a monotonically increasing byte `offset`, and the
+  // final chunk sets `done`. A stream that ends without `done` is discarded.
+  rpc InstallSnapshot(stream SnapshotChunk) returns (SnapshotResponse);
+
+  // Bidirectional streaming AppendEntries. The server replies once per request in
+  // request order.
+  rpc AppendStream(stream AppendRequest) returns (stream AppendResponse);
+}
+
+message AppendRequest {
+  bytes payload = 1;
+}
+
+message AppendResponse {
+  bytes payload = 1;
+}
+
+message VoteCallRequest {
+  bytes payload = 1;
+}
+
+message VoteCallResponse {
+  bytes payload = 1;
+}
+
+message SnapshotChunk {
+  // Encoded `VoteOf<C>`; set on the first chunk only.
+  bytes vote = 1;
+  // Encoded `SnapshotMetaOf<C>`; set on the first chunk only.
+  bytes meta = 2;
+  // Snapshot bytes for this chunk.
+  bytes data = 3;
+  // Byte offset of `data` in the snapshot. Must equal the number of bytes
+  // already received.
+  uint64 offset = 4;
+  // Set on the terminal chunk. A terminal chunk may carry empty `data`.
+  bool done = 5;
+}
+
+message SnapshotResponse {
+  bytes payload = 1;
+}

@@ -33,7 +33,7 @@ impl fmt::Display for FollowerReadError {
 
 impl std::error::Error for FollowerReadError {}
 
-pub struct ExampleClient<C>
+pub struct MatchEngineClient<C>
 where C: RaftTypeConfig
 {
     /// The leader node to send request to.
@@ -44,7 +44,7 @@ where C: RaftTypeConfig
     pub inner: Client,
 }
 
-impl<C> ExampleClient<C>
+impl<C> MatchEngineClient<C>
 where C: RaftTypeConfig<Node = BasicNode>
 {
     /// Create a client with a leader node id and a node manager to get node address by node id.
@@ -118,7 +118,7 @@ where C: RaftTypeConfig<Node = BasicNode>
 
     /// Add a node as learner.
     ///
-    /// The node to add has to exist, i.e., being added with `write(ExampleRequest::AddNode{})`
+    /// The node to add has to exist, i.e., being added with `write(MatchEngineRequest::AddNode{})`
     pub async fn add_learner(
         &self,
         req: (C::NodeId, String),

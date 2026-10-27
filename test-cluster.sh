@@ -2,6 +2,13 @@
 
 set -o errexit
 
+# Demo script: use a dedicated data dir so a rerun starts from a clean cluster.
+# An explicit RAFT_DATA_DIR is respected and never wiped.
+if [ -z "${RAFT_DATA_DIR:-}" ]; then
+    export RAFT_DATA_DIR=/tmp/matchengine-raft-test-cluster
+    rm -rf "$RAFT_DATA_DIR"
+fi
+
 cargo build
 
 kill() {
@@ -67,7 +74,7 @@ sleep 1
 echo "Initialize server 1 as a single-node cluster"
 sleep 2
 echo
-rpc 21001/init '{}'
+rpc 21001/init '[]'
 
 echo "Server 1 is a leader now"
 
@@ -135,7 +142,7 @@ rpc 21003/read  '"foo"'
 echo "Write data on leader"
 sleep 1
 echo
-rpc 21001/write '{"Place": { "order": {"live": "Limit", "side": "Buy", "price": 4000.0, "volume": 4.4, "id": 1, "sequance": 0} }}'
+rpc 21001/write '{"Place": { "order": {"live": "Limit", "side": "Buy", "price": 4000.0, "volume": 4.4, "id": 1, "sequence": 0} }}'
 
 sleep 1
 echo "Data written"

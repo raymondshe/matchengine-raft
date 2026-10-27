@@ -1,575 +1,329 @@
-# OpenRaft实操分享
+# OpenRaft 实践分享（当前实现版）
 
-由于工作需要，一直对原子多播应用有非常浓厚的兴趣。通过一段时间的技术选型。我们非常幸运的得到了databOpenRaft实操分享end社群的热心支持。我也想通过我们的实际工作，对Openraft的未来应用尽一些微薄之力。
+本文最初记录了基于 openraft 早期版本、使用 sled 保存日志和状态机的实现。当前分支已经完成
+openraft 0.10 迁移，并改为**自研分段 WAL + 原子快照**的持久化方案，节点间 Raft RPC 默认使用
+**gRPC**。本文已按现在的代码重写；如果和代码不一致，以 `src/` 为准。
 
-我的实践的上一篇文章反应了我们的选型过程，有兴趣的人可以看一下。[Raft in Rust (原子多播+撮合引擎）](http://t.csdn.cn/jcOnv )这篇文章更多的是想说明我们在使用OpenRaft的实际问题，并且通过我们的实现，揭秘OpenRaft的一些机制。
+- 代码仓库：[raymondshe/matchengine-raft](https://github.com/raymondshe/matchengine-raft)
+- 依赖版本：`openraft` 0.10.0-alpha.37、`tonic` 0.14、`actix-web` 4.x
+- 运行环境：Rust 1.85+（edition 2024）
 
--------
+## 1. 应用场景
 
-## 代码仓库
+撮合引擎对延迟和顺序都很敏感：
 
-大家在使用OpenRaft的时候，我相信很多人都查看了手册：
-[Getting Started - openraftThe openraft user guide.](https://datafuselabs.github.io/openraft/getting-started.html)
+- 所有会改变订单簿的命令都必须经过 Raft 复制，并在每个节点按相同顺序应用。
+- 状态机本身尽量留在内存里，apply 时不做磁盘随机写。
+- 日志必须真正落盘，节点重启后能够从快照 + 日志尾部恢复。
+- 节点间复制要能流水线发送，快照传输不能阻塞投票。
 
-当然，这是一个非常优秀的手册。我们从这个手册里，会学习到如何使用OpenRaft实现自己的应用。而且，[openraft/example-raft-kv](https://github.com/datafuselabs/openraft/tree/main/example-raft-kv)这个例子确实能够很好的说明如何实现一个简单的应用。但是，这个例子是使用的内存来做持久化实现。当然内存不会真正做持久化，所以很容易在节点退出后，丢失状态。而我们真正需要的示例是一个能够持久化的例子。
+因此本项目的分工是：
 
+| 数据 | 存放方式 | 目的 |
+|---|---|---|
+| Raft 日志 | 分段预写日志 `log/*.wal` | 持久化、顺序追加、一次批次一次 fsync |
+| vote / last_purged | `log/state`（原子重写） | 安全关键但低频 |
+| 状态机 | 内存（KV + 订单簿 + 序列号） | apply 快 |
+| 快照 | `snapshot/current.snap`（原子替换） | 启动恢复和追赶落后节点 |
 
-另外一个实例就是 [databend/metasrv](https://github.com/datafuselabs/databend/tree/main/metasrv)而这个示例里面，我们可以看到一个完整的 metadata 存储服务的实现。实际上，metasrv本身是一个类似于etcd的kv存储。存储整个databend集群的metadata。这个示例里面，metasrv使用了sled作为底层存储。sled寄存储log，有存储 statemachine 的状态。这个例子，statemachine所有的更新都直接在sled存储里通过sled的事物完成了。所以，对于如何存储snapshot这个问题，我们并不太容易看清楚。所以snapshot的产生和传递主要是在节点间同步的时候使用。
+## 2. 整体结构
 
-这里，大家可以看到我们开放的源代码。虽然这个示例是基于 example-raft-kv 示例，没有达到 metasrv的生产强度。但是我们还是非常全面的表现出了 openraft 对 log, snapshot 处理的行为和能力。
+```
+应用层（KV + 订单簿撮合）
+        │
+OpenRaft Core（共识、复制、选举）
+        │
+┌───────┼────────────────┬──────────────────┐
+│       │                │                  │
+LogStore  StateMachineStore  RaftNetwork        HTTP API
+(WAL)     (内存 + 快照)      (gRPC / HTTP)       (actix-web)
+```
 
-[GitHub - raymondshe/matchengine-raft](https://github.com/raymondshe/matchengine-raft)
+节点由 `build_match_engine_node()`（`src/lib.rs`）组装：
 
--------
-## 应用场景
+1. 打开 `LogStore` 和 `StateMachineStore`。
+2. 创建 `Raft` 实例。
+3. 绑定 gRPC 监听端口并启动 tonic 服务。
+4. 启动 actix-web HTTP 服务，注册 Raft、管理、应用路由。
+5. 返回 `MatchEngineNode`；调用 `shutdown()` 可以干净地停止 HTTP、gRPC 和 Raft，之后再重开同一
+   存储目录（重启测试依赖这一点）。
 
-和metasrv的场景不同。我们需要我们的statemachine尽量在内存里面更新，尽量少落盘。虽然sled本地落盘的速度也很快，但是内存操作的速度会更快。所以，我们基本上就是这样进行操作的。
+## 3. 请求与应答类型
 
-![image info](./match_engine.png)
-
- *[总体设计图](https://excalidraw.com/#json=kSzwFGNGr_WNjytPO65RN,CjvsM4m_3efHnSIGK37Sow)*
-
-所以在这个图里面，大家可以看到日志是通过sled进行存储的。而这些日志由于通过Raft协议，实际上他们在每台机器上的顺序是一致的。所以，不同的matchengine-raft实例，在相同的日志流情况下，对状态机的操作就是一致的。所以，不管我们从哪一个日志开始写snapshot，通过加载snapshot并且回放后续的日志，我们都可以恢复到最新状态。
-
-按照设计图中显示，当前StateMachine的状态是处理了第9个日志里的消息。这时候，系统保存了所有的消息到Sled。并且在第3个消息的时候落盘了一次snapshot，并且在低6个消息的时候落盘了一次snapshot。如果这台机器当机，我们是可以从编号为3的snapshot恢复状态机，并且继续处理3,4,5,6,7,8,9这6条消息来恢复当前状态。当然，我们也可以从编号为6的snapshot恢复状态机，并且继续处理7,8,9这3条消息来恢复当前状态。
-
-当然我们可以选择多少个消息进行一次落盘。当然落盘的次数越多越可靠，但是性能影响比较大。好在snapshot的生成和落盘是异步的方式做的。
-
-有兴趣的朋友可以看一下akka的 [EventSroucing](https://doc.akka.io/docs/akka/current/typed/index-persistence.html "EventSroucing") 模式。这种模式和Raft单节点非常相像。不同的是OpenRaft强调多实例一致性，而Akka 则提供了非常多的方式来存储 Log( Journal )和 Snapshot.
-
--------
-
-## 实现细节
-
- 谈到实现细节。我们还是回到官方文档 [geting-started](https://datafuselabs.github.io/openraft/getting-started.html "geting-started") 来。我们也按照这个文档的顺序进行说明。
-
-Raft对于从应用开发着的角度，我们可以简化到下面的这张图里。Raft的分布式共识就是要保证驱动状态机的指令能够在 Log 里被一致的复制到各个节点里。
-
-![image info](https://datafuselabs.github.io/openraft/images/raft-overview.png)​
-
-
-Raft有两个重要的组成部分：
-
-* 如何一致的在节点之间复制日志
-* 并且在状态机里面如何消费这些日志
-
-基于OpenRaft 实现我们自己的 Raft 应用其实并不复杂，只需要一下三部分：
-
-* 定义好客户端的请求和应答
-* 实现好存储 RaftStore 来持久化状态
-* 实现一个网络层，来保证 Raft 节点之间能相互传递消息。
-
-好，那我们就开始吧：
-
-### 1. 定义好客户端的请求和应答
---------------------
-
-请求有可能是客户端发出的驱动 Raft 状态机的数据，而应答则是 Raft 状态机会打给客户端的数据。
-
-请求和应答需要实现 AppData 和 AppDataResponse 这里，我们的实现如下：
+应用命令定义在 `src/store/types.rs`：
 
 ```rust
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub enum ExampleRequest {
-    Set { key: String, value: String },
-    Place { order: Order },
-    Cancel { order: Order}
+pub enum MatchEngineRequest {
+    Set { key: String, value: String },
+    Place { order: Order },
+    Cancel { order: Order },
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct ExampleResponse {
-    pub value: Option<String>,
+pub struct MatchEngineResponse {
+    pub value: Option<String>,
 }
 ```
 
-这两个类型完全是应用相关的，而且和RaftStrage的状态机实现相关。
+`Order`（`src/matchengine/mod.rs`）包含 `live`（Limit/Market）、`side`（Buy/Sell）、`price`、
+`volume`、`id` 和 `sequence`。`sequence` 字段在反序列化时是必需的，但 `place_order()` 会用订单簿
+自己的计数器覆盖它。
 
-1. 这里，Set是 example-raft-kv 原示例就有的命令。
-2. 大家也注意到了，命令都是对状态机有驱动的命令。也就是会对状态机状态造成改变的命令。如果我们需要取状态机内部数据的值返回给客户端。我们大可不必定义到这里。
+## 4. 存储实现
 
---------
-### 2. 实现 RaftStorage
+### 4.1 分段 WAL（`src/store/log_store.rs`）
 
-这是整个项目非常关键的一部分。
+日志按段写入 `log/NNNNNNNNNN.wal`：
 
-只要实现好 trait RaftStorage，我们就把数据存储和消费的行为定义好。RaftStoreage可以包装一个像 [RocksDB](https://docs.rs/rocksdb/latest/rocksdb/ "RocksDB"), [Sled](https://github.com/spacejam/sled "Sled") 的本地 KV 存储或者远端的 SQL DB。
+- 每个段文件开头是 8 字节头：`MRFT` + 版本号（u32 LE）。
+- 每条记录是 `[len: u32 LE][crc32: u32 LE][postcard 负载]`。
+- `append()` 把 openraft 交来的一整批记录拼进一次 `write_all`，然后只做一次 `sync_data`。
+  因此一次 AppendEntries 携带 N 条日志时只付一次 fsync。
+- 读取使用 `pread`（`read_at`）和缓存的文件句柄，复制任务可以在追加进行时并发读取；磁盘 IO
+  期间不持有全局锁。
+- 所有阻塞 IO 都通过 `spawn_blocking` 执行，异步运行时只做编解码。
+- 默认段大小 64 MiB。只有被 purge 完全覆盖的段才会删除；删除前先轮转活跃段，保证日志不会出现
+  空洞。
+- 启动时逐段扫描。遇到长度非法、CRC 不匹配或文件尾部不完整的记录，就把它当作撕裂尾部截断，
+  而不是继续解析。
 
-RaftStorage 定义了下面一些API
+`LogStore` 实现 `RaftLogStorage`，包括 `get_log_state`、`read_vote`/`save_vote`、
+`read_committed`/`save_committed`、`append`、`truncate_after`、`purge` 和 `get_log_reader`。
+`committed` 作为普通 WAL 记录追加，不单独 fsync，由下一次 append 一并持久化。
 
+### 4.2 vote 与 purge 标记
 
-* 读写Raft状态，比方说 term，vote (term：任期，vote：投票结果）
+投票和 `last_purged` 数量少但关系正确性，单独放在 `log/state`：
 
-```rust
-fn save_vote(vote:&Vote) 
-fn read_vote() -> Result<Option<Vote>>
-```
+- 写入方式：临时文件 → `fsync` → `rename` → 目录 `fsync`。
+- 这样 crash 后只会看到旧的完整文件或新的完整文件，不会看到半个文件。
 
-* 读写日志
+### 4.3 状态机与快照（`src/store/state_machine.rs`）
 
-```rust 
-fn get_log_state() -> Result<LogState> fn try_get_log_entries(range) -> Result<Vec<Entry>> 
-fn append_to_log(entries) 
-fn delete_conflict_logs_since(since:LogId) 
-fn purge_logs_upto(upto:LogId)
-```
-
-* 将日志的内容应用到状态机
-
-``` rust
-fn last_applied_state() -> Result<(Option<LogId>,Option<EffectiveMembership>)> 
-fn apply_to_state_machine(entries) -> Result<Vec<AppResponse>>
-```
-
-* 创建和安装快照（snapshot） 
+状态机常驻内存：
 
 ```rust
-fn build_snapshot() -> Result<Snapshot> fn get_current_snapshot() -> Result<Option<Snapshot>> 
-fn begin_receiving_snapshot() -> Result<Box<SnapshotData>> 
-fn install_snapshot(meta, snapshot)
-```
-
-在 [ExampleStore](https://github.com/datafuselabs/openraft/blob/main/example-raft-kv/src/store/mod.rs "ExampleStore")，这些内存化存储行为是非常明确简单的。而我们不是要真正落盘了吗？那我们就看一下 matchengine-rust 是怎么实现的。
-
-这里是 [matchengine-raft/src/store](https://github.com/raymondshe/matchengine-raft/tree/master/src/store "matchengine-raft/src/store")
-
-| 接口 | 实现方式 |
-| ------------- |-------------| 
-|Raft状态 | sled存储，使用专门的key来读写raft状态。|
-|日志 | sled存储，使用 log_index 来唯一标识一个 Log Entity |
-|应用状态机 | 状态机里面一部分是业务数据，但是一部分是raft的数据。业务数据主要是订单薄。 |   
-|快照 | 快照完全是通过文件进行存储的，而且文件的名字就保留了快照的全部meta信息。|
-
-我们说明一些设计要点
-
-### ExampleStore的数据
-
-ExchangeStore 里面主要是包含下面的成员变量。
-
-```rust
-#[derive(Debug)]
-pub struct ExampleStore {
-
-    last_purged_log_id: RwLock<Option<LogId<ExampleNodeId>>>,
-
-    /// The Raft log.
-
-    pub log: sled::Tree,
-    
-    /// The Raft state machine.
-    pub state_machine: RwLock<ExampleStateMachine>,
-
-    /// The current granted vote.
-    vote: sled::Tree,
-
-    snapshot_idx: Arc<Mutex<u64>>,
-
-    current_snapshot: RwLock<Option<ExampleSnapshot>>,
-
-    config : Config,
-
-    pub node_id: ExampleNodeId,
-
+pub struct StateMachineData {
+    pub data: BTreeMap<String, String>, // KV
+    pub orders: Vec<Order>,              // 活动订单
+    pub sequence: u64,                   // 订单序列号
 }
 ```
 
-帮助我们落盘的成员主要是 log, vote。而需要产生snapshot进行落盘的所有内容都在 state_machine.
+`StateMachineStore` 另存 `last_applied_log`、`last_membership` 和当前快照，并实现
+`RaftStateMachine`（`applied_state`、`apply`、`get_current_snapshot`、`install_snapshot`、
+`get_snapshot_builder`）；快照生成通过 `RaftSnapshotBuilder::build_snapshot` 完成。
+`begin_receiving_snapshot` 使用 trait 默认实现。
 
-1. last_purged_log_id： 这是最后删除的日志ID。删除日志本身可以节约存储，但是，对我们来讲，我了保证数据存储的安全。在删除日志之前，我们必须有这条日志index大的snapshot产生。否则，我们就没有办法通过snapshot来恢复数据。
-
-2. log: 这是一个 sled::Tree，也就是一个map。如果看着部分代码的话，我们就可以清楚的明白log对象的结构。key是一个log_id_index的 Big Endian 的字节片段。value是通过serd_json进行序列化的内容。
-
-```rust
-    #[tracing::instrument(level = "trace", skip(self, entries))]
-    async fn append_to_log(
-        &mut self,
-        entries: &[&Entry<ExampleTypeConfig>],
-    ) -> Result<(), StorageError<ExampleNodeId>> {
-
-        let log = &self.log;
-        for entry in entries {
-            log.insert(entry.log_id.index.to_be_bytes(), IVec::from(serde_json::to_vec(&*entry).unwrap())).unwrap();
-        }
-        Ok(())
-    }
+快照文件 `snapshot/current.snap` 的格式：
 
 ```
-
-3. state_machine: 这里就是通过日志驱动的所有状态的集合。
-```rust
-#[derive(Serialize, Deserialize, Debug, Default, Clone)]pub struct ExampleStateMachine {
-
-    pub last_applied_log: Option<LogId<ExampleNodeId>>,
-
-    // TODO: it should not be Option.
-    pub last_membership: EffectiveMembership<ExampleNodeId>,
-
-    /// Application data.
-    pub data: BTreeMap<String, String>,
-
-    // ** Orderbook
-    pub orderbook: OrderBook,
-
-}
+"MRFSNAP" | version u32 | crc32 u32 | postcard(SnapshotPayload)
 ```
 
-StateMachine里面最重要的数据就是 orderbook这部分就是撮合引擎里面重要的订单表。存放买方和卖方的未成交订单信息。这是主要的业务逻辑。 data 这部分是原来例子中的kv存储。我们还在这里没有删除。
+`SnapshotPayload` 包含 `SnapshotMeta` 和 postcard 编码的 `StateMachineData`。写盘流程是
+临时文件 → `fsync` → `rename` → 目录 `fsync`；`install_snapshot` 会先校验 magic、版本、CRC 和
+内容，再替换磁盘上的副本，坏快照不会破坏已有的好快照。启动时如果快照损坏，节点会直接报错，
+而不是静默从空状态启动。
 
-这里last_applied_log, last_menbership 这些状态和业务逻辑没有太大关系。所以，如果您要实现自己的StateMachine。还是尽量和例子保持一致。主要是因为这两个状态是通过apply_to_state_machine这个接口更新。也正好需要持久化。如果需要进一步隐藏raft的细节，我们还是建议openraft能将这两个状态进一步进行隐藏封装。
+### 4.4 数据目录
 
-对state_machine的落盘操作主要集中在这里：[store/store.rs](https://github.com/raymondshe/matchengine-raft/blob/master/src/store/store.rs "store/store.rs")。有兴趣的可以看一下。这里面比较有意思的问题是orderbook本身无法被默认的serde_json序列化/反序列化。所以我们才在 [matchengine/mod.rs](https://github.com/raymondshe/matchengine-raft/blob/master/src/matchengine/mod.rs "matchengine/mod.rs") 加了这段代码：
+每个节点使用独立目录：
 
-```rust
-pub mod vectorize {
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
-    use std::iter::FromIterator;
- 
-    pub fn serialize<'a, T, K, V, S>(target: T, ser: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-        T: IntoIterator<Item = (&'a K, &'a V)>,
-        K: Serialize + 'a,
-        V: Serialize + 'a,
-    {
-        let container: Vec<_> = target.into_iter().collect();
-        serde::Serialize::serialize(&container, ser)
-    }
- 
-    pub fn deserialize<'de, T, K, V, D>(des: D) -> Result<T, D::Error>
-    where
-        D: Deserializer<'de>,
-        T: FromIterator<(K, V)>,
-        K: Deserialize<'de>,
-        V: Deserialize<'de>,
-    {
-        let container: Vec<_> = serde::Deserialize::deserialize(des)?;
-        Ok(T::from_iter(container.into_iter()))
-    }
-}
- 
-/// main OrderBook structure
-#[derive(Clone, Default, Serialize, Deserialize, Debug)]
-pub struct OrderBook {
-    #[serde(with = "vectorize")]
-    pub bids: BTreeMap<BidKey, Order>,
-    #[serde(with = "vectorize")]
-    pub asks: BTreeMap<AskKey, Order>,
-    pub sequance: u64,
-}
+```
+<data_dir>/<instance_prefix>-<node_id>/
+  log/
+    state
+    0000000000.wal
+  snapshot/
+    current.snap
 ```
 
-4. vote: 就是对最后一次vote的存储。具体请看, 铁这段代码倒不是因为这段代码有多重要，只是由于代码比较简单，看可以少些一些说明：
+由 `StorageConfig`（`src/store/config.rs`）计算，命令行参数是 `--data-dir` 和
+`--instance-prefix`，对应环境变量 `RAFT_DATA_DIR` 和 `RAFT_INSTANCE_PREFIX`。默认值分别是
+`/tmp/matchengine-raft` 和 `matchengine`。
+
+### 4.5 恢复流程
+
+节点启动时：
+
+1. 扫描 WAL，重建索引、读取 vote 和 `last_purged`，截断撕裂尾部。
+2. 如果存在 `snapshot/current.snap`，加载它并重建 KV、订单簿和序列号。
+3. openraft 在恢复出的状态之上重放保留的日志尾部。
+
+因此单节点重启后可以恢复所有已提交的 KV 写入、订单簿和序列号。纯日志重放和“快照 + 尾部”两条
+路径都由 `tests/cluster/test_restart.rs` 覆盖。
+
+### 4.6 快照与日志保留
+
+`default_raft_config()` 只覆盖心跳和选举时间，快照策略使用 openraft 默认值
+（`LogsSinceLast(5000)`，`max_in_snapshot_log_to_keep = 1000`）。测试会按需调小：
 
 ```rust
-#[tracing::instrument(level = "trace", skip(self))]
-    async fn save_vote(&mut self, vote: &Vote<ExampleNodeId>) -> Result<(), StorageError<ExampleNodeId>> {
-        self.vote.insert(b"vote", IVec::from(serde_json::to_vec(vote).unwrap())).unwrap();
-        Ok(())
-    }
- 
-    async fn read_vote(&mut self) -> Result<Option<Vote<ExampleNodeId>>, StorageError<ExampleNodeId>> {
-        let value = self.vote.get(b"vote").unwrap();
-        match value {
-            None => {Ok(None)},
-            Some(val) =>  {Ok(Some(serde_json::from_slice::<Vote<ExampleNodeId>>(&*val).unwrap()))}
-        }
-    }
-```
-但是这儿确实有个小坑，之前我没有注意到vote需要持久化，开始调试的时候产生了很多问题。知道找到openraft作者 Zhang Yanpo才解决。也是出发我想开源这个 openraft 文件持久化实现的诱因吧。感谢 Zhang Yanpo, 好样的。
-
-5. 其他的成员变量其实没什么太好说的了。和原例子一样。
-
-### 对日志和快照的控制
-
-日志，快照相互配合，我们可以很好的持久化状态，并且恢复最新状态。多久写一次快照，保存多少日志。在这里我们使用了下面的代码。
-```rust
-let mut config = Config::default().validate().unwrap();
-    config.snapshot_policy = SnapshotPolicy::LogsSinceLast(500);
-    config.max_applied_log_to_keep = 20000;
-    config.install_snapshot_timeout = 400;
-```  
-
-强烈建议大家看一下 [Config in openraft::config - Rust](https://docs.rs/openraft/latest/openraft/config/struct.Config.html "Config in openraft::config - Rust")
-
-重点看 snapshot_policy, 代码里可以清楚的标识，我们需要500次log写一次快照。也就是 openraft会调用 build_snapshot 函数创建snapshot。原示例里，snapshot只是在内存里保存在 current_snapshot 变量里。而我们需要真实的落盘。请注意这段代码的 self.write_snapshot()
-
-```rust
-#[async_trait]
-impl RaftSnapshotBuilder<ExampleTypeConfig, Cursor<Vec<u8>>> for Arc<ExampleStore> {
-    #[tracing::instrument(level = "trace", skip(self))]
-    async fn build_snapshot(
-        &mut self,
-    ) -> Result<Snapshot<ExampleTypeConfig, Cursor<Vec<u8>>>, StorageError<ExampleNodeId>> {
-        let (data, last_applied_log);
- 
-        {
-            // Serialize the data of the state machine.
-            let state_machine = self.state_machine.read().await;
-            data = serde_json::to_vec(&*state_machine)
-                .map_err(|e| StorageIOError::new(ErrorSubject::StateMachine, ErrorVerb::Read, AnyError::new(&e)))?;
- 
-            last_applied_log = state_machine.last_applied_log;
-        }
- 
-        let last_applied_log = match last_applied_log {
-            None => {
-                panic!("can not compact empty state machine");
-            }
-            Some(x) => x,
-        };
- 
-        let snapshot_idx = {
-            let mut l = self.snapshot_idx.lock().unwrap();
-            *l += 1;
-            *l
-        };
- 
-        let snapshot_id = format!(
-            "{}-{}-{}",
-            last_applied_log.leader_id, last_applied_log.index, snapshot_idx
-        );
- 
-        let meta = SnapshotMeta {
-            last_log_id: last_applied_log,
-            snapshot_id,
-        };
- 
-        let snapshot = ExampleSnapshot {
-            meta: meta.clone(),
-            data: data.clone(),
-        };
- 
-        {
-            let mut current_snapshot = self.current_snapshot.write().await;
-            *current_snapshot = Some(snapshot);
-        }
- 
-        self.write_snapshot().await.unwrap();
- 
-        Ok(Snapshot {
-            meta,
-            snapshot: Box::new(Cursor::new(data)),
-        })
-    }
-}
+let mut config = default_raft_config();
+config.snapshot_policy = SnapshotPolicy::LogsSinceLast(10);
+config.max_in_snapshot_log_to_keep = 0; // 快照覆盖的日志全部 purge
 ```
 
-这下我们有了snapshot，当然snapshot一方面可以用来在节点之间同步状态。另一方面就是在启动的时候恢复状态。而 openraft 的实现非常好。实际上恢复状态只需要回复到最新的snapshot就行。只要本地日志完备，openraft 会帮助你调用 apply_to_statemachine 来恢复到最新状态。所以我们就有了restore函数。
+`tests/cluster/test_snapshot.rs` 依赖这组配置：学习者必须在日志被 purge 之后才加入，否则它可
+通过普通日志复制追上，测试就证明不了快照安装路径。
 
-```rust
-#[async_trait]
-impl Restore for Arc<ExampleStore> {
-    #[tracing::instrument(level = "trace", skip(self))]
-    async fn restore(&mut self) {
-        tracing::debug!("restore");
-        let log = &self.log;
- 
-        let first = log.iter().rev()
-        .next()
-        .map(|res| res.unwrap()).map(|(_, val)|
-            serde_json::from_slice::<Entry<ExampleTypeConfig>>(&*val).unwrap().log_id);
- 
-        match first {
-            Some(x) => {
-                tracing::debug!("restore: first log id = {:?}", x);
-                let mut ld = self.last_purged_log_id.write().await;
-                *ld = Some(x);
-            },
-            None => {}
-        }
- 
-        let snapshot = self.get_current_snapshot().await.unwrap();
- 
-        match snapshot {
-            Some (ss) => {self.install_snapshot(&ss.meta, ss.snapshot).await.unwrap();},
-            None => {}
-        }
-    }
-}
-```
+## 5. 网络层
 
-大家注意一下snapshot的操作。当然，在这里，我们也恢复了last_purged_log_id。
+### 5.1 两种传输
 
-当然store这个函数会在ExampleStore刚刚构建的时候调用。
+`src/network/transport.rs` 在运行时选择出站 Raft RPC 的传输：
 
- ```rust
-    // Create a instance of where the Raft data will be stored.
-    let es = ExampleStore::open_create(node_id);
-    
-    //es.load_latest_snapshot().await.unwrap();
- 
-    let mut store = Arc::new(es);
-    
-    store.restore().await;
-```
+- `Transport::Grpc`（默认）：`src/network/grpc/`，protobuf 信封 + postcard 负载。
+- `Transport::Http`：`src/network/raft_network_impl.rs`，HTTP/JSON。
 
-### 如何确定RaftStorage是对的
+不管选哪种，节点都会同时提供：
 
-请查阅 [Test suite for RaftStorage](https://github.com/datafuselabs/openraft/blob/main/memstore/src/test.rs "Test suite for RaftStorage"), 如果通过这个测试，一般来讲，OpenRaft就可以使用他了。
+- 公共 HTTP API 和 HTTP Raft 端点（`/append`、`/vote`、`/snapshot`）；
+- gRPC Raft 服务（`AppendEntries`、`Vote`、`InstallSnapshot`、`AppendStream`）。
 
-```rust
-#[test] 
-pub fn test_mem_store() -> anyhow::Result<()> { openraft::testing::Suite::test_all(MemStore::new) }
-```
+### 5.2 端口约定
 
-### RaftStorage的竞争状态
+`BasicNode.addr` 始终保存公共 HTTP 地址，Raft 传输端口由
+`raft_addr_from_http(addr)` 推导：同一主机，端口 + `RAFT_PORT_OFFSET`（1000）。
 
-在我们的设计里，在一个时刻，最多有一个线程会写状态，但是，会有多个线程来进行读取。比方说，可能有多个复制任务在同时度日志和存储。
+- `127.0.0.1:21001` → gRPC `127.0.0.1:22001`
+- 客户端转发仍然使用 `addr`，不需要第二个地址字段。
 
-### 实现必须保证数据持久性
+### 5.3 gRPC 细节
 
-调用者会假设所有的写操作都被持久化了。而且Raft的纠错机制也是依赖于可靠的存储。
+- 普通 append/vote 使用一元 RPC，并遵循 `RPCOption::soft_ttl()`。
+- `stream_append` 使用双向流 `AppendStream`， follower 直接把请求喂给 `Raft::stream_append`，
+  实现流水线复制而不是一问一答。
+- 快照使用客户端流式 `InstallSnapshot`，每块 256 KiB。
+- 每个对端分别持有复制、心跳、快照三条连接，快照不会阻塞投票。
+- 双向消息上限都是 64 MiB；快照总大小不受单条消息限制。
+- 错误映射：`Unavailable` → `RPCError::Unreachable`，超时/`DeadlineExceeded` →
+  `RPCError::Timeout`，其他状态 → `RPCError::Network`；Raft 层拒绝以编码后的 `RaftError` 返回。
 
-----------------------
-## 3. 实现 RaftNetwork
+HTTP 传输保留为兼容和对照实现；它的 `stream_append` 仍然是顺序发送。
 
+## 6. 启动集群
 
-为了节点之间对日志能够有共识，我们需要能够让节点之间进行通讯。trait RaftNetwork就定义了数据传输的需求。RaftNetwork的实现可以是考虑调用远端的Raft节点的服务
-
-```rust
-pub trait RaftNetwork<D>: Send + Sync + 'static where D: AppData { 
-    async fn send_append_entries(&self, target: NodeId, node:Option<Node>, rpc: AppendEntriesRequest<D>) -> Result<AppendEntriesResponse>; 
-    async fn send_install_snapshot( &self, target: NodeId, node:Option<Node>, rpc: InstallSnapshotRequest,) -> Result<InstallSnapshotResponse>; 
-    async fn send_vote(&self, target: NodeId, node:Option<Node>, rpc: VoteRequest) -> Result<VoteResponse>; 
-}
-```
-
-[ExampleNetwork](https://github.com/datafuselabs/openraft/blob/main/example-raft-kv/src/network/raft_network_impl.rs "ExampleNetwork") 显示了如何调用传输消息。每一个Raft节点都应该提供有这样一个RPC服务。当节点收到raft rpc，服务会吧请求传递给raft实例，并且通过[raft-server-endpoint](https://github.com/datafuselabs/openraft/blob/main/example-raft-kv/src/network/raft.rs "raft-server-endpoint")返回应答。
-
-在实际情况下可能使用 [Tonic gRPC](https://github.com/hyperium/tonic "Tonic gRPC")是一个更好的选择。 [databend-meta](#L89 "databend-meta") 里有一个非常好的参考实现。
-
-在我们的 matchengen-raft 实现里，我们解决了原示例中大量重连的问题。
-
-1. 维护一个可服用量的client
-
-这段代码在：[network/raft_network_impl.rs](https://github.com/raymondshe/matchengine-raft/blob/master/src/network/raft_network_impl.rs "network/raft_network_impl.rs")
-
-```rust
-     let clients = Arc::get_mut(&mut self.clients).unwrap();
-     let client = clients.entry(url.clone()).or_insert(reqwest::Client::new());
-```
-2. 在服务器端引入keep_alive
-
-这段代码在：[lib.rs](https://github.com/raymondshe/matchengine-raft/blob/master/src/lib.rs "lib.rs")
-```rust
-    // Start the actix-web server.
-    let server = HttpServer::new(move || {
-        App::new()
-            .wrap(Logger::default())
-            .wrap(Logger::new("%a %{User-Agent}i"))
-            .wrap(middleware::Compress::default())
-            .app_data(app.clone())
-            // raft internal RPC
-            .service(raft::append)
-            .service(raft::snapshot)
-            .service(raft::vote)
-            // admin API
-            .service(management::init)
-            .service(management::add_learner)
-            .service(management::change_membership)
-            .service(management::metrics)
-            // application API
-            .service(api::write)
-            .service(api::read)
-            .service(api::consistent_read)
-    }).keep_alive(Duration::from_secs(5));
-```
-
-这样的改动确实是对性能有一些提升。但是真的需要更快的话，我们使用grpc，甚至使用 reliable multicast，比方说 [pgm](https://datatracker.ietf.org/doc/html/rfc3208 "pgm")。
-
-------------
-## 4. 启动集群
-
-由于我们保留了之前的 key/value 实现。所以之前的脚本应该还是能够工作的。而且之前的key/value 有了真正的存储。
-
-为了能够运行集群：
-
-* 启动三个没有初始化的raft节点;
-* 初始化其中一台raft节点；
-* 把其他的raft节点加入到这个集群里;
-* 更新raft成员配置。
-[example-raft-kv](https://github.com/datafuselabs/openraft/tree/main/example-raft-kv "example-raft-kv") 的readme文档里面把这些步骤都介绍的比较清楚了。
-
-* 下面两个测试脚本是非常有用的：
-[test-cluster.sh](https://github.com/datafuselabs/openraft/blob/main/example-raft-kv/test-cluster.sh "test-cluster.sh") 这个脚本可以简练的掩饰如何用curl和raft集群进行交互。在脚本里，您可以看到所有http请求和应答。
-
-
-
-[test\_cluster.rs](https://github.com/datafuselabs/openraft/blob/main/example-raft-kv/tests/cluster/test_cluster.rs "test_cluster.rs") 这个rust程序显示了怎么使用ExampleClient操作集群，发送请求和接受应答。
- 
-
-这里我们要强调的是，在初始化raft集群的时候。我们需要上述的过程。如果集群已经被初始化，并且我们已经持久化了相应的状态 （menbership, vote, log) 以后，再某些节点退出并且重新加入，我们就不需要再过多干预了。
-
-在使用metasrv启动meta service的时候，我也遇到了相同的情况。所以还是要先启动一个single node以保证这个节点作为种子节点被合理初始化了。
-
-[Deploy a Databend Meta Service Cluster | Databend](https://databend.rs/doc/manage/metasrv/metasrv-deploy "Deploy a Databend Meta Service Cluster | Databend")
-
-为了更好的启动管理集群，我们在项目里添加了 [test.sh](https://github.com/raymondshe/matchengine-raft/blob/master/test.sh "test.sh")。用法如下：
-
+### 6.1 启动节点
 
 ```bash
-./test.sh <command> <node_id>
+cargo build
+
+./target/debug/matchengine-raft --id 1 --http-addr 127.0.0.1:21001
+./target/debug/matchengine-raft --id 2 --http-addr 127.0.0.1:21002
+./target/debug/matchengine-raft --id 3 --http-addr 127.0.0.1:21003
 ```
 
-我们可以在不同阶段调用不同的命令。大家有兴趣的话可以看一下代码。这部分是主程序部分，包含了我们实现的所有命令。
+默认使用 gRPC 连接对端；加 `--transport http` 可切回 HTTP/JSON。所有状态默认写到
+`/tmp/matchengine-raft/matchengine-<id>/`。
+
+### 6.2 初始化
 
 ```bash
-echo "Run command $1"
-case $1 in
-"place-order")
-    place_order $2
-    ;;
-"metrics")
-    get_metrics $2
-    ;;
- 
-"kill-node")
-    kill_node $2
-    ;;
-"kill")
-    kill
-    ;;
-"start-node")
-    start_node $2
-    ;;
-"get-seq")
-    rpc 2100$2/read  '"orderbook_sequance"'
-    ;;
-"build-cluster")
-    build_cluster $2
-    ;;
-"change-membership")
-	change_membership $2
-    ;;
- 
-"clean")
-    clean
-    ;;
-  *)
-    "Nothing is done!"
-    ;;
-esac
+curl -X POST -H "Content-Type: application/json" \
+  -d '[]' \
+  http://127.0.0.1:21001/init
 ```
-# 未来的工作
 
-当前我们实现的matchengine-raft只是为了示例怎么通过raft应用到撮合引擎这样一个对性能，稳定性，高可用要求都非常苛刻的应用场景。通过 raft 集群来完成撮合引擎的分布式管理。我们相信真正把这个玩具撮合引擎推向产品环境，我们还是需要进行很多工作：
+`/init` 接收 JSON 数组：`[]` 表示把当前节点初始化为单节点集群。直接 POST 或 `{}` 会反序列化
+失败（"invalid type: map, expected a sequence"）。
 
-1. 优化序列化方案，serd_json固然好，但是通过字符串进行编解码还是差点儿意思。至少用到bson或者更好的用 protobuf, avro等，提高编解码速度，传输和存储的开销。
-2. 优化RaftNetwork, 在可以使用multi-cast的情况下使用pgm，如果不行，可以使用grpc。
-3. 撮合结果的分发。这部分在很多情况下依赖消息队列中间件比较好。
-4. 增加更多的撮合算法。这部分完全是业务需求，和openraft无关。我们就不在这个文章里讨论了。
-5. 完善测试和客户端的调用。
-6. 完善压测程序，准备进一步调优。
+### 6.3 添加学习者和变更成员
 
-# 结论
+```bash
+curl -X POST -H "Content-Type: application/json" \
+  -d '[2, "127.0.0.1:21002"]' \
+  http://127.0.0.1:21001/add-learner
 
-通过这个简单的小项目，我们：
+curl -X POST -H "Content-Type: application/json" \
+  -d '[3, "127.0.0.1:21003"]' \
+  http://127.0.0.1:21001/add-learner
 
-1. 实现了一个简单的玩具撮合引擎。
-2. 验证了OpenRaft在功能上对撮合引擎场景的支持能力。
-3. 给OpenRaft提供了一个基于 sled KV存储的日志存储的参考实现。
-4. 给OpenRaft提供了一个基于本地文件的快照存储的参考实现。
+curl -X POST -H "Content-Type: application/json" \
+  -d '[1, 2, 3]' \
+  http://127.0.0.1:21001/change-membership
+```
 
-给大家透露一个小秘密，SAP也在使用OpenRaft来构建关键应用。大家想想，都用到Raft协议了，一定是非常重要的应用。
+成员关系、vote 和日志都会持久化，所以集群一旦初始化，节点重启后不需要重新 init；直接启动即可
+重新加入。
 
-对于 databend 社群的帮助，我表示由衷的感谢。作为一个长期工作在软件行业一线的老程序猿，看到中国开源软件开始在基础构建发力，由衷的感到欣慰。也希望中国开源社群越来越好，越来越强大，走向软件行业的顶端。
-​
+### 6.4 脚本
+
+- `./test-cluster.sh`：启动 3 节点、初始化、添加 learner、变更成员、读写，最后杀掉进程。使用
+  `/tmp/matchengine-raft-test-cluster`，未显式设置 `RAFT_DATA_DIR` 时每次启动前清空，便于重复运行。
+- `./open-cluster.sh`：同样启动并初始化 3 节点，但保持运行，便于手工调试；使用
+  `/tmp/matchengine-raft-open-cluster`。
+- `./test.sh <command> [node]`：日常手工操作，支持 `start-node`、`build-cluster`、
+  `change-membership`、`metrics`、`place-order`、`get-seq`、`kill-node`、`kill`、`clean`。
+
+`test.sh clean` 会把整个 `RAFT_DATA_DIR` 重命名为带时间戳的目录，再创建空目录；它不会删除数据。
+
+## 7. 读取路径
+
+| 端点 | 一致性 | 说明 |
+|---|---|---|
+| `POST /read` | 本地读，可能过期 | 直接读本地状态机 |
+| `POST /linearizable_read` | 线性一致 | 必须到达领导者，先获取 linearizer 再等待状态机追上 |
+| `POST /follower_read` | 线性一致 | follower 向领导者请求 linearizer，本地等待后读取 |
+
+三个端点都接收 JSON 字符串键。除普通 KV 键外：
+
+- `orderbook_orders`：所有活动订单的 JSON 数组；
+- `orderbook_sequence`：订单序列号（兼容旧拼写 `orderbook_sequance`）。
+
+## 8. 测试
+
+`cargo test` 运行库内单元测试和 `tests/cluster` 集成目标：
+
+| 文件 | 覆盖内容 |
+|---|---|
+| `tests/cluster/test_cluster.rs` | 3 节点集群全流程，默认 gRPC；`MATCHENGINE_TEST_TRANSPORT=http` 时走 HTTP |
+| `tests/cluster/test_snapshot.rs` | 快照生成、日志 purge、学习者通过 gRPC 安装快照 |
+| `tests/cluster/test_storage.rs` | WAL 帧、撕裂尾部、段轮转、跨段 truncate/purge、vote/committed、快照构建/安装/重开、损坏检测 |
+| `tests/cluster/test_restart.rs` | 完整节点重启：日志重放恢复和快照 + 尾部恢复 |
+
+每个集成测试使用唯一的临时数据目录。测试端口固定：集群测试 `21001-21003`（gRPC
+`22001-22003`），快照测试 `21101-21102`，重启测试 `21201-21202`。重跑前先清理残留进程：
+
+```bash
+pkill -f matchengine-raft
+```
+
+## 9. 性能考虑
+
+已做的优化：
+
+- 一批日志一次 `write_all` + 一次 `sync_data`，避免逐条 fsync。
+- `pread` 并发读，追加与复制读取互不阻塞。
+- 状态机留在内存，apply 不做磁盘 IO。
+- gRPC 双向流复制，减少 RTT 往返。
+- 快照分块传输，并与投票/追加使用独立连接。
+- 快照和 `log/state` 原子替换，崩溃后不需要额外修复流程。
+
+尚未完成：
+
+- 没有 HTTP/JSON 与 gRPC 的基准测试工具，`docs/TRANSPORTS.md` 中的数字只是预期，不是实测。
+- gRPC 监听器尚未配置 TLS/mTLS。
+- 快照仍然整体缓冲在内存中；更大的订单簿需要流式安装。
+
+## 10. 未来工作
+
+1. 构建传输基准：L1 RPC 微基准 + L2 三节点提交延迟，记录 HTTP/JSON 与 gRPC 的对比。
+2. 为 gRPC 增加 TLS/mTLS。
+3. 实现 openraft 的 `pre_vote` / `transfer_leader` RPC（当前使用 trait 默认实现）。
+4. 撮合结果分发（消息队列）和更多撮合算法（市价单、整数 tick 价格）。
+5. 完善客户端库和端到端压测。
+
+## 11. 结论
+
+当前实现已经具备：
+
+1. 一个可运行的 Raft 撮合引擎示例；
+2. 真正持久化的 Raft 日志（分段 WAL）和状态机快照；
+3. 节点重启后的完整恢复能力，并有集成测试覆盖；
+4. 默认 gRPC、可切换 HTTP 的传输层，以及流式追加和分块快照。
+
+它仍然是一个示例工程，不是生产级交易所；上生产前至少需要补齐 TLS、基准测试、监控和更严格的
+撮合/金额表示。
+
+感谢 Databend 社区和 openraft 作者 Zhang Yanpo 的支持。

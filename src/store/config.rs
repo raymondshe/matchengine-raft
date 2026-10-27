@@ -1,53 +1,111 @@
-use clap::Parser;
+//! Filesystem layout for a node's durable state.
+//!
+//! Every node owns a directory so that several nodes can share one machine (the tests do exactly
+//! that). The layout is:
+//!
+//! ```text
+//! <data_dir>/<instance_prefix>-<node_id>/
+//!   log/
+//!     state            # vote + last purged log id, written atomically
+//!     0000000000.wal   # append-only segments, one fsync per append
+//!   snapshot/
+//!     current.snap     # latest state machine snapshot, written atomically
+//! ```
 
-use serde::Deserialize;
-use serde::Serialize;
+use std::path::Path;
+use std::path::PathBuf;
 
-/// Configuration for the Raft storage layer.
-///
-/// This struct defines all configurable parameters for the persistent storage
-/// system, including paths for snapshots and journal files, as well as
-/// snapshot triggering behavior.
-#[derive(Clone, Debug, Serialize, Deserialize, Parser)]
-pub struct Config {
-    /// Directory path where state machine snapshots will be stored.
-    ///
-    /// Snapshots are periodic saves of the entire state machine state,
-    /// allowing for faster recovery by replaying only the logs after
-    /// the snapshot was taken.
-    #[clap(long, env = "RAFT_SNAPSHOT_PATH", default_value = "/tmp/snapshot")]
-    pub snapshot_path: String,
+use crate::MatchEngineNodeId;
 
-    /// Prefix string used for naming storage files.
-    ///
-    /// This prefix helps identify which Raft instance the files belong to,
-    /// useful when running multiple clusters or instances on the same machine.
-    #[clap(long, env = "RAFT_INSTANCE_PREFIX", default_value = "match")]
+/// Environment variable that overrides [`StorageConfig::data_dir`].
+pub const DATA_DIR_ENV: &str = "RAFT_DATA_DIR";
+/// Environment variable that overrides [`StorageConfig::instance_prefix`].
+pub const INSTANCE_PREFIX_ENV: &str = "RAFT_INSTANCE_PREFIX";
+
+/// Default root directory for node data.
+pub const DEFAULT_DATA_DIR: &str = "/tmp/matchengine-raft";
+/// Default prefix used when naming a node directory.
+pub const DEFAULT_INSTANCE_PREFIX: &str = "matchengine";
+
+/// Where a node keeps its durable state.
+#[derive(Clone, Debug)]
+pub struct StorageConfig {
+    /// Root directory; each node gets a subdirectory below it.
+    pub data_dir: PathBuf,
+
+    /// Prefix of the per-node directory name. Change it to run independent
+    /// clusters from the same `data_dir`.
     pub instance_prefix: String,
-
-    /// Directory path where the Raft journal (write-ahead log) will be stored.
-    ///
-    /// The journal contains all Raft log entries persisted using Sled,
-    /// ensuring durability of all operations before they are applied.
-    #[clap(long, env = "RAFT_JOURNAL_PATH", default_value = "/tmp/journal")]
-    pub journal_path: String,
-
-    /// Number of log entries after which a new snapshot should be created.
-    ///
-    /// A lower value creates snapshots more frequently, reducing recovery
-    /// time but increasing I/O overhead. A higher value reduces I/O but
-    /// may increase recovery time.
-    #[clap(long, env = "RAFT_SNAPSHOT_PER_EVENTS", default_value = "500")]
-    pub snapshot_per_events: u32,
 }
 
-impl Default for Config {
-    /// Creates a default configuration using default values for all fields.
-    ///
-    /// The default values are suitable for development and testing environments.
-    /// For production use, consider adjusting paths and snapshot frequency
-    /// based on your workload requirements.
+impl Default for StorageConfig {
     fn default() -> Self {
-        <Self as Parser>::parse_from(&Vec::<&'static str>::new())
+        let data_dir = std::env::var_os(DATA_DIR_ENV)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_DATA_DIR));
+        let instance_prefix = std::env::var(INSTANCE_PREFIX_ENV)
+            .unwrap_or_else(|_| DEFAULT_INSTANCE_PREFIX.to_string());
+
+        Self {
+            data_dir,
+            instance_prefix,
+        }
+    }
+}
+
+impl StorageConfig {
+    /// Uses `data_dir` with the default instance prefix.
+    pub fn new(data_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            data_dir: data_dir.into(),
+            instance_prefix: DEFAULT_INSTANCE_PREFIX.to_string(),
+        }
+    }
+
+    /// Sets the instance prefix, e.g. to isolate two clusters sharing a disk.
+    pub fn with_instance_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.instance_prefix = prefix.into();
+        self
+    }
+
+    /// Directory holding this node's durable state.
+    pub fn node_dir(&self, node_id: MatchEngineNodeId) -> PathBuf {
+        self.data_dir.join(format!("{}-{node_id}", self.instance_prefix))
+    }
+
+    /// Directory holding the Raft log segments.
+    pub fn log_dir(&self, node_id: MatchEngineNodeId) -> PathBuf {
+        self.node_dir(node_id).join("log")
+    }
+
+    /// Directory holding the state machine snapshot.
+    pub fn snapshot_dir(&self, node_id: MatchEngineNodeId) -> PathBuf {
+        self.node_dir(node_id).join("snapshot")
+    }
+}
+
+/// Best-effort fsync of a directory, so a rename or unlink survives a crash.
+pub(crate) fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    // Opening a directory for reading is not possible on every platform; failing to
+    // fsync it only weakens crash safety, so it must not fail the operation.
+    match std::fs::File::open(dir) {
+        Ok(f) => f.sync_all(),
+        Err(_) => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn node_dirs_are_isolated_per_node() {
+        let config = StorageConfig::new("/data").with_instance_prefix("cluster-a");
+
+        assert_eq!(Path::new("/data/cluster-a-1"), config.node_dir(1));
+        assert_eq!(Path::new("/data/cluster-a-2"), config.node_dir(2));
+        assert_ne!(config.log_dir(1), config.log_dir(2));
+        assert_eq!(Path::new("/data/cluster-a-1/log"), config.log_dir(1));
+        assert_eq!(Path::new("/data/cluster-a-1/snapshot"), config.snapshot_dir(1));
     }
 }

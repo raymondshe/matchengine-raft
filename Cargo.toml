@@ -19,27 +19,36 @@ path = "src/bin/main.rs"
 
 [dependencies]
 actix-web = "4.0.0-rc.2"
+async-stream = "0.3.6"
 async-trait = "0.1.36"
 clap = { version = "4.1.11", features = ["derive", "env"] }
+crc32fast = "1.4"
 env_logger = "0.9.0"
-openraft = { git = "https://github.com/datafuselabs/openraft", rev = "903770f", features = ["serde", "type-alias"] }
-openraft-legacy = { git = "https://github.com/datafuselabs/openraft", rev = "903770f" }
+openraft = { version = "0.10.0-alpha.37", features = ["serde", "type-alias"] }
 futures = "0.3"
+postcard = { version = "1.1.3", features = ["use-std"] }
+prost = "0.14.4"
 reqwest = { version = "0.12.5", features = ["json"] }
 serde = { version="1.0.114", features=["derive", "rc"] }
 serde_json = "1.0.57"
-tokio = { version="1.39", default-features=false, features=["sync", "io-util", "macros", "rt", "rt-multi-thread", "time", "tracing"] }
+tokio = { version="1.39", default-features=false, features=["sync", "net", "io-util", "macros", "rt", "rt-multi-thread", "time", "tracing"] }
+tokio-stream = { version = "0.1.19", features = ["net", "sync"] }
+tonic = "0.14.7"
+tonic-prost = "0.14.7"
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.0", features = ["env-filter"] }
 uuid = { version = "0.8.1", features = ["v4"] }
 sled = "0.34.7"
-walkdir = "2.3.2"
 rand = "0.9"
 thiserror = "2.0.18"
 
 [dev-dependencies]
 anyhow = "1.0.63"
 maplit = "1.0.2"
+
+[build-dependencies]
+protoc-bin-vendored = "3.3.0"
+tonic-prost-build = "0.14.7"
 
 [features]
 docinclude = [] # Used only for activating `doc(include="...")` on nightly.

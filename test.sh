@@ -40,52 +40,50 @@ rpc() {
 }
 
 build_cluster() {
-    echo "Adding node 2 and node 3 as learners, to receive log from leader node 1"
+    local node=${1:-1}
+    echo "Initializing node $node and adding the other nodes as learners"
     echo
-    rpc 2100$1/init '{}'
-    echo "Node $1 added as leaner"
+    rpc 2100"$node"/init '[]'
+    echo "Node $node initialized"
 
-    if test $1 -ne 1 
+    if test "$node" -ne 1
     then
-        rpc 2100$1/add-learner       '[1, "127.0.0.1:21001"]'
-        echo "Node 1 added as leaner"
+        rpc 2100"$node"/add-learner       '[1, "127.0.0.1:21001"]'
+        echo "Node 1 added as learner"
     fi
-    if test $1 -ne 2 
+    if test "$node" -ne 2
     then
-        rpc 2100$1/add-learner       '[2, "127.0.0.1:21002"]'
-        echo "Node 2 added as leaner"
+        rpc 2100"$node"/add-learner       '[2, "127.0.0.1:21002"]'
+        echo "Node 2 added as learner"
     fi
-    if test $1 -ne 3
+    if test "$node" -ne 3
     then
-        rpc 2100$1/add-learner       '[3, "127.0.0.1:21003"]'
-        echo "Node 3 added as leaner"
+        rpc 2100"$node"/add-learner       '[3, "127.0.0.1:21003"]'
+        echo "Node 3 added as learner"
     fi
 }
 
 place_order() {
-##############################################################{
     echo "Place order on leader"
-    for i in {1..1500}
+    local node=${1:-1}
+    local i=1
+    while [ "$i" -le 1500 ]
     do
         echo
-        JSON='{"Place": { "order": {"live": "Limit", "side": "Buy", "price": 400'
-        JSON+="$i.0,"
-        JSON+='"volume": 4.4, "id": '
-        JSON+="$i,"
-        JSON+=' "sequance": '
-        JSON+="$i"
-        JSON+='} }}'
-        echo $JSON
-        rpc 2100$1/write "$JSON"
-    done 
+        JSON='{"Place": { "order": {"live": "Limit", "side": "Buy", "price": 400'"$i"'.0, "volume": 4.4, "id": '"$i"', "sequence": '"$i"' } }}'
+        echo "$JSON"
+        rpc 2100"$node"/write "$JSON"
+        i=$((i + 1))
+    done
 
     echo "Data written"
 }
 
 get_metrics() {
+    local node=${1:-1}
     echo "Get metrics from the leader"
     echo
-    rpc 2100$1/metrics
+    rpc 2100"$node"/metrics
 }
 
 kill_node() {
@@ -107,21 +105,21 @@ start_node() {
 }
 
 change_membership () {
-
-echo "Changing membership from [1] to 3 nodes cluster: [$1]"
-echo
-rpc 21001/change-membership '[1]'
-echo "Membership changed"
-
+    local members=${1:-[1,2,3]}
+    echo "Changing membership to $members"
+    echo
+    rpc 21001/change-membership "$members"
+    echo "Membership changed"
 }
 
 clean() {
     echo "Cleaning"
-    surname=`date -Iseconds`
-    mv /tmp/snapshot /tmp/snapshot.$surname
-    mkdir -p /tmp/snapshot
-    mv /tmp/journal /tmp/journal.$surname
-    mkdir -p /tmp/journal 
+    surname=`date +%Y%m%dT%H%M%S`
+    dir=${RAFT_DATA_DIR:-/tmp/matchengine-raft}
+    if [ -d "$dir" ]; then
+        mv "$dir" "$dir.$surname"
+    fi
+    mkdir -p "$dir"
 }
 
 export RUST_LOG=debug 
@@ -147,7 +145,7 @@ case $1 in
     start_node $2
     ;;
 "get-seq")
-    rpc 2100$2/read  '"orderbook_sequance"'
+    rpc 2100"${2:-1}"/read  '"orderbook_sequence"'
     ;;
 "build-cluster")
     build_cluster $2

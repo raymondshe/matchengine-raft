@@ -4,10 +4,13 @@ use std::panic::PanicHookInfo;
 use std::thread;
 use std::time::Duration;
 
-use matchengine_raft::client::ExampleClient;
-use matchengine_raft::start_example_raft_node;
-use matchengine_raft::store::ExampleRequest;
-use matchengine_raft::ExampleTypeConfig;
+use matchengine_raft::StorageConfig;
+use matchengine_raft::client::MatchEngineClient;
+use matchengine_raft::default_raft_config;
+use matchengine_raft::start_match_engine_node_with_storage;
+use matchengine_raft::store::MatchEngineRequest;
+use matchengine_raft::MatchEngineTypeConfig;
+use matchengine_raft::Transport;
 use maplit::btreemap;
 use maplit::btreeset;
 use openraft::BasicNode;
@@ -43,13 +46,13 @@ pub fn log_panic(panic: &PanicHookInfo) {
 /// Write to it and read from it.
 #[test]
 fn test_cluster() {
-    ExampleTypeConfig::run(test_cluster_inner()).unwrap();
+    MatchEngineTypeConfig::run(test_cluster_inner()).unwrap();
 }
 
 async fn test_cluster_inner() -> anyhow::Result<()> {
     // --- The client itself does not store addresses for all nodes, but just node id.
     //     Thus we need a supporting component to provide mapping from node id to node address.
-    //     This is only used by the client. A raft node in this example stores node addresses in its
+    //     This is only used by the client. A raft node stores node addresses in its
     // store.
 
     std::panic::set_hook(Box::new(|panic| {
@@ -77,31 +80,44 @@ async fn test_cluster_inner() -> anyhow::Result<()> {
     };
 
     // --- Start 3 raft node in 3 threads.
+    //     `MATCHENGINE_TEST_TRANSPORT=http` runs the same suite over the legacy
+    //     HTTP/JSON transport; the default is gRPC.
 
-    let _h1 = thread::spawn(|| {
-        let mut rt = AsyncRuntimeOf::<ExampleTypeConfig>::new(1);
-        let x = rt.block_on(start_example_raft_node(1, "127.0.0.1:21001".to_string()));
-        println!("x: {:?}", x);
-    });
+    let transport = match std::env::var("MATCHENGINE_TEST_TRANSPORT").as_deref() {
+        Ok("http") => Transport::Http,
+        _ => Transport::Grpc,
+    };
 
-    let _h2 = thread::spawn(|| {
-        let mut rt = AsyncRuntimeOf::<ExampleTypeConfig>::new(1);
-        let x = rt.block_on(start_example_raft_node(2, "127.0.0.1:21002".to_string()));
-        println!("x: {:?}", x);
-    });
+    // A fresh data dir per run: persisted membership would make `init` fail on
+    // the second run. Each node gets its own subdirectory below it.
+    let temp = crate::common::TempDir::new("cluster");
+    let storage = StorageConfig::new(temp.path()).with_instance_prefix("cluster");
 
-    let _h3 = thread::spawn(|| {
-        let mut rt = AsyncRuntimeOf::<ExampleTypeConfig>::new(1);
-        let x = rt.block_on(start_example_raft_node(3, "127.0.0.1:21003".to_string()));
-        println!("x: {:?}", x);
-    });
+    let start = |id: u64, addr: &str, storage: StorageConfig| {
+        let addr = addr.to_string();
+        thread::spawn(move || {
+            let mut rt = AsyncRuntimeOf::<MatchEngineTypeConfig>::new(1);
+            let x = rt.block_on(start_match_engine_node_with_storage(
+                id,
+                addr,
+                transport,
+                default_raft_config(),
+                storage,
+            ));
+            println!("x: {:?}", x);
+        })
+    };
+
+    let _h1 = start(1, "127.0.0.1:21001", storage.clone());
+    let _h2 = start(2, "127.0.0.1:21002", storage.clone());
+    let _h3 = start(3, "127.0.0.1:21003", storage);
 
     // Wait for server to start up.
-    ExampleTypeConfig::sleep(Duration::from_millis(200)).await;
+    MatchEngineTypeConfig::sleep(Duration::from_millis(200)).await;
 
     // --- Create a client to the first node, as a control handle to the cluster.
 
-    let client = ExampleClient::<ExampleTypeConfig>::new(1, get_addr(1)?);
+    let client = MatchEngineClient::<MatchEngineTypeConfig>::new(1, get_addr(1)?);
 
     // --- 1. Initialize the target node as a cluster of only one node.
     //        After init(), the single node cluster will be fully functional.
@@ -110,7 +126,7 @@ async fn test_cluster_inner() -> anyhow::Result<()> {
     client.init().await??;
 
     // Wait for the initial membership log to commit after election
-    ExampleTypeConfig::sleep(Duration::from_millis(200)).await;
+    MatchEngineTypeConfig::sleep(Duration::from_millis(200)).await;
 
     println!("=== metrics after init");
     client.metrics().await?;
@@ -158,7 +174,7 @@ async fn test_cluster_inner() -> anyhow::Result<()> {
 
     println!("=== write `foo=bar`");
     client
-        .write(&ExampleRequest::Set {
+        .write(&MatchEngineRequest::Set {
             key: "foo".to_string(),
             value: "bar".to_string(),
         })
@@ -166,7 +182,7 @@ async fn test_cluster_inner() -> anyhow::Result<()> {
 
     // --- Wait for a while to let the replication get done.
 
-    ExampleTypeConfig::sleep(Duration::from_millis(1_000)).await;
+    MatchEngineTypeConfig::sleep(Duration::from_millis(1_000)).await;
 
     // --- Read it on every node.
 
@@ -175,12 +191,12 @@ async fn test_cluster_inner() -> anyhow::Result<()> {
     assert_eq!("bar", x);
 
     println!("=== read `foo` on node 2");
-    let client2 = ExampleClient::<ExampleTypeConfig>::new(2, get_addr(2)?);
+    let client2 = MatchEngineClient::<MatchEngineTypeConfig>::new(2, get_addr(2)?);
     let x = client2.read(&("foo".to_string())).await?;
     assert_eq!("bar", x);
 
     println!("=== read `foo` on node 3");
-    let client3 = ExampleClient::<ExampleTypeConfig>::new(3, get_addr(3)?);
+    let client3 = MatchEngineClient::<MatchEngineTypeConfig>::new(3, get_addr(3)?);
     let x = client3.read(&("foo".to_string())).await?;
     assert_eq!("bar", x);
 
@@ -188,13 +204,13 @@ async fn test_cluster_inner() -> anyhow::Result<()> {
 
     println!("=== read `foo` on node 2");
     client2
-        .write(&ExampleRequest::Set {
+        .write(&MatchEngineRequest::Set {
             key: "foo".to_string(),
             value: "wow".to_string(),
         })
         .await??;
 
-    ExampleTypeConfig::sleep(Duration::from_millis(1_000)).await;
+    MatchEngineTypeConfig::sleep(Duration::from_millis(1_000)).await;
 
     // --- Read it on every node.
 
@@ -203,12 +219,12 @@ async fn test_cluster_inner() -> anyhow::Result<()> {
     assert_eq!("wow", x);
 
     println!("=== read `foo` on node 2");
-    let client2 = ExampleClient::<ExampleTypeConfig>::new(2, get_addr(2)?);
+    let client2 = MatchEngineClient::<MatchEngineTypeConfig>::new(2, get_addr(2)?);
     let x = client2.read(&("foo".to_string())).await?;
     assert_eq!("wow", x);
 
     println!("=== read `foo` on node 3");
-    let client3 = ExampleClient::<ExampleTypeConfig>::new(3, get_addr(3)?);
+    let client3 = MatchEngineClient::<MatchEngineTypeConfig>::new(3, get_addr(3)?);
     let x = client3.read(&("foo".to_string())).await?;
     assert_eq!("wow", x);
 
@@ -234,7 +250,7 @@ async fn test_cluster_inner() -> anyhow::Result<()> {
     println!("=== change-membership to 3, ");
     client.change_membership(&btreeset! {3}).await??;
 
-    ExampleTypeConfig::sleep(Duration::from_millis(8_000)).await;
+    MatchEngineTypeConfig::sleep(Duration::from_millis(8_000)).await;
 
     println!("=== metrics after change-membership to {{3}}");
     let x = client.metrics().await?;
@@ -242,7 +258,7 @@ async fn test_cluster_inner() -> anyhow::Result<()> {
 
     println!("=== write `foo=zoo` to node-3");
     client3
-        .write(&ExampleRequest::Set {
+        .write(&MatchEngineRequest::Set {
             key: "foo".to_string(),
             value: "zoo".to_string(),
         })

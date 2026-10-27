@@ -7,25 +7,27 @@ use actix_web::post;
 use actix_web::web::Data;
 use actix_web::web::Json;
 use openraft::BasicNode;
-use openraft::LogId;
 use openraft::RaftMetrics;
 use openraft::ReadPolicy;
+use openraft::alias::LogIdOf;
 use openraft::async_runtime::WatchReceiver;
 use openraft::errors::Infallible;
 use openraft::errors::decompose::DecomposeResult;
+use openraft::raft::linearizable_read::ReadLogId;
 use serde::Deserialize;
 use serde::Serialize;
 
-use crate::ExampleNodeId;
-use crate::ExampleTypeConfig;
-use crate::app::ExampleApp;
+use crate::MatchEngineNodeId;
+use crate::MatchEngineTypeConfig;
+use crate::app::MatchEngineApp;
 
 /// Serializable representation of linearizer data for follower reads
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LinearizerData {
-    pub node_id: ExampleNodeId,
-    pub read_log_id: LogId<ExampleTypeConfig>,
-    pub applied: Option<LogId<ExampleTypeConfig>>,
+    pub node_id: MatchEngineNodeId,
+    /// Serializes transparently as a `LogId`.
+    pub read_log_id: ReadLogId<MatchEngineTypeConfig>,
+    pub applied: Option<LogIdOf<MatchEngineTypeConfig>>,
 }
 
 // --- Cluster management
@@ -36,7 +38,7 @@ pub struct LinearizerData {
 /// This should be done before adding a node as a member into the cluster
 /// (by calling `change-membership`)
 #[post("/add-learner")]
-pub async fn add_learner(app: Data<ExampleApp>, req: Json<(ExampleNodeId, String)>) -> actix_web::Result<impl Responder> {
+pub async fn add_learner(app: Data<MatchEngineApp>, req: Json<(MatchEngineNodeId, String)>) -> actix_web::Result<impl Responder> {
     let node_id = req.0.0;
     let node = BasicNode { addr: req.0.1.clone() };
     let res = app.raft.add_learner(node_id, node, true).await.decompose().unwrap();
@@ -45,7 +47,7 @@ pub async fn add_learner(app: Data<ExampleApp>, req: Json<(ExampleNodeId, String
 
 /// Changes specified learners to members, or remove members.
 #[post("/change-membership")]
-pub async fn change_membership(app: Data<ExampleApp>, req: Json<BTreeSet<ExampleNodeId>>) -> actix_web::Result<impl Responder> {
+pub async fn change_membership(app: Data<MatchEngineApp>, req: Json<BTreeSet<MatchEngineNodeId>>) -> actix_web::Result<impl Responder> {
     let res = app.raft.change_membership(req.0, false).await.decompose().unwrap();
     Ok(Json(res))
 }
@@ -53,7 +55,7 @@ pub async fn change_membership(app: Data<ExampleApp>, req: Json<BTreeSet<Example
 /// Initialize a single-node cluster if the `req` is empty vec.
 /// Otherwise initialize a cluster with the `req` specified vec of node-id and node-address
 #[post("/init")]
-pub async fn init(app: Data<ExampleApp>, req: Json<Vec<(ExampleNodeId, String)>>) -> actix_web::Result<impl Responder> {
+pub async fn init(app: Data<MatchEngineApp>, req: Json<Vec<(MatchEngineNodeId, String)>>) -> actix_web::Result<impl Responder> {
     let mut nodes = BTreeMap::new();
     if req.0.is_empty() {
         nodes.insert(app.id, BasicNode { addr: app.addr.clone() });
@@ -68,10 +70,10 @@ pub async fn init(app: Data<ExampleApp>, req: Json<Vec<(ExampleNodeId, String)>>
 
 /// Get the latest metrics of the cluster
 #[get("/metrics")]
-pub async fn metrics(app: Data<ExampleApp>) -> actix_web::Result<impl Responder> {
+pub async fn metrics(app: Data<MatchEngineApp>) -> actix_web::Result<impl Responder> {
     let metrics = app.raft.metrics().borrow_watched().clone();
 
-    let res: Result<RaftMetrics<ExampleTypeConfig>, Infallible> = Ok(metrics);
+    let res: Result<RaftMetrics<MatchEngineTypeConfig>, Infallible> = Ok(metrics);
     Ok(Json(res))
 }
 
@@ -81,7 +83,7 @@ pub async fn metrics(app: Data<ExampleApp>) -> actix_web::Result<impl Responder>
 /// The follower can then reconstruct a Linearizer and wait for its local state
 /// machine to catch up before performing a linearizable read.
 #[post("/get_linearizer")]
-pub async fn get_linearizer(app: Data<ExampleApp>) -> actix_web::Result<impl Responder> {
+pub async fn get_linearizer(app: Data<MatchEngineApp>) -> actix_web::Result<impl Responder> {
     let linearizer = app.raft.get_read_linearizer(ReadPolicy::ReadIndex).await.decompose().unwrap();
 
     let data = match linearizer {

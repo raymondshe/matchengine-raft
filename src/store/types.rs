@@ -17,7 +17,7 @@ use crate::matchengine::Order;
 /// * `Place` - Adds an order to the order book
 /// * `Cancel` - Removes an order from the order book
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub enum ExampleRequest {
+pub enum MatchEngineRequest {
     /// Store a key-value pair in the distributed KV store.
     Set { key: String, value: String },
     /// Place a new order in the matching engine.
@@ -26,21 +26,21 @@ pub enum ExampleRequest {
     Cancel { order: Order }
 }
 
-impl ExampleRequest {
+impl MatchEngineRequest {
     pub fn set(key: impl Into<String>, value: impl Into<String>) -> Self {
-        ExampleRequest::Set {
+        MatchEngineRequest::Set {
             key: key.into(),
             value: value.into(),
         }
     }
 }
 
-impl fmt::Display for ExampleRequest {
+impl fmt::Display for MatchEngineRequest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ExampleRequest::Set { key, value } => write!(f, "Set {{ key: {}, value: {} }}", key, value),
-            ExampleRequest::Place { order } => write!(f, "Place {{ order: {:?} }}", order),
-            ExampleRequest::Cancel { order } => write!(f, "Cancel {{ order: {:?} }}", order),
+            MatchEngineRequest::Set { key, value } => write!(f, "Set {{ key: {}, value: {} }}", key, value),
+            MatchEngineRequest::Place { order } => write!(f, "Place {{ order: {:?} }}", order),
+            MatchEngineRequest::Cancel { order } => write!(f, "Cancel {{ order: {:?} }}", order),
         }
     }
 }
@@ -50,19 +50,19 @@ impl fmt::Display for ExampleRequest {
 /// This is the result of a successful write operation, containing
 /// any output from applying the request.
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct ExampleResponse {
+pub struct MatchEngineResponse {
     /// The value returned from the state machine application, if any.
     pub value: Option<String>,
 }
 
-impl ExampleResponse {
+impl MatchEngineResponse {
     pub fn new(value: impl Into<String>) -> Self {
-        ExampleResponse {
+        MatchEngineResponse {
             value: Some(value.into()),
         }
     }
 
     pub fn none() -> Self {
-        ExampleResponse { value: None }
+        MatchEngineResponse { value: None }
     }
 }
