@@ -33,15 +33,20 @@ use crate::store::state_machine::StateMachineStoreInner;
 /// machine before a response is returned. This ensures strong consistency.
 ///
 /// The request can be:
-/// - `Place`: Add an order to the order book
-/// - `Cancel`: Remove an order from the order book
+/// - `Place`: Submit an order (GTC/IOC/FOK/GTD/Day, post-only, iceberg or stop)
+/// - `Cancel`: Remove a resting order or cancel a parked stop
+/// - `PurgeExpired`: Evict GTD/Day orders whose deadline has passed (the
+///   timestamps travel in the request, so the state machine stays deterministic)
 ///
 /// # Returns
 ///
 /// The result of applying the request, or an error if the node is not
 /// the leader or the write fails.
 #[post("/write")]
-pub async fn write(app: Data<MatchEngineApp>, req: Json<MatchEngineRequest>) -> actix_web::Result<impl Responder> {
+pub async fn write(
+    app: Data<MatchEngineApp>,
+    req: Json<MatchEngineRequest>,
+) -> actix_web::Result<impl Responder> {
     let response = app.raft.client_write(req.0).await.decompose().unwrap();
     Ok(Json(response))
 }
@@ -54,7 +59,9 @@ pub async fn write(app: Data<MatchEngineApp>, req: Json<MatchEngineRequest>) -> 
 /// leader has been elected.
 ///
 /// Supported keys:
-/// - `orderbook_orders`: Returns all orders in the order book as JSON
+/// - `orderbook_orders`: Returns all orders resting in the book as JSON
+/// - `orderbook_stops`: Returns the parked stop orders as JSON
+/// - `orderbook_last_trade_price`: Returns the last trade price (`null` before the first trade)
 /// - `orderbook_sequence`: Returns the current sequence number
 /// - `orderbook_sequance`: Accepted as a legacy spelling of the above
 ///
@@ -64,7 +71,10 @@ pub async fn write(app: Data<MatchEngineApp>, req: Json<MatchEngineRequest>) -> 
 ///
 /// The requested value, or an empty string if the key is not known.
 #[post("/read")]
-pub async fn read(app: Data<MatchEngineApp>, req: Json<String>) -> actix_web::Result<impl Responder> {
+pub async fn read(
+    app: Data<MatchEngineApp>,
+    req: Json<String>,
+) -> actix_web::Result<impl Responder> {
     let inner = app.state_machine_store.inner().lock().await;
     let value = read_state(&inner, &req.0);
     let res: Result<String, Infallible> = Ok(value);
@@ -81,8 +91,16 @@ pub async fn read(app: Data<MatchEngineApp>, req: Json<String>) -> actix_web::Re
 /// This provides strong consistency guarantees but may be slower than
 /// a local read.
 #[post("/linearizable_read")]
-pub async fn linearizable_read(app: Data<MatchEngineApp>, req: Json<String>) -> actix_web::Result<impl Responder> {
-    let ret = app.raft.get_read_linearizer(ReadPolicy::ReadIndex).await.decompose().unwrap();
+pub async fn linearizable_read(
+    app: Data<MatchEngineApp>,
+    req: Json<String>,
+) -> actix_web::Result<impl Responder> {
+    let ret = app
+        .raft
+        .get_read_linearizer(ReadPolicy::ReadIndex)
+        .await
+        .decompose()
+        .unwrap();
 
     match ret {
         Ok(linearizer) => {
@@ -107,7 +125,10 @@ pub async fn linearizable_read(app: Data<MatchEngineApp>, req: Json<String>) -> 
 /// 3. Wait for local state machine to catch up to the linearizer's read_log_id
 /// 4. Read from local state machine
 #[post("/follower_read")]
-pub async fn follower_read(app: Data<MatchEngineApp>, req: Json<String>) -> actix_web::Result<impl Responder> {
+pub async fn follower_read(
+    app: Data<MatchEngineApp>,
+    req: Json<String>,
+) -> actix_web::Result<impl Responder> {
     // 1. Get current leader
     let leader_id = match app.raft.current_leader().await {
         Some(id) => id,
@@ -143,15 +164,17 @@ pub async fn follower_read(app: Data<MatchEngineApp>, req: Json<String>) -> acti
         }
     };
 
-    let linearizer_data_result: Result<crate::network::management::LinearizerData, LinearizableReadError<MatchEngineTypeConfig>> =
-        match response.json().await {
-            Ok(result) => result,
-            Err(e) => {
-                return Ok(Json(Err(FollowerReadError {
-                    message: format!("Failed to parse linearizer data: {}", e),
-                })));
-            }
-        };
+    let linearizer_data_result: Result<
+        crate::network::management::LinearizerData,
+        LinearizableReadError<MatchEngineTypeConfig>,
+    > = match response.json().await {
+        Ok(result) => result,
+        Err(e) => {
+            return Ok(Json(Err(FollowerReadError {
+                message: format!("Failed to parse linearizer data: {}", e),
+            })));
+        }
+    };
 
     let linearizer_data = match linearizer_data_result {
         Ok(data) => data,
@@ -188,11 +211,17 @@ pub async fn follower_read(app: Data<MatchEngineApp>, req: Json<String>) -> acti
 /// The state machine holds an order book, so reads are named views of it rather than lookups in a
 /// key-value map. Unknown keys return an empty string, which keeps the endpoint total.
 fn read_state<C>(inner: &StateMachineStoreInner<C>, key: &str) -> String
-where C: openraft::RaftTypeConfig<D = MatchEngineRequest, R = MatchEngineResponse> {
+where
+    C: openraft::RaftTypeConfig<D = MatchEngineRequest, R = MatchEngineResponse>,
+{
     match key {
         "orderbook_orders" => {
             let content = inner.to_content();
             serde_json::to_string(&content.orders).unwrap_or_default()
+        }
+        "orderbook_stops" => serde_json::to_string(&inner.orderbook.stops).unwrap_or_default(),
+        "orderbook_last_trade_price" => {
+            serde_json::to_string(&inner.orderbook.last_trade_price).unwrap_or_default()
         }
         "orderbook_sequence" | "orderbook_sequance" => inner.orderbook.sequence.to_string(),
         _ => String::new(),

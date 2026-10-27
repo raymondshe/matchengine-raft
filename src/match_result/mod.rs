@@ -34,6 +34,7 @@ use serde::Serialize;
 
 use crate::matchengine::MatchResult;
 use crate::matchengine::Order;
+use crate::matchengine::RejectReason;
 
 /// Stable identity of one event: a Raft log index plus the event's position inside that entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -52,14 +53,26 @@ pub enum MatchEventKind {
     Rested,
     /// The taker traded `volume` with a resting order at `price`.
     Fill,
-    /// An order was removed from the book by a cancel request.
+    /// An order was removed with `volume` still open: a cancel request, the
+    /// cancelled remainder of an IOC order, or whatever a market order or a
+    /// stop child could not execute.
     Cancelled,
+    /// A parked stop order was elected by a trade at `price` and executed
+    /// immediately as its child. Its trades follow as `Fill` events, and any
+    /// remainder it could not execute as a `Cancelled` one.
+    Triggered,
+    /// An order was removed by an expiry purge (a `GTD` deadline or the day close).
+    Expired,
+    /// An order was refused outright and never entered the book; `reason`
+    /// says why. Nothing executed and nothing rested.
+    Rejected,
 }
 
 /// A single order-lifecycle event produced while applying one Raft entry.
 ///
-/// Fills are the reason this type exists, but rests and cancels travel through the same feed so a
-/// consumer can follow an order from placement to removal with one cursor.
+/// Fills are the reason this type exists, but rests, cancels, stop triggers,
+/// expiries and rejections travel through the same feed so a consumer can
+/// follow an order from placement to removal with one cursor.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct MatchEvent {
     /// Position in the applied log. Unique, stable and replica-independent.
@@ -71,14 +84,49 @@ pub struct MatchEvent {
     pub order_sequence: u64,
     /// For a [`MatchEventKind::Fill`]: the resting order's sequence. `None` otherwise.
     pub counterparty_sequence: Option<u64>,
-    /// Execution price for a fill, order price otherwise.
+    /// Execution price for a fill, the trigger price for a stop election, the order price
+    /// otherwise.
     pub price: f64,
     /// Executed volume for a fill; resting remainder for [`MatchEventKind::Rested`]; the volume
-    /// that was still open for [`MatchEventKind::Cancelled`].
+    /// that was still open for [`MatchEventKind::Cancelled`] and [`MatchEventKind::Expired`]; the
+    /// stop's open volume for [`MatchEventKind::Triggered`]; the submitted volume for
+    /// [`MatchEventKind::Rejected`].
     pub volume: f64,
+    /// The policy reason behind a rejection or expiry. Absent (and omitted from the JSON lines)
+    /// for every other kind.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<RejectReason>,
 }
 
 impl MatchEvent {
+    /// Fill events for one sweep, in execution order.
+    ///
+    /// `first_ordinal` continues the numbering when one entry produces more than one batch (the
+    /// fills of a stop elected by the entry's own trades, for instance).
+    pub fn for_fills(
+        log_index: u64,
+        first_ordinal: u32,
+        taker_sequence: u64,
+        matches: &[MatchResult],
+    ) -> Vec<MatchEvent> {
+        matches
+            .iter()
+            .enumerate()
+            .map(|(offset, m)| MatchEvent {
+                event_id: EventId {
+                    log_index,
+                    ordinal: first_ordinal + offset as u32,
+                },
+                kind: MatchEventKind::Fill,
+                order_sequence: taker_sequence,
+                counterparty_sequence: Some(m.maker.sequence),
+                price: m.maker.price,
+                volume: m.matches,
+                reason: None,
+            })
+            .collect()
+    }
+
     /// Builds the events for a `Place` request.
     ///
     /// `matches` is what `OrderBook::place_order` returned, and `resting_volume` is the volume the
@@ -90,33 +138,32 @@ impl MatchEvent {
         matches: &[MatchResult],
         resting_volume: Option<f64>,
     ) -> Vec<MatchEvent> {
-        let mut events = Vec::with_capacity(matches.len() + usize::from(resting_volume.is_some()));
+        Self::for_place_at(log_index, 0, taker, matches, resting_volume)
+    }
 
-        for m in matches {
-            events.push(MatchEvent {
-                event_id: EventId {
-                    log_index,
-                    ordinal: events.len() as u32,
-                },
-                kind: MatchEventKind::Fill,
-                order_sequence: taker.sequence,
-                counterparty_sequence: Some(m.maker.sequence),
-                price: m.maker.price,
-                volume: m.matches,
-            });
-        }
+    /// [`MatchEvent::for_place`] with its first event at `first_ordinal`, so a stop cascade
+    /// produced by the same entry continues the same numbering.
+    pub fn for_place_at(
+        log_index: u64,
+        first_ordinal: u32,
+        taker: &Order,
+        matches: &[MatchResult],
+        resting_volume: Option<f64>,
+    ) -> Vec<MatchEvent> {
+        let mut events = Self::for_fills(log_index, first_ordinal, taker.sequence, matches);
 
         if let Some(volume) = resting_volume {
             events.push(MatchEvent {
                 event_id: EventId {
                     log_index,
-                    ordinal: events.len() as u32,
+                    ordinal: first_ordinal + events.len() as u32,
                 },
                 kind: MatchEventKind::Rested,
                 order_sequence: taker.sequence,
                 counterparty_sequence: None,
                 price: taker.price,
                 volume,
+                reason: None,
             });
         }
 
@@ -126,16 +173,80 @@ impl MatchEvent {
     /// Builds the event for a cancel. `cancelled` is the order as it was stored in the book, so
     /// `volume` is the part that was still open, not the volume originally submitted.
     pub fn for_cancel(log_index: u64, cancelled: &Order) -> MatchEvent {
+        Self::for_cancel_at(log_index, 0, cancelled)
+    }
+
+    /// [`MatchEvent::for_cancel`] at an explicit ordinal.
+    pub fn for_cancel_at(log_index: u64, ordinal: u32, cancelled: &Order) -> MatchEvent {
+        Self::for_cancelled_volume(log_index, ordinal, cancelled, cancelled.open_volume())
+    }
+
+    /// A `Cancelled` event with an explicit open volume: the unexecuted remainder of an IOC
+    /// order, of a market order, or of a stop child, which is cancelled rather than rested.
+    pub fn for_cancelled_volume(
+        log_index: u64,
+        ordinal: u32,
+        order: &Order,
+        volume: f64,
+    ) -> MatchEvent {
         MatchEvent {
-            event_id: EventId {
-                log_index,
-                ordinal: 0,
-            },
+            event_id: EventId { log_index, ordinal },
             kind: MatchEventKind::Cancelled,
-            order_sequence: cancelled.sequence,
+            order_sequence: order.sequence,
             counterparty_sequence: None,
-            price: cancelled.price,
-            volume: cancelled.volume,
+            price: order.price,
+            volume,
+            reason: None,
+        }
+    }
+
+    /// A parked stop was elected by a trade at `trigger_price`; the child's executions follow as
+    /// `Fill` events and its unexecuted remainder as a `Cancelled` one.
+    pub fn for_triggered(
+        log_index: u64,
+        ordinal: u32,
+        stop: &Order,
+        trigger_price: f64,
+    ) -> MatchEvent {
+        MatchEvent {
+            event_id: EventId { log_index, ordinal },
+            kind: MatchEventKind::Triggered,
+            order_sequence: stop.sequence,
+            counterparty_sequence: None,
+            price: trigger_price,
+            volume: stop.open_volume(),
+            reason: None,
+        }
+    }
+
+    /// An order removed by an expiry purge; `volume` is what was still open.
+    pub fn for_expired(log_index: u64, ordinal: u32, expired: &Order) -> MatchEvent {
+        MatchEvent {
+            event_id: EventId { log_index, ordinal },
+            kind: MatchEventKind::Expired,
+            order_sequence: expired.sequence,
+            counterparty_sequence: None,
+            price: expired.price,
+            volume: expired.open_volume(),
+            reason: None,
+        }
+    }
+
+    /// An order refused outright: it never entered the book and nothing executed for it.
+    pub fn for_rejected(
+        log_index: u64,
+        ordinal: u32,
+        order: &Order,
+        reason: RejectReason,
+    ) -> MatchEvent {
+        MatchEvent {
+            event_id: EventId { log_index, ordinal },
+            kind: MatchEventKind::Rejected,
+            order_sequence: order.sequence,
+            counterparty_sequence: None,
+            price: order.price,
+            volume: order.volume,
+            reason: Some(reason),
         }
     }
 }
@@ -301,17 +412,9 @@ struct FileRecord<'a> {
 mod tests {
     use super::*;
     use crate::matchengine::OrderSide;
-    use crate::matchengine::OrderType;
 
     fn order(side: OrderSide, price: f64, volume: f64, sequence: u64) -> Order {
-        Order {
-            live: OrderType::Limit,
-            side,
-            price,
-            volume,
-            id: 0,
-            sequence,
-        }
+        Order::new(side, price, volume, sequence)
     }
 
     #[test]
@@ -532,5 +635,83 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn trigger_expiry_and_rejection_events_carry_their_semantics() {
+        let stop = order(OrderSide::Sell, 0.0, 5.0, 8);
+
+        let triggered = MatchEvent::for_triggered(40, 1, &stop, 95.0);
+        assert_eq!(MatchEventKind::Triggered, triggered.kind);
+        assert_eq!(
+            EventId {
+                log_index: 40,
+                ordinal: 1
+            },
+            triggered.event_id
+        );
+        assert_eq!(8, triggered.order_sequence);
+        assert_eq!(
+            95.0, triggered.price,
+            "the trigger prints the electing trade price"
+        );
+        assert_eq!(5.0, triggered.volume, "the stop's open volume");
+        assert_eq!(None, triggered.reason);
+
+        let expired = MatchEvent::for_expired(41, 0, &stop);
+        assert_eq!(MatchEventKind::Expired, expired.kind);
+        assert_eq!(5.0, expired.volume);
+        assert_eq!(8, expired.order_sequence);
+
+        let rejected = MatchEvent::for_rejected(42, 0, &stop, RejectReason::FokUnfillable);
+        assert_eq!(MatchEventKind::Rejected, rejected.kind);
+        assert_eq!(Some(RejectReason::FokUnfillable), rejected.reason);
+        assert_eq!(5.0, rejected.volume, "a rejection executes nothing");
+    }
+
+    #[test]
+    fn cancel_with_an_explicit_remainder_reports_that_remainder() {
+        let taker = order(OrderSide::Buy, 100.0, 9.0, 4);
+
+        let event = MatchEvent::for_cancelled_volume(7, 2, &taker, 3.5);
+
+        assert_eq!(MatchEventKind::Cancelled, event.kind);
+        assert_eq!(
+            EventId {
+                log_index: 7,
+                ordinal: 2
+            },
+            event.event_id
+        );
+        assert_eq!(3.5, event.volume);
+        assert_eq!(4, event.order_sequence);
+    }
+
+    #[test]
+    fn file_sink_omits_absent_reasons_and_writes_present_ones() {
+        let dir = TempDir::new();
+        let path = dir.path().join("events.jsonl");
+        let sink = FileLogSink::open(&path).unwrap();
+        let order = order(OrderSide::Buy, 100.0, 1.0, 0);
+
+        sink.publish(&[MatchEvent::for_cancel(1, &order)]).unwrap();
+        sink.publish(&[MatchEvent::for_rejected(
+            2,
+            0,
+            &order,
+            RejectReason::PostOnlyWouldCross,
+        )])
+        .unwrap();
+
+        let lines = read_lines(&path);
+        assert!(
+            lines[0].get("reason").is_none(),
+            "a plain cancel must not grow a reason field"
+        );
+        assert_eq!(serde_json::json!("rejected"), lines[1]["kind"]);
+        assert_eq!(
+            serde_json::json!("post_only_would_cross"),
+            lines[1]["reason"]
+        );
     }
 }

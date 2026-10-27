@@ -12,6 +12,8 @@ use std::time::UNIX_EPOCH;
 use matchengine_raft::MatchEngineTypeConfig;
 use matchengine_raft::matchengine::Order;
 use matchengine_raft::matchengine::OrderSide;
+use matchengine_raft::matchengine::OrderType;
+use matchengine_raft::matchengine::TimeInForce;
 use matchengine_raft::store::StateMachineData;
 use openraft::Entry;
 use openraft::LogId;
@@ -52,7 +54,10 @@ struct TempDir(PathBuf);
 
 impl TempDir {
     fn new(label: &str) -> Self {
-        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
             "matchengine-storage-{label}-{}-{nanos}-{seq}",
@@ -145,7 +150,10 @@ fn entries_survive_reopen() {
 
     block_on(async {
         let store = Store::open(dir.path()).unwrap();
-        assert_eq!((0..20).collect::<Vec<_>>(), indexes(&read(&store, 0..100).await));
+        assert_eq!(
+            (0..20).collect::<Vec<_>>(),
+            indexes(&read(&store, 0..100).await)
+        );
 
         // Appending after recovery continues the same log.
         append(&store, vec![blank(20)]).await;
@@ -178,7 +186,10 @@ fn torn_tail_is_discarded_on_reopen() {
 
     block_on(async {
         let store = Store::open(dir.path()).unwrap();
-        assert_eq!((0..5).collect::<Vec<_>>(), indexes(&read(&store, 0..100).await));
+        assert_eq!(
+            (0..5).collect::<Vec<_>>(),
+            indexes(&read(&store, 0..100).await)
+        );
         assert_eq!(Some(log_id(1, 4)), log_state(&store).await.last_log_id);
     });
 
@@ -191,7 +202,10 @@ fn torn_tail_is_discarded_on_reopen() {
     });
     block_on(async {
         let store = Store::open(dir.path()).unwrap();
-        assert_eq!((0..6).collect::<Vec<_>>(), indexes(&read(&store, 0..100).await));
+        assert_eq!(
+            (0..6).collect::<Vec<_>>(),
+            indexes(&read(&store, 0..100).await)
+        );
     });
 }
 
@@ -204,15 +218,24 @@ fn segments_rotate_and_survive_reopen() {
         for i in 0..40 {
             append(&store, vec![blank(i)]).await;
         }
-        assert_eq!((0..40).collect::<Vec<_>>(), indexes(&read(&store, 0..100).await));
+        assert_eq!(
+            (0..40).collect::<Vec<_>>(),
+            indexes(&read(&store, 0..100).await)
+        );
         drop(store);
     });
 
-    assert!(wal_files(dir.path()).len() > 1, "small segments should have rotated");
+    assert!(
+        wal_files(dir.path()).len() > 1,
+        "small segments should have rotated"
+    );
 
     block_on(async {
         let store = Store::open_with_segment_size(dir.path(), 160).unwrap();
-        assert_eq!((0..40).collect::<Vec<_>>(), indexes(&read(&store, 0..100).await));
+        assert_eq!(
+            (0..40).collect::<Vec<_>>(),
+            indexes(&read(&store, 0..100).await)
+        );
         assert_eq!(Some(log_id(1, 39)), log_state(&store).await.last_log_id);
     });
 }
@@ -231,18 +254,27 @@ fn truncate_after_drops_the_suffix_across_segments() {
         let mut store = store.clone();
         store.truncate_after(Some(log_id(1, 10))).await.unwrap();
 
-        assert_eq!((0..=10).collect::<Vec<_>>(), indexes(&read(&store, 0..100).await));
+        assert_eq!(
+            (0..=10).collect::<Vec<_>>(),
+            indexes(&read(&store, 0..100).await)
+        );
         assert_eq!(Some(log_id(1, 10)), log_state(&store).await.last_log_id);
 
         // The log continues after the new tail.
         append(&store, vec![blank(11)]).await;
-        assert_eq!((0..=11).collect::<Vec<_>>(), indexes(&read(&store, 0..100).await));
+        assert_eq!(
+            (0..=11).collect::<Vec<_>>(),
+            indexes(&read(&store, 0..100).await)
+        );
         drop(store);
     });
 
     block_on(async {
         let store = Store::open_with_segment_size(dir.path(), 160).unwrap();
-        assert_eq!((0..=11).collect::<Vec<_>>(), indexes(&read(&store, 0..100).await));
+        assert_eq!(
+            (0..=11).collect::<Vec<_>>(),
+            indexes(&read(&store, 0..100).await)
+        );
         assert_eq!(Some(log_id(1, 11)), log_state(&store).await.last_log_id);
     });
 }
@@ -289,8 +321,14 @@ fn purge_deletes_covered_segments_and_persists_the_marker() {
         let state = log_state(&store).await;
         assert_eq!(Some(log_id(1, 20)), state.last_purged_log_id);
         assert_eq!(Some(log_id(1, 39)), state.last_log_id);
-        assert_eq!((21..40).collect::<Vec<_>>(), indexes(&read(&store, 0..100).await));
-        assert!(wal_files(dir.path()).len() < before, "purge should delete fully covered segments");
+        assert_eq!(
+            (21..40).collect::<Vec<_>>(),
+            indexes(&read(&store, 0..100).await)
+        );
+        assert!(
+            wal_files(dir.path()).len() < before,
+            "purge should delete fully covered segments"
+        );
         drop(store);
     });
 
@@ -298,7 +336,10 @@ fn purge_deletes_covered_segments_and_persists_the_marker() {
         let store = Store::open_with_segment_size(dir.path(), 160).unwrap();
         let state = log_state(&store).await;
         assert_eq!(Some(log_id(1, 20)), state.last_purged_log_id);
-        assert_eq!((21..40).collect::<Vec<_>>(), indexes(&read(&store, 0..100).await));
+        assert_eq!(
+            (21..40).collect::<Vec<_>>(),
+            indexes(&read(&store, 0..100).await)
+        );
 
         // Purging everything leaves one empty active segment and a clean get_log_state.
         let mut store = store.clone();
@@ -337,7 +378,10 @@ fn vote_and_committed_survive_reopen() {
         let mut store = store.clone();
         assert_eq!(Some(Vote::new(7, 1)), store.read_vote().await.unwrap());
         assert_eq!(Some(log_id(1, 3)), store.read_committed().await.unwrap());
-        assert_eq!((0..6).collect::<Vec<_>>(), indexes(&read(&store, 0..100).await));
+        assert_eq!(
+            (0..6).collect::<Vec<_>>(),
+            indexes(&read(&store, 0..100).await)
+        );
     });
 }
 
@@ -359,6 +403,15 @@ async fn fill_sm(sm: &Sm) {
     inner
         .orderbook
         .place_order(&mut Order::new(OrderSide::Sell, 20.0, 4.0, 0));
+
+    // A parked stop and a last trade price: both travel in snapshots too.
+    inner.orderbook.last_trade_price = Some(10.0);
+    let mut stop = Order::new(OrderSide::Sell, 0.0, 4.0, 0);
+    stop.live = OrderType::Market;
+    stop.stop_price = 5.0;
+    stop.tif = TimeInForce::Gtd(9_000);
+    stop.timestamp = 1_000;
+    inner.orderbook.execute_order(&mut stop);
 }
 
 #[test]
@@ -376,7 +429,13 @@ fn snapshot_survives_reopen() {
         let sm = Sm::open(dir.path()).unwrap();
         let content = sm.to_content().await;
         assert_eq!(3, content.orders.len());
-        assert_eq!(103, content.sequence);
+        assert_eq!(104, content.sequence);
+        assert_eq!(1, content.stops.len(), "the parked stop must survive");
+        assert_eq!(
+            Some(10.0),
+            content.last_trade_price,
+            "and so must the last trade"
+        );
 
         let mut sm2 = sm.clone();
         let (applied, _) = sm2.applied_state().await.unwrap();
@@ -395,7 +454,11 @@ fn build_snapshot_is_served_and_persisted() {
         let built = sm.build_snapshot().await.unwrap();
         assert_eq!(Some(log_id(1, 9)), built.meta.last_log_id);
 
-        let current = sm.get_current_snapshot().await.unwrap().expect("snapshot is cached in memory");
+        let current = sm
+            .get_current_snapshot()
+            .await
+            .unwrap()
+            .expect("snapshot is cached in memory");
         assert_eq!(built.meta.last_log_id, current.meta.last_log_id);
         assert_eq!(built.snapshot.into_inner(), current.snapshot.into_inner());
     });
@@ -426,6 +489,8 @@ fn install_snapshot_replaces_state_and_is_durable() {
 
         let content = target.to_content().await;
         assert_eq!(3, content.orders.len());
+        assert_eq!(1, content.stops.len(), "the parked stop is installed too");
+        assert_eq!(Some(10.0), content.last_trade_price);
     });
 
     // A restarted node must boot from the installed snapshot even without any log replay.
@@ -468,7 +533,11 @@ fn invalid_snapshot_is_rejected_without_clobbering_state() {
 #[test]
 fn corrupt_snapshot_file_fails_to_open() {
     let dir = TempDir::new("sm-corrupt");
-    std::fs::write(dir.path().join("current.snap"), b"MRFSNAP\x01\x00\x00\x00garbage").unwrap();
+    std::fs::write(
+        dir.path().join("current.snap"),
+        b"MRFSNAP\x01\x00\x00\x00garbage",
+    )
+    .unwrap();
 
     let err = Sm::open(dir.path()).unwrap_err();
     assert_eq!(std::io::ErrorKind::InvalidData, err.kind());
@@ -499,6 +568,8 @@ fn state_machine_data_conversion_roundtrips() {
     let data = StateMachineData {
         orders: vec![Order::new(OrderSide::Buy, 1.5, 2.0, 3)],
         sequence: 4,
+        stops: Vec::new(),
+        last_trade_price: None,
     };
 
     let bytes = postcard::to_allocvec(&data).unwrap();

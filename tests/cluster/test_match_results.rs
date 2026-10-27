@@ -158,3 +158,145 @@ fn read_events(path: &Path) -> Vec<serde_json::Value> {
         .map(|line| serde_json::from_str(line).expect("the sink must write valid JSON lines"))
         .collect()
 }
+
+/// Drives the new order types through `/write` and checks the file sink:
+/// a parked stop elected by a trade (trigger + child fill), a GTD order
+/// evicted by `PurgeExpired`, and the new `/read` keys.
+#[test]
+fn file_sink_records_stop_triggers_and_expiries() {
+    C::run(async {
+        let temp = TempDir::new("match-results-types");
+        let event_log = temp.path().join("match-events.jsonl");
+        let storage = StorageConfig::new(temp.path())
+            .with_instance_prefix("match-results-types")
+            .with_match_event_log(&event_log);
+
+        let node = build_match_engine_node(
+            1,
+            "127.0.0.1:21302".to_string(),
+            Transport::Grpc,
+            default_raft_config(),
+            storage,
+        )
+        .await
+        .unwrap();
+
+        let client = MatchEngineClient::<C>::new(1, "127.0.0.1:21302".to_string());
+        client.init().await.unwrap().unwrap();
+        wait_for_leader(&client).await;
+
+        let place = |order: Order| MatchEngineRequest::Place { order };
+
+        // Two bids park liquidity at 100 and 95 (sequences 0 and 1).
+        client
+            .write(&place(Order::new(OrderSide::Buy, 100.0, 10.0, 0)))
+            .await
+            .unwrap()
+            .unwrap();
+        client
+            .write(&place(Order::new(OrderSide::Buy, 95.0, 10.0, 0)))
+            .await
+            .unwrap()
+            .unwrap();
+
+        // A sell stop at 95 parks off the book (sequence 2); no event yet.
+        let mut stop = Order::new(OrderSide::Sell, 0.0, 5.0, 0);
+        stop.live = matchengine_raft::matchengine::OrderType::Market;
+        stop.stop_price = 95.0;
+        client.write(&place(stop)).await.unwrap().unwrap();
+
+        wait_for_events(&event_log, 2).await;
+        assert_eq!(
+            2,
+            read_events(&event_log).len(),
+            "parking publishes nothing"
+        );
+
+        // A print at 100 does not reach the stop; the next one at 95 does.
+        client
+            .write(&place(Order::new(OrderSide::Sell, 100.0, 10.0, 0)))
+            .await
+            .unwrap()
+            .unwrap();
+        client
+            .write(&place(Order::new(OrderSide::Sell, 95.0, 3.0, 0)))
+            .await
+            .unwrap()
+            .unwrap();
+
+        let events = wait_for_events(&event_log, 6).await;
+        let triggered = events
+            .iter()
+            .find(|event| event["kind"] == "triggered")
+            .expect("the stop must be elected");
+        assert_eq!(2, triggered["order_sequence"]);
+        assert_eq!(95.0, triggered["price"]);
+        assert_eq!(5.0, triggered["volume"]);
+
+        // The child executes as a market order and its fill follows the trigger
+        // inside the same log entry.
+        let child = events
+            .iter()
+            .find(|event| {
+                event["kind"] == "fill"
+                    && event["order_sequence"] == 2
+                    && event["event_id"]["log_index"] == triggered["event_id"]["log_index"]
+            })
+            .expect("the stop's child must print");
+        assert_eq!(5.0, child["volume"]);
+        assert_eq!(
+            triggered["event_id"]["ordinal"].as_u64().unwrap() + 1,
+            child["event_id"]["ordinal"].as_u64().unwrap()
+        );
+
+        // A GTD order that is still live, then purged at its deadline.
+        let mut gtd = Order::new(OrderSide::Buy, 90.0, 1.0, 0);
+        gtd.tif = matchengine_raft::matchengine::TimeInForce::Gtd(2_000);
+        gtd.timestamp = 1_000;
+        client.write(&place(gtd)).await.unwrap().unwrap();
+        wait_for_events(&event_log, 7).await;
+
+        let response = client
+            .write(&MatchEngineRequest::PurgeExpired {
+                now_ms: 1_000,
+                day_close_ms: None,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            Some("0".to_string()),
+            response.data.value,
+            "nothing is due yet"
+        );
+
+        let response = client
+            .write(&MatchEngineRequest::PurgeExpired {
+                now_ms: 2_000,
+                day_close_ms: None,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(Some("1".to_string()), response.data.value);
+
+        let events = wait_for_events(&event_log, 8).await;
+        let expired = events
+            .iter()
+            .find(|event| event["kind"] == "expired")
+            .expect("the GTD order expires");
+        assert_eq!(5, expired["order_sequence"]);
+        assert_eq!(1.0, expired["volume"]);
+
+        // New read keys: the stop store is empty and the last trade printed 95.
+        let stops = client.read(&"orderbook_stops".to_string()).await.unwrap();
+        assert_eq!("[]", stops);
+        let last = client
+            .read(&"orderbook_last_trade_price".to_string())
+            .await
+            .unwrap();
+        assert_eq!("95.0", last);
+
+        node.shutdown().await.unwrap();
+    });
+}

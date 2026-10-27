@@ -56,6 +56,8 @@ LogStore  StateMachineStore  RaftNetwork        HTTP API
 pub enum MatchEngineRequest {
     Place { order: Order },
     Cancel { order: Order },
+    // 过期清除：时间戳随请求复制，apply 不读取时钟
+    PurgeExpired { now_ms: u64, day_close_ms: Option<u64> },
 }
 
 pub struct MatchEngineResponse {
@@ -63,9 +65,12 @@ pub struct MatchEngineResponse {
 }
 ```
 
-`Order`（`src/matchengine/mod.rs`）包含 `live`（Limit/Market）、`side`（Buy/Sell）、`price`、
-`volume`、`id` 和 `sequence`。`sequence` 字段在反序列化时是必需的，但 `place_order()` 会用订单簿
-自己的计数器覆盖它。
+`Order`（`src/matchengine/mod.rs`）的核心字段是 `live`（Limit/Market）、`side`（Buy/Sell）、
+`price`、`volume`、`id` 和 `sequence`；`sequence` 在反序列化时是必需的，但 `place_order()` 会用
+订单簿自己的计数器覆盖它。订单类型通过带 serde 默认值的附加字段表达：`tif`（GTC/IOC/FOK/
+GTD(毫秒)/Day）、`post_only`、`stop_price`（`0.0` 表示非止损单）、`display_volume`（冰山单可见
+档位，`0.0` 表示非冰山单）、`hidden_volume`（冰山隐藏量）和 `timestamp`（客户端时间，用于校验
+GTD）。止损单在触发前停在订单簿之外；成交价触及止损价后作为立即执行的子单（剩余量撤销）。
 
 ## 4. 存储实现
 
@@ -102,8 +107,10 @@ pub struct MatchEngineResponse {
 
 ```rust
 pub struct StateMachineData {
-    pub orders: Vec<Order>,  // 活动订单
-    pub sequence: u64,       // 订单序列号
+    pub orders: Vec<Order>,              // 挂单（先买后卖）
+    pub sequence: u64,                   // 订单序列号
+    pub stops: Vec<Order>,               // 停在场外的止损单（按准入顺序）
+    pub last_trade_price: Option<f64>,   // 最后成交价，用于触发止损
 }
 ```
 
@@ -266,7 +273,9 @@ curl -X POST -H "Content-Type: application/json" \
 
 三个端点都接收 JSON 字符串键，用于读取订单簿的命名视图：
 
-- `orderbook_orders`：所有活动订单的 JSON 数组；
+- `orderbook_orders`：订单簿中所有挂单的 JSON 数组；
+- `orderbook_stops`：停在场外的止损单；
+- `orderbook_last_trade_price`：最后成交价（首笔成交前为 `null`）；
 - `orderbook_sequence`：订单序列号（兼容旧拼写 `orderbook_sequance`）。
 
 ## 8. 测试

@@ -13,7 +13,7 @@ Single-crate Rust project (edition 2024): a Raft-replicated order-book matching 
   - `cargo bench --bench matchengine` runs the order-book micro-benchmarks (no framework, prints best-of-5 per-round times).
   - `tests/cluster/test_snapshot.rs` forces a snapshot, purges the log, and checks that a joining learner installs the snapshot over gRPC.
   - `tests/cluster/test_storage.rs` covers the WAL and snapshot formats directly; `tests/cluster/test_restart.rs` boots a node, stops it, and proves recovery via log replay and via snapshot.
-  - `tests/cluster/test_match_results.rs` boots a node with the file sink and checks rest/fill/cancel events in log order (port 21301, gRPC 22301).
+  - `tests/cluster/test_match_results.rs` boots a node with the file sink and checks rest/fill/cancel events in log order (port 21301, gRPC 22301); a second test on 21302 exercises a stop trigger, GTD expiry and the new `/read` keys.
   - Every integration test allocates a unique temp data dir (`tests/cluster/common.rs`); never point tests at the default `/tmp/matchengine-raft` or a second run will inherit the first run's membership.
 - First build is a normal crates.io download + compile; `openraft` 0.10.0-alpha.37 is a regular version dependency (it used to be a git pin, which cost ~7 min of checkout/build). The build script vendors `protoc` via `protoc-bin-vendored`, so no system protobuf compiler is needed.
 - Cluster walkthrough over HTTP: `./test-cluster.sh` (builds, starts 3 nodes, initialises with `-d '[]'`, writes/reads). It uses `/tmp/matchengine-raft-test-cluster` and clears it on start unless `RAFT_DATA_DIR` is set. `./open-cluster.sh` starts the same cluster in `/tmp/matchengine-raft-open-cluster` and leaves it running.
@@ -45,22 +45,37 @@ Single-crate Rust project (edition 2024): a Raft-replicated order-book matching 
 - Deadlines: unary vote/append and each `stream_append` request in flight get `RPCOption::soft_ttl()`. `stream_append` only times a wait while a request is in flight (the heartbeat worker polls for a response before the feeder necessarily sends), and `full_snapshot` has no per-RPC deadline — it is bounded by the `cancel` future and HTTP/2 keep-alive, because a legitimate snapshot can outlive one heartbeat interval.
 - Each peer gets separate gRPC connections for replication, heartbeat and snapshot (openraft's `new_heartbeat_client` / `new_snapshot_client` default to `new_client`, and each `GrpcNetwork` owns its own lazy channel), so a snapshot cannot head-of-line-block a vote.
 - Storage is **durable**. `src/store/log_store.rs` is a hand-written segmented WAL: `log/NNNNNNNNNN.wal` with an 8-byte `MRFT`+version header, `[len u32 LE][crc32 u32 LE][postcard payload]` records, one `write_all` + one `sync_data` per openraft append batch, `pread` reads, and blocking IO on `spawn_blocking`. Recovery walks segments and truncates a torn tail. Vote + `last_purged` live in an atomically rewritten `log/state`; `committed` is a WAL record that becomes durable with the next append (no second fsync).
-- `src/store/state_machine.rs` keeps the order book + sequence in memory and persists `snapshot/current.snap` (magic `MRFSNAP` + version + postcard meta + postcard content) via temp file → fsync → rename → dir fsync. Snapshot version is 2; v1 files (which also carried a KV map) are rejected on open. `install_snapshot` validates before replacing the durable copy. Restart = open snapshot, then openraft replays the retained log tail.
+- `src/store/state_machine.rs` keeps the order book + sequence in memory and persists `snapshot/current.snap` (magic `MRFSNAP` + version + postcard meta + postcard content) via temp file → fsync → rename → dir fsync. Snapshot version is 3 (v2 added nothing beyond dropping the KV map; v3 carries the extended `Order`, parked stops and the last trade price). Older files are rejected on open. `install_snapshot` validates before replacing the durable copy. Restart = open snapshot, then openraft replays the retained log tail.
 - `src/store/config.rs` owns `StorageConfig` (`data_dir`, `instance_prefix`, `node_dir`/`log_dir`/`snapshot_dir`). The old sled-backed `src/store/store.rs` and the `walkdir` dependency are gone; `sled` remains only for the `sled_test.rs` playground binary.
 
 ## Test gotchas
 
-- `tests/cluster/test_cluster.rs` boots 3 nodes in threads on fixed ports 127.0.0.1:21001-21003 (gRPC 22001-22003) and never shuts them down. `test_snapshot.rs` uses 21101-21102 (gRPC 22101-22102); `test_restart.rs` uses 21201 and 21202 (gRPC 22201-22202); `test_match_results.rs` uses 21301 (gRPC 22301) and shuts its node down. Kill leftovers (`./test.sh kill`, i.e. `pkill -f matchengine-raft`) before rerunning or the bind fails.
+- `tests/cluster/test_cluster.rs` boots 3 nodes in threads on fixed ports 127.0.0.1:21001-21003 (gRPC 22001-22003) and never shuts them down. `test_snapshot.rs` uses 21101-21102 (gRPC 22101-22102); `test_restart.rs` uses 21201 and 21202 (gRPC 22201-22202); `test_match_results.rs` uses 21301 and 21302 (gRPC 22301/22302) and shuts its nodes down. Kill leftovers (`./test.sh kill`, i.e. `pkill -f matchengine-raft`) before rerunning or the bind fails.
 - `test_snapshot.rs` polls `metrics().current_leader` after `init`; without that wait the first write can race the election and fail with `NotLeader`.
 - The cluster test asserts an exact `LinearizableReadError` message string naming node 1; changing error formatting breaks it.
 - The snapshot test depends on `snapshot_policy = LogsSinceLast(10)` and `max_in_snapshot_log_to_keep = 0`: the learner must join after the covered log has been purged, otherwise it catches up by log replication and the test proves nothing.
 
 ## Matching-engine quirks
 
-- `OrderBook::place_order` stops matching as soon as the taker's remaining volume reaches zero, and
-  a partially filled maker is updated in place so its `id`, `side`, `live` and `sequence` survive.
-  `Order::new` still hardcodes `id: 0`, so do not use it to rebuild a resting order. Regression
-  tests: `exact_fill_*`, `partial_fill_preserves_maker_identity` in `src/matchengine/mod.rs`.
+- `OrderBook::execute_order` is the full lifecycle `apply` runs (validate, park a stop, sweep, rest
+  or cancel the remainder, run the stop cascade) and returns an `Outcome`; `place_order` is the
+  compatibility wrapper that returns only the fills. `OrderBook::place_order` stops matching as soon
+  as the taker's remaining volume reaches zero, and a partially filled maker is updated in place so
+  its `id`, `side`, `live` and `sequence` survive. `Order::new` still hardcodes `id: 0`, so do not
+  use it to rebuild a resting order. Regression tests: `exact_fill_*`,
+  `partial_fill_preserves_maker_identity` in `src/matchengine/mod.rs`.
+- Order types live as flat fields on `Order` (`tif`, `post_only`, `stop_price`, `display_volume`,
+  `hidden_volume`, `timestamp`), all with serde defaults. `stop_price`/`display_volume` use `0.0`
+  as "none" so the record stays cheap to copy in the matching loop. `apply` never reads a clock:
+  GTD/Day deadlines arrive in `MatchEngineRequest::PurgeExpired { now_ms, day_close_ms }`, and stops
+  are elected by `OrderBook::last_trade_price`, which is replicated state. Parked stops live in
+  `orderbook.stops` (admission order, off the book, invisible to depth) and are cancelled by side +
+  sequence. A stop child never rests: whatever it cannot execute is cancelled. A stop the last
+  trade already crosses is refused (`stop_would_trigger`) rather than firing on entry.
+- Rejections (FOK unfillable, post-only crossing, stop already crossed, invalid shape) do not enter
+  the book; `apply` publishes a `rejected` event with a `reason` and the write still returns the
+  assigned sequence. Event kinds are `fill`, `rested`, `cancelled`, `triggered`, `expired`,
+  `rejected`; a stop cascade keeps increasing ordinals inside the same log entry.
 - `Order` deserializes `sequence`; the scripts now send `sequence` too. `Order::sequence` is still
   required by the deserializer even though `place_order()` overwrites it.
 - Match results leave `apply` as `MatchEvent`s through a `MatchResultSink`. `EventId` is

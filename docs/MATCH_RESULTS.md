@@ -195,7 +195,8 @@ pub struct EventId {
     pub ordinal: u32,     // 0-based position inside that entry
 }
 
-pub enum MatchEventKind { Rested, Fill, Cancelled }  // JSON: "rested", "fill", "cancelled"
+// JSON: "rested", "fill", "cancelled", "triggered", "expired", "rejected"
+pub enum MatchEventKind { Rested, Fill, Cancelled, Triggered, Expired, Rejected }
 
 pub struct MatchEvent {
     pub event_id: EventId,
@@ -206,8 +207,12 @@ pub struct MatchEvent {
     pub counterparty_sequence: Option<u64>,
     /// Maker price on a fill, order price otherwise.
     pub price: f64,
-    /// Filled volume, resting remainder, or the open volume a cancel removed.
+    /// Filled volume, resting remainder, the open volume a cancel/expiry
+    /// removed, the stop's open volume on a trigger, or the submitted volume
+    /// on a rejection.
     pub volume: f64,
+    /// Why a `Rejected` (or `Expired`) event happened; omitted when absent.
+    pub reason: Option<RejectReason>,
 }
 ```
 
@@ -439,13 +444,18 @@ Implemented today (`cargo test --lib`, `cargo test --test cluster test_match_res
 
 - `apply` publishes `Rested`, `Fill` and `Cancelled` events to the configured sink, with the right
   order/counterparty sequences and the book's exact volumes.
+- The order-type paths publish their own kinds: `Triggered` (a parked stop was elected; its child's
+  fills follow in the same entry, then a `Cancelled` for any remainder), `Expired` (a `PurgeExpired`
+  eviction) and `Rejected` (FOK unfillable, post-only crossing, stop already crossed, invalid
+  shape). Ordinals keep increasing across the whole entry, so a stop cascade stays one ordered batch.
 - A cancel of an order that is not in the book publishes nothing.
 - A failing sink is logged and does not fail `apply` or change the state.
 - `FileLogSink` writes one JSON object per event with `node_id`, appends across reopen, and writes
   nothing for an empty batch.
 - `resting_volume` reports the stored remainder, `None` for a fully filled or unplaced order.
 - End-to-end (`tests/cluster/test_match_results.rs`): a node started with `--match-event-log`
-  records rest/fill/cancel in log order and the `/write` response is unchanged.
+  records rest/fill/cancel in log order and the `/write` response is unchanged; a second node
+  checks `Triggered` + child fill, `Expired` from `PurgeExpired`, and the new `/read` keys.
 
 Still to write with phases 2–4:
 

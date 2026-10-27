@@ -77,7 +77,10 @@ one it dials.
    - Management APIs for cluster administration
 
 3. **Matching Engine** ([`matchengine/`](./src/matchengine/))
-   - Order book with bids and asks
+   - Price-time priority order book with bids and asks
+   - Order types: GTC, IOC, FOK, GTD, Day, post-only, iceberg, stop-market and stop-limit
+   - Deterministic expiry (`PurgeExpired` carries the timestamps through the log) and stop
+     election on the replicated last trade price
    - Example of a real-world state machine application
 
 ## Getting Started
@@ -320,22 +323,62 @@ Each node writes to `<data-dir>/<instance-prefix>-<node-id>/{log,snapshot}`. Con
 The equivalent environment variables are `RAFT_DATA_DIR` and `RAFT_INSTANCE_PREFIX`; the defaults
 are `/tmp/matchengine-raft` and `matchengine`.
 
+### Order types
+
+An order is one flat `Order` record; every optional type is a field on it. All new fields have serde
+defaults, so payloads written before they existed still deserialize. The semantics follow
+[OrderBook-rs](https://github.com/joaquinbejar/OrderBook-rs):
+
+| Type | Field | Behaviour |
+|---|---|---|
+| GTC (default) | — | Rests until filled or cancelled. |
+| IOC | `"tif": "IOC"` | Executes what crosses now; the remainder is cancelled and reported by a `cancelled` event. |
+| FOK | `"tif": "FOK"` | A preflight sums the reachable visible + hidden depth at or inside the limit. Unless the whole order fits, it is refused (`rejected`, reason `fok_unfillable`) and the book is untouched. |
+| GTD | `"tif": {"GTD": 1700000000000}` (Unix ms) | Rests until a `PurgeExpired` with `now_ms >= expiry` evicts it. |
+| Day | `"tif": "DAY"` | Expires when `PurgeExpired` is called with `day_close_ms` and `now_ms >= close`; without a close it behaves like GTC. |
+| Post-only | `"post_only": true` | Never takes liquidity: it rests in full, or is refused (`post_only_would_cross`) when it would trade. |
+| Iceberg | `"display_volume": 100.0` | `volume` is the total; only one display tranche rests. The rest waits in `hidden_volume`, invisible to depth, and is refilled tranche by tranche as the visible part is consumed. |
+| Stop-market | `"live": "Market", "stop_price": 95.0` | Parks off the book until a trade at or through the stop price (sell: `<=` stop, buy: `>=` stop), then sweeps every level. The child never rests: its remainder is cancelled. |
+| Stop-limit | `"live": "Limit", "price": 96.0, "stop_price": 95.0` | Same election, child bounded by `price`; the remainder is cancelled. |
+
+Market orders (`"live": "Market"`) ignore their own price, sweep the opposite side and cancel the
+remainder; they never rest.
+
+Expiry is deterministic: `apply` never reads a clock, so the deadlines travel in the replicated
+request and every replica evicts the same orders:
+
+```json
+{"PurgeExpired": {"now_ms": 1700000000000, "day_close_ms": null}}
+```
+
+The response carries the number of evicted orders (`{"value": "2"}`), and each one emits an
+`expired` event reporting its still-open volume.
+
+A stop is only elected by a *new* trade: one the last trade price already crosses is refused
+(`stop_would_trigger`) instead of turning into a market order on entry. One trade can cascade
+through several stops; elected stops execute in admission order.
+
+Unsupported combinations (a stop that is also post-only or an iceberg, a post-only market order, a
+zero/negative size or price, a GTD deadline not after the order's own `timestamp`) are refused with
+a `rejected` event carrying the reason.
+
 ### Match-result processing
 
-`apply` turns every `MatchResult` into a `MatchEvent` (`fill`, `rested` or `cancelled`) and hands it
+`apply` turns every `MatchResult` into a `MatchEvent` (`fill`, `rested`, `cancelled`, `triggered`,
+`expired` or `rejected`) and hands it
 to a pluggable `MatchResultSink` (`src/match_result/mod.rs`). Events are derived from the applied log
 entry alone, so every replica produces the same ids; the sink itself is node-local and never
 influences the replicated state:
 
 ```
-POST /write { Place | Cancel }
+POST /write { Place | Cancel | PurgeExpired }
         │
         ▼
   StateMachineStore::apply  (every replica)
         │
         ├──► order book + sequence ──► snapshot        [replicated state]
         │
-        └──► MatchEvent  (fill | rested | cancelled)   [id = log position]
+        └──► MatchEvent  (fill/rested/cancelled/…)     [id = log position]
                     │
                     ▼
           MatchResultSink                              [node-local, best effort]
@@ -423,7 +466,7 @@ The gRPC transport exposes the same operations on `--http-addr` port + 1000
 
 ### Application APIs
 
-- `POST /write` - Submit a `Place` or `Cancel` request through Raft
+- `POST /write` - Submit a `Place`, `Cancel` or `PurgeExpired` request through Raft
 - `POST /read` - Read from the local state machine (may be stale)
 - `POST /linearizable_read` - Linearizable read; the request must reach the leader
 - `POST /follower_read` - Linearizable read served locally after fetching a linearizer from the leader
@@ -431,7 +474,9 @@ The gRPC transport exposes the same operations on `--http-addr` port + 1000
 `/read`, `/linearizable_read` and `/follower_read` accept a JSON string key naming a view of the
 order book:
 
-- `orderbook_orders` - all live orders as a JSON array
+- `orderbook_orders` - all orders resting in the book as a JSON array
+- `orderbook_stops` - the stop orders parked off the book, in admission order
+- `orderbook_last_trade_price` - the last trade price (`null` before the first trade), which elects stops
 - `orderbook_sequence` - the order sequence counter (`orderbook_sequance` is accepted as a legacy
   alias)
 
@@ -439,6 +484,13 @@ Example order payload accepted by `/write` (note the field name `sequence`):
 
 ```json
 {"Place": {"order": {"live": "Limit", "side": "Buy", "price": 4000.0, "volume": 4.4, "id": 1, "sequence": 1}}}
+```
+
+Every order-type field (`tif`, `post_only`, `stop_price`, `display_volume`, `hidden_volume`,
+`timestamp`) is optional and defaults to "plain GTC limit order":
+
+```json
+{"Place": {"order": {"live": "Limit", "side": "Sell", "price": 4000.0, "volume": 100.0, "tif": "IOC", "display_volume": 10.0}}}
 ```
 
 The matching engine overwrites `sequence` when it applies the order, so the value clients send is
@@ -454,12 +506,12 @@ ignored; `0` is the conventional placeholder. The field is still required by the
 | `tests/cluster/test_snapshot.rs` | Snapshot creation, log purge, and a learner installing the purged state over the gRPC snapshot stream |
 | `tests/cluster/test_storage.rs` | WAL framing, torn-tail truncation, segment rotation, truncate/purge across segments, vote/committed persistence, snapshot build/install/reopen, corrupt-file rejection |
 | `tests/cluster/test_restart.rs` | Full node restart recovering the order book and sequence via WAL replay, and via snapshot + tail |
-| `tests/cluster/test_match_results.rs` | A node started with `--match-event-log` records rest/fill/cancel events in log order while the `/write` response stays unchanged |
+| `tests/cluster/test_match_results.rs` | A node started with `--match-event-log` records rest/fill/cancel events in log order while the `/write` response stays unchanged; a second node checks stop triggers, GTD expiry and the new `/read` keys |
 
 Every integration test uses a unique temporary data directory. The cluster test uses fixed ports
 `21001-21003` (gRPC `22001-22003`), the snapshot test `21101-21102`, the restart test `21201-21202`
-and the match-result test `21301`; stop leftover processes (`pkill -f matchengine-raft`) before
-rerunning.
+and the match-result tests `21301`/`21302`; stop leftover processes (`pkill -f matchengine-raft`)
+before rerunning.
 
 Known gaps and the roadmap are tracked in [`TODO.md`](./TODO.md).
 

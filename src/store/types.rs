@@ -13,14 +13,25 @@ use crate::matchengine::Order;
 ///
 /// # Variants
 ///
-/// * `Place` - Adds an order to the order book
+/// * `Place` - Adds an order to the order book (or parks it as a stop)
 /// * `Cancel` - Removes an order from the order book
+/// * `PurgeExpired` - Evicts GTD/Day orders whose deadline has passed
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum MatchEngineRequest {
     /// Place a new order in the matching engine.
     Place { order: Order },
     /// Cancel an existing order from the matching engine.
     Cancel { order: Order },
+    /// Evict every order whose time in force has expired at `now_ms`.
+    ///
+    /// The timestamps travel in the request (and therefore through the Raft
+    /// log), so the state machine never reads a clock and every replica evicts
+    /// exactly the same orders. `day_close_ms` supplies the trading-day close:
+    /// `Day` orders expire only when it is present and `now_ms >= close`.
+    PurgeExpired {
+        now_ms: u64,
+        day_close_ms: Option<u64>,
+    },
 }
 
 impl fmt::Display for MatchEngineRequest {
@@ -28,6 +39,13 @@ impl fmt::Display for MatchEngineRequest {
         match self {
             MatchEngineRequest::Place { order } => write!(f, "Place {{ order: {:?} }}", order),
             MatchEngineRequest::Cancel { order } => write!(f, "Cancel {{ order: {:?} }}", order),
+            MatchEngineRequest::PurgeExpired {
+                now_ms,
+                day_close_ms,
+            } => write!(
+                f,
+                "PurgeExpired {{ now_ms: {now_ms}, day_close_ms: {day_close_ms:?} }}"
+            ),
         }
     }
 }

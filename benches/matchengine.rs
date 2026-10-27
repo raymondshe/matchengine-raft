@@ -13,14 +13,7 @@ use matchengine_raft::matchengine::OrderSide;
 
 /// A resting limit order helper; `id` stays 0 like `Order::new` does.
 fn resting(side: OrderSide, price: f64, volume: f64) -> Order {
-    Order {
-        live: matchengine_raft::matchengine::OrderType::Limit,
-        side,
-        price,
-        volume,
-        id: 0,
-        sequence: 0,
-    }
+    Order::new(side, price, volume, 0)
 }
 
 /// Runs `f` `rounds` times five times and prints the fastest per-round time.
@@ -98,6 +91,34 @@ fn main() {
             let mut taker = resting(OrderSide::Buy, 100.0, 1.0);
             assert_eq!(1, ob.place_order(&mut taker).len());
         }
+    });
+
+    // IOC remainders: each taker fills one unit and cancels the other.
+    let mut ioc_book = OrderBook::new();
+    bench("ioc cancels 1k", 100, || {
+        for _ in 0..1000u32 {
+            let mut maker = resting(OrderSide::Sell, 100.0, 1.0);
+            ioc_book.place_order(&mut maker);
+            let mut taker = resting(OrderSide::Buy, 100.0, 2.0);
+            taker.tif = matchengine_raft::matchengine::TimeInForce::Ioc;
+            let outcome = ioc_book.execute_order(&mut taker);
+            assert_eq!(1, outcome.fills.len());
+            assert_eq!(Some(1.0), outcome.cancelled);
+        }
+        assert!(ioc_book.asks.is_empty());
+    });
+
+    // Iceberg replenishment: one hidden reserve refilled 1k times.
+    bench("iceberg replenish 1k", 100, || {
+        let mut ob = OrderBook::new();
+        let mut iceberg = resting(OrderSide::Sell, 100.0, 1000.0);
+        iceberg.display_volume = 1.0;
+        ob.place_order(&mut iceberg);
+        for _ in 0..1000u32 {
+            let mut taker = resting(OrderSide::Buy, 100.0, 1.0);
+            assert_eq!(1, ob.place_order(&mut taker).len());
+        }
+        assert!(ob.asks.is_empty());
     });
 
     // Cancels: exact-key removals against a resting book.

@@ -3,7 +3,7 @@ use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
 /// Specifies whether an order is a buy (bid) or sell (ask) order.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OrderSide {
     /// Buy order - trader wants to purchase an asset.
     Buy,
@@ -21,12 +21,93 @@ pub enum OrderCmd {
 }
 
 /// Specifies the type of order (execution style).
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OrderType {
-    /// Market order - executes immediately at the best available price.
+    /// Market order - executes immediately at the best available price,
+    /// ignoring its own `price`. Whatever it cannot execute is cancelled, so a
+    /// market order never rests.
     Market,
     /// Limit order - executes only at the specified price or better.
     Limit,
+}
+
+/// How long an order stays live: the classic time-in-force policies.
+///
+/// Variants and semantics mirror `pricelevel::TimeInForce` from
+/// [OrderBook-rs](https://github.com/joaquinbejar/OrderBook-rs): `Ioc` and
+/// `Fok` are immediate (whatever does not execute is cancelled, never
+/// rested), `Gtd` carries its expiry as a Unix timestamp in milliseconds, and
+/// `Day` expires at the trading-day close when the caller supplies one.
+///
+/// Expiry is never evaluated against a wall clock inside the state machine:
+/// the timestamp travels in the [`crate::store::MatchEngineRequest::PurgeExpired`]
+/// request, so every replica evicts exactly the same orders.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum TimeInForce {
+    /// Good-'til-cancelled: rests until it fills or is cancelled (the default).
+    #[default]
+    #[serde(alias = "gtc")]
+    Gtc,
+    /// Immediate-or-cancel: execute what crosses now, cancel the remainder.
+    #[serde(alias = "ioc")]
+    Ioc,
+    /// Fill-or-kill: execute everything now or cancel the whole order.
+    #[serde(alias = "fok")]
+    Fok,
+    /// Good-'til-date: rests until `expiry` (Unix timestamp in milliseconds).
+    #[serde(alias = "gtd")]
+    Gtd(u64),
+    /// Good for the day: rests until the trading-day close supplied with the
+    /// expiry purge. Without a close it behaves like GTC.
+    #[serde(alias = "day")]
+    Day,
+}
+
+impl TimeInForce {
+    /// `true` when the unfilled part of such an order is cancelled after the
+    /// sweep instead of resting (IOC and FOK).
+    pub fn is_immediate(&self) -> bool {
+        matches!(self, Self::Ioc | Self::Fok)
+    }
+
+    /// `true` when the order can be removed by an expiry purge.
+    pub fn has_expiry(&self) -> bool {
+        matches!(self, Self::Gtd(_) | Self::Day)
+    }
+
+    /// Whether an order with this time in force has expired at `now_ms`.
+    ///
+    /// `Gtd` expires at or after its deadline. `Day` expires at the close, but
+    /// only when the caller supplies one; `day_close_ms: None` keeps Day
+    /// orders live (the same rule `pricelevel` uses).
+    pub fn is_expired(&self, now_ms: u64, day_close_ms: Option<u64>) -> bool {
+        match self {
+            Self::Gtd(expiry) => now_ms >= *expiry,
+            Self::Day => day_close_ms.is_some_and(|close| now_ms >= close),
+            _ => false,
+        }
+    }
+}
+
+/// Why the engine refused an order outright: it never entered the book and
+/// nothing executed for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RejectReason {
+    /// Fill-or-kill: the book could not fill the whole order at its price.
+    FokUnfillable,
+    /// Post-only: the order would have crossed the book, so it was refused
+    /// instead of taking liquidity.
+    PostOnlyWouldCross,
+    /// Stop order: the last trade price already crossed the stop price, and a
+    /// stop never turns into an order on entry (it only triggers on new
+    /// trades).
+    StopWouldTrigger,
+    /// Good-'til-date: the expiry is not after the order's own timestamp.
+    GtdAlreadyExpired,
+    /// Volume, price or an unsupported type combination is out of range.
+    InvalidOrder,
 }
 
 /// Represents a single order in the order book.
@@ -34,6 +115,12 @@ pub enum OrderType {
 /// An order contains all necessary information about a trader's request
 /// to buy or sell an asset, including price, volume, and timing information
 /// for matching and prioritization.
+///
+/// The plain fields (side/price/volume plus [`OrderType`]) are the core
+/// order; the optional fields layer the additional types on top of the same
+/// structure, mirroring how OrderBook-rs layers time in force, post-only,
+/// icebergs and stops over one order record. Every new field has a serde
+/// default, so payloads written before they existed still deserialize.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct Order {
     /// The type of order (Limit or Market).
@@ -43,6 +130,9 @@ pub struct Order {
     /// The price level for this order (for limit orders).
     pub price: f64,
     /// The quantity of the asset to trade.
+    ///
+    /// For a resting iceberg order this is the currently displayed tranche;
+    /// [`Order::open_volume`] reports the tranche plus the hidden reserve.
     pub volume: f64,
 
     /// Unique identifier for the order.
@@ -52,10 +142,45 @@ pub struct Order {
     /// This ensures price-time priority - orders with lower sequence
     /// numbers are matched first at the same price level.
     pub sequence: u64,
+
+    /// Time in force ([`TimeInForce`]); defaults to GTC.
+    #[serde(default)]
+    pub tif: TimeInForce,
+    /// Post-only: never take liquidity. If the order would cross the book it
+    /// is refused outright ([`RejectReason::PostOnlyWouldCross`]) instead of
+    /// trading; otherwise it rests in full like a GTC limit.
+    #[serde(default)]
+    pub post_only: bool,
+    /// Stop (trigger) price; `0.0` means the order is not a stop. When set,
+    /// the order parks off the book until the last trade price elects it
+    /// (sell: a trade at or below the stop; buy: a trade at or above it), then
+    /// executes immediately as this order's `live` type — `Limit` makes it a
+    /// stop-limit, `Market` a stop-market. The child never rests: whatever it
+    /// cannot execute is cancelled.
+    ///
+    /// Prices are positive, so `0.0` doubles as "none" and keeps [`Order`]
+    /// small enough to stay cheap to copy on the matching path.
+    #[serde(default)]
+    pub stop_price: f64,
+    /// Iceberg display size (`0.0` means the order is not an iceberg): the
+    /// visible tranche of a resting iceberg order. Whatever the sweep leaves
+    /// over rests in [`Order::hidden_volume`], out of sight of depth and
+    /// matching, and is drawn back into `volume` one tranche at a time as the
+    /// visible part is consumed.
+    #[serde(default)]
+    pub display_volume: f64,
+    /// Hidden reserve of a resting iceberg order. Invisible to depth and
+    /// matching until the visible tranche is consumed.
+    #[serde(default)]
+    pub hidden_volume: f64,
+    /// Client-supplied creation time (Unix ms), recorded in the log. Only used
+    /// to sanity-check GTD expiries; the engine never reads a wall clock.
+    #[serde(default)]
+    pub timestamp: u64,
 }
 
 impl Order {
-    /// Creates a new limit order with the specified parameters.
+    /// Creates a new GTC limit order with the specified parameters.
     ///
     /// # Arguments
     ///
@@ -66,15 +191,45 @@ impl Order {
     ///
     /// # Returns
     ///
-    /// A new Order instance with OrderType::Limit.
+    /// A new Order instance with `OrderType::Limit` and `TimeInForce::Gtc`.
+    /// The identifier stays 0: never rebuild a resting order with this.
     pub fn new(side: OrderSide, price: f64, size: f64, sequence: u64) -> Self {
         Self {
-            id: 0,
-            side: side,
-            live: OrderType::Limit, // TODO: More types
-            price: price,
+            live: OrderType::Limit,
+            side,
+            price,
             volume: size,
-            sequence: sequence,
+            id: 0,
+            sequence,
+            tif: TimeInForce::Gtc,
+            post_only: false,
+            stop_price: 0.0,
+            display_volume: 0.0,
+            hidden_volume: 0.0,
+            timestamp: 0,
+        }
+    }
+
+    /// Total open volume: the visible part plus any iceberg reserve.
+    ///
+    /// This is what a cancel or expiry of this order removes, and what a FOK
+    /// preflight may draw on.
+    pub fn open_volume(&self) -> f64 {
+        self.volume + self.hidden_volume
+    }
+
+    /// `true` when the order is parked off the book until its stop price
+    /// triggers.
+    pub fn is_stop(&self) -> bool {
+        self.stop_price > 0.0
+    }
+
+    /// Whether a trade at `last_trade_price` elects this stop order: a sell
+    /// stop fires at or below its stop price, a buy stop at or above it.
+    fn stop_elected(&self, last_trade_price: f64) -> bool {
+        match self.side {
+            OrderSide::Buy => last_trade_price >= self.stop_price,
+            OrderSide::Sell => last_trade_price <= self.stop_price,
         }
     }
 }
@@ -243,6 +398,10 @@ pub mod vectorize {
 /// - Bids (buy orders) sorted by price descending, then sequence ascending
 /// - Asks (sell orders) sorted by price ascending, then sequence ascending
 ///
+/// Stop orders are not in either map: while parked they are off the book,
+/// invisible to matching and depth, and are held in `stops` in admission
+/// order until a trade elects them.
+///
 /// This implements a standard price-time priority matching engine.
 #[derive(Clone, Default, Serialize, Deserialize, Debug)]
 pub struct OrderBook {
@@ -254,6 +413,14 @@ pub struct OrderBook {
     pub asks: BTreeMap<AskKey, Order>,
     /// Sequence counter for assigning order sequence numbers.
     pub sequence: u64,
+    /// Parked stop orders, in admission (sequence) order. Elected stops are
+    /// removed and executed as immediate takers; they never rest.
+    #[serde(default)]
+    pub stops: Vec<Order>,
+    /// Price of the most recent trade, if there has been one. This is what
+    /// elects parked stops, so it is part of the replicated state.
+    #[serde(default)]
+    pub last_trade_price: Option<f64>,
 }
 
 /// Represents the result of a successful order match.
@@ -296,16 +463,53 @@ impl MatchResult {
     }
 }
 
+/// Everything one submitted order did to the book: what
+/// [`OrderBook::execute_order`] reports so the state machine can turn it into
+/// events and a response.
+#[derive(Debug, Clone, Default)]
+pub struct Outcome {
+    /// Trades the submitted order executed, in execution order.
+    pub fills: Vec<MatchResult>,
+    /// Open volume the submission left resting in the book (the visible
+    /// tranche for an iceberg); `None` when nothing rests.
+    pub resting: Option<f64>,
+    /// Volume of the submission that was cancelled without executing (an IOC
+    /// remainder, a market remainder, or FOK rounding dust).
+    pub cancelled: Option<f64>,
+    /// The order was parked off the book as a stop order.
+    pub parked: bool,
+    /// The order was refused outright; it never entered the book.
+    pub rejected: Option<RejectReason>,
+    /// Parked stops the submission's trades elected, in execution order.
+    pub triggers: Vec<StopExecution>,
+}
+
+/// One elected stop order: its election, its child execution, and what the
+/// child could not execute.
+#[derive(Debug, Clone)]
+pub struct StopExecution {
+    /// The stop as it was parked, with its open volume at election time.
+    pub stop: Order,
+    /// Last trade price that elected the stop.
+    pub trigger_price: f64,
+    /// Trades the stop's child executed (printed at maker prices).
+    pub fills: Vec<MatchResult>,
+    /// Child volume that could not execute; cancelled, never rested.
+    pub cancelled: Option<f64>,
+}
+
 impl OrderBook {
     /// Creates a new, empty order book.
     ///
-    /// The order book starts with no bids or asks, and the sequence
-    /// counter initialized to 0.
+    /// The order book starts with no bids or asks, no parked stops, and the
+    /// sequence counter initialized to 0.
     pub fn new() -> Self {
         Self {
             bids: BTreeMap::new(),
             asks: BTreeMap::new(),
             sequence: 0,
+            stops: Vec::new(),
+            last_trade_price: None,
         }
     }
 
@@ -365,6 +569,10 @@ impl OrderBook {
     /// 2. For sell orders: matches against bids starting from the best price
     /// 3. Any remaining quantity is added to the book
     ///
+    /// Only the trades are returned; see [`OrderBook::execute_order`] for the
+    /// rest of the outcome (rested volume, cancellations, stop elections and
+    /// rejections), which is what the state machine needs to emit events.
+    ///
     /// # Arguments
     ///
     /// * `order` - The order to place (will have its sequence number set)
@@ -374,29 +582,110 @@ impl OrderBook {
     /// A vector of `MatchResult` representing all trades that occurred,
     /// or an empty vector if no matches were made.
     pub fn place_order(&mut self, order: &mut Order) -> Vec<MatchResult> {
-        order.sequence = self.sequence;
-        self.sequence += 1;
-
-        match order.side {
-            OrderSide::Buy => {
-                return self.match_bid_order(&order);
-            }
-            OrderSide::Sell => {
-                return self.match_ask_order(&order);
-            }
-        }
+        self.execute_order(order).fills
     }
 
-    /// Cancels an existing order from the book.
+    /// Runs one submitted order through its whole lifecycle: validation, stop
+    /// parking, the sweep, the rest or cancellation of the remainder, and the
+    /// stop cascade the trades may elect.
+    ///
+    /// This is the deterministic core `apply` runs: everything it decides comes
+    /// from the order (as recorded in the log) and the book itself. No clock is
+    /// read — GTD and Day expiry arrive as a `PurgeExpired` request, and stop
+    /// elections follow the last trade price, part of the replicated state.
     ///
     /// # Arguments
     ///
-    /// * `order` - The order to cancel (must have the correct price and sequence)
+    /// * `order` - The order to process (will have its sequence number set)
+    pub fn execute_order(&mut self, order: &mut Order) -> Outcome {
+        order.sequence = self.sequence;
+        self.sequence += 1;
+
+        let mut outcome = Outcome::default();
+        if let Some(reason) = validate_order(order) {
+            outcome.rejected = Some(reason);
+            return outcome;
+        }
+
+        // A stop order parks off the book; it is only ever elected by a *new*
+        // trade, so one the last trade already crosses is refused on entry.
+        if order.is_stop() {
+            if self
+                .last_trade_price
+                .is_some_and(|last| order.stop_elected(last))
+            {
+                outcome.rejected = Some(RejectReason::StopWouldTrigger);
+            } else {
+                self.stops.push(*order);
+                outcome.parked = true;
+            }
+            return outcome;
+        }
+
+        // Post-only never takes liquidity: rest it whole or refuse it.
+        if order.post_only {
+            if self.would_cross(order) {
+                outcome.rejected = Some(RejectReason::PostOnlyWouldCross);
+            } else {
+                outcome.resting = Some(self.rest(order, order.volume));
+            }
+            return outcome;
+        }
+
+        // Fill-or-kill: the whole quantity must be there, or nothing happens.
+        if order.tif == TimeInForce::Fok && self.fillable_volume(order) < order.volume {
+            outcome.rejected = Some(RejectReason::FokUnfillable);
+            return outcome;
+        }
+
+        // A market order sweeps every level; a limit order stops at its price.
+        let limit = match order.live {
+            OrderType::Market => None,
+            OrderType::Limit => Some(order.price),
+        };
+        let (fills, remainder) = self.sweep(order, limit);
+        outcome.fills = fills;
+
+        if remainder > 0.0 {
+            if order.tif.is_immediate() || order.live == OrderType::Market {
+                // IOC/FOK remainders and market remainders are cancelled: a
+                // market or immediate order never rests.
+                outcome.cancelled = Some(remainder);
+            } else {
+                outcome.resting = Some(self.rest(order, remainder));
+            }
+        }
+
+        // Any trade moves the last trade price, which may elect parked stops.
+        if let Some(print) = outcome.fills.last() {
+            self.last_trade_price = Some(print.maker.price);
+        }
+        self.run_stops(&mut outcome);
+
+        outcome
+    }
+
+    /// Cancels an existing order from the book or from the parked stops.
+    ///
+    /// # Arguments
+    ///
+    /// * `order` - The order to cancel (must have the correct price and sequence;
+    ///   a parked stop is matched by side and sequence, since its price is a
+    ///   trigger rather than a book key)
     ///
     /// # Returns
     ///
     /// The cancelled order if found, or `None` if no matching order was in the book.
     pub fn cancel(&mut self, order: &Order) -> Option<Order> {
+        // A parked stop is off the book: its sequence identifies it.
+        let parked = self
+            .stops
+            .iter()
+            .position(|stop| stop.side == order.side && stop.sequence == order.sequence);
+        if let Some(index) = parked {
+            return Some(self.stops.remove(index));
+        }
+
         match order.side {
             OrderSide::Buy => {
                 let key = BidKey {
@@ -441,171 +730,297 @@ impl OrderBook {
         }
     }
 
-    /// Adds `volume` of an unmatched buy order back into the bid side of the book.
-    fn rest_as_bid(&mut self, order: &Order, volume: f64) {
+    /// Rests `total` of unfilled volume for `order` on its own side of the book.
+    ///
+    /// A plain order rests whole; an iceberg rests one display tranche and moves
+    /// the remainder into its hidden reserve, which is invisible to depth and
+    /// to [`OrderBook::resting_volume`] until the sweep consumes the tranche and
+    /// draws the next one out of it.
+    /// Returns the visible tranche that went into the book (all of `total`
+    /// for a plain order), so callers do not have to look it up again.
+    fn rest(&mut self, order: &Order, total: f64) -> f64 {
+        let visible = if order.display_volume > 0.0 {
+            order.display_volume.min(total)
+        } else {
+            total
+        };
         let mut resting = *order;
-        resting.volume = volume;
-        self.bids.insert(
-            BidKey {
-                price: order.price,
-                sequence: order.sequence,
-            },
-            resting,
-        );
+        resting.volume = visible;
+        resting.hidden_volume = total - visible;
+
+        match order.side {
+            OrderSide::Buy => {
+                self.bids.insert(
+                    BidKey {
+                        price: order.price,
+                        sequence: order.sequence,
+                    },
+                    resting,
+                );
+            }
+            OrderSide::Sell => {
+                self.asks.insert(
+                    AskKey {
+                        price: order.price,
+                        sequence: order.sequence,
+                    },
+                    resting,
+                );
+            }
+        }
+
+        visible
     }
 
-    /// Adds `volume` of an unmatched sell order back into the ask side of the book.
-    fn rest_as_ask(&mut self, order: &Order, volume: f64) {
-        let mut resting = *order;
-        resting.volume = volume;
-        self.asks.insert(
-            AskKey {
-                price: order.price,
-                sequence: order.sequence,
-            },
-            resting,
-        );
+    /// Sweeps the opposite side of the book, returning the trades it executed
+    /// and the volume that could not execute.
+    ///
+    /// `limit` bounds the execution price: `None` (a market order) sweeps every
+    /// resting level, `Some(price)` stops as soon as the best level is away from
+    /// it. Only the resting side is touched; resting or cancelling the remainder
+    /// is the caller's decision.
+    ///
+    /// A fully consumed iceberg draws its next tranche out of its hidden reserve
+    /// instead of leaving the book and the taker keeps matching it, exactly as
+    /// OrderBook-rs replenishes an iceberg tranche: to the taker it looks like
+    /// several orders queued at that price.
+    fn sweep(&mut self, order: &Order, limit: Option<f64>) -> (Vec<MatchResult>, f64) {
+        match order.side {
+            OrderSide::Buy => Self::sweep_side(&mut self.asks, order, limit),
+            OrderSide::Sell => Self::sweep_side(&mut self.bids, order, limit),
+        }
     }
 
-    /// Attempts to match a buy (bid) order against the ask side of the book.
+    /// Shared sweep loop for one resting side; see [`OrderBook::sweep`].
     ///
-    /// The matching algorithm:
-    /// 1. Starts with the best (lowest priced) ask
-    /// 2. Matches as much as possible at each price level
-    /// 3. If the ask is completely filled, removes it and continues
-    /// 4. If the ask has remaining volume, updates it and stops
-    /// 5. If the order can't be fully matched, adds the remainder to the bid side
-    ///
-    /// The loop stops as soon as the taker's remaining volume reaches zero, so
-    /// an exhausted taker never emits a zero-quantity trade or touches a later
-    /// ask. Partially filled asks are updated in place to keep their identity.
-    ///
-    /// # Arguments
-    ///
-    /// * `order` - The buy order to match
-    ///
-    /// # Returns
-    ///
-    /// A vector of MatchResult for each trade executed
-    fn match_bid_order(&mut self, order: &Order) -> Vec<MatchResult> {
+    /// Generic over the key type so bids and asks run the same loop: a sweep
+    /// never rebuilds a key, it only walks `first_entry`.
+    fn sweep_side<K: Ord>(
+        resting: &mut BTreeMap<K, Order>,
+        order: &Order,
+        limit: Option<f64>,
+    ) -> (Vec<MatchResult>, f64) {
         let mut results = Vec::new();
         let mut remaining_volume = order.volume;
 
         // Stop as soon as the taker is exhausted: a zero-volume taker must not
-        // "match" the next ask and rewrite it.
+        // "match" the next maker and rewrite it.
         while remaining_volume > 0.0 {
             // `first_entry` walks the tree once and keeps the position, so
-            // removing a fully filled ask or shrinking a partially filled one
-            // below does not descend a second time.
-            let Some(mut best) = self.asks.first_entry() else {
-                // No more asks to match, add remaining to bids
-                self.rest_as_bid(order, remaining_volume);
+            // removing a fully filled maker, shrinking a partially filled one
+            // or refilling an iceberg below does not descend a second time.
+            let Some(mut best) = resting.first_entry() else {
                 break;
             };
 
-            let best_ask = *best.get();
-            if best_ask.price > order.price {
-                // Best ask price is too high, add remaining to bids
-                self.rest_as_bid(order, remaining_volume);
+            let maker = *best.get();
+            let crosses = match (limit, order.side) {
+                (Some(limit), OrderSide::Buy) => maker.price <= limit,
+                (Some(limit), OrderSide::Sell) => maker.price >= limit,
+                (None, _) => true,
+            };
+            if !crosses {
+                // The best level is away from the taker's limit: it cannot
+                // trade any further.
                 break;
             }
 
-            // Can match with best ask
-            let match_volume = remaining_volume.min(best_ask.volume);
+            let match_volume = remaining_volume.min(maker.volume);
             results.push(MatchResult {
                 taker: Order {
                     volume: remaining_volume,
                     ..*order
                 },
-                maker: best_ask,
+                maker,
                 matches: match_volume,
             });
 
-            if best_ask.volume > remaining_volume {
+            if maker.volume > remaining_volume {
                 // Partially filled: shrink the maker in place so it keeps
                 // its identity (id, side, live and sequence).
-                best.get_mut().volume = best_ask.volume - match_volume;
+                best.get_mut().volume = maker.volume - match_volume;
                 // Taker fully matched
+                remaining_volume = 0.0;
                 break;
+            }
+
+            // The visible tranche is gone.
+            remaining_volume -= match_volume;
+            if maker.hidden_volume > 0.0 {
+                // Iceberg: refill one tranche from the hidden reserve and keep
+                // matching this same order.
+                let draw = if maker.display_volume > 0.0 {
+                    maker.display_volume.min(maker.hidden_volume)
+                } else {
+                    maker.hidden_volume
+                };
+                let maker_slot = best.get_mut();
+                maker_slot.volume = draw;
+                maker_slot.hidden_volume = maker.hidden_volume - draw;
             } else {
-                // Remove the fully matched ask and continue with the next one.
                 best.remove();
-                remaining_volume -= match_volume;
             }
         }
 
-        results
+        (results, remaining_volume)
     }
 
-    /// Attempts to match a sell (ask) order against the bid side of the book.
+    /// Volume the opposite side could execute for `order` right now: every
+    /// visible tranche plus every iceberg reserve at or inside its limit.
     ///
-    /// The matching algorithm:
-    /// 1. Starts with the best (highest priced) bid
-    /// 2. Matches as much as possible at each price level
-    /// 3. If the bid is completely filled, removes it and continues
-    /// 4. If the bid has remaining volume, updates it and stops
-    /// 5. If the order can't be fully matched, adds the remainder to the ask side
-    ///
-    /// The loop stops as soon as the taker's remaining volume reaches zero, so
-    /// an exhausted taker never emits a zero-quantity trade or touches a later
-    /// bid. Partially filled bids are updated in place to keep their identity.
-    ///
-    /// # Arguments
-    ///
-    /// * `order` - The sell order to match
-    ///
-    /// # Returns
-    ///
-    /// A vector of MatchResult for each trade executed
-    fn match_ask_order(&mut self, order: &Order) -> Vec<MatchResult> {
-        let mut results = Vec::new();
-        let mut remaining_volume = order.volume;
+    /// Read-only. A fill-or-kill preflight compares this with the order's
+    /// volume before anything moves; the sweep then allocates greedily per
+    /// level, so an accepted FOK executes its whole quantity and rests nothing.
+    fn fillable_volume(&self, order: &Order) -> f64 {
+        let limit = match order.live {
+            OrderType::Market => None,
+            OrderType::Limit => Some(order.price),
+        };
+        match order.side {
+            OrderSide::Buy => self
+                .asks
+                .values()
+                .take_while(|maker| limit.is_none_or(|limit| maker.price <= limit))
+                .map(Order::open_volume)
+                .sum(),
+            OrderSide::Sell => self
+                .bids
+                .values()
+                .take_while(|maker| limit.is_none_or(|limit| maker.price >= limit))
+                .map(Order::open_volume)
+                .sum(),
+        }
+    }
 
-        // Stop as soon as the taker is exhausted: a zero-volume taker must not
-        // "match" the next bid and rewrite it.
-        while remaining_volume > 0.0 {
-            // `first_entry` walks the tree once and keeps the position, so
-            // removing a fully filled bid or shrinking a partially filled one
-            // below does not descend a second time.
-            let Some(mut best) = self.bids.first_entry() else {
-                // No more bids to match, add remaining to asks
-                self.rest_as_ask(order, remaining_volume);
-                break;
+    /// Whether `order` at its own price would trade against the book right now.
+    fn would_cross(&self, order: &Order) -> bool {
+        match order.side {
+            OrderSide::Buy => self.best_ask().is_some_and(|ask| ask.price <= order.price),
+            OrderSide::Sell => self.best_bid().is_some_and(|bid| bid.price >= order.price),
+        }
+    }
+
+    /// Elects and executes parked stops while the last trade price crosses one.
+    ///
+    /// Stops are considered in admission (sequence) order. An elected stop runs
+    /// immediately — a market stop sweeps every level, a limit stop keeps to its
+    /// limit price — and whatever its child cannot execute is cancelled, never
+    /// rested. Each child's prints move the last trade price again, so one trade
+    /// can cascade through several stops; every turn removes a stop, so the
+    /// cascade terminates.
+    fn run_stops(&mut self, outcome: &mut Outcome) {
+        loop {
+            let Some(last_trade_price) = self.last_trade_price else {
+                return;
+            };
+            let Some(index) = self
+                .stops
+                .iter()
+                .position(|stop| stop.stop_elected(last_trade_price))
+            else {
+                return;
             };
 
-            let best_bid = *best.get();
-            if best_bid.price < order.price {
-                // Best bid price is too low, add remaining to asks
-                self.rest_as_ask(order, remaining_volume);
-                break;
+            let stop = self.stops.remove(index);
+            let trigger_price = last_trade_price;
+            let limit = match stop.live {
+                OrderType::Market => None,
+                OrderType::Limit => Some(stop.price),
+            };
+
+            let (fills, remainder) = self.sweep(&stop, limit);
+            if let Some(print) = fills.last() {
+                self.last_trade_price = Some(print.maker.price);
             }
 
-            // Can match with best bid
-            let match_volume = remaining_volume.min(best_bid.volume);
-            results.push(MatchResult {
-                taker: Order {
-                    volume: remaining_volume,
-                    ..*order
-                },
-                maker: best_bid,
-                matches: match_volume,
+            outcome.triggers.push(StopExecution {
+                stop,
+                trigger_price,
+                fills,
+                cancelled: (remainder > 0.0).then_some(remainder),
             });
+        }
+    }
 
-            if best_bid.volume > remaining_volume {
-                // Partially filled: shrink the maker in place so it keeps
-                // its identity (id, side, live and sequence).
-                best.get_mut().volume = best_bid.volume - match_volume;
-                // Taker fully matched
-                break;
-            } else {
-                // Remove the fully matched bid and continue with the next one.
-                best.remove();
-                remaining_volume -= match_volume;
+    /// Removes every resting and parked order whose time in force has expired,
+    /// returning them in a deterministic order: bids by sequence, then asks by
+    /// sequence, then parked stops by admission.
+    ///
+    /// `now_ms` and `day_close_ms` travel in the request and therefore through
+    /// the Raft log, so every replica evicts exactly the same orders while the
+    /// state machine itself never reads a clock. A `Day` order only expires when
+    /// a close is supplied; `GTD` expires at or after its deadline.
+    pub fn purge_expired(&mut self, now_ms: u64, day_close_ms: Option<u64>) -> Vec<Order> {
+        let has_expired = |order: &Order| order.tif.is_expired(now_ms, day_close_ms);
+        let mut removed = Vec::new();
+
+        let bids: Vec<BidKey> = self.bids.keys().copied().collect();
+        for key in bids {
+            if has_expired(&self.bids[&key]) {
+                removed.push(self.bids.remove(&key).expect("key came from the map"));
             }
         }
+        let asks: Vec<AskKey> = self.asks.keys().copied().collect();
+        for key in asks {
+            if has_expired(&self.asks[&key]) {
+                removed.push(self.asks.remove(&key).expect("key came from the map"));
+            }
+        }
+        self.stops.retain(|stop| {
+            if has_expired(stop) {
+                removed.push(*stop);
+                false
+            } else {
+                true
+            }
+        });
 
-        results
+        removed
     }
+}
+
+/// Checks an order's shape and whether its type combination is supported;
+/// `None` means the order is admissible.
+fn validate_order(order: &Order) -> Option<RejectReason> {
+    if !(order.volume.is_finite() && order.volume > 0.0) {
+        return Some(RejectReason::InvalidOrder);
+    }
+    // A market order ignores its own price; a limit order (including a
+    // stop-limit child) needs a positive one.
+    if order.live == OrderType::Limit && !(order.price.is_finite() && order.price > 0.0) {
+        return Some(RejectReason::InvalidOrder);
+    }
+    // A stop price is a price, not a size: any non-negative finite value is
+    // fine (`0.0` means "no stop").
+    if !order.stop_price.is_finite() || order.stop_price < 0.0 {
+        return Some(RejectReason::InvalidOrder);
+    }
+    // An iceberg displays whole tranches: anything outside (0, volume] is nonsense.
+    if !order.display_volume.is_finite() || !(0.0..=order.volume).contains(&order.display_volume) {
+        return Some(RejectReason::InvalidOrder);
+    }
+
+    // Combinations this engine does not define: post-only and stops are their
+    // own admission paths, and neither can also be an iceberg or immediate.
+    if order.post_only
+        && (order.live != OrderType::Limit || order.is_stop() || order.display_volume > 0.0)
+    {
+        return Some(RejectReason::InvalidOrder);
+    }
+    if order.is_stop()
+        && (order.post_only || order.display_volume > 0.0 || order.tif.is_immediate())
+    {
+        return Some(RejectReason::InvalidOrder);
+    }
+
+    // A GTD deadline at or before the order's own timestamp is already dead.
+    if let TimeInForce::Gtd(expiry) = order.tif
+        && expiry <= order.timestamp
+    {
+        return Some(RejectReason::GtdAlreadyExpired);
+    }
+
+    None
 }
 
 #[cfg(test)]
@@ -659,14 +1074,23 @@ mod tests {
     /// Builds a resting limit order with an explicit identity, so tests can
     /// assert that matching never rewrites it.
     fn resting_order(side: OrderSide, price: f64, volume: f64, id: u64) -> Order {
-        Order {
-            live: OrderType::Limit,
-            side,
-            price,
-            volume,
-            id,
-            sequence: 0,
-        }
+        let mut order = Order::new(side, price, volume, 0);
+        order.id = id;
+        order
+    }
+
+    /// A resting order with every optional type switched off apart from the
+    /// ones the caller sets, so tests read as "this order, but IOC".
+    fn order_with(
+        side: OrderSide,
+        price: f64,
+        volume: f64,
+        id: u64,
+        apply: impl FnOnce(&mut Order),
+    ) -> Order {
+        let mut order = resting_order(side, price, volume, id);
+        apply(&mut order);
+        order
     }
 
     /// Regression test for issue #1.
@@ -888,13 +1312,13 @@ mod tests {
     fn order_replace() {
         let mut ob = OrderBook::new();
         let mut o1 = Order::new(OrderSide::Sell, 100.22, 22.0, 1);
-        let o2 = Order::new(OrderSide::Buy, 100.22, 10.0, 1);
+        let mut o2 = Order::new(OrderSide::Buy, 100.22, 10.0, 1);
 
         let o3 = Order::new(OrderSide::Sell, 100.22, 12.0, 0);
 
         ob.place_order(&mut o1);
         assert_eq!(ob.best_ask(), Some(&o1));
-        ob.match_bid_order(&o2);
+        ob.place_order(&mut o2);
         assert_eq!(ob.best_ask(), Some(&o3));
         /*
         let serialized = serde_json::to_string(&ob).unwrap();
@@ -903,5 +1327,511 @@ mod tests {
         let deserialized: OrderBook = serde_json::from_str(&serialized).unwrap();
         println!("deserialized = {:?}", deserialized);
         */
+    }
+
+    // --- Time in force
+
+    #[test]
+    fn ioc_cancels_its_remainder_instead_of_resting() {
+        let mut ob = OrderBook::new();
+        let mut maker = resting_order(OrderSide::Sell, 100.0, 6.0, 1);
+        ob.place_order(&mut maker);
+
+        let mut ioc = order_with(OrderSide::Buy, 100.0, 10.0, 2, |o| o.tif = TimeInForce::Ioc);
+        let outcome = ob.execute_order(&mut ioc);
+
+        assert_eq!(
+            vec![6.0],
+            outcome.fills.iter().map(|f| f.matches).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            Some(4.0),
+            outcome.cancelled,
+            "the remainder must be cancelled"
+        );
+        assert_eq!(None, outcome.resting, "an IOC order never rests");
+        assert!(ob.bids.is_empty());
+        assert!(ob.asks.is_empty(), "the maker was consumed");
+    }
+
+    #[test]
+    fn ioc_without_liquidity_executes_nothing() {
+        let mut ob = OrderBook::new();
+        let mut ioc = order_with(OrderSide::Buy, 100.0, 5.0, 1, |o| o.tif = TimeInForce::Ioc);
+
+        let outcome = ob.execute_order(&mut ioc);
+
+        assert!(outcome.fills.is_empty());
+        assert_eq!(Some(5.0), outcome.cancelled);
+        assert_eq!(None, outcome.resting);
+        assert!(ob.bids.is_empty());
+    }
+
+    #[test]
+    fn fok_sweeps_every_level_it_needs() {
+        let mut ob = OrderBook::new();
+        let mut a1 = resting_order(OrderSide::Sell, 100.0, 6.0, 1);
+        let mut a2 = resting_order(OrderSide::Sell, 101.0, 5.0, 2);
+        ob.place_order(&mut a1);
+        ob.place_order(&mut a2);
+
+        let mut fok = order_with(OrderSide::Buy, 101.0, 10.0, 3, |o| o.tif = TimeInForce::Fok);
+        let outcome = ob.execute_order(&mut fok);
+
+        assert_eq!(
+            vec![6.0, 4.0],
+            outcome.fills.iter().map(|f| f.matches).collect::<Vec<_>>()
+        );
+        assert!(outcome.rejected.is_none());
+        assert_eq!(None, outcome.cancelled);
+        assert_eq!(None, outcome.resting);
+        assert_eq!(
+            1.0,
+            ob.best_ask().expect("1 unit of ask #2 must remain").volume
+        );
+    }
+
+    #[test]
+    fn fok_is_refused_when_the_whole_order_cannot_fill() {
+        let build = || {
+            let mut ob = OrderBook::new();
+            let mut a1 = resting_order(OrderSide::Sell, 100.0, 6.0, 1);
+            let mut a2 = resting_order(OrderSide::Sell, 101.0, 5.0, 2);
+            ob.place_order(&mut a1);
+            ob.place_order(&mut a2);
+            ob
+        };
+
+        // 10 at a limit of 100 reaches only the 6 resting there.
+        let mut ob = build();
+        let mut fok = order_with(OrderSide::Buy, 100.0, 10.0, 3, |o| o.tif = TimeInForce::Fok);
+        let outcome = ob.execute_order(&mut fok);
+        assert_eq!(Some(RejectReason::FokUnfillable), outcome.rejected);
+        assert!(outcome.fills.is_empty());
+        assert_eq!(2, ob.asks.len(), "a rejected FOK must not move the book");
+        assert_eq!(6.0, ob.best_ask().unwrap().volume);
+
+        // 12 is more than the 11 the book holds, even within the limit.
+        let mut ob = build();
+        let mut fok = order_with(OrderSide::Buy, 101.0, 12.0, 3, |o| o.tif = TimeInForce::Fok);
+        let outcome = ob.execute_order(&mut fok);
+        assert_eq!(Some(RejectReason::FokUnfillable), outcome.rejected);
+        assert_eq!(2, ob.asks.len());
+    }
+
+    #[test]
+    fn market_order_sweeps_every_level_and_never_rests() {
+        let mut ob = OrderBook::new();
+        let mut a1 = resting_order(OrderSide::Sell, 100.0, 6.0, 1);
+        let mut a2 = resting_order(OrderSide::Sell, 101.0, 5.0, 2);
+        ob.place_order(&mut a1);
+        ob.place_order(&mut a2);
+
+        // A market buy ignores its own price entirely (0.0 would never cross).
+        let mut market = order_with(OrderSide::Buy, 0.0, 20.0, 3, |o| o.live = OrderType::Market);
+        let outcome = ob.execute_order(&mut market);
+
+        assert_eq!(
+            vec![6.0, 5.0],
+            outcome.fills.iter().map(|f| f.matches).collect::<Vec<_>>()
+        );
+        assert_eq!(Some(9.0), outcome.cancelled);
+        assert_eq!(None, outcome.resting, "a market order never rests");
+        assert!(ob.asks.is_empty());
+        assert!(ob.bids.is_empty());
+
+        // The sell side behaves the same way.
+        let mut b1 = resting_order(OrderSide::Buy, 100.0, 6.0, 4);
+        let mut b2 = resting_order(OrderSide::Buy, 99.0, 5.0, 5);
+        ob.place_order(&mut b1);
+        ob.place_order(&mut b2);
+        let mut market = order_with(OrderSide::Sell, 0.0, 20.0, 6, |o| {
+            o.live = OrderType::Market
+        });
+        let outcome = ob.execute_order(&mut market);
+        assert_eq!(
+            vec![6.0, 5.0],
+            outcome.fills.iter().map(|f| f.matches).collect::<Vec<_>>()
+        );
+        assert_eq!(Some(9.0), outcome.cancelled);
+        assert!(ob.bids.is_empty());
+    }
+
+    #[test]
+    fn post_only_rests_when_it_would_not_cross() {
+        let mut ob = OrderBook::new();
+        let mut ask = resting_order(OrderSide::Sell, 101.0, 5.0, 1);
+        ob.place_order(&mut ask);
+
+        let mut post = order_with(OrderSide::Buy, 100.0, 4.0, 2, |o| o.post_only = true);
+        let outcome = ob.execute_order(&mut post);
+
+        assert!(outcome.fills.is_empty());
+        assert_eq!(Some(4.0), outcome.resting);
+        assert_eq!(
+            4.0,
+            ob.best_bid().expect("the post-only order rests").volume
+        );
+    }
+
+    #[test]
+    fn post_only_is_refused_when_it_would_cross() {
+        let mut ob = OrderBook::new();
+        let mut ask = resting_order(OrderSide::Sell, 100.0, 5.0, 1);
+        ob.place_order(&mut ask);
+
+        let mut post = order_with(OrderSide::Buy, 100.0, 4.0, 2, |o| o.post_only = true);
+        let outcome = ob.execute_order(&mut post);
+
+        assert_eq!(Some(RejectReason::PostOnlyWouldCross), outcome.rejected);
+        assert!(outcome.fills.is_empty());
+        assert!(ob.bids.is_empty());
+        assert_eq!(5.0, ob.best_ask().unwrap().volume, "the book must not move");
+    }
+
+    // --- Iceberg
+
+    #[test]
+    fn iceberg_rests_only_its_display_tranche() {
+        let mut ob = OrderBook::new();
+        let mut iceberg = order_with(OrderSide::Sell, 100.0, 10.0, 1, |o| o.display_volume = 4.0);
+
+        let outcome = ob.execute_order(&mut iceberg);
+
+        assert_eq!(Some(4.0), outcome.resting, "only the tranche is visible");
+        let resting = ob.best_ask().expect("the tranche rests");
+        assert_eq!(4.0, resting.volume);
+        assert_eq!(6.0, resting.hidden_volume);
+        assert_eq!(10.0, resting.open_volume(), "the order still owns 10");
+    }
+
+    #[test]
+    fn iceberg_replenishes_from_its_hidden_reserve() {
+        let mut ob = OrderBook::new();
+        let mut iceberg = order_with(OrderSide::Sell, 100.0, 10.0, 1, |o| o.display_volume = 4.0);
+        ob.place_order(&mut iceberg);
+
+        // 4 consumes the whole tranche; the order refills another 4 from hidden.
+        let mut taker = resting_order(OrderSide::Buy, 100.0, 4.0, 2);
+        let trades = ob.place_order(&mut taker);
+        assert_eq!(1, trades.len(), "the taker is done after one tranche");
+        assert_eq!(4.0, trades[0].matches);
+        assert_eq!(4.0, ob.best_ask().unwrap().volume, "refilled from hidden");
+        assert_eq!(2.0, ob.best_ask().unwrap().hidden_volume);
+
+        // 6 takes the refilled tranche and then the last two units.
+        let mut taker = resting_order(OrderSide::Buy, 100.0, 6.0, 3);
+        let trades = ob.place_order(&mut taker);
+        assert_eq!(
+            vec![4.0, 2.0],
+            trades.iter().map(|t| t.matches).collect::<Vec<_>>()
+        );
+        assert!(ob.asks.is_empty(), "an exhausted iceberg leaves the book");
+    }
+
+    #[test]
+    fn iceberg_reserves_count_as_reachable_depth_for_fill_or_kill() {
+        let mut ob = OrderBook::new();
+        let mut iceberg = order_with(OrderSide::Sell, 100.0, 10.0, 1, |o| o.display_volume = 4.0);
+        ob.place_order(&mut iceberg);
+
+        let mut fok = order_with(OrderSide::Buy, 100.0, 10.0, 2, |o| o.tif = TimeInForce::Fok);
+        let outcome = ob.execute_order(&mut fok);
+
+        assert!(
+            outcome.rejected.is_none(),
+            "the hidden reserve is real depth"
+        );
+        assert_eq!(
+            vec![4.0, 4.0, 2.0],
+            outcome.fills.iter().map(|f| f.matches).collect::<Vec<_>>()
+        );
+        assert!(outcome.resting.is_none());
+        assert!(ob.asks.is_empty());
+    }
+
+    // --- Stops
+
+    #[test]
+    fn stop_market_parks_and_is_elected_by_a_trade() {
+        let mut ob = OrderBook::new();
+        let mut b1 = resting_order(OrderSide::Buy, 95.0, 10.0, 1);
+        let mut b2 = resting_order(OrderSide::Buy, 100.0, 10.0, 2);
+        ob.place_order(&mut b1);
+        ob.place_order(&mut b2);
+
+        // Nothing has traded yet, so a sell stop at 95 can park.
+        let mut stop = order_with(OrderSide::Sell, 0.0, 5.0, 3, |o| {
+            o.live = OrderType::Market;
+            o.stop_price = 95.0;
+        });
+        let outcome = ob.execute_order(&mut stop);
+        assert!(outcome.parked);
+        assert_eq!(1, ob.stops.len());
+        assert!(outcome.fills.is_empty());
+        assert!(!ob.bids.is_empty(), "the book is untouched by parking");
+
+        // A print at 100 is above the stop: nothing is elected.
+        let mut taker = resting_order(OrderSide::Sell, 100.0, 10.0, 4);
+        let outcome = ob.execute_order(&mut taker);
+        assert!(outcome.triggers.is_empty());
+        assert_eq!(Some(100.0), ob.last_trade_price);
+
+        // A print at 95 elects the stop: the market child sweeps 5 off the bid.
+        let mut taker = resting_order(OrderSide::Sell, 95.0, 3.0, 5);
+        let outcome = ob.execute_order(&mut taker);
+        assert_eq!(
+            vec![3.0],
+            outcome.fills.iter().map(|f| f.matches).collect::<Vec<_>>()
+        );
+        assert_eq!(1, outcome.triggers.len(), "the stop must fire");
+        let trigger = &outcome.triggers[0];
+        assert_eq!(95.0, trigger.trigger_price);
+        assert_eq!(2, trigger.stop.sequence, "the stop keeps its identity");
+        assert_eq!(
+            vec![5.0],
+            trigger.fills.iter().map(|f| f.matches).collect::<Vec<_>>()
+        );
+        assert!(trigger.cancelled.is_none());
+        assert!(ob.stops.is_empty(), "an elected stop leaves the book");
+        assert_eq!(2.0, ob.best_bid().expect("10 - 3 - 5 = 2").volume);
+        assert_eq!(Some(95.0), ob.last_trade_price);
+    }
+
+    #[test]
+    fn stop_limit_child_keeps_to_its_limit_and_never_rests() {
+        let mut ob = OrderBook::new();
+        let mut a1 = resting_order(OrderSide::Sell, 101.0, 5.0, 1);
+        let mut a2 = resting_order(OrderSide::Sell, 102.0, 9.0, 2);
+        let mut bid = resting_order(OrderSide::Buy, 100.0, 10.0, 3);
+        ob.place_order(&mut a1);
+        ob.place_order(&mut a2);
+        ob.place_order(&mut bid);
+
+        // Buy stop at 100 that sweeps at most up to 101.
+        let mut stop = order_with(OrderSide::Buy, 101.0, 20.0, 4, |o| o.stop_price = 100.0);
+        assert!(ob.execute_order(&mut stop).parked);
+
+        // A print at 100 (the ask trades against the resting bid) elects it.
+        let mut taker = resting_order(OrderSide::Sell, 100.0, 1.0, 5);
+        let outcome = ob.execute_order(&mut taker);
+
+        assert_eq!(1, outcome.triggers.len());
+        let trigger = &outcome.triggers[0];
+        assert_eq!(100.0, trigger.trigger_price);
+        assert_eq!(
+            vec![5.0],
+            trigger.fills.iter().map(|f| f.matches).collect::<Vec<_>>()
+        );
+        assert_eq!(Some(15.0), trigger.cancelled, "the child never rests");
+        assert_eq!(
+            9.0,
+            ob.best_ask().expect("only the 102 level survives").volume
+        );
+        assert_eq!(9.0, ob.best_bid().expect("10 - 1 bid remains").volume);
+    }
+
+    #[test]
+    fn stop_that_the_last_trade_already_crossed_is_refused() {
+        let mut ob = OrderBook::new();
+        let mut bid = resting_order(OrderSide::Buy, 100.0, 10.0, 1);
+        ob.place_order(&mut bid);
+        let mut taker = resting_order(OrderSide::Sell, 100.0, 5.0, 2);
+        ob.place_order(&mut taker);
+        assert_eq!(Some(100.0), ob.last_trade_price);
+
+        // A sell stop at or above the last trade would fire immediately, so a
+        // stop never turns into a market order on entry.
+        let mut stop = order_with(OrderSide::Sell, 0.0, 5.0, 3, |o| {
+            o.live = OrderType::Market;
+            o.stop_price = 101.0;
+        });
+        let outcome = ob.execute_order(&mut stop);
+
+        assert_eq!(Some(RejectReason::StopWouldTrigger), outcome.rejected);
+        assert!(ob.stops.is_empty());
+        assert!(outcome.fills.is_empty());
+    }
+
+    // --- Expiry
+
+    #[test]
+    fn expiry_purge_removes_gtd_and_day_orders() {
+        let mut ob = OrderBook::new();
+        let mut gtd = order_with(OrderSide::Buy, 100.0, 10.0, 1, |o| {
+            o.tif = TimeInForce::Gtd(2_000);
+            o.timestamp = 1_000;
+        });
+        let mut day = order_with(OrderSide::Buy, 99.0, 10.0, 2, |o| o.tif = TimeInForce::Day);
+        let mut gtc = order_with(OrderSide::Buy, 98.0, 10.0, 3, |_| {});
+        let mut gtd_stop = order_with(OrderSide::Sell, 0.0, 5.0, 4, |o| {
+            o.live = OrderType::Market;
+            o.stop_price = 95.0;
+            o.tif = TimeInForce::Gtd(2_000);
+            o.timestamp = 1_000;
+        });
+        ob.execute_order(&mut gtd);
+        ob.execute_order(&mut day);
+        ob.execute_order(&mut gtc);
+        ob.execute_order(&mut gtd_stop);
+        assert_eq!(1, ob.stops.len());
+
+        // Before either deadline nothing expires; Day without a close never does.
+        assert!(ob.purge_expired(1_999, None).is_empty());
+        assert_eq!(3, ob.bids.len());
+
+        // At the GTD deadline both GTD orders (resting and parked) go.
+        let expired = ob.purge_expired(2_000, None);
+        assert_eq!(2, expired.len());
+        assert_eq!(
+            vec![0, 3],
+            expired
+                .iter()
+                .map(|o| o.sequence as u32)
+                .collect::<Vec<_>>()
+        );
+        assert!(ob.stops.is_empty());
+        assert_eq!(2, ob.bids.len(), "Day and GTC stay without a close");
+
+        // Day expires once a close at or before `now` is supplied.
+        let expired = ob.purge_expired(1_000, Some(900));
+        assert_eq!(1, expired.len());
+        assert_eq!(1, expired[0].sequence);
+        assert_eq!(1, ob.bids.len(), "the GTC order survives everything");
+        assert_eq!(4, ob.sequence, "purging never rewinds the sequence");
+    }
+
+    // --- Validation
+
+    #[test]
+    fn invalid_orders_are_refused_without_touching_the_book() {
+        let mut ob = OrderBook::new();
+
+        let mut empty = resting_order(OrderSide::Buy, 100.0, 0.0, 1);
+        assert_eq!(
+            Some(RejectReason::InvalidOrder),
+            ob.execute_order(&mut empty).rejected
+        );
+
+        let mut post_market = order_with(OrderSide::Buy, 0.0, 1.0, 2, |o| {
+            o.live = OrderType::Market;
+            o.post_only = true;
+        });
+        assert_eq!(
+            Some(RejectReason::InvalidOrder),
+            ob.execute_order(&mut post_market).rejected
+        );
+
+        let mut stop_iceberg = order_with(OrderSide::Sell, 100.0, 10.0, 3, |o| {
+            o.display_volume = 4.0;
+            o.stop_price = 95.0;
+        });
+        assert_eq!(
+            Some(RejectReason::InvalidOrder),
+            ob.execute_order(&mut stop_iceberg).rejected
+        );
+
+        let mut dead_gtd = order_with(OrderSide::Buy, 100.0, 1.0, 4, |o| {
+            o.tif = TimeInForce::Gtd(500);
+            o.timestamp = 500;
+        });
+        assert_eq!(
+            Some(RejectReason::GtdAlreadyExpired),
+            ob.execute_order(&mut dead_gtd).rejected
+        );
+
+        assert!(ob.bids.is_empty() && ob.asks.is_empty() && ob.stops.is_empty());
+        assert_eq!(
+            4, ob.sequence,
+            "every submission consumes a sequence, even a refused one"
+        );
+    }
+
+    #[test]
+    fn stop_cascade_runs_each_elected_stop_in_admission_order() {
+        let mut ob = OrderBook::new();
+        let mut b1 = resting_order(OrderSide::Buy, 100.0, 6.0, 1);
+        let mut b2 = resting_order(OrderSide::Buy, 95.0, 4.0, 2);
+        let mut b3 = resting_order(OrderSide::Buy, 90.0, 5.0, 3);
+        ob.place_order(&mut b1);
+        ob.place_order(&mut b2);
+        ob.place_order(&mut b3);
+
+        let mut stop_95 = order_with(OrderSide::Sell, 0.0, 5.0, 4, |o| {
+            o.live = OrderType::Market;
+            o.stop_price = 95.0;
+        });
+        let mut stop_90 = order_with(OrderSide::Sell, 0.0, 3.0, 5, |o| {
+            o.live = OrderType::Market;
+            o.stop_price = 90.0;
+        });
+        ob.execute_order(&mut stop_95);
+        ob.execute_order(&mut stop_90);
+        assert_eq!(2, ob.stops.len());
+
+        // Print 100: above both stops, nothing fires.
+        let mut taker = resting_order(OrderSide::Sell, 100.0, 6.0, 6);
+        assert!(ob.execute_order(&mut taker).triggers.is_empty());
+
+        // Print 95 elects the first stop; its child sweeps down to 90, which
+        // elects the second stop inside the same submission.
+        let mut taker = resting_order(OrderSide::Sell, 95.0, 4.0, 7);
+        let outcome = ob.execute_order(&mut taker);
+
+        assert_eq!(2, outcome.triggers.len(), "the cascade must run both stops");
+        assert_eq!(
+            vec![3, 4],
+            outcome
+                .triggers
+                .iter()
+                .map(|t| t.stop.sequence)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(95.0, outcome.triggers[0].trigger_price);
+        assert_eq!(
+            vec![5.0],
+            outcome.triggers[0]
+                .fills
+                .iter()
+                .map(|f| f.matches)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            90.0, outcome.triggers[1].trigger_price,
+            "the first child moved the price"
+        );
+        assert!(
+            outcome.triggers[1].fills.is_empty(),
+            "the book is empty by now"
+        );
+        assert_eq!(Some(3.0), outcome.triggers[1].cancelled);
+        assert!(ob.stops.is_empty());
+        assert!(ob.bids.is_empty());
+        assert_eq!(Some(90.0), ob.last_trade_price);
+    }
+
+    #[test]
+    fn parked_stop_is_cancelled_by_side_and_sequence() {
+        let mut ob = OrderBook::new();
+        let mut stop = order_with(OrderSide::Sell, 0.0, 5.0, 1, |o| {
+            o.live = OrderType::Market;
+            o.stop_price = 95.0;
+        });
+        ob.execute_order(&mut stop);
+        assert_eq!(1, ob.stops.len());
+
+        // The cancel request identifies the stop by side and sequence; its price
+        // is a trigger target, not a book key.
+        let mut request = Order::new(OrderSide::Sell, 0.0, 5.0, 0);
+        request.stop_price = 95.0;
+        request.sequence = stop.sequence;
+
+        let cancelled = ob.cancel(&request).expect("the parked stop is cancellable");
+        assert_eq!(stop.sequence, cancelled.sequence);
+        assert!(ob.stops.is_empty());
+        assert!(
+            ob.cancel(&request).is_none(),
+            "a second cancel finds nothing"
+        );
     }
 }

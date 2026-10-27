@@ -49,10 +49,12 @@ const SNAPSHOT_FILE: &str = "current.snap";
 const SNAPSHOT_MAGIC: &[u8; 7] = b"MRFSNAP";
 /// Snapshot file format version.
 ///
-/// Version 2 dropped the key-value store from [`StateMachineData`]. Postcard is not
-/// self-describing, so a v1 file is rejected with an explicit error instead of being decoded
-/// into a different shape.
-const SNAPSHOT_VERSION: u32 = 2;
+/// Version 2 dropped the key-value store from [`StateMachineData`]. Version 3 added the
+/// extended [`Order`] fields (time in force, post-only, stop price, iceberg tranches,
+/// timestamp) together with parked stops and the last trade price. Postcard is not
+/// self-describing, so an older file is rejected with an explicit error instead of being
+/// decoded into a different shape.
+const SNAPSHOT_VERSION: u32 = 3;
 /// `magic + version + crc32 of the body`.
 const SNAPSHOT_HEADER_LEN: usize = SNAPSHOT_MAGIC.len() + 4 + 4;
 
@@ -76,11 +78,17 @@ struct SnapshotPayload<C: RaftTypeConfig> {
 /// Data contained in the Raft state machine.
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]
 pub struct StateMachineData {
-    /// All active orders in the order book (both bids and asks).
+    /// All orders resting in the book, bids then asks.
     pub orders: Vec<Order>,
 
     /// The current sequence number for order placement.
     pub sequence: u64,
+
+    /// Stop orders parked off the book, in admission order.
+    pub stops: Vec<Order>,
+
+    /// Price of the most recent trade, which elects parked stops.
+    pub last_trade_price: Option<f64>,
 }
 
 /// Inner storage for the state machine.
@@ -113,11 +121,14 @@ impl<C: RaftTypeConfig> StateMachineStoreInner<C> {
     fn install_content(&mut self, content: StateMachineData) {
         self.orderbook.asks.clear();
         self.orderbook.bids.clear();
+        self.orderbook.stops.clear();
         self.orderbook.sequence = content.sequence;
+        self.orderbook.last_trade_price = content.last_trade_price;
 
         for order in &content.orders {
             self.orderbook.insert_order(order);
         }
+        self.orderbook.stops.extend(content.stops.iter().copied());
     }
 
     /// Converts the state machine to a serializable content format.
@@ -125,6 +136,8 @@ impl<C: RaftTypeConfig> StateMachineStoreInner<C> {
         let mut content = StateMachineData {
             orders: Vec::new(),
             sequence: self.orderbook.sequence,
+            stops: self.orderbook.stops.clone(),
+            last_trade_price: self.orderbook.last_trade_price,
         };
 
         let mut bids: Vec<Order> = self.orderbook.bids.values().cloned().collect();
@@ -199,10 +212,7 @@ impl<C: RaftTypeConfig> StateMachineStore<C> {
             inner.install_content(content);
             inner.last_applied_log = meta.last_log_id.clone();
             inner.last_membership = meta.last_membership.clone();
-            inner.current_snapshot = Some(StoredSnapshot {
-                meta,
-                data,
-            });
+            inner.current_snapshot = Some(StoredSnapshot { meta, data });
         }
 
         Ok(Self {
@@ -247,7 +257,9 @@ impl<C: RaftTypeConfig> StateMachineStore<C> {
 
 /// Public access to the state machine internals for our application
 impl<C> StateMachineStore<C>
-where C: RaftTypeConfig<D = MatchEngineRequest, R = MatchEngineResponse> {
+where
+    C: RaftTypeConfig<D = MatchEngineRequest, R = MatchEngineResponse>,
+{
     pub async fn orderbook_sequence(&self) -> u64 {
         let inner = self.inner.lock().await;
         inner.orderbook.sequence
@@ -279,7 +291,9 @@ where C: RaftTypeConfig<D = MatchEngineRequest, R = MatchEngineResponse> {
 }
 
 impl<C> RaftSnapshotBuilder<C> for StateMachineStore<C>
-where C: RaftTypeConfig<D = MatchEngineRequest, R = MatchEngineResponse> {
+where
+    C: RaftTypeConfig<D = MatchEngineRequest, R = MatchEngineResponse>,
+{
     type SnapshotData = Cursor<Vec<u8>>;
 
     #[tracing::instrument(level = "trace", skip(self))]
@@ -315,22 +329,29 @@ where C: RaftTypeConfig<D = MatchEngineRequest, R = MatchEngineResponse> {
 impl<C> RaftStateMachine<C> for StateMachineStore<C>
 where
     C: RaftTypeConfig<
-        D = MatchEngineRequest,
-        R = MatchEngineResponse,
-        Entry = Entry<CommittedLeaderIdOf<C>, EntryPayloadOf<C>>,
-    >,
+            D = MatchEngineRequest,
+            R = MatchEngineResponse,
+            Entry = Entry<CommittedLeaderIdOf<C>, EntryPayloadOf<C>>,
+        >,
 {
     type SnapshotData = Cursor<Vec<u8>>;
     type SnapshotBuilder = Self;
 
-    async fn applied_state(&mut self) -> Result<(Option<LogIdOf<C>>, StoredMembershipOf<C>), io::Error> {
+    async fn applied_state(
+        &mut self,
+    ) -> Result<(Option<LogIdOf<C>>, StoredMembershipOf<C>), io::Error> {
         let inner = self.inner.lock().await;
-        Ok((inner.last_applied_log.clone(), inner.last_membership.clone()))
+        Ok((
+            inner.last_applied_log.clone(),
+            inner.last_membership.clone(),
+        ))
     }
 
     #[tracing::instrument(level = "trace", skip(self, entries))]
     async fn apply<Strm>(&mut self, mut entries: Strm) -> Result<(), io::Error>
-    where Strm: Stream<Item = Result<EntryResponder<C>, io::Error>> + Unpin + OptionalSend {
+    where
+        Strm: Stream<Item = Result<EntryResponder<C>, io::Error>> + Unpin + OptionalSend,
+    {
         let mut inner = self.inner.lock().await;
 
         while let Some((entry, responder)) = entries.try_next().await? {
@@ -344,29 +365,65 @@ where
             let response = match &entry.payload {
                 EntryPayload::Blank => MatchEngineResponse::none(),
                 EntryPayload::Normal(req) => match req {
-                    MatchEngineRequest::Place {
-                        order,
-                    } => {
+                    MatchEngineRequest::Place { order } => {
                         let mut o = *order;
-                        let matches = inner.orderbook.place_order(&mut o);
-                        // The remainder is read back from the book because `place_order` only
-                        // writes the sequence back into the caller's order.
-                        let resting_volume = inner.orderbook.resting_volume(&o);
-                        let events = MatchEvent::for_place(
-                            entry.log_id.index,
-                            &o,
-                            &matches,
-                            resting_volume,
-                        );
+                        let log_index = entry.log_id.index;
+                        let outcome = inner.orderbook.execute_order(&mut o);
+
+                        // Every event of this entry shares its log index and numbers its
+                        // ordinals continuously, so a stop cascade stays one ordered batch.
+                        let mut events = Vec::new();
+                        match outcome.rejected {
+                            Some(reason) => {
+                                events.push(MatchEvent::for_rejected(log_index, 0, &o, reason));
+                            }
+                            None => {
+                                events.extend(MatchEvent::for_place_at(
+                                    log_index,
+                                    0,
+                                    &o,
+                                    &outcome.fills,
+                                    outcome.resting,
+                                ));
+                                if let Some(volume) = outcome.cancelled {
+                                    events.push(MatchEvent::for_cancelled_volume(
+                                        log_index,
+                                        events.len() as u32,
+                                        &o,
+                                        volume,
+                                    ));
+                                }
+                                for trigger in &outcome.triggers {
+                                    events.push(MatchEvent::for_triggered(
+                                        log_index,
+                                        events.len() as u32,
+                                        &trigger.stop,
+                                        trigger.trigger_price,
+                                    ));
+                                    events.extend(MatchEvent::for_fills(
+                                        log_index,
+                                        events.len() as u32,
+                                        trigger.stop.sequence,
+                                        &trigger.fills,
+                                    ));
+                                    if let Some(volume) = trigger.cancelled {
+                                        events.push(MatchEvent::for_cancelled_volume(
+                                            log_index,
+                                            events.len() as u32,
+                                            &trigger.stop,
+                                            volume,
+                                        ));
+                                    }
+                                }
+                            }
+                        }
                         self.publish_match_events(&events);
 
                         MatchEngineResponse {
                             value: Some(o.sequence.to_string()),
                         }
                     }
-                    MatchEngineRequest::Cancel {
-                        order,
-                    } => {
+                    MatchEngineRequest::Cancel { order } => {
                         if let Some(cancelled) = inner.orderbook.cancel(order) {
                             self.publish_match_events(&[MatchEvent::for_cancel(
                                 entry.log_id.index,
@@ -375,9 +432,25 @@ where
                         }
                         MatchEngineResponse::none()
                     }
+                    MatchEngineRequest::PurgeExpired {
+                        now_ms,
+                        day_close_ms,
+                    } => {
+                        let expired = inner.orderbook.purge_expired(*now_ms, *day_close_ms);
+                        let events: Vec<MatchEvent> = expired
+                            .iter()
+                            .enumerate()
+                            .map(|(ordinal, order)| {
+                                MatchEvent::for_expired(entry.log_id.index, ordinal as u32, order)
+                            })
+                            .collect();
+                        self.publish_match_events(&events);
+                        MatchEngineResponse::new(expired.len().to_string())
+                    }
                 },
                 EntryPayload::Membership(mem) => {
-                    inner.last_membership = StoredMembership::new(Some(entry.log_id.clone()), mem.clone());
+                    inner.last_membership =
+                        StoredMembership::new(Some(entry.log_id.clone()), mem.clone());
                     MatchEngineResponse::none()
                 }
             };
@@ -420,7 +493,9 @@ where
 
     #[tracing::instrument(level = "trace", skip(self))]
     #[allow(clippy::type_complexity)]
-    async fn get_current_snapshot(&mut self) -> Result<Option<SnapshotOf<C, Cursor<Vec<u8>>>>, io::Error> {
+    async fn get_current_snapshot(
+        &mut self,
+    ) -> Result<Option<SnapshotOf<C, Cursor<Vec<u8>>>>, io::Error> {
         let inner = self.inner.lock().await;
         match &inner.current_snapshot {
             Some(snapshot) => Ok(Some(SnapshotOf::<C, Cursor<Vec<u8>>> {
@@ -443,11 +518,14 @@ fn encode_content(content: &StateMachineData) -> io::Result<Vec<u8>> {
 }
 
 fn decode_content(data: &[u8]) -> io::Result<StateMachineData> {
-    postcard::from_bytes(data).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("corrupt snapshot: {e}")))
+    postcard::from_bytes(data)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("corrupt snapshot: {e}")))
 }
 
 /// Reads and validates the snapshot file, returning metadata plus the encoded content.
-fn read_snapshot_file<C: RaftTypeConfig>(dir: &Path) -> io::Result<Option<(SnapshotMetaOf<C>, Vec<u8>)>> {
+fn read_snapshot_file<C: RaftTypeConfig>(
+    dir: &Path,
+) -> io::Result<Option<(SnapshotMetaOf<C>, Vec<u8>)>> {
     let path = dir.join(SNAPSHOT_FILE);
     let bytes = match std::fs::read(&path) {
         Ok(bytes) => bytes,
@@ -461,16 +539,26 @@ fn read_snapshot_file<C: RaftTypeConfig>(dir: &Path) -> io::Result<Option<(Snaps
             format!("{} is not a snapshot file", path.display()),
         ));
     }
-    let version = u32::from_le_bytes(bytes[SNAPSHOT_MAGIC.len()..SNAPSHOT_MAGIC.len() + 4].try_into().unwrap());
+    let version = u32::from_le_bytes(
+        bytes[SNAPSHOT_MAGIC.len()..SNAPSHOT_MAGIC.len() + 4]
+            .try_into()
+            .unwrap(),
+    );
     if version != SNAPSHOT_VERSION {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("{} has unsupported snapshot version {version}", path.display()),
+            format!(
+                "{} has unsupported snapshot version {version}",
+                path.display()
+            ),
         ));
     }
 
-    let expected_crc =
-        u32::from_le_bytes(bytes[SNAPSHOT_MAGIC.len() + 4..SNAPSHOT_HEADER_LEN].try_into().unwrap());
+    let expected_crc = u32::from_le_bytes(
+        bytes[SNAPSHOT_MAGIC.len() + 4..SNAPSHOT_HEADER_LEN]
+            .try_into()
+            .unwrap(),
+    );
     if crc32fast::hash(&bytes[SNAPSHOT_HEADER_LEN..]) != expected_crc {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -478,21 +566,28 @@ fn read_snapshot_file<C: RaftTypeConfig>(dir: &Path) -> io::Result<Option<(Snaps
         ));
     }
 
-    let payload: SnapshotPayload<C> = postcard::from_bytes(&bytes[SNAPSHOT_HEADER_LEN..])
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("corrupt snapshot: {e}")))?;
+    let payload: SnapshotPayload<C> =
+        postcard::from_bytes(&bytes[SNAPSHOT_HEADER_LEN..]).map_err(|e| {
+            io::Error::new(io::ErrorKind::InvalidData, format!("corrupt snapshot: {e}"))
+        })?;
 
     Ok(Some((payload.meta, payload.data)))
 }
 
 /// Writes a snapshot atomically: temp file, fsync, rename, fsync directory.
-fn write_snapshot_file<C: RaftTypeConfig>(dir: &Path, meta: &SnapshotMetaOf<C>, data: &[u8]) -> io::Result<()> {
+fn write_snapshot_file<C: RaftTypeConfig>(
+    dir: &Path,
+    meta: &SnapshotMetaOf<C>,
+    data: &[u8],
+) -> io::Result<()> {
     use std::io::Write;
 
     let payload = SnapshotPayload::<C> {
         meta: meta.clone(),
         data: data.to_vec(),
     };
-    let body = postcard::to_allocvec(&payload).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let body = postcard::to_allocvec(&payload)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
     let tmp = dir.join(format!("{SNAPSHOT_FILE}.tmp"));
     let path = dir.join(SNAPSHOT_FILE);
@@ -529,7 +624,10 @@ mod tests {
     use openraft::vote::RaftLeaderId;
 
     fn log_id(term: u64, index: u64) -> LogIdOf<MatchEngineTypeConfig> {
-        LogId::new(CommittedLeaderIdOf::<MatchEngineTypeConfig>::new(term, 1), index)
+        LogId::new(
+            CommittedLeaderIdOf::<MatchEngineTypeConfig>::new(term, 1),
+            index,
+        )
     }
 
     #[tokio::test]
@@ -539,9 +637,12 @@ mod tests {
         let store = StateMachineStore::<MatchEngineTypeConfig>::open(dir.path()).unwrap();
         {
             let mut inner = store.inner().lock().await;
-            inner
-                .orderbook
-                .place_order(&mut Order::new(crate::matchengine::OrderSide::Buy, 10.0, 2.0, 0));
+            inner.orderbook.place_order(&mut Order::new(
+                crate::matchengine::OrderSide::Buy,
+                10.0,
+                2.0,
+                0,
+            ));
             inner.last_applied_log = Some(log_id(1, 3));
             inner.last_membership = StoredMembership::new(Some(log_id(1, 1)), Default::default());
         }
@@ -572,7 +673,10 @@ mod tests {
         use openraft::alias::EntryOf;
         use openraft::alias::EntryPayloadOf;
 
-        fn entry(index: u64, payload: EntryPayloadOf<MatchEngineTypeConfig>) -> EntryOf<MatchEngineTypeConfig> {
+        fn entry(
+            index: u64,
+            payload: EntryPayloadOf<MatchEngineTypeConfig>,
+        ) -> EntryOf<MatchEngineTypeConfig> {
             Entry {
                 log_id: log_id(1, index),
                 payload,
@@ -582,20 +686,27 @@ mod tests {
         let dir = tempdir();
         let sink = Arc::new(MemorySink::new());
         let mut store =
-            StateMachineStore::<MatchEngineTypeConfig>::open_with_sink(dir.path(), sink.clone()).unwrap();
+            StateMachineStore::<MatchEngineTypeConfig>::open_with_sink(dir.path(), sink.clone())
+                .unwrap();
 
         // A sell of 5 rests, then a buy of 8 crosses it: 5 fills and 3 rest as a bid.
         let entries = futures::stream::iter(vec![
             Ok((
-                entry(1, EntryPayload::Normal(MatchEngineRequest::Place {
-                    order: Order::new(OrderSide::Sell, 100.0, 5.0, 0),
-                })),
+                entry(
+                    1,
+                    EntryPayload::Normal(MatchEngineRequest::Place {
+                        order: Order::new(OrderSide::Sell, 100.0, 5.0, 0),
+                    }),
+                ),
                 None,
             )),
             Ok((
-                entry(2, EntryPayload::Normal(MatchEngineRequest::Place {
-                    order: Order::new(OrderSide::Buy, 100.0, 8.0, 0),
-                })),
+                entry(
+                    2,
+                    EntryPayload::Normal(MatchEngineRequest::Place {
+                        order: Order::new(OrderSide::Buy, 100.0, 8.0, 0),
+                    }),
+                ),
                 None,
             )),
         ]);
@@ -625,9 +736,12 @@ mod tests {
 
         // Cancelling the 3 that rested reports the remaining volume from the book.
         let entries = futures::stream::iter(vec![Ok((
-            entry(3, EntryPayload::Normal(MatchEngineRequest::Cancel {
-                order: Order::new(OrderSide::Buy, 100.0, 3.0, 1),
-            })),
+            entry(
+                3,
+                EntryPayload::Normal(MatchEngineRequest::Cancel {
+                    order: Order::new(OrderSide::Buy, 100.0, 3.0, 1),
+                }),
+            ),
             None,
         ))]);
         store.apply(entries).await.unwrap();
@@ -642,9 +756,12 @@ mod tests {
 
         // A cancel of something that is not in the book publishes nothing.
         let entries = futures::stream::iter(vec![Ok((
-            entry(4, EntryPayload::Normal(MatchEngineRequest::Cancel {
-                order: Order::new(OrderSide::Buy, 100.0, 3.0, 1),
-            })),
+            entry(
+                4,
+                EntryPayload::Normal(MatchEngineRequest::Cancel {
+                    order: Order::new(OrderSide::Buy, 100.0, 3.0, 1),
+                }),
+            ),
             None,
         ))]);
         store.apply(entries).await.unwrap();
@@ -694,6 +811,144 @@ mod tests {
         assert_eq!(Some(log_id(1, 1)), inner.last_applied_log);
     }
 
+    /// The time-in-force and stop paths publish their own event kinds, and one
+    /// entry's events (a stop cascade) keep increasing ordinals.
+    #[tokio::test]
+    async fn apply_publishes_ioc_stop_and_expiry_events() {
+        use crate::match_result::MatchEventKind;
+        use crate::match_result::MemorySink;
+        use crate::matchengine::Order;
+        use crate::matchengine::OrderSide;
+        use crate::matchengine::OrderType;
+        use crate::matchengine::TimeInForce;
+        use openraft::alias::EntryOf;
+
+        fn entry(
+            index: u64,
+            payload: EntryPayloadOf<MatchEngineTypeConfig>,
+        ) -> EntryOf<MatchEngineTypeConfig> {
+            Entry {
+                log_id: log_id(1, index),
+                payload,
+            }
+        }
+
+        let dir = tempdir();
+        let sink = Arc::new(MemorySink::new());
+        let mut store =
+            StateMachineStore::<MatchEngineTypeConfig>::open_with_sink(dir.path(), sink.clone())
+                .unwrap();
+
+        let mut gtd = Order::new(OrderSide::Buy, 90.0, 1.0, 0);
+        gtd.tif = TimeInForce::Gtd(2_000);
+        gtd.timestamp = 1_000;
+
+        let mut stop = Order::new(OrderSide::Sell, 0.0, 5.0, 0);
+        stop.live = OrderType::Market;
+        stop.stop_price = 95.0;
+
+        let entries = futures::stream::iter(vec![
+            Ok((
+                entry(
+                    1,
+                    EntryPayload::Normal(MatchEngineRequest::Place { order: gtd }),
+                ),
+                None,
+            )),
+            Ok((
+                entry(
+                    2,
+                    EntryPayload::Normal(MatchEngineRequest::Place {
+                        order: Order::new(OrderSide::Buy, 100.0, 10.0, 0),
+                    }),
+                ),
+                None,
+            )),
+            Ok((
+                entry(
+                    3,
+                    EntryPayload::Normal(MatchEngineRequest::Place {
+                        order: Order::new(OrderSide::Buy, 95.0, 10.0, 0),
+                    }),
+                ),
+                None,
+            )),
+            Ok((
+                entry(
+                    4,
+                    EntryPayload::Normal(MatchEngineRequest::Place { order: stop }),
+                ),
+                None,
+            )),
+            Ok((
+                entry(
+                    5,
+                    EntryPayload::Normal(MatchEngineRequest::Place {
+                        order: Order::new(OrderSide::Sell, 100.0, 10.0, 0),
+                    }),
+                ),
+                None,
+            )),
+            Ok((
+                entry(
+                    6,
+                    EntryPayload::Normal(MatchEngineRequest::Place {
+                        order: Order::new(OrderSide::Sell, 95.0, 3.0, 0),
+                    }),
+                ),
+                None,
+            )),
+            Ok((
+                entry(
+                    7,
+                    EntryPayload::Normal(MatchEngineRequest::PurgeExpired {
+                        now_ms: 2_000,
+                        day_close_ms: None,
+                    }),
+                ),
+                None,
+            )),
+        ]);
+        store.apply(entries).await.unwrap();
+
+        let events = sink.events();
+        // Rests for the GTD order and the two bids; a fill for entry 5; then the
+        // elected stop's trigger + child fill; finally the expiry.
+        assert_eq!(8, events.len(), "unexpected events: {events:?}");
+
+        assert_eq!(MatchEventKind::Rested, events[0].kind);
+        assert_eq!(MatchEventKind::Fill, events[3].kind);
+        assert_eq!(10.0, events[3].volume);
+
+        let triggered = &events[5];
+        assert_eq!(MatchEventKind::Triggered, triggered.kind);
+        assert_eq!(3, triggered.order_sequence, "the stop's sequence");
+        assert_eq!(95.0, triggered.price, "the trade that elected it");
+        assert_eq!(5.0, triggered.volume);
+        assert_eq!(
+            [6, 1],
+            [
+                triggered.event_id.log_index,
+                u64::from(triggered.event_id.ordinal)
+            ]
+        );
+
+        let child_fill = &events[6];
+        assert_eq!(MatchEventKind::Fill, child_fill.kind);
+        assert_eq!(
+            3, child_fill.order_sequence,
+            "child fills belong to the stop"
+        );
+        assert_eq!(5.0, child_fill.volume);
+        assert_eq!(2, child_fill.event_id.ordinal, "same entry, next ordinal");
+
+        let expired = &events[7];
+        assert_eq!(MatchEventKind::Expired, expired.kind);
+        assert_eq!(0, expired.order_sequence, "the GTD order");
+        assert_eq!(1.0, expired.volume);
+        assert_eq!(7, expired.event_id.log_index);
+    }
+
     struct TempDir(PathBuf);
 
     impl TempDir {
@@ -717,7 +972,10 @@ mod tests {
         let unique = format!(
             "matchengine-sm-test-{}-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
             COUNTER.fetch_add(1, Ordering::Relaxed)
         );
         let path = std::env::temp_dir().join(unique);

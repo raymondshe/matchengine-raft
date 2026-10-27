@@ -113,13 +113,26 @@ vote/committed persistence, snapshot build/install/reopen) and `tests/cluster/te
 - [ ] Deliver fills and cancels durably to the order/clearing system: events in the `/write`
   response, a bounded replicated event log, `/events` cursor reads, and `client_order_id` dedupe.
   Design: `docs/MATCH_RESULTS.md` (phases 1b–3).
-- [ ] `OrderType::Limit` is hardcoded in `Order::new` (`// TODO: More types` at `src/matchengine/mod.rs:74`); no market orders.
+- [x] Order types (semantics modelled on
+  [OrderBook-rs](https://github.com/joaquinbejar/OrderBook-rs)): GTC, IOC, FOK, GTD, Day,
+  post-only, iceberg (display tranche + hidden reserve), market, stop-market and stop-limit.
+  Expiry is deterministic via `PurgeExpired { now_ms, day_close_ms }`; stops park off the book and
+  are elected by the replicated last trade price. Events: `triggered`, `expired`, `rejected` join
+  `fill`/`rested`/`cancelled`.
+- [ ] OrderBook-rs types not ported yet: trailing stops (watermark + trail amount, child on a new
+  print), pegged orders (reference price offsets), custom reserve replenishment, stop-protection
+  collars, market-to-limit, and self-trade prevention.
+- [ ] A `PurgeExpired` only runs when a client submits it; nothing expires on its own. A leader-side
+  ticker that proposes one periodically (with the leader's clock, recorded in the log) would make
+  GTD/Day self-driving without breaking determinism.
 - [ ] `price`/`volume` are `f64` — money should use integer ticks/decimal.
 - [ ] The book is a per-order `BTreeMap<BidKey/AskKey, Order>`; every fill descends the tree once
   and sweeps touch one entry per order. Bucketing orders per price level
   (`BTreeMap<price, VecDeque<Order>>` plus a sequence-keyed index so cancels stay O(log n)) would
   make full-level sweeps O(1) per order. Measured headroom and current numbers: `cargo bench
-  --bench matchengine`.
+  --bench matchengine`. The extended `Order` (time in force, stop, iceberg fields) also grew the
+  map value from 40 to ~88 bytes, which shows up as roughly 1.5–1.7x on the copy-heavy benches; a
+  compact resting record or per-level buckets would recover it.
 - [ ] `impl PartialEq for Order` ignores `id`, so two different orders at the same price/size compare equal.
 - [ ] `Order::sequence` is required by the public deserializer even though `place_order()` overwrites
   it; make it optional (serde default) so callers do not have to send a value the engine ignores.

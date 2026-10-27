@@ -76,7 +76,9 @@
    - 用于集群管理的管理 API
 
 3. **撮合引擎** ([`matchengine/`](./src/matchengine/))
-   - 包含买单和卖单的订单簿
+   - 价格-时间优先的订单簿（买单与卖单）
+   - 订单类型：GTC、IOC、FOK、GTD、Day、Post-Only、冰山单、止损市价单、止损限价单
+   - 确定性过期（`PurgeExpired` 通过日志携带时间戳）与基于复制的最后成交价触发止损
    - 现实世界状态机应用的示例
 
 ## 快速开始
@@ -304,21 +306,58 @@ Raft 日志追加写入 `log/NNNNNNNNNN.wal` 分段文件：
 
 对应的环境变量为 `RAFT_DATA_DIR` 和 `RAFT_INSTANCE_PREFIX`，默认值分别是 `/tmp/matchengine-raft` 和 `matchengine`。
 
+### 订单类型
+
+订单是一个扁平的 `Order` 记录，每种可选类型都是它上面的一个字段。新增字段都带 serde 默认值，
+因此旧格式的请求负载仍然可以反序列化。语义与
+[OrderBook-rs](https://github.com/joaquinbejar/OrderBook-rs) 一致：
+
+| 类型 | 字段 | 行为 |
+|---|---|---|
+| GTC（默认） | — | 一直挂单，直到成交或被撤销。 |
+| IOC | `"tif": "IOC"` | 立即吃掉能成交的部分，剩余量被撤销，并以 `cancelled` 事件报告。 |
+| FOK | `"tif": "FOK"` | 预检会汇总限价范围内可达的可见量与冰山隐藏量；不能全部成交时整单被拒绝（`rejected`，原因 `fok_unfillable`），订单簿保持不变。 |
+| GTD | `"tif": {"GTD": 1700000000000}`（Unix 毫秒） | 挂单直到 `PurgeExpired` 在 `now_ms >= expiry` 时将其清除。 |
+| Day | `"tif": "DAY"` | 当 `PurgeExpired` 带有 `day_close_ms` 且 `now_ms >= close` 时过期；未提供收盘时间时行为等同 GTC。 |
+| Post-Only | `"post_only": true` | 从不吃单：整单挂入订单簿，若会成交则被拒绝（`post_only_would_cross`）。 |
+| 冰山单 | `"display_volume": 100.0` | `volume` 是总量，只有一档可见量挂单；其余在 `hidden_volume` 中，对深度不可见，可见量被吃掉后逐档补足。 |
+| 止损市价单 | `"live": "Market", "stop_price": 95.0` | 先停在订单簿之外，直到成交价触及止损价（卖单 `<=`，买单 `>=`），然后扫遍对手方所有价位；子单从不挂单，剩余量撤销。 |
+| 止损限价单 | `"live": "Limit", "price": 96.0, "stop_price": 95.0` | 触发方式相同，子单受 `price` 限制；剩余量撤销。 |
+
+市价单（`"live": "Market"`）忽略自身价格，扫遍对手方，剩余量撤销，从不挂单。
+
+过期是确定性的：`apply` 从不读取时钟，因此截止时间随复制请求一起传递，每个副本清除完全相同的订单：
+
+```json
+{"PurgeExpired": {"now_ms": 1700000000000, "day_close_ms": null}}
+```
+
+响应携带被清除的订单数量（`{"value": "2"}`），每个订单会产生一个 `expired` 事件，报告其仍然
+未成交的数量。
+
+止损单只会被**新的**成交触发：若最后成交价已经越过止损价，订单在进入时就被拒绝
+（`stop_would_trigger`），而不会立刻变成市价单。一次成交可以级联触发多个止损单；被触发的止损按
+准入顺序执行。
+
+不支持的组合（止损单同时是 Post-Only 或冰山单、Post-Only 市价单、数量或价格非正、GTD 截止时间
+不晚于订单自身的 `timestamp`）会被拒绝，并产生带原因的 `rejected` 事件。
+
 ### 撮合结果处理
 
-`apply` 会把每个 `MatchResult` 转换成 `MatchEvent`（`fill` / `rested` / `cancelled`），再交给可替换的
+`apply` 会把每个 `MatchResult` 转换成 `MatchEvent`（`fill` / `rested` / `cancelled` / `triggered` /
+`expired` / `rejected`），再交给可替换的
 `MatchResultSink`（`src/match_result/mod.rs`）。事件只由已应用的日志条目推导，因此每个副本产生相同的
 id；sink 本身是节点本地配置，绝不会影响复制状态：
 
 ```
-POST /write { Place | Cancel }
+POST /write { Place | Cancel | PurgeExpired }
         │
         ▼
   StateMachineStore::apply  （每个副本都执行）
         │
         ├──► 订单簿 + 序列号 ──► 快照               [复制状态]
         │
-        └──► MatchEvent（fill | rested | cancelled）[id = 日志位置]
+        └──► MatchEvent（fill/rested/cancelled/…） [id = 日志位置]
                     │
                     ▼
           MatchResultSink                           [节点本地，尽力而为]
@@ -401,20 +440,29 @@ gRPC 传输在 `--http-addr` 端口 + 1000 上暴露相同操作（`AppendEntrie
 
 ### 应用 API
 
-- `POST /write` - 通过 Raft 提交 `Place` 或 `Cancel` 请求
+- `POST /write` - 通过 Raft 提交 `Place`、`Cancel` 或 `PurgeExpired` 请求
 - `POST /read` - 从本地状态机读取（可能读到旧值）
 - `POST /linearizable_read` - 线性一致性读；请求必须到达领导者
 - `POST /follower_read` - 从领导者获取 linearizer 后在本地完成的线性一致性读
 
 `/read`、`/linearizable_read` 和 `/follower_read` 接收 JSON 字符串键，用于读取订单簿的命名视图：
 
-- `orderbook_orders` - 所有活动订单的 JSON 数组
+- `orderbook_orders` - 订单簿中所有挂单的 JSON 数组
+- `orderbook_stops` - 停在订单簿之外的止损单（按准入顺序）
+- `orderbook_last_trade_price` - 最后成交价（首笔成交前为 `null`），用于触发止损
 - `orderbook_sequence` - 订单序列号计数器（兼容旧拼写 `orderbook_sequance`）
 
 `/write` 接受的订单示例（注意字段名是 `sequence`）：
 
 ```json
 {"Place": {"order": {"live": "Limit", "side": "Buy", "price": 4000.0, "volume": 4.4, "id": 1, "sequence": 1}}}
+```
+
+所有订单类型字段（`tif`、`post_only`、`stop_price`、`display_volume`、`hidden_volume`、
+`timestamp`）都是可选的，默认就是普通的 GTC 限价单：
+
+```json
+{"Place": {"order": {"live": "Limit", "side": "Sell", "price": 4000.0, "volume": 100.0, "tif": "IOC", "display_volume": 10.0}}}
 ```
 
 撮合引擎在应用订单时会覆盖 `sequence`，因此客户端发送的值会被忽略；约定填 `0`。该字段仍然是
@@ -430,11 +478,11 @@ gRPC 传输在 `--http-addr` 端口 + 1000 上暴露相同操作（`AppendEntrie
 | `tests/cluster/test_snapshot.rs` | 快照生成、日志 purge，以及学习者通过 gRPC 快照流安装已 purge 的状态 |
 | `tests/cluster/test_storage.rs` | WAL 帧格式、撕裂尾部截断、分段轮转、跨段 truncate/purge、vote/committed 持久化、快照构建/安装/重开、损坏文件拒绝 |
 | `tests/cluster/test_restart.rs` | 完整节点重启后通过日志重放恢复，以及通过快照 + 尾部恢复订单簿和序列号 |
-| `tests/cluster/test_match_results.rs` | 以 `--match-event-log` 启动的节点按日志顺序记录 rest/fill/cancel 事件，同时 `/write` 响应保持不变 |
+| `tests/cluster/test_match_results.rs` | 以 `--match-event-log` 启动的节点按日志顺序记录 rest/fill/cancel 事件，同时 `/write` 响应保持不变；第二个节点验证止损触发、GTD 过期和新增的 `/read` 键 |
 
 所有集成测试都使用唯一的临时数据目录。集群测试固定使用端口 `21001-21003`（gRPC
 `22001-22003`），快照测试使用 `21101-21102`，重启测试使用 `21201-21202`，撮合结果测试使用
-`21301`；重跑前请先停止残留进程（`pkill -f matchengine-raft`）。
+`21301`/`21302`；重跑前请先停止残留进程（`pkill -f matchengine-raft`）。
 
 已知差距与路线图统一记录在 [`TODO.md`](./TODO.md)。
 
