@@ -10,6 +10,7 @@ Single-crate Rust project (edition 2024): a Raft-replicated order-book matching 
   - `--match-event-log <file>` (env `MATCH_EVENT_LOG`) appends every applied fill/rest/cancel to a JSONL file. Debug aid only: node-local, not replicated, duplicates lines when the log is replayed after a restart.
 - `cargo test` runs everything (a single integration target, `cluster`, ~10s once built). Focus it with `cargo test --test cluster`.
   - `MATCHENGINE_TEST_TRANSPORT=http cargo test --test cluster` runs the cluster suite over the legacy HTTP/JSON transport.
+  - `cargo bench --bench matchengine` runs the order-book micro-benchmarks (no framework, prints best-of-5 per-round times).
   - `tests/cluster/test_snapshot.rs` forces a snapshot, purges the log, and checks that a joining learner installs the snapshot over gRPC.
   - `tests/cluster/test_storage.rs` covers the WAL and snapshot formats directly; `tests/cluster/test_restart.rs` boots a node, stops it, and proves recovery via log replay and via snapshot.
   - `tests/cluster/test_match_results.rs` boots a node with the file sink and checks rest/fill/cancel events in log order (port 21301, gRPC 22301).

@@ -1,6 +1,6 @@
+use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
-use serde::{Serialize, Deserialize};
 
 /// Specifies whether an order is a buy (bid) or sell (ask) order.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -95,7 +95,7 @@ impl Eq for Order {}
 /// BidKey implements reverse price ordering (highest price first) and
 /// FIFO ordering at the same price level (lowest sequence first).
 /// This ensures the best bid price is always at the front of the book.
-#[derive(Debug, Clone, Copy,Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct BidKey {
     /// The price level of this bid order.
     pub price: f64,
@@ -149,7 +149,7 @@ impl PartialOrd for BidKey {
 /// AskKey implements natural price ordering (lowest price first) and
 /// FIFO ordering at the same price level (lowest sequence first).
 /// This ensures the best ask price is always at the front of the book.
-#[derive(Debug, Clone, Copy,Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct AskKey {
     /// The price level of this ask order.
     pub price: f64,
@@ -197,7 +197,6 @@ impl PartialOrd for AskKey {
         Some(self.cmp(&other))
     }
 }
-
 
 /// Serialization utilities for BTreeMap to vector conversion.
 ///
@@ -274,7 +273,9 @@ pub struct MatchResult {
 /// Equality comparison for match results.
 impl PartialEq for MatchResult {
     fn eq(&self, other: &Self) -> bool {
-        (self.taker == other.taker) && (self.maker == other.maker) && (self.matches == other.matches)
+        (self.taker == other.taker)
+            && (self.maker == other.maker)
+            && (self.matches == other.matches)
     }
 }
 
@@ -313,10 +314,7 @@ impl OrderBook {
     /// The best bid is the highest price any buyer is willing to pay.
     /// Returns `None` if there are no bid orders in the book.
     pub fn best_bid(&self) -> Option<&Order> {
-        match self.bids.iter().next() {
-            None => None,
-            Some((_key,value)) => Some(value),
-        }
+        self.bids.first_key_value().map(|(_key, value)| value)
     }
 
     /// Returns the current best (lowest) ask price order.
@@ -324,10 +322,7 @@ impl OrderBook {
     /// The best ask is the lowest price any seller is willing to accept.
     /// Returns `None` if there are no ask orders in the book.
     pub fn best_ask(&self) -> Option<&Order> {
-        match self.asks.iter().next() {
-            None => None,
-            Some((_key,value)) => Some(value),
-        }
+        self.asks.first_key_value().map(|(_key, value)| value)
     }
 
     /// Inserts an order directly into the book without attempting to match it.
@@ -339,15 +334,25 @@ impl OrderBook {
     /// # Arguments
     ///
     /// * `order` - The order to insert into the book
-    #[tracing::instrument(level = "trace", skip(self))]
     pub fn insert_order(&mut self, order: &Order) {
-        //tracing::debug!("insert_order: {:?})", order);
         match order.side {
             OrderSide::Buy => {
-                self.bids.insert(BidKey{price: order.price, sequence: order.sequence}, order.clone());
+                self.bids.insert(
+                    BidKey {
+                        price: order.price,
+                        sequence: order.sequence,
+                    },
+                    order.clone(),
+                );
             }
             OrderSide::Sell => {
-                self.asks.insert(AskKey{price: order.price, sequence: order.sequence}, order.clone());
+                self.asks.insert(
+                    AskKey {
+                        price: order.price,
+                        sequence: order.sequence,
+                    },
+                    order.clone(),
+                );
             }
         }
     }
@@ -368,9 +373,7 @@ impl OrderBook {
     ///
     /// A vector of `MatchResult` representing all trades that occurred,
     /// or an empty vector if no matches were made.
-    #[tracing::instrument(level = "trace", skip(self))]
     pub fn place_order(&mut self, order: &mut Order) -> Vec<MatchResult> {
-        //tracing::debug!("place_order: [{:?}, +oo)", order);
         order.sequence = self.sequence;
         self.sequence += 1;
 
@@ -393,14 +396,20 @@ impl OrderBook {
     /// # Returns
     ///
     /// The cancelled order if found, or `None` if no matching order was in the book.
-    pub fn cancel(&mut self, order: &Order) -> Option<Order>{
+    pub fn cancel(&mut self, order: &Order) -> Option<Order> {
         match order.side {
             OrderSide::Buy => {
-                let key = BidKey{price: order.price, sequence: order.sequence};
+                let key = BidKey {
+                    price: order.price,
+                    sequence: order.sequence,
+                };
                 return self.bids.remove(&key);
             }
             OrderSide::Sell => {
-                let key = AskKey{price: order.price, sequence: order.sequence};
+                let key = AskKey {
+                    price: order.price,
+                    sequence: order.sequence,
+                };
                 return self.asks.remove(&key);
             }
         }
@@ -417,13 +426,45 @@ impl OrderBook {
         match order.side {
             OrderSide::Buy => self
                 .bids
-                .get(&BidKey { price: order.price, sequence: order.sequence })
+                .get(&BidKey {
+                    price: order.price,
+                    sequence: order.sequence,
+                })
                 .map(|resting| resting.volume),
             OrderSide::Sell => self
                 .asks
-                .get(&AskKey { price: order.price, sequence: order.sequence })
+                .get(&AskKey {
+                    price: order.price,
+                    sequence: order.sequence,
+                })
                 .map(|resting| resting.volume),
         }
+    }
+
+    /// Adds `volume` of an unmatched buy order back into the bid side of the book.
+    fn rest_as_bid(&mut self, order: &Order, volume: f64) {
+        let mut resting = *order;
+        resting.volume = volume;
+        self.bids.insert(
+            BidKey {
+                price: order.price,
+                sequence: order.sequence,
+            },
+            resting,
+        );
+    }
+
+    /// Adds `volume` of an unmatched sell order back into the ask side of the book.
+    fn rest_as_ask(&mut self, order: &Order, volume: f64) {
+        let mut resting = *order;
+        resting.volume = volume;
+        self.asks.insert(
+            AskKey {
+                price: order.price,
+                sequence: order.sequence,
+            },
+            resting,
+        );
     }
 
     /// Attempts to match a buy (bid) order against the ask side of the book.
@@ -453,52 +494,43 @@ impl OrderBook {
         // Stop as soon as the taker is exhausted: a zero-volume taker must not
         // "match" the next ask and rewrite it.
         while remaining_volume > 0.0 {
-            match self.asks.iter().next() {
-                None => {
-                    // No more asks to match, add remaining to bids
-                    let mut remaining_order = order.clone();
-                    remaining_order.volume = remaining_volume;
-                    self.bids.insert(
-                        BidKey{price: order.price, sequence: order.sequence},
-                        remaining_order
-                    );
-                    break;
-                }
-                Some((key, best_ask)) => {
-                    if best_ask.price > order.price {
-                        // Best ask price is too high, add remaining to bids
-                        let mut remaining_order = order.clone();
-                        remaining_order.volume = remaining_volume;
-                        self.bids.insert(
-                            BidKey{ price: order.price, sequence: order.sequence },
-                            remaining_order
-                        );
-                        break;
-                    }
+            // `first_entry` walks the tree once and keeps the position, so
+            // removing a fully filled ask or shrinking a partially filled one
+            // below does not descend a second time.
+            let Some(mut best) = self.asks.first_entry() else {
+                // No more asks to match, add remaining to bids
+                self.rest_as_bid(order, remaining_volume);
+                break;
+            };
 
-                    // Can match with best ask
-                    let match_volume = remaining_volume.min(best_ask.volume);
-                    let mut temp_order = order.clone();
-                    temp_order.volume = remaining_volume;
-                    results.push(MatchResult::new(&temp_order, &best_ask, match_volume));
+            let best_ask = *best.get();
+            if best_ask.price > order.price {
+                // Best ask price is too high, add remaining to bids
+                self.rest_as_bid(order, remaining_volume);
+                break;
+            }
 
-                    if best_ask.volume > remaining_volume {
-                        // Partially filled: shrink the maker in place so it keeps
-                        // its identity (id, side, live and sequence).
-                        let akey = AskKey{price: key.price, sequence: key.sequence};
-                        let mut new_best_ask = *best_ask;
-                        new_best_ask.volume = best_ask.volume - match_volume;
-                        self.asks.insert(akey, new_best_ask);
-                        // Taker fully matched
-                        break;
-                    } else {
-                        // Remove the fully matched ask
-                        let akey = AskKey{price: key.price, sequence: key.sequence};
-                        self.asks.remove(&akey);
-                        remaining_volume -= match_volume;
-                        // Continue matching with next ask
-                    }
-                }
+            // Can match with best ask
+            let match_volume = remaining_volume.min(best_ask.volume);
+            results.push(MatchResult {
+                taker: Order {
+                    volume: remaining_volume,
+                    ..*order
+                },
+                maker: best_ask,
+                matches: match_volume,
+            });
+
+            if best_ask.volume > remaining_volume {
+                // Partially filled: shrink the maker in place so it keeps
+                // its identity (id, side, live and sequence).
+                best.get_mut().volume = best_ask.volume - match_volume;
+                // Taker fully matched
+                break;
+            } else {
+                // Remove the fully matched ask and continue with the next one.
+                best.remove();
+                remaining_volume -= match_volume;
             }
         }
 
@@ -532,52 +564,43 @@ impl OrderBook {
         // Stop as soon as the taker is exhausted: a zero-volume taker must not
         // "match" the next bid and rewrite it.
         while remaining_volume > 0.0 {
-            match self.bids.iter().next() {
-                None => {
-                    // No more bids to match, add remaining to asks
-                    let mut remaining_order = order.clone();
-                    remaining_order.volume = remaining_volume;
-                    self.asks.insert(
-                        AskKey{price: order.price, sequence: order.sequence},
-                        remaining_order
-                    );
-                    break;
-                }
-                Some((key, best_bid)) => {
-                    if best_bid.price < order.price {
-                        // Best bid price is too low, add remaining to asks
-                        let mut remaining_order = order.clone();
-                        remaining_order.volume = remaining_volume;
-                        self.asks.insert(
-                            AskKey{price: order.price, sequence: order.sequence},
-                            remaining_order
-                        );
-                        break;
-                    }
+            // `first_entry` walks the tree once and keeps the position, so
+            // removing a fully filled bid or shrinking a partially filled one
+            // below does not descend a second time.
+            let Some(mut best) = self.bids.first_entry() else {
+                // No more bids to match, add remaining to asks
+                self.rest_as_ask(order, remaining_volume);
+                break;
+            };
 
-                    // Can match with best bid
-                    let match_volume = remaining_volume.min(best_bid.volume);
-                    let mut temp_order = order.clone();
-                    temp_order.volume = remaining_volume;
-                    results.push(MatchResult::new(&temp_order, &best_bid, match_volume));
+            let best_bid = *best.get();
+            if best_bid.price < order.price {
+                // Best bid price is too low, add remaining to asks
+                self.rest_as_ask(order, remaining_volume);
+                break;
+            }
 
-                    if best_bid.volume > remaining_volume {
-                        // Partially filled: shrink the maker in place so it keeps
-                        // its identity (id, side, live and sequence).
-                        let akey = BidKey{price: key.price, sequence: key.sequence};
-                        let mut new_best_bid = *best_bid;
-                        new_best_bid.volume = best_bid.volume - match_volume;
-                        self.bids.insert(akey, new_best_bid);
-                        // Taker fully matched
-                        break;
-                    } else {
-                        // Remove the fully matched bid
-                        let akey = BidKey{price: key.price, sequence: key.sequence};
-                        self.bids.remove(&akey);
-                        remaining_volume -= match_volume;
-                        // Continue matching with next bid
-                    }
-                }
+            // Can match with best bid
+            let match_volume = remaining_volume.min(best_bid.volume);
+            results.push(MatchResult {
+                taker: Order {
+                    volume: remaining_volume,
+                    ..*order
+                },
+                maker: best_bid,
+                matches: match_volume,
+            });
+
+            if best_bid.volume > remaining_volume {
+                // Partially filled: shrink the maker in place so it keeps
+                // its identity (id, side, live and sequence).
+                best.get_mut().volume = best_bid.volume - match_volume;
+                // Taker fully matched
+                break;
+            } else {
+                // Remove the fully matched bid and continue with the next one.
+                best.remove();
+                remaining_volume -= match_volume;
             }
         }
 
@@ -618,10 +641,10 @@ mod tests {
     #[test]
     fn basic_best_ask() {
         let mut ob = OrderBook::new();
-        let mut o1 = Order::new(OrderSide::Sell,100.22, 20.0, 1);
-        let mut o2 = Order::new(OrderSide::Sell,100.22, 20.0, 2);
-        let mut o3 = Order::new(OrderSide::Sell,100.24, 20.0, 3);
-        let mut o4 = Order::new(OrderSide::Sell,100.20, 20.0, 4);
+        let mut o1 = Order::new(OrderSide::Sell, 100.22, 20.0, 1);
+        let mut o2 = Order::new(OrderSide::Sell, 100.22, 20.0, 2);
+        let mut o3 = Order::new(OrderSide::Sell, 100.24, 20.0, 3);
+        let mut o4 = Order::new(OrderSide::Sell, 100.20, 20.0, 4);
 
         ob.place_order(&mut o1);
         assert_eq!(ob.best_ask(), Some(&o1));
@@ -667,7 +690,11 @@ mod tests {
         assert_eq!(trades[0].maker.id, 1);
         assert_eq!(trades[0].taker.id, 3);
         assert_eq!(trades[0].matches, 10.0);
-        assert!(trades.iter().all(|t| t.matches > 0.0), "phantom fill: {:?}", trades);
+        assert!(
+            trades.iter().all(|t| t.matches > 0.0),
+            "phantom fill: {:?}",
+            trades
+        );
 
         let bystander = ob.best_bid().expect("bid #2 must still rest");
         assert_eq!(bystander.id, 2, "bystander id must not be reset");
@@ -694,7 +721,11 @@ mod tests {
         assert_eq!(trades[0].maker.id, 1);
         assert_eq!(trades[0].taker.id, 3);
         assert_eq!(trades[0].matches, 10.0);
-        assert!(trades.iter().all(|t| t.matches > 0.0), "phantom fill: {:?}", trades);
+        assert!(
+            trades.iter().all(|t| t.matches > 0.0),
+            "phantom fill: {:?}",
+            trades
+        );
 
         let bystander = ob.best_ask().expect("ask #2 must still rest");
         assert_eq!(bystander.id, 2, "bystander id must not be reset");
@@ -767,7 +798,12 @@ mod tests {
         let mut s = resting_order(OrderSide::Sell, 99.0, 10.0, 3);
         let trades = ob.place_order(&mut s);
 
-        assert_eq!(trades.len(), 1, "deeper bid must not be touched: {:?}", trades);
+        assert_eq!(
+            trades.len(),
+            1,
+            "deeper bid must not be touched: {:?}",
+            trades
+        );
         assert_eq!((trades[0].maker.id, trades[0].matches), (1, 10.0));
 
         let deeper = ob.best_bid().expect("bid #2 must still rest");
@@ -786,7 +822,12 @@ mod tests {
         let mut b = resting_order(OrderSide::Buy, 101.0, 10.0, 3);
         let trades = ob.place_order(&mut b);
 
-        assert_eq!(trades.len(), 1, "deeper ask must not be touched: {:?}", trades);
+        assert_eq!(
+            trades.len(),
+            1,
+            "deeper ask must not be touched: {:?}",
+            trades
+        );
         assert_eq!((trades[0].maker.id, trades[0].matches), (1, 10.0));
 
         let deeper = ob.best_ask().expect("ask #2 must still rest");
@@ -810,7 +851,10 @@ mod tests {
         let trades = ob.place_order(&mut s);
 
         assert_eq!(
-            trades.iter().map(|t| (t.maker.id, t.matches)).collect::<Vec<_>>(),
+            trades
+                .iter()
+                .map(|t| (t.maker.id, t.matches))
+                .collect::<Vec<_>>(),
             vec![(1, 10.0), (2, 5.0)]
         );
         assert!(ob.best_bid().is_none(), "fully swept book must be empty");
@@ -826,7 +870,10 @@ mod tests {
         let trades = ob.place_order(&mut b);
 
         assert_eq!(
-            trades.iter().map(|t| (t.maker.id, t.matches)).collect::<Vec<_>>(),
+            trades
+                .iter()
+                .map(|t| (t.maker.id, t.matches))
+                .collect::<Vec<_>>(),
             vec![(1, 10.0), (2, 5.0)]
         );
         assert!(ob.best_ask().is_none(), "fully swept book must be empty");
@@ -857,5 +904,4 @@ mod tests {
         println!("deserialized = {:?}", deserialized);
         */
     }
-
 }

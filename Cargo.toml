@@ -17,6 +17,10 @@ readme = "README.md"
 name = "matchengine-raft"
 path = "src/bin/main.rs"
 
+[[bench]]
+name = "matchengine"
+harness = false
+
 [dependencies]
 actix-web = "4.0.0-rc.2"
 async-stream = "0.3.6"

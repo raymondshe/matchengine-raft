@@ -115,6 +115,11 @@ vote/committed persistence, snapshot build/install/reopen) and `tests/cluster/te
   Design: `docs/MATCH_RESULTS.md` (phases 1b–3).
 - [ ] `OrderType::Limit` is hardcoded in `Order::new` (`// TODO: More types` at `src/matchengine/mod.rs:74`); no market orders.
 - [ ] `price`/`volume` are `f64` — money should use integer ticks/decimal.
+- [ ] The book is a per-order `BTreeMap<BidKey/AskKey, Order>`; every fill descends the tree once
+  and sweeps touch one entry per order. Bucketing orders per price level
+  (`BTreeMap<price, VecDeque<Order>>` plus a sequence-keyed index so cancels stay O(log n)) would
+  make full-level sweeps O(1) per order. Measured headroom and current numbers: `cargo bench
+  --bench matchengine`.
 - [ ] `impl PartialEq for Order` ignores `id`, so two different orders at the same price/size compare equal.
 - [ ] `Order::sequence` is required by the public deserializer even though `place_order()` overwrites
   it; make it optional (serde default) so callers do not have to send a value the engine ignores.
@@ -144,4 +149,5 @@ Remaining:
 ## 11. Client library and benchmarks
 
 - [ ] Harden `src/client.rs` before it is used outside the examples: retry/backoff on transient RPC errors, configurable timeouts, and a typed error for "no known leader" instead of a bare message.
+- [x] Order-book micro-benchmarks: `cargo bench --bench matchengine` (sweep wide/deep, rest, partial fill, cancel; best-of-5 per round, no framework).
 - [ ] Add end-to-end latency benchmarks (submit → commit → apply → response) next to the transport harness in §10, so matching and replication costs can be separated.
