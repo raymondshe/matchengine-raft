@@ -233,6 +233,8 @@ src/
 ├── app.rs                   # 应用状态
 ├── matchengine/
 │   └── mod.rs               # 订单簿撮合引擎
+├── match_result/
+│   └── mod.rs               # MatchEvent id + 可替换的 MatchResultSink（noop/memory/file）
 ├── network/
 │   ├── api.rs               # 应用 HTTP 端点
 │   ├── management.rs        # 管理 HTTP 端点
@@ -259,7 +261,8 @@ tests/
     ├── test_cluster.rs      # 3 节点集群，两种传输
     ├── test_snapshot.rs     # 快照生成/purge + 学习者通过 gRPC 安装
     ├── test_storage.rs      # WAL 与快照格式
-    └── test_restart.rs      # 重启恢复：日志重放与快照
+    ├── test_restart.rs      # 重启恢复：日志重放与快照
+    └── test_match_results.rs # 撮合事件写入 JSONL 文件 sink
 ```
 
 ## 存储实现
@@ -290,6 +293,23 @@ Raft 日志追加写入 `log/NNNNNNNNNN.wal` 分段文件：
 ```
 
 对应的环境变量为 `RAFT_DATA_DIR` 和 `RAFT_INSTANCE_PREFIX`，默认值分别是 `/tmp/matchengine-raft` 和 `matchengine`。
+
+### 撮合结果处理
+
+`apply` 会把每个 `MatchResult` 转换成 `MatchEvent`（`fill` / `rested` / `cancelled`），再交给可替换的
+`MatchResultSink`（`src/match_result/mod.rs`）。默认的 sink 直接丢弃事件，因此引擎行为与以前一致。
+需要观察事件时启用文件 sink：
+
+```bash
+./target/release/matchengine-raft --id 1 --http-addr 127.0.0.1:21001 \
+    --match-event-log /tmp/node1-events.jsonl
+```
+
+每行一个事件，例如
+`{"node_id":1,"event_id":{"log_index":42,"ordinal":0},"kind":"fill","order_sequence":7,"counterparty_sequence":3,"price":100.0,"volume":10.0}`。
+
+文件 sink 只是调试工具：仅写本地文件，不参与复制，也不 fsync，重启后重放日志会把同一批事件再写一遍。
+可靠的清结算分发（复制的事件日志、`/events` 游标读取、幂等提交）设计方案见 `docs/MATCH_RESULTS.md`。
 
 ### 快照配置
 
@@ -382,10 +402,11 @@ gRPC 传输在 `--http-addr` 端口 + 1000 上暴露相同操作（`AppendEntrie
 | `tests/cluster/test_snapshot.rs` | 快照生成、日志 purge，以及学习者通过 gRPC 快照流安装已 purge 的状态 |
 | `tests/cluster/test_storage.rs` | WAL 帧格式、撕裂尾部截断、分段轮转、跨段 truncate/purge、vote/committed 持久化、快照构建/安装/重开、损坏文件拒绝 |
 | `tests/cluster/test_restart.rs` | 完整节点重启后通过日志重放恢复，以及通过快照 + 尾部恢复 KV、订单簿和序列号 |
+| `tests/cluster/test_match_results.rs` | 以 `--match-event-log` 启动的节点按日志顺序记录 rest/fill/cancel 事件，同时 `/write` 响应保持不变 |
 
 所有集成测试都使用唯一的临时数据目录。集群测试固定使用端口 `21001-21003`（gRPC
-`22001-22003`），快照测试使用 `21101-21102`，重启测试使用 `21201-21202`；重跑前请先停止残留进程
-（`pkill -f matchengine-raft`）。
+`22001-22003`），快照测试使用 `21101-21102`，重启测试使用 `21201-21202`，撮合结果测试使用
+`21301`；重跑前请先停止残留进程（`pkill -f matchengine-raft`）。
 
 ## 未来工作
 
@@ -394,7 +415,8 @@ gRPC 传输在 `--http-addr` 端口 + 1000 上暴露相同操作（`AppendEntrie
 - [x] 添加全面测试 —— 存储、快照、集群与重启覆盖
 - [ ] 按 `docs/TRANSPORTS.md` 构建 HTTP/JSON 与 gRPC 的基准测试工具
 - [ ] 为 gRPC 监听器配置 TLS/mTLS
-- [ ] 通过消息队列添加撮合结果分发
+- [x] 撮合结果接入可替换的 `MatchResultSink` —— `fill`/`rested`/`cancelled` 事件带 `(log_index, ordinal)` id，并提供 `--match-event-log` JSONL 文件 sink 用于调试
+- [ ] 将撮合结果可靠地分发给订单/清结算系统 —— `/write` 响应返回事件、带 `/events` 游标读取的复制事件日志、幂等提交；设计见 `docs/MATCH_RESULTS.md`（阶段 1b–3）
 - [ ] 实现更多撮合算法（市价单、整数 tick 价格）
 - [ ] 增强客户端库并添加端到端延迟基准
 

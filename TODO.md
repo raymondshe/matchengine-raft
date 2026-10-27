@@ -65,6 +65,8 @@ vote/committed persistence, snapshot build/install/reopen) and `tests/cluster/te
 - [ ] Add negative tests: write to a follower, unknown-key read, malformed `Place` payload.
 - [ ] `tests/cluster/test_cluster.rs` binds fixed ports 21001-21003 and leaves 3 nodes running after the test finishes; parameterize ports and shut the nodes down.
 - [x] Test restart recovery (both log replay and snapshot boot paths).
+- [x] Test match-result processing: `apply` -> sink events (rest/fill/cancel), failing-sink
+  isolation, file-sink JSONL format, and an end-to-end `--match-event-log` node test.
 
 ## 6. Docs
 
@@ -80,6 +82,8 @@ vote/committed persistence, snapshot build/install/reopen) and `tests/cluster/te
   `ExampleStore`/combined `RaftStorage`/sled description is gone.
 - [x] `docs/AERON_SOLUTION.md` and `docs/TRANSPORTS.md` updated: gRPC is adopted, storage is
   durable, and all remaining performance numbers are labelled as guidance.
+- [x] `docs/MATCH_RESULTS.md` writes down how fills/cancels reach the order/clearing system.
+  Phase 1a of it is implemented; the durable event log and `/events` are still proposals.
 - [ ] Keep `AGENTS.md` and this file in sync after code changes; both are maintained by hand.
 
 ## 7. Scripts
@@ -102,6 +106,12 @@ vote/committed persistence, snapshot build/install/reopen) and `tests/cluster/te
 
 ## 9. Matching engine (from README "Future Work" + found in code)
 
+- [x] Route match results through a replaceable `MatchResultSink` (`MatchEvent` with
+  `(log_index, ordinal)` ids; `Noop`/`Memory`/`File` sinks; `--match-event-log` file log for
+  debugging). `apply` publishes best-effort and never lets a sink failure affect the state machine.
+- [ ] Deliver fills and cancels durably to the order/clearing system: events in the `/write`
+  response, a bounded replicated event log, `/events` cursor reads, and `client_order_id` dedupe.
+  Design: `docs/MATCH_RESULTS.md` (phases 1b–3).
 - [ ] `OrderType::Limit` is hardcoded in `Order::new` (`// TODO: More types` at `src/matchengine/mod.rs:74`); no market orders.
 - [ ] `price`/`volume` are `f64` — money should use integer ticks/decimal.
 - [ ] `impl PartialEq for Order` ignores `id`, so two different orders at the same price/size compare equal.

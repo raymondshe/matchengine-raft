@@ -30,6 +30,13 @@ pub struct Opt {
     /// Prefix of the per-node directory, so independent clusters can share one data dir.
     #[clap(long, env = "RAFT_INSTANCE_PREFIX", default_value = "matchengine")]
     pub instance_prefix: String,
+
+    /// Append every applied match event (fills, rests, cancels) to this JSONL file.
+    ///
+    /// Debugging aid: the file is node-local, not replicated, and replayed entries are
+    /// written again after a restart. Omit to discard match results.
+    #[clap(long, env = "MATCH_EVENT_LOG")]
+    pub match_event_log: Option<PathBuf>,
 }
 
 #[actix_web::main]
@@ -40,7 +47,11 @@ async fn main() -> std::io::Result<()> {
     // Parse the parameters passed by arguments.
     let options = Opt::parse();
 
-    let storage = StorageConfig::new(options.data_dir).with_instance_prefix(options.instance_prefix);
+    let mut storage =
+        StorageConfig::new(options.data_dir).with_instance_prefix(options.instance_prefix);
+    if let Some(path) = options.match_event_log {
+        storage = storage.with_match_event_log(path);
+    }
 
     start_match_engine_node_with_storage(
         options.id,

@@ -19,6 +19,9 @@ use openraft::BasicNode;
 use openraft::Config;
 
 use crate::app::MatchEngineApp;
+use crate::match_result::FileLogSink;
+use crate::match_result::MatchResultSink;
+use crate::match_result::NoopSink;
 use crate::network::api;
 use crate::network::grpc::MAX_MESSAGE_SIZE;
 use crate::network::grpc::pb::raft_service_server::RaftServiceServer;
@@ -36,6 +39,8 @@ pub mod app;
 pub mod client;
 /// Matching engine module with order book implementation.
 pub mod matchengine;
+/// Pluggable processing of the match results (fills, rests, cancels) produced by the state machine.
+pub mod match_result;
 /// Network layer module for HTTP endpoints and Raft RPC.
 pub mod network;
 /// Storage layer module for Raft logs and state machine persistence.
@@ -220,13 +225,23 @@ pub async fn build_match_engine_node(
 
     // Open (or create) the durable log; recovery replays segments and discards a torn tail.
     let log_store = LogStore::open(storage.log_dir(node_id))?;
+    // Match results are computed by `apply`; the sink decides what happens with them. The default
+    // drops them, exactly as before.
+    let match_result_sink: Arc<dyn MatchResultSink> = match &storage.match_event_log {
+        Some(path) => Arc::new(FileLogSink::open(path)?.with_node_id(node_id)),
+        None => Arc::new(NoopSink),
+    };
     // Load the latest snapshot, if any. openraft replays the retained log tail on top of it.
-    let state_machine_store = StateMachineStore::open(storage.snapshot_dir(node_id))?;
+    let state_machine_store = StateMachineStore::open_with_sink(
+        storage.snapshot_dir(node_id),
+        match_result_sink,
+    )?;
 
     tracing::info!(
         node_id,
         log_dir = %log_store.dir().display(),
         snapshot_dir = %state_machine_store.dir().display(),
+        match_result_sink = state_machine_store.match_result_sink().name(),
         "opened persistent storage"
     );
 

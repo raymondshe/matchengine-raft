@@ -238,6 +238,8 @@ src/
 ├── app.rs                   # Application state
 ├── matchengine/
 │   └── mod.rs               # Order book matching engine
+├── match_result/
+│   └── mod.rs               # MatchEvent ids + pluggable MatchResultSink (noop/memory/file)
 ├── network/
 │   ├── api.rs               # Application HTTP endpoints
 │   ├── management.rs        # Admin HTTP endpoints
@@ -264,7 +266,8 @@ tests/
     ├── test_cluster.rs      # 3-node cluster, both transports
     ├── test_snapshot.rs     # Snapshot build/purge + learner install over gRPC
     ├── test_storage.rs      # WAL and snapshot formats
-    └── test_restart.rs      # Restart recovery: log replay and snapshot
+    ├── test_restart.rs      # Restart recovery: log replay and snapshot
+    └── test_match_results.rs # Match events in the JSONL file sink
 ```
 
 ## Storage Implementation
@@ -306,6 +309,24 @@ Each node writes to `<data-dir>/<instance-prefix>-<node-id>/{log,snapshot}`. Con
 
 The equivalent environment variables are `RAFT_DATA_DIR` and `RAFT_INSTANCE_PREFIX`; the defaults
 are `/tmp/matchengine-raft` and `matchengine`.
+
+### Match-result processing
+
+`apply` turns every `MatchResult` into a `MatchEvent` (`fill`, `rested` or `cancelled`) and hands it
+to a pluggable `MatchResultSink` (`src/match_result/mod.rs`). The default sink drops the events, so
+the engine behaves as before. To inspect them, enable the file sink:
+
+```bash
+./target/release/matchengine-raft --id 1 --http-addr 127.0.0.1:21001 \
+    --match-event-log /tmp/node1-events.jsonl
+```
+
+Each line is one event, for example
+`{"node_id":1,"event_id":{"log_index":42,"ordinal":0},"kind":"fill","order_sequence":7,"counterparty_sequence":3,"price":100.0,"volume":10.0}`.
+
+The file sink is a debugging aid: it is node-local, is not replicated or fsynced, and replaying the
+log after a restart writes the replayed events again. The durable clearing feed (a replicated event
+log, `/events` cursor reads and idempotent submission) is designed in `docs/MATCH_RESULTS.md`.
 
 ### Snapshot configuration
 
@@ -402,10 +423,12 @@ ignored; `0` is the conventional placeholder. The field is still required by the
 | `tests/cluster/test_snapshot.rs` | Snapshot creation, log purge, and a learner installing the purged state over the gRPC snapshot stream |
 | `tests/cluster/test_storage.rs` | WAL framing, torn-tail truncation, segment rotation, truncate/purge across segments, vote/committed persistence, snapshot build/install/reopen, corrupt-file rejection |
 | `tests/cluster/test_restart.rs` | Full node restart recovering KV, order book and sequence via WAL replay, and via snapshot + tail |
+| `tests/cluster/test_match_results.rs` | A node started with `--match-event-log` records rest/fill/cancel events in log order while the `/write` response stays unchanged |
 
 Every integration test uses a unique temporary data directory. The cluster test uses fixed ports
-`21001-21003` (gRPC `22001-22003`), the snapshot test `21101-21102`, and the restart test
-`21201-21202`; stop leftover processes (`pkill -f matchengine-raft`) before rerunning.
+`21001-21003` (gRPC `22001-22003`), the snapshot test `21101-21102`, the restart test `21201-21202`
+and the match-result test `21301`; stop leftover processes (`pkill -f matchengine-raft`) before
+rerunning.
 
 ## Future Work
 
@@ -414,7 +437,8 @@ Every integration test uses a unique temporary data directory. The cluster test 
 - [x] Add comprehensive testing — storage, snapshot, cluster and restart coverage
 - [ ] Add the HTTP/JSON vs gRPC benchmark harness described in `docs/TRANSPORTS.md`
 - [ ] Configure TLS/mTLS for the gRPC listener
-- [ ] Add matching result distribution via message queues
+- [x] Route match results through a pluggable `MatchResultSink` — `fill`/`rested`/`cancelled` events with `(log_index, ordinal)` ids, and a `--match-event-log` JSONL file sink for debugging
+- [ ] Deliver match results durably to order/clearing systems — events in the `/write` response, a replicated event log with `/events` cursor reads, and idempotent submission; design in `docs/MATCH_RESULTS.md` (phases 1b–3)
 - [ ] Implement more matching algorithms (market orders, integer tick prices)
 - [ ] Enhance client library and add end-to-end latency benchmarks
 

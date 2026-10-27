@@ -406,6 +406,26 @@ impl OrderBook {
         }
     }
 
+    /// Volume of `order` that is still resting after [`OrderBook::place_order`], if any.
+    ///
+    /// `place_order` does not write the unfilled remainder back into the caller's order, so this
+    /// looks the order up by the key it would have been stored under. `None` means the order was
+    /// either fully filled or never rested. The value is exactly the volume in the book, which
+    /// matters when emitting events: deriving it as `submitted - filled` can differ in the last
+    /// floating-point bit.
+    pub fn resting_volume(&self, order: &Order) -> Option<f64> {
+        match order.side {
+            OrderSide::Buy => self
+                .bids
+                .get(&BidKey { price: order.price, sequence: order.sequence })
+                .map(|resting| resting.volume),
+            OrderSide::Sell => self
+                .asks
+                .get(&AskKey { price: order.price, sequence: order.sequence })
+                .map(|resting| resting.volume),
+        }
+    }
+
     /// Attempts to match a buy (bid) order against the ask side of the book.
     ///
     /// The matching algorithm:
@@ -707,6 +727,30 @@ mod tests {
         assert_eq!(rest.price, 100.22);
         assert!(matches!(rest.side, OrderSide::Sell));
         assert!(matches!(rest.live, OrderType::Limit));
+    }
+
+    /// `resting_volume` is how event emitters learn the unfilled remainder without recomputing it
+    /// from floating-point subtraction.
+    #[test]
+    fn resting_volume_reports_the_stored_remainder() {
+        let mut ob = OrderBook::new();
+        let mut maker = resting_order(OrderSide::Sell, 100.0, 5.0, 1);
+        ob.place_order(&mut maker);
+
+        // Buys 10 against an ask of 5: 5 trades, 5 rests as a bid.
+        let mut taker = resting_order(OrderSide::Buy, 100.0, 10.0, 2);
+        ob.place_order(&mut taker);
+
+        assert_eq!(Some(5.0), ob.resting_volume(&taker));
+
+        // A fully filled taker leaves nothing behind.
+        let mut filled = resting_order(OrderSide::Sell, 100.0, 5.0, 3);
+        ob.place_order(&mut filled);
+        assert_eq!(None, ob.resting_volume(&filled));
+
+        // So does an order that was never placed.
+        let unplaced = resting_order(OrderSide::Buy, 100.0, 1.0, 99);
+        assert_eq!(None, ob.resting_volume(&unplaced));
     }
 
     /// An exact fill must stop matching even when deeper price levels would

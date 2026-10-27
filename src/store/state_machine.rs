@@ -8,6 +8,7 @@
 //! renamed into place, so a crash never leaves a half-written snapshot visible.
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::io;
 use std::io::Cursor;
 use std::path::Path;
@@ -34,6 +35,9 @@ use openraft::storage::RaftStateMachine;
 use serde::Deserialize;
 use serde::Serialize;
 
+use crate::match_result::MatchEvent;
+use crate::match_result::MatchResultSink;
+use crate::match_result::NoopSink;
 use crate::matchengine::Order;
 use crate::matchengine::OrderBook;
 use crate::store::config::sync_dir;
@@ -142,10 +146,13 @@ impl<C: RaftTypeConfig> StateMachineStoreInner<C> {
 ///
 /// This is a newtype wrapper around `Arc<Mutex<StateMachineStoreInner<C>>>` to satisfy
 /// Rust's orphan rules when implementing foreign traits. Clones share the same state.
-#[derive(Debug)]
+///
+/// It also owns the [`MatchResultSink`] this node publishes fills to. The sink is node-local
+/// configuration and never affects the replicated state.
 pub struct StateMachineStore<C: RaftTypeConfig> {
     inner: Arc<Mutex<StateMachineStoreInner<C>>>,
     dir: Arc<PathBuf>,
+    sink: Arc<dyn MatchResultSink>,
 }
 
 impl<C: RaftTypeConfig> Clone for StateMachineStore<C> {
@@ -153,16 +160,41 @@ impl<C: RaftTypeConfig> Clone for StateMachineStore<C> {
         Self {
             inner: self.inner.clone(),
             dir: self.dir.clone(),
+            sink: self.sink.clone(),
         }
+    }
+}
+
+impl<C: RaftTypeConfig> fmt::Debug for StateMachineStore<C> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StateMachineStore")
+            .field("inner", &self.inner)
+            .field("dir", &self.dir)
+            .field("match_result_sink", &self.sink.name())
+            .finish()
     }
 }
 
 impl<C: RaftTypeConfig> StateMachineStore<C> {
     /// Opens the state machine in `dir`, restoring the latest durable snapshot if one exists.
     ///
+    /// Match results are computed and dropped; use [`StateMachineStore::open_with_sink`] to
+    /// observe them.
+    ///
     /// A corrupt snapshot is reported as an error instead of silently starting empty: silently
     /// dropping committed data would be worse than refusing to start.
     pub fn open(dir: impl Into<PathBuf>) -> io::Result<Self> {
+        Self::open_with_sink(dir, Arc::new(NoopSink))
+    }
+
+    /// Like [`StateMachineStore::open`], but publishes match results to `sink`.
+    ///
+    /// The sink is not part of the Raft state: two nodes applying the same log with different
+    /// sinks still end up with identical state machines.
+    pub fn open_with_sink(
+        dir: impl Into<PathBuf>,
+        sink: Arc<dyn MatchResultSink>,
+    ) -> io::Result<Self> {
         let dir = dir.into();
         std::fs::create_dir_all(&dir)?;
 
@@ -182,6 +214,7 @@ impl<C: RaftTypeConfig> StateMachineStore<C> {
         Ok(Self {
             inner: Arc::new(Mutex::new(inner)),
             dir: Arc::new(dir),
+            sink,
         })
     }
 
@@ -192,6 +225,29 @@ impl<C: RaftTypeConfig> StateMachineStore<C> {
 
     pub fn inner(&self) -> &Arc<Mutex<StateMachineStoreInner<C>>> {
         &self.inner
+    }
+
+    /// The sink this store publishes match results to.
+    pub fn match_result_sink(&self) -> &Arc<dyn MatchResultSink> {
+        &self.sink
+    }
+
+    /// Publishes one entry's events, logging (but swallowing) sink failures.
+    ///
+    /// Failure must never fail `apply`: replicas that cannot reach their sink have to keep
+    /// converging with replicas that can.
+    fn publish_match_events(&self, events: &[MatchEvent]) {
+        if events.is_empty() {
+            return;
+        }
+        if let Err(e) = self.sink.publish(events) {
+            tracing::warn!(
+                sink = self.sink.name(),
+                events = events.len(),
+                error = %e,
+                "match result sink failed; the state machine is unaffected"
+            );
+        }
     }
 }
 
@@ -288,6 +344,9 @@ where
 
             inner.last_applied_log = Some(entry.log_id.clone());
 
+            // Application code below stays deterministic: events are derived from the entry
+            // alone, and publishing them is best-effort (a sink failure is logged, never
+            // propagated) so replicas with different sinks still converge.
             let response = match &entry.payload {
                 EntryPayload::Blank => MatchEngineResponse::none(),
                 EntryPayload::Normal(req) => match req {
@@ -302,7 +361,18 @@ where
                         order,
                     } => {
                         let mut o = *order;
-                        let _mr = inner.orderbook.place_order(&mut o);
+                        let matches = inner.orderbook.place_order(&mut o);
+                        // The remainder is read back from the book because `place_order` only
+                        // writes the sequence back into the caller's order.
+                        let resting_volume = inner.orderbook.resting_volume(&o);
+                        let events = MatchEvent::for_place(
+                            entry.log_id.index,
+                            &o,
+                            &matches,
+                            resting_volume,
+                        );
+                        self.publish_match_events(&events);
+
                         MatchEngineResponse {
                             value: Some(o.sequence.to_string()),
                         }
@@ -310,7 +380,12 @@ where
                     MatchEngineRequest::Cancel {
                         order,
                     } => {
-                        let _o = inner.orderbook.cancel(order);
+                        if let Some(cancelled) = inner.orderbook.cancel(order) {
+                            self.publish_match_events(&[MatchEvent::for_cancel(
+                                entry.log_id.index,
+                                &cancelled,
+                            )]);
+                        }
                         MatchEngineResponse::none()
                     }
                 },
@@ -497,6 +572,138 @@ mod tests {
 
         let err = StateMachineStore::<MatchEngineTypeConfig>::open(dir.path()).unwrap_err();
         assert_eq!(io::ErrorKind::InvalidData, err.kind());
+    }
+
+    /// Applies real entries so the sink wiring is covered, not just event construction.
+    #[tokio::test]
+    async fn apply_publishes_rests_fills_and_cancels_to_the_sink() {
+        use crate::match_result::MatchEventKind;
+        use crate::match_result::MemorySink;
+        use crate::matchengine::Order;
+        use crate::matchengine::OrderSide;
+        use openraft::alias::EntryOf;
+        use openraft::alias::EntryPayloadOf;
+
+        fn entry(index: u64, payload: EntryPayloadOf<MatchEngineTypeConfig>) -> EntryOf<MatchEngineTypeConfig> {
+            Entry {
+                log_id: log_id(1, index),
+                payload,
+            }
+        }
+
+        let dir = tempdir();
+        let sink = Arc::new(MemorySink::new());
+        let mut store =
+            StateMachineStore::<MatchEngineTypeConfig>::open_with_sink(dir.path(), sink.clone()).unwrap();
+
+        // A sell of 5 rests, then a buy of 8 crosses it: 5 fills and 3 rest as a bid.
+        let entries = futures::stream::iter(vec![
+            Ok((
+                entry(1, EntryPayload::Normal(MatchEngineRequest::Place {
+                    order: Order::new(OrderSide::Sell, 100.0, 5.0, 0),
+                })),
+                None,
+            )),
+            Ok((
+                entry(2, EntryPayload::Normal(MatchEngineRequest::Place {
+                    order: Order::new(OrderSide::Buy, 100.0, 8.0, 0),
+                })),
+                None,
+            )),
+        ]);
+        store.apply(entries).await.unwrap();
+
+        let events = sink.events();
+        assert_eq!(3, events.len(), "expected rested, fill, rested: {events:?}");
+
+        assert_eq!(MatchEventKind::Rested, events[0].kind);
+        assert_eq!(0, events[0].order_sequence);
+        assert_eq!(5.0, events[0].volume);
+        assert_eq!(1, events[0].event_id.log_index);
+
+        assert_eq!(MatchEventKind::Fill, events[1].kind);
+        assert_eq!(1, events[1].order_sequence);
+        assert_eq!(Some(0), events[1].counterparty_sequence);
+        assert_eq!(100.0, events[1].price);
+        assert_eq!(5.0, events[1].volume);
+        assert_eq!(2, events[1].event_id.log_index);
+        assert_eq!(0, events[1].event_id.ordinal);
+
+        assert_eq!(MatchEventKind::Rested, events[2].kind);
+        assert_eq!(1, events[2].order_sequence);
+        assert_eq!(3.0, events[2].volume);
+        assert_eq!(2, events[2].event_id.log_index);
+        assert_eq!(1, events[2].event_id.ordinal);
+
+        // Cancelling the 3 that rested reports the remaining volume from the book.
+        let entries = futures::stream::iter(vec![Ok((
+            entry(3, EntryPayload::Normal(MatchEngineRequest::Cancel {
+                order: Order::new(OrderSide::Buy, 100.0, 3.0, 1),
+            })),
+            None,
+        ))]);
+        store.apply(entries).await.unwrap();
+
+        let events = sink.events();
+        assert_eq!(4, events.len());
+        let cancelled = &events[3];
+        assert_eq!(MatchEventKind::Cancelled, cancelled.kind);
+        assert_eq!(1, cancelled.order_sequence);
+        assert_eq!(3.0, cancelled.volume);
+        assert_eq!(3, cancelled.event_id.log_index);
+
+        // A cancel of something that is not in the book publishes nothing.
+        let entries = futures::stream::iter(vec![Ok((
+            entry(4, EntryPayload::Normal(MatchEngineRequest::Cancel {
+                order: Order::new(OrderSide::Buy, 100.0, 3.0, 1),
+            })),
+            None,
+        ))]);
+        store.apply(entries).await.unwrap();
+        assert_eq!(4, sink.len());
+    }
+
+    /// A failing sink must not fail `apply` or change the resulting state.
+    #[tokio::test]
+    async fn sink_failure_does_not_fail_apply() {
+        use crate::match_result::MatchResultSink;
+        use crate::matchengine::Order;
+        use crate::matchengine::OrderSide;
+        use openraft::alias::EntryOf;
+
+        #[derive(Debug)]
+        struct FailingSink;
+
+        impl MatchResultSink for FailingSink {
+            fn name(&self) -> &'static str {
+                "failing"
+            }
+
+            fn publish(&self, _events: &[crate::match_result::MatchEvent]) -> io::Result<()> {
+                Err(io::Error::other("sink is down"))
+            }
+        }
+
+        let dir = tempdir();
+        let mut store = StateMachineStore::<MatchEngineTypeConfig>::open_with_sink(
+            dir.path(),
+            Arc::new(FailingSink),
+        )
+        .unwrap();
+
+        let entry = EntryOf::<MatchEngineTypeConfig> {
+            log_id: log_id(1, 1),
+            payload: EntryPayload::Normal(MatchEngineRequest::Place {
+                order: Order::new(OrderSide::Buy, 100.0, 1.0, 0),
+            }),
+        };
+        let entries = futures::stream::iter(vec![Ok((entry, None))]);
+
+        store.apply(entries).await.unwrap();
+
+        let inner = store.inner().lock().await;
+        assert_eq!(1.0, inner.orderbook.best_bid().unwrap().volume);
+        assert_eq!(Some(log_id(1, 1)), inner.last_applied_log);
     }
 
     struct TempDir(PathBuf);

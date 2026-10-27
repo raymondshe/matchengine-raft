@@ -7,10 +7,12 @@ Single-crate Rust project (edition 2024): a Raft-replicated KV store + order-boo
 - Build and run one node: `cargo run --bin matchengine-raft -- --id 1 --http-addr 127.0.0.1:21001 --transport grpc`
   - `--transport` is `grpc` (default) or `http`; it selects **outbound** Raft RPC only. The node always serves both the HTTP API on `--http-addr` and gRPC on the same host at `port + 1000`.
   - `--data-dir` (env `RAFT_DATA_DIR`, default `/tmp/matchengine-raft`) and `--instance-prefix` (env `RAFT_INSTANCE_PREFIX`, default `matchengine`) place durable state in `<data-dir>/<prefix>-<id>/{log,snapshot}`.
+  - `--match-event-log <file>` (env `MATCH_EVENT_LOG`) appends every applied fill/rest/cancel to a JSONL file. Debug aid only: node-local, not replicated, duplicates lines when the log is replayed after a restart.
 - `cargo test` runs everything (a single integration target, `cluster`, ~10s once built). Focus it with `cargo test --test cluster`.
   - `MATCHENGINE_TEST_TRANSPORT=http cargo test --test cluster` runs the cluster suite over the legacy HTTP/JSON transport.
   - `tests/cluster/test_snapshot.rs` forces a snapshot, purges the log, and checks that a joining learner installs the snapshot over gRPC.
   - `tests/cluster/test_storage.rs` covers the WAL and snapshot formats directly; `tests/cluster/test_restart.rs` boots a node, stops it, and proves recovery via log replay and via snapshot.
+  - `tests/cluster/test_match_results.rs` boots a node with the file sink and checks rest/fill/cancel events in log order (port 21301, gRPC 22301).
   - Every integration test allocates a unique temp data dir (`tests/cluster/common.rs`); never point tests at the default `/tmp/matchengine-raft` or a second run will inherit the first run's membership.
 - First build is a normal crates.io download + compile; `openraft` 0.10.0-alpha.37 is a regular version dependency (it used to be a git pin, which cost ~7 min of checkout/build). The build script vendors `protoc` via `protoc-bin-vendored`, so no system protobuf compiler is needed.
 - Cluster walkthrough over HTTP: `./test-cluster.sh` (builds, starts 3 nodes, initialises with `-d '[]'`, writes/reads). It uses `/tmp/matchengine-raft-test-cluster` and clears it on start unless `RAFT_DATA_DIR` is set. `./open-cluster.sh` starts the same cluster in `/tmp/matchengine-raft-open-cluster` and leaves it running.
@@ -20,6 +22,7 @@ Single-crate Rust project (edition 2024): a Raft-replicated KV store + order-boo
 ## Where things are wired
 
 - `build_match_engine_node()` in `src/lib.rs` is the only composition point: it opens `LogStore`/`StateMachineStore` from a `StorageConfig`, creates the Raft config, `TransportNetworkFactory`, binds the gRPC listener, starts the tonic server and registers every actix route. It returns a `MatchEngineNode` whose `run()` waits for shutdown and whose `shutdown()` stops HTTP, gRPC and Raft cleanly (needed before reopening the same storage).
+- Match-result processing is pluggable: `src/match_result/mod.rs` defines `MatchEvent`/`EventId` and the `MatchResultSink` trait (`NoopSink`, `MemorySink`, `FileLogSink`). `build_match_engine_node` installs `NoopSink`, or a `FileLogSink` when `StorageConfig::match_event_log` is set, via `StateMachineStore::open_with_sink`. `apply` derives events from the entry alone and publishes them through `publish_match_events`; sink errors are logged and never fail the apply.
 - `start_match_engine_node_with_transport()`, `start_match_engine_node_with_config()` and `start_match_engine_node_with_storage()` are thin build+run wrappers for the binary, tests and benchmarks.
 - Actual HTTP routes: `/init`, `/add-learner`, `/change-membership`, `GET /metrics`, `/get_linearizer`, `/write`, `/read`, `/linearizable_read`, `/follower_read`, and Raft RPC `/vote`, `/append`, `/snapshot`. There is no `/raft-append`, `/raft-vote`, `/raft-snapshot` or `/consistent_read`.
 - gRPC Raft service (`proto/raft.proto`, `src/network/grpc/`): `AppendEntries`, `Vote`, `InstallSnapshot` (client-streaming chunks), `AppendStream` (bidirectional, used by `stream_append`). Envelopes are protobuf; payloads are `postcard`-encoded openraft types.
@@ -46,7 +49,7 @@ Single-crate Rust project (edition 2024): a Raft-replicated KV store + order-boo
 
 ## Test gotchas
 
-- `tests/cluster/test_cluster.rs` boots 3 nodes in threads on fixed ports 127.0.0.1:21001-21003 (gRPC 22001-22003) and never shuts them down. `test_snapshot.rs` uses 21101-21102 (gRPC 22101-22102); `test_restart.rs` uses 21201 and 21202 (gRPC 22201-22202) and does shut its nodes down. Kill leftovers (`./test.sh kill`, i.e. `pkill -f matchengine-raft`) before rerunning or the bind fails.
+- `tests/cluster/test_cluster.rs` boots 3 nodes in threads on fixed ports 127.0.0.1:21001-21003 (gRPC 22001-22003) and never shuts them down. `test_snapshot.rs` uses 21101-21102 (gRPC 22101-22102); `test_restart.rs` uses 21201 and 21202 (gRPC 22201-22202); `test_match_results.rs` uses 21301 (gRPC 22301) and shuts its node down. Kill leftovers (`./test.sh kill`, i.e. `pkill -f matchengine-raft`) before rerunning or the bind fails.
 - `test_snapshot.rs` polls `metrics().current_leader` after `init`; without that wait the first write can race the election and fail with `NotLeader`.
 - The cluster test asserts an exact `LinearizableReadError` message string naming node 1; changing error formatting breaks it.
 - The snapshot test depends on `snapshot_policy = LogsSinceLast(10)` and `max_in_snapshot_log_to_keep = 0`: the learner must join after the covered log has been purged, otherwise it catches up by log replication and the test proves nothing.
@@ -59,6 +62,9 @@ Single-crate Rust project (edition 2024): a Raft-replicated KV store + order-boo
   tests: `exact_fill_*`, `partial_fill_preserves_maker_identity` in `src/matchengine/mod.rs`.
 - `Order` deserializes `sequence`; the scripts now send `sequence` too. `Order::sequence` is still
   required by the deserializer even though `place_order()` overwrites it.
+- Match results leave `apply` as `MatchEvent`s through a `MatchResultSink`. `EventId` is
+  `(log_index, ordinal)`, so no event counter is stored in snapshots; `OrderBook::resting_volume`
+  is the authoritative source for a `Rested` event's volume (do not derive it by subtraction).
 - `/read` special keys: `orderbook_orders`, and `orderbook_sequence` (misspelled variant `orderbook_sequance` also accepted).
 
 ## Docs vs code
@@ -68,3 +74,8 @@ Single-crate Rust project (edition 2024): a Raft-replicated KV store + order-boo
 - `docs/AERON_SOLUTION.md` and `docs/TRANSPORTS.md` are investigation documents: gRPC via `tonic`
   is implemented (`src/network/grpc/`) and is the default, HTTP remains selectable, and no transport
   benchmark exists. Read `docs/TRANSPORTS.md`'s status banner before treating its numbers as results.
+- `docs/MATCH_RESULTS.md` describes match-result delivery. Phase 1a is implemented: `apply`
+  publishes `Fill`/`Rested`/`Cancelled` events to a `MatchResultSink`, and `--match-event-log`
+  installs a file sink for debugging. Still proposals: events in the `/write` response, the
+  replicated event log, `/events` and `client_order_id` dedupe. Do not describe those as existing
+  behaviour.
