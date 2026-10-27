@@ -2,9 +2,9 @@
 
 //! Match Engine Raft
 //!
-//! A practical implementation of a distributed key-value store and matching engine
-//! built upon OpenRaft. This crate provides all the components needed to run a
-//! Raft-based distributed system with a matching engine as the state machine.
+//! A practical implementation of a distributed matching engine built upon OpenRaft.
+//! This crate provides all the components needed to run a Raft-based distributed
+//! system with an order-book matching engine as the state machine.
 
 use std::sync::Arc;
 use std::time::Duration;

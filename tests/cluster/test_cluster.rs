@@ -7,6 +7,8 @@ use std::time::Duration;
 use matchengine_raft::StorageConfig;
 use matchengine_raft::client::MatchEngineClient;
 use matchengine_raft::default_raft_config;
+use matchengine_raft::matchengine::Order;
+use matchengine_raft::matchengine::OrderSide;
 use matchengine_raft::start_match_engine_node_with_storage;
 use matchengine_raft::store::MatchEngineRequest;
 use matchengine_raft::MatchEngineTypeConfig;
@@ -172,13 +174,13 @@ async fn test_cluster_inner() -> anyhow::Result<()> {
 
     // --- Try to write some application data through the leader.
 
-    println!("=== write `foo=bar`");
-    client
-        .write(&MatchEngineRequest::Set {
-            key: "foo".to_string(),
-            value: "bar".to_string(),
+    println!("=== write a resting buy order");
+    let response = client
+        .write(&MatchEngineRequest::Place {
+            order: Order::new(OrderSide::Buy, 100.0, 10.0, 0),
         })
         .await??;
+    assert_eq!(Some("0".to_string()), response.data.value);
 
     // --- Wait for a while to let the replication get done.
 
@@ -186,54 +188,48 @@ async fn test_cluster_inner() -> anyhow::Result<()> {
 
     // --- Read it on every node.
 
-    println!("=== read `foo` on node 1");
-    let x = client.read(&("foo".to_string())).await?;
-    assert_eq!("bar", x);
+    println!("=== read `orderbook_sequence` on node 1");
+    assert_eq!("1", client.read(&"orderbook_sequence".to_string()).await?);
 
-    println!("=== read `foo` on node 2");
+    println!("=== read `orderbook_sequence` on node 2");
     let client2 = MatchEngineClient::<MatchEngineTypeConfig>::new(2, get_addr(2)?);
-    let x = client2.read(&("foo".to_string())).await?;
-    assert_eq!("bar", x);
+    assert_eq!("1", client2.read(&"orderbook_sequence".to_string()).await?);
 
-    println!("=== read `foo` on node 3");
+    println!("=== read `orderbook_sequence` on node 3");
     let client3 = MatchEngineClient::<MatchEngineTypeConfig>::new(3, get_addr(3)?);
-    let x = client3.read(&("foo".to_string())).await?;
-    assert_eq!("bar", x);
+    assert_eq!("1", client3.read(&"orderbook_sequence".to_string()).await?);
 
-    // --- A write to non-leader will be automatically forwarded to a known leader
+    // --- A write to non-leader will be automatically forwarded to a known leader.
+    //     The sell crosses the resting bid, so it also proves matching replicated.
 
-    println!("=== read `foo` on node 2");
-    client2
-        .write(&MatchEngineRequest::Set {
-            key: "foo".to_string(),
-            value: "wow".to_string(),
+    println!("=== write a crossing sell to node 2");
+    let response = client2
+        .write(&MatchEngineRequest::Place {
+            order: Order::new(OrderSide::Sell, 100.0, 4.0, 0),
         })
         .await??;
+    assert_eq!(Some("1".to_string()), response.data.value);
 
     MatchEngineTypeConfig::sleep(Duration::from_millis(1_000)).await;
 
-    // --- Read it on every node.
+    // --- The book holds the 6 that did not trade, on every node.
 
-    println!("=== read `foo` on node 1");
-    let x = client.read(&("foo".to_string())).await?;
-    assert_eq!("wow", x);
+    for (name, node_client) in [("node 1", &client), ("node 2", &client2), ("node 3", &client3)] {
+        println!("=== read `orderbook_orders` on {name}");
+        let orders: Vec<Order> = serde_json::from_str(&node_client.read(&"orderbook_orders".to_string()).await?)?;
+        assert_eq!(1, orders.len(), "unexpected book on {name}: {orders:?}");
+        assert_eq!(6.0, orders[0].volume);
+    }
 
-    println!("=== read `foo` on node 2");
+    println!("=== linearizable_read `orderbook_sequence` on node 1");
+    assert_eq!("2", client.linearizable_read(&"orderbook_sequence".to_string()).await??);
+
+    // A fresh client bound to node 2: the previous one learned the leader while forwarding,
+    // and this assertion is about what the follower itself answers.
     let client2 = MatchEngineClient::<MatchEngineTypeConfig>::new(2, get_addr(2)?);
-    let x = client2.read(&("foo".to_string())).await?;
-    assert_eq!("wow", x);
 
-    println!("=== read `foo` on node 3");
-    let client3 = MatchEngineClient::<MatchEngineTypeConfig>::new(3, get_addr(3)?);
-    let x = client3.read(&("foo".to_string())).await?;
-    assert_eq!("wow", x);
-
-    println!("=== linearizable_read `foo` on node 1");
-    let x = client.linearizable_read(&("foo".to_string())).await??;
-    assert_eq!("wow", x);
-
-    println!("=== linearizable_read `foo` on node 2 MUST return LinearizableReadError");
-    let x = client2.linearizable_read(&("foo".to_string())).await?;
+    println!("=== linearizable_read `orderbook_sequence` on node 2 MUST return LinearizableReadError");
+    let x = client2.linearizable_read(&"orderbook_sequence".to_string()).await?;
     match x {
         Err(e) => {
             let s = e.to_string();
@@ -256,16 +252,15 @@ async fn test_cluster_inner() -> anyhow::Result<()> {
     let x = client.metrics().await?;
     assert_eq!(&vec![btreeset![3]], x.membership_config.membership().get_joint_config());
 
-    println!("=== write `foo=zoo` to node-3");
+    println!("=== write a resting buy to node-3");
     client3
-        .write(&MatchEngineRequest::Set {
-            key: "foo".to_string(),
-            value: "zoo".to_string(),
+        .write(&MatchEngineRequest::Place {
+            order: Order::new(OrderSide::Buy, 99.0, 1.0, 0),
         })
         .await??;
 
-    println!("=== read `foo=zoo` to node-3");
-    let got = client3.read(&"foo".to_string()).await?;
-    assert_eq!("zoo", got);
+    println!("=== read `orderbook_orders` on node-3");
+    let orders: Vec<Order> = serde_json::from_str(&client3.read(&"orderbook_orders".to_string()).await?)?;
+    assert_eq!(2, orders.len(), "the shrunk cluster lost an order: {orders:?}");
     Ok(())
 }

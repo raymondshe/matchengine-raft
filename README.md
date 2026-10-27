@@ -32,12 +32,13 @@ This project extends the [example-raft-kv](https://github.com/datafuselabs/openr
 
 ```
                     ┌─────────────────────────────────────────┐
-                    │           Application Layer              │
-                    │  (KV Store + Order Book Matching Engine)│
+                    │           Application Layer             │
+                    │      (Order Book Matching Engine)       │
+                    │ apply ──► MatchEvent ──► Sink (plugin)  │
                     └─────────────────────┬───────────────────┘
                                           │
                     ┌─────────────────────▼───────────────────┐
-                    │           OpenRaft Core                  │
+                    │           OpenRaft Core                 │
                     │  (Consensus, Replication, Leadership)   │
                     └─────────────────────┬───────────────────┘
                                           │
@@ -99,9 +100,9 @@ The easiest way to see the cluster in action is to run the provided test script:
 ```
 
 This script builds, starts a 3-node cluster on `127.0.0.1:21001-21003` (gRPC Raft on
-`22001-22003`), initializes it, adds learners, changes membership, and writes/reads data. It uses
-only `curl` against the HTTP API, showing the request/response flow. It stores state in
-`/tmp/matchengine-raft-test-cluster` and clears that directory on start, so reruns are
+`22001-22003`), initializes it, adds learners, changes membership, and places an order and reads the
+book back. It uses only `curl` against the HTTP API, showing the request/response flow. It stores
+state in `/tmp/matchengine-raft-test-cluster` and clears that directory on start, so reruns are
 reproducible; set `RAFT_DATA_DIR` to keep state somewhere else.
 
 ### Using the Rust Tests
@@ -176,25 +177,25 @@ curl -X POST -H "Content-Type: application/json" \
   http://127.0.0.1:21001/change-membership
 ```
 
-#### 5. Write and Read Data
+#### 5. Write and Read Orders
 
-Write data:
+Place an order:
 
 ```shell
 curl -X POST -H "Content-Type: application/json" \
-  -d '{"Set":{"key":"foo","value":"bar"}}' \
+  -d '{"Place":{"order":{"live":"Limit","side":"Buy","price":4000.0,"volume":4.4,"id":1,"sequence":0}}}' \
   http://127.0.0.1:21001/write
 ```
 
-Read data from any node:
+Read the order book from any node:
 
 ```shell
 curl -X POST -H "Content-Type: application/json" \
-  -d '"foo"' \
+  -d '"orderbook_orders"' \
   http://127.0.0.1:21002/read
 ```
 
-You should be able to read the data from any node!
+You should be able to see the order from any node!
 
 ### Using the Helper Script
 
@@ -293,8 +294,8 @@ avoiding a second fsync per batch.
 
 ### Snapshots (`src/store/state_machine.rs`)
 
-The state machine (KV map + order book + sequence counter) stays in memory so applying entries is
-fast. Snapshots are written as `snapshot/current.snap` (magic + version + CRC32 + postcard metadata
+The state machine (order book + sequence counter) stays in memory so applying entries is fast.
+Snapshots are written as `snapshot/current.snap` (magic + version + CRC32 + postcard metadata
 + postcard state) using the same atomic temp-file/rename protocol. `install_snapshot` validates the
 incoming bytes before replacing the durable copy, so a bad snapshot cannot destroy a good one.
 
@@ -313,8 +314,29 @@ are `/tmp/matchengine-raft` and `matchengine`.
 ### Match-result processing
 
 `apply` turns every `MatchResult` into a `MatchEvent` (`fill`, `rested` or `cancelled`) and hands it
-to a pluggable `MatchResultSink` (`src/match_result/mod.rs`). The default sink drops the events, so
-the engine behaves as before. To inspect them, enable the file sink:
+to a pluggable `MatchResultSink` (`src/match_result/mod.rs`). Events are derived from the applied log
+entry alone, so every replica produces the same ids; the sink itself is node-local and never
+influences the replicated state:
+
+```
+POST /write { Place | Cancel }
+        │
+        ▼
+  StateMachineStore::apply  (every replica)
+        │
+        ├──► order book + sequence ──► snapshot        [replicated state]
+        │
+        └──► MatchEvent  (fill | rested | cancelled)   [id = log position]
+                    │
+                    ▼
+          MatchResultSink                              [node-local, best effort]
+            ├── NoopSink      default: events dropped
+            ├── FileLogSink   --match-event-log -> JSONL
+            └── (future)      replicated event log + /events cursor
+```
+
+The default sink drops the events, so the engine behaves as before. To inspect them, enable the
+file sink:
 
 ```bash
 ./target/release/matchengine-raft --id 1 --http-addr 127.0.0.1:21001 \
@@ -348,11 +370,11 @@ config.max_in_snapshot_log_to_keep = 0; // purge everything the snapshot covers
 
 On startup the node:
 1. Recovers the WAL index, vote and purge marker (discarding a torn tail).
-2. Loads `snapshot/current.snap` if it exists and rebuilds the order book and KV map.
+2. Loads `snapshot/current.snap` if it exists and rebuilds the order book.
 3. Lets openraft replay the retained log tail on top of the restored state.
 
-A single-node cluster therefore comes back with all committed KV writes, live orders and its
-sequence counter, whether recovery is pure log replay or snapshot + tail. Both paths are covered by
+A single-node cluster therefore comes back with all live orders and its sequence counter, whether
+recovery is pure log replay or snapshot + tail. Both paths are covered by
 `tests/cluster/test_restart.rs`.
 
 ## Cluster Management
@@ -392,13 +414,13 @@ The gRPC transport exposes the same operations on `--http-addr` port + 1000
 
 ### Application APIs
 
-- `POST /write` - Submit a `Set`, `Place` or `Cancel` request through Raft
+- `POST /write` - Submit a `Place` or `Cancel` request through Raft
 - `POST /read` - Read from the local state machine (may be stale)
 - `POST /linearizable_read` - Linearizable read; the request must reach the leader
 - `POST /follower_read` - Linearizable read served locally after fetching a linearizer from the leader
 
-`/read`, `/linearizable_read` and `/follower_read` accept a JSON string key. Besides ordinary KV
-keys, the state machine exposes:
+`/read`, `/linearizable_read` and `/follower_read` accept a JSON string key naming a view of the
+order book:
 
 - `orderbook_orders` - all live orders as a JSON array
 - `orderbook_sequence` - the order sequence counter (`orderbook_sequance` is accepted as a legacy
@@ -422,7 +444,7 @@ ignored; `0` is the conventional placeholder. The field is still required by the
 | `tests/cluster/test_cluster.rs` | 3-node cluster: init, learner, membership, write/read, linearizable read, leader forwarding, membership shrink; runs over gRPC by default and HTTP with `MATCHENGINE_TEST_TRANSPORT=http` |
 | `tests/cluster/test_snapshot.rs` | Snapshot creation, log purge, and a learner installing the purged state over the gRPC snapshot stream |
 | `tests/cluster/test_storage.rs` | WAL framing, torn-tail truncation, segment rotation, truncate/purge across segments, vote/committed persistence, snapshot build/install/reopen, corrupt-file rejection |
-| `tests/cluster/test_restart.rs` | Full node restart recovering KV, order book and sequence via WAL replay, and via snapshot + tail |
+| `tests/cluster/test_restart.rs` | Full node restart recovering the order book and sequence via WAL replay, and via snapshot + tail |
 | `tests/cluster/test_match_results.rs` | A node started with `--match-event-log` records rest/fill/cancel events in log order while the `/write` response stays unchanged |
 
 Every integration test uses a unique temporary data directory. The cluster test uses fixed ports

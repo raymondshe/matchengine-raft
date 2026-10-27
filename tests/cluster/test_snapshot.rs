@@ -7,6 +7,8 @@ use matchengine_raft::StorageConfig;
 use matchengine_raft::Transport;
 use matchengine_raft::client::MatchEngineClient;
 use matchengine_raft::default_raft_config;
+use matchengine_raft::matchengine::Order;
+use matchengine_raft::matchengine::OrderSide;
 use matchengine_raft::start_match_engine_node_with_storage;
 use matchengine_raft::store::MatchEngineRequest;
 use openraft::SnapshotPolicy;
@@ -90,11 +92,12 @@ async fn test_grpc_snapshot_install_inner() -> anyhow::Result<()> {
         MatchEngineTypeConfig::sleep(Duration::from_millis(50)).await;
     }
 
+    // 30 resting orders give the snapshot policy enough log entries to trigger.
+    // Prices are distinct so nothing crosses and every order stays in the book.
     for i in 0..30 {
         client1
-            .write(&MatchEngineRequest::Set {
-                key: format!("k{i}"),
-                value: format!("v{i}"),
+            .write(&MatchEngineRequest::Place {
+                order: Order::new(OrderSide::Buy, 100.0 - f64::from(i), 1.0, 0),
             })
             .await??;
     }
@@ -129,8 +132,8 @@ async fn test_grpc_snapshot_install_inner() -> anyhow::Result<()> {
     let client2 = MatchEngineClient::<MatchEngineTypeConfig>::new(2, "127.0.0.1:21102".to_string());
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        if let Ok(value) = client2.read(&"k29".to_string()).await
-            && value == "v29"
+        if let Ok(value) = client2.read(&"orderbook_sequence".to_string()).await
+            && value == "30"
         {
             break;
         }
@@ -141,6 +144,10 @@ async fn test_grpc_snapshot_install_inner() -> anyhow::Result<()> {
 
         MatchEngineTypeConfig::sleep(Duration::from_millis(100)).await;
     }
+
+    // The snapshot, not log replay, carried the book: all 30 orders are present.
+    let orders: Vec<Order> = serde_json::from_str(&client2.read(&"orderbook_orders".to_string()).await?)?;
+    assert_eq!(30, orders.len());
 
     Ok(())
 }

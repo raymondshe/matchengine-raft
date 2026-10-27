@@ -1,9 +1,9 @@
 //! Full-node restart recovery tests.
 //!
-//! Each test boots a single-node cluster on its own port, writes data, stops the
+//! Each test boots a single-node cluster on its own port, places orders, stops the
 //! node through [`MatchEngineNode::shutdown`], then builds a new node on the same
-//! storage directory and verifies that the KV state, the order book and the
-//! sequence counter came back.
+//! storage directory and verifies that the order book and the sequence counter came
+//! back.
 
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
@@ -87,17 +87,7 @@ fn make_client(addr: &str) -> MatchEngineClient<C> {
     MatchEngineClient::<C>::new(1, addr.to_string())
 }
 
-async fn write_kv(client: &MatchEngineClient<C>, key: &str, value: &str) -> anyhow::Result<()> {
-    client
-        .write(&MatchEngineRequest::Set {
-            key: key.to_string(),
-            value: value.to_string(),
-        })
-        .await??;
-    Ok(())
-}
-
-/// Writes three non-crossing orders so the book keeps all of them and the
+/// Places three non-crossing orders so the book keeps all of them and the
 /// sequence counter advances deterministically.
 async fn place_orders(client: &MatchEngineClient<C>) -> anyhow::Result<()> {
     let orders = [
@@ -113,18 +103,35 @@ async fn place_orders(client: &MatchEngineClient<C>) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn assert_application_state(client: &MatchEngineClient<C>) -> anyhow::Result<()> {
-    for (key, value) in [("alpha", "one"), ("beta", "two"), ("gamma", "three")] {
-        let got = client.read(&key.to_string()).await?;
-        assert_eq!(value, got, "key {key} lost across restart");
+/// Places `count` resting asks at distinct prices above every bid the tests use,
+/// purely to generate log entries (the snapshot test needs more entries than the
+/// snapshot policy threshold).
+async fn place_resting_orders(client: &MatchEngineClient<C>, count: u64) -> anyhow::Result<()> {
+    for i in 0..count {
+        client
+            .write(&MatchEngineRequest::Place {
+                order: Order::new(OrderSide::Sell, 100.0 + i as f64, 1.0, 0),
+            })
+            .await??;
     }
+    Ok(())
+}
 
+async fn assert_order_state(
+    client: &MatchEngineClient<C>,
+    expected_orders: usize,
+    expected_sequence: &str,
+) -> anyhow::Result<()> {
     let orders_json = client.read(&"orderbook_orders".to_string()).await?;
     let orders: Vec<Order> = serde_json::from_str(&orders_json)?;
-    assert_eq!(3, orders.len(), "order book lost orders across restart: {orders_json}");
+    assert_eq!(
+        expected_orders,
+        orders.len(),
+        "order book lost orders across restart: {orders_json}"
+    );
 
     let sequence = client.read(&"orderbook_sequence".to_string()).await?;
-    assert_eq!("3", sequence, "sequence counter not recovered");
+    assert_eq!(expected_sequence, sequence, "sequence counter not recovered");
     Ok(())
 }
 
@@ -145,11 +152,8 @@ fn restart_recovers_from_log_replay() {
         client.init().await.unwrap().unwrap();
         wait_for_leader(&client).await.unwrap();
 
-        write_kv(&client, "alpha", "one").await.unwrap();
-        write_kv(&client, "beta", "two").await.unwrap();
-        write_kv(&client, "gamma", "three").await.unwrap();
         place_orders(&client).await.unwrap();
-        assert_application_state(&client).await.unwrap();
+        assert_order_state(&client, 3, "3").await.unwrap();
 
         node.shutdown().await.unwrap();
 
@@ -162,11 +166,22 @@ fn restart_recovers_from_log_replay() {
         let node = start(addr, &storage, config).await.unwrap();
         let client = make_client(addr);
         wait_for_leader(&client).await.unwrap();
-        assert_application_state(&client).await.unwrap();
+        assert_order_state(&client, 3, "3").await.unwrap();
 
         // The recovered node is still writable.
-        write_kv(&client, "delta", "four").await.unwrap();
-        assert_eq!("four", client.read(&"delta".to_string()).await.unwrap());
+        client
+            .write(&MatchEngineRequest::Place {
+                order: Order::new(OrderSide::Buy, 8.0, 1.0, 0),
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!("4", client.read(&"orderbook_sequence".to_string()).await.unwrap());
+        let orders: Vec<Order> = serde_json::from_str(
+            &client.read(&"orderbook_orders".to_string()).await.unwrap(),
+        )
+        .unwrap();
+        assert_eq!(4, orders.len());
 
         node.shutdown().await.unwrap();
     });
@@ -188,14 +203,9 @@ fn restart_recovers_from_snapshot() {
         client.init().await.unwrap().unwrap();
         wait_for_leader(&client).await.unwrap();
 
-        for i in 0..30 {
-            write_kv(&client, &format!("k{i}"), &format!("v{i}")).await.unwrap();
-        }
-        write_kv(&client, "alpha", "one").await.unwrap();
-        write_kv(&client, "beta", "two").await.unwrap();
-        write_kv(&client, "gamma", "three").await.unwrap();
+        place_resting_orders(&client, 30).await.unwrap();
         place_orders(&client).await.unwrap();
-        assert_application_state(&client).await.unwrap();
+        assert_order_state(&client, 33, "33").await.unwrap();
 
         // Wait until a snapshot exists and the log it covers has been purged.
         let deadline = Instant::now() + Duration::from_secs(15);
@@ -226,11 +236,9 @@ fn restart_recovers_from_snapshot() {
         let client = make_client(addr);
         wait_for_leader(&client).await.unwrap();
 
-        // The snapshot carried the KV tail plus the order book.
-        for i in 0..30 {
-            assert_eq!(format!("v{i}"), client.read(&format!("k{i}")).await.unwrap());
-        }
-        assert_application_state(&client).await.unwrap();
+        // The snapshot carried the whole book, including the 30 orders whose log
+        // entries were purged.
+        assert_order_state(&client, 33, "33").await.unwrap();
 
         node.shutdown().await.unwrap();
     });

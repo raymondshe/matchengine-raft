@@ -42,8 +42,9 @@ The dead sled file `src/store/store.rs` was deleted.
   `full_sweep_leaves_book_empty_without_phantom_trades` in `src/matchengine/mod.rs`.
 - [ ] `Order::sequence` is still required by the deserializer even though `place_order()` overwrites
   it; make it optional (`#[serde(default)]`) so clients need not send a value the engine ignores.
-- [ ] Collapse the three duplicated `orderbook_sequance` compatibility arms in
-  `src/network/api.rs` into one helper used by `/read`, `/linearizable_read` and `/follower_read`.
+- [x] Collapse the three duplicated `orderbook_sequance` compatibility arms in
+  `src/network/api.rs` into one `read_state` helper used by `/read`, `/linearizable_read` and
+  `/follower_read` (done together with removing the KV store).
 - [ ] `src/lib.rs` registers two `Logger` middlewares — every request is logged twice. Keep one.
 
 ## 4. Dependency cleanup
@@ -62,7 +63,7 @@ vote/committed persistence, snapshot build/install/reopen) and `tests/cluster/te
 (full node restart via log replay and via snapshot).
 
 - [ ] Add unit tests for the order book: partial fills, cancel of an already-filled order, price-time priority (`BidKey`/`AskKey` ordering).
-- [ ] Add negative tests: write to a follower, unknown-key read, malformed `Place` payload.
+- [ ] Add negative tests: write to a follower, unknown `/read` key, malformed `Place` payload.
 - [ ] `tests/cluster/test_cluster.rs` binds fixed ports 21001-21003 and leaves 3 nodes running after the test finishes; parameterize ports and shut the nodes down.
 - [x] Test restart recovery (both log replay and snapshot boot paths).
 - [x] Test match-result processing: `apply` -> sink events (rest/fill/cancel), failing-sink

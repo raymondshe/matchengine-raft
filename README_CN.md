@@ -32,13 +32,14 @@
 
 ```
                     ┌─────────────────────────────────────────┐
-                    │           应用层                         │
-                    │  (KV 存储 + 订单簿撮合引擎)             │
+                    │           应用层                        │
+                    │      (订单簿撮合引擎)                   │
+                    │ apply ──► MatchEvent ──► Sink（可插拔） │
                     └─────────────────────┬───────────────────┘
                                           │
                     ┌─────────────────────▼───────────────────┐
-                    │           OpenRaft 核心                  │
-                    │  (共识、复制、领导者选举)                 │
+                    │           OpenRaft 核心                 │
+                    │  (共识、复制、领导者选举)               │
                     └─────────────────────┬───────────────────┘
                                           │
               ┌───────────────────────────┼───────────────────────────┐
@@ -171,21 +172,21 @@ curl -X POST -H "Content-Type: application/json" \
   http://127.0.0.1:21001/change-membership
 ```
 
-#### 5. 写入和读取数据
+#### 5. 写入和读取订单
 
-写入数据：
+下单：
 
 ```shell
 curl -X POST -H "Content-Type: application/json" \
-  -d '{"Set":{"key":"foo","value":"bar"}}' \
+  -d '{"Place":{"order":{"live":"Limit","side":"Buy","price":4000.0,"volume":4.4,"id":1,"sequence":0}}}' \
   http://127.0.0.1:21001/write
 ```
 
-从任意节点读取数据：
+从任意节点读取订单簿：
 
 ```shell
 curl -X POST -H "Content-Type: application/json" \
-  -d '"foo"' \
+  -d '"orderbook_orders"' \
   http://127.0.0.1:21002/read
 ```
 
@@ -281,7 +282,7 @@ Raft 日志追加写入 `log/NNNNNNNNNN.wal` 分段文件：
 
 ### 快照（`src/store/state_machine.rs`）
 
-状态机（KV 表 + 订单簿 + 序列号）常驻内存以保证 apply 速度。快照写入 `snapshot/current.snap`（magic + 版本 + CRC32 + postcard 元数据 + postcard 状态），同样通过临时文件 + rename 原子替换。`install_snapshot` 会先校验收到的数据再替换磁盘副本，坏快照不会破坏已有的好快照。
+状态机（订单簿 + 序列号）常驻内存以保证 apply 速度。快照写入 `snapshot/current.snap`（magic + 版本 + CRC32 + postcard 元数据 + postcard 状态），同样通过临时文件 + rename 原子替换。`install_snapshot` 会先校验收到的数据再替换磁盘副本，坏快照不会破坏已有的好快照。
 
 ### 每节点数据目录
 
@@ -297,8 +298,27 @@ Raft 日志追加写入 `log/NNNNNNNNNN.wal` 分段文件：
 ### 撮合结果处理
 
 `apply` 会把每个 `MatchResult` 转换成 `MatchEvent`（`fill` / `rested` / `cancelled`），再交给可替换的
-`MatchResultSink`（`src/match_result/mod.rs`）。默认的 sink 直接丢弃事件，因此引擎行为与以前一致。
-需要观察事件时启用文件 sink：
+`MatchResultSink`（`src/match_result/mod.rs`）。事件只由已应用的日志条目推导，因此每个副本产生相同的
+id；sink 本身是节点本地配置，绝不会影响复制状态：
+
+```
+POST /write { Place | Cancel }
+        │
+        ▼
+  StateMachineStore::apply  （每个副本都执行）
+        │
+        ├──► 订单簿 + 序列号 ──► 快照               [复制状态]
+        │
+        └──► MatchEvent（fill | rested | cancelled）[id = 日志位置]
+                    │
+                    ▼
+          MatchResultSink                           [节点本地，尽力而为]
+            ├── NoopSink      默认：直接丢弃
+            ├── FileLogSink   --match-event-log -> JSONL
+            └── （规划中）     复制事件日志 + /events 游标
+```
+
+默认的 sink 直接丢弃事件，因此引擎行为与以前一致。需要观察事件时启用文件 sink：
 
 ```bash
 ./target/release/matchengine-raft --id 1 --http-addr 127.0.0.1:21001 \
@@ -330,10 +350,10 @@ config.max_in_snapshot_log_to_keep = 0; // 清理快照已覆盖的全部日志
 
 启动时节点会：
 1. 恢复 WAL 索引、投票和 purge 标记（并丢弃撕裂的尾部）。
-2. 如果存在 `snapshot/current.snap`，加载它并重建订单簿和 KV 表。
+2. 如果存在 `snapshot/current.snap`，加载它并重建订单簿。
 3. 由 openraft 在其上重放保留的日志尾部。
 
-单节点集群因此可以恢复所有已提交的 KV 写入、活动订单和序列号，无论恢复路径是纯日志重放还是快照 + 尾部重放。两条路径都由 `tests/cluster/test_restart.rs` 覆盖。
+单节点集群因此可以恢复所有活动订单和序列号，无论恢复路径是纯日志重放还是快照 + 尾部重放。两条路径都由 `tests/cluster/test_restart.rs` 覆盖。
 
 ## 集群管理
 
@@ -372,13 +392,12 @@ gRPC 传输在 `--http-addr` 端口 + 1000 上暴露相同操作（`AppendEntrie
 
 ### 应用 API
 
-- `POST /write` - 通过 Raft 提交 `Set`、`Place` 或 `Cancel` 请求
+- `POST /write` - 通过 Raft 提交 `Place` 或 `Cancel` 请求
 - `POST /read` - 从本地状态机读取（可能读到旧值）
 - `POST /linearizable_read` - 线性一致性读；请求必须到达领导者
 - `POST /follower_read` - 从领导者获取 linearizer 后在本地完成的线性一致性读
 
-`/read`、`/linearizable_read` 和 `/follower_read` 接收 JSON 字符串键。除普通 KV 键外，状态机
-还暴露：
+`/read`、`/linearizable_read` 和 `/follower_read` 接收 JSON 字符串键，用于读取订单簿的命名视图：
 
 - `orderbook_orders` - 所有活动订单的 JSON 数组
 - `orderbook_sequence` - 订单序列号计数器（兼容旧拼写 `orderbook_sequance`）
@@ -401,7 +420,7 @@ gRPC 传输在 `--http-addr` 端口 + 1000 上暴露相同操作（`AppendEntrie
 | `tests/cluster/test_cluster.rs` | 3 节点集群：初始化、学习者、成员变更、读写、线性一致性读、领导者转发、缩容；默认走 gRPC，设置 `MATCHENGINE_TEST_TRANSPORT=http` 后走 HTTP |
 | `tests/cluster/test_snapshot.rs` | 快照生成、日志 purge，以及学习者通过 gRPC 快照流安装已 purge 的状态 |
 | `tests/cluster/test_storage.rs` | WAL 帧格式、撕裂尾部截断、分段轮转、跨段 truncate/purge、vote/committed 持久化、快照构建/安装/重开、损坏文件拒绝 |
-| `tests/cluster/test_restart.rs` | 完整节点重启后通过日志重放恢复，以及通过快照 + 尾部恢复 KV、订单簿和序列号 |
+| `tests/cluster/test_restart.rs` | 完整节点重启后通过日志重放恢复，以及通过快照 + 尾部恢复订单簿和序列号 |
 | `tests/cluster/test_match_results.rs` | 以 `--match-event-log` 启动的节点按日志顺序记录 rest/fill/cancel 事件，同时 `/write` 响应保持不变 |
 
 所有集成测试都使用唯一的临时数据目录。集群测试固定使用端口 `21001-21003`（gRPC

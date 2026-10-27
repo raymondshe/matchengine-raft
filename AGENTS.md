@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Single-crate Rust project (edition 2024): a Raft-replicated KV store + order-book matching engine built on OpenRaft.
+Single-crate Rust project (edition 2024): a Raft-replicated order-book matching engine built on OpenRaft.
 
 ## Commands
 
@@ -44,7 +44,7 @@ Single-crate Rust project (edition 2024): a Raft-replicated KV store + order-boo
 - Deadlines: unary vote/append and each `stream_append` request in flight get `RPCOption::soft_ttl()`. `stream_append` only times a wait while a request is in flight (the heartbeat worker polls for a response before the feeder necessarily sends), and `full_snapshot` has no per-RPC deadline — it is bounded by the `cancel` future and HTTP/2 keep-alive, because a legitimate snapshot can outlive one heartbeat interval.
 - Each peer gets separate gRPC connections for replication, heartbeat and snapshot (openraft's `new_heartbeat_client` / `new_snapshot_client` default to `new_client`, and each `GrpcNetwork` owns its own lazy channel), so a snapshot cannot head-of-line-block a vote.
 - Storage is **durable**. `src/store/log_store.rs` is a hand-written segmented WAL: `log/NNNNNNNNNN.wal` with an 8-byte `MRFT`+version header, `[len u32 LE][crc32 u32 LE][postcard payload]` records, one `write_all` + one `sync_data` per openraft append batch, `pread` reads, and blocking IO on `spawn_blocking`. Recovery walks segments and truncates a torn tail. Vote + `last_purged` live in an atomically rewritten `log/state`; `committed` is a WAL record that becomes durable with the next append (no second fsync).
-- `src/store/state_machine.rs` keeps KV/order book/sequence in memory and persists `snapshot/current.snap` (magic `MRFSNAP` + version + postcard meta + postcard content) via temp file → fsync → rename → dir fsync. `install_snapshot` validates before replacing the durable copy. Restart = open snapshot, then openraft replays the retained log tail.
+- `src/store/state_machine.rs` keeps the order book + sequence in memory and persists `snapshot/current.snap` (magic `MRFSNAP` + version + postcard meta + postcard content) via temp file → fsync → rename → dir fsync. Snapshot version is 2; v1 files (which also carried a KV map) are rejected on open. `install_snapshot` validates before replacing the durable copy. Restart = open snapshot, then openraft replays the retained log tail.
 - `src/store/config.rs` owns `StorageConfig` (`data_dir`, `instance_prefix`, `node_dir`/`log_dir`/`snapshot_dir`). The old sled-backed `src/store/store.rs` and the `walkdir` dependency are gone; `sled` remains only for the `sled_test.rs` playground binary.
 
 ## Test gotchas
@@ -65,7 +65,7 @@ Single-crate Rust project (edition 2024): a Raft-replicated KV store + order-boo
 - Match results leave `apply` as `MatchEvent`s through a `MatchResultSink`. `EventId` is
   `(log_index, ordinal)`, so no event counter is stored in snapshots; `OrderBook::resting_volume`
   is the authoritative source for a `Rested` event's volume (do not derive it by subtraction).
-- `/read` special keys: `orderbook_orders`, and `orderbook_sequence` (misspelled variant `orderbook_sequance` also accepted).
+- `/read` keys are resolved by `read_state` in `src/network/api.rs`: `orderbook_orders`, and `orderbook_sequence` (misspelled variant `orderbook_sequance` also accepted). Any other key returns an empty string; there is no KV store.
 
 ## Docs vs code
 

@@ -1,4 +1,4 @@
-//! `StateMachineStore`: an in-memory KV store + matching engine, made durable by snapshots.
+//! `StateMachineStore`: an in-memory order book, made durable by snapshots.
 //!
 //! The state machine itself is intentionally kept in memory: applying a Raft entry must be fast
 //! and the log already provides durability. Every applied batch is recoverable by replaying the
@@ -7,7 +7,6 @@
 //! Snapshots are written to `<dir>/current.snap` with a small framing header, then fsynced and
 //! renamed into place, so a crash never leaves a half-written snapshot visible.
 
-use std::collections::BTreeMap;
 use std::fmt;
 use std::io;
 use std::io::Cursor;
@@ -49,7 +48,11 @@ const SNAPSHOT_FILE: &str = "current.snap";
 /// Magic prefix of a snapshot file.
 const SNAPSHOT_MAGIC: &[u8; 7] = b"MRFSNAP";
 /// Snapshot file format version.
-const SNAPSHOT_VERSION: u32 = 1;
+///
+/// Version 2 dropped the key-value store from [`StateMachineData`]. Postcard is not
+/// self-describing, so a v1 file is rejected with an explicit error instead of being decoded
+/// into a different shape.
+const SNAPSHOT_VERSION: u32 = 2;
 /// `magic + version + crc32 of the body`.
 const SNAPSHOT_HEADER_LEN: usize = SNAPSHOT_MAGIC.len() + 4 + 4;
 
@@ -73,9 +76,6 @@ struct SnapshotPayload<C: RaftTypeConfig> {
 /// Data contained in the Raft state machine.
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]
 pub struct StateMachineData {
-    /// Application KV store data.
-    pub data: BTreeMap<String, String>,
-
     /// All active orders in the order book (both bids and asks).
     pub orders: Vec<Order>,
 
@@ -90,9 +90,6 @@ pub struct StateMachineStoreInner<C: RaftTypeConfig> {
 
     pub last_membership: StoredMembershipOf<C>,
 
-    /// The Raft state machine.
-    pub state_machine_data: StateMachineData,
-
     /// The order book for the matching engine.
     pub orderbook: OrderBook,
 
@@ -105,7 +102,6 @@ impl<C: RaftTypeConfig> Default for StateMachineStoreInner<C> {
         Self {
             last_applied_log: None,
             last_membership: StoredMembership::default(),
-            state_machine_data: StateMachineData::default(),
             orderbook: OrderBook::new(),
             current_snapshot: None,
         }
@@ -115,7 +111,6 @@ impl<C: RaftTypeConfig> Default for StateMachineStoreInner<C> {
 impl<C: RaftTypeConfig> StateMachineStoreInner<C> {
     /// Replaces the state with serialized content, rebuilding the order book indices.
     fn install_content(&mut self, content: StateMachineData) {
-        self.state_machine_data.data = content.data;
         self.orderbook.asks.clear();
         self.orderbook.bids.clear();
         self.orderbook.sequence = content.sequence;
@@ -128,7 +123,6 @@ impl<C: RaftTypeConfig> StateMachineStoreInner<C> {
     /// Converts the state machine to a serializable content format.
     pub fn to_content(&self) -> StateMachineData {
         let mut content = StateMachineData {
-            data: self.state_machine_data.data.clone(),
             orders: Vec::new(),
             sequence: self.orderbook.sequence,
         };
@@ -350,13 +344,6 @@ where
             let response = match &entry.payload {
                 EntryPayload::Blank => MatchEngineResponse::none(),
                 EntryPayload::Normal(req) => match req {
-                    MatchEngineRequest::Set {
-                        key,
-                        value,
-                    } => {
-                        inner.state_machine_data.data.insert(key.clone(), value.clone());
-                        MatchEngineResponse::new(value.clone())
-                    }
                     MatchEngineRequest::Place {
                         order,
                     } => {
@@ -552,8 +539,9 @@ mod tests {
         let store = StateMachineStore::<MatchEngineTypeConfig>::open(dir.path()).unwrap();
         {
             let mut inner = store.inner().lock().await;
-            inner.state_machine_data.data.insert("k".to_string(), "v".to_string());
-            inner.orderbook.sequence = 7;
+            inner
+                .orderbook
+                .place_order(&mut Order::new(crate::matchengine::OrderSide::Buy, 10.0, 2.0, 0));
             inner.last_applied_log = Some(log_id(1, 3));
             inner.last_membership = StoredMembership::new(Some(log_id(1, 1)), Default::default());
         }
@@ -561,8 +549,8 @@ mod tests {
 
         let reopened = StateMachineStore::<MatchEngineTypeConfig>::open(dir.path()).unwrap();
         let content = reopened.to_content().await;
-        assert_eq!(Some(&"v".to_string()), content.data.get("k"));
-        assert_eq!(7, content.sequence);
+        assert_eq!(1, content.orders.len());
+        assert_eq!(1, content.sequence);
     }
 
     #[tokio::test]

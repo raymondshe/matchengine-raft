@@ -118,48 +118,25 @@ echo
 rpc 21001/metrics
 sleep 1
 
-echo "Write data on leader"
-sleep 1
-echo
-rpc 21001/write '{"Set":{"key":"foo","value":"bar"}}'
-sleep 1
-echo "Data written"
-sleep 1
-
-echo "Read on every node, including the leader"
-sleep 1
-echo "Read from node 1"
-echo
-rpc 21001/read  '"foo"'
-echo "Read from node 2"
-echo
-rpc 21002/read  '"foo"'
-echo "Read from node 3"
-echo
-rpc 21003/read  '"foo"'
-
-##############################################################{
-echo "Write data on leader"
+echo "Place a resting buy order on the leader"
 sleep 1
 echo
 rpc 21001/write '{"Place": { "order": {"live": "Limit", "side": "Buy", "price": 4000.0, "volume": 4.4, "id": 1, "sequence": 0} }}'
-
 sleep 1
-echo "Data written"
+echo "Order placed"
 sleep 1
 
-echo "Read on every node, including the leader"
+echo "Read the order book on every node, including the leader"
 sleep 1
 echo "Read from node 1"
 echo
-rpc 21001/read  '"foo"'
+rpc 21001/read  '"orderbook_orders"'
 echo "Read from node 2"
 echo
-rpc 21002/read  '"foo"'
+rpc 21002/read  '"orderbook_orders"'
 echo "Read from node 3"
 echo
-rpc 21003/read  '"foo"'
-##############################################################}
+rpc 21003/read  '"orderbook_orders"'
 
 echo "Killing all nodes in 3s..."
 sleep 1

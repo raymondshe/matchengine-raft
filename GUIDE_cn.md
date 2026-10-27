@@ -23,13 +23,13 @@ openraft 0.10 迁移，并改为**自研分段 WAL + 原子快照**的持久化�
 |---|---|---|
 | Raft 日志 | 分段预写日志 `log/*.wal` | 持久化、顺序追加、一次批次一次 fsync |
 | vote / last_purged | `log/state`（原子重写） | 安全关键但低频 |
-| 状态机 | 内存（KV + 订单簿 + 序列号） | apply 快 |
+| 状态机 | 内存（订单簿 + 序列号） | apply 快 |
 | 快照 | `snapshot/current.snap`（原子替换） | 启动恢复和追赶落后节点 |
 
 ## 2. 整体结构
 
 ```
-应用层（KV + 订单簿撮合）
+应用层（订单簿撮合 + MatchResultSink）
         │
 OpenRaft Core（共识、复制、选举）
         │
@@ -54,7 +54,6 @@ LogStore  StateMachineStore  RaftNetwork        HTTP API
 
 ```rust
 pub enum MatchEngineRequest {
-    Set { key: String, value: String },
     Place { order: Order },
     Cancel { order: Order },
 }
@@ -103,9 +102,8 @@ pub struct MatchEngineResponse {
 
 ```rust
 pub struct StateMachineData {
-    pub data: BTreeMap<String, String>, // KV
-    pub orders: Vec<Order>,              // 活动订单
-    pub sequence: u64,                   // 订单序列号
+    pub orders: Vec<Order>,  // 活动订单
+    pub sequence: u64,       // 订单序列号
 }
 ```
 
@@ -147,10 +145,10 @@ pub struct StateMachineData {
 节点启动时：
 
 1. 扫描 WAL，重建索引、读取 vote 和 `last_purged`，截断撕裂尾部。
-2. 如果存在 `snapshot/current.snap`，加载它并重建 KV、订单簿和序列号。
+2. 如果存在 `snapshot/current.snap`，加载它并重建订单簿和序列号。
 3. openraft 在恢复出的状态之上重放保留的日志尾部。
 
-因此单节点重启后可以恢复所有已提交的 KV 写入、订单簿和序列号。纯日志重放和“快照 + 尾部”两条
+因此单节点重启后可以恢复所有活动订单和序列号。纯日志重放和“快照 + 尾部”两条
 路径都由 `tests/cluster/test_restart.rs` 覆盖。
 
 ### 4.6 快照与日志保留
@@ -266,7 +264,7 @@ curl -X POST -H "Content-Type: application/json" \
 | `POST /linearizable_read` | 线性一致 | 必须到达领导者，先获取 linearizer 再等待状态机追上 |
 | `POST /follower_read` | 线性一致 | follower 向领导者请求 linearizer，本地等待后读取 |
 
-三个端点都接收 JSON 字符串键。除普通 KV 键外：
+三个端点都接收 JSON 字符串键，用于读取订单簿的命名视图：
 
 - `orderbook_orders`：所有活动订单的 JSON 数组；
 - `orderbook_sequence`：订单序列号（兼容旧拼写 `orderbook_sequance`）。

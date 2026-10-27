@@ -244,8 +244,8 @@ MatchEngineRequest::Place { order } => {
 }
 ```
 
-`Cancel` publishes a `Cancelled` event only when `cancel()` actually removed an order; `Set`,
-`Blank` and membership entries publish nothing. `OrderBook::resting_volume` exists precisely so the
+`Cancel` publishes a `Cancelled` event only when `cancel()` actually removed an order; `Blank`
+and membership entries publish nothing. `OrderBook::resting_volume` exists precisely so the
 `Rested` event reports the volume stored in the book instead of `submitted - filled`, which can
 differ in the last floating-point bit.
 
@@ -257,7 +257,7 @@ All of this is pure state-machine work up to the sink call; the sink is the only
 
 ```rust
 pub struct MatchEngineResponse {
-    pub value: Option<String>,        // existing: sequence or Set value
+    pub value: Option<String>,        // existing: sequence string
     pub sequence: Option<u64>,        // explicit taker sequence
     pub events: Vec<MatchEvent>,      // new
     pub events_truncated: bool,       // new: response holds only the first N events
@@ -293,7 +293,6 @@ Additions to `StateMachineData` (which is what `to_content()`/snapshots serialis
 
 ```rust
 pub struct StateMachineData {
-    pub data: BTreeMap<String, String>,
     pub orders: Vec<Order>,
     pub sequence: u64,
     pub events: VecDeque<MatchEvent>, // retained window, ordered by event_id
@@ -312,17 +311,17 @@ pub struct StateMachineData {
   learner receives only the retained window — that is expected, and the read API advertises
   `oldest_event_id` so consumers can detect the gap.
 
-Snapshot format: `SNAPSHOT_VERSION` must go from 1 to 2. Postcard encodes struct fields positionally,
-so a v2 decoder reading a v1 payload fails on the missing fields (`postcard::from_bytes` reports an
-unexpected end of input). Two options:
+Snapshot format: `SNAPSHOT_VERSION` must go from 2 to 3 (version 2 is what dropped the old
+key-value map). Postcard encodes struct fields positionally, so a v3 decoder reading a v2 payload
+fails on the missing fields (`postcard::from_bytes` reports an unexpected end of input). Two options:
 
-1. **Reject v1 with a clear error** (simplest; acceptable for a demo, but requires wiping data).
-2. Decode a versioned enum (`V1(StateMachineDataV1) | V2(StateMachineDataV2)`) and migrate.
+1. **Reject v2 with a clear error** (simplest; acceptable for a demo, but requires wiping data).
+2. Decode a versioned enum (`V2(StateMachineDataV2) | V3(StateMachineDataV3)`) and migrate.
 
 Recommendation: bump the version, reject older files with an explicit message, and document the
 migration if this repo ever stops being an example. This is nearly free: `read_snapshot_file` already
 checks the version in the header and fails with `unsupported snapshot version {version}` before
-decoding, so a v1 file on disk is rejected loudly rather than silently misparsed.
+decoding, so a v2 file on disk is rejected loudly rather than silently misparsed.
 
 ### 4.6 Read API and consumer protocol
 
@@ -422,8 +421,8 @@ event rate per apply batch at debug level, consistent with the existing `tracing
 
 ## 6. API compatibility
 
-- `MatchEngineResponse` keeps `value` (sequence string for `Place`, value for `Set`) so existing
-  callers and scripts keep working. New fields are additive and serde ignores unknown fields on the
+- `MatchEngineResponse` keeps `value` (the sequence string for `Place`) so existing callers and
+  scripts keep working. New fields are additive and serde ignores unknown fields on the
   consumer side.
 - `MatchResult` itself stays as-is for the matcher; `MatchEvent` is the wire/storage type. This keeps
   the matching code independent of the clearing schema.

@@ -345,8 +345,6 @@ fn vote_and_committed_survive_reopen() {
 
 async fn fill_sm(sm: &Sm) {
     let mut inner = sm.inner().lock().await;
-    inner.state_machine_data.data.insert("alpha".into(), "one".into());
-    inner.state_machine_data.data.insert("beta".into(), "two".into());
     inner.last_applied_log = Some(log_id(1, 9));
     inner.last_membership = openraft::StoredMembership::new(Some(log_id(1, 1)), Default::default());
 
@@ -377,8 +375,6 @@ fn snapshot_survives_reopen() {
     block_on(async {
         let sm = Sm::open(dir.path()).unwrap();
         let content = sm.to_content().await;
-        assert_eq!(Some(&"one".to_string()), content.data.get("alpha"));
-        assert_eq!(Some(&"two".to_string()), content.data.get("beta"));
         assert_eq!(3, content.orders.len());
         assert_eq!(103, content.sequence);
 
@@ -429,7 +425,6 @@ fn install_snapshot_replaces_state_and_is_durable() {
             .unwrap();
 
         let content = target.to_content().await;
-        assert_eq!(Some(&"one".to_string()), content.data.get("alpha"));
         assert_eq!(3, content.orders.len());
     });
 
@@ -437,7 +432,6 @@ fn install_snapshot_replaces_state_and_is_durable() {
     block_on(async {
         let target = Sm::open(target_dir.path()).unwrap();
         let content = target.to_content().await;
-        assert_eq!(Some(&"two".to_string()), content.data.get("beta"));
         assert_eq!(3, content.orders.len());
     });
 }
@@ -503,14 +497,12 @@ fn bit_flipped_snapshot_fails_the_checksum() {
 #[test]
 fn state_machine_data_conversion_roundtrips() {
     let data = StateMachineData {
-        data: [("k".to_string(), "v".to_string())].into_iter().collect(),
         orders: vec![Order::new(OrderSide::Buy, 1.5, 2.0, 3)],
         sequence: 4,
     };
 
     let bytes = postcard::to_allocvec(&data).unwrap();
     let back: StateMachineData = postcard::from_bytes(&bytes).unwrap();
-    assert_eq!("v", back.data["k"]);
     assert_eq!(1, back.orders.len());
     assert_eq!(4, back.sequence);
 }

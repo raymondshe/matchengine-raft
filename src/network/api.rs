@@ -14,6 +14,8 @@ use crate::MatchEngineTypeConfig;
 use crate::app::MatchEngineApp;
 use crate::client::FollowerReadError;
 use crate::store::MatchEngineRequest;
+use crate::store::MatchEngineResponse;
+use crate::store::state_machine::StateMachineStoreInner;
 
 /**
  * Application API endpoints for interacting with the Raft state machine.
@@ -31,7 +33,6 @@ use crate::store::MatchEngineRequest;
 /// machine before a response is returned. This ensures strong consistency.
 ///
 /// The request can be:
-/// - `Set`: Store a key-value pair
 /// - `Place`: Add an order to the order book
 /// - `Cancel`: Remove an order from the order book
 ///
@@ -52,28 +53,20 @@ pub async fn write(app: Data<MatchEngineApp>, req: Json<MatchEngineRequest>) -> 
 /// may return stale data if the node has been partitioned or a new
 /// leader has been elected.
 ///
-/// Special keys:
+/// Supported keys:
 /// - `orderbook_orders`: Returns all orders in the order book as JSON
 /// - `orderbook_sequence`: Returns the current sequence number
-/// - Any other key: Returns the value from the KV store
+/// - `orderbook_sequance`: Accepted as a legacy spelling of the above
+///
+/// Any other key returns an empty string.
 ///
 /// # Returns
 ///
-/// The requested value, or an empty string if the key doesn't exist.
+/// The requested value, or an empty string if the key is not known.
 #[post("/read")]
 pub async fn read(app: Data<MatchEngineApp>, req: Json<String>) -> actix_web::Result<impl Responder> {
     let inner = app.state_machine_store.inner().lock().await;
-    let key = req.0;
-    let value = match key.as_str() {
-        "orderbook_orders" => {
-            let content = inner.to_content();
-            serde_json::to_string(&content.orders).unwrap_or_default()
-        }
-        "orderbook_sequence" => inner.orderbook.sequence.to_string(),
-        // Backward compatibility
-        "orderbook_sequance" => inner.orderbook.sequence.to_string(),
-        _ => inner.state_machine_data.data.get(&key).cloned().unwrap_or_default(),
-    };
+    let value = read_state(&inner, &req.0);
     let res: Result<String, Infallible> = Ok(value);
     Ok(Json(res))
 }
@@ -96,16 +89,7 @@ pub async fn linearizable_read(app: Data<MatchEngineApp>, req: Json<String>) -> 
             linearizer.await_ready(&app.raft).await.unwrap();
 
             let inner = app.state_machine_store.inner().lock().await;
-            let key = req.0;
-            let value = match key.as_str() {
-                "orderbook_orders" => {
-                    let content = inner.to_content();
-                    serde_json::to_string(&content.orders).unwrap_or_default()
-                }
-                "orderbook_sequence" => inner.orderbook.sequence.to_string(),
-                "orderbook_sequance" => inner.orderbook.sequence.to_string(),
-                _ => inner.state_machine_data.data.get(&key).cloned().unwrap_or_default(),
-            };
+            let value = read_state(&inner, &req.0);
 
             let res: Result<String, LinearizableReadError<MatchEngineTypeConfig>> = Ok(value);
             Ok(Json(res))
@@ -194,16 +178,23 @@ pub async fn follower_read(app: Data<MatchEngineApp>, req: Json<String>) -> acti
 
     // 5. Read from local state machine
     let inner = app.state_machine_store.inner().lock().await;
-    let key = req.0;
-    let value = match key.as_str() {
+    let value = read_state(&inner, &req.0);
+
+    Ok(Json(Ok(value)))
+}
+
+/// Resolves a `/read` key against the state machine.
+///
+/// The state machine holds an order book, so reads are named views of it rather than lookups in a
+/// key-value map. Unknown keys return an empty string, which keeps the endpoint total.
+fn read_state<C>(inner: &StateMachineStoreInner<C>, key: &str) -> String
+where C: openraft::RaftTypeConfig<D = MatchEngineRequest, R = MatchEngineResponse> {
+    match key {
         "orderbook_orders" => {
             let content = inner.to_content();
             serde_json::to_string(&content.orders).unwrap_or_default()
         }
-        "orderbook_sequence" => inner.orderbook.sequence.to_string(),
-        "orderbook_sequance" => inner.orderbook.sequence.to_string(),
-        _ => inner.state_machine_data.data.get(&key).cloned().unwrap_or_default(),
-    };
-
-    Ok(Json(Ok(value)))
+        "orderbook_sequence" | "orderbook_sequance" => inner.orderbook.sequence.to_string(),
+        _ => String::new(),
+    }
 }
