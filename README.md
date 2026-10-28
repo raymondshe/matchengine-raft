@@ -523,4 +523,10 @@ Special thanks to the Databend community and Zhang Yanpo for their support.
 
 ## License
 
-Please refer to the original OpenRaft project for licensing information.
+MIT — see [`LICENSE`](./LICENSE).
+
+The project started as a fork of
+[example-raft-kv](https://github.com/datafuselabs/openraft/tree/main/example-raft-kv) in the
+[OpenRaft](https://github.com/datafuselabs/openraft) project, which is dual-licensed under MIT or
+Apache-2.0. The original copyright and license notices continue to apply to code derived from it;
+this repository is distributed under the MIT license in `LICENSE`.

@@ -494,4 +494,9 @@ gRPC 传输在 `--http-addr` 端口 + 1000 上暴露相同操作（`AppendEntrie
 
 ## 许可证
 
-请参考原始 OpenRaft 项目获取许可信息。
+MIT —— 见 [`LICENSE`](./LICENSE)。
+
+本项目最初分叉自 [OpenRaft](https://github.com/datafuselabs/openraft) 项目中的
+[example-raft-kv](https://github.com/datafuselabs/openraft/tree/main/example-raft-kv)，上游采用
+MIT 或 Apache-2.0 双许可。源自上游的代码继续适用其原始版权与许可声明；本仓库以 `LICENSE`
+中的 MIT 许可证分发。
