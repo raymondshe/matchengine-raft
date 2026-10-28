@@ -245,6 +245,9 @@ src/
 ├── app.rs                   # 应用状态
 ├── matchengine/
 │   └── mod.rs               # 订单簿撮合引擎
+├── market_data/
+│   ├── mod.rs               # tap、深度日志、影子订单簿、限流发布线程
+│   └── wire.rs              # 64 字节二进制头 + 消息体（可直接交给 Aeron）
 ├── match_result/
 │   └── mod.rs               # MatchEvent id + 可替换的 MatchResultSink（noop/memory/file）
 ├── network/
@@ -274,7 +277,8 @@ tests/
     ├── test_snapshot.rs     # 快照生成/purge + 学习者通过 gRPC 安装
     ├── test_storage.rs      # WAL 与快照格式
     ├── test_restart.rs      # 重启恢复：日志重放与快照
-    └── test_match_results.rs # 撮合事件写入 JSONL 文件 sink
+    ├── test_match_results.rs # 撮合事件写入 JSONL 文件 sink
+    └── test_market_data.rs    # 行情 feed：快照、成交、BBO、深度、K 线
 ```
 
 ## 存储实现
@@ -395,6 +399,25 @@ POST /write { Place | Cancel | PurgeExpired }
 文件 sink 只是调试工具：仅写本地文件，不参与复制，也不 fsync，重启后重放日志会把同一批事件再写一遍。
 可靠的清结算分发（复制的事件日志、`/events` 游标读取、幂等提交）设计方案见 `docs/MATCH_RESULTS.md`。
 
+### 行情数据 feed（可选）
+
+`--market-data-log <file>`（环境变量 `MARKET_DATA_LOG`）开启 `docs/AERON_SOLUTION.md` 第二部分
+设计的确定性行情输出，实现在 `src/market_data/`：
+
+- 撮合线程只追加它本来就知道的可见深度变化（临时日志），并把该条目的 `MatchEvent` 复制进有界队列；
+  撮合路径上没有订单簿扫描、编码或 IO；
+- 独立线程维护影子订单簿并发布合并后的消息：成交（批量、绝不采样）、BBO（最新价/中间价/价差）、
+  深度快照与批后增量、生命周期事件、OHLC K 线（默认 1 秒和 1 分钟）以及状态心跳；
+- 只有领导者发布；每次获得领导权都先发一次重置快照。队列满时丢弃帧并发送 `GAP`，`apply` 永远不会
+  被订阅者阻塞或拖慢。
+
+当前 sink 是用于调试的 JSONL。同样的消息在 `src/market_data/wire.rs` 有二进制编码（64 字节头、
+小端消息体），`MarketDataSink` 就是后续 Aeron 适配器的接入点。模式已支持多标的（`symbol_id`，
+当前为 0）。可调参数：`--market-data-depth`、`--market-data-bbo-interval-ms`、
+`--market-data-bar-intervals-ms`。
+
+`/read marketdata_status` 返回 feed 计数器和领导者门控状态。
+
 ### 快照配置
 
 `default_raft_config()`（`src/lib.rs`）只设置心跳和选举时间，快照策略沿用 openraft 默认值
@@ -468,6 +491,7 @@ gRPC 传输在 `--http-addr` 端口 + 1000 上暴露相同操作（`AppendEntrie
 - `orderbook_last_trade_price` - 最后成交价（首笔成交前为 `null`），用于触发止损
 - `orderbook_depth` - 买卖两侧前 10 档的聚合可见深度（`orderbook_depth:N` 可指定档数，上限 200）
 - `orderbook_spread` - 最优卖价减最优买价（任一侧为空时为 `null`）
+- `marketdata_status` - 行情 feed 计数器与门控状态（feed 关闭时为 `{}`）
 - `orderbook_sequence` - 订单序列号计数器（兼容旧拼写 `orderbook_sequance`）
 
 `/write` 接受的订单示例（注意字段名是 `sequence`）：
@@ -483,8 +507,8 @@ gRPC 传输在 `--http-addr` 端口 + 1000 上暴露相同操作（`AppendEntrie
 {"Place": {"order": {"live": "Limit", "side": "Sell", "price": 4000.0, "volume": 100.0, "tif": "IOC", "display_volume": 10.0}}}
 ```
 
-撮合引擎在应用订单时会覆盖 `sequence`，因此客户端发送的值会被忽略；约定填 `0`。该字段仍然是
-反序列化所必需的。
+撮合引擎在应用订单时会覆盖 `sequence`，接收请求的领导者还会在入口处覆盖 `timestamp`，因此客户端
+发送的这两个值都会被忽略（约定填 `0`）。`sequence` 仍然是反序列化所必需的。
 
 ## 测试
 
@@ -497,10 +521,11 @@ gRPC 传输在 `--http-addr` 端口 + 1000 上暴露相同操作（`AppendEntrie
 | `tests/cluster/test_storage.rs` | WAL 帧格式、撕裂尾部截断、分段轮转、跨段 truncate/purge、vote/committed 持久化、快照构建/安装/重开、损坏文件拒绝 |
 | `tests/cluster/test_restart.rs` | 完整节点重启后通过日志重放恢复，以及通过快照 + 尾部恢复订单簿和序列号 |
 | `tests/cluster/test_match_results.rs` | 以 `--match-event-log` 启动的节点按日志顺序记录 rest/fill/cancel 事件，同时 `/write` 响应保持不变；第二个节点验证止损触发、GTD 过期和新增的 `/read` 键 |
+| `tests/cluster/test_market_data.rs` | 以 `--market-data-log` 启动的节点发布重置快照、批量成交、BBO、合并深度和一根已收盘 K 线；`/read marketdata_status` 报告计数器 |
 
 所有集成测试都使用唯一的临时数据目录。集群测试固定使用端口 `21001-21003`（gRPC
 `22001-22003`），快照测试使用 `21101-21102`，重启测试使用 `21201-21202`，撮合结果测试使用
-`21301`/`21302`；重跑前请先停止残留进程（`pkill -f matchengine-raft`）。
+`21301`/`21302`、行情数据测试 `21303`；重跑前请先停止残留进程（`pkill -f matchengine-raft`）。
 
 已知差距与路线图统一记录在 [`TODO.md`](./TODO.md)。
 

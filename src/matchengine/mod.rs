@@ -181,8 +181,10 @@ pub struct Order {
     /// matching until the visible tranche is consumed.
     #[serde(default)]
     pub hidden_volume: f64,
-    /// Client-supplied creation time (Unix ms), recorded in the log. Only used
-    /// to sanity-check GTD expiries; the engine never reads a wall clock.
+    /// Intake timestamp (Unix ms), stamped by the receiving leader before the
+    /// order is proposed (client values are overwritten). It is recorded in the
+    /// log, validates GTD expiries and labels every market-data record derived
+    /// from the order; `apply` itself never reads a clock.
     #[serde(default)]
     pub timestamp: u64,
 }
@@ -429,6 +431,15 @@ pub struct OrderBook {
     /// elects parked stops, so it is part of the replicated state.
     #[serde(default)]
     pub last_trade_price: Option<f64>,
+    /// Transient journal of visible-depth changes for the market-data tap.
+    /// Never part of a snapshot; drained after each applied entry.
+    #[serde(skip)]
+    pub depth_journal: Vec<DepthChange>,
+    /// Whether book mutations append to [`OrderBook::depth_journal`]. Enabled
+    /// once when a market-data tap is installed, so the matching loop pays one
+    /// predictable branch per mutation and nothing else when it is off.
+    #[serde(skip)]
+    pub record_depth: bool,
 }
 
 /// Represents the result of a successful order match.
@@ -562,6 +573,23 @@ pub struct DepthLevel {
     pub orders: u32,
 }
 
+/// A net change to one visible price level, recorded while the book mutates.
+///
+/// The journal is a transient tap for market-data derivation: it carries only
+/// values the book operation already knows, so recording it costs one push and
+/// never walks the tree. It is disabled unless a market-data tap is attached.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct DepthChange {
+    /// Side of the book the level belongs to.
+    pub side: OrderSide,
+    /// Price of the level.
+    pub price: f64,
+    /// Change in visible resting volume (hidden iceberg reserve is excluded).
+    pub delta_volume: f64,
+    /// Change in the number of resting orders at the level.
+    pub delta_orders: i32,
+}
+
 impl OrderBook {
     /// Creates a new, empty order book.
     ///
@@ -574,6 +602,42 @@ impl OrderBook {
             sequence: 0,
             stops: Vec::new(),
             last_trade_price: None,
+            depth_journal: Vec::new(),
+            record_depth: false,
+        }
+    }
+
+    /// Enables the transient depth journal (a market-data tap was installed).
+    ///
+    /// Idempotent; the journal keeps whatever it already holds so a caller can
+    /// drain it with [`OrderBook::take_depth_journal`].
+    pub fn enable_depth_journal(&mut self) {
+        self.record_depth = true;
+    }
+
+    /// Drains the depth journal, leaving it empty.
+    ///
+    /// Returns an empty vector when the journal is disabled: the tap is the only
+    /// consumer and it is either installed at start-up or not at all.
+    pub fn take_depth_journal(&mut self) -> Vec<DepthChange> {
+        std::mem::take(&mut self.depth_journal)
+    }
+
+    /// Appends one depth change when the journal is enabled.
+    fn record_depth_change(
+        &mut self,
+        side: OrderSide,
+        price: f64,
+        delta_volume: f64,
+        delta_orders: i32,
+    ) {
+        if self.record_depth {
+            self.depth_journal.push(DepthChange {
+                side,
+                price,
+                delta_volume,
+                delta_orders,
+            });
         }
     }
 
@@ -807,22 +871,20 @@ impl OrderBook {
             return Some(self.stops.remove(index));
         }
 
-        match order.side {
-            OrderSide::Buy => {
-                let key = BidKey {
-                    price: order.price,
-                    sequence: order.sequence,
-                };
-                return self.bids.remove(&key);
-            }
-            OrderSide::Sell => {
-                let key = AskKey {
-                    price: order.price,
-                    sequence: order.sequence,
-                };
-                return self.asks.remove(&key);
-            }
+        let removed = match order.side {
+            OrderSide::Buy => self.bids.remove(&BidKey {
+                price: order.price,
+                sequence: order.sequence,
+            }),
+            OrderSide::Sell => self.asks.remove(&AskKey {
+                price: order.price,
+                sequence: order.sequence,
+            }),
+        };
+        if let Some(cancelled) = removed {
+            self.record_depth_change(cancelled.side, cancelled.price, -cancelled.volume, -1);
         }
+        removed
     }
 
     /// Amends the price and/or open volume of a resting limit order.
@@ -930,6 +992,20 @@ impl OrderBook {
         };
         if reinserted {
             self.sequence += 1;
+            self.record_depth_change(
+                key.side,
+                amendment.previous_price,
+                -amendment.previous_volume,
+                -1,
+            );
+            self.record_depth_change(key.side, amendment.order.price, amendment.order.volume, 1);
+        } else if amendment.order.volume != amendment.previous_volume {
+            self.record_depth_change(
+                key.side,
+                amendment.order.price,
+                amendment.order.volume - amendment.previous_volume,
+                0,
+            );
         }
 
         Ok(amendment)
@@ -999,6 +1075,7 @@ impl OrderBook {
                 );
             }
         }
+        self.record_depth_change(order.side, order.price, visible, 1);
 
         visible
     }
@@ -1016,9 +1093,24 @@ impl OrderBook {
     /// OrderBook-rs replenishes an iceberg tranche: to the taker it looks like
     /// several orders queued at that price.
     fn sweep(&mut self, order: &Order, limit: Option<f64>) -> (Vec<MatchResult>, f64) {
+        // The journal is a separate field, so the resting side and the journal
+        // can be borrowed together without a second pass over the map.
+        let record = self.record_depth;
         match order.side {
-            OrderSide::Buy => Self::sweep_side(&mut self.asks, order, limit),
-            OrderSide::Sell => Self::sweep_side(&mut self.bids, order, limit),
+            OrderSide::Buy => Self::sweep_side(
+                &mut self.asks,
+                order,
+                limit,
+                record,
+                &mut self.depth_journal,
+            ),
+            OrderSide::Sell => Self::sweep_side(
+                &mut self.bids,
+                order,
+                limit,
+                record,
+                &mut self.depth_journal,
+            ),
         }
     }
 
@@ -1030,6 +1122,8 @@ impl OrderBook {
         resting: &mut BTreeMap<K, Order>,
         order: &Order,
         limit: Option<f64>,
+        record: bool,
+        journal: &mut Vec<DepthChange>,
     ) -> (Vec<MatchResult>, f64) {
         let mut results = Vec::new();
         let mut remaining_volume = order.volume;
@@ -1070,6 +1164,7 @@ impl OrderBook {
                 // Partially filled: shrink the maker in place so it keeps
                 // its identity (id, side, live and sequence).
                 best.get_mut().volume = maker.volume - match_volume;
+                record_depth_change(journal, record, maker.side, maker.price, -match_volume, 0);
                 // Taker fully matched
                 remaining_volume = 0.0;
                 break;
@@ -1088,8 +1183,17 @@ impl OrderBook {
                 let maker_slot = best.get_mut();
                 maker_slot.volume = draw;
                 maker_slot.hidden_volume = maker.hidden_volume - draw;
+                record_depth_change(
+                    journal,
+                    record,
+                    maker.side,
+                    maker.price,
+                    draw - match_volume,
+                    0,
+                );
             } else {
                 best.remove();
+                record_depth_change(journal, record, maker.side, maker.price, -match_volume, -1);
             }
         }
 
@@ -1188,13 +1292,17 @@ impl OrderBook {
         let bids: Vec<BidKey> = self.bids.keys().copied().collect();
         for key in bids {
             if has_expired(&self.bids[&key]) {
-                removed.push(self.bids.remove(&key).expect("key came from the map"));
+                let order = self.bids.remove(&key).expect("key came from the map");
+                self.record_depth_change(OrderSide::Buy, order.price, -order.volume, -1);
+                removed.push(order);
             }
         }
         let asks: Vec<AskKey> = self.asks.keys().copied().collect();
         for key in asks {
             if has_expired(&self.asks[&key]) {
-                removed.push(self.asks.remove(&key).expect("key came from the map"));
+                let order = self.asks.remove(&key).expect("key came from the map");
+                self.record_depth_change(OrderSide::Sell, order.price, -order.volume, -1);
+                removed.push(order);
             }
         }
         self.stops.retain(|stop| {
@@ -1207,6 +1315,25 @@ impl OrderBook {
         });
 
         removed
+    }
+}
+
+/// Appends a depth change to the sweep journal when recording is enabled.
+fn record_depth_change(
+    journal: &mut Vec<DepthChange>,
+    record: bool,
+    side: OrderSide,
+    price: f64,
+    delta_volume: f64,
+    delta_orders: i32,
+) {
+    if record {
+        journal.push(DepthChange {
+            side,
+            price,
+            delta_volume,
+            delta_orders,
+        });
     }
 }
 
@@ -2303,5 +2430,136 @@ mod tests {
         assert_eq!(None, ob.mid_price());
         assert!(ob.depth(OrderSide::Buy, 10).is_empty());
         assert!(ob.depth(OrderSide::Sell, 10).is_empty());
+    }
+
+    // --- Depth journal
+
+    fn sum_depth(journal: &[DepthChange], side: OrderSide, price: f64) -> (f64, i32) {
+        journal
+            .iter()
+            .filter(|change| change.side == side && change.price == price)
+            .fold((0.0, 0), |(volume, orders), change| {
+                (volume + change.delta_volume, orders + change.delta_orders)
+            })
+    }
+
+    #[test]
+    fn depth_journal_records_rest_fill_and_cancel() {
+        let mut ob = OrderBook::new();
+        ob.enable_depth_journal();
+
+        let mut maker = resting_order(OrderSide::Sell, 100.0, 10.0, 1);
+        ob.place_order(&mut maker);
+        assert_eq!(
+            vec![DepthChange {
+                side: OrderSide::Sell,
+                price: 100.0,
+                delta_volume: 10.0,
+                delta_orders: 1,
+            }],
+            ob.take_depth_journal()
+        );
+
+        let mut taker = resting_order(OrderSide::Buy, 100.0, 4.0, 2);
+        ob.place_order(&mut taker);
+        assert_eq!(
+            vec![DepthChange {
+                side: OrderSide::Sell,
+                price: 100.0,
+                delta_volume: -4.0,
+                delta_orders: 0,
+            }],
+            ob.take_depth_journal()
+        );
+
+        let cancelled = ob.cancel(&maker).expect("the remainder rests");
+        assert_eq!(6.0, cancelled.volume);
+        assert_eq!(
+            vec![DepthChange {
+                side: OrderSide::Sell,
+                price: 100.0,
+                delta_volume: -6.0,
+                delta_orders: -1,
+            }],
+            ob.take_depth_journal()
+        );
+    }
+
+    #[test]
+    fn depth_journal_handles_iceberg_refill() {
+        let mut ob = OrderBook::new();
+        ob.enable_depth_journal();
+
+        let mut iceberg = order_with(OrderSide::Sell, 100.0, 10.0, 1, |o| o.display_volume = 4.0);
+        ob.place_order(&mut iceberg);
+        assert_eq!(
+            vec![DepthChange {
+                side: OrderSide::Sell,
+                price: 100.0,
+                delta_volume: 4.0,
+                delta_orders: 1,
+            }],
+            ob.take_depth_journal()
+        );
+
+        // 4 fills the tranche, the order refills 4, then 2 fill the next tranche:
+        // the level went from 4 to 2, so the net recorded change is -2.
+        let mut taker = resting_order(OrderSide::Buy, 100.0, 6.0, 2);
+        ob.place_order(&mut taker);
+        assert_eq!(
+            (-2.0, 0),
+            sum_depth(&ob.take_depth_journal(), OrderSide::Sell, 100.0)
+        );
+        assert_eq!(2.0, ob.best_ask().expect("the iceberg survives").volume);
+    }
+
+    #[test]
+    fn depth_journal_records_amend_and_expiry() {
+        let mut ob = OrderBook::new();
+        ob.enable_depth_journal();
+
+        let mut bid = resting_order(OrderSide::Buy, 100.0, 10.0, 1);
+        ob.place_order(&mut bid);
+        ob.take_depth_journal();
+
+        // Same-price reduction: one in-place delta.
+        ob.amend(&bid, None, Some(4.0)).expect("amendable");
+        assert_eq!(
+            vec![DepthChange {
+                side: OrderSide::Buy,
+                price: 100.0,
+                delta_volume: -6.0,
+                delta_orders: 0,
+            }],
+            ob.take_depth_journal()
+        );
+
+        // Price change: the level is left and re-created under the new price.
+        let amended = ob.amend(&bid, Some(99.0), None).expect("amendable");
+        let journal = ob.take_depth_journal();
+        assert_eq!((-4.0, -1), sum_depth(&journal, OrderSide::Buy, 100.0));
+        assert_eq!((4.0, 1), sum_depth(&journal, OrderSide::Buy, 99.0));
+
+        // Expiry removes the level.
+        let mut gtd = order_with(OrderSide::Buy, 98.0, 3.0, 0, |o| {
+            o.tif = TimeInForce::Gtd(2_000);
+            o.timestamp = 1_000;
+        });
+        ob.execute_order(&mut gtd);
+        ob.take_depth_journal();
+        assert_eq!(1, ob.purge_expired(2_000, None).len());
+        assert_eq!(
+            (-3.0, -1),
+            sum_depth(&ob.take_depth_journal(), OrderSide::Buy, 98.0)
+        );
+        assert_eq!(99.0, amended.order.price);
+    }
+
+    #[test]
+    fn depth_journal_is_off_by_default() {
+        let mut ob = OrderBook::new();
+        let mut bid = resting_order(OrderSide::Buy, 100.0, 1.0, 1);
+        ob.place_order(&mut bid);
+        assert!(ob.take_depth_journal().is_empty());
     }
 }

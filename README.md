@@ -251,6 +251,9 @@ src/
 ├── app.rs                   # Application state
 ├── matchengine/
 │   └── mod.rs               # Order book matching engine
+├── market_data/
+│   ├── mod.rs               # Tap, depth journal consumer, shadow book, throttled publisher
+│   └── wire.rs              # 64-byte binary header + message bodies (Aeron-ready)
 ├── match_result/
 │   └── mod.rs               # MatchEvent ids + pluggable MatchResultSink (noop/memory/file)
 ├── network/
@@ -280,7 +283,8 @@ tests/
     ├── test_snapshot.rs     # Snapshot build/purge + learner install over gRPC
     ├── test_storage.rs      # WAL and snapshot formats
     ├── test_restart.rs      # Restart recovery: log replay and snapshot
-    └── test_match_results.rs # Match events in the JSONL file sink
+    ├── test_match_results.rs # Match events in the JSONL file sink
+    └── test_market_data.rs    # Market-data feed: snapshot, trades, BBO, depth, bars
 ```
 
 ## Storage Implementation
@@ -421,6 +425,28 @@ The file sink is a debugging aid: it is node-local, is not replicated or fsynced
 log after a restart writes the replayed events again. The durable clearing feed (a replicated event
 log, `/events` cursor reads and idempotent submission) is designed in `docs/MATCH_RESULTS.md`.
 
+### Market-data feed (opt-in)
+
+`--market-data-log <file>` (env `MARKET_DATA_LOG`) turns on the deterministic market-data egress
+designed in `docs/AERON_SOLUTION.md` Part II and implemented in `src/market_data/`:
+
+- the matching thread only appends the visible-depth changes it already computes (a transient
+  journal) and copies the entry's `MatchEvent`s into a bounded queue — no book scans, encoding or
+  IO on the matching path;
+- a dedicated thread keeps a shadow book and publishes coalesced messages: trades (batched, never
+  sampled), BBO (`last`/`mid`/spread), depth snapshots and post-batch deltas, lifecycle events,
+  OHLC bars (1 s and 1 m by default) and status heartbeats;
+- only the leader publishes; every leadership gain starts with a reset snapshot. A full queue drops
+  frames and emits a `GAP`; `apply` is never blocked or slowed by a subscriber.
+
+The shipped sink is JSONL for debugging. The same messages have a binary encoding in
+`src/market_data/wire.rs` (64-byte header, little-endian bodies), and `MarketDataSink` is the seam
+the Aeron adapter will implement (next phase). The schema is multi-symbol ready (`symbol_id`, 0
+today). Tuning: `--market-data-depth`, `--market-data-bbo-interval-ms`,
+`--market-data-bar-intervals-ms`.
+
+`/read marketdata_status` returns the feed counters and the leader gate.
+
 ### Snapshot configuration
 
 `default_raft_config()` (`src/lib.rs`) sets only the heartbeat and election timings; snapshot
@@ -499,6 +525,7 @@ order book:
 - `orderbook_depth` - aggregated visible depth for the top 10 price levels per side
   (`orderbook_depth:N` selects another count, capped at 200)
 - `orderbook_spread` - best ask minus best bid (`null` while either side is empty)
+- `marketdata_status` - market-data feed counters and gate state (`{}` when the feed is off)
 - `orderbook_sequence` - the order sequence counter (`orderbook_sequance` is accepted as a legacy
   alias)
 
@@ -515,8 +542,9 @@ Every order-type field (`tif`, `post_only`, `stop_price`, `display_volume`, `hid
 {"Place": {"order": {"live": "Limit", "side": "Sell", "price": 4000.0, "volume": 100.0, "tif": "IOC", "display_volume": 10.0}}}
 ```
 
-The matching engine overwrites `sequence` when it applies the order, so the value clients send is
-ignored; `0` is the conventional placeholder. The field is still required by the deserializer.
+The matching engine overwrites `sequence` when it applies the order, and the receiving leader
+stamps `timestamp` at intake, so both values clients send are ignored (`0` is the conventional
+placeholder). `sequence` is still required by the deserializer.
 
 ## Testing
 
@@ -529,11 +557,12 @@ ignored; `0` is the conventional placeholder. The field is still required by the
 | `tests/cluster/test_storage.rs` | WAL framing, torn-tail truncation, segment rotation, truncate/purge across segments, vote/committed persistence, snapshot build/install/reopen, corrupt-file rejection |
 | `tests/cluster/test_restart.rs` | Full node restart recovering the order book and sequence via WAL replay, and via snapshot + tail |
 | `tests/cluster/test_match_results.rs` | A node started with `--match-event-log` records rest/fill/cancel events in log order while the `/write` response stays unchanged; a second node checks stop triggers, GTD expiry and the new `/read` keys |
+| `tests/cluster/test_market_data.rs` | A node started with `--market-data-log` publishes a reset snapshot, batched trades, BBO, coalesced depth and a closed OHLC bar; `/read marketdata_status` reports the counters |
 
 Every integration test uses a unique temporary data directory. The cluster test uses fixed ports
 `21001-21003` (gRPC `22001-22003`), the snapshot test `21101-21102`, the restart test `21201-21202`
-and the match-result tests `21301`/`21302`; stop leftover processes (`pkill -f matchengine-raft`)
-before rerunning.
+the match-result tests `21301`/`21302` and the market-data test `21303`; stop leftover processes
+(`pkill -f matchengine-raft`) before rerunning.
 
 Known gaps and the roadmap are tracked in [`TODO.md`](./TODO.md).
 

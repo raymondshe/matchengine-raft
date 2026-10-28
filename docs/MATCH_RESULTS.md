@@ -203,6 +203,8 @@ pub struct MatchEvent {
     pub kind: MatchEventKind,
     /// Sequence of the order this event is about.
     pub order_sequence: u64,
+    /// Side of that order (the maker's side is the opposite on a fill).
+    pub side: OrderSide,
     /// The resting order's sequence on a fill.
     pub counterparty_sequence: Option<u64>,
     /// On an amendment: the sequence the order had before it.
@@ -530,8 +532,9 @@ endpoint.
    volume matters.
 3. **Consumer placement** — in-cluster sidecar pulling `/events`, or an external service? Affects
    whether long-poll/streaming is worth building.
-4. **Timestamp** — is a client-supplied ingest timestamp acceptable to clearing, given it is
-   untrusted, or is log-order-only sufficient?
+4. **Timestamp** — resolved for market data: the receiving leader stamps `Order.timestamp` at
+   intake (client values are overwritten), so it is log-carried and trustworthy. Clearing still
+   needs to decide whether it wants that intake time in the event feed or log order alone.
 5. **Cancel identity** — `cancel()` currently keys on `(price, sequence)`, which clearing has from
    the events, but humans think in `order id`; consider an order-id index as a follow-up.
 6. **Multi-instrument** — global `event_id` vs per-instrument; revisit when a second book exists.

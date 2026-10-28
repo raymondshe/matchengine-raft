@@ -35,6 +35,7 @@ use serde::Serialize;
 use crate::matchengine::Amendment;
 use crate::matchengine::MatchResult;
 use crate::matchengine::Order;
+use crate::matchengine::OrderSide;
 use crate::matchengine::RejectReason;
 
 /// Stable identity of one event: a Raft log index plus the event's position inside that entry.
@@ -88,6 +89,8 @@ pub struct MatchEvent {
     /// Sequence number of the order this event is about (the taker, the resting order, or the
     /// cancelled order). `place_order` assigns it, so it is the id `/write` returns.
     pub order_sequence: u64,
+    /// Side of that order. On a fill the maker's side is the opposite.
+    pub side: OrderSide,
     /// For a [`MatchEventKind::Fill`]: the resting order's sequence. `None` otherwise.
     pub counterparty_sequence: Option<u64>,
     /// For a [`MatchEventKind::Amended`]: the sequence the order had before the
@@ -116,6 +119,7 @@ impl MatchEvent {
     pub fn for_fills(
         log_index: u64,
         first_ordinal: u32,
+        taker_side: OrderSide,
         taker_sequence: u64,
         matches: &[MatchResult],
     ) -> Vec<MatchEvent> {
@@ -129,6 +133,7 @@ impl MatchEvent {
                 },
                 kind: MatchEventKind::Fill,
                 order_sequence: taker_sequence,
+                side: taker_side,
                 counterparty_sequence: Some(m.maker.sequence),
                 previous_sequence: None,
                 price: m.maker.price,
@@ -161,7 +166,13 @@ impl MatchEvent {
         matches: &[MatchResult],
         resting_volume: Option<f64>,
     ) -> Vec<MatchEvent> {
-        let mut events = Self::for_fills(log_index, first_ordinal, taker.sequence, matches);
+        let mut events = Self::for_fills(
+            log_index,
+            first_ordinal,
+            taker.side,
+            taker.sequence,
+            matches,
+        );
 
         if let Some(volume) = resting_volume {
             events.push(MatchEvent {
@@ -171,6 +182,7 @@ impl MatchEvent {
                 },
                 kind: MatchEventKind::Rested,
                 order_sequence: taker.sequence,
+                side: taker.side,
                 counterparty_sequence: None,
                 previous_sequence: None,
                 price: taker.price,
@@ -205,6 +217,7 @@ impl MatchEvent {
             event_id: EventId { log_index, ordinal },
             kind: MatchEventKind::Cancelled,
             order_sequence: order.sequence,
+            side: order.side,
             counterparty_sequence: None,
             previous_sequence: None,
             price: order.price,
@@ -225,6 +238,7 @@ impl MatchEvent {
             event_id: EventId { log_index, ordinal },
             kind: MatchEventKind::Triggered,
             order_sequence: stop.sequence,
+            side: stop.side,
             counterparty_sequence: None,
             previous_sequence: None,
             price: trigger_price,
@@ -239,6 +253,7 @@ impl MatchEvent {
             event_id: EventId { log_index, ordinal },
             kind: MatchEventKind::Expired,
             order_sequence: expired.sequence,
+            side: expired.side,
             counterparty_sequence: None,
             previous_sequence: None,
             price: expired.price,
@@ -258,6 +273,7 @@ impl MatchEvent {
             event_id: EventId { log_index, ordinal },
             kind: MatchEventKind::Rejected,
             order_sequence: order.sequence,
+            side: order.side,
             counterparty_sequence: None,
             previous_sequence: None,
             price: order.price,
@@ -273,6 +289,7 @@ impl MatchEvent {
             event_id: EventId { log_index, ordinal },
             kind: MatchEventKind::Amended,
             order_sequence: amendment.order.sequence,
+            side: amendment.order.side,
             counterparty_sequence: None,
             previous_sequence: Some(amendment.previous_sequence),
             price: amendment.order.price,

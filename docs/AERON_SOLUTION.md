@@ -500,10 +500,11 @@ Ordered by value per day:
 
 # Part II — Market-data egress over Aeron
 
-Status: **design only.** No market-data code exists. The integration points referenced below are the
-ones in the current tree: snapshot v3 (`src/store/state_machine.rs`), the `MatchEvent` pipeline
-(`src/match_result/mod.rs`), the order book (`src/matchengine/mod.rs`) and the node composition
-point (`build_match_engine_node` in `src/lib.rs`). Every Aeron transport property quoted here comes
+Status: **core implemented, Aeron adapter pending.** The deterministic pipeline below now exists in
+`src/market_data/`: depth journal, tap, shadow book, throttling/coalescing, OHLC bars, snapshots,
+leader gating, JSONL sink, the binary wire encoder and `/read marketdata_status`. The Aeron
+transport (`rusteron` + media driver), Archive replay and multi-symbol routing remain. Progress and
+acceptance criteria: `docs/MARKET_DATA_PLAN.md`. Every Aeron transport property quoted here comes
 from §3.2; nothing in this part has been benchmarked.
 
 ## 11. Recommendation

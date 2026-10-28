@@ -8,6 +8,7 @@ Single-crate Rust project (edition 2024): a Raft-replicated order-book matching 
   - `--transport` is `grpc` (default) or `http`; it selects **outbound** Raft RPC only. The node always serves both the HTTP API on `--http-addr` and gRPC on the same host at `port + 1000`.
   - `--data-dir` (env `RAFT_DATA_DIR`, default `/tmp/matchengine-raft`) and `--instance-prefix` (env `RAFT_INSTANCE_PREFIX`, default `matchengine`) place durable state in `<data-dir>/<prefix>-<id>/{log,snapshot}`.
   - `--match-event-log <file>` (env `MATCH_EVENT_LOG`) appends every applied fill/rest/cancel to a JSONL file. Debug aid only: node-local, not replicated, duplicates lines when the log is replayed after a restart.
+  - `--market-data-log <file>` (env `MARKET_DATA_LOG`) enables the deterministic market-data feed (`src/market_data/`) and appends its messages as JSONL. Leader-only; `--market-data-depth`, `--market-data-bbo-interval-ms` and `--market-data-bar-intervals-ms` tune it.
 - `cargo test` runs everything (a single integration target, `cluster`, ~10s once built). Focus it with `cargo test --test cluster`.
   - `MATCHENGINE_TEST_TRANSPORT=http cargo test --test cluster` runs the cluster suite over the legacy HTTP/JSON transport.
   - `cargo bench --bench matchengine` runs the order-book micro-benchmarks (no framework, prints best-of-5 per-round times).
@@ -50,7 +51,7 @@ Single-crate Rust project (edition 2024): a Raft-replicated order-book matching 
 
 ## Test gotchas
 
-- `tests/cluster/test_cluster.rs` boots 3 nodes in threads on fixed ports 127.0.0.1:21001-21003 (gRPC 22001-22003) and never shuts them down. `test_snapshot.rs` uses 21101-21102 (gRPC 22101-22102); `test_restart.rs` uses 21201 and 21202 (gRPC 22201-22202); `test_match_results.rs` uses 21301 and 21302 (gRPC 22301/22302) and shuts its nodes down. Kill leftovers (`./test.sh kill`, i.e. `pkill -f matchengine-raft`) before rerunning or the bind fails.
+- `tests/cluster/test_cluster.rs` boots 3 nodes in threads on fixed ports 127.0.0.1:21001-21003 (gRPC 22001-22003) and never shuts them down. `test_snapshot.rs` uses 21101-21102 (gRPC 22101-22102); `test_restart.rs` uses 21201 and 21202 (gRPC 22201-22202); `test_match_results.rs` uses 21301 and 21302 (gRPC 22301/22302), `test_market_data.rs` uses 21303 (gRPC 22303), and both shut their nodes down. Kill leftovers (`./test.sh kill`, i.e. `pkill -f matchengine-raft`) before rerunning or the bind fails.
 - `test_snapshot.rs` polls `metrics().current_leader` after `init`; without that wait the first write can race the election and fail with `NotLeader`.
 - The cluster test asserts an exact `LinearizableReadError` message string naming node 1; changing error formatting breaks it.
 - The snapshot test depends on `snapshot_policy = LogsSinceLast(10)` and `max_in_snapshot_log_to_keep = 0`: the learner must join after the covered log has been purged, otherwise it catches up by log replication and the test proves nothing.
@@ -76,6 +77,15 @@ Single-crate Rust project (edition 2024): a Raft-replicated order-book matching 
   the book; `apply` publishes a `rejected` event with a `reason` and the write still returns the
   assigned sequence. Event kinds are `fill`, `rested`, `cancelled`, `triggered`, `expired`,
   `rejected`, `amended`; a stop cascade keeps increasing ordinals inside the same log entry.
+- The market-data tap does not run on the matching thread: book mutations append `DepthChange`
+  entries to a transient `OrderBook::depth_journal` (`enable_depth_journal`, `#[serde(skip)]`) and
+  `apply` hands the journal plus the entry's `MatchEvent`s to a bounded `SyncSender` (`try_send`).
+  A separate thread owns the shadow book, throttling, OHLC bars, encoding and the sink. A full
+  queue drops frames and emits `GAP`; matching is never blocked. The feed is leader-gated by a
+  `raft.metrics()` watcher, which pushes a reset snapshot on every leadership gain.
+- The receiving HTTP node stamps `Order.timestamp` at intake (overwriting client values) before
+  proposing; it travels in the log and labels events and market data. `MatchEvent.side` is the side
+  of the order the event is about.
 - `OrderBook::amend` changes a plain resting limit order keyed like `cancel` (side + current price +
   sequence): a same-price volume reduction keeps the sequence (time priority) and updates in place;
   a new price or a larger volume re-inserts under a NEW sequence, which the `/write` response
@@ -89,8 +99,9 @@ Single-crate Rust project (edition 2024): a Raft-replicated order-book matching 
   is the authoritative source for a `Rested` event's volume (do not derive it by subtraction).
 - `/read` keys are resolved by `read_state` in `src/network/api.rs`: `orderbook_orders`,
   `orderbook_stops`, `orderbook_last_trade_price`, `orderbook_depth` (`orderbook_depth:N` for N
-  levels, capped at 200), `orderbook_spread`, and `orderbook_sequence` (misspelled variant
-  `orderbook_sequance` also accepted). Any other key returns an empty string; there is no KV store.
+  levels, capped at 200), `orderbook_spread`, `marketdata_status`, and `orderbook_sequence`
+  (misspelled variant `orderbook_sequance` also accepted). Any other key returns an empty string;
+  there is no KV store.
 
 ## Docs vs code
 
@@ -99,6 +110,8 @@ Single-crate Rust project (edition 2024): a Raft-replicated order-book matching 
 - `docs/AERON_SOLUTION.md` and `docs/TRANSPORTS.md` are investigation documents: gRPC via `tonic`
   is implemented (`src/network/grpc/`) and is the default, HTTP remains selectable, and no transport
   benchmark exists. Read `docs/TRANSPORTS.md`'s status banner before treating its numbers as results.
+- `docs/MARKET_DATA_PLAN.md` tracks the market-data egress implementation (tap, shadow book,
+  binary wire format, JSONL sink, leader gating); the Aeron adapter is still the next phase.
 - `docs/MATCH_RESULTS.md` describes match-result delivery. Phase 1a is implemented: `apply`
   publishes `Fill`/`Rested`/`Cancelled`/`Triggered`/`Expired`/`Rejected`/`Amended` events to a
   `MatchResultSink`, and `--match-event-log`

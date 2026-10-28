@@ -7,6 +7,8 @@
 use std::path::Path;
 use std::time::Duration;
 use std::time::Instant;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
 use matchengine_raft::MatchEngineTypeConfig;
 use matchengine_raft::StorageConfig;
@@ -249,16 +251,22 @@ fn file_sink_records_stop_triggers_and_expiries() {
             child["event_id"]["ordinal"].as_u64().unwrap()
         );
 
-        // A GTD order that is still live, then purged at its deadline.
+        // A GTD order that is still live, then purged at its deadline. The
+        // leader stamps intake time, so the deadline is relative to the clock.
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let expiry = now_ms + 60_000;
         let mut gtd = Order::new(OrderSide::Buy, 90.0, 1.0, 0);
-        gtd.tif = matchengine_raft::matchengine::TimeInForce::Gtd(2_000);
-        gtd.timestamp = 1_000;
+        gtd.tif = matchengine_raft::matchengine::TimeInForce::Gtd(expiry);
+        gtd.timestamp = 1_000; // overwritten by the leader at intake
         client.write(&place(gtd)).await.unwrap().unwrap();
         wait_for_events(&event_log, 7).await;
 
         let response = client
             .write(&MatchEngineRequest::PurgeExpired {
-                now_ms: 1_000,
+                now_ms,
                 day_close_ms: None,
             })
             .await
@@ -272,7 +280,7 @@ fn file_sink_records_stop_triggers_and_expiries() {
 
         let response = client
             .write(&MatchEngineRequest::PurgeExpired {
-                now_ms: 2_000,
+                now_ms: expiry,
                 day_close_ms: None,
             })
             .await

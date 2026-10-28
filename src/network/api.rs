@@ -1,3 +1,6 @@
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
+
 use actix_web::Responder;
 use actix_web::post;
 use actix_web::web;
@@ -48,8 +51,29 @@ pub async fn write(
     app: Data<MatchEngineApp>,
     req: Json<MatchEngineRequest>,
 ) -> actix_web::Result<impl Responder> {
-    let response = app.raft.client_write(req.0).await.decompose().unwrap();
+    let mut request = req.into_inner();
+    stamp_intake_time(&mut request);
+    let response = app.raft.client_write(request).await.decompose().unwrap();
     Ok(Json(response))
+}
+
+/// Stamps the request with the receiving leader's clock.
+///
+/// The timestamp travels through the log, so `apply` never reads a clock; it is
+/// what GTD validation and every market-data record use. Client-supplied values
+/// are overwritten so there is a single time source.
+fn stamp_intake_time(request: &mut MatchEngineRequest) {
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or_default();
+
+    match request {
+        MatchEngineRequest::Place { order }
+        | MatchEngineRequest::Cancel { order }
+        | MatchEngineRequest::Amend { order, .. } => order.timestamp = now_ms,
+        MatchEngineRequest::PurgeExpired { .. } => {}
+    }
 }
 
 /// Reads data from the local state machine (non-consistent read).
@@ -68,6 +92,7 @@ pub async fn write(
 /// - `orderbook_spread`: Returns the best ask minus the best bid (`null` if either side is empty)
 /// - `orderbook_sequence`: Returns the current sequence number
 /// - `orderbook_sequance`: Accepted as a legacy spelling of the above
+/// - `marketdata_status`: Market-data feed counters and gate state (`{}` when the feed is off)
 ///
 /// Any other key returns an empty string.
 ///
@@ -226,6 +251,11 @@ where
         "orderbook_stops" => serde_json::to_string(&inner.orderbook.stops).unwrap_or_default(),
         "orderbook_depth" => depth_json(inner, 10),
         "orderbook_spread" => serde_json::to_string(&inner.orderbook.spread()).unwrap_or_default(),
+        "marketdata_status" => inner
+            .market_data
+            .as_ref()
+            .map(|tap| tap.status_json())
+            .unwrap_or_else(|| "{}".to_string()),
         "orderbook_last_trade_price" => {
             serde_json::to_string(&inner.orderbook.last_trade_price).unwrap_or_default()
         }
@@ -294,5 +324,6 @@ mod tests {
         let inner = book();
         assert_eq!("1.0", read_state(&inner, "orderbook_spread"));
         assert_eq!("", read_state(&inner, "nope"));
+        assert_eq!("{}", read_state(&inner, "marketdata_status"));
     }
 }

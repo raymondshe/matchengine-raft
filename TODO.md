@@ -146,6 +146,24 @@ vote/committed persistence, snapshot build/install/reopen) and `tests/cluster/te
   it; make it optional (serde default) so callers do not have to send a value the engine ignores.
 - [ ] Payloads on the public HTTP API are JSON; consider protobuf/Avro there too. Raft RPCs already use `postcard` over gRPC.
 
+## 12. Market data
+
+Design: `docs/AERON_SOLUTION.md` Part II; implementation plan and progress:
+`docs/MARKET_DATA_PLAN.md`.
+
+- [x] Deterministic feed core: depth journal in `OrderBook`, `MatchEvent.side`, leader-stamped
+  intake timestamps, shadow book, throttled/coalesced processor (trades, BBO, depth
+  snapshots/deltas, lifecycle, OHLC bars, status, gap), leader gating with reset snapshots,
+  JSONL sink, binary wire encoder and `marketdata_status` read.
+- [ ] Aeron adapter: implement `MarketDataSink` with `rusteron-client` + an embedded driver in
+  tests, feature-gated (`market-data-aeron`); see AERON_SOLUTION §20/§23.
+- [ ] Archive recording/replay and the snapshot-request stream (2003/2010).
+- [ ] Multi-symbol engine: `symbol_id` on orders and per-symbol books; the feed schema already
+  carries the field and the shadow/bars are keyed by it.
+- [ ] Consumer SDK/reference decoder for the wire format (the encoder is covered by golden tests).
+- [ ] Load test at the 50k-500k fills/s target and record feed latency/backpressure numbers.
+
+
 ## 10. Transport
 
 gRPC (`tonic`) is implemented and is the default for peer-to-peer Raft RPCs; HTTP/JSON remains
@@ -170,5 +188,7 @@ Remaining:
 ## 11. Client library and benchmarks
 
 - [ ] Harden `src/client.rs` before it is used outside the examples: retry/backoff on transient RPC errors, configurable timeouts, and a typed error for "no known leader" instead of a bare message.
-- [x] Order-book micro-benchmarks: `cargo bench --bench matchengine` (sweep wide/deep, rest, partial fill, IOC cancel, iceberg refill, amend, cancel; best-of-5 per round, no framework).
+- [x] Order-book micro-benchmarks: `cargo bench --bench matchengine` (sweep wide/deep, rest, rest
+  with the market-data journal, partial fill, IOC cancel, iceberg refill, amend, cancel; best-of-5
+  per round, no framework).
 - [ ] Add end-to-end latency benchmarks (submit → commit → apply → response) next to the transport harness in §10, so matching and replication costs can be separated.

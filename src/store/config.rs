@@ -16,6 +16,7 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use crate::MatchEngineNodeId;
+use crate::market_data::MarketDataConfig;
 
 /// Environment variable that overrides [`StorageConfig::data_dir`].
 pub const DATA_DIR_ENV: &str = "RAFT_DATA_DIR";
@@ -23,6 +24,8 @@ pub const DATA_DIR_ENV: &str = "RAFT_DATA_DIR";
 pub const INSTANCE_PREFIX_ENV: &str = "RAFT_INSTANCE_PREFIX";
 /// Environment variable that sets [`StorageConfig::match_event_log`].
 pub const MATCH_EVENT_LOG_ENV: &str = "MATCH_EVENT_LOG";
+/// Environment variable that enables the market-data JSONL feed.
+pub const MARKET_DATA_LOG_ENV: &str = "MARKET_DATA_LOG";
 
 /// Default root directory for node data.
 pub const DEFAULT_DATA_DIR: &str = "/tmp/matchengine-raft";
@@ -45,6 +48,11 @@ pub struct StorageConfig {
     /// This is a debugging aid: the file is node-local, is not replicated, and
     /// replays after a restart. See [`crate::match_result::FileLogSink`].
     pub match_event_log: Option<PathBuf>,
+
+    /// Optional market-data egress configuration. `None` keeps the feed off;
+    /// enabling it installs the tap on the state machine and starts the
+    /// publisher thread bounded by this configuration.
+    pub market_data: Option<MarketDataConfig>,
 }
 
 impl Default for StorageConfig {
@@ -55,11 +63,14 @@ impl Default for StorageConfig {
         let instance_prefix = std::env::var(INSTANCE_PREFIX_ENV)
             .unwrap_or_else(|_| DEFAULT_INSTANCE_PREFIX.to_string());
         let match_event_log = std::env::var_os(MATCH_EVENT_LOG_ENV).map(PathBuf::from);
+        let market_data = std::env::var_os(MARKET_DATA_LOG_ENV)
+            .map(|path| MarketDataConfig::jsonl(PathBuf::from(path)));
 
         Self {
             data_dir,
             instance_prefix,
             match_event_log,
+            market_data,
         }
     }
 }
@@ -71,6 +82,7 @@ impl StorageConfig {
             data_dir: data_dir.into(),
             instance_prefix: DEFAULT_INSTANCE_PREFIX.to_string(),
             match_event_log: None,
+            market_data: None,
         }
     }
 
@@ -86,9 +98,16 @@ impl StorageConfig {
         self
     }
 
+    /// Enables the market-data egress with `config`.
+    pub fn with_market_data(mut self, config: MarketDataConfig) -> Self {
+        self.market_data = Some(config);
+        self
+    }
+
     /// Directory holding this node's durable state.
     pub fn node_dir(&self, node_id: MatchEngineNodeId) -> PathBuf {
-        self.data_dir.join(format!("{}-{node_id}", self.instance_prefix))
+        self.data_dir
+            .join(format!("{}-{node_id}", self.instance_prefix))
     }
 
     /// Directory holding the Raft log segments.
@@ -124,7 +143,10 @@ mod tests {
         assert_eq!(Path::new("/data/cluster-a-2"), config.node_dir(2));
         assert_ne!(config.log_dir(1), config.log_dir(2));
         assert_eq!(Path::new("/data/cluster-a-1/log"), config.log_dir(1));
-        assert_eq!(Path::new("/data/cluster-a-1/snapshot"), config.snapshot_dir(1));
+        assert_eq!(
+            Path::new("/data/cluster-a-1/snapshot"),
+            config.snapshot_dir(1)
+        );
     }
 
     #[test]
@@ -132,6 +154,19 @@ mod tests {
         assert!(StorageConfig::new("/data").match_event_log.is_none());
 
         let config = StorageConfig::new("/data").with_match_event_log("/data/events.jsonl");
-        assert_eq!(Some(PathBuf::from("/data/events.jsonl")), config.match_event_log);
+        assert_eq!(
+            Some(PathBuf::from("/data/events.jsonl")),
+            config.match_event_log
+        );
+    }
+
+    #[test]
+    fn market_data_is_opt_in() {
+        assert!(StorageConfig::new("/data").market_data.is_none());
+
+        let config =
+            StorageConfig::new("/data").with_market_data(MarketDataConfig::jsonl("/data/md.jsonl"));
+        let market_data = config.market_data.expect("market data enabled");
+        assert_eq!(Some(PathBuf::from("/data/md.jsonl")), market_data.log_path);
     }
 }

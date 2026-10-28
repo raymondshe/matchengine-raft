@@ -82,6 +82,20 @@ fn main() {
         assert_eq!(1000, ob.bids.len());
     });
 
+    // Resting with the market-data tap enabled: the same insert path plus one
+    // journal append per order (the matching-thread cost of the feed).
+    bench("rest 1k bids + journal", 100, || {
+        let mut ob = OrderBook::new();
+        ob.enable_depth_journal();
+        for i in 0..1000u32 {
+            let price = 100.0 - f64::from(i / 10) * 0.01;
+            let mut bid = resting(OrderSide::Buy, price, 1.0);
+            bid.id = u64::from(i);
+            ob.place_order(&mut bid);
+        }
+        assert_eq!(1000, ob.take_depth_journal().len());
+    });
+
     // Partial fills: many takers nibble at one huge maker.
     bench("partial fills 1k", 100, || {
         let mut ob = OrderBook::new();

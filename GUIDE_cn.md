@@ -282,7 +282,17 @@ curl -X POST -H "Content-Type: application/json" \
 - `orderbook_last_trade_price`：最后成交价（首笔成交前为 `null`）；
 - `orderbook_depth`：买卖两侧前 10 档聚合深度（`orderbook_depth:N` 指定档数，上限 200）；
 - `orderbook_spread`：最优卖价减最优买价；
+- `marketdata_status`：行情 feed 计数器与发布门控（未启用行情时为 `{}`）；
 - `orderbook_sequence`：订单序列号（兼容旧拼写 `orderbook_sequance`）。
+
+### 行情数据输出（可选）
+
+`--market-data-log <file>`（环境变量 `MARKET_DATA_LOG`）开启 `docs/AERON_SOLUTION.md` 第二部分设计、
+`src/market_data/` 实现的确定性行情输出。撮合线程只把本来就知道的可见深度变化写入临时日志，并把
+`MatchEvent` 复制进有界队列；独立线程维护影子订单簿并发布成交、BBO、深度快照/增量、生命周期、
+OHLC K 线和状态心跳。只有领导者发布，每次获得领导权先发重置快照；队列满时丢弃帧并发送 `GAP`，
+`apply` 不会被阻塞。当前 sink 为调试用 JSONL，`src/market_data/wire.rs` 是可直接交给 Aeron 的
+二进制编码。
 
 ## 8. 测试
 

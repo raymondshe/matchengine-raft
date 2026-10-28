@@ -17,8 +17,11 @@ use actix_web::middleware::Logger;
 use actix_web::web::Data;
 use openraft::BasicNode;
 use openraft::Config;
+use openraft::async_runtime::WatchReceiver;
 
 use crate::app::MatchEngineApp;
+use crate::market_data::MarketDataControl;
+use crate::market_data::MarketDataHandle;
 use crate::match_result::FileLogSink;
 use crate::match_result::MatchResultSink;
 use crate::match_result::NoopSink;
@@ -37,10 +40,12 @@ pub use store::StorageConfig;
 pub mod app;
 /// Smart client module for interacting with the Raft cluster.
 pub mod client;
-/// Matching engine module with order book implementation.
-pub mod matchengine;
+/// Market-data egress: the deterministic feed pipeline (tap, shadow book, wire format).
+pub mod market_data;
 /// Pluggable processing of the match results (fills, rests, cancels) produced by the state machine.
 pub mod match_result;
+/// Matching engine module with order book implementation.
+pub mod matchengine;
 /// Network layer module for HTTP endpoints and Raft RPC.
 pub mod network;
 /// Storage layer module for Raft logs and state machine persistence.
@@ -87,6 +92,8 @@ pub struct MatchEngineNode {
     http_task: tokio::task::JoinHandle<()>,
     grpc_shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     grpc_task: tokio::task::JoinHandle<()>,
+    market_data: Option<MarketDataHandle>,
+    market_data_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl MatchEngineNode {
@@ -115,6 +122,15 @@ impl MatchEngineNode {
         }
         let _ = self.grpc_task.await;
 
+        // Stop the feed before Raft: the watcher must not push snapshots for a
+        // shutting-down node, and the publisher thread joins here.
+        if let Some(task) = self.market_data_task.take() {
+            task.abort();
+        }
+        if let Some(mut handle) = self.market_data.take() {
+            let _ = tokio::task::spawn_blocking(move || handle.shutdown()).await;
+        }
+
         self.raft
             .shutdown()
             .await
@@ -123,7 +139,10 @@ impl MatchEngineNode {
 }
 
 /// Starts a complete Raft node with an HTTP server, using the default transport.
-pub async fn start_match_engine_node(node_id: MatchEngineNodeId, http_addr: String) -> std::io::Result<()> {
+pub async fn start_match_engine_node(
+    node_id: MatchEngineNodeId,
+    http_addr: String,
+) -> std::io::Result<()> {
     start_match_engine_node_with_transport(node_id, http_addr, Transport::default()).await
 }
 
@@ -183,7 +202,14 @@ pub async fn start_match_engine_node_with_config(
     transport: Transport,
     config: Config,
 ) -> std::io::Result<()> {
-    start_match_engine_node_with_storage(node_id, http_addr, transport, config, StorageConfig::default()).await
+    start_match_engine_node_with_storage(
+        node_id,
+        http_addr,
+        transport,
+        config,
+        StorageConfig::default(),
+    )
+    .await
 }
 
 /// Starts a node with an explicit Raft configuration and storage layout.
@@ -194,7 +220,10 @@ pub async fn start_match_engine_node_with_storage(
     config: Config,
     storage: StorageConfig,
 ) -> std::io::Result<()> {
-    build_match_engine_node(node_id, http_addr, transport, config, storage).await?.run().await
+    build_match_engine_node(node_id, http_addr, transport, config, storage)
+        .await?
+        .run()
+        .await
 }
 
 /// Builds a node without waiting for it to stop.
@@ -231,10 +260,17 @@ pub async fn build_match_engine_node(
         Some(path) => Arc::new(FileLogSink::open(path)?.with_node_id(node_id)),
         None => Arc::new(NoopSink),
     };
+    // Start the market-data publisher before the state machine so the tap can
+    // be installed at open; it is node-local and never affects replication.
+    let market_data = match &storage.market_data {
+        Some(config) => Some(MarketDataHandle::start(config.clone(), node_id)?),
+        None => None,
+    };
     // Load the latest snapshot, if any. openraft replays the retained log tail on top of it.
-    let state_machine_store = StateMachineStore::open_with_sink(
+    let state_machine_store = StateMachineStore::open_with_sinks(
         storage.snapshot_dir(node_id),
         match_result_sink,
+        market_data.as_ref().map(|handle| handle.tap()),
     )?;
 
     tracing::info!(
@@ -259,6 +295,21 @@ pub async fn build_match_engine_node(
     )
     .await
     .map_err(|e| std::io::Error::other(format!("failed to create Raft instance: {e}")))?;
+
+    // The feed follows leadership: on every gain it resets consumers with a
+    // snapshot, then publishes this node's applied entries.
+    let market_data_task = market_data.as_ref().map(|handle| {
+        spawn_market_data_watch(
+            node_id,
+            raft.clone(),
+            state_machine_store.clone(),
+            handle.control(),
+            storage
+                .market_data
+                .as_ref()
+                .map_or(10, |config| config.depth_levels),
+        )
+    });
 
     // Serve the gRPC transport. The listener is already bound, so peers can
     // connect as soon as this node is initialized.
@@ -338,5 +389,41 @@ pub async fn build_match_engine_node(
         http_task,
         grpc_shutdown: Some(grpc_shutdown),
         grpc_task,
+        market_data,
+        market_data_task,
+    })
+}
+
+/// Watches Raft leadership and steers the market-data feed.
+///
+/// On becoming leader: open the gate and push a fresh snapshot (the reset point
+/// for consumers). On losing it: close the gate so a deposed leader stops
+/// publishing. The loop also handles a node that starts as leader.
+fn spawn_market_data_watch(
+    node_id: MatchEngineNodeId,
+    raft: MatchEngineRaft,
+    state_machine: StateMachineStore,
+    control: MarketDataControl,
+    depth_levels: usize,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut metrics = raft.metrics();
+        let mut leader = false;
+        loop {
+            let is_leader = metrics.borrow_and_update().current_leader == Some(node_id);
+            if is_leader != leader {
+                leader = is_leader;
+                control.set_leader(leader);
+                if leader {
+                    let snapshot = state_machine
+                        .capture_market_data_snapshot(depth_levels, 0)
+                        .await;
+                    control.push_snapshot(snapshot);
+                }
+            }
+            if metrics.changed().await.is_err() {
+                return;
+            }
+        }
     })
 }
