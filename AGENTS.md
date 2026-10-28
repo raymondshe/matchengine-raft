@@ -75,13 +75,22 @@ Single-crate Rust project (edition 2024): a Raft-replicated order-book matching 
 - Rejections (FOK unfillable, post-only crossing, stop already crossed, invalid shape) do not enter
   the book; `apply` publishes a `rejected` event with a `reason` and the write still returns the
   assigned sequence. Event kinds are `fill`, `rested`, `cancelled`, `triggered`, `expired`,
-  `rejected`; a stop cascade keeps increasing ordinals inside the same log entry.
+  `rejected`, `amended`; a stop cascade keeps increasing ordinals inside the same log entry.
+- `OrderBook::amend` changes a plain resting limit order keyed like `cancel` (side + current price +
+  sequence): a same-price volume reduction keeps the sequence (time priority) and updates in place;
+  a new price or a larger volume re-inserts under a NEW sequence, which the `/write` response
+  returns. Crossing amendments are refused (`amend_would_cross`); icebergs, parked stops and market
+  orders are cancel + re-place. `OrderBook::spread`/`mid_price`/`depth` are read-only views (depth
+  aggregates visible volume only, hidden iceberg reserve excluded).
 - `Order` deserializes `sequence`; the scripts now send `sequence` too. `Order::sequence` is still
   required by the deserializer even though `place_order()` overwrites it.
 - Match results leave `apply` as `MatchEvent`s through a `MatchResultSink`. `EventId` is
   `(log_index, ordinal)`, so no event counter is stored in snapshots; `OrderBook::resting_volume`
   is the authoritative source for a `Rested` event's volume (do not derive it by subtraction).
-- `/read` keys are resolved by `read_state` in `src/network/api.rs`: `orderbook_orders`, and `orderbook_sequence` (misspelled variant `orderbook_sequance` also accepted). Any other key returns an empty string; there is no KV store.
+- `/read` keys are resolved by `read_state` in `src/network/api.rs`: `orderbook_orders`,
+  `orderbook_stops`, `orderbook_last_trade_price`, `orderbook_depth` (`orderbook_depth:N` for N
+  levels, capped at 200), `orderbook_spread`, and `orderbook_sequence` (misspelled variant
+  `orderbook_sequance` also accepted). Any other key returns an empty string; there is no KV store.
 
 ## Docs vs code
 
@@ -91,7 +100,8 @@ Single-crate Rust project (edition 2024): a Raft-replicated order-book matching 
   is implemented (`src/network/grpc/`) and is the default, HTTP remains selectable, and no transport
   benchmark exists. Read `docs/TRANSPORTS.md`'s status banner before treating its numbers as results.
 - `docs/MATCH_RESULTS.md` describes match-result delivery. Phase 1a is implemented: `apply`
-  publishes `Fill`/`Rested`/`Cancelled` events to a `MatchResultSink`, and `--match-event-log`
+  publishes `Fill`/`Rested`/`Cancelled`/`Triggered`/`Expired`/`Rejected`/`Amended` events to a
+  `MatchResultSink`, and `--match-event-log`
   installs a file sink for debugging. Still proposals: events in the `/write` response, the
   replicated event log, `/events` and `client_order_id` dedupe. Do not describe those as existing
   behaviour.

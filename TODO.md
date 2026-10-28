@@ -119,6 +119,14 @@ vote/committed persistence, snapshot build/install/reopen) and `tests/cluster/te
   Expiry is deterministic via `PurgeExpired { now_ms, day_close_ms }`; stops park off the book and
   are elected by the replicated last trade price. Events: `triggered`, `expired`, `rejected` join
   `fill`/`rested`/`cancelled`.
+- [x] Order amendment (`Amend`): price and/or open volume of a plain resting limit order, keyed by
+  side + current price + sequence. Same-price reductions keep time priority; price changes and size
+  increases re-insert under a new sequence. Crossing amendments are refused; icebergs, stops and
+  market orders are cancel + re-place. `spread`/`mid_price`/`depth` helpers and the
+  `orderbook_depth`/`orderbook_spread` read keys are in place.
+- [ ] Amend parked stops (change trigger price/volume) and icebergs (tranche semantics); a
+  sequence→location index would also allow cancel/amend by sequence alone, at the cost of index
+  maintenance in the sweep or tombstone compaction.
 - [ ] OrderBook-rs types not ported yet: trailing stops (watermark + trail amount, child on a new
   print), pegged orders (reference price offsets), custom reserve replenishment, stop-protection
   collars, market-to-limit, and self-trade prevention.
@@ -162,5 +170,5 @@ Remaining:
 ## 11. Client library and benchmarks
 
 - [ ] Harden `src/client.rs` before it is used outside the examples: retry/backoff on transient RPC errors, configurable timeouts, and a typed error for "no known leader" instead of a bare message.
-- [x] Order-book micro-benchmarks: `cargo bench --bench matchengine` (sweep wide/deep, rest, partial fill, cancel; best-of-5 per round, no framework).
+- [x] Order-book micro-benchmarks: `cargo bench --bench matchengine` (sweep wide/deep, rest, partial fill, IOC cancel, iceberg refill, amend, cancel; best-of-5 per round, no framework).
 - [ ] Add end-to-end latency benchmarks (submit → commit → apply → response) next to the transport harness in §10, so matching and replication costs can be separated.

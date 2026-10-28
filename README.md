@@ -362,10 +362,29 @@ Unsupported combinations (a stop that is also post-only or an iceberg, a post-on
 zero/negative size or price, a GTD deadline not after the order's own `timestamp`) are refused with
 a `rejected` event carrying the reason.
 
+### Order amendment
+
+`Amend` changes the price and/or open volume of a resting limit order. The request identifies the
+order exactly like `Cancel` — side, current price and sequence — and each new field is optional:
+
+```json
+{"Amend": {"order": {"live": "Limit", "side": "Buy", "price": 4000.0, "volume": 4.4, "id": 1, "sequence": 7}, "price": 4002.0, "volume": 3.0}}
+```
+
+- A same-price reduction keeps the order's sequence, so it keeps time priority.
+- A new price or a larger volume re-inserts the order with a new sequence (it loses priority); the
+  `/write` response carries the sequence to use from then on.
+- An amendment whose new price would cross the opposite side is refused (`amend_would_cross`): a
+  resting book never crosses, so taking liquidity is still cancel + place.
+- Icebergs, parked stops and market orders are not amendable (`unsupported_order`); cancel and
+  re-place them instead.
+- A successful amendment emits an `amended` event carrying both the previous and the new sequence;
+  a refused one returns `null` from `/write` and publishes a `rejected` event with the reason.
+
 ### Match-result processing
 
 `apply` turns every `MatchResult` into a `MatchEvent` (`fill`, `rested`, `cancelled`, `triggered`,
-`expired` or `rejected`) and hands it
+`expired`, `rejected` or `amended`) and hands it
 to a pluggable `MatchResultSink` (`src/match_result/mod.rs`). Events are derived from the applied log
 entry alone, so every replica produces the same ids; the sink itself is node-local and never
 influences the replicated state:
@@ -466,7 +485,7 @@ The gRPC transport exposes the same operations on `--http-addr` port + 1000
 
 ### Application APIs
 
-- `POST /write` - Submit a `Place`, `Cancel` or `PurgeExpired` request through Raft
+- `POST /write` - Submit a `Place`, `Cancel`, `Amend` or `PurgeExpired` request through Raft
 - `POST /read` - Read from the local state machine (may be stale)
 - `POST /linearizable_read` - Linearizable read; the request must reach the leader
 - `POST /follower_read` - Linearizable read served locally after fetching a linearizer from the leader
@@ -477,6 +496,9 @@ order book:
 - `orderbook_orders` - all orders resting in the book as a JSON array
 - `orderbook_stops` - the stop orders parked off the book, in admission order
 - `orderbook_last_trade_price` - the last trade price (`null` before the first trade), which elects stops
+- `orderbook_depth` - aggregated visible depth for the top 10 price levels per side
+  (`orderbook_depth:N` selects another count, capped at 200)
+- `orderbook_spread` - best ask minus best bid (`null` while either side is empty)
 - `orderbook_sequence` - the order sequence counter (`orderbook_sequance` is accepted as a legacy
   alias)
 

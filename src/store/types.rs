@@ -15,6 +15,7 @@ use crate::matchengine::Order;
 ///
 /// * `Place` - Adds an order to the order book (or parks it as a stop)
 /// * `Cancel` - Removes an order from the order book
+/// * `Amend` - Changes the price and/or open volume of a resting limit order
 /// * `PurgeExpired` - Evicts GTD/Day orders whose deadline has passed
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum MatchEngineRequest {
@@ -22,6 +23,18 @@ pub enum MatchEngineRequest {
     Place { order: Order },
     /// Cancel an existing order from the matching engine.
     Cancel { order: Order },
+    /// Amend a resting limit order. `order` identifies it exactly like `Cancel`
+    /// (side + current price + sequence); `price` and `volume` are the new
+    /// values, and `None` leaves a field unchanged.
+    Amend {
+        order: Order,
+        /// New price; omitted/`null` keeps the current one.
+        #[serde(default)]
+        price: Option<f64>,
+        /// New open volume; omitted/`null` keeps the current one.
+        #[serde(default)]
+        volume: Option<f64>,
+    },
     /// Evict every order whose time in force has expired at `now_ms`.
     ///
     /// The timestamps travel in the request (and therefore through the Raft
@@ -39,6 +52,15 @@ impl fmt::Display for MatchEngineRequest {
         match self {
             MatchEngineRequest::Place { order } => write!(f, "Place {{ order: {:?} }}", order),
             MatchEngineRequest::Cancel { order } => write!(f, "Cancel {{ order: {:?} }}", order),
+            MatchEngineRequest::Amend {
+                order,
+                price,
+                volume,
+            } => write!(
+                f,
+                "Amend {{ order: {:?}, price: {price:?}, volume: {volume:?} }}",
+                order
+            ),
             MatchEngineRequest::PurgeExpired {
                 now_ms,
                 day_close_ms,

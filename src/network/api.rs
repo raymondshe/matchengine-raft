@@ -35,6 +35,7 @@ use crate::store::state_machine::StateMachineStoreInner;
 /// The request can be:
 /// - `Place`: Submit an order (GTC/IOC/FOK/GTD/Day, post-only, iceberg or stop)
 /// - `Cancel`: Remove a resting order or cancel a parked stop
+/// - `Amend`: Change the price and/or open volume of a resting limit order
 /// - `PurgeExpired`: Evict GTD/Day orders whose deadline has passed (the
 ///   timestamps travel in the request, so the state machine stays deterministic)
 ///
@@ -62,6 +63,9 @@ pub async fn write(
 /// - `orderbook_orders`: Returns all orders resting in the book as JSON
 /// - `orderbook_stops`: Returns the parked stop orders as JSON
 /// - `orderbook_last_trade_price`: Returns the last trade price (`null` before the first trade)
+/// - `orderbook_depth`: Aggregated visible depth for the top 10 levels per side;
+///   `orderbook_depth:N` selects another level count (capped at 200)
+/// - `orderbook_spread`: Returns the best ask minus the best bid (`null` if either side is empty)
 /// - `orderbook_sequence`: Returns the current sequence number
 /// - `orderbook_sequance`: Accepted as a legacy spelling of the above
 ///
@@ -220,10 +224,75 @@ where
             serde_json::to_string(&content.orders).unwrap_or_default()
         }
         "orderbook_stops" => serde_json::to_string(&inner.orderbook.stops).unwrap_or_default(),
+        "orderbook_depth" => depth_json(inner, 10),
+        "orderbook_spread" => serde_json::to_string(&inner.orderbook.spread()).unwrap_or_default(),
         "orderbook_last_trade_price" => {
             serde_json::to_string(&inner.orderbook.last_trade_price).unwrap_or_default()
         }
         "orderbook_sequence" | "orderbook_sequance" => inner.orderbook.sequence.to_string(),
+        _ if key.starts_with("orderbook_depth:") => {
+            let levels = key
+                .trim_start_matches("orderbook_depth:")
+                .parse::<usize>()
+                .unwrap_or(10)
+                .min(200);
+            depth_json(inner, levels)
+        }
         _ => String::new(),
+    }
+}
+
+/// Renders aggregated depth for both sides as one JSON object.
+fn depth_json<C>(inner: &StateMachineStoreInner<C>, levels: usize) -> String
+where
+    C: openraft::RaftTypeConfig<D = MatchEngineRequest, R = MatchEngineResponse>,
+{
+    serde_json::json!({
+        "bids": inner.orderbook.depth(crate::matchengine::OrderSide::Buy, levels),
+        "asks": inner.orderbook.depth(crate::matchengine::OrderSide::Sell, levels),
+    })
+    .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::MatchEngineTypeConfig;
+    use crate::matchengine::Order;
+    use crate::matchengine::OrderSide;
+
+    fn book() -> StateMachineStoreInner<MatchEngineTypeConfig> {
+        let mut inner = StateMachineStoreInner::<MatchEngineTypeConfig>::default();
+        for (price, volume) in [(100.0, 3.0), (100.0, 2.0), (99.0, 4.0)] {
+            let mut bid = Order::new(OrderSide::Buy, price, volume, 0);
+            inner.orderbook.execute_order(&mut bid);
+        }
+        let mut ask = Order::new(OrderSide::Sell, 101.0, 5.0, 0);
+        inner.orderbook.execute_order(&mut ask);
+        inner
+    }
+
+    #[test]
+    fn read_depth_aggregates_levels_and_honours_the_limit() {
+        let inner = book();
+
+        let depth: serde_json::Value =
+            serde_json::from_str(&read_state(&inner, "orderbook_depth:1")).unwrap();
+        assert_eq!(1, depth["bids"].as_array().unwrap().len());
+        assert_eq!(100.0, depth["bids"][0]["price"]);
+        assert_eq!(5.0, depth["bids"][0]["volume"]);
+        assert_eq!(2, depth["bids"][0]["orders"]);
+        assert_eq!(101.0, depth["asks"][0]["price"]);
+
+        let full: serde_json::Value =
+            serde_json::from_str(&read_state(&inner, "orderbook_depth")).unwrap();
+        assert_eq!(2, full["bids"].as_array().unwrap().len());
+    }
+
+    #[test]
+    fn read_spread_and_unknown_keys() {
+        let inner = book();
+        assert_eq!("1.0", read_state(&inner, "orderbook_spread"));
+        assert_eq!("", read_state(&inner, "nope"));
     }
 }

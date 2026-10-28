@@ -56,6 +56,8 @@ LogStore  StateMachineStore  RaftNetwork        HTTP API
 pub enum MatchEngineRequest {
     Place { order: Order },
     Cancel { order: Order },
+    // 修改挂单的限价/数量；order 用 方向+当前价格+序列号 定位
+    Amend { order: Order, price: Option<f64>, volume: Option<f64> },
     // 过期清除：时间戳随请求复制，apply 不读取时钟
     PurgeExpired { now_ms: u64, day_close_ms: Option<u64> },
 }
@@ -67,7 +69,9 @@ pub struct MatchEngineResponse {
 
 `Order`（`src/matchengine/mod.rs`）的核心字段是 `live`（Limit/Market）、`side`（Buy/Sell）、
 `price`、`volume`、`id` 和 `sequence`；`sequence` 在反序列化时是必需的，但 `place_order()` 会用
-订单簿自己的计数器覆盖它。订单类型通过带 serde 默认值的附加字段表达：`tif`（GTC/IOC/FOK/
+订单簿自己的计数器覆盖它。`OrderBook::amend` 修改普通挂单：同价位减量保留序列号（时间优先权），改价或增量会以新序列号
+重新入簿；会穿越对手方的修改被拒绝。冰山单、止损单和市价单请先撤销再下单。订单类型通过带
+serde 默认值的附加字段表达：`tif`（GTC/IOC/FOK/
 GTD(毫秒)/Day）、`post_only`、`stop_price`（`0.0` 表示非止损单）、`display_volume`（冰山单可见
 档位，`0.0` 表示非冰山单）、`hidden_volume`（冰山隐藏量）和 `timestamp`（客户端时间，用于校验
 GTD）。止损单在触发前停在订单簿之外；成交价触及止损价后作为立即执行的子单（剩余量撤销）。
@@ -276,6 +280,8 @@ curl -X POST -H "Content-Type: application/json" \
 - `orderbook_orders`：订单簿中所有挂单的 JSON 数组；
 - `orderbook_stops`：停在场外的止损单；
 - `orderbook_last_trade_price`：最后成交价（首笔成交前为 `null`）；
+- `orderbook_depth`：买卖两侧前 10 档聚合深度（`orderbook_depth:N` 指定档数，上限 200）；
+- `orderbook_spread`：最优卖价减最优买价；
 - `orderbook_sequence`：订单序列号（兼容旧拼写 `orderbook_sequance`）。
 
 ## 8. 测试

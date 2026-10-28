@@ -195,8 +195,8 @@ pub struct EventId {
     pub ordinal: u32,     // 0-based position inside that entry
 }
 
-// JSON: "rested", "fill", "cancelled", "triggered", "expired", "rejected"
-pub enum MatchEventKind { Rested, Fill, Cancelled, Triggered, Expired, Rejected }
+// JSON: "rested", "fill", "cancelled", "triggered", "expired", "rejected", "amended"
+pub enum MatchEventKind { Rested, Fill, Cancelled, Triggered, Expired, Rejected, Amended }
 
 pub struct MatchEvent {
     pub event_id: EventId,
@@ -205,11 +205,13 @@ pub struct MatchEvent {
     pub order_sequence: u64,
     /// The resting order's sequence on a fill.
     pub counterparty_sequence: Option<u64>,
+    /// On an amendment: the sequence the order had before it.
+    pub previous_sequence: Option<u64>,
     /// Maker price on a fill, order price otherwise.
     pub price: f64,
     /// Filled volume, resting remainder, the open volume a cancel/expiry
-    /// removed, the stop's open volume on a trigger, or the submitted volume
-    /// on a rejection.
+    /// removed, the stop's open volume on a trigger, the submitted volume on a
+    /// rejection, or the new open volume on an amendment.
     pub volume: f64,
     /// Why a `Rejected` (or `Expired`) event happened; omitted when absent.
     pub reason: Option<RejectReason>,
@@ -446,8 +448,10 @@ Implemented today (`cargo test --lib`, `cargo test --test cluster test_match_res
   order/counterparty sequences and the book's exact volumes.
 - The order-type paths publish their own kinds: `Triggered` (a parked stop was elected; its child's
   fills follow in the same entry, then a `Cancelled` for any remainder), `Expired` (a `PurgeExpired`
-  eviction) and `Rejected` (FOK unfillable, post-only crossing, stop already crossed, invalid
-  shape). Ordinals keep increasing across the whole entry, so a stop cascade stays one ordered batch.
+  eviction), `Amended` (a resting order changed price/volume; the event carries both the previous
+  and the new sequence) and `Rejected` (FOK unfillable, post-only crossing, stop already crossed,
+  amend of an unknown/unsupported order, invalid shape). Ordinals keep increasing across the whole
+  entry, so a stop cascade stays one ordered batch.
 - A cancel of an order that is not in the book publishes nothing.
 - A failing sink is logged and does not fail `apply` or change the state.
 - `FileLogSink` writes one JSON object per event with `node_id`, appends across reopen, and writes
@@ -521,8 +525,9 @@ endpoint.
 ## 10. Open questions
 
 1. **Retention default** — 262k events is a guess; measure postcard size and pick a memory budget.
-2. **Scope of v1 events** — answered for now: `Rested`, `Fill` and `Cancelled` are all emitted.
-   Revisit if clearing only wants fills and the extra volume matters.
+2. **Scope of v1 events** — answered for now: `Rested`, `Fill`, `Cancelled`, `Triggered`, `Expired`,
+   `Rejected` and `Amended` are all emitted. Revisit if clearing only wants fills and the extra
+   volume matters.
 3. **Consumer placement** — in-cluster sidecar pulling `/events`, or an external service? Affects
    whether long-poll/streaming is worth building.
 4. **Timestamp** — is a client-supplied ingest timestamp acceptable to clearing, given it is

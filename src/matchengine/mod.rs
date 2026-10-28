@@ -106,6 +106,14 @@ pub enum RejectReason {
     StopWouldTrigger,
     /// Good-'til-date: the expiry is not after the order's own timestamp.
     GtdAlreadyExpired,
+    /// Amend: no resting order matches the supplied key.
+    OrderNotFound,
+    /// Amend: the order cannot be amended (a stop or a market order, which do
+    /// not rest on the book).
+    UnsupportedOrder,
+    /// Amend: the new price would cross the opposite side. A resting book must
+    /// never cross; cancel and place a new order to take liquidity.
+    AmendWouldCross,
     /// Volume, price or an unsupported type combination is out of range.
     InvalidOrder,
 }
@@ -498,6 +506,62 @@ pub struct StopExecution {
     pub cancelled: Option<f64>,
 }
 
+/// A successful amendment: the order as it now rests, plus where it came from.
+#[derive(Debug, Clone)]
+pub struct Amendment {
+    /// The resting order after the amendment. Its `sequence` is the identity to
+    /// use from now on.
+    pub order: Order,
+    /// Sequence the order had before the amendment.
+    pub previous_sequence: u64,
+    /// Price the order rested at before the amendment.
+    pub previous_price: f64,
+    /// Open volume the order had before the amendment.
+    pub previous_volume: f64,
+}
+
+/// Why an amendment was refused. Nothing changes on any of these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AmendError {
+    /// No resting order matches the key (side + current price + sequence).
+    NotFound,
+    /// The order does not rest on the book (a parked stop or a market order).
+    NotResting,
+    /// Icebergs are not amendable: their hidden reserve has no well-defined
+    /// meaning for a replacement volume.
+    UnsupportedType,
+    /// The new price is not a positive finite number.
+    InvalidPrice,
+    /// The new volume is not a positive finite number.
+    InvalidVolume,
+    /// The new price would cross the opposite side.
+    WouldCross,
+}
+
+impl AmendError {
+    /// Maps the error onto the reason published on a `rejected` event.
+    pub fn reason(self) -> RejectReason {
+        match self {
+            AmendError::NotFound => RejectReason::OrderNotFound,
+            AmendError::NotResting | AmendError::UnsupportedType => RejectReason::UnsupportedOrder,
+            AmendError::InvalidPrice | AmendError::InvalidVolume => RejectReason::InvalidOrder,
+            AmendError::WouldCross => RejectReason::AmendWouldCross,
+        }
+    }
+}
+
+/// One aggregated price level of the book, as returned by [`OrderBook::depth`].
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct DepthLevel {
+    /// Price of the level.
+    pub price: f64,
+    /// Total visible volume resting at the level (hidden iceberg reserve is
+    /// excluded, matching what the book itself can trade).
+    pub volume: f64,
+    /// Number of orders at the level.
+    pub orders: u32,
+}
+
 impl OrderBook {
     /// Creates a new, empty order book.
     ///
@@ -527,6 +591,63 @@ impl OrderBook {
     /// Returns `None` if there are no ask orders in the book.
     pub fn best_ask(&self) -> Option<&Order> {
         self.asks.first_key_value().map(|(_key, value)| value)
+    }
+
+    /// Best ask minus best bid, if both sides of the book are populated.
+    ///
+    /// A crossed book never exists after a successful submission, so the
+    /// spread is non-negative for a live book.
+    pub fn spread(&self) -> Option<f64> {
+        match (self.best_bid(), self.best_ask()) {
+            (Some(bid), Some(ask)) => Some(ask.price - bid.price),
+            _ => None,
+        }
+    }
+
+    /// Midpoint between the best bid and the best ask, if both exist.
+    pub fn mid_price(&self) -> Option<f64> {
+        match (self.best_bid(), self.best_ask()) {
+            (Some(bid), Some(ask)) => Some((bid.price + ask.price) / 2.0),
+            _ => None,
+        }
+    }
+
+    /// Aggregated visible depth for one side, best price first, up to `levels`
+    /// distinct prices.
+    ///
+    /// Volume counts the visible tranche of each order; an iceberg's hidden
+    /// reserve is invisible to the book, so it is invisible here too. The
+    /// returned levels are a snapshot: later mutations are not reflected.
+    pub fn depth(&self, side: OrderSide, levels: usize) -> Vec<DepthLevel> {
+        let mut depth: Vec<DepthLevel> = Vec::with_capacity(levels.min(64));
+        if levels == 0 {
+            return depth;
+        }
+
+        let orders: Box<dyn Iterator<Item = &Order>> = match side {
+            OrderSide::Buy => Box::new(self.bids.values()),
+            OrderSide::Sell => Box::new(self.asks.values()),
+        };
+
+        for order in orders {
+            let same_level = depth.last().is_some_and(|level| level.price == order.price);
+            if same_level {
+                let level = depth.last_mut().expect("checked above");
+                level.volume += order.volume;
+                level.orders += 1;
+            } else if depth.len() < levels {
+                depth.push(DepthLevel {
+                    price: order.price,
+                    volume: order.volume,
+                    orders: 1,
+                });
+            } else {
+                // A new price level beyond the requested depth ends the walk.
+                break;
+            }
+        }
+
+        depth
     }
 
     /// Inserts an order directly into the book without attempting to match it.
@@ -702,6 +823,116 @@ impl OrderBook {
                 return self.asks.remove(&key);
             }
         }
+    }
+
+    /// Amends the price and/or open volume of a resting limit order.
+    ///
+    /// The key identifies the order exactly like [`OrderBook::cancel`]: side,
+    /// current price and sequence. `price` and `volume` are the new values;
+    /// `None` leaves a field unchanged.
+    ///
+    /// Priority follows the usual exchange rule:
+    ///
+    /// - same price and a volume that does not grow: the order keeps its
+    ///   sequence, so it keeps time priority and is updated in place;
+    /// - a new price or a larger volume: the order is re-inserted with a new
+    ///   sequence, so it loses time priority. The returned [`Amendment`]
+    ///   carries the identity to use from now on.
+    ///
+    /// An amendment whose new price would cross the opposite side is refused
+    /// ([`AmendError::WouldCross`]): a resting book must never cross, so taking
+    /// liquidity is cancel + place. Icebergs, parked stops and market orders are
+    /// not amendable ([`AmendError::UnsupportedType`] /
+    /// [`AmendError::NotResting`]).
+    pub fn amend(
+        &mut self,
+        key: &Order,
+        price: Option<f64>,
+        volume: Option<f64>,
+    ) -> Result<Amendment, AmendError> {
+        if let Some(price) = price
+            && !(price.is_finite() && price > 0.0)
+        {
+            return Err(AmendError::InvalidPrice);
+        }
+        if let Some(volume) = volume
+            && !(volume.is_finite() && volume > 0.0)
+        {
+            return Err(AmendError::InvalidVolume);
+        }
+        if key.is_stop() {
+            return Err(AmendError::NotResting);
+        }
+
+        let stored = match key.side {
+            OrderSide::Buy => *self
+                .bids
+                .get(&BidKey {
+                    price: key.price,
+                    sequence: key.sequence,
+                })
+                .ok_or(AmendError::NotFound)?,
+            OrderSide::Sell => *self
+                .asks
+                .get(&AskKey {
+                    price: key.price,
+                    sequence: key.sequence,
+                })
+                .ok_or(AmendError::NotFound)?,
+        };
+
+        if stored.live != OrderType::Limit {
+            return Err(AmendError::NotResting);
+        }
+        if stored.display_volume > 0.0 {
+            return Err(AmendError::UnsupportedType);
+        }
+
+        let new_price = price.unwrap_or(stored.price);
+        let new_volume = volume.unwrap_or(stored.volume);
+
+        if new_price != stored.price {
+            let would_cross = match key.side {
+                OrderSide::Buy => self.best_ask().is_some_and(|ask| ask.price <= new_price),
+                OrderSide::Sell => self.best_bid().is_some_and(|bid| bid.price >= new_price),
+            };
+            if would_cross {
+                return Err(AmendError::WouldCross);
+            }
+        }
+
+        let next_sequence = self.sequence;
+        let (amendment, reinserted) = match key.side {
+            OrderSide::Buy => amend_in_map(
+                &mut self.bids,
+                BidKey {
+                    price: key.price,
+                    sequence: key.sequence,
+                },
+                stored,
+                new_price,
+                new_volume,
+                next_sequence,
+                |price, sequence| BidKey { price, sequence },
+            ),
+            OrderSide::Sell => amend_in_map(
+                &mut self.asks,
+                AskKey {
+                    price: key.price,
+                    sequence: key.sequence,
+                },
+                stored,
+                new_price,
+                new_volume,
+                next_sequence,
+                |price, sequence| AskKey { price, sequence },
+            ),
+        };
+        if reinserted {
+            self.sequence += 1;
+        }
+
+        Ok(amendment)
     }
 
     /// Volume of `order` that is still resting after [`OrderBook::place_order`], if any.
@@ -977,6 +1208,58 @@ impl OrderBook {
 
         removed
     }
+}
+
+/// Applies a validated amendment to one side of the book.
+///
+/// Returns the amendment and whether the order was re-inserted (which costs a
+/// new sequence, so the caller must advance the counter).
+fn amend_in_map<K: Ord>(
+    map: &mut BTreeMap<K, Order>,
+    key: K,
+    stored: Order,
+    new_price: f64,
+    new_volume: f64,
+    next_sequence: u64,
+    make_key: impl Fn(f64, u64) -> K,
+) -> (Amendment, bool) {
+    let previous_sequence = stored.sequence;
+    let previous_price = stored.price;
+    let previous_volume = stored.volume;
+
+    if new_price == stored.price && new_volume <= stored.volume {
+        // A same-price reduction keeps time priority, so the key survives.
+        let entry = map.get_mut(&key).expect("the caller looked the key up");
+        entry.volume = new_volume;
+        return (
+            Amendment {
+                order: *entry,
+                previous_sequence,
+                previous_price,
+                previous_volume,
+            },
+            false,
+        );
+    }
+
+    // Price changes and size increases lose time priority: re-insert the order
+    // under a fresh sequence so it queues behind everyone already at the level.
+    map.remove(&key).expect("the caller looked the key up");
+    let mut updated = stored;
+    updated.price = new_price;
+    updated.volume = new_volume;
+    updated.sequence = next_sequence;
+    map.insert(make_key(new_price, next_sequence), updated);
+
+    (
+        Amendment {
+            order: updated,
+            previous_sequence,
+            previous_price,
+            previous_volume,
+        },
+        true,
+    )
 }
 
 /// Checks an order's shape and whether its type combination is supported;
@@ -1833,5 +2116,192 @@ mod tests {
             ob.cancel(&request).is_none(),
             "a second cancel finds nothing"
         );
+    }
+
+    // --- Amendment
+
+    #[test]
+    fn amend_quantity_down_keeps_time_priority() {
+        let mut ob = OrderBook::new();
+        let mut first = resting_order(OrderSide::Buy, 100.0, 10.0, 1);
+        let mut second = resting_order(OrderSide::Buy, 100.0, 10.0, 2);
+        ob.place_order(&mut first);
+        ob.place_order(&mut second);
+
+        let amended = ob.amend(&first, None, Some(4.0)).expect("amendable");
+
+        assert_eq!(
+            first.sequence, amended.order.sequence,
+            "a reduction keeps the sequence"
+        );
+        assert_eq!(first.sequence, amended.previous_sequence);
+        assert_eq!(4.0, amended.order.volume);
+        let (key, best) = ob.bids.first_key_value().expect("the level survives");
+        assert_eq!(first.sequence, key.sequence, "still first at the level");
+        assert_eq!(4.0, best.volume);
+        assert_eq!(Some(4.0), ob.resting_volume(&amended.order));
+    }
+
+    #[test]
+    fn amend_size_up_loses_priority() {
+        let mut ob = OrderBook::new();
+        let mut first = resting_order(OrderSide::Buy, 100.0, 10.0, 1);
+        let mut second = resting_order(OrderSide::Buy, 100.0, 10.0, 2);
+        ob.place_order(&mut first);
+        ob.place_order(&mut second);
+        let old_sequence = first.sequence;
+
+        let amended = ob.amend(&first, None, Some(15.0)).expect("amendable");
+
+        assert_eq!(old_sequence, amended.previous_sequence);
+        assert_eq!(
+            2, amended.order.sequence,
+            "the amendment takes a fresh sequence"
+        );
+        let (key, _) = ob.bids.first_key_value().expect("both orders remain");
+        assert_eq!(
+            second.sequence, key.sequence,
+            "the untouched order now leads"
+        );
+    }
+
+    #[test]
+    fn amend_price_moves_the_order_and_keeps_its_fields() {
+        let mut ob = OrderBook::new();
+        let mut ask = resting_order(OrderSide::Sell, 101.0, 10.0, 1);
+        ask.tif = TimeInForce::Gtd(9_000);
+        ask.timestamp = 1_000;
+        ob.place_order(&mut ask);
+        let old_sequence = ask.sequence;
+
+        let amended = ob.amend(&ask, Some(102.0), None).expect("amendable");
+
+        assert_eq!(102.0, amended.order.price);
+        assert_eq!(
+            TimeInForce::Gtd(9_000),
+            amended.order.tif,
+            "the rest of the order survives"
+        );
+        assert_eq!(1_000, amended.order.timestamp);
+        assert_eq!(old_sequence, amended.previous_sequence);
+        assert_ne!(old_sequence, amended.order.sequence);
+        assert_eq!(
+            None,
+            ob.asks.get(&AskKey {
+                price: 101.0,
+                sequence: old_sequence
+            })
+        );
+        assert_eq!(Some(102.0), ob.best_ask().map(|order| order.price));
+    }
+
+    #[test]
+    fn amend_refuses_unknown_crossing_and_unsupported_orders() {
+        let mut ob = OrderBook::new();
+        let mut ask = resting_order(OrderSide::Sell, 100.0, 5.0, 1);
+        ob.place_order(&mut ask);
+        let mut bid = resting_order(OrderSide::Buy, 99.0, 5.0, 2);
+        ob.place_order(&mut bid);
+
+        let unknown = resting_order(OrderSide::Buy, 99.0, 5.0, 99);
+        assert_eq!(
+            Err(AmendError::NotFound),
+            ob.amend(&unknown, Some(98.0), None).map(|_| ())
+        );
+
+        // Moving the bid through the ask would cross the book.
+        assert_eq!(
+            Err(AmendError::WouldCross),
+            ob.amend(&bid, Some(101.0), None).map(|_| ())
+        );
+
+        assert_eq!(
+            Err(AmendError::InvalidVolume),
+            ob.amend(&bid, None, Some(0.0)).map(|_| ())
+        );
+        assert_eq!(
+            Err(AmendError::InvalidPrice),
+            ob.amend(&bid, Some(-1.0), None).map(|_| ())
+        );
+
+        // Stops park off the book and cannot be amended.
+        let mut stop = order_with(OrderSide::Sell, 0.0, 5.0, 3, |o| {
+            o.live = OrderType::Market;
+            o.stop_price = 95.0;
+        });
+        ob.execute_order(&mut stop);
+        assert_eq!(
+            Err(AmendError::NotResting),
+            ob.amend(&stop, None, Some(1.0)).map(|_| ())
+        );
+
+        // Icebergs have no well-defined replacement volume here.
+        let mut iceberg = order_with(OrderSide::Sell, 103.0, 10.0, 4, |o| o.display_volume = 4.0);
+        ob.place_order(&mut iceberg);
+        assert_eq!(
+            Err(AmendError::UnsupportedType),
+            ob.amend(&iceberg, None, Some(9.0)).map(|_| ())
+        );
+    }
+
+    // --- Depth and spread
+
+    #[test]
+    fn depth_aggregates_levels_and_reports_spread() {
+        let mut ob = OrderBook::new();
+        for (price, volume) in [(100.0, 1.0), (100.0, 2.0), (99.0, 3.0), (98.0, 4.0)] {
+            let mut bid = resting_order(OrderSide::Buy, price, volume, 0);
+            ob.place_order(&mut bid);
+        }
+        let mut ask1 = resting_order(OrderSide::Sell, 101.0, 5.0, 0);
+        let mut ask2 = resting_order(OrderSide::Sell, 102.0, 6.0, 0);
+        ob.place_order(&mut ask1);
+        ob.place_order(&mut ask2);
+
+        let bids = ob.depth(OrderSide::Buy, 2);
+        assert_eq!(
+            vec![
+                DepthLevel {
+                    price: 100.0,
+                    volume: 3.0,
+                    orders: 2
+                },
+                DepthLevel {
+                    price: 99.0,
+                    volume: 3.0,
+                    orders: 1
+                },
+            ],
+            bids
+        );
+
+        let asks = ob.depth(OrderSide::Sell, 10);
+        assert_eq!(2, asks.len());
+        assert_eq!(101.0, asks[0].price);
+
+        assert_eq!(Some(1.0), ob.spread());
+        assert_eq!(Some(100.5), ob.mid_price());
+        assert!(ob.depth(OrderSide::Buy, 0).is_empty());
+    }
+
+    #[test]
+    fn depth_ignores_hidden_iceberg_reserve() {
+        let mut ob = OrderBook::new();
+        let mut iceberg = order_with(OrderSide::Sell, 100.0, 10.0, 1, |o| o.display_volume = 4.0);
+        ob.place_order(&mut iceberg);
+
+        let asks = ob.depth(OrderSide::Sell, 5);
+        assert_eq!(1, asks.len());
+        assert_eq!(4.0, asks[0].volume, "only the visible tranche is depth");
+        assert_eq!(1, asks[0].orders);
+    }
+
+    #[test]
+    fn an_empty_book_has_no_spread() {
+        let ob = OrderBook::new();
+        assert_eq!(None, ob.spread());
+        assert_eq!(None, ob.mid_price());
+        assert!(ob.depth(OrderSide::Buy, 10).is_empty());
+        assert!(ob.depth(OrderSide::Sell, 10).is_empty());
     }
 }

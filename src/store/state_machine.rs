@@ -432,6 +432,31 @@ where
                         }
                         MatchEngineResponse::none()
                     }
+                    MatchEngineRequest::Amend {
+                        order,
+                        price,
+                        volume,
+                    } => match inner.orderbook.amend(order, *price, *volume) {
+                        Ok(amendment) => {
+                            self.publish_match_events(&[MatchEvent::for_amended(
+                                entry.log_id.index,
+                                0,
+                                &amendment,
+                            )]);
+                            // A price change or a size increase re-inserts the order:
+                            // the response carries the identity to use from now on.
+                            MatchEngineResponse::new(amendment.order.sequence.to_string())
+                        }
+                        Err(err) => {
+                            self.publish_match_events(&[MatchEvent::for_rejected(
+                                entry.log_id.index,
+                                0,
+                                order,
+                                err.reason(),
+                            )]);
+                            MatchEngineResponse::none()
+                        }
+                    },
                     MatchEngineRequest::PurgeExpired {
                         now_ms,
                         day_close_ms,
@@ -947,6 +972,95 @@ mod tests {
         assert_eq!(0, expired.order_sequence, "the GTD order");
         assert_eq!(1.0, expired.volume);
         assert_eq!(7, expired.event_id.log_index);
+    }
+
+    /// Amendment goes through `apply`: the event carries both identities and the
+    /// book keeps the new size; a failed amend publishes a rejection.
+    #[tokio::test]
+    async fn apply_publishes_amended_and_rejected_events() {
+        use crate::match_result::MatchEventKind;
+        use crate::match_result::MemorySink;
+        use crate::matchengine::Order;
+        use crate::matchengine::OrderSide;
+        use crate::matchengine::RejectReason;
+        use openraft::alias::EntryOf;
+
+        fn entry(
+            index: u64,
+            payload: EntryPayloadOf<MatchEngineTypeConfig>,
+        ) -> EntryOf<MatchEngineTypeConfig> {
+            Entry {
+                log_id: log_id(1, index),
+                payload,
+            }
+        }
+
+        let dir = tempdir();
+        let sink = Arc::new(MemorySink::new());
+        let mut store =
+            StateMachineStore::<MatchEngineTypeConfig>::open_with_sink(dir.path(), sink.clone())
+                .unwrap();
+
+        // The key of an order uses side + price + sequence; `Order::new` sets the
+        // sequence, and the taker flow assigns the same one on apply.
+        let bid = Order::new(OrderSide::Buy, 100.0, 10.0, 0);
+        let entries = futures::stream::iter(vec![
+            Ok((
+                entry(
+                    1,
+                    EntryPayload::Normal(MatchEngineRequest::Place { order: bid }),
+                ),
+                None,
+            )),
+            Ok((
+                entry(
+                    2,
+                    EntryPayload::Normal(MatchEngineRequest::Amend {
+                        order: bid,
+                        price: None,
+                        volume: Some(12.0),
+                    }),
+                ),
+                None,
+            )),
+            Ok((
+                entry(
+                    3,
+                    EntryPayload::Normal(MatchEngineRequest::Amend {
+                        order: Order::new(OrderSide::Buy, 100.0, 1.0, 42),
+                        price: Some(99.0),
+                        volume: None,
+                    }),
+                ),
+                None,
+            )),
+        ]);
+        store.apply(entries).await.unwrap();
+
+        let events = sink.events();
+        assert_eq!(3, events.len(), "unexpected events: {events:?}");
+
+        assert_eq!(MatchEventKind::Rested, events[0].kind);
+
+        let amended = &events[1];
+        assert_eq!(MatchEventKind::Amended, amended.kind);
+        assert_eq!(
+            1, amended.order_sequence,
+            "the amendment takes a new sequence"
+        );
+        assert_eq!(Some(0), amended.previous_sequence);
+        assert_eq!(100.0, amended.price);
+        assert_eq!(12.0, amended.volume);
+
+        let rejected = &events[2];
+        assert_eq!(MatchEventKind::Rejected, rejected.kind);
+        assert_eq!(Some(RejectReason::OrderNotFound), rejected.reason);
+
+        let inner = store.inner().lock().await;
+        let best = inner.orderbook.best_bid().expect("the bid remains");
+        assert_eq!(12.0, best.volume);
+        assert_eq!(1, best.sequence);
+        assert_eq!(2, inner.orderbook.sequence);
     }
 
     struct TempDir(PathBuf);

@@ -121,6 +121,23 @@ fn main() {
         assert!(ob.asks.is_empty());
     });
 
+    // Amends: same-price reductions keep the sequence and update in place.
+    bench("amend 1k", 100, || {
+        let mut ob = OrderBook::new();
+        let mut orders = Vec::with_capacity(1000);
+        for i in 0..1000u32 {
+            let mut bid = resting(OrderSide::Buy, 100.0 - f64::from(i / 10) * 0.01, 10.0);
+            bid.id = u64::from(i);
+            ob.place_order(&mut bid);
+            orders.push(bid);
+        }
+        for order in &orders {
+            let amended = ob.amend(order, None, Some(5.0)).expect("amendable");
+            assert_eq!(order.sequence, amended.order.sequence);
+        }
+        assert_eq!(1000, ob.bids.len());
+    });
+
     // Cancels: exact-key removals against a resting book.
     bench("cancel 1k", 100, || {
         let mut ob = OrderBook::new();

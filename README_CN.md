@@ -342,10 +342,26 @@ Raft 日志追加写入 `log/NNNNNNNNNN.wal` 分段文件：
 不支持的组合（止损单同时是 Post-Only 或冰山单、Post-Only 市价单、数量或价格非正、GTD 截止时间
 不晚于订单自身的 `timestamp`）会被拒绝，并产生带原因的 `rejected` 事件。
 
+### 订单修改
+
+`Amend` 修改一笔挂单的限价和/或未成交数量。请求与 `Cancel` 一样通过 方向、当前价格和序列号
+定位订单，新字段均可选：
+
+```json
+{"Amend": {"order": {"live": "Limit", "side": "Buy", "price": 4000.0, "volume": 4.4, "id": 1, "sequence": 7}, "price": 4002.0, "volume": 3.0}}
+```
+
+- 同价位减少数量会保留序列号，因此保留时间优先权；
+- 修改价格或增加数量会以新序列号重新入簿（失去优先权），`/write` 响应返回之后使用的序列号；
+- 新价格会与对手方成交的修改会被拒绝（`amend_would_cross`）：挂单簿永不交叉，吃单仍需先撤后下；
+- 冰山单、停在场外的止损单和市价单不可修改（`unsupported_order`），请撤销后重新下单；
+- 成功的修改会产生 `amended` 事件，同时携带旧序列号和新序列号；被拒绝的修改在 `/write` 中返回
+  `null`，并产生带原因的 `rejected` 事件。
+
 ### 撮合结果处理
 
 `apply` 会把每个 `MatchResult` 转换成 `MatchEvent`（`fill` / `rested` / `cancelled` / `triggered` /
-`expired` / `rejected`），再交给可替换的
+`expired` / `rejected` / `amended`），再交给可替换的
 `MatchResultSink`（`src/match_result/mod.rs`）。事件只由已应用的日志条目推导，因此每个副本产生相同的
 id；sink 本身是节点本地配置，绝不会影响复制状态：
 
@@ -440,7 +456,7 @@ gRPC 传输在 `--http-addr` 端口 + 1000 上暴露相同操作（`AppendEntrie
 
 ### 应用 API
 
-- `POST /write` - 通过 Raft 提交 `Place`、`Cancel` 或 `PurgeExpired` 请求
+- `POST /write` - 通过 Raft 提交 `Place`、`Cancel`、`Amend` 或 `PurgeExpired` 请求
 - `POST /read` - 从本地状态机读取（可能读到旧值）
 - `POST /linearizable_read` - 线性一致性读；请求必须到达领导者
 - `POST /follower_read` - 从领导者获取 linearizer 后在本地完成的线性一致性读
@@ -450,6 +466,8 @@ gRPC 传输在 `--http-addr` 端口 + 1000 上暴露相同操作（`AppendEntrie
 - `orderbook_orders` - 订单簿中所有挂单的 JSON 数组
 - `orderbook_stops` - 停在订单簿之外的止损单（按准入顺序）
 - `orderbook_last_trade_price` - 最后成交价（首笔成交前为 `null`），用于触发止损
+- `orderbook_depth` - 买卖两侧前 10 档的聚合可见深度（`orderbook_depth:N` 可指定档数，上限 200）
+- `orderbook_spread` - 最优卖价减最优买价（任一侧为空时为 `null`）
 - `orderbook_sequence` - 订单序列号计数器（兼容旧拼写 `orderbook_sequance`）
 
 `/write` 接受的订单示例（注意字段名是 `sequence`）：

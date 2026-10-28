@@ -32,6 +32,7 @@ use std::sync::MutexGuard;
 use serde::Deserialize;
 use serde::Serialize;
 
+use crate::matchengine::Amendment;
 use crate::matchengine::MatchResult;
 use crate::matchengine::Order;
 use crate::matchengine::RejectReason;
@@ -66,6 +67,11 @@ pub enum MatchEventKind {
     /// An order was refused outright and never entered the book; `reason`
     /// says why. Nothing executed and nothing rested.
     Rejected,
+    /// A resting order's price and/or open volume changed. `previous_sequence`
+    /// is the identity it had before; `order_sequence` is the identity to use
+    /// after (the same one when time priority was kept, a new one when the
+    /// amendment moved the order).
+    Amended,
 }
 
 /// A single order-lifecycle event produced while applying one Raft entry.
@@ -84,13 +90,17 @@ pub struct MatchEvent {
     pub order_sequence: u64,
     /// For a [`MatchEventKind::Fill`]: the resting order's sequence. `None` otherwise.
     pub counterparty_sequence: Option<u64>,
+    /// For a [`MatchEventKind::Amended`]: the sequence the order had before the
+    /// amendment. `None` otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_sequence: Option<u64>,
     /// Execution price for a fill, the trigger price for a stop election, the order price
     /// otherwise.
     pub price: f64,
     /// Executed volume for a fill; resting remainder for [`MatchEventKind::Rested`]; the volume
     /// that was still open for [`MatchEventKind::Cancelled`] and [`MatchEventKind::Expired`]; the
     /// stop's open volume for [`MatchEventKind::Triggered`]; the submitted volume for
-    /// [`MatchEventKind::Rejected`].
+    /// [`MatchEventKind::Rejected`]; the new open volume for [`MatchEventKind::Amended`].
     pub volume: f64,
     /// The policy reason behind a rejection or expiry. Absent (and omitted from the JSON lines)
     /// for every other kind.
@@ -120,6 +130,7 @@ impl MatchEvent {
                 kind: MatchEventKind::Fill,
                 order_sequence: taker_sequence,
                 counterparty_sequence: Some(m.maker.sequence),
+                previous_sequence: None,
                 price: m.maker.price,
                 volume: m.matches,
                 reason: None,
@@ -161,6 +172,7 @@ impl MatchEvent {
                 kind: MatchEventKind::Rested,
                 order_sequence: taker.sequence,
                 counterparty_sequence: None,
+                previous_sequence: None,
                 price: taker.price,
                 volume,
                 reason: None,
@@ -194,6 +206,7 @@ impl MatchEvent {
             kind: MatchEventKind::Cancelled,
             order_sequence: order.sequence,
             counterparty_sequence: None,
+            previous_sequence: None,
             price: order.price,
             volume,
             reason: None,
@@ -213,6 +226,7 @@ impl MatchEvent {
             kind: MatchEventKind::Triggered,
             order_sequence: stop.sequence,
             counterparty_sequence: None,
+            previous_sequence: None,
             price: trigger_price,
             volume: stop.open_volume(),
             reason: None,
@@ -226,6 +240,7 @@ impl MatchEvent {
             kind: MatchEventKind::Expired,
             order_sequence: expired.sequence,
             counterparty_sequence: None,
+            previous_sequence: None,
             price: expired.price,
             volume: expired.open_volume(),
             reason: None,
@@ -244,9 +259,25 @@ impl MatchEvent {
             kind: MatchEventKind::Rejected,
             order_sequence: order.sequence,
             counterparty_sequence: None,
+            previous_sequence: None,
             price: order.price,
             volume: order.volume,
             reason: Some(reason),
+        }
+    }
+
+    /// A resting order was amended: `order_sequence` is the identity to use from
+    /// now on, `previous_sequence` the one it had before.
+    pub fn for_amended(log_index: u64, ordinal: u32, amendment: &Amendment) -> MatchEvent {
+        MatchEvent {
+            event_id: EventId { log_index, ordinal },
+            kind: MatchEventKind::Amended,
+            order_sequence: amendment.order.sequence,
+            counterparty_sequence: None,
+            previous_sequence: Some(amendment.previous_sequence),
+            price: amendment.order.price,
+            volume: amendment.order.volume,
+            reason: None,
         }
     }
 }
@@ -713,5 +744,30 @@ mod tests {
             serde_json::json!("post_only_would_cross"),
             lines[1]["reason"]
         );
+    }
+
+    #[test]
+    fn amended_event_moves_the_identity_and_records_the_old_one() {
+        let mut order = order(OrderSide::Buy, 101.0, 4.0, 0);
+        order.sequence = 9;
+        let amendment = Amendment {
+            order,
+            previous_sequence: 5,
+            previous_price: 100.0,
+            previous_volume: 4.0,
+        };
+
+        let event = MatchEvent::for_amended(12, 0, &amendment);
+
+        assert_eq!(MatchEventKind::Amended, event.kind);
+        assert_eq!(9, event.order_sequence);
+        assert_eq!(Some(5), event.previous_sequence);
+        assert_eq!(101.0, event.price);
+        assert_eq!(4.0, event.volume);
+        assert_eq!(None, event.counterparty_sequence);
+        assert_eq!(None, event.reason);
+
+        let json = serde_json::to_value(event).unwrap();
+        assert_eq!(serde_json::json!(5), json["previous_sequence"]);
     }
 }
