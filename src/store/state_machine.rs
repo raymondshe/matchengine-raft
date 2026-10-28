@@ -36,6 +36,7 @@ use openraft::storage::RaftStateMachine;
 use serde::Deserialize;
 use serde::Serialize;
 
+use crate::market_data::MarketDataControl;
 use crate::market_data::MarketDataTap;
 use crate::market_data::SnapshotFrame;
 use crate::market_data::TapFrame;
@@ -143,6 +144,7 @@ impl<C: RaftTypeConfig> StateMachineStoreInner<C> {
         // A restored state starts a new journal; the tap gets a snapshot from
         // the seeder rather than deltas that predate the restore.
         self.orderbook.take_depth_journal();
+        self.orderbook.rebuild_derived_indexes();
     }
 
     /// Converts the state machine to a serializable content format.
@@ -293,6 +295,7 @@ impl<C: RaftTypeConfig> StateMachineStore<C> {
         &self,
         inner: &mut StateMachineStoreInner<C>,
         log_index: u64,
+        market_seq: u64,
         ts_ms: u64,
         events: &[MatchEvent],
     ) {
@@ -305,6 +308,7 @@ impl<C: RaftTypeConfig> StateMachineStore<C> {
         }
         tap.publish(TapFrame {
             log_index,
+            market_seq,
             ts_ms,
             symbol_id: 0,
             events: events.to_vec(),
@@ -338,24 +342,25 @@ where
         symbol_id: u32,
     ) -> SnapshotFrame {
         let inner = self.inner.lock().await;
-        let log_index = inner
-            .last_applied_log
-            .as_ref()
-            .map_or(0, |log_id| log_id.index);
-        let ts_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|elapsed| elapsed.as_millis() as u64)
-            .unwrap_or_default();
-        SnapshotFrame {
-            log_index,
-            ts_ms,
-            symbol_id,
-            bids: inner.orderbook.depth(OrderSide::Buy, depth_levels),
-            asks: inner.orderbook.depth(OrderSide::Sell, depth_levels),
-            last_trade: inner.orderbook.last_trade_price,
-            book_sequence: inner.orderbook.sequence,
-            pending_stops: inner.orderbook.stops.len() as u32,
-        }
+        snapshot_from_inner(&inner, depth_levels, symbol_id)
+    }
+
+    /// Captures a reset snapshot, queues it and only then opens the feed gate.
+    ///
+    /// Holding the state-machine lock across "build and enqueue" is what makes
+    /// the ordering guarantee real: no frame applied before the capture can be
+    /// published after the snapshot, and no frame applied after the capture can
+    /// reach the processor before it (the snapshot is queued first, and the
+    /// gate opens only after it).
+    pub async fn start_market_data_feed(
+        &self,
+        control: &MarketDataControl,
+        depth_levels: usize,
+        symbol_id: u32,
+    ) {
+        let inner = self.inner.lock().await;
+        control.push_snapshot(snapshot_from_inner(&inner, depth_levels, symbol_id));
+        control.set_leader(true);
     }
 
     /// Writes the current in-memory content as a durable snapshot.
@@ -466,9 +471,16 @@ where
                                 events.push(MatchEvent::for_rejected(log_index, 0, &o, reason));
                             }
                             None => {
+                                for expired in &outcome.expired {
+                                    events.push(MatchEvent::for_expired(
+                                        log_index,
+                                        events.len() as u32,
+                                        expired,
+                                    ));
+                                }
                                 events.extend(MatchEvent::for_place_at(
                                     log_index,
-                                    0,
+                                    events.len() as u32,
                                     &o,
                                     &outcome.fills,
                                     outcome.resting,
@@ -507,7 +519,13 @@ where
                             }
                         }
                         self.publish_match_events(&events);
-                        self.publish_market_frame(&mut inner, log_index, o.timestamp, &events);
+                        self.publish_market_frame(
+                            &mut inner,
+                            log_index,
+                            outcome.market_seq,
+                            o.timestamp,
+                            &events,
+                        );
 
                         MatchEngineResponse {
                             value: Some(o.sequence.to_string()),
@@ -515,13 +533,36 @@ where
                     }
                     MatchEngineRequest::Cancel { order } => {
                         let log_index = entry.log_id.index;
+                        let market_seq = inner.orderbook.next_market_sequence();
                         let mut events = Vec::new();
+                        let expired_orders = if inner.orderbook.has_gtd_deadlines() {
+                            inner.orderbook.purge_due_gtd(order.timestamp)
+                        } else {
+                            Vec::new()
+                        };
+                        for expired in expired_orders {
+                            events.push(MatchEvent::for_expired(
+                                log_index,
+                                events.len() as u32,
+                                &expired,
+                            ));
+                        }
                         if let Some(cancelled) = inner.orderbook.cancel(order) {
-                            events.push(MatchEvent::for_cancel(log_index, &cancelled));
+                            events.push(MatchEvent::for_cancel_at(
+                                log_index,
+                                events.len() as u32,
+                                &cancelled,
+                            ));
                         }
                         self.publish_match_events(&events);
-                        self.publish_market_frame(&mut inner, log_index, order.timestamp, &events);
-                        MatchEngineResponse::none()
+                        self.publish_market_frame(
+                            &mut inner,
+                            log_index,
+                            market_seq,
+                            order.timestamp,
+                            &events,
+                        );
+                        MatchEngineResponse::new(market_seq.to_string())
                     }
                     MatchEngineRequest::Amend {
                         order,
@@ -529,27 +570,51 @@ where
                         volume,
                     } => {
                         let log_index = entry.log_id.index;
-                        let (events, response) = match inner.orderbook.amend(order, *price, *volume)
-                        {
-                            Ok(amendment) => (
-                                vec![MatchEvent::for_amended(log_index, 0, &amendment)],
-                                // A price change or a size increase re-inserts the
-                                // order: the response carries the new identity.
-                                MatchEngineResponse::new(amendment.order.sequence.to_string()),
-                            ),
-                            Err(err) => (
-                                vec![MatchEvent::for_rejected(log_index, 0, order, err.reason())],
-                                MatchEngineResponse::none(),
-                            ),
+                        let market_seq = inner.orderbook.next_market_sequence();
+                        let mut events = Vec::new();
+                        let expired_orders = if inner.orderbook.has_gtd_deadlines() {
+                            inner.orderbook.purge_due_gtd(order.timestamp)
+                        } else {
+                            Vec::new()
                         };
+                        for expired in expired_orders {
+                            events.push(MatchEvent::for_expired(
+                                log_index,
+                                events.len() as u32,
+                                &expired,
+                            ));
+                        }
+                        match inner
+                            .orderbook
+                            .amend_with_sequence(order, *price, *volume, market_seq)
+                        {
+                            Ok(amendment) => events.push(MatchEvent::for_amended(
+                                log_index,
+                                events.len() as u32,
+                                &amendment,
+                            )),
+                            Err(err) => events.push(MatchEvent::for_rejected(
+                                log_index,
+                                events.len() as u32,
+                                order,
+                                err.reason(),
+                            )),
+                        }
                         self.publish_match_events(&events);
-                        self.publish_market_frame(&mut inner, log_index, order.timestamp, &events);
-                        response
+                        self.publish_market_frame(
+                            &mut inner,
+                            log_index,
+                            market_seq,
+                            order.timestamp,
+                            &events,
+                        );
+                        MatchEngineResponse::new(market_seq.to_string())
                     }
                     MatchEngineRequest::PurgeExpired {
                         now_ms,
                         day_close_ms,
                     } => {
+                        let market_seq = inner.orderbook.next_market_sequence();
                         let expired = inner.orderbook.purge_expired(*now_ms, *day_close_ms);
                         let events: Vec<MatchEvent> = expired
                             .iter()
@@ -559,8 +624,14 @@ where
                             })
                             .collect();
                         self.publish_match_events(&events);
-                        self.publish_market_frame(&mut inner, entry.log_id.index, *now_ms, &events);
-                        MatchEngineResponse::new(expired.len().to_string())
+                        self.publish_market_frame(
+                            &mut inner,
+                            entry.log_id.index,
+                            market_seq,
+                            *now_ms,
+                            &events,
+                        );
+                        MatchEngineResponse::new(market_seq.to_string())
                     }
                 },
                 EntryPayload::Membership(mem) => {
@@ -728,6 +799,33 @@ where
     tokio::task::spawn_blocking(f)
         .await
         .map_err(|e| io::Error::other(format!("storage task panicked: {e}")))?
+}
+
+/// Builds a feed snapshot from the current in-memory state.
+fn snapshot_from_inner<C: RaftTypeConfig>(
+    inner: &StateMachineStoreInner<C>,
+    depth_levels: usize,
+    symbol_id: u32,
+) -> SnapshotFrame {
+    let log_index = inner
+        .last_applied_log
+        .as_ref()
+        .map_or(0, |log_id| log_id.index);
+    let ts_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or_default();
+    SnapshotFrame {
+        log_index,
+        market_seq: inner.orderbook.sequence, // next sequence: the reset boundary
+        ts_ms,
+        symbol_id,
+        bids: inner.orderbook.depth(OrderSide::Buy, depth_levels),
+        asks: inner.orderbook.depth(OrderSide::Sell, depth_levels),
+        last_trade: inner.orderbook.last_trade_price,
+        book_sequence: inner.orderbook.sequence,
+        pending_stops: inner.orderbook.stops.len() as u32,
+    }
 }
 
 #[cfg(test)]
@@ -1150,7 +1248,10 @@ mod tests {
         let best = inner.orderbook.best_bid().expect("the bid remains");
         assert_eq!(12.0, best.volume);
         assert_eq!(1, best.sequence);
-        assert_eq!(2, inner.orderbook.sequence);
+        assert_eq!(
+            3, inner.orderbook.sequence,
+            "the failed amend consumed a sequence"
+        );
     }
 
     /// `apply` hands events and the depth journal to the market-data tap with
@@ -1206,6 +1307,7 @@ mod tests {
 
         let frame = next_frame(&channels.receiver).await;
         assert_eq!(1, frame.log_index);
+        assert_eq!(0, frame.market_seq, "the bid's order sequence");
         assert_eq!(1_234, frame.ts_ms);
         assert_eq!(0, frame.symbol_id);
         assert_eq!(1, frame.events.len());
@@ -1228,6 +1330,7 @@ mod tests {
 
         let frame = next_frame(&channels.receiver).await;
         assert_eq!(2, frame.log_index);
+        assert_eq!(1, frame.market_seq, "the ask's order sequence");
         assert_eq!(2_000, frame.ts_ms);
         assert!(
             frame
@@ -1246,9 +1349,171 @@ mod tests {
 
         let snapshot = store.capture_market_data_snapshot(5, 0).await;
         assert_eq!(2, snapshot.log_index);
+        assert_eq!(2, snapshot.market_seq, "the next sequence is the boundary");
         assert_eq!(1, snapshot.bids.len(), "the bid remainder is captured");
         assert_eq!(6.0, snapshot.bids[0].volume);
         assert_eq!(Some(100.0), snapshot.last_trade);
+
+        let status = store
+            .inner()
+            .lock()
+            .await
+            .market_data
+            .as_ref()
+            .expect("tap installed")
+            .status_json();
+        let status: serde_json::Value = serde_json::from_str(&status).expect("status json");
+        assert_eq!(2, status["frames"]);
+        assert_eq!(0, status["dropped_frames"]);
+    }
+
+    /// A takeover snapshots and enqueues first, and only then opens the tap
+    /// gate; a follower's frames never queue ahead of the reset.
+    #[tokio::test]
+    async fn market_data_feed_opens_only_after_the_snapshot_is_queued() {
+        use crate::market_data::Ingest;
+        use crate::market_data::MarketDataControl;
+        use crate::market_data::MarketDataTap;
+        use crate::match_result::NoopSink;
+        use crate::matchengine::Order;
+        use crate::matchengine::OrderSide;
+        use openraft::alias::EntryOf;
+        use std::sync::Mutex;
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+
+        fn entry(
+            index: u64,
+            payload: EntryPayloadOf<MatchEngineTypeConfig>,
+        ) -> EntryOf<MatchEngineTypeConfig> {
+            Entry {
+                log_id: log_id(1, index),
+                payload,
+            }
+        }
+
+        let dir = tempdir();
+        let (tap, channels) = MarketDataTap::channel(16);
+        // A follower: the tap gate is closed, so this entry never queues a frame.
+        channels.enabled.store(false, Ordering::Relaxed);
+        let mut store = StateMachineStore::<MatchEngineTypeConfig>::open_with_sinks(
+            dir.path(),
+            Arc::new(NoopSink),
+            Some(tap.clone()),
+        )
+        .unwrap();
+
+        let mut bid = Order::new(OrderSide::Buy, 100.0, 5.0, 0);
+        bid.timestamp = 1_000;
+        let entries = futures::stream::iter(vec![Ok((
+            entry(
+                1,
+                EntryPayload::Normal(MatchEngineRequest::Place { order: bid }),
+            ),
+            None,
+        ))]);
+        store.apply(entries).await.unwrap();
+
+        let control = MarketDataControl::new(
+            channels.enabled.clone(),
+            true,
+            Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            Arc::new(Mutex::new(None)),
+        );
+        store.start_market_data_feed(&control, 5, 0).await;
+        assert!(channels.enabled.load(Ordering::Relaxed), "gate opened");
+
+        let snapshot = control.take_pending().expect("snapshot queued");
+        assert_eq!(1, snapshot.log_index, "snapshot covers the follower entry");
+        assert_eq!(
+            1, snapshot.market_seq,
+            "the next market sequence after the bid"
+        );
+        assert_eq!(1, snapshot.bids.len());
+        assert_eq!(5.0, snapshot.bids[0].volume);
+
+        let mut ask = Order::new(OrderSide::Sell, 101.0, 1.0, 0);
+        ask.timestamp = 2_000;
+        let entries = futures::stream::iter(vec![Ok((
+            entry(
+                2,
+                EntryPayload::Normal(MatchEngineRequest::Place { order: ask }),
+            ),
+            None,
+        ))]);
+        store.apply(entries).await.unwrap();
+
+        match channels
+            .receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("post-snapshot frame")
+        {
+            Ingest::Frame(frame) => {
+                assert_eq!(2, frame.log_index);
+                assert_eq!(1, frame.market_seq);
+            }
+        }
+    }
+
+    /// Cancel/Amend consume a market sequence and run the automatic GTD purge,
+    /// so an order due at the request's intake time cannot be cancelled or filled.
+    #[tokio::test]
+    async fn cancel_and_amend_consume_sequences_and_purge_due_gtd() {
+        use crate::match_result::MatchEventKind;
+        use crate::match_result::MemorySink;
+        use crate::matchengine::Order;
+        use crate::matchengine::OrderSide;
+        use crate::matchengine::TimeInForce;
+        use openraft::alias::EntryOf;
+
+        fn entry(
+            index: u64,
+            payload: EntryPayloadOf<MatchEngineTypeConfig>,
+        ) -> EntryOf<MatchEngineTypeConfig> {
+            Entry {
+                log_id: log_id(1, index),
+                payload,
+            }
+        }
+
+        let dir = tempdir();
+        let sink = Arc::new(MemorySink::new());
+        let mut store =
+            StateMachineStore::<MatchEngineTypeConfig>::open_with_sink(dir.path(), sink.clone())
+                .unwrap();
+
+        let mut gtd = Order::new(OrderSide::Buy, 100.0, 5.0, 0);
+        gtd.tif = TimeInForce::Gtd(2_000);
+        gtd.timestamp = 1_000;
+        let mut cancel_key = Order::new(OrderSide::Buy, 100.0, 5.0, 0);
+        cancel_key.timestamp = 2_000;
+        let entries = futures::stream::iter(vec![
+            Ok((
+                entry(
+                    1,
+                    EntryPayload::Normal(MatchEngineRequest::Place { order: gtd }),
+                ),
+                None,
+            )),
+            Ok((
+                entry(
+                    2,
+                    EntryPayload::Normal(MatchEngineRequest::Cancel { order: cancel_key }),
+                ),
+                None,
+            )),
+        ]);
+        store.apply(entries).await.unwrap();
+
+        let events = sink.events();
+        assert_eq!(2, events.len(), "rest then expiry: {events:?}");
+        assert_eq!(MatchEventKind::Rested, events[0].kind);
+        assert_eq!(MatchEventKind::Expired, events[1].kind);
+        assert_eq!(5.0, events[1].volume);
+        assert!(
+            store.inner().lock().await.orderbook.bids.is_empty(),
+            "the expired bid is gone and the cancel found nothing"
+        );
     }
 
     struct TempDir(PathBuf);

@@ -16,7 +16,7 @@ use crate::matchengine::Order;
 /// * `Place` - Adds an order to the order book (or parks it as a stop)
 /// * `Cancel` - Removes an order from the order book
 /// * `Amend` - Changes the price and/or open volume of a resting limit order
-/// * `PurgeExpired` - Evicts GTD/Day orders whose deadline has passed
+/// * `PurgeExpired` - Explicitly evicts expired orders (GTD is normally purged automatically)
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum MatchEngineRequest {
     /// Place a new order in the matching engine.
@@ -35,12 +35,14 @@ pub enum MatchEngineRequest {
         #[serde(default)]
         volume: Option<f64>,
     },
-    /// Evict every order whose time in force has expired at `now_ms`.
+    /// Explicitly evict orders whose time in force has expired at `now_ms`.
     ///
-    /// The timestamps travel in the request (and therefore through the Raft
-    /// log), so the state machine never reads a clock and every replica evicts
-    /// exactly the same orders. `day_close_ms` supplies the trading-day close:
-    /// `Day` orders expire only when it is present and `now_ms >= close`.
+    /// GTD orders are normally evicted automatically by every admissible
+    /// `Place`/`Cancel`/`Amend` at its intake timestamp; this request is for
+    /// administrative purges and for `Day`, which needs the trading-day close
+    /// (`day_close_ms`). The timestamps travel through the log, so the state
+    /// machine never reads a clock. Consumes a market sequence; the response is
+    /// that sequence.
     PurgeExpired {
         now_ms: u64,
         day_close_ms: Option<u64>,

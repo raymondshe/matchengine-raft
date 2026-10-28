@@ -768,6 +768,7 @@ mod tests {
         let mut order = order(OrderSide::Buy, 101.0, 4.0, 0);
         order.sequence = 9;
         let amendment = Amendment {
+            market_seq: 9,
             order,
             previous_sequence: 5,
             previous_price: 100.0,
@@ -786,5 +787,18 @@ mod tests {
 
         let json = serde_json::to_value(event).unwrap();
         assert_eq!(serde_json::json!(5), json["previous_sequence"]);
+    }
+
+    #[test]
+    fn events_carry_the_side_of_the_order_they_describe() {
+        let taker = order(OrderSide::Buy, 101.0, 2.0, 1);
+        let maker = order(OrderSide::Sell, 100.0, 2.0, 2);
+
+        let events =
+            MatchEvent::for_place(1, &taker, &[MatchResult::new(&taker, &maker, 2.0)], None);
+        assert_eq!(OrderSide::Buy, events[0].side, "fill is about the taker");
+
+        let cancelled = MatchEvent::for_cancel(2, &maker);
+        assert_eq!(OrderSide::Sell, cancelled.side);
     }
 }

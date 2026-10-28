@@ -40,27 +40,48 @@
 本项目扩展了 [example-raft-kv](https://github.com/datafuselabs/openraft/tree/main/example-raft-kv)，增加了持久化存储和 gRPC 传输：
 
 ```
-                    ┌─────────────────────────────────────────┐
-                    │           应用层                        │
-                    │      (订单簿撮合引擎)                   │
-                    │ apply ──► MatchEvent ──► Sink（可插拔） │
-                    └─────────────────────┬───────────────────┘
-                                          │
-                    ┌─────────────────────▼───────────────────┐
-                    │           OpenRaft 核心                 │
-                    │  (共识、复制、领导者选举)               │
-                    └─────────────────────┬───────────────────┘
-                                          │
-              ┌───────────────────────────┼───────────────────────────┐
-              │                           │                           │
-    ┌─────────▼─────────┐     ┌─────────▼─────────┐     ┌─────────▼─────────┐
-    │  日志 + 状态      │     │   RaftNetwork     │     │   HTTP API        │
-    │ (WAL + 快照文件)  │     │  (gRPC / HTTP)    │     │  (Actix-web)      │
-    └───────────────────┘     └───────────────────┘     └───────────────────┘
+                  ┌─────────────────────────────────────────────────────────┐
+                  │                         应用层                          │
+                  │                    (订单簿撮合引擎)                     │
+                  │          apply ──► 订单簿 + 复制的 market_seq           │
+                  │      MatchEvent ──► MatchResultSink（审计/清结算）      │
+                  └─────────────────────┬───────────────────────────┬───────┘
+                                        │                           │ MatchEvent + 深度日志
+                                        │                           │ try_send（有界，不阻塞）
+                                        │                           ▼
+                                        │             ┌──────────────────────────────────────┐
+                                        │             │       行情线程（按领导者发布）       │
+                                        │             │    影子订单簿 · OHLC · 线格式 v2     │
+                                        │             │      确定性 market_seq/sub_seq       │
+                                        │             └──────────────────────────────────────┘
+                                        │                                 │ MarketDataSink
+                                        │                                 ▼
+                                        │             ┌──────────────────────────────────────┐
+                                        │             │  当前 JSONL · 后续 Aeron 2001–2007   │
+                                        │             │        成交 BBO 深度 生命周期        │
+                                        │             │               状态 K线               │
+                                        ▼             └──────────────────────────────────────┘
+                  ┌─────────────────────────────────────────────────────────┐
+                  │                      OpenRaft 核心                      │
+                  │                (共识、复制、领导者选举)                 │
+                  └────────────────────────────┬────────────────────────────┘
+                                               │
+                                               │
+               ┌───────────────────────────────┴───────────────────────────────┐
+               │                               │                               │
+               ▼                               ▼                               ▼
+    ┌─────────────────────┐         ┌─────────────────────┐         ┌─────────────────────┐
+    │     日志 + 状态     │         │     RaftNetwork     │         │      HTTP API       │
+    │    (WAL + 快照)     │         │    (gRPC / HTTP)    │         │     (Actix-web)     │
+    └─────────────────────┘         └─────────────────────┘         └─────────────────────┘
 ```
 
 节点间 Raft RPC 默认使用 `端口 + 1000` 上的 gRPC。公共 API 与 HTTP Raft 处理器仍由
 `--http-addr` 监听器提供，因此无论节点主动使用哪种传输，它都会同时服务两种协议。
+
+行情输出是节点本地的，且不参与共识：tap 使用有界 `try_send`，因此慢订阅者永远不会阻塞
+`apply`。JSONL sink 仅用于调试；同样的线格式 v2 消息就是后续 Aeron 适配器（2001–2007 流）
+要发布的内容。
 
 ### 核心组件
 
@@ -80,6 +101,12 @@
    - 订单类型：GTC、IOC、FOK、GTD、Day、Post-Only、冰山单、止损市价单、止损限价单
    - 确定性过期（`PurgeExpired` 通过日志携带时间戳）与基于复制的最后成交价触发止损
    - 现实世界状态机应用的示例
+
+4. **行情数据出口** ([`market_data/`](./src/market_data/))
+   - `apply` 将撮合事件和深度日志交给有界 tap（`try_send`，撮合路径永不等待）
+   - 仅领导者发布的线程维护影子订单簿、生成 BBO/OHLC K 线并编码线格式 v2
+   - 消息键为 `(symbol_id, stream_id, market_seq, sub_seq)`；每个 taker 一条不设上限的 `TRADE`
+   - 当前使用 JSONL sink；下一阶段是 Aeron 2001–2007 流
 
 ## 快速开始
 
@@ -321,7 +348,7 @@ Raft 日志追加写入 `log/NNNNNNNNNN.wal` 分段文件：
 | GTC（默认） | — | 一直挂单，直到成交或被撤销。 |
 | IOC | `"tif": "IOC"` | 立即吃掉能成交的部分，剩余量被撤销，并以 `cancelled` 事件报告。 |
 | FOK | `"tif": "FOK"` | 预检会汇总限价范围内可达的可见量与冰山隐藏量；不能全部成交时整单被拒绝（`rejected`，原因 `fok_unfillable`），订单簿保持不变。 |
-| GTD | `"tif": {"GTD": 1700000000000}`（Unix 毫秒） | 挂单直到 `PurgeExpired` 在 `now_ms >= expiry` 时将其清除。 |
+| GTD | `"tif": {"GTD": 1700000000000}`（Unix 毫秒） | 挂单直到任一变更请求的入口时间达到截止时间（自动清除），或被显式 `PurgeExpired` 清除。 |
 | Day | `"tif": "DAY"` | 当 `PurgeExpired` 带有 `day_close_ms` 且 `now_ms >= close` 时过期；未提供收盘时间时行为等同 GTC。 |
 | Post-Only | `"post_only": true` | 从不吃单：整单挂入订单簿，若会成交则被拒绝（`post_only_would_cross`）。 |
 | 冰山单 | `"display_volume": 100.0` | `volume` 是总量，只有一档可见量挂单；其余在 `hidden_volume` 中，对深度不可见，可见量被吃掉后逐档补足。 |
@@ -336,8 +363,10 @@ Raft 日志追加写入 `log/NNNNNNNNNN.wal` 分段文件：
 {"PurgeExpired": {"now_ms": 1700000000000, "day_close_ms": null}}
 ```
 
-响应携带被清除的订单数量（`{"value": "2"}`），每个订单会产生一个 `expired` 事件，报告其仍然
-未成交的数量。
+过期是确定性的：`apply` 不读取时钟。每个可接受的变更请求（`Place`、`Cancel`、`Amend`）在应用前
+都会以入口时间执行自动 GTD 清除，因此吃单不会成交已到期的流动性。`Day` 仍需要收盘时间，只能由
+显式请求清除。`PurgeExpired` 自身消耗一个市场序列号，响应即该序列号；每个被清除的订单会产生
+`expired` 事件。
 
 止损单只会被**新的**成交触发：若最后成交价已经越过止损价，订单在进入时就被拒绝
 （`stop_would_trigger`），而不会立刻变成市价单。一次成交可以级联触发多个止损单；被触发的止损按
@@ -359,8 +388,9 @@ Raft 日志追加写入 `log/NNNNNNNNNN.wal` 分段文件：
 - 修改价格或增加数量会以新序列号重新入簿（失去优先权），`/write` 响应返回之后使用的序列号；
 - 新价格会与对手方成交的修改会被拒绝（`amend_would_cross`）：挂单簿永不交叉，吃单仍需先撤后下；
 - 冰山单、停在场外的止损单和市价单不可修改（`unsupported_order`），请撤销后重新下单；
-- 成功的修改会产生 `amended` 事件，同时携带旧序列号和新序列号；被拒绝的修改在 `/write` 中返回
-  `null`，并产生带原因的 `rejected` 事件。
+- 成功的修改会产生 `amended` 事件，同时携带旧、新订单序列号；`/write` 响应是本次修改的
+  `market_seq`（重新入簿时也是新订单序列号）。被拒绝的修改仍会消耗一个序列号，并产生带原因的
+  `rejected` 事件。
 
 ### 撮合结果处理
 
@@ -370,7 +400,7 @@ Raft 日志追加写入 `log/NNNNNNNNNN.wal` 分段文件：
 id；sink 本身是节点本地配置，绝不会影响复制状态：
 
 ```
-POST /write { Place | Cancel | PurgeExpired }
+POST /write { Place | Cancel | Amend | PurgeExpired }
         │
         ▼
   StateMachineStore::apply  （每个副本都执行）
@@ -406,15 +436,21 @@ POST /write { Place | Cancel | PurgeExpired }
 
 - 撮合线程只追加它本来就知道的可见深度变化（临时日志），并把该条目的 `MatchEvent` 复制进有界队列；
   撮合路径上没有订单簿扫描、编码或 IO；
-- 独立线程维护影子订单簿并发布合并后的消息：成交（批量、绝不采样）、BBO（最新价/中间价/价差）、
-  深度快照与批后增量、生命周期事件、OHLC K 线（默认 1 秒和 1 分钟）以及状态心跳；
-- 只有领导者发布；每次获得领导权都先发一次重置快照。队列满时丢弃帧并发送 `GAP`，`apply` 永远不会
-  被订阅者阻塞或拖慢。
+- 独立线程维护影子订单簿并发布**确定性排序**的消息：同一 taker 的所有成交合并为一条 `TRADE`
+  消息（不设上限）、每个改变订单簿的 entry 发一次 BBO（最新价/中间价/价差）、深度快照与批后增量、
+  生命周期事件、OHLC K 线（默认 1 秒和 1 分钟），以及每 100 个市场序列号一次的 STATUS；
+- 每条消息携带 `(symbol_id, stream_id, market_seq, sub_seq)`。`market_seq` 是复制的变更序列号
+  （`Place` 使用 taker 订单序列号；`Cancel`、`Amend`、`PurgeExpired` 各消耗一个），因此该键在
+  leader 与 follower、主节点切换和重启后都一致；下游按该四元组去重，`(log_index, ordinal)` 仍是
+  审计位置；
+- 默认只有领导者发布（`--market-data-leader-only=false` 时每个副本都发布）；每次获得领导权先发一次
+  重置快照（边界为下一个 `market_seq`）。队列满时丢弃帧并发送 `GAP`，`apply` 永远不会被订阅者阻塞
+  或拖慢。
 
 当前 sink 是用于调试的 JSONL。同样的消息在 `src/market_data/wire.rs` 有二进制编码（64 字节头、
-小端消息体），`MarketDataSink` 就是后续 Aeron 适配器的接入点。模式已支持多标的（`symbol_id`，
-当前为 0）。可调参数：`--market-data-depth`、`--market-data-bbo-interval-ms`、
-`--market-data-bar-intervals-ms`。
+版本 2、小端消息体），`MarketDataSink` 就是后续 Aeron 适配器的接入点。模式已支持多标的
+（`symbol_id`，当前为 0）。可调参数：`--market-data-depth`、`--market-data-status-every`、
+`--market-data-bar-intervals-ms`、`--market-data-leader-only`。
 
 `/read marketdata_status` 返回 feed 计数器和领导者门控状态。
 
@@ -479,7 +515,8 @@ gRPC 传输在 `--http-addr` 端口 + 1000 上暴露相同操作（`AppendEntrie
 
 ### 应用 API
 
-- `POST /write` - 通过 Raft 提交 `Place`、`Cancel`、`Amend` 或 `PurgeExpired` 请求
+- `POST /write` - 通过 Raft 提交 `Place`、`Cancel`、`Amend` 或 `PurgeExpired` 请求。所有变更请求的
+  响应都是分配的 `market_seq`（`Place` 同时是订单序列号）。
 - `POST /read` - 从本地状态机读取（可能读到旧值）
 - `POST /linearizable_read` - 线性一致性读；请求必须到达领导者
 - `POST /follower_read` - 从领导者获取 linearizer 后在本地完成的线性一致性读
@@ -521,7 +558,7 @@ gRPC 传输在 `--http-addr` 端口 + 1000 上暴露相同操作（`AppendEntrie
 | `tests/cluster/test_storage.rs` | WAL 帧格式、撕裂尾部截断、分段轮转、跨段 truncate/purge、vote/committed 持久化、快照构建/安装/重开、损坏文件拒绝 |
 | `tests/cluster/test_restart.rs` | 完整节点重启后通过日志重放恢复，以及通过快照 + 尾部恢复订单簿和序列号 |
 | `tests/cluster/test_match_results.rs` | 以 `--match-event-log` 启动的节点按日志顺序记录 rest/fill/cancel 事件，同时 `/write` 响应保持不变；第二个节点验证止损触发、GTD 过期和新增的 `/read` 键 |
-| `tests/cluster/test_market_data.rs` | 以 `--market-data-log` 启动的节点发布重置快照、批量成交、BBO、合并深度和一根已收盘 K 线；`/read marketdata_status` 报告计数器 |
+| `tests/cluster/test_market_data.rs` | 以 `--market-data-log` 启动的节点发布重置快照、每个 taker 一条成交消息、BBO、批后深度总量和一根已收盘 K 线；断言同时检查 `market_seq` 锚点与 `/read marketdata_status` 计数器 |
 
 所有集成测试都使用唯一的临时数据目录。集群测试固定使用端口 `21001-21003`（gRPC
 `22001-22003`），快照测试使用 `21101-21102`，重启测试使用 `21201-21202`，撮合结果测试使用

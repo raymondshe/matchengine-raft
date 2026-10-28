@@ -56,9 +56,9 @@ LogStore  StateMachineStore  RaftNetwork        HTTP API
 pub enum MatchEngineRequest {
     Place { order: Order },
     Cancel { order: Order },
-    // 修改挂单的限价/数量；order 用 方向+当前价格+序列号 定位
+    // 修改挂单的限价/数量；order 用 方向+当前价格+序列号 定位；消耗一个 market_seq
     Amend { order: Order, price: Option<f64>, volume: Option<f64> },
-    // 过期清除：时间戳随请求复制，apply 不读取时钟
+    // 显式过期清除（Day/管理用）；GTD 会由每次变更请求自动清除
     PurgeExpired { now_ms: u64, day_close_ms: Option<u64> },
 }
 
@@ -69,12 +69,14 @@ pub struct MatchEngineResponse {
 
 `Order`（`src/matchengine/mod.rs`）的核心字段是 `live`（Limit/Market）、`side`（Buy/Sell）、
 `price`、`volume`、`id` 和 `sequence`；`sequence` 在反序列化时是必需的，但 `place_order()` 会用
-订单簿自己的计数器覆盖它。`OrderBook::amend` 修改普通挂单：同价位减量保留序列号（时间优先权），改价或增量会以新序列号
+订单簿自己的计数器覆盖它。HTTP 入口的领导者还会覆盖 `timestamp`：它既是 GTD 校验/自动清除的
+触发时间，也是行情记录的时间；`Place`/`Cancel`/`Amend`/`PurgeExpired` 的响应都返回分配的
+`market_seq`。`OrderBook::amend` 修改普通挂单：同价位减量保留序列号（时间优先权），改价或增量会以新序列号
 重新入簿；会穿越对手方的修改被拒绝。冰山单、止损单和市价单请先撤销再下单。订单类型通过带
 serde 默认值的附加字段表达：`tif`（GTC/IOC/FOK/
 GTD(毫秒)/Day）、`post_only`、`stop_price`（`0.0` 表示非止损单）、`display_volume`（冰山单可见
-档位，`0.0` 表示非冰山单）、`hidden_volume`（冰山隐藏量）和 `timestamp`（客户端时间，用于校验
-GTD）。止损单在触发前停在订单簿之外；成交价触及止损价后作为立即执行的子单（剩余量撤销）。
+档位，`0.0` 表示非冰山单）、`hidden_volume`（冰山隐藏量）和 `timestamp`（入口时间，用于 GTD
+校验与自动清除）。止损单在触发前停在订单簿之外；成交价触及止损价后作为立即执行的子单（剩余量撤销）。
 
 ## 4. 存储实现
 
@@ -289,10 +291,12 @@ curl -X POST -H "Content-Type: application/json" \
 
 `--market-data-log <file>`（环境变量 `MARKET_DATA_LOG`）开启 `docs/AERON_SOLUTION.md` 第二部分设计、
 `src/market_data/` 实现的确定性行情输出。撮合线程只把本来就知道的可见深度变化写入临时日志，并把
-`MatchEvent` 复制进有界队列；独立线程维护影子订单簿并发布成交、BBO、深度快照/增量、生命周期、
-OHLC K 线和状态心跳。只有领导者发布，每次获得领导权先发重置快照；队列满时丢弃帧并发送 `GAP`，
-`apply` 不会被阻塞。当前 sink 为调试用 JSONL，`src/market_data/wire.rs` 是可直接交给 Aeron 的
-二进制编码。
+`MatchEvent` 复制进有界队列；独立线程维护影子订单簿并发布按 (symbol, stream, market_seq, sub_seq)
+确定性排序的成交、BBO、深度快照/增量、生命周期、OHLC K 线和状态。同一 taker 的全部成交在一条
+`TRADE` 中；`market_seq` 是复制的变更序列号（`Cancel`/`Amend`/`PurgeExpired` 也会消耗一个），
+因此键在 leader 与 follower、切换和重启后一致。默认只有领导者发布（`--market-data-leader-only=false`
+时每个副本都发布），每次获得领导权先发重置快照；队列满时丢弃帧并发送 `GAP`，`apply` 不会被阻塞。当前 sink 为调试用 JSONL，
+`src/market_data/wire.rs` 是可直接交给 Aeron 的二进制编码（v2）。
 
 ## 8. 测试
 

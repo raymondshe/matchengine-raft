@@ -11,15 +11,15 @@
 //!                │
 //!                ▼
 //!        market-data thread
-//!          shadow book · throttling · OHLC bars · wire encoding
+//!          shadow book · entry-driven batching · OHLC bars · wire encoding
 //!                │
 //!                ▼
 //!        MarketDataSink (JSONL today, Aeron next)
 //! ```
 //!
 //! Timestamps are the intake timestamps carried in the replicated requests
-//! (§13); nothing here reads a clock to label data. Wall clocks are used only
-//! to pace coalescing windows, never to order or bucket records.
+//! (§13); nothing here reads a clock to label data. Message boundaries are a
+//! pure function of the applied entry, so every replica derives the same keys.
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -32,6 +32,8 @@ use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
@@ -41,7 +43,6 @@ use std::sync::mpsc::TrySendError;
 use std::sync::mpsc::sync_channel;
 use std::thread::JoinHandle;
 use std::time::Duration;
-use std::time::Instant;
 
 use serde::Serialize;
 
@@ -62,12 +63,19 @@ pub const STREAM_BBO: u16 = 2002;
 pub const STREAM_DEPTH_SNAPSHOT: u16 = 2003;
 /// Coalesced depth changes (post-batch totals).
 pub const STREAM_DEPTH_DELTA: u16 = 2004;
-/// Batched order-lifecycle events.
+/// Order-lifecycle events, one message per entry.
 pub const STREAM_LIFECYCLE: u16 = 2005;
-/// Heartbeat and gate state.
+/// Deterministic status cadence and diagnostic gaps.
 pub const STREAM_STATUS: u16 = 2006;
 /// OHLCV bars.
 pub const STREAM_BAR: u16 = 2007;
+
+/// `sub_seq` reserved for the local `GAP` diagnostic, so it can never collide
+/// with a deterministic message in the same `(stream, market_seq)` anchor.
+pub const GAP_SUB_SEQ: u16 = u16::MAX;
+/// `sub_seq` of the reset snapshot's BBO: the first post-snapshot frame starts
+/// at the same `market_seq`, so the two must not share a key.
+const SNAPSHOT_BBO_SUB_SEQ: u16 = 1;
 
 /// Header flags (§16).
 pub mod flags {
@@ -77,10 +85,10 @@ pub mod flags {
     pub const RESET: u16 = 1 << 1;
     /// Records were dropped before this message.
     pub const GAP: u16 = 1 << 2;
-    /// Last message of a coalesced batch.
+    /// Last message of an entry's batch.
     pub const END_OF_BATCH: u16 = 1 << 3;
-    /// A stream is being throttled (status/diagnostics).
-    pub const THROTTLED: u16 = 1 << 4;
+    /// Reserved for a future transport-level throttle marker.
+    pub const RESERVED_THROTTLE: u16 = 1 << 4;
     /// A live (still open) OHLC bar.
     pub const PARTIAL_BAR: u16 = 1 << 5;
     /// A final OHLC bar.
@@ -95,18 +103,11 @@ pub struct MarketDataConfig {
     pub log_path: Option<PathBuf>,
     /// Depth levels per side in snapshots (default 10).
     pub depth_levels: usize,
-    /// Minimum spacing between BBO updates (default 1 ms).
-    pub bbo_interval_ms: u64,
-    /// Minimum spacing between depth-delta flushes (default 5 ms).
-    pub depth_interval_ms: u64,
-    /// Minimum spacing between lifecycle batches (default 10 ms).
-    pub lifecycle_interval_ms: u64,
-    /// Status heartbeat spacing (default 100 ms).
-    pub status_interval_ms: u64,
-    /// Maximum fills per `TRADE` message before an early flush (default 32).
-    pub trade_batch_max: usize,
-    /// Maximum lifecycle records per message (default 512); `rested` is shed
-    /// first when the batch overflows.
+    /// Emit a deterministic STATUS message when `market_seq % status_every == 0`
+    /// (default 100; 0 disables).
+    pub status_every: u64,
+    /// Maximum lifecycle records per entry (default 512); `rested` is shed first
+    /// when the entry overflows. Trades are never capped.
     pub lifecycle_batch_max: usize,
     /// OHLC intervals in milliseconds (default `1s` and `1m`).
     pub bar_intervals_ms: Vec<u64>,
@@ -121,11 +122,7 @@ impl Default for MarketDataConfig {
         Self {
             log_path: None,
             depth_levels: 10,
-            bbo_interval_ms: 1,
-            depth_interval_ms: 5,
-            lifecycle_interval_ms: 10,
-            status_interval_ms: 100,
-            trade_batch_max: 32,
+            status_every: 100,
             lifecycle_batch_max: 512,
             bar_intervals_ms: vec![1_000, 60_000],
             queue_capacity: 8_192,
@@ -165,7 +162,7 @@ pub struct MarketDataStats {
     pub lifecycle_shed: AtomicU64,
     /// Bars published (closed + live).
     pub bars: AtomicU64,
-    /// Status heartbeats published.
+    /// Status messages published.
     pub status: AtomicU64,
     /// Gap markers published.
     pub gaps: AtomicU64,
@@ -173,19 +170,28 @@ pub struct MarketDataStats {
     pub dropped_frames: AtomicU64,
     /// Snapshots installed.
     pub snapshots: AtomicU64,
+    /// `market_seq` of the last processed frame.
+    pub last_market_seq: AtomicU64,
     /// `log_index` of the last processed frame.
     pub last_log_index: AtomicU64,
     /// `ts_ms` of the last processed frame.
     pub last_ts_ms: AtomicU64,
     /// Whether this node currently publishes.
     pub publishing: AtomicBool,
+    /// Sink name, set once when the feed starts.
+    sink: OnceLock<&'static str>,
 }
 
 impl MarketDataStats {
+    /// Records the sink name for `/read marketdata_status`.
+    pub fn set_sink(&self, sink: &'static str) {
+        let _ = self.sink.set(sink);
+    }
+
     /// Renders the counters as the JSON served by `/read marketdata_status`.
-    pub fn status_json(&self, sink: &'static str) -> String {
+    pub fn status_json(&self) -> String {
         serde_json::json!({
-            "sink": sink,
+            "sink": self.sink.get().copied().unwrap_or("none"),
             "publishing": self.publishing.load(Ordering::Relaxed),
             "frames": self.frames.load(Ordering::Relaxed),
             "trades": self.trades.load(Ordering::Relaxed),
@@ -200,6 +206,7 @@ impl MarketDataStats {
             "gaps": self.gaps.load(Ordering::Relaxed),
             "dropped_frames": self.dropped_frames.load(Ordering::Relaxed),
             "snapshots": self.snapshots.load(Ordering::Relaxed),
+            "last_market_seq": self.last_market_seq.load(Ordering::Relaxed),
             "last_log_index": self.last_log_index.load(Ordering::Relaxed),
             "last_ts_ms": self.last_ts_ms.load(Ordering::Relaxed),
         })
@@ -212,7 +219,7 @@ impl MarketDataStats {
 // ---------------------------------------------------------------------------
 
 /// One executed fill in a `TRADE` batch.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct TradeRecord {
     /// Raft log index of the entry that produced the fill.
     pub log_index: u64,
@@ -233,7 +240,7 @@ pub struct TradeRecord {
 }
 
 /// Latest-value top of book.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct BboRecord {
     /// Last trade price, if any.
     pub last_trade: Option<f64>,
@@ -252,7 +259,7 @@ pub struct BboRecord {
 }
 
 /// Full top-N depth for one instrument.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct DepthSnapshotRecord {
     /// Bid levels, best first.
     pub bids: Vec<DepthLevel>,
@@ -261,7 +268,7 @@ pub struct DepthSnapshotRecord {
 }
 
 /// One touched price level with its post-batch totals.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct LevelUpdate {
     /// Side of the level.
     pub side: OrderSide,
@@ -270,7 +277,7 @@ pub struct LevelUpdate {
 }
 
 /// One order-lifecycle event.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct LifecycleRecord {
     /// Raft log index.
     pub log_index: u64,
@@ -295,7 +302,7 @@ pub struct LifecycleRecord {
 }
 
 /// One OHLCV bar.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct BarRecord {
     /// Bar width.
     pub interval_ms: u64,
@@ -319,15 +326,17 @@ pub struct BarRecord {
     pub bar_seq: u64,
 }
 
-/// Feed heartbeat.
-#[derive(Debug, Clone, Serialize)]
+/// Deterministic status cadence record.
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct StatusRecord {
     /// Last processed log index.
     pub last_log_index: u64,
     /// Last processed ordinal.
     pub last_ordinal: u32,
-    /// Last assigned stream sequence.
-    pub last_stream_seq: u64,
+    /// Last processed market sequence.
+    pub last_market_seq: u64,
+    /// Sub-sequence of the last message in that anchor.
+    pub last_sub_seq: u16,
     /// Last applied log index (same as `last_log_index` for a live feed).
     pub applied_index: u64,
     /// Replicated book sequence counter.
@@ -337,7 +346,7 @@ pub struct StatusRecord {
 }
 
 /// A hard-failure marker: frames were dropped before this message.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct GapRecord {
     /// Last position published before the gap.
     pub last_good_log_index: u64,
@@ -348,14 +357,17 @@ pub struct GapRecord {
 }
 
 /// A decoded market-data message: one wire frame.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct MarketMessage {
     /// Destination stream (2001..2007).
     pub stream: u16,
     /// Header flags.
     pub flags: u16,
-    /// Monotonic per stream within a session.
-    pub stream_seq: u64,
+    /// Replicated market/mutation sequence (the taker order sequence for Place).
+    pub market_seq: u64,
+    /// Deterministic message index within `(stream, market_seq)`; `GAP` uses
+    /// [`GAP_SUB_SEQ`] and the reset snapshot's BBO uses 1.
+    pub sub_seq: u16,
     /// Raft log index the message refers to.
     pub log_index: u64,
     /// Ordinal inside that entry.
@@ -373,7 +385,7 @@ pub struct MarketMessage {
 }
 
 /// Payload variants; one per stream.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MessageBody {
     /// Executed fills.
@@ -386,7 +398,7 @@ pub enum MessageBody {
     DepthDelta(Vec<LevelUpdate>),
     /// Order lifecycle events.
     Lifecycle(Vec<LifecycleRecord>),
-    /// Feed heartbeat.
+    /// Deterministic status cadence.
     Status(StatusRecord),
     /// Dropped-frame marker.
     Gap(GapRecord),
@@ -399,6 +411,9 @@ pub enum MessageBody {
 pub struct TapFrame {
     /// Raft log index of the entry.
     pub log_index: u64,
+    /// Replicated market/mutation sequence of the entry (the taker order
+    /// sequence for a `Place`).
+    pub market_seq: u64,
     /// Intake timestamp of the request (Unix ms).
     pub ts_ms: u64,
     /// Instrument id (0 today).
@@ -414,6 +429,10 @@ pub struct TapFrame {
 pub struct SnapshotFrame {
     /// Applied log index the snapshot reflects.
     pub log_index: u64,
+    /// Next replicated market/mutation sequence: the exclusive reset boundary.
+    /// Frames below it are already in the snapshot; the first post-capture
+    /// frame starts exactly here.
+    pub market_seq: u64,
     /// Capture timestamp (Unix ms).
     pub ts_ms: u64,
     /// Instrument id (0 today).
@@ -435,8 +454,6 @@ pub struct SnapshotFrame {
 pub enum Ingest {
     /// One applied entry.
     Frame(TapFrame),
-    /// A state capture that resets the shadow book.
-    Snapshot(SnapshotFrame),
 }
 
 // ---------------------------------------------------------------------------
@@ -540,6 +557,8 @@ pub struct TapChannels {
     pub dropped: Arc<AtomicU64>,
     /// Set when a frame was dropped; the processor emits a `GAP`.
     pub gap_pending: Arc<AtomicBool>,
+    /// The publishing gate shared with the processor and the leader watcher.
+    pub enabled: Arc<AtomicBool>,
 }
 
 /// The matching thread's handle on the feed.
@@ -552,6 +571,9 @@ pub struct MarketDataTap {
     stats: Arc<MarketDataStats>,
     dropped: Arc<AtomicU64>,
     gap_pending: Arc<AtomicBool>,
+    /// Publishing gate. While closed the tap drops frames at the source, so no
+    /// stale frame can be queued ahead of the takeover snapshot.
+    enabled: Arc<AtomicBool>,
 }
 
 impl fmt::Debug for MarketDataTap {
@@ -567,24 +589,34 @@ impl MarketDataTap {
         let stats = Arc::new(MarketDataStats::default());
         let dropped = Arc::new(AtomicU64::new(0));
         let gap_pending = Arc::new(AtomicBool::new(false));
+        let enabled = Arc::new(AtomicBool::new(true));
         (
             Self {
                 sender,
                 stats: stats.clone(),
                 dropped: dropped.clone(),
                 gap_pending: gap_pending.clone(),
+                enabled: enabled.clone(),
             },
             TapChannels {
                 receiver,
                 stats,
                 dropped,
                 gap_pending,
+                enabled,
             },
         )
     }
 
     /// Hands one applied entry to the feed. Never blocks.
+    ///
+    /// While the gate is closed the frame is dropped at the source: followers
+    /// and deposed leaders do not fill the queue with data that a takeover
+    /// snapshot would supersede.
     pub fn publish(&self, frame: TapFrame) {
+        if !self.enabled.load(Ordering::Relaxed) {
+            return;
+        }
         self.stats.frames.fetch_add(1, Ordering::Relaxed);
         match self.sender.try_send(Ingest::Frame(frame)) {
             Ok(()) => {}
@@ -598,7 +630,7 @@ impl MarketDataTap {
 
     /// Counters as JSON for `/read marketdata_status`.
     pub fn status_json(&self) -> String {
-        self.stats.status_json("tap")
+        self.stats.status_json()
     }
 
     /// Shared counters.
@@ -610,27 +642,64 @@ impl MarketDataTap {
 /// A cheap, cloneable control handle for the leader watcher.
 #[derive(Clone, Debug)]
 pub struct MarketDataControl {
-    tap: MarketDataTap,
     leader: Arc<AtomicBool>,
+    leader_only: bool,
+    resetting: Arc<AtomicBool>,
+    pending: Arc<Mutex<Option<SnapshotFrame>>>,
 }
 
 impl MarketDataControl {
-    /// Opens or closes the publish gate.
-    pub fn set_leader(&self, leader: bool) {
-        self.leader.store(leader, Ordering::Relaxed);
+    /// Builds a control handle from its parts (used by tests and the node wiring).
+    pub(crate) fn new(
+        leader: Arc<AtomicBool>,
+        leader_only: bool,
+        resetting: Arc<AtomicBool>,
+        pending: Arc<Mutex<Option<SnapshotFrame>>>,
+    ) -> Self {
+        Self {
+            leader,
+            leader_only,
+            resetting,
+            pending,
+        }
     }
 
-    /// Queues a reset snapshot for the processor.
-    pub fn push_snapshot(&self, snapshot: SnapshotFrame) {
-        if self
-            .tap
-            .sender
-            .try_send(Ingest::Snapshot(snapshot))
-            .is_err()
-        {
-            self.tap.dropped.fetch_add(1, Ordering::Relaxed);
-            self.tap.gap_pending.store(true, Ordering::Relaxed);
+    /// Suppresses emission until the next reset snapshot is applied.
+    pub fn begin_reset(&self) {
+        self.resetting.store(true, Ordering::Relaxed);
+    }
+
+    /// Opens or closes the publish gate (the tap and processor share it).
+    ///
+    /// A leader-only feed closes on loss and waits for the next takeover
+    /// snapshot; a feed that publishes from every replica stays open.
+    pub fn set_leader(&self, leader: bool) {
+        if self.leader_only {
+            self.leader.store(leader, Ordering::Relaxed);
+            if !leader {
+                self.resetting.store(true, Ordering::Relaxed);
+            }
+        } else {
+            self.leader.store(true, Ordering::Relaxed);
         }
+    }
+
+    /// Queues a reset snapshot. The processor applies it before any later frame.
+    pub fn push_snapshot(&self, snapshot: SnapshotFrame) {
+        *self
+            .pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(snapshot);
+        self.resetting.store(true, Ordering::Relaxed);
+    }
+
+    /// Takes the pending reset snapshot, if any (tests).
+    #[cfg(test)]
+    pub(crate) fn take_pending(&self) -> Option<SnapshotFrame> {
+        self.pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
     }
 }
 
@@ -638,6 +707,9 @@ impl MarketDataControl {
 pub struct MarketDataHandle {
     tap: MarketDataTap,
     leader: Arc<AtomicBool>,
+    leader_only: bool,
+    resetting: Arc<AtomicBool>,
+    pending: Arc<Mutex<Option<SnapshotFrame>>>,
     stop: Arc<AtomicBool>,
     join: Option<JoinHandle<()>>,
 }
@@ -655,8 +727,15 @@ impl MarketDataHandle {
             Some(path) => Box::new(JsonlSink::open(path, node_id)?),
             None => Box::new(NullSink),
         };
+        let leader_only = config.leader_only;
         let (tap, channels) = MarketDataTap::channel(config.queue_capacity);
-        let leader = Arc::new(AtomicBool::new(false));
+        channels.stats.set_sink(sink.name());
+        // A leader-only node starts closed and waits for its first snapshot;
+        // an all-replica feed starts open but still waits for the startup reset.
+        channels.enabled.store(!leader_only, Ordering::Relaxed);
+        let leader = channels.enabled.clone();
+        let resetting = Arc::new(AtomicBool::new(true));
+        let pending = Arc::new(Mutex::new(None));
         let stop = Arc::new(AtomicBool::new(false));
 
         let mut processor = MarketDataProcessor::new(
@@ -664,6 +743,8 @@ impl MarketDataHandle {
             sink,
             channels.stats,
             leader.clone(),
+            resetting.clone(),
+            pending.clone(),
             channels.dropped,
             channels.gap_pending,
         );
@@ -675,6 +756,9 @@ impl MarketDataHandle {
         Ok(Self {
             tap,
             leader,
+            leader_only,
+            resetting,
+            pending,
             stop,
             join: Some(join),
         })
@@ -687,28 +771,22 @@ impl MarketDataHandle {
 
     /// A cloneable control handle for the leadership watcher.
     pub fn control(&self) -> MarketDataControl {
-        MarketDataControl {
-            tap: self.tap.clone(),
-            leader: self.leader.clone(),
-        }
+        MarketDataControl::new(
+            self.leader.clone(),
+            self.leader_only,
+            self.resetting.clone(),
+            self.pending.clone(),
+        )
     }
 
     /// Updates the publish gate (driven by `raft.metrics()`).
     pub fn set_leader(&self, leader: bool) {
-        self.leader.store(leader, Ordering::Relaxed);
+        self.control().set_leader(leader);
     }
 
     /// Queues a state capture; the processor emits it before later deltas.
     pub fn push_snapshot(&self, snapshot: SnapshotFrame) {
-        if self
-            .tap
-            .sender
-            .try_send(Ingest::Snapshot(snapshot))
-            .is_err()
-        {
-            self.tap.dropped.fetch_add(1, Ordering::Relaxed);
-            self.tap.gap_pending.store(true, Ordering::Relaxed);
-        }
+        self.control().push_snapshot(snapshot);
     }
 
     /// Stops and joins the processor thread. Safe to call once.
@@ -838,17 +916,17 @@ struct BarAgg {
 }
 
 impl BarAgg {
-    fn new(interval_ms: u64, window_start_ms: u64, ts_ms: u64, price: f64, volume: f64) -> Self {
+    fn new(interval_ms: u64, window_start_ms: u64, ts_ms: u64, first_price: f64) -> Self {
         Self {
             interval_ms,
             window_start_ms,
             last_ts_ms: ts_ms,
-            open: price,
-            high: price,
-            low: price,
-            close: price,
-            volume,
-            trade_count: 1,
+            open: first_price,
+            high: first_price,
+            low: first_price,
+            close: first_price,
+            volume: 0.0,
+            trade_count: 0,
             last_live_ms: ts_ms,
         }
     }
@@ -887,35 +965,34 @@ struct MarketDataProcessor {
     sink: Box<dyn MarketDataSink>,
     stats: Arc<MarketDataStats>,
     leader: Arc<AtomicBool>,
+    resetting: Arc<AtomicBool>,
+    pending: Arc<Mutex<Option<SnapshotFrame>>>,
     shadow: BTreeMap<u32, ShadowBook>,
-    trade_batch: Vec<TradeRecord>,
-    lifecycle_batch: Vec<LifecycleRecord>,
-    dirty: BTreeSet<(u32, u8, u64)>,
-    bbo_dirty: BTreeSet<u32>,
     bars: BTreeMap<(u32, u64), BarAgg>,
     bar_seq: BTreeMap<(u32, u64), u64>,
-    stream_seq: BTreeMap<u16, u64>,
-    last_position: (u64, u32),
-    snapshot_boundary: Option<u64>,
-    batch_symbol: u32,
-    last_trade_flush: Option<Instant>,
-    last_bbo: Option<Instant>,
-    last_depth: Option<Instant>,
-    last_lifecycle: Option<Instant>,
-    last_status: Option<Instant>,
+    active_market_seq: Option<u64>,
     book_sequence: u64,
     pending_stops: u32,
     dropped: Arc<AtomicU64>,
     dropped_seen: u64,
     gap_pending: Arc<AtomicBool>,
+    last_position: (u64, u32),
+    /// Frames applied after a takeover snapshot was captured but before it was
+    /// installed; they are replayed once the snapshot is the active boundary.
+    pre_snapshot: Vec<TapFrame>,
 }
 
 impl MarketDataProcessor {
+    // One argument per shared handle keeps ownership obvious at the single
+    // construction site; this is not a hot-path call.
+    #[allow(clippy::too_many_arguments)]
     fn new(
         config: MarketDataConfig,
         sink: Box<dyn MarketDataSink>,
         stats: Arc<MarketDataStats>,
         leader: Arc<AtomicBool>,
+        resetting: Arc<AtomicBool>,
+        pending: Arc<Mutex<Option<SnapshotFrame>>>,
         dropped: Arc<AtomicU64>,
         gap_pending: Arc<AtomicBool>,
     ) -> Self {
@@ -924,242 +1001,139 @@ impl MarketDataProcessor {
             sink,
             stats,
             leader,
+            resetting,
+            pending,
             shadow: BTreeMap::new(),
-            trade_batch: Vec::new(),
-            lifecycle_batch: Vec::new(),
-            dirty: BTreeSet::new(),
-            bbo_dirty: BTreeSet::new(),
             bars: BTreeMap::new(),
             bar_seq: BTreeMap::new(),
-            stream_seq: BTreeMap::new(),
-            last_position: (0, 0),
-            snapshot_boundary: None,
-            batch_symbol: 0,
-            last_trade_flush: None,
-            last_bbo: None,
-            last_depth: None,
-            last_lifecycle: None,
-            last_status: None,
+            active_market_seq: None,
             book_sequence: 0,
             pending_stops: 0,
             dropped,
             dropped_seen: 0,
             gap_pending,
+            last_position: (0, 0),
+            pre_snapshot: Vec::new(),
         }
     }
 
     /// Runs the processor loop until `stop` is set.
     fn run(&mut self, receiver: Receiver<Ingest>, stop: Arc<AtomicBool>) {
         while !stop.load(Ordering::Relaxed) {
+            if let Some(snapshot) = self.take_pending() {
+                self.apply_snapshot(snapshot);
+            }
             match receiver.recv_timeout(Duration::from_millis(5)) {
                 Ok(Ingest::Frame(frame)) => self.ingest(frame),
-                Ok(Ingest::Snapshot(snapshot)) => self.apply_snapshot(snapshot),
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             }
-            self.tick(Instant::now());
         }
-        self.flush_all();
+    }
+
+    fn take_pending(&self) -> Option<SnapshotFrame> {
+        self.pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
     }
 
     fn publishing(&self) -> bool {
-        !self.config.leader_only || self.leader.load(Ordering::Relaxed)
+        let gate_open = !self.config.leader_only || self.leader.load(Ordering::Relaxed);
+        gate_open && !self.resetting.load(Ordering::Relaxed)
     }
 
-    fn ingest(&mut self, frame: TapFrame) {
-        self.stats.frames.fetch_add(1, Ordering::Relaxed);
-        self.stats
-            .last_log_index
-            .store(frame.log_index, Ordering::Relaxed);
-        self.stats.last_ts_ms.store(frame.ts_ms, Ordering::Relaxed);
-
-        if let Some(boundary) = self.snapshot_boundary
-            && frame.log_index <= boundary
-        {
-            return;
-        }
-        if !self.publishing() {
-            return;
-        }
-        if frame.symbol_id != self.batch_symbol
-            && (!self.trade_batch.is_empty() || !self.lifecycle_batch.is_empty())
-        {
-            let now = Instant::now();
-            self.flush_trades(now);
-            self.flush_lifecycle(now);
-            self.batch_symbol = frame.symbol_id;
-        }
-
-        for change in frame.depth {
-            let side = match change.side {
-                OrderSide::Buy => 0u8,
-                OrderSide::Sell => 1u8,
-            };
-            self.shadow
-                .entry(frame.symbol_id)
-                .or_default()
-                .apply(change);
-            self.dirty
-                .insert((frame.symbol_id, side, change.price.to_bits()));
-            self.bbo_dirty.insert(frame.symbol_id);
-        }
-
-        let mut last_ordinal = 0;
-        for event in &frame.events {
-            last_ordinal = event.event_id.ordinal;
-            self.lifecycle_batch.push(LifecycleRecord {
-                log_index: event.event_id.log_index,
-                ordinal: event.event_id.ordinal,
-                ts_ms: frame.ts_ms,
-                kind: event.kind,
-                order_sequence: event.order_sequence,
-                side: event.side,
-                counterparty_sequence: event.counterparty_sequence,
-                price: event.price,
-                volume: event.volume,
-                reason: event.reason,
-            });
-
-            if event.kind == MatchEventKind::Fill {
-                let Some(maker_sequence) = event.counterparty_sequence else {
-                    continue;
-                };
-                self.trade_batch.push(TradeRecord {
-                    log_index: event.event_id.log_index,
-                    ordinal: event.event_id.ordinal,
-                    ts_ms: frame.ts_ms,
-                    price: event.price,
-                    volume: event.volume,
-                    taker_side: event.side,
-                    taker_sequence: event.order_sequence,
-                    maker_sequence,
-                });
-                self.shadow.entry(frame.symbol_id).or_default().last_trade = Some(event.price);
-                self.update_bars(frame.symbol_id, frame.ts_ms, event.price, event.volume);
-                self.bbo_dirty.insert(frame.symbol_id);
-                self.stats.trades.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-
-        self.last_position = (frame.log_index, last_ordinal);
-        self.batch_symbol = frame.symbol_id;
-    }
-
+    /// Installs a reset point: new shadow, cleared bars, new active sequence.
     fn apply_snapshot(&mut self, snapshot: SnapshotFrame) {
         self.stats.snapshots.fetch_add(1, Ordering::Relaxed);
-        self.shadow.entry(snapshot.symbol_id).or_default().reset(
+        let symbol = snapshot.symbol_id;
+        self.shadow.entry(symbol).or_default().reset(
             &snapshot.bids,
             &snapshot.asks,
             snapshot.last_trade,
         );
-        // A snapshot is only meaningful as a reset point: clear anything that
-        // predates it. With one instrument that is every accumulator.
-        self.trade_batch.clear();
-        self.lifecycle_batch.clear();
-        self.dirty.clear();
-        self.bbo_dirty.clear();
         self.bars.clear();
-        self.snapshot_boundary = Some(snapshot.log_index);
-        self.last_position = (snapshot.log_index, 0);
+        self.bar_seq.clear();
+        self.active_market_seq = Some(snapshot.market_seq);
         self.book_sequence = snapshot.book_sequence;
         self.pending_stops = snapshot.pending_stops;
-        self.last_trade_flush = None;
-        self.last_bbo = None;
-        self.last_depth = None;
-        self.last_lifecycle = None;
+        self.dropped_seen = self.dropped.load(Ordering::Relaxed);
+        self.last_position = (snapshot.log_index, 0);
+        self.resetting.store(false, Ordering::Relaxed);
+        self.stats
+            .publishing
+            .store(self.publishing(), Ordering::Relaxed);
 
-        if !self.publishing() {
-            return;
-        }
-
-        let shadow = self.shadow.entry(snapshot.symbol_id).or_default();
         let body = DepthSnapshotRecord {
-            bids: shadow.depth(OrderSide::Buy, self.config.depth_levels),
-            asks: shadow.depth(OrderSide::Sell, self.config.depth_levels),
+            bids: self.shadow.get(&symbol).map_or_else(Vec::new, |book| {
+                book.depth(OrderSide::Buy, self.config.depth_levels)
+            }),
+            asks: self.shadow.get(&symbol).map_or_else(Vec::new, |book| {
+                book.depth(OrderSide::Sell, self.config.depth_levels)
+            }),
         };
         self.emit(
             STREAM_DEPTH_SNAPSHOT,
             flags::SNAPSHOT | flags::RESET,
+            snapshot.market_seq,
+            0,
             snapshot.log_index,
             0,
             snapshot.ts_ms,
-            snapshot.symbol_id,
+            symbol,
             MessageBody::DepthSnapshot(body),
         );
         self.stats.depth_snapshots.fetch_add(1, Ordering::Relaxed);
-        self.bbo_dirty.insert(snapshot.symbol_id);
-    }
+        self.emit_bbo(
+            symbol,
+            snapshot.market_seq,
+            snapshot.log_index,
+            0,
+            snapshot.ts_ms,
+            SNAPSHOT_BBO_SUB_SEQ,
+        );
 
-    fn update_bars(&mut self, symbol_id: u32, ts_ms: u64, price: f64, volume: f64) {
-        for interval in self.config.bar_intervals_ms.clone() {
-            let window = ts_ms - (ts_ms % interval);
-            let key = (symbol_id, interval);
-            let mut closed = None;
-
-            match self.bars.get_mut(&key) {
-                Some(bar) if bar.window_start_ms == window => {
-                    // A late print is clamped into the open window (never reopen).
-                    bar.update(ts_ms, price, volume);
-                }
-                Some(bar) => {
-                    closed = Some(std::mem::replace(
-                        bar,
-                        BarAgg::new(interval, window, ts_ms, price, volume),
-                    ));
-                }
-                None => {
-                    self.bars
-                        .insert(key, BarAgg::new(interval, window, ts_ms, price, volume));
-                }
-            }
-
-            if let Some(bar) = closed
-                && bar.trade_count > 0
-            {
-                self.emit_bar(symbol_id, bar, true);
-            }
+        // Replay frames applied between the capture and the snapshot install.
+        // Anything below the boundary is already in the snapshot.
+        let buffered = std::mem::take(&mut self.pre_snapshot);
+        for frame in buffered {
+            self.ingest(frame);
         }
     }
 
-    fn emit_bar(&mut self, symbol_id: u32, bar: BarAgg, closed: bool) {
-        let seq = {
-            let entry = self
-                .bar_seq
-                .entry((symbol_id, bar.interval_ms))
-                .or_insert(0);
-            *entry += 1;
-            *entry
-        };
-        let ts = if closed {
-            bar.window_start_ms + bar.interval_ms
-        } else {
-            bar.last_ts_ms
-        };
-        let flags = if closed {
-            flags::BAR_CLOSE
-        } else {
-            flags::PARTIAL_BAR
-        };
-        self.emit(
-            STREAM_BAR,
-            flags,
-            self.last_position.0,
-            0,
-            ts,
-            symbol_id,
-            MessageBody::Bar(bar.record(seq)),
-        );
-        self.stats.bars.fetch_add(1, Ordering::Relaxed);
-    }
-
-    fn tick(&mut self, now: Instant) {
+    // `is_multiple_of` would raise the crate's MSRV above 1.85.
+    #[allow(clippy::manual_is_multiple_of)]
+    fn ingest(&mut self, frame: TapFrame) {
+        // A takeover snapshot was captured at an earlier log position; frames
+        // applied after the capture but before the snapshot is installed carry
+        // a sequence at or above its boundary and must not be lost.
+        if self.resetting.load(Ordering::Relaxed) {
+            if self.pre_snapshot.len() < 4_096 {
+                self.pre_snapshot.push(frame);
+            } else {
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+                self.gap_pending.store(true, Ordering::Relaxed);
+                self.stats.dropped_frames.fetch_add(1, Ordering::Relaxed);
+            }
+            return;
+        }
+        self.stats.frames.fetch_add(1, Ordering::Relaxed);
+        self.stats
+            .last_market_seq
+            .store(frame.market_seq, Ordering::Relaxed);
+        self.stats
+            .last_log_index
+            .store(frame.log_index, Ordering::Relaxed);
+        self.stats.last_ts_ms.store(frame.ts_ms, Ordering::Relaxed);
         let publishing = self.publishing();
         self.stats.publishing.store(publishing, Ordering::Relaxed);
         if !publishing {
-            self.trade_batch.clear();
-            self.lifecycle_batch.clear();
-            self.dirty.clear();
-            self.bbo_dirty.clear();
+            return;
+        }
+        if self
+            .active_market_seq
+            .is_some_and(|active| frame.market_seq < active)
+        {
             return;
         }
 
@@ -1170,10 +1144,12 @@ impl MarketDataProcessor {
             self.emit(
                 STREAM_STATUS,
                 flags::GAP,
-                self.last_position.0,
-                self.last_position.1,
-                self.stats.last_ts_ms.load(Ordering::Relaxed),
+                frame.market_seq,
+                GAP_SUB_SEQ,
+                frame.log_index,
                 0,
+                frame.ts_ms,
+                frame.symbol_id,
                 MessageBody::Gap(GapRecord {
                     last_good_log_index: self.last_position.0,
                     last_good_ordinal: self.last_position.1,
@@ -1183,273 +1159,355 @@ impl MarketDataProcessor {
             self.stats.gaps.fetch_add(1, Ordering::Relaxed);
         }
 
-        let trade_interval = Duration::from_millis(1);
-        if self.trade_batch.len() >= self.config.trade_batch_max
-            || due(&mut self.last_trade_flush, now, trade_interval)
-        {
-            self.flush_trades(now);
-        }
-        if self.lifecycle_batch.len() >= self.config.lifecycle_batch_max
-            || due(
-                &mut self.last_lifecycle,
-                now,
-                Duration::from_millis(self.config.lifecycle_interval_ms),
-            )
-        {
-            self.flush_lifecycle(now);
-        }
-        if due(
-            &mut self.last_depth,
-            now,
-            Duration::from_millis(self.config.depth_interval_ms),
-        ) {
-            self.flush_depth(now);
-        }
-        if due(
-            &mut self.last_bbo,
-            now,
-            Duration::from_millis(self.config.bbo_interval_ms),
-        ) {
-            self.flush_bbo(now);
-        }
-        if due(
-            &mut self.last_status,
-            now,
-            Duration::from_millis(self.config.status_interval_ms),
-        ) {
-            self.flush_status(now);
+        let symbol = frame.symbol_id;
+        let ordinal = frame
+            .events
+            .last()
+            .map_or(0, |event| event.event_id.ordinal);
+
+        // Visible depth: apply the journal, then publish post-batch totals.
+        let mut touched: BTreeSet<(u8, u64)> = BTreeSet::new();
+        for change in &frame.depth {
+            let side = match change.side {
+                OrderSide::Buy => 0u8,
+                OrderSide::Sell => 1u8,
+            };
+            self.shadow.entry(symbol).or_default().apply(*change);
+            touched.insert((side, change.price.to_bits()));
         }
 
-        self.flush_live_bars();
-    }
-
-    fn flush_all(&mut self) {
-        if !self.publishing() {
-            return;
-        }
-        let now = Instant::now();
-        self.flush_trades(now);
-        self.flush_lifecycle(now);
-        self.flush_depth(now);
-        self.flush_bbo(now);
-        self.flush_status(now);
-        self.flush_live_bars();
-    }
-
-    fn flush_trades(&mut self, now: Instant) {
-        if self.trade_batch.is_empty() {
-            return;
-        }
-        let records = std::mem::take(&mut self.trade_batch);
-        let count = records.len();
-        let last = records.last().expect("checked non-empty");
-        let (log_index, ordinal, ts) = (last.log_index, last.ordinal, last.ts_ms);
-        self.emit(
-            STREAM_TRADE,
-            flags::END_OF_BATCH,
-            log_index,
-            ordinal,
-            ts,
-            self.batch_symbol,
-            MessageBody::Trade(records),
-        );
-        self.stats.trade_messages.fetch_add(1, Ordering::Relaxed);
-        debug_assert!(count > 0);
-        self.last_trade_flush = Some(now);
-    }
-
-    fn flush_lifecycle(&mut self, now: Instant) {
-        if self.lifecycle_batch.is_empty() {
-            return;
-        }
-        let max = self.config.lifecycle_batch_max.max(1);
-        if self.lifecycle_batch.len() > max {
-            let mut kept = Vec::with_capacity(max);
-            let mut shed = 0usize;
-            let overflow = self.lifecycle_batch.len() - max;
-            for record in self.lifecycle_batch.drain(..) {
-                if shed < overflow && record.kind == MatchEventKind::Rested {
-                    shed += 1;
-                } else {
-                    kept.push(record);
-                }
+        // Fills: all of them go into one TRADE message (no chunking).
+        let mut trades = Vec::new();
+        for event in &frame.events {
+            if event.kind != MatchEventKind::Fill {
+                continue;
             }
-            self.lifecycle_batch = kept;
-            self.stats
-                .lifecycle_shed
-                .fetch_add(shed as u64, Ordering::Relaxed);
-        }
-
-        let records = std::mem::take(&mut self.lifecycle_batch);
-        let last = records.last().expect("checked non-empty");
-        let (log_index, ordinal, ts) = (last.log_index, last.ordinal, last.ts_ms);
-        self.emit(
-            STREAM_LIFECYCLE,
-            flags::END_OF_BATCH,
-            log_index,
-            ordinal,
-            ts,
-            self.batch_symbol,
-            MessageBody::Lifecycle(records),
-        );
-        self.stats
-            .lifecycle_messages
-            .fetch_add(1, Ordering::Relaxed);
-        self.last_lifecycle = Some(now);
-    }
-
-    fn flush_depth(&mut self, now: Instant) {
-        if self.dirty.is_empty() {
-            return;
-        }
-        let dirty = std::mem::take(&mut self.dirty);
-        let mut by_symbol: BTreeMap<u32, Vec<LevelUpdate>> = BTreeMap::new();
-        for (symbol, side, price_bits) in dirty {
-            let side = if side == 0 {
-                OrderSide::Buy
-            } else {
-                OrderSide::Sell
-            };
-            let Some(shadow) = self.shadow.get(&symbol) else {
+            let Some(maker_sequence) = event.counterparty_sequence else {
                 continue;
             };
-            let Some(level) = shadow.level(side, price_bits) else {
-                continue;
-            };
-            by_symbol.entry(symbol).or_default().push(LevelUpdate {
-                side,
-                level: DepthLevel {
-                    price: level.price,
-                    volume: level.volume,
-                    orders: level.orders,
-                },
+            self.shadow.entry(symbol).or_default().last_trade = Some(event.price);
+            trades.push(TradeRecord {
+                log_index: event.event_id.log_index,
+                ordinal: event.event_id.ordinal,
+                ts_ms: frame.ts_ms,
+                price: event.price,
+                volume: event.volume,
+                taker_side: event.side,
+                taker_sequence: event.order_sequence,
+                maker_sequence,
             });
         }
-        for (symbol, updates) in by_symbol {
-            if updates.is_empty() {
-                continue;
-            }
-            self.emit(
-                STREAM_DEPTH_DELTA,
-                flags::END_OF_BATCH,
-                self.last_position.0,
-                self.last_position.1,
-                self.stats.last_ts_ms.load(Ordering::Relaxed),
-                symbol,
-                MessageBody::DepthDelta(updates),
-            );
-            self.stats.depth_deltas.fetch_add(1, Ordering::Relaxed);
-        }
-        self.last_depth = Some(now);
-    }
 
-    fn flush_bbo(&mut self, now: Instant) {
-        if self.bbo_dirty.is_empty() {
-            return;
-        }
-        let dirty = std::mem::take(&mut self.bbo_dirty);
-        for symbol in dirty {
-            let Some(shadow) = self.shadow.get(&symbol) else {
-                continue;
-            };
-            let bid = shadow.best_bid();
-            let ask = shadow.best_ask();
-            if bid.is_none() && ask.is_none() && shadow.last_trade.is_none() {
-                continue;
+        if !touched.is_empty() {
+            let mut updates = Vec::new();
+            if let Some(book) = self.shadow.get(&symbol) {
+                for (side, price_bits) in &touched {
+                    let side = if *side == 0 {
+                        OrderSide::Buy
+                    } else {
+                        OrderSide::Sell
+                    };
+                    if let Some(level) = book.level(side, *price_bits) {
+                        updates.push(LevelUpdate {
+                            side,
+                            level: DepthLevel {
+                                price: level.price,
+                                volume: level.volume,
+                                orders: level.orders,
+                            },
+                        });
+                    }
+                }
             }
-            let (bid_price, bid_volume) =
-                bid.map_or((0.0, 0.0), |level| (level.price, level.volume));
-            let (ask_price, ask_volume) =
-                ask.map_or((0.0, 0.0), |level| (level.price, level.volume));
-            let mid = if bid.is_some() && ask.is_some() {
-                Some((bid_price + ask_price) / 2.0)
-            } else {
-                None
-            };
-            let spread = if bid.is_some() && ask.is_some() {
-                Some(ask_price - bid_price)
-            } else {
-                None
-            };
-            self.emit(
-                STREAM_BBO,
-                flags::END_OF_BATCH,
-                self.last_position.0,
-                self.last_position.1,
-                self.stats.last_ts_ms.load(Ordering::Relaxed),
+            if !updates.is_empty() {
+                self.emit(
+                    STREAM_DEPTH_DELTA,
+                    flags::END_OF_BATCH,
+                    frame.market_seq,
+                    0,
+                    frame.log_index,
+                    ordinal,
+                    frame.ts_ms,
+                    symbol,
+                    MessageBody::DepthDelta(updates),
+                );
+                self.stats.depth_deltas.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        if !touched.is_empty() || !trades.is_empty() {
+            self.emit_bbo(
                 symbol,
-                MessageBody::Bbo(BboRecord {
-                    last_trade: shadow.last_trade,
-                    bid: bid_price,
-                    bid_volume,
-                    ask: ask_price,
-                    ask_volume,
-                    mid,
-                    spread,
+                frame.market_seq,
+                frame.log_index,
+                ordinal,
+                frame.ts_ms,
+                0,
+            );
+        }
+
+        if !trades.is_empty() {
+            self.stats
+                .trades
+                .fetch_add(trades.len() as u64, Ordering::Relaxed);
+            self.emit(
+                STREAM_TRADE,
+                flags::END_OF_BATCH,
+                frame.market_seq,
+                0,
+                frame.log_index,
+                ordinal,
+                frame.ts_ms,
+                symbol,
+                MessageBody::Trade(trades),
+            );
+            self.stats.trade_messages.fetch_add(1, Ordering::Relaxed);
+        }
+
+        if !frame.events.is_empty() {
+            let mut records: Vec<LifecycleRecord> = frame
+                .events
+                .iter()
+                .map(|event| LifecycleRecord {
+                    log_index: event.event_id.log_index,
+                    ordinal: event.event_id.ordinal,
+                    ts_ms: frame.ts_ms,
+                    kind: event.kind,
+                    order_sequence: event.order_sequence,
+                    side: event.side,
+                    counterparty_sequence: event.counterparty_sequence,
+                    price: event.price,
+                    volume: event.volume,
+                    reason: event.reason,
+                })
+                .collect();
+            let max = self.config.lifecycle_batch_max.max(1);
+            if records.len() > max {
+                let overflow = records.len() - max;
+                let mut shed = 0usize;
+                records.retain(|record| {
+                    if shed < overflow && record.kind == MatchEventKind::Rested {
+                        shed += 1;
+                        false
+                    } else {
+                        true
+                    }
+                });
+                self.stats
+                    .lifecycle_shed
+                    .fetch_add(shed as u64, Ordering::Relaxed);
+            }
+            self.emit(
+                STREAM_LIFECYCLE,
+                flags::END_OF_BATCH,
+                frame.market_seq,
+                0,
+                frame.log_index,
+                ordinal,
+                frame.ts_ms,
+                symbol,
+                MessageBody::Lifecycle(records),
+            );
+            self.stats
+                .lifecycle_messages
+                .fetch_add(1, Ordering::Relaxed);
+        }
+
+        self.update_bars(
+            symbol,
+            frame.market_seq,
+            frame.log_index,
+            ordinal,
+            frame.ts_ms,
+            &frame.events,
+        );
+
+        if self.config.status_every > 0 && frame.market_seq % self.config.status_every == 0 {
+            self.emit(
+                STREAM_STATUS,
+                0,
+                frame.market_seq,
+                0,
+                frame.log_index,
+                ordinal,
+                frame.ts_ms,
+                symbol,
+                MessageBody::Status(StatusRecord {
+                    last_market_seq: frame.market_seq,
+                    last_sub_seq: 0,
+                    last_log_index: frame.log_index,
+                    last_ordinal: ordinal,
+                    applied_index: self.stats.last_log_index.load(Ordering::Relaxed),
+                    book_sequence: self.book_sequence,
+                    pending_stops: self.pending_stops,
                 }),
             );
-            self.stats.bbo.fetch_add(1, Ordering::Relaxed);
+            self.stats.status.fetch_add(1, Ordering::Relaxed);
         }
-        self.last_bbo = Some(now);
     }
 
-    fn flush_status(&mut self, now: Instant) {
-        let last_seq = self.stream_seq.values().copied().max().unwrap_or(0);
+    fn emit_bbo(
+        &mut self,
+        symbol: u32,
+        market_seq: u64,
+        log_index: u64,
+        ordinal: u32,
+        ts_ms: u64,
+        sub_seq: u16,
+    ) {
+        let Some(book) = self.shadow.get(&symbol) else {
+            return;
+        };
+        let bid = book.best_bid();
+        let ask = book.best_ask();
+        if bid.is_none() && ask.is_none() && book.last_trade.is_none() {
+            return;
+        }
+        let (bid_price, bid_volume) = bid.map_or((0.0, 0.0), |level| (level.price, level.volume));
+        let (ask_price, ask_volume) = ask.map_or((0.0, 0.0), |level| (level.price, level.volume));
+        let mid = if bid.is_some() && ask.is_some() {
+            Some((bid_price + ask_price) / 2.0)
+        } else {
+            None
+        };
+        let spread = if bid.is_some() && ask.is_some() {
+            Some(ask_price - bid_price)
+        } else {
+            None
+        };
         self.emit(
-            STREAM_STATUS,
-            0,
-            self.last_position.0,
-            self.last_position.1,
-            self.stats.last_ts_ms.load(Ordering::Relaxed),
-            0,
-            MessageBody::Status(StatusRecord {
-                last_log_index: self.last_position.0,
-                last_ordinal: self.last_position.1,
-                last_stream_seq: last_seq,
-                applied_index: self.stats.last_log_index.load(Ordering::Relaxed),
-                book_sequence: self.book_sequence,
-                pending_stops: self.pending_stops,
+            STREAM_BBO,
+            flags::END_OF_BATCH,
+            market_seq,
+            sub_seq,
+            log_index,
+            ordinal,
+            ts_ms,
+            symbol,
+            MessageBody::Bbo(BboRecord {
+                last_trade: book.last_trade,
+                bid: bid_price,
+                bid_volume,
+                ask: ask_price,
+                ask_volume,
+                mid,
+                spread,
             }),
         );
-        self.stats.status.fetch_add(1, Ordering::Relaxed);
-        self.last_status = Some(now);
+        self.stats.bbo.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn flush_live_bars(&mut self) {
-        let mut due_bars = Vec::new();
-        for (key, bar) in &mut self.bars {
-            if bar.trade_count > 0
+    fn update_bars(
+        &mut self,
+        symbol: u32,
+        market_seq: u64,
+        log_index: u64,
+        ordinal: u32,
+        ts_ms: u64,
+        events: &[MatchEvent],
+    ) {
+        let fills: Vec<(f64, f64)> = events
+            .iter()
+            .filter(|event| event.kind == MatchEventKind::Fill)
+            .map(|event| (event.price, event.volume))
+            .collect();
+        if fills.is_empty() {
+            return;
+        }
+
+        let mut outgoing: Vec<(BarAgg, bool)> = Vec::new();
+        let intervals = self.config.bar_intervals_ms.clone();
+        for interval in &intervals {
+            let interval = *interval;
+            let key = (symbol, interval);
+            let window = ts_ms - (ts_ms % interval);
+
+            match self.bars.get_mut(&key) {
+                Some(bar) if bar.window_start_ms == window => {
+                    for (price, volume) in &fills {
+                        bar.update(ts_ms, *price, *volume);
+                    }
+                }
+                Some(bar) => {
+                    let old =
+                        std::mem::replace(bar, BarAgg::new(interval, window, ts_ms, fills[0].0));
+                    for (price, volume) in &fills {
+                        bar.update(ts_ms, *price, *volume);
+                    }
+                    if old.trade_count > 0 {
+                        outgoing.push((old, true));
+                    }
+                }
+                None => {
+                    let mut bar = BarAgg::new(interval, window, ts_ms, fills[0].0);
+                    for (price, volume) in &fills {
+                        bar.update(ts_ms, *price, *volume);
+                    }
+                    self.bars.insert(key, bar);
+                }
+            }
+        }
+
+        for interval in &intervals {
+            let key = (symbol, *interval);
+            if let Some(bar) = self.bars.get_mut(&key)
                 && bar.last_ts_ms > bar.last_live_ms
                 && bar.last_ts_ms.saturating_sub(bar.last_live_ms) >= 1_000
             {
                 bar.last_live_ms = bar.last_ts_ms;
-                due_bars.push((key.0, bar.clone()));
+                outgoing.push((bar.clone(), false));
             }
         }
-        for (symbol, bar) in due_bars {
-            self.emit_bar(symbol, bar, false);
+
+        for (sub_seq, (bar, closed)) in outgoing.into_iter().enumerate() {
+            let seq = {
+                let entry = self.bar_seq.entry((symbol, bar.interval_ms)).or_insert(0);
+                *entry += 1;
+                *entry
+            };
+            let ts = if closed {
+                bar.window_start_ms + bar.interval_ms
+            } else {
+                bar.last_ts_ms
+            };
+            self.emit(
+                STREAM_BAR,
+                if closed {
+                    flags::BAR_CLOSE
+                } else {
+                    flags::PARTIAL_BAR
+                },
+                market_seq,
+                sub_seq.min(usize::from(u16::MAX)) as u16,
+                log_index,
+                ordinal,
+                ts,
+                symbol,
+                MessageBody::Bar(bar.record(seq)),
+            );
+            self.stats.bars.fetch_add(1, Ordering::Relaxed);
         }
     }
 
+    // One argument per wire-header field keeps every call site explicit.
+    #[allow(clippy::too_many_arguments)]
     fn emit(
         &mut self,
         stream: u16,
         message_flags: u16,
+        market_seq: u64,
+        sub_seq: u16,
         log_index: u64,
         ordinal: u32,
         ts_ms: u64,
         symbol_id: u32,
         body: MessageBody,
     ) {
-        let stream_seq = {
-            let entry = self.stream_seq.entry(stream).or_insert(0);
-            *entry += 1;
-            *entry
-        };
         let message = MarketMessage {
             stream,
             flags: message_flags,
-            stream_seq,
+            market_seq,
+            sub_seq,
             log_index,
             ordinal,
             epoch: 0,
@@ -1465,20 +1523,8 @@ impl MarketDataProcessor {
     }
 }
 
-fn due(last: &mut Option<Instant>, now: Instant, interval: Duration) -> bool {
-    match *last {
-        Some(previous) if now.duration_since(previous) < interval => false,
-        _ => {
-            *last = Some(now);
-            true
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
-
     use super::*;
     use crate::matchengine::MatchResult;
     use crate::matchengine::Order;
@@ -1502,14 +1548,17 @@ mod tests {
         messages: Arc<Mutex<Vec<MarketMessage>>>,
         stats: Arc<MarketDataStats>,
         leader: Arc<AtomicBool>,
-        dropped: Arc<AtomicU64>,
+        resetting: Arc<AtomicBool>,
         gap_pending: Arc<AtomicBool>,
+        dropped: Arc<AtomicU64>,
     }
 
-    fn harness(config: MarketDataConfig, leader: bool) -> Harness {
+    fn harness(config: MarketDataConfig) -> Harness {
         let messages = Arc::new(Mutex::new(Vec::new()));
         let stats = Arc::new(MarketDataStats::default());
-        let leader = Arc::new(AtomicBool::new(leader));
+        let leader = Arc::new(AtomicBool::new(true));
+        let resetting = Arc::new(AtomicBool::new(false));
+        let pending = Arc::new(Mutex::new(None));
         let dropped = Arc::new(AtomicU64::new(0));
         let gap_pending = Arc::new(AtomicBool::new(false));
         let processor = MarketDataProcessor::new(
@@ -1517,6 +1566,8 @@ mod tests {
             Box::new(CollectSink(messages.clone())),
             stats.clone(),
             leader.clone(),
+            resetting.clone(),
+            pending,
             dropped.clone(),
             gap_pending.clone(),
         );
@@ -1525,8 +1576,9 @@ mod tests {
             messages,
             stats,
             leader,
-            dropped,
+            resetting,
             gap_pending,
+            dropped,
         }
     }
 
@@ -1541,16 +1593,33 @@ mod tests {
                 .map(|message| message.body)
                 .collect()
         }
+
+        fn clear(&self) {
+            self.messages.lock().unwrap().clear();
+        }
+
+        fn assert_unique_keys(&self) {
+            let messages = self.messages();
+            let mut keys: Vec<(u16, u64, u16)> = messages
+                .iter()
+                .map(|message| (message.stream, message.market_seq, message.sub_seq))
+                .collect();
+            let total = keys.len();
+            keys.sort_unstable();
+            keys.dedup();
+            assert_eq!(total, keys.len(), "duplicate message keys: {messages:?}");
+        }
     }
 
     fn frame(
-        log_index: u64,
+        market_seq: u64,
         ts_ms: u64,
         depth: Vec<DepthChange>,
         events: Vec<MatchEvent>,
     ) -> TapFrame {
         TapFrame {
-            log_index,
+            log_index: market_seq + 1,
+            market_seq,
             ts_ms,
             symbol_id: 0,
             events,
@@ -1559,8 +1628,7 @@ mod tests {
     }
 
     fn fill_event(
-        log_index: u64,
-        ordinal: u32,
+        market_seq: u64,
         side: OrderSide,
         price: f64,
         volume: f64,
@@ -1578,8 +1646,8 @@ mod tests {
             maker,
         );
         MatchEvent::for_fills(
-            log_index,
-            ordinal,
+            market_seq + 1,
+            0,
             side,
             taker,
             &[MatchResult::new(&taker_order, &maker_order, volume)],
@@ -1596,183 +1664,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn publishes_trades_bbo_and_coalesced_depth() {
-        let mut h = harness(MarketDataConfig::default(), true);
-        h.processor.ingest(frame(
-            1,
-            1_000,
-            vec![
-                depth(OrderSide::Sell, 100.5, 5.0, 1),
-                depth(OrderSide::Buy, 99.5, 3.0, 1),
-            ],
-            vec![fill_event(1, 0, OrderSide::Buy, 100.5, 2.0, 10, 1)],
-        ));
-        h.processor.ingest(frame(
-            2,
-            1_001,
-            vec![depth(OrderSide::Sell, 100.5, -2.0, 0)],
-            vec![],
-        ));
-        h.processor
-            .tick(Instant::now() + Duration::from_millis(250));
-
-        let bodies = h.bodies();
-
-        let trades: Vec<_> = bodies
-            .iter()
-            .filter_map(|body| match body {
-                MessageBody::Trade(records) => Some(records),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(1, trades.len(), "one batched trade message");
-        assert_eq!(1, trades[0].len());
-        assert_eq!(OrderSide::Buy, trades[0][0].taker_side);
-        assert_eq!(100.5, trades[0][0].price);
-        assert_eq!(2.0, trades[0][0].volume);
-
-        let bbo = bodies
-            .iter()
-            .find_map(|body| match body {
-                MessageBody::Bbo(bbo) => Some(bbo),
-                _ => None,
-            })
-            .expect("bbo published");
-        assert_eq!(Some(100.5), bbo.last_trade);
-        assert_eq!(99.5, bbo.bid);
-        assert_eq!(3.0, bbo.bid_volume);
-        assert_eq!(100.5, bbo.ask);
-        assert_eq!(3.0, bbo.ask_volume, "deltas coalesced before the BBO");
-        assert_eq!(Some(100.0), bbo.mid);
-        assert_eq!(Some(1.0), bbo.spread);
-
-        let deltas: Vec<_> = bodies
-            .iter()
-            .filter_map(|body| match body {
-                MessageBody::DepthDelta(updates) => Some(updates),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(1, deltas.len(), "one coalesced delta message");
-        assert_eq!(2, deltas[0].len(), "two touched levels");
-        let ask = deltas[0]
-            .iter()
-            .find(|update| update.side == OrderSide::Sell)
-            .expect("ask level");
-        assert_eq!(3.0, ask.level.volume);
-        assert_eq!(1, ask.level.orders);
-    }
-
-    #[test]
-    fn bars_close_when_the_window_rolls() {
-        let mut config = MarketDataConfig::default();
-        config.bar_intervals_ms = vec![1_000];
-        let mut h = harness(config, true);
-
-        h.processor.ingest(frame(
-            1,
-            1_000,
-            vec![],
-            vec![fill_event(1, 0, OrderSide::Buy, 100.0, 1.0, 1, 2)],
-        ));
-        h.processor.ingest(frame(
-            2,
-            1_100,
-            vec![],
-            vec![fill_event(2, 0, OrderSide::Buy, 102.0, 2.0, 3, 4)],
-        ));
-        h.processor.ingest(frame(
-            3,
-            2_100,
-            vec![],
-            vec![fill_event(3, 0, OrderSide::Buy, 99.0, 1.0, 5, 6)],
-        ));
-
-        let bars: Vec<_> = h
-            .bodies()
-            .into_iter()
-            .filter_map(|body| match body {
-                MessageBody::Bar(bar) => Some(bar),
-                _ => None,
-            })
-            .collect();
-        let closed = bars
-            .iter()
-            .find(|bar| bar.window_start_ms == 1_000 && bar.trade_count > 0)
-            .expect("closed bar");
-        assert_eq!(100.0, closed.open);
-        assert_eq!(102.0, closed.high);
-        assert_eq!(100.0, closed.low);
-        assert_eq!(102.0, closed.close);
-        assert_eq!(3.0, closed.volume);
-        assert_eq!(2, closed.trade_count);
-        assert_eq!(1, closed.bar_seq);
-        assert_eq!(2_000, closed.window_start_ms + closed.interval_ms);
-    }
-
-    #[test]
-    fn lifecycle_sheds_rested_before_critical_events() {
-        let mut config = MarketDataConfig::default();
-        config.lifecycle_batch_max = 2;
-        let mut h = harness(config, true);
-
-        let mut rested = Vec::new();
-        for _ in 0..3 {
-            let mut order = Order::new(OrderSide::Buy, 100.0, 1.0, 0);
-            rested.extend(MatchEvent::for_place_at(1, 0, &order, &[], Some(1.0)));
-            order.volume = 0.0;
-        }
-        let mut cancelled = Vec::new();
-        for sequence in 0..2 {
-            let mut order = Order::new(OrderSide::Buy, 100.0, 1.0, sequence);
-            order.sequence = sequence;
-            cancelled.push(MatchEvent::for_cancel_at(2, 0, &order));
-        }
-        let mut events = rested;
-        events.extend(cancelled);
-
-        h.processor.ingest(frame(3, 3_000, vec![], events));
-        h.processor
-            .tick(Instant::now() + Duration::from_millis(250));
-
-        let lifecycle = h
-            .bodies()
-            .into_iter()
-            .find_map(|body| match body {
-                MessageBody::Lifecycle(records) => Some(records),
-                _ => None,
-            })
-            .expect("lifecycle batch");
-        assert_eq!(2, lifecycle.len(), "only the critical events survive");
-        assert!(
-            lifecycle
-                .iter()
-                .all(|record| record.kind == MatchEventKind::Cancelled)
-        );
-        assert_eq!(3, h.stats.lifecycle_shed.load(Ordering::Relaxed));
-    }
-
-    #[test]
-    fn gap_marker_and_snapshot_reset_the_feed() {
-        let mut h = harness(MarketDataConfig::default(), true);
-        h.dropped.store(3, Ordering::Relaxed);
-        h.gap_pending.store(true, Ordering::Relaxed);
-        h.processor.tick(Instant::now() + Duration::from_millis(10));
-
-        let gap = h
-            .bodies()
-            .into_iter()
-            .find_map(|body| match body {
-                MessageBody::Gap(gap) => Some(gap),
-                _ => None,
-            })
-            .expect("gap marker");
-        assert_eq!(3, gap.dropped);
-        assert_eq!(1, h.stats.gaps.load(Ordering::Relaxed));
-
-        h.processor.apply_snapshot(SnapshotFrame {
-            log_index: 10,
+    fn snapshot(market_seq: u64) -> SnapshotFrame {
+        SnapshotFrame {
+            log_index: market_seq + 1,
+            market_seq,
             ts_ms: 5_000,
             symbol_id: 0,
             bids: vec![DepthLevel {
@@ -1786,90 +1681,335 @@ mod tests {
                 orders: 1,
             }],
             last_trade: Some(100.5),
-            book_sequence: 12,
+            book_sequence: market_seq + 1,
             pending_stops: 1,
-        });
-        h.processor
-            .tick(Instant::now() + Duration::from_millis(250));
-
-        let bodies = h.bodies();
-        let snapshot = bodies
-            .iter()
-            .find_map(|body| match body {
-                MessageBody::DepthSnapshot(snapshot) => Some(snapshot),
-                _ => None,
-            })
-            .expect("snapshot published");
-        assert_eq!(1, snapshot.bids.len());
-        assert_eq!(1, snapshot.asks.len());
-
-        let bbo = bodies
-            .iter()
-            .find_map(|body| match body {
-                MessageBody::Bbo(bbo) => Some(bbo),
-                _ => None,
-            })
-            .expect("bbo after snapshot");
-        assert_eq!(100.0, bbo.bid);
-        assert_eq!(101.0, bbo.ask);
-        assert_eq!(Some(100.5), bbo.last_trade);
-
-        // Frames already covered by the snapshot are suppressed.
-        let before = h
-            .messages()
-            .iter()
-            .filter(|message| matches!(message.body, MessageBody::Trade(_)))
-            .count();
-        h.processor.ingest(frame(
-            9,
-            4_000,
-            vec![],
-            vec![fill_event(9, 0, OrderSide::Buy, 99.0, 1.0, 7, 8)],
-        ));
-        h.processor
-            .tick(Instant::now() + Duration::from_millis(500));
-        let after = h
-            .messages()
-            .iter()
-            .filter(|message| matches!(message.body, MessageBody::Trade(_)))
-            .count();
-        assert_eq!(before, after, "pre-snapshot frames are suppressed");
+        }
     }
 
     #[test]
-    fn leader_gate_blocks_until_a_snapshot_arrives() {
-        let mut h = harness(MarketDataConfig::default(), false);
+    fn publishes_all_products_for_one_frame() {
+        let mut h = harness(MarketDataConfig::default());
+        h.processor.ingest(frame(
+            7,
+            1_000,
+            vec![
+                depth(OrderSide::Sell, 100.5, 5.0, 1),
+                depth(OrderSide::Buy, 99.5, 3.0, 1),
+            ],
+            vec![fill_event(7, OrderSide::Buy, 100.5, 2.0, 10, 1)],
+        ));
+
+        let messages = h.messages();
+        assert!(
+            messages
+                .iter()
+                .all(|message| message.market_seq == 7 && message.sub_seq == 0),
+            "every message is anchored to the frame: {messages:?}"
+        );
+
+        let trade = messages
+            .iter()
+            .find_map(|message| match &message.body {
+                MessageBody::Trade(records) => Some(records),
+                _ => None,
+            })
+            .expect("trade message");
+        assert_eq!(1, trade.len());
+        assert_eq!(OrderSide::Buy, trade[0].taker_side);
+        assert_eq!(100.5, trade[0].price);
+        assert_eq!(2.0, trade[0].volume);
+
+        let bbo = messages
+            .iter()
+            .find_map(|message| match &message.body {
+                MessageBody::Bbo(bbo) => Some(bbo),
+                _ => None,
+            })
+            .expect("bbo message");
+        assert_eq!(Some(100.5), bbo.last_trade);
+        assert_eq!((99.5, 3.0), (bbo.bid, bbo.bid_volume));
+        assert_eq!((100.5, 5.0), (bbo.ask, bbo.ask_volume));
+
+        let depth = messages
+            .iter()
+            .find_map(|message| match &message.body {
+                MessageBody::DepthDelta(updates) => Some(updates),
+                _ => None,
+            })
+            .expect("depth message");
+        assert_eq!(2, depth.len());
+
+        assert!(
+            messages
+                .iter()
+                .any(|message| matches!(message.body, MessageBody::Lifecycle(_))),
+            "lifecycle message"
+        );
+        h.assert_unique_keys();
+    }
+
+    #[test]
+    fn one_trade_message_carries_every_fill_of_the_taker() {
+        let mut h = harness(MarketDataConfig::default());
+        let events: Vec<MatchEvent> = (0..500u64)
+            .map(|i| fill_event(9, OrderSide::Sell, 100.0, 1.0, 100, i))
+            .collect();
+        h.processor.ingest(frame(9, 1_000, vec![], events));
+
+        let trades: Vec<_> = h
+            .bodies()
+            .into_iter()
+            .filter_map(|body| match body {
+                MessageBody::Trade(records) => Some(records),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(1, trades.len(), "one message per taker");
+        assert_eq!(500, trades[0].len(), "no chunking");
+        assert_eq!(500, h.stats.trades.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn each_frame_emits_its_own_post_batch_depth_total() {
+        let mut h = harness(MarketDataConfig::default());
+        h.processor.ingest(frame(
+            1,
+            1_000,
+            vec![depth(OrderSide::Sell, 100.0, 5.0, 1)],
+            vec![],
+        ));
+        h.processor.ingest(frame(
+            2,
+            1_001,
+            vec![depth(OrderSide::Sell, 100.0, -2.0, 0)],
+            vec![],
+        ));
+
+        let levels: Vec<u64> = h
+            .messages()
+            .iter()
+            .filter_map(|message| match &message.body {
+                MessageBody::DepthDelta(updates) => Some((updates[0].level.volume * 10.0) as u64),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(vec![50, 30], levels);
+        assert_eq!(
+            vec![1u64, 2u64],
+            h.messages()
+                .iter()
+                .filter(|m| matches!(m.body, MessageBody::DepthDelta(_)))
+                .map(|m| m.market_seq)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn bars_close_from_event_time_and_are_anchored() {
+        let config = MarketDataConfig {
+            bar_intervals_ms: vec![1_000],
+            ..MarketDataConfig::default()
+        };
+        let mut h = harness(config);
+
+        h.processor.ingest(frame(
+            1,
+            1_000,
+            vec![],
+            vec![fill_event(1, OrderSide::Buy, 100.0, 1.0, 1, 2)],
+        ));
+        h.processor.ingest(frame(
+            2,
+            1_100,
+            vec![],
+            vec![fill_event(2, OrderSide::Buy, 102.0, 2.0, 3, 4)],
+        ));
+        h.processor.ingest(frame(
+            3,
+            2_100,
+            vec![],
+            vec![fill_event(3, OrderSide::Buy, 99.0, 1.0, 5, 6)],
+        ));
+
+        let bars: Vec<(u64, BarRecord)> = h
+            .messages()
+            .into_iter()
+            .filter_map(|message| match message.body {
+                MessageBody::Bar(bar) => Some((message.market_seq, bar)),
+                _ => None,
+            })
+            .collect();
+        let (anchor, closed) = bars
+            .iter()
+            .find(|(_, bar)| bar.window_start_ms == 1_000 && bar.trade_count > 0)
+            .expect("closed bar");
+        assert_eq!(3, *anchor, "the frame that rolled the window");
+        assert_eq!(100.0, closed.open);
+        assert_eq!(102.0, closed.high);
+        assert_eq!(100.0, closed.low);
+        assert_eq!(102.0, closed.close);
+        assert_eq!(3.0, closed.volume);
+        assert_eq!(2, closed.trade_count);
+    }
+
+    #[test]
+    fn lifecycle_sheds_rested_before_critical_events() {
+        let config = MarketDataConfig {
+            lifecycle_batch_max: 2,
+            ..MarketDataConfig::default()
+        };
+        let mut h = harness(config);
+
+        let mut events = Vec::new();
+        for _ in 0..3 {
+            let order = Order::new(OrderSide::Buy, 100.0, 1.0, 0);
+            events.extend(MatchEvent::for_place_at(1, 0, &order, &[], Some(1.0)));
+        }
+        for sequence in 0..2 {
+            let mut order = Order::new(OrderSide::Buy, 100.0, 1.0, sequence);
+            order.sequence = sequence;
+            events.push(MatchEvent::for_cancel_at(2, 0, &order));
+        }
+        h.processor.ingest(frame(3, 3_000, vec![], events));
+
+        let lifecycle = h
+            .bodies()
+            .into_iter()
+            .find_map(|body| match body {
+                MessageBody::Lifecycle(records) => Some(records),
+                _ => None,
+            })
+            .expect("lifecycle batch");
+        assert_eq!(2, lifecycle.len());
+        assert!(
+            lifecycle
+                .iter()
+                .all(|record| record.kind == MatchEventKind::Cancelled)
+        );
+        assert_eq!(3, h.stats.lifecycle_shed.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn snapshot_resets_and_suppresses_older_frames() {
+        let mut h = harness(MarketDataConfig::default());
+        h.processor.apply_snapshot(snapshot(10));
+
+        let messages = h.messages();
+        let reset = messages
+            .iter()
+            .find(|message| matches!(message.body, MessageBody::DepthSnapshot(_)))
+            .expect("snapshot message");
+        assert_eq!(10, reset.market_seq);
+        assert_eq!(flags::SNAPSHOT | flags::RESET, reset.flags);
+        assert!(
+            messages
+                .iter()
+                .any(|message| matches!(message.body, MessageBody::Bbo(_)))
+        );
+
+        h.clear();
+        h.processor.ingest(frame(
+            9,
+            4_000,
+            vec![depth(OrderSide::Buy, 99.0, 1.0, 1)],
+            vec![fill_event(9, OrderSide::Buy, 99.0, 1.0, 7, 8)],
+        ));
+        assert!(h.messages().is_empty(), "pre-snapshot frame suppressed");
+
+        h.processor.ingest(frame(
+            11,
+            6_000,
+            vec![depth(OrderSide::Buy, 99.0, 1.0, 1)],
+            vec![fill_event(11, OrderSide::Buy, 99.0, 1.0, 9, 10)],
+        ));
+        assert!(h.messages().iter().all(|message| message.market_seq == 11));
+    }
+
+    #[test]
+    fn leader_and_reset_gates_suppress_emission() {
+        let mut h = harness(MarketDataConfig::default());
+        h.leader.store(false, Ordering::Relaxed);
         h.processor.ingest(frame(
             1,
             1_000,
             vec![depth(OrderSide::Buy, 100.0, 1.0, 1)],
-            vec![fill_event(1, 0, OrderSide::Buy, 100.0, 1.0, 1, 2)],
+            vec![fill_event(1, OrderSide::Buy, 100.0, 1.0, 1, 2)],
         ));
-        h.processor
-            .tick(Instant::now() + Duration::from_millis(250));
-        assert!(h.bodies().is_empty(), "a follower publishes nothing");
-        assert!(!h.stats.publishing.load(Ordering::Relaxed));
+        assert!(h.messages().is_empty());
 
         h.leader.store(true, Ordering::Relaxed);
-        h.processor.apply_snapshot(SnapshotFrame {
-            log_index: 0,
-            ts_ms: 2_000,
-            symbol_id: 0,
-            bids: vec![],
-            asks: vec![],
-            last_trade: None,
-            book_sequence: 0,
-            pending_stops: 0,
-        });
-        h.processor
-            .tick(Instant::now() + Duration::from_millis(300));
-        assert!(h.stats.publishing.load(Ordering::Relaxed));
-        assert!(
-            h.bodies()
-                .iter()
-                .any(|body| matches!(body, MessageBody::DepthSnapshot(_))),
-            "leadership gain starts with a snapshot"
-        );
+        h.resetting.store(true, Ordering::Relaxed);
+        h.processor.ingest(frame(
+            2,
+            1_100,
+            vec![],
+            vec![fill_event(2, OrderSide::Buy, 100.0, 1.0, 3, 4)],
+        ));
+        assert!(h.messages().is_empty(), "resetting suppresses");
+
+        h.processor.apply_snapshot(snapshot(2));
+        h.clear();
+        h.processor.ingest(frame(
+            3,
+            1_200,
+            vec![],
+            vec![fill_event(3, OrderSide::Buy, 100.0, 1.0, 5, 6)],
+        ));
+        assert!(!h.messages().is_empty());
+
+        h.leader.store(false, Ordering::Relaxed);
+        h.clear();
+        h.processor.ingest(frame(
+            4,
+            1_300,
+            vec![],
+            vec![fill_event(4, OrderSide::Buy, 100.0, 1.0, 7, 8)],
+        ));
+        assert!(h.messages().is_empty(), "loss closes the gate");
+    }
+
+    #[test]
+    fn gap_marker_is_anchored_to_the_next_frame() {
+        let mut h = harness(MarketDataConfig::default());
+        h.dropped.store(3, Ordering::Relaxed);
+        h.gap_pending.store(true, Ordering::Relaxed);
+        h.processor.ingest(frame(5, 1_000, vec![], vec![]));
+
+        let gap = h
+            .bodies()
+            .into_iter()
+            .find_map(|body| match body {
+                MessageBody::Gap(gap) => Some(gap),
+                _ => None,
+            })
+            .expect("gap marker");
+        assert_eq!(3, gap.dropped);
+        assert_eq!(1, h.stats.gaps.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn status_uses_a_deterministic_cadence() {
+        let config = MarketDataConfig {
+            status_every: 100,
+            ..MarketDataConfig::default()
+        };
+        let mut h = harness(config);
+
+        h.processor.ingest(frame(100, 1_000, vec![], vec![]));
+        h.processor.ingest(frame(101, 1_001, vec![], vec![]));
+
+        let statuses: Vec<_> = h
+            .messages()
+            .into_iter()
+            .filter_map(|message| match message.body {
+                MessageBody::Status(status) => Some((message.market_seq, status)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(1, statuses.len());
+        assert_eq!(100, statuses[0].0);
+        assert_eq!(100, statuses[0].1.last_market_seq);
+        assert_eq!(0, statuses[0].1.last_sub_seq);
     }
 
     #[test]
@@ -1882,5 +2022,149 @@ mod tests {
         assert!(channels.gap_pending.load(Ordering::Relaxed));
         assert_eq!(1, channels.stats.dropped_frames.load(Ordering::Relaxed));
         assert_eq!(2, channels.stats.frames.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn two_replicas_fed_the_same_frames_emit_identical_messages() {
+        let frames = vec![
+            frame(
+                1,
+                1_000,
+                vec![depth(OrderSide::Sell, 100.5, 5.0, 1)],
+                vec![fill_event(1, OrderSide::Buy, 100.5, 2.0, 1, 2)],
+            ),
+            frame(2, 1_100, vec![depth(OrderSide::Buy, 99.5, 3.0, 1)], vec![]),
+            frame(
+                3,
+                2_100,
+                vec![depth(OrderSide::Sell, 100.5, -2.0, 0)],
+                vec![fill_event(3, OrderSide::Buy, 100.5, 1.0, 3, 2)],
+            ),
+        ];
+        let mut a = harness(MarketDataConfig::default());
+        let mut b = harness(MarketDataConfig::default());
+        for frame in &frames {
+            a.processor.ingest(frame.clone());
+            b.processor.ingest(frame.clone());
+        }
+
+        let json = |h: &Harness| serde_json::to_string(&h.messages()).unwrap();
+        assert_eq!(json(&a), json(&b), "same frames, same messages");
+        assert!(a.messages().iter().all(|message| message.market_seq > 0));
+    }
+
+    #[test]
+    fn a_takeover_snapshot_continues_the_same_keys() {
+        let frames: Vec<TapFrame> = (1..=6)
+            .map(|sequence| {
+                frame(
+                    sequence,
+                    1_000 * sequence,
+                    vec![depth(OrderSide::Sell, 100.5, 1.0, 1)],
+                    vec![fill_event(sequence, OrderSide::Buy, 100.5, 1.0, 10, 20)],
+                )
+            })
+            .collect();
+
+        let mut a = harness(MarketDataConfig::default());
+        for frame in &frames {
+            a.processor.ingest(frame.clone());
+        }
+
+        let mut b = harness(MarketDataConfig::default());
+        b.processor.apply_snapshot(snapshot(4));
+        for frame in frames.iter().filter(|frame| frame.market_seq >= 4) {
+            b.processor.ingest(frame.clone());
+        }
+
+        let trades = |h: &Harness, from: u64| -> Vec<(u64, Vec<TradeRecord>)> {
+            h.messages()
+                .into_iter()
+                .filter(|message| message.market_seq >= from)
+                .filter_map(|message| match message.body {
+                    MessageBody::Trade(records) => Some((message.market_seq, records)),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(
+            trades(&a, 4),
+            trades(&b, 4),
+            "the takeover continues the same keys"
+        );
+        assert!(trades(&b, 4).iter().all(|(sequence, _)| *sequence >= 4));
+    }
+
+    #[test]
+    fn frames_after_the_snapshot_capture_are_replayed() {
+        let mut h = harness(MarketDataConfig::default());
+        h.resetting.store(true, Ordering::Relaxed);
+        h.processor.ingest(frame(
+            5,
+            5_000,
+            vec![depth(OrderSide::Buy, 99.0, 1.0, 1)],
+            vec![fill_event(5, OrderSide::Buy, 99.0, 1.0, 7, 8)],
+        ));
+        assert!(h.messages().is_empty(), "buffered while resetting");
+
+        h.processor.apply_snapshot(snapshot(5));
+
+        let messages = h.messages();
+        assert!(
+            messages
+                .iter()
+                .any(|message| matches!(message.body, MessageBody::DepthSnapshot(_)))
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.market_seq == 5
+                    && matches!(message.body, MessageBody::Trade(_))),
+            "the post-capture frame is replayed after the snapshot"
+        );
+        h.assert_unique_keys();
+    }
+
+    #[test]
+    fn gap_and_status_share_the_stream_without_key_collisions() {
+        let config = MarketDataConfig {
+            status_every: 100,
+            ..MarketDataConfig::default()
+        };
+        let mut h = harness(config);
+        h.dropped.store(2, Ordering::Relaxed);
+        h.gap_pending.store(true, Ordering::Relaxed);
+
+        h.processor.ingest(frame(100, 1_000, vec![], vec![]));
+
+        let statuses: Vec<_> = h
+            .messages()
+            .into_iter()
+            .filter(|message| message.stream == STREAM_STATUS)
+            .collect();
+        assert_eq!(2, statuses.len(), "one GAP, one cadence status");
+        let mut sub_seqs: Vec<u16> = statuses.iter().map(|message| message.sub_seq).collect();
+        sub_seqs.sort_unstable();
+        assert_eq!(
+            vec![0, GAP_SUB_SEQ],
+            sub_seqs,
+            "the anchor's keys stay unique"
+        );
+        assert_eq!(
+            GAP_SUB_SEQ,
+            statuses
+                .iter()
+                .find(|message| message.flags == flags::GAP)
+                .expect("gap marker")
+                .sub_seq
+        );
+        let status = statuses
+            .iter()
+            .find_map(|message| match &message.body {
+                MessageBody::Status(status) => Some(status),
+                _ => None,
+            })
+            .expect("cadence status");
+        assert_eq!(0, status.last_sub_seq);
     }
 }

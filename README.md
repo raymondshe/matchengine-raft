@@ -40,28 +40,49 @@ A practical implementation of a distributed matching engine built upon [OpenRaft
 This project extends the [example-raft-kv](https://github.com/datafuselabs/openraft/tree/main/example-raft-kv) with persistent storage and a gRPC transport:
 
 ```
-                    ┌─────────────────────────────────────────┐
-                    │           Application Layer             │
-                    │      (Order Book Matching Engine)       │
-                    │ apply ──► MatchEvent ──► Sink (plugin)  │
-                    └─────────────────────┬───────────────────┘
-                                          │
-                    ┌─────────────────────▼───────────────────┐
-                    │           OpenRaft Core                 │
-                    │  (Consensus, Replication, Leadership)   │
-                    └─────────────────────┬───────────────────┘
-                                          │
-              ┌───────────────────────────┼───────────────────────────┐
-              │                           │                           │
-    ┌─────────▼─────────┐     ┌─────────▼─────────┐     ┌─────────▼─────────┐
-    │  Log + State      │     │   RaftNetwork     │     │   HTTP API        │
-    │ (WAL + Snapshots) │     │  (gRPC / HTTP)    │     │  (Actix-web)      │
-    └───────────────────┘     └───────────────────┘     └───────────────────┘
+                  ┌─────────────────────────────────────────────────────────┐
+                  │                    Application Layer                    │
+                  │              (Order Book Matching Engine)               │
+                  │      apply ──► order book + replicated market_seq       │
+                  │    MatchEvent ──► MatchResultSink (audit / clearing)    │
+                  └─────────────────────┬───────────────────────────┬───────┘
+                                        │                           │ MatchEvent + depth journal
+                                        │                           │ try_send (never blocks)
+                                        │                           ▼
+                                        │             ┌──────────────────────────────────────┐
+                                        │             │  Market-data thread (leader-gated)   │
+                                        │             │     shadow book · OHLC · wire v2     │
+                                        │             │   deterministic market_seq/sub_seq   │
+                                        │             └──────────────────────────────────────┘
+                                        │                                 │ MarketDataSink
+                                        │                                 ▼
+                                        │             ┌──────────────────────────────────────┐
+                                        │             │   JSONL now · Aeron 2001–2007 next   │
+                                        │             │      TRADE BBO DEPTH LIFECYCLE       │
+                                        │             │              STATUS BAR              │
+                                        ▼             └──────────────────────────────────────┘
+                  ┌─────────────────────────────────────────────────────────┐
+                  │                      OpenRaft Core                      │
+                  │          (Consensus, Replication, Leadership)           │
+                  └────────────────────────────┬────────────────────────────┘
+                                               │
+                                               │
+               ┌───────────────────────────────┴───────────────────────────────┐
+               │                               │                               │
+               ▼                               ▼                               ▼
+    ┌─────────────────────┐         ┌─────────────────────┐         ┌─────────────────────┐
+    │     Log + State     │         │     RaftNetwork     │         │      HTTP API       │
+    │  (WAL + Snapshots)  │         │    (gRPC / HTTP)    │         │     (Actix-web)     │
+    └─────────────────────┘         └─────────────────────┘         └─────────────────────┘
 ```
 
 Peer-to-peer Raft RPCs use gRPC on `port + 1000` by default. The public API and the HTTP Raft
 handlers stay on the `--http-addr` listener, so a node serves both transports regardless of which
 one it dials.
+
+Market-data egress is node-local and off the consensus path: the tap is a bounded `try_send`, so a
+slow subscriber can never block `apply`. The JSONL sink is for debugging; the same wire-v2 messages
+are what the Aeron adapter (streams 2001–2007) will publish next.
 
 ### Key Components
 
@@ -82,6 +103,12 @@ one it dials.
    - Deterministic expiry (`PurgeExpired` carries the timestamps through the log) and stop
      election on the replicated last trade price
    - Example of a real-world state machine application
+
+4. **Market-Data Egress** ([`market_data/`](./src/market_data/))
+   - `apply` hands match events and a depth journal to a bounded tap (`try_send`; matching never waits)
+   - A leader-gated thread keeps a shadow book, derives BBO/OHLC bars and encodes wire v2
+   - Keys are `(symbol_id, stream_id, market_seq, sub_seq)`; one uncapped `TRADE` per taker
+   - JSONL sink today; Aeron streams 2001–2007 are the next phase
 
 ## Getting Started
 
@@ -252,7 +279,7 @@ src/
 ├── matchengine/
 │   └── mod.rs               # Order book matching engine
 ├── market_data/
-│   ├── mod.rs               # Tap, depth journal consumer, shadow book, throttled publisher
+│   ├── mod.rs               # Tap, depth journal consumer, shadow book, deterministic publisher
 │   └── wire.rs              # 64-byte binary header + message bodies (Aeron-ready)
 ├── match_result/
 │   └── mod.rs               # MatchEvent ids + pluggable MatchResultSink (noop/memory/file)
@@ -338,7 +365,7 @@ defaults, so payloads written before they existed still deserialize. The semanti
 | GTC (default) | — | Rests until filled or cancelled. |
 | IOC | `"tif": "IOC"` | Executes what crosses now; the remainder is cancelled and reported by a `cancelled` event. |
 | FOK | `"tif": "FOK"` | A preflight sums the reachable visible + hidden depth at or inside the limit. Unless the whole order fits, it is refused (`rejected`, reason `fok_unfillable`) and the book is untouched. |
-| GTD | `"tif": {"GTD": 1700000000000}` (Unix ms) | Rests until a `PurgeExpired` with `now_ms >= expiry` evicts it. |
+| GTD | `"tif": {"GTD": 1700000000000}` (Unix ms) | Rests until a mutating request's intake timestamp reaches the deadline (automatic purge) or an explicit `PurgeExpired` evicts it. |
 | Day | `"tif": "DAY"` | Expires when `PurgeExpired` is called with `day_close_ms` and `now_ms >= close`; without a close it behaves like GTC. |
 | Post-only | `"post_only": true` | Never takes liquidity: it rests in full, or is refused (`post_only_would_cross`) when it would trade. |
 | Iceberg | `"display_volume": 100.0` | `volume` is the total; only one display tranche rests. The rest waits in `hidden_volume`, invisible to depth, and is refilled tranche by tranche as the visible part is consumed. |
@@ -348,15 +375,17 @@ defaults, so payloads written before they existed still deserialize. The semanti
 Market orders (`"live": "Market"`) ignore their own price, sweep the opposite side and cancel the
 remainder; they never rest.
 
-Expiry is deterministic: `apply` never reads a clock, so the deadlines travel in the replicated
-request and every replica evicts the same orders:
+Expiry is deterministic: `apply` never reads a clock. Every admissible mutating request
+(`Place`, `Cancel`, `Amend`) runs the automatic GTD purge at its intake timestamp before it is
+applied, so a taker cannot trade against liquidity that is already due. `Day` still needs a market
+close, so only the explicit request evicts it:
 
 ```json
 {"PurgeExpired": {"now_ms": 1700000000000, "day_close_ms": null}}
 ```
 
-The response carries the number of evicted orders (`{"value": "2"}`), and each one emits an
-`expired` event reporting its still-open volume.
+`PurgeExpired` itself consumes a market sequence; its response is that sequence. Every evicted
+order emits an `expired` event with its still-open volume.
 
 A stop is only elected by a *new* trade: one the last trade price already crosses is refused
 (`stop_would_trigger`) instead of turning into a market order on entry. One trade can cascade
@@ -382,8 +411,10 @@ order exactly like `Cancel` — side, current price and sequence — and each ne
   resting book never crosses, so taking liquidity is still cancel + place.
 - Icebergs, parked stops and market orders are not amendable (`unsupported_order`); cancel and
   re-place them instead.
-- A successful amendment emits an `amended` event carrying both the previous and the new sequence;
-  a refused one returns `null` from `/write` and publishes a `rejected` event with the reason.
+- A successful amendment emits an `amended` event carrying both the previous and the new order
+  sequence; the `/write` response is the amendment's `market_seq` (the new order sequence when the
+  order was re-inserted). A refused amendment still consumes a sequence and publishes a `rejected`
+  event with the reason.
 
 ### Match-result processing
 
@@ -394,7 +425,7 @@ entry alone, so every replica produces the same ids; the sink itself is node-loc
 influences the replicated state:
 
 ```
-POST /write { Place | Cancel | PurgeExpired }
+POST /write { Place | Cancel | Amend | PurgeExpired }
         │
         ▼
   StateMachineStore::apply  (every replica)
@@ -433,17 +464,23 @@ designed in `docs/AERON_SOLUTION.md` Part II and implemented in `src/market_data
 - the matching thread only appends the visible-depth changes it already computes (a transient
   journal) and copies the entry's `MatchEvent`s into a bounded queue — no book scans, encoding or
   IO on the matching path;
-- a dedicated thread keeps a shadow book and publishes coalesced messages: trades (batched, never
-  sampled), BBO (`last`/`mid`/spread), depth snapshots and post-batch deltas, lifecycle events,
-  OHLC bars (1 s and 1 m by default) and status heartbeats;
-- only the leader publishes; every leadership gain starts with a reset snapshot. A full queue drops
-  frames and emits a `GAP`; `apply` is never blocked or slowed by a subscriber.
+- a dedicated thread keeps a shadow book and publishes **deterministically sequenced** messages:
+  all fills of one taker in one `TRADE` message (uncapped), BBO (`last`/`mid`/spread) per
+  book-changing frame, depth snapshots and post-batch deltas, lifecycle events, OHLC bars (1 s and
+  1 m by default) and a status message every 100th market sequence;
+- every message carries `(symbol_id, stream_id, market_seq, sub_seq)`. `market_seq` is the replicated
+  mutation sequence (the taker order sequence for `Place`; `Cancel`, `Amend` and `PurgeExpired`
+  consume one), so the key is identical on leader and followers, across failover and restart.
+  Downstream deduplicates on that tuple; `(log_index, ordinal)` remains the audit position;
+- only the leader publishes by default (`--market-data-leader-only=false` feeds every replica);
+  every leadership gain starts with a reset snapshot whose boundary is the next `market_seq`. A full
+  queue drops frames and emits a `GAP`; `apply` is never blocked or slowed by a subscriber.
 
 The shipped sink is JSONL for debugging. The same messages have a binary encoding in
-`src/market_data/wire.rs` (64-byte header, little-endian bodies), and `MarketDataSink` is the seam
-the Aeron adapter will implement (next phase). The schema is multi-symbol ready (`symbol_id`, 0
-today). Tuning: `--market-data-depth`, `--market-data-bbo-interval-ms`,
-`--market-data-bar-intervals-ms`.
+`src/market_data/wire.rs` (64-byte header, version 2, little-endian bodies), and `MarketDataSink`
+is the seam the Aeron adapter will implement (next phase). The schema is multi-symbol ready
+(`symbol_id`, 0 today). Tuning: `--market-data-depth`, `--market-data-status-every`,
+`--market-data-bar-intervals-ms`, `--market-data-leader-only`.
 
 `/read marketdata_status` returns the feed counters and the leader gate.
 
@@ -511,7 +548,9 @@ The gRPC transport exposes the same operations on `--http-addr` port + 1000
 
 ### Application APIs
 
-- `POST /write` - Submit a `Place`, `Cancel`, `Amend` or `PurgeExpired` request through Raft
+- `POST /write` - Submit a `Place`, `Cancel`, `Amend` or `PurgeExpired` request through Raft. The
+  response is the assigned `market_seq` for every mutating request (for a `Place`, also the order
+  sequence).
 - `POST /read` - Read from the local state machine (may be stale)
 - `POST /linearizable_read` - Linearizable read; the request must reach the leader
 - `POST /follower_read` - Linearizable read served locally after fetching a linearizer from the leader
@@ -557,7 +596,7 @@ placeholder). `sequence` is still required by the deserializer.
 | `tests/cluster/test_storage.rs` | WAL framing, torn-tail truncation, segment rotation, truncate/purge across segments, vote/committed persistence, snapshot build/install/reopen, corrupt-file rejection |
 | `tests/cluster/test_restart.rs` | Full node restart recovering the order book and sequence via WAL replay, and via snapshot + tail |
 | `tests/cluster/test_match_results.rs` | A node started with `--match-event-log` records rest/fill/cancel events in log order while the `/write` response stays unchanged; a second node checks stop triggers, GTD expiry and the new `/read` keys |
-| `tests/cluster/test_market_data.rs` | A node started with `--market-data-log` publishes a reset snapshot, batched trades, BBO, coalesced depth and a closed OHLC bar; `/read marketdata_status` reports the counters |
+| `tests/cluster/test_market_data.rs` | A node started with `--market-data-log` publishes a reset snapshot, one trade message per taker, BBO, post-entry depth totals and a closed OHLC bar; the assertions check `market_seq` anchors and `/read marketdata_status` counters |
 
 Every integration test uses a unique temporary data directory. The cluster test uses fixed ports
 `21001-21003` (gRPC `22001-22003`), the snapshot test `21101-21102`, the restart test `21201-21202`

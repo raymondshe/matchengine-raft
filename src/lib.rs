@@ -308,6 +308,10 @@ pub async fn build_match_engine_node(
                 .market_data
                 .as_ref()
                 .map_or(10, |config| config.depth_levels),
+            storage
+                .market_data
+                .as_ref()
+                .is_none_or(|config| config.leader_only),
         )
     });
 
@@ -405,20 +409,32 @@ fn spawn_market_data_watch(
     state_machine: StateMachineStore,
     control: MarketDataControl,
     depth_levels: usize,
+    leader_only: bool,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut metrics = raft.metrics();
         let mut leader = false;
+        let mut started = false;
         loop {
             let is_leader = metrics.borrow_and_update().current_leader == Some(node_id);
-            if is_leader != leader {
-                leader = is_leader;
-                control.set_leader(leader);
-                if leader {
-                    let snapshot = state_machine
-                        .capture_market_data_snapshot(depth_levels, 0)
+            if !leader_only {
+                // Every replica publishes: a startup reset is all consumers need.
+                if !started {
+                    started = true;
+                    state_machine
+                        .start_market_data_feed(&control, depth_levels, 0)
                         .await;
-                    control.push_snapshot(snapshot);
+                }
+            } else if is_leader != leader {
+                leader = is_leader;
+                if leader {
+                    // Capture and enqueue under the state-machine lock, then open
+                    // the gate: the snapshot precedes every delta it covers.
+                    state_machine
+                        .start_market_data_feed(&control, depth_levels, 0)
+                        .await;
+                } else {
+                    control.set_leader(false);
                 }
             }
             if metrics.changed().await.is_err() {

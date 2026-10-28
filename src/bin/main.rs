@@ -51,13 +51,21 @@ pub struct Opt {
     #[clap(long, default_value_t = 10)]
     pub market_data_depth: usize,
 
-    /// Minimum spacing between BBO updates, in milliseconds.
-    #[clap(long, default_value_t = 1)]
-    pub market_data_bbo_interval_ms: u64,
+    /// Emit a deterministic STATUS message every N market sequences (default 100; 0 disables).
+    #[clap(long, default_value_t = 100)]
+    pub market_data_status_every: u64,
 
     /// OHLC bar intervals in milliseconds, comma separated (default 1000,60000).
     #[clap(long, value_delimiter = ',')]
     pub market_data_bar_intervals_ms: Vec<u64>,
+
+    /// Publish market data only while this node is the leader (default true).
+    ///
+    /// Set to false to feed every replica; duplicates carry identical
+    /// `(symbol_id, stream_id, market_seq, sub_seq)` keys and deduplicate
+    /// downstream. This is mainly a testing switch.
+    #[clap(long, num_args = 0..=1, default_missing_value = "true", default_value_t = true)]
+    pub market_data_leader_only: bool,
 }
 
 #[actix_web::main]
@@ -76,7 +84,8 @@ async fn main() -> std::io::Result<()> {
     if let Some(path) = options.market_data_log {
         let mut config = MarketDataConfig::jsonl(path);
         config.depth_levels = options.market_data_depth;
-        config.bbo_interval_ms = options.market_data_bbo_interval_ms;
+        config.status_every = options.market_data_status_every;
+        config.leader_only = options.market_data_leader_only;
         if !options.market_data_bar_intervals_ms.is_empty() {
             config.bar_intervals_ms = options.market_data_bar_intervals_ms;
         }

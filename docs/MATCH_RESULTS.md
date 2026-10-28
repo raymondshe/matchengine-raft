@@ -449,11 +449,12 @@ Implemented today (`cargo test --lib`, `cargo test --test cluster test_match_res
 - `apply` publishes `Rested`, `Fill` and `Cancelled` events to the configured sink, with the right
   order/counterparty sequences and the book's exact volumes.
 - The order-type paths publish their own kinds: `Triggered` (a parked stop was elected; its child's
-  fills follow in the same entry, then a `Cancelled` for any remainder), `Expired` (a `PurgeExpired`
-  eviction), `Amended` (a resting order changed price/volume; the event carries both the previous
-  and the new sequence) and `Rejected` (FOK unfillable, post-only crossing, stop already crossed,
-  amend of an unknown/unsupported order, invalid shape). Ordinals keep increasing across the whole
-  entry, so a stop cascade stays one ordered batch.
+  fills follow in the same entry, then a `Cancelled` for any remainder), `Expired` (an automatic
+  GTD purge at a mutating request's intake time, or an explicit `PurgeExpired`), `Amended` (a
+  resting order changed price/volume; the event carries both the previous and the new sequence) and
+  `Rejected` (FOK unfillable, post-only crossing, stop already crossed, amend of an
+  unknown/unsupported order, invalid shape). Expired events come first in an entry, and ordinals
+  keep increasing across the whole entry, so a stop cascade stays one ordered batch.
 - A cancel of an order that is not in the book publishes nothing.
 - A failing sink is logged and does not fail `apply` or change the state.
 - `FileLogSink` writes one JSON object per event with `node_id`, appends across reopen, and writes

@@ -40,8 +40,10 @@ pub enum OrderType {
 /// `Day` expires at the trading-day close when the caller supplies one.
 ///
 /// Expiry is never evaluated against a wall clock inside the state machine:
-/// the timestamp travels in the [`crate::store::MatchEngineRequest::PurgeExpired`]
-/// request, so every replica evicts exactly the same orders.
+/// every mutating request carries the leader's intake timestamp through the
+/// log and purges due GTD orders before applying, while `Day` waits for an
+/// explicit [`crate::store::MatchEngineRequest::PurgeExpired`] with the trading
+/// day's close. Every replica evicts exactly the same orders.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum TimeInForce {
@@ -183,8 +185,9 @@ pub struct Order {
     pub hidden_volume: f64,
     /// Intake timestamp (Unix ms), stamped by the receiving leader before the
     /// order is proposed (client values are overwritten). It is recorded in the
-    /// log, validates GTD expiries and labels every market-data record derived
-    /// from the order; `apply` itself never reads a clock.
+    /// log, validates GTD expiries, triggers the automatic GTD purge for every
+    /// mutating request, and labels every market-data record derived from the
+    /// order; `apply` itself never reads a clock.
     #[serde(default)]
     pub timestamp: u64,
 }
@@ -440,6 +443,15 @@ pub struct OrderBook {
     /// predictable branch per mutation and nothing else when it is off.
     #[serde(skip)]
     pub record_depth: bool,
+    /// Earliest GTD deadline among resting and parked orders, when known. The
+    /// automatic purge checks this in O(1) and only scans the book when a
+    /// deadline is actually due.
+    #[serde(skip)]
+    pub earliest_gtd_expiry: Option<u64>,
+    /// Set when a GTD order left the book; the earliest deadline is recomputed
+    /// lazily on the next mutation.
+    #[serde(skip)]
+    gtd_scan_dirty: bool,
 }
 
 /// Represents the result of a successful order match.
@@ -487,6 +499,12 @@ impl MatchResult {
 /// events and a response.
 #[derive(Debug, Clone, Default)]
 pub struct Outcome {
+    /// Replicated market/mutation sequence assigned to this submission. For a
+    /// `Place` it is also the taker order's sequence.
+    pub market_seq: u64,
+    /// Resting orders evicted by the automatic GTD purge before this request
+    /// was applied, in deterministic order.
+    pub expired: Vec<Order>,
     /// Trades the submitted order executed, in execution order.
     pub fills: Vec<MatchResult>,
     /// Open volume the submission left resting in the book (the visible
@@ -520,6 +538,8 @@ pub struct StopExecution {
 /// A successful amendment: the order as it now rests, plus where it came from.
 #[derive(Debug, Clone)]
 pub struct Amendment {
+    /// Replicated market/mutation sequence assigned to this amendment.
+    pub market_seq: u64,
     /// The resting order after the amendment. Its `sequence` is the identity to
     /// use from now on.
     pub order: Order,
@@ -604,6 +624,70 @@ impl OrderBook {
             last_trade_price: None,
             depth_journal: Vec::new(),
             record_depth: false,
+            earliest_gtd_expiry: None,
+            gtd_scan_dirty: false,
+        }
+    }
+
+    /// Takes the next replicated market/mutation sequence.
+    ///
+    /// Every mutating request consumes exactly one: `Place` uses it as the
+    /// order sequence, `Cancel`/`PurgeExpired` as the event anchor, and `Amend`
+    /// as the event anchor (and the re-inserted order's sequence when priority
+    /// is lost). The counter is part of the replicated state and snapshots.
+    pub fn next_market_sequence(&mut self) -> u64 {
+        let sequence = self.sequence;
+        self.sequence += 1;
+        sequence
+    }
+
+    /// Recomputes the earliest GTD deadline after a GTD order left the book.
+    fn refresh_earliest_gtd(&mut self) {
+        if !self.gtd_scan_dirty {
+            return;
+        }
+        self.gtd_scan_dirty = false;
+        let mut earliest: Option<u64> = None;
+        for order in self
+            .bids
+            .values()
+            .chain(self.asks.values())
+            .chain(self.stops.iter())
+        {
+            if let TimeInForce::Gtd(expiry) = order.tif {
+                earliest = Some(earliest.map_or(expiry, |current| current.min(expiry)));
+            }
+        }
+        self.earliest_gtd_expiry = earliest;
+    }
+
+    /// Rebuilds the derived indexes after a snapshot restore.
+    pub fn rebuild_derived_indexes(&mut self) {
+        self.gtd_scan_dirty = true;
+        self.refresh_earliest_gtd();
+    }
+
+    /// Whether any order could be evicted by the automatic GTD purge.
+    ///
+    /// The hot path checks this before calling [`OrderBook::purge_due_gtd`], so
+    /// a book without GTD orders pays one predictable branch per mutation.
+    #[inline]
+    pub fn has_gtd_deadlines(&self) -> bool {
+        self.earliest_gtd_expiry.is_some() || self.gtd_scan_dirty
+    }
+
+    /// Purges GTD orders due at `now_ms`, doing no book scan when the earliest
+    /// deadline is still in the future.
+    #[inline]
+    pub fn purge_due_gtd(&mut self, now_ms: u64) -> Vec<Order> {
+        self.refresh_earliest_gtd();
+        if self
+            .earliest_gtd_expiry
+            .is_some_and(|expiry| now_ms >= expiry)
+        {
+            self.purge_expired(now_ms, None)
+        } else {
+            Vec::new()
         }
     }
 
@@ -776,20 +860,31 @@ impl OrderBook {
     ///
     /// This is the deterministic core `apply` runs: everything it decides comes
     /// from the order (as recorded in the log) and the book itself. No clock is
-    /// read — GTD and Day expiry arrive as a `PurgeExpired` request, and stop
-    /// elections follow the last trade price, part of the replicated state.
+    /// read — the order's intake timestamp drives the automatic GTD purge, `Day`
+    /// waits for an explicit `PurgeExpired`, and stop elections follow the last
+    /// trade price, part of the replicated state.
     ///
     /// # Arguments
     ///
     /// * `order` - The order to process (will have its sequence number set)
     pub fn execute_order(&mut self, order: &mut Order) -> Outcome {
-        order.sequence = self.sequence;
-        self.sequence += 1;
+        order.sequence = self.next_market_sequence();
 
-        let mut outcome = Outcome::default();
+        let mut outcome = Outcome {
+            market_seq: order.sequence,
+            ..Outcome::default()
+        };
         if let Some(reason) = validate_order(order) {
             outcome.rejected = Some(reason);
             return outcome;
+        }
+
+        // Every admissible mutating request advances the GTD clock: the taker's
+        // intake timestamp is the trigger time and its sequence anchors the
+        // expiry events. `Day` needs a market close, so only the explicit
+        // `PurgeExpired` request evicts it.
+        if self.has_gtd_deadlines() {
+            outcome.expired = self.purge_due_gtd(order.timestamp);
         }
 
         // A stop order parks off the book; it is only ever elected by a *new*
@@ -801,6 +896,12 @@ impl OrderBook {
             {
                 outcome.rejected = Some(RejectReason::StopWouldTrigger);
             } else {
+                if let TimeInForce::Gtd(expiry) = order.tif {
+                    self.earliest_gtd_expiry = Some(
+                        self.earliest_gtd_expiry
+                            .map_or(expiry, |current| current.min(expiry)),
+                    );
+                }
                 self.stops.push(*order);
                 outcome.parked = true;
             }
@@ -868,7 +969,11 @@ impl OrderBook {
             .iter()
             .position(|stop| stop.side == order.side && stop.sequence == order.sequence);
         if let Some(index) = parked {
-            return Some(self.stops.remove(index));
+            let stop = self.stops.remove(index);
+            if matches!(stop.tif, TimeInForce::Gtd(_)) {
+                self.gtd_scan_dirty = true;
+            }
+            return Some(stop);
         }
 
         let removed = match order.side {
@@ -882,6 +987,9 @@ impl OrderBook {
             }),
         };
         if let Some(cancelled) = removed {
+            if matches!(cancelled.tif, TimeInForce::Gtd(_)) {
+                self.gtd_scan_dirty = true;
+            }
             self.record_depth_change(cancelled.side, cancelled.price, -cancelled.volume, -1);
         }
         removed
@@ -911,6 +1019,22 @@ impl OrderBook {
         key: &Order,
         price: Option<f64>,
         volume: Option<f64>,
+    ) -> Result<Amendment, AmendError> {
+        let market_seq = self.next_market_sequence();
+        self.amend_with_sequence(key, price, volume, market_seq)
+    }
+
+    /// [`OrderBook::amend`] with the request's market sequence already assigned.
+    ///
+    /// The caller (`apply`) takes the sequence and runs the automatic purge
+    /// before calling this, so the amendment and the expiries it may trigger
+    /// share one anchor.
+    pub fn amend_with_sequence(
+        &mut self,
+        key: &Order,
+        price: Option<f64>,
+        volume: Option<f64>,
+        market_seq: u64,
     ) -> Result<Amendment, AmendError> {
         if let Some(price) = price
             && !(price.is_finite() && price > 0.0)
@@ -963,7 +1087,6 @@ impl OrderBook {
             }
         }
 
-        let next_sequence = self.sequence;
         let (amendment, reinserted) = match key.side {
             OrderSide::Buy => amend_in_map(
                 &mut self.bids,
@@ -974,7 +1097,7 @@ impl OrderBook {
                 stored,
                 new_price,
                 new_volume,
-                next_sequence,
+                market_seq,
                 |price, sequence| BidKey { price, sequence },
             ),
             OrderSide::Sell => amend_in_map(
@@ -986,12 +1109,11 @@ impl OrderBook {
                 stored,
                 new_price,
                 new_volume,
-                next_sequence,
+                market_seq,
                 |price, sequence| AskKey { price, sequence },
             ),
         };
         if reinserted {
-            self.sequence += 1;
             self.record_depth_change(
                 key.side,
                 amendment.previous_price,
@@ -1075,6 +1197,12 @@ impl OrderBook {
                 );
             }
         }
+        if let TimeInForce::Gtd(expiry) = order.tif {
+            self.earliest_gtd_expiry = Some(
+                self.earliest_gtd_expiry
+                    .map_or(expiry, |current| current.min(expiry)),
+            );
+        }
         self.record_depth_change(order.side, order.price, visible, 1);
 
         visible
@@ -1096,13 +1224,18 @@ impl OrderBook {
         // The journal is a separate field, so the resting side and the journal
         // can be borrowed together without a second pass over the map.
         let record = self.record_depth;
-        match order.side {
+        // Books without GTD orders skip the per-fill expiry check entirely.
+        let mut gtd_dirty = self.gtd_scan_dirty;
+        let track_gtd = self.has_gtd_deadlines();
+        let result = match order.side {
             OrderSide::Buy => Self::sweep_side(
                 &mut self.asks,
                 order,
                 limit,
                 record,
                 &mut self.depth_journal,
+                track_gtd,
+                &mut gtd_dirty,
             ),
             OrderSide::Sell => Self::sweep_side(
                 &mut self.bids,
@@ -1110,8 +1243,12 @@ impl OrderBook {
                 limit,
                 record,
                 &mut self.depth_journal,
+                track_gtd,
+                &mut gtd_dirty,
             ),
-        }
+        };
+        self.gtd_scan_dirty = gtd_dirty;
+        result
     }
 
     /// Shared sweep loop for one resting side; see [`OrderBook::sweep`].
@@ -1124,6 +1261,8 @@ impl OrderBook {
         limit: Option<f64>,
         record: bool,
         journal: &mut Vec<DepthChange>,
+        track_gtd: bool,
+        gtd_dirty: &mut bool,
     ) -> (Vec<MatchResult>, f64) {
         let mut results = Vec::new();
         let mut remaining_volume = order.volume;
@@ -1193,6 +1332,9 @@ impl OrderBook {
                 );
             } else {
                 best.remove();
+                if track_gtd && matches!(maker.tif, TimeInForce::Gtd(_)) {
+                    *gtd_dirty = true;
+                }
                 record_depth_change(journal, record, maker.side, maker.price, -match_volume, -1);
             }
         }
@@ -1257,6 +1399,9 @@ impl OrderBook {
             };
 
             let stop = self.stops.remove(index);
+            if matches!(stop.tif, TimeInForce::Gtd(_)) {
+                self.gtd_scan_dirty = true;
+            }
             let trigger_price = last_trade_price;
             let limit = match stop.live {
                 OrderType::Market => None,
@@ -1313,6 +1458,9 @@ impl OrderBook {
                 true
             }
         });
+        if !removed.is_empty() {
+            self.gtd_scan_dirty = true;
+        }
 
         removed
     }
@@ -1347,7 +1495,7 @@ fn amend_in_map<K: Ord>(
     stored: Order,
     new_price: f64,
     new_volume: f64,
-    next_sequence: u64,
+    market_seq: u64,
     make_key: impl Fn(f64, u64) -> K,
 ) -> (Amendment, bool) {
     let previous_sequence = stored.sequence;
@@ -1360,6 +1508,7 @@ fn amend_in_map<K: Ord>(
         entry.volume = new_volume;
         return (
             Amendment {
+                market_seq,
                 order: *entry,
                 previous_sequence,
                 previous_price,
@@ -1375,11 +1524,12 @@ fn amend_in_map<K: Ord>(
     let mut updated = stored;
     updated.price = new_price;
     updated.volume = new_volume;
-    updated.sequence = next_sequence;
-    map.insert(make_key(new_price, next_sequence), updated);
+    updated.sequence = market_seq;
+    map.insert(make_key(new_price, market_seq), updated);
 
     (
         Amendment {
+            market_seq,
             order: updated,
             previous_sequence,
             previous_price,
@@ -2261,6 +2411,7 @@ mod tests {
             first.sequence, amended.order.sequence,
             "a reduction keeps the sequence"
         );
+        assert_eq!(2, amended.market_seq, "the amendment consumes one sequence");
         assert_eq!(first.sequence, amended.previous_sequence);
         assert_eq!(4.0, amended.order.volume);
         let (key, best) = ob.bids.first_key_value().expect("the level survives");
@@ -2281,6 +2432,7 @@ mod tests {
         let amended = ob.amend(&first, None, Some(15.0)).expect("amendable");
 
         assert_eq!(old_sequence, amended.previous_sequence);
+        assert_eq!(2, amended.market_seq);
         assert_eq!(
             2, amended.order.sequence,
             "the amendment takes a fresh sequence"
@@ -2303,6 +2455,7 @@ mod tests {
 
         let amended = ob.amend(&ask, Some(102.0), None).expect("amendable");
 
+        assert_eq!(1, amended.market_seq);
         assert_eq!(102.0, amended.order.price);
         assert_eq!(
             TimeInForce::Gtd(9_000),
@@ -2561,5 +2714,42 @@ mod tests {
         let mut bid = resting_order(OrderSide::Buy, 100.0, 1.0, 1);
         ob.place_order(&mut bid);
         assert!(ob.take_depth_journal().is_empty());
+    }
+
+    #[test]
+    fn a_place_purges_due_gtd_before_matching() {
+        let mut ob = OrderBook::new();
+        let mut gtd = order_with(OrderSide::Buy, 100.0, 5.0, 0, |o| {
+            o.tif = TimeInForce::Gtd(2_000);
+            o.timestamp = 1_000;
+        });
+        assert!(ob.execute_order(&mut gtd).expired.is_empty());
+
+        // The taker's intake timestamp is the purge trigger time.
+        let mut taker = resting_order(OrderSide::Sell, 100.0, 2.0, 0);
+        taker.timestamp = 2_000;
+        let outcome = ob.execute_order(&mut taker);
+
+        assert_eq!(1, outcome.expired.len(), "the GTD bid expires first");
+        assert_eq!(gtd.sequence, outcome.expired[0].sequence);
+        assert!(outcome.fills.is_empty(), "expired liquidity must not fill");
+        assert_eq!(1, ob.asks.len(), "the sell rests on the ask side");
+        assert!(ob.bids.is_empty());
+        assert_eq!(taker.sequence, outcome.market_seq);
+    }
+
+    #[test]
+    fn day_orders_need_an_explicit_purge() {
+        let mut ob = OrderBook::new();
+        let mut day = order_with(OrderSide::Buy, 100.0, 5.0, 0, |o| o.tif = TimeInForce::Day);
+        ob.execute_order(&mut day);
+
+        let mut taker = resting_order(OrderSide::Sell, 101.0, 1.0, 0);
+        taker.timestamp = u64::MAX / 2;
+        let outcome = ob.execute_order(&mut taker);
+        assert!(outcome.expired.is_empty(), "Day waits for a market close");
+
+        assert_eq!(1, ob.purge_expired(1_001, Some(1_001)).len());
+        assert!(ob.bids.is_empty());
     }
 }

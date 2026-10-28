@@ -6,8 +6,9 @@
 //! streams 2001–2007 without changing the schema.
 //!
 //! Layout is packed (no implicit padding): fields are written in the order
-//! listed, and variable arrays start with a `u16` count. A version bump is
-//! required for any change other than adding a field at the end of `STATUS`.
+//! listed, and variable arrays start with a `u32` count, so a single taker's
+//! uncapped fill list cannot be truncated. A version bump is required for any
+//! change other than adding a field at the end of `STATUS`.
 
 use super::BarRecord;
 use super::DepthSnapshotRecord;
@@ -23,7 +24,7 @@ use crate::matchengine::RejectReason;
 /// Magic bytes at the start of every message.
 pub const MAGIC: [u8; 4] = *b"AMKT";
 /// Current schema version.
-pub const VERSION: u8 = 1;
+pub const VERSION: u8 = 2;
 /// Header length in bytes.
 pub const HEADER_LEN: usize = 64;
 
@@ -37,11 +38,11 @@ pub enum MessageType {
     Bbo = 2,
     /// Full depth snapshot.
     DepthSnapshot = 3,
-    /// Coalesced depth changes.
+    /// Post-entry depth totals for touched levels.
     DepthDelta = 4,
     /// Order lifecycle.
     Lifecycle = 5,
-    /// Heartbeat.
+    /// Deterministic status cadence.
     Status = 6,
     /// Dropped-frame marker.
     Gap = 7,
@@ -75,7 +76,7 @@ pub fn encode(message: &MarketMessage) -> Vec<u8> {
     out.push(VERSION);
     out.push(message.body.message_type() as u8);
     out.extend_from_slice(&message.flags.to_le_bytes());
-    out.extend_from_slice(&message.stream_seq.to_le_bytes());
+    out.extend_from_slice(&message.market_seq.to_le_bytes());
     out.extend_from_slice(&message.log_index.to_le_bytes());
     out.extend_from_slice(&message.ordinal.to_le_bytes());
     out.extend_from_slice(&(body.len() as u32).to_le_bytes());
@@ -83,7 +84,8 @@ pub fn encode(message: &MarketMessage) -> Vec<u8> {
     out.extend_from_slice(&message.leader_id.to_le_bytes());
     out.extend_from_slice(&message.ts_ms.to_le_bytes());
     out.extend_from_slice(&message.symbol_id.to_le_bytes());
-    out.extend_from_slice(&0u32.to_le_bytes()); // reserved
+    out.extend_from_slice(&message.sub_seq.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes()); // reserved
     out.extend_from_slice(&body);
     out
 }
@@ -91,7 +93,7 @@ pub fn encode(message: &MarketMessage) -> Vec<u8> {
 fn encode_body(body: &MessageBody, out: &mut Vec<u8>) {
     match body {
         MessageBody::Trade(records) => {
-            out.extend_from_slice(&(records.len() as u16).to_le_bytes());
+            out.extend_from_slice(&(records.len() as u32).to_le_bytes());
             for record in records {
                 encode_trade(record, out);
             }
@@ -109,7 +111,7 @@ fn encode_body(body: &MessageBody, out: &mut Vec<u8>) {
             encode_depth_snapshot(snapshot, out);
         }
         MessageBody::DepthDelta(updates) => {
-            out.extend_from_slice(&(updates.len() as u16).to_le_bytes());
+            out.extend_from_slice(&(updates.len() as u32).to_le_bytes());
             for update in updates {
                 encode_level(
                     update.side,
@@ -121,7 +123,7 @@ fn encode_body(body: &MessageBody, out: &mut Vec<u8>) {
             }
         }
         MessageBody::Lifecycle(records) => {
-            out.extend_from_slice(&(records.len() as u16).to_le_bytes());
+            out.extend_from_slice(&(records.len() as u32).to_le_bytes());
             for record in records {
                 encode_lifecycle(record, out);
             }
@@ -152,8 +154,8 @@ fn encode_trade(record: &TradeRecord, out: &mut Vec<u8>) {
 }
 
 fn encode_depth_snapshot(snapshot: &DepthSnapshotRecord, out: &mut Vec<u8>) {
-    out.extend_from_slice(&(snapshot.bids.len() as u16).to_le_bytes());
-    out.extend_from_slice(&(snapshot.asks.len() as u16).to_le_bytes());
+    out.extend_from_slice(&(snapshot.bids.len() as u32).to_le_bytes());
+    out.extend_from_slice(&(snapshot.asks.len() as u32).to_le_bytes());
     for level in &snapshot.bids {
         encode_level(OrderSide::Buy, level.price, level.volume, level.orders, out);
     }
@@ -189,9 +191,10 @@ fn encode_lifecycle(record: &LifecycleRecord, out: &mut Vec<u8>) {
 }
 
 fn encode_status(status: &StatusRecord, out: &mut Vec<u8>) {
+    out.extend_from_slice(&status.last_market_seq.to_le_bytes());
+    out.extend_from_slice(&status.last_sub_seq.to_le_bytes());
     out.extend_from_slice(&status.last_log_index.to_le_bytes());
     out.extend_from_slice(&status.last_ordinal.to_le_bytes());
-    out.extend_from_slice(&status.last_stream_seq.to_le_bytes());
     out.extend_from_slice(&status.applied_index.to_le_bytes());
     out.extend_from_slice(&status.book_sequence.to_le_bytes());
     out.extend_from_slice(&status.pending_stops.to_le_bytes());
@@ -263,6 +266,7 @@ mod tests {
     use crate::market_data::DepthSnapshotRecord;
     use crate::market_data::GapRecord;
     use crate::market_data::LevelUpdate;
+    use crate::market_data::StatusRecord;
     use crate::market_data::flags;
     use crate::matchengine::DepthLevel;
 
@@ -312,7 +316,8 @@ mod tests {
         MarketMessage {
             stream: 0,
             flags: flags::END_OF_BATCH,
-            stream_seq: 7,
+            market_seq: 7,
+            sub_seq: 3,
             log_index: 42,
             ordinal: 3,
             epoch: 9,
@@ -345,8 +350,14 @@ mod tests {
         assert_eq!(1, reader.u64());
         assert_eq!(1_700_000_000_000, reader.u64());
         assert_eq!(0, reader.u32());
-        assert_eq!(0, reader.u32());
+        assert_eq!(3, reader.u16());
+        assert_eq!(0, reader.u16());
         assert_eq!(HEADER_LEN, reader.offset);
+
+        // Gap body: last good position and drop count.
+        assert_eq!(41, reader.u64());
+        assert_eq!(2, reader.u32());
+        assert_eq!(1, reader.u32());
     }
 
     #[test]
@@ -376,7 +387,7 @@ mod tests {
         let bytes = encode(&message(body));
         let mut reader = Reader::new(&bytes, HEADER_LEN);
 
-        assert_eq!(2, reader.u16());
+        assert_eq!(2, reader.u32());
         assert_eq!(10, reader.u64());
         assert_eq!(0, reader.u32());
         assert_eq!(1_000, reader.u64());
@@ -412,8 +423,8 @@ mod tests {
         });
         let bytes = encode(&message(snapshot));
         let mut reader = Reader::new(&bytes, HEADER_LEN);
-        assert_eq!(1, reader.u16());
-        assert_eq!(1, reader.u16());
+        assert_eq!(1, reader.u32());
+        assert_eq!(1, reader.u32());
         assert_eq!(0, reader.u8());
         assert_eq!(100.0, reader.f64());
         assert_eq!(5.0, reader.f64());
@@ -433,7 +444,7 @@ mod tests {
         }]);
         let bytes = encode(&message(delta));
         let mut reader = Reader::new(&bytes, HEADER_LEN);
-        assert_eq!(1, reader.u16());
+        assert_eq!(1, reader.u32());
         assert_eq!(1, reader.u8());
         assert_eq!(99.0, reader.f64());
         assert_eq!(4.0, reader.f64());
@@ -466,6 +477,28 @@ mod tests {
     }
 
     #[test]
+    fn status_body_encodes() {
+        let bytes = encode(&message(MessageBody::Status(StatusRecord {
+            last_market_seq: 12,
+            last_sub_seq: 1,
+            last_log_index: 9,
+            last_ordinal: 1,
+            applied_index: 10,
+            book_sequence: 4,
+            pending_stops: 2,
+        })));
+        let mut reader = Reader::new(&bytes, HEADER_LEN);
+        assert_eq!(12, reader.u64());
+        assert_eq!(1, reader.u16());
+        assert_eq!(9, reader.u64());
+        assert_eq!(1, reader.u32());
+        assert_eq!(10, reader.u64());
+        assert_eq!(4, reader.u64());
+        assert_eq!(2, reader.u32());
+        assert_eq!(bytes.len(), HEADER_LEN + 42);
+    }
+
+    #[test]
     fn lifecycle_and_bar_encode() {
         let lifecycle = MessageBody::Lifecycle(vec![LifecycleRecord {
             log_index: 5,
@@ -481,7 +514,7 @@ mod tests {
         }]);
         let bytes = encode(&message(lifecycle));
         let mut reader = Reader::new(&bytes, HEADER_LEN);
-        assert_eq!(1, reader.u16());
+        assert_eq!(1, reader.u32());
         assert_eq!(5, reader.u64());
         assert_eq!(2, reader.u32());
         assert_eq!(1_000, reader.u64());
@@ -517,5 +550,29 @@ mod tests {
         assert_eq!(7.0, reader.f64());
         assert_eq!(3, reader.u32());
         assert_eq!(4, reader.u64());
+    }
+
+    #[test]
+    fn trade_count_is_wide_enough_for_an_uncapped_sweep() {
+        let fills: Vec<TradeRecord> = (0..70_000u64)
+            .map(|i| TradeRecord {
+                log_index: i,
+                ordinal: 0,
+                ts_ms: 1_000,
+                price: 100.0,
+                volume: 1.0,
+                taker_side: OrderSide::Buy,
+                taker_sequence: 1,
+                maker_sequence: i,
+            })
+            .collect();
+        let bytes = encode(&message(MessageBody::Trade(fills)));
+        let mut reader = Reader::new(&bytes, HEADER_LEN);
+        assert_eq!(70_000, reader.u32());
+        assert_eq!(
+            HEADER_LEN + 4 + 70_000 * 53,
+            bytes.len(),
+            "every fill is encoded"
+        );
     }
 }

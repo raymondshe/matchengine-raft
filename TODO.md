@@ -130,9 +130,9 @@ vote/committed persistence, snapshot build/install/reopen) and `tests/cluster/te
 - [ ] OrderBook-rs types not ported yet: trailing stops (watermark + trail amount, child on a new
   print), pegged orders (reference price offsets), custom reserve replenishment, stop-protection
   collars, market-to-limit, and self-trade prevention.
-- [ ] A `PurgeExpired` only runs when a client submits it; nothing expires on its own. A leader-side
-  ticker that proposes one periodically (with the leader's clock, recorded in the log) would make
-  GTD/Day self-driving without breaking determinism.
+- [x] Automatic GTD purge: every admissible `Place`/`Cancel`/`Amend` purges GTD orders due at its
+  intake timestamp before applying, using the replicated sequence/timestamp. `Day` still needs the
+  explicit `PurgeExpired { now_ms, day_close_ms }` because it requires a market close.
 - [ ] `price`/`volume` are `f64` — money should use integer ticks/decimal.
 - [ ] The book is a per-order `BTreeMap<BidKey/AskKey, Order>`; every fill descends the tree once
   and sweeps touch one entry per order. Bucketing orders per price level
@@ -152,14 +152,20 @@ Design: `docs/AERON_SOLUTION.md` Part II; implementation plan and progress:
 `docs/MARKET_DATA_PLAN.md`.
 
 - [x] Deterministic feed core: depth journal in `OrderBook`, `MatchEvent.side`, leader-stamped
-  intake timestamps, shadow book, throttled/coalesced processor (trades, BBO, depth
-  snapshots/deltas, lifecycle, OHLC bars, status, gap), leader gating with reset snapshots,
-  JSONL sink, binary wire encoder and `marketdata_status` read.
+  intake timestamps, shadow book, deterministic processor (one TRADE per taker, BBO, depth
+  snapshots/deltas, lifecycle, OHLC bars, status cadence, gap), leader gating with reset
+  snapshots, JSONL sink, binary wire encoder v2 and `marketdata_status` read.
 - [ ] Aeron adapter: implement `MarketDataSink` with `rusteron-client` + an embedded driver in
   tests, feature-gated (`market-data-aeron`); see AERON_SOLUTION §20/§23.
 - [ ] Archive recording/replay and the snapshot-request stream (2003/2010).
 - [ ] Multi-symbol engine: `symbol_id` on orders and per-symbol books; the feed schema already
   carries the field and the shadow/bars are keyed by it.
+- [x] Deterministic market-data sequencing (`market_seq`, `sub_seq`): every mutation consumes the
+  replicated sequence, boundaries are entry-driven, one TRADE per taker (uncapped), status every
+  `status_every`, wire v2. Keys are identical across replicas, failover and restart. Design:
+  AERON §16.1; plan U8.
+- [ ] Wire `epoch` (leader generation) and `leader_id` instead of the current zeros; the header
+  fields exist and the leader watcher already knows the term.
 - [ ] Consumer SDK/reference decoder for the wire format (the encoder is covered by golden tests).
 - [ ] Load test at the 50k-500k fills/s target and record feed latency/backpressure numbers.
 
