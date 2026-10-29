@@ -15,9 +15,9 @@ use matchengine_raft::build_match_engine_node;
 use matchengine_raft::client::MatchEngineClient;
 use matchengine_raft::default_raft_config;
 use matchengine_raft::match_result::MatchEventKind;
-use matchengine_raft::matchengine::Order;
-use matchengine_raft::matchengine::OrderSide;
 use matchengine_raft::network::api::EventsRequest;
+use matchengine_raft::order_book::Order;
+use matchengine_raft::order_book::OrderSide;
 use matchengine_raft::store::MatchEngineRequest;
 use openraft::type_config::TypeConfigExt;
 

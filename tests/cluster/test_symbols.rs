@@ -14,11 +14,11 @@ use matchengine_raft::build_match_engine_node;
 use matchengine_raft::client::MatchEngineClient;
 use matchengine_raft::default_raft_config;
 use matchengine_raft::match_result::MatchEventKind;
-use matchengine_raft::matchengine::Fixed;
-use matchengine_raft::matchengine::Order;
-use matchengine_raft::matchengine::OrderSide;
-use matchengine_raft::matchengine::RejectReason;
-use matchengine_raft::matchengine::SymbolConfig;
+use matchengine_raft::order_book::Fixed;
+use matchengine_raft::order_book::Order;
+use matchengine_raft::order_book::OrderSide;
+use matchengine_raft::order_book::RejectReason;
+use matchengine_raft::order_book::SymbolConfig;
 use matchengine_raft::store::MatchEngineRequest;
 use openraft::type_config::TypeConfigExt;
 
@@ -157,9 +157,9 @@ fn symbol_configuration_validates_orders_and_survives_restart() {
         assert!(snapshot.last_log_id.is_some());
         let bytes = std::fs::read(storage.snapshot_dir(1).join("current.snap")).unwrap();
         assert_eq!(
-            7,
+            9,
             u32::from_le_bytes(bytes[7..11].try_into().unwrap()),
-            "snapshot must be v7"
+            "snapshot must be v9"
         );
 
         node.shutdown().await.unwrap();

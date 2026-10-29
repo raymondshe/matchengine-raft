@@ -1,7 +1,7 @@
 # Decimal and fixed-point options for price and volume
 
 Status: **implemented end-to-end.** `Order`, `OrderBook.last_trade_price`, match events,
-depth/BBO/spread, `/read`, the market-data feed, snapshot v7 and wire v3 use 18-scale `Fixed`
+depth/BBO/spread, `/read`, the market-data feed, snapshot v9 and wire v5 use 18-scale `Fixed`
 integers. JSON emits decimal strings and accepts legacy numeric input. One process/cluster trades
 exactly one symbol, whose replicated `SymbolConfig` is enforced and locked after the first order;
 multi-symbol isolation is deployment-level (one process per symbol). This document keeps the
@@ -207,7 +207,7 @@ The arithmetic ranking is unchanged; the decisive BTC issue is range, not primit
 
 ## Implementation status
 
-Implemented in `src/matchengine/fixed.rs`, `Order` and the state machine:
+Implemented in `src/order_book/fixed.rs`, `Order` and the state machine:
 
 - `price`, `volume`, `stop_price`, `display_volume` and `hidden_volume` use a common-scale
   `Fixed(i128)` with 18 fractional digits.
@@ -217,14 +217,17 @@ Implemented in `src/matchengine/fixed.rs`, `Order` and the state machine:
   JSONL file sink emit decimal strings.
 - `DepthLevel`, `DepthChange`, `spread`, `mid_price`, `/read` depth/BBO/spread/last-trade and the
   market-data records are `Fixed`. The shadow book is keyed by `Fixed`, not by `f64` bits.
-- Market-data wire **v3** encodes every price and quantity as a little-endian scale-18 `i128`
-  (16 bytes); v2 frames are not silently reinterpreted.
-- Snapshot **v7** stores the last trade price, match events and the single-symbol precision
-  configuration as fixed-point/deterministic values. Older snapshots are rejected with a clear
-  error.
+- Market-data wire **v5** encodes every price, quantity, quote volume and fee as a little-endian
+  scale-18 `i128` (16 bytes), plus the fee asset per side; older frames are not silently
+  reinterpreted.
+- Snapshot **v9** stores the last trade price, match events, base/quote asset metadata, tick/lot
+  rules, maker/taker fee rates, fee assets and fill fees, plus the single-symbol precision
+  configuration. Older snapshots are rejected with a clear error.
 - `Fixed::notional(price, quantity)` multiplies through a 256-bit intermediate and truncates toward
   zero at 18 places. `Fixed * Fixed` uses the same checked path; the matching loop itself does not
   multiply price by quantity.
+- `Order.maker_fee_rate`/`taker_fee_rate` are signed `Fixed` fractions. Fills charge the taker rate
+  and the maker rate on exact notional; `fee_overflow` marks values outside the scale-18 range.
 - JSON emits decimal strings for all `Fixed` values, so 18-digit values round-trip exactly. Legacy
   numeric JSON payloads are still accepted on input.
 - `Order.symbol_id` must match the process/cluster's configured symbol; `SymbolConfig` declares
@@ -247,7 +250,7 @@ Recommended next steps:
 1. Document the one-process-per-symbol deployment contract and add gateway routing/isolation.
 2. Define the notional/settlement rounding policy and use `Fixed::notional` or `i256` directly.
 3. Benchmark the matching loop and feed before/after; keep the "matching must not regress" gate.
-4. Record the wire v3/v7 compatibility policy in the deployment notes.
+4. Record the wire v5/snapshot v9 compatibility policy in the deployment notes.
 
 ## Decision summary
 

@@ -53,8 +53,8 @@ This project extends the [example-raft-kv](https://github.com/datafuselabs/openr
                                         │                           │ try_send (never blocks)
                                         │                           ▼
                                         │             ┌──────────────────────────────────────┐
-                                        │             │  Market-data thread (leader-gated)   │
-                                        │             │     shadow book · OHLC · wire v3     │
+                                        │             │  Market-data task (leader-gated)   │
+                                        │             │     shadow book · OHLC · wire v5     │
                                         │             │   deterministic market_seq/sub_seq   │
                                         │             └──────────────────────────────────────┘
                                         │                                 │ MarketDataSink
@@ -84,7 +84,7 @@ handlers stay on the `--http-addr` listener, so a node serves both transports re
 one it dials.
 
 Market-data egress is node-local and off the consensus path: the tap is a bounded `try_send`, so a
-slow subscriber can never block `apply`. The JSONL sink is for debugging; the same wire-v3 messages
+slow subscriber can never block `apply`. The JSONL sink is for debugging; the same wire-v5 messages
 are what the Aeron adapter (streams 2001–2007) will publish next.
 
 ### Key Components
@@ -100,7 +100,7 @@ are what the Aeron adapter (streams 2001–2007) will publish next.
    - Separate replication, heartbeat and snapshot channels per peer
    - Management APIs for cluster administration
 
-3. **Matching Engine** ([`matchengine/`](./src/matchengine/))
+3. **Matching Engine** ([`order_book/`](./src/order_book/))
    - Price-time priority order book with bids and asks
    - Order types: GTC, IOC, FOK, GTD, Day, post-only, iceberg, stop-market and stop-limit
    - Deterministic expiry (`PurgeExpired` carries the timestamps through the log) and stop
@@ -110,7 +110,7 @@ are what the Aeron adapter (streams 2001–2007) will publish next.
 
 4. **Market-Data Egress** ([`market_data/`](./src/market_data/))
    - `apply` hands match events and a depth journal to a bounded tap (`try_send`; matching never waits)
-   - A leader-gated thread keeps a shadow book, derives BBO/OHLC bars and encodes wire v3
+   - A leader-gated tokio task keeps a shadow book, derives BBO/OHLC bars and encodes wire v5
    - Keys are `(symbol_id, stream_id, market_seq, sub_seq)`; one uncapped `TRADE` per taker
    - JSONL sink today; Aeron streams 2001–2007 are the next phase
 
@@ -278,8 +278,9 @@ src/
 ├── client.rs                # Smart client with leader forwarding
 ├── lib.rs                   # Node composition, servers, shutdown
 ├── app.rs                   # Application state
-├── matchengine/
-│   └── mod.rs               # Order book matching engine
+├── order_book/
+│   ├── mod.rs               # Order book matching engine
+│   └── fixed.rs             # Exact fixed-point values and symbol metadata
 ├── market_data/
 │   ├── mod.rs               # Tap, depth journal consumer, shadow book, deterministic publisher
 │   └── wire.rs              # 64-byte binary header + message bodies (Aeron-ready)
@@ -320,7 +321,9 @@ tests/
     ├── test_membership.rs     # Leader failover + learner catch-up from a live log
     ├── test_late_join.rs      # Stale node rejoins and catches up from live members
     ├── test_exactness.rs      # 18-digit values through API, events, feed and snapshot restart
-    └── test_symbols.rs        # One-symbol config, precision rejection and symbol lock
+    ├── test_symbols.rs        # One-symbol config, precision rejection and symbol lock
+    ├── test_fees.rs           # Maker/taker fees through API, events, feed and restart
+    └── test_fee_assets.rs     # QQQ/USD tick/lot, quote volume and quote fees
 ```
 
 ## Storage Implementation
@@ -350,7 +353,7 @@ avoiding a second fsync per batch.
 ### Snapshots (`src/store/state_machine.rs`)
 
 The state machine (order book + sequence counter + retained match-event window + submission dedupe
-map) stays in memory so applying entries is fast. Snapshot v7 is written as
+map) stays in memory so applying entries is fast. Snapshot v9 is written as
 `snapshot/current.snap` using the same atomic temp-file/rename protocol; `install_snapshot`
 validates the incoming bytes before replacing the durable copy, so a bad snapshot cannot destroy a
 good one.
@@ -482,7 +485,7 @@ POST /write { Place | Cancel | Amend | PurgeExpired }
 `Place` accepts an optional `client_order_id`; retrying it returns the original sequence and
 events instead of placing a second order. The event window is bounded by `--max-events` (env
 `MAX_EVENTS`, default 262144); the submission map has a separate fixed 262144-record cap so retry
-resolution never depends on a node-local flag. Both are included in snapshot v7. `GET /events/status` reports the
+resolution never depends on a node-local flag. Both are included in snapshot v9. `GET /events/status` reports the
 oldest/last retained id and eviction counters; consumers resume from `next_after` and dedupe on
 `event_id`.
 
@@ -528,10 +531,10 @@ older than `oldest_event_id`, the window has evicted events and clearing must re
 `--market-data-log <file>` (env `MARKET_DATA_LOG`) turns on the deterministic market-data egress
 designed in `docs/AERON_SOLUTION.md` Part II and implemented in `src/market_data/`:
 
-- the matching thread only appends the visible-depth changes it already computes (a transient
+- the matching path only appends the visible-depth changes it already computes (a transient
   journal) and copies the entry's `MatchEvent`s into a bounded queue — no book scans, encoding or
   IO on the matching path;
-- a dedicated thread keeps a shadow book and publishes **deterministically sequenced** messages:
+- a dedicated tokio task keeps a shadow book and publishes **deterministically sequenced** messages:
   all fills of one taker in one `TRADE` message (uncapped), BBO (`last`/`mid`/spread) per
   book-changing frame, depth snapshots and post-batch deltas, lifecycle events, OHLC bars (1 s and
   1 m by default) and a status message every 100th market sequence;
@@ -544,7 +547,7 @@ designed in `docs/AERON_SOLUTION.md` Part II and implemented in `src/market_data
   queue drops frames and emits a `GAP`; `apply` is never blocked or slowed by a subscriber.
 
 The shipped sink is JSONL for debugging. The same messages have a binary encoding in
-`src/market_data/wire.rs` (64-byte header, version 3, scale-18 `i128` bodies), and `MarketDataSink`
+`src/market_data/wire.rs` (64-byte header, version 5, scale-18 `i128` bodies), and `MarketDataSink`
 is the seam the Aeron adapter will implement (next phase). Every message carries the configured
 process `symbol_id`, so separate per-symbol deployments can share a bus. Tuning: `--market-data-depth`, `--market-data-status-every`,
 `--market-data-bar-intervals-ms`, `--market-data-leader-only`.
@@ -651,7 +654,9 @@ pub struct MatchEngineResponse {
 
 Every order/mutation request consumes one `market_seq`; `Place` also uses it as the order
 sequence, while `ConfigureSymbol` does not consume one. The response carries at most 512 events;
-the full batch is available from `/events`.
+the full batch is available from `/events`. Fill events carry
+`quote_volume`, `volume_unit`, `taker_fee`/`taker_fee_asset` and `maker_fee`/`maker_fee_asset`;
+the same fields are on market-data `TRADE` and fill `LIFECYCLE` records (wire v5).
 `client_order_id` is optional and only affects `Place`: a retry returns the original sequence and
 events instead of placing a second order.
 
@@ -673,23 +678,34 @@ order book:
 Prices and quantities are stored internally as exact 18-scale fixed-point integers. JSON accepts
 either decimal strings or legacy numbers; match events, `/read` and the market-data feed emit
 decimal strings so 18-decimal values round-trip exactly. A process/cluster trades exactly one
-symbol: `SymbolConfig` is replicated and snapshotted, prices and quantities with more decimals than
-configured are rejected, and orders routed to another `symbol_id` are refused. Scaling to several
-symbols means running one process/cluster per symbol, so resources and failures stay isolated.
-Values are normalized to the common 18-decimal scale.
+symbol: `SymbolConfig` is replicated and snapshotted with base/quote `AssetId`/`AssetClass`
+metadata, price tick, base lot and fee-asset policy. Prices/quantities with excess precision or
+wrong increments are rejected, and orders routed to another `symbol_id` are refused. Scaling to
+several symbols means running one process/cluster per symbol, so resources and failures stay
+isolated. Values are normalized to the common 18-decimal scale.
 
 Example order payload accepted by `/write` (note the field name `sequence`):
 
 ```json
-{"Place": {"order": {"live": "Limit", "side": "Buy", "price": "4000.25", "volume": "4.4", "id": 1, "sequence": 1}, "client_order_id": "order-123"}}
+{"Place": {"order": {"live": "Limit", "side": "Buy", "volume_unit": "base", "price": "4000.25", "volume": "4.4", "maker_fee_rate": "0.001", "taker_fee_rate": "0.002", "id": 1, "sequence": 1}, "client_order_id": "order-123"}}
 ```
 
-`client_order_id` is optional; omit it for the old non-idempotent behaviour.
+`client_order_id` is optional; omit it for the old non-idempotent behaviour. `volume_unit` is
+`base` by default; `quote` makes `volume` a gross quote amount (limit orders normalize at the limit
+price, market orders use a quote budget/proceeds sweep).
 
-Set this process's symbol and accepted precision before trading:
+Set this process's symbol, assets and accepted precision before trading:
 
 ```json
-{"ConfigureSymbol": {"config": {"symbol_id": 0, "price_decimals": 2, "quantity_decimals": 2}}}
+{"ConfigureSymbol": {"config": {
+  "symbol_id": 0,
+  "base_asset": {"code": "QQQ", "class": "etf", "decimals": 4},
+  "quote_asset": {"code": "USD", "class": "fiat", "decimals": 2},
+  "price_decimals": 2,
+  "price_tick": "0.01",
+  "base_lot": "0.0001",
+  "fee_asset_policy": "received"
+}}}
 ```
 
 The configuration is replicated and locked once the first order is accepted. Changing it while
@@ -697,7 +713,19 @@ orders are open, or after trading has started, is refused. A successful change o
 node also queues a market-data reset snapshot for the new symbol. The response uses the optional
 `error` field for this non-fatal case; the write itself is still committed.
 
-Every order-type field (`tif`, `post_only`, `stop_price`, `display_volume`, `hidden_volume`,
+Fee rates (`maker_fee_rate`, `taker_fee_rate`) are signed `Fixed` fractions supplied by the
+gateway from the user level. `"0.001"` means 10 bps and negative values are rebates. They are
+optional and default to zero. The engine computes each fill's notional from the maker price and
+matched quantity, then charges the taker order's taker rate and the maker order's maker rate.
+Fees are truncated toward zero at 18 places; `fee_overflow` is set when the notional or a fee
+exceeds the supported fixed-point range. The engine records fees but does not move balances.
+
+Base/quote volume semantics and asset-aware fee deduction for fiat, stablecoin, crypto, ETF and
+equity pairs are implemented. The fee asset can be the received asset (default), quote or base;
+the full model and open extensions (sessions, corporate actions, fixed/regulatory fees, fee tokens)
+are in [`docs/FEE_DEDUCTION.md`](./docs/FEE_DEDUCTION.md).
+
+Every other order-type field (`tif`, `post_only`, `stop_price`, `display_volume`, `hidden_volume`,
 `timestamp`) is optional and defaults to "plain GTC limit order":
 
 ```json
@@ -723,15 +751,17 @@ placeholder). `sequence` is still required by the deserializer.
 | `tests/cluster/test_events.rs` | `/write` returns events, `/events` pages by cursor, `client_order_id` retries do not duplicate an order, and `--max-events` eviction is visible in `/events/status` |
 | `tests/cluster/test_membership.rs` | Kill the elected leader: a surviving voter takes over with the committed book and accepts new writes. A learner added after the writes catches up through normal log replication, is promoted, and writes through its own node |
 | `tests/cluster/test_late_join.rs` | A node with a stale snapshot/WAL is removed, misses 40 writes while the leader snapshots and purges, then rejoins as a learner and catches up from the live cluster |
-| `tests/cluster/test_exactness.rs` | An 18-fractional-digit price and quantity round-trip through `/write`, `/read`, `/events`, the JSONL market-data feed, snapshot v7 and a restart without passing through `f64` |
+| `tests/cluster/test_exactness.rs` | An 18-fractional-digit price and quantity round-trip through `/write`, `/read`, `/events`, the JSONL market-data feed, snapshot v9 and a restart without passing through `f64` |
 | `tests/cluster/test_symbols.rs` | `ConfigureSymbol` sets the process symbol/precision, rejects over-precision and cross-symbol orders, locks the configuration once trading starts, and survives snapshot restart |
+| `tests/cluster/test_fees.rs` | Maker and taker fee rates produce exact fill fees in `/write`, `/events`, the file sink and the market-data feed, and survive snapshot restart |
+| `tests/cluster/test_fee_assets.rs` | QQQ/USD ETF/fiat metadata, tick/lot enforcement, quote-volume limit normalization and quote-asset fee deduction |
 
 Every integration test uses a unique temporary data directory. The cluster test uses fixed ports
 `21001-21003` (gRPC `22001-22003`), the snapshot test `21101-21102`, the restart tests
 `21201-21204`, the match-result tests `21301`/`21302`, the market-data test `21303`, the event-log test
 `21304`, the failover test `21401-21403`, the learner catch-up test `21501-21502`, the late-join
-test `21601-21603`, the exactness test `21701` (gRPC `22701`) and the symbol-config test `21801`
-(gRPC `22801`); stop leftover processes
+test `21601-21603`, the exactness test `21701` (gRPC `22701`), the symbol-config test `21801` (gRPC `22801`), the fee test `21901` (gRPC `22901`) and the
+fee-asset test `21902` (gRPC `22902`); stop leftover processes
 (`pkill -f matchengine-raft`) before rerunning.
 
 ## Performance and Current Limits
@@ -755,7 +785,7 @@ Still missing:
 - The gRPC listener has no TLS/mTLS.
 - Snapshot installation still buffers the whole snapshot in memory.
 - `Order` prices/quantities, `last_trade_price`, match events, depth/BBO/spread, the JSONL feed
-  and wire v3 use exact 18-scale fixed-point integers. Snapshot v7 and wire v3 are breaking
+  and wire v5 use exact 18-scale fixed-point integers. Snapshot v9 and wire v5 are breaking
   changes from earlier builds. `SymbolConfig` is replicated and locked for one symbol per
   process/cluster; multi-symbol deployments run one process per symbol. See
   [`docs/DECIMAL.md`](./docs/DECIMAL.md).

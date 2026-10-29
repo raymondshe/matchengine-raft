@@ -2,6 +2,8 @@ mod common;
 mod test_cluster;
 mod test_events;
 mod test_exactness;
+mod test_fee_assets;
+mod test_fees;
 mod test_late_join;
 mod test_market_data;
 mod test_match_results;

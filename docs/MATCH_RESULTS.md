@@ -1,7 +1,7 @@
 # Delivering match results to the order / clearing system
 
 Status: **phases 1a–3 implemented.** `apply` turns results into [`MatchEvent`]s, returns the first
-512 in the `/write` response, appends them to a bounded event window that is part of snapshot v7,
+512 in the `/write` response, appends them to a bounded event window that is part of snapshot v9,
 and serves that window through `POST /events` and `GET /events/status`. `client_order_id` makes
 submissions idempotent across retries. `--match-event-log <path>` remains a node-local JSONL
 debugging sink. Phase 4 (long-poll, gRPC streaming, MQ bridge) is the remaining proposal.
@@ -197,6 +197,12 @@ pub struct MatchEvent {
     /// removed, the stop's open volume on a trigger, the submitted volume on a
     /// rejection, or the new open volume on an amendment.
     pub volume: Fixed,
+    /// Taker fee on a fill; zero for non-fill events and fee overflow.
+    pub taker_fee: Fixed,
+    /// Maker fee on a fill; zero for non-fill events and fee overflow.
+    pub maker_fee: Fixed,
+    /// True when the fill's notional or fee overflowed; fee fields are zero.
+    pub fee_overflow: bool,
     /// Why a `Rejected` (or `Expired`) event happened; omitted when absent.
     pub reason: Option<RejectReason>,
 }
@@ -215,6 +221,9 @@ Notes:
   derivable from the taker order.
 - `Cancelled` carries the volume that was still open in the book, not the volume originally
   submitted.
+- Fill events carry exact `taker_fee`/`maker_fee`. The taker uses its taker rate, the resting
+  maker uses its maker rate; positive = charge, negative = rebate. `fee_overflow` marks a notional
+  or fee outside the scale-18 range; the fee amounts are then zero and must not be used.
 
 Multi-instrument isolation is deployment-level: each symbol gets its own process/cluster and
 event sequence, so no per-instrument cursor split is needed inside one engine.
@@ -277,7 +286,8 @@ Implemented response shape:
     "events": [
       {"event_id": {"log_index": 42, "ordinal": 0}, "kind": "fill",
        "order_sequence": 7, "counterparty_sequence": 3,
-       "price": "100", "volume": "10"}
+       "price": "100", "volume": "10",
+       "taker_fee": "0.4", "maker_fee": "0.1", "fee_overflow": false}
     ],
     "events_truncated": false
   },
@@ -316,10 +326,11 @@ pub struct StateMachineData {
   learner receives only the retained window — that is expected, and the read API advertises
   `oldest_event_id` so consumers can detect the gap.
 
-Snapshot format: `SNAPSHOT_VERSION` is **7**; v7 adds the single-symbol precision configuration,
-v6 stores the last trade price and match events as fixed-point values, v5 stored
-order prices/quantities as fixed-point integers, and v4 added the event window and submission map
-on top of the v3 order/stop fields. Postcard encodes struct fields positionally, so an older decoder
+Snapshot format: `SNAPSHOT_VERSION` is **9**; v9 adds base/quote asset metadata, tick/lot rules,
+volume units, fee assets and the fee policy, v8 adds maker/taker fee rates to orders and fee fields
+to match events, v7 adds the single-symbol precision configuration, v6 stores the last trade price
+and match events as fixed-point values, v5 stored order prices/quantities as fixed-point integers,
+and v4 added the event window and submission map on top of the v3 order/stop fields. Postcard encodes struct fields positionally, so an older decoder
 fails on the missing fields (`postcard::from_bytes` reports an unexpected end of input). Two options:
 
 1. **Reject v2 with a clear error** (simplest; acceptable for a demo, but requires wiping data).
@@ -424,7 +435,7 @@ event rate per apply batch at debug level, consistent with the existing `tracing
 | Duplicate delivery | Consumer sees an event twice | Dedupe on `event_id` |
 | Huge sweep (many fills) | Large response | Response capped with `events_truncated`; full set available from `/events` |
 | Slow consumer | — | Pull-based, so it cannot block `apply`; only its own cursor lags |
-| Snapshot from an older binary | v6 or earlier payload | Version check rejects it with a clear error; v7 is the first one-symbol-config snapshot |
+| Snapshot from an older binary | v8 or earlier payload | Version check rejects it with a clear error; v9 is the current asset-aware snapshot |
 
 ---
 
@@ -498,7 +509,7 @@ Still to write (mainly phase 4 / operational tests):
 |---|---|---|
 | 1a ✅ | `MatchEvent` + `EventId`; build events in `apply`; `MatchResultSink` with `Noop`/`Memory`/`File` sinks; `--match-event-log`; unit and end-to-end tests | done |
 | 1b ✅ | Events in `MatchEngineResponse`; 512-event cap with `events_truncated` | done |
-| 2 ✅ | Bounded event window + snapshot v4/v5/v6/v7 + `oldest_event_id`/`last_event_id`; `/events` and `/events/status`; restart/snapshot/retention tests | done |
+| 2 ✅ | Bounded event window + snapshot v4–v9 + `oldest_event_id`/`last_event_id`; `/events` and `/events/status`; restart/snapshot/retention tests | done |
 | 3 ✅ | `client_order_id` submission dedupe with bounded map | done |
 | 4 | Optional: long-poll, gRPC `StreamEvents`, MQ bridge sidecar | 2–3 days |
 
@@ -543,5 +554,5 @@ and two read endpoints (`/events`, `/events/status`).
    the events, but humans think in `order id`; consider an order-id index as a follow-up.
 6. **Multi-instrument** — one process/cluster per symbol; event ids are per deployment, not per
    book inside one process.
-7. **Snapshot migration** — v7 rejects older snapshots. Add a versioned decoder only if a
+7. **Snapshot migration** — v9 rejects older snapshots. Add a versioned decoder only if a
    deployment has data worth carrying across a future format change.

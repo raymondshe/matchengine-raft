@@ -7,9 +7,9 @@
 use std::time::Duration;
 use std::time::Instant;
 
-use matchengine_raft::matchengine::Order;
-use matchengine_raft::matchengine::OrderBook;
-use matchengine_raft::matchengine::OrderSide;
+use matchengine_raft::order_book::Order;
+use matchengine_raft::order_book::OrderBook;
+use matchengine_raft::order_book::OrderSide;
 
 /// A resting limit order helper; `id` stays 0 like `Order::new` does.
 fn resting(side: OrderSide, price: f64, volume: f64) -> Order {
@@ -114,7 +114,7 @@ fn main() {
             let mut maker = resting(OrderSide::Sell, 100.0, 1.0);
             ioc_book.place_order(&mut maker);
             let mut taker = resting(OrderSide::Buy, 100.0, 2.0);
-            taker.tif = matchengine_raft::matchengine::TimeInForce::Ioc;
+            taker.tif = matchengine_raft::order_book::TimeInForce::Ioc;
             let outcome = ioc_book.execute_order(&mut taker);
             assert_eq!(1, outcome.fills.len());
             assert_eq!(Some(1.0), outcome.cancelled.map(|v| v.to_f64()));

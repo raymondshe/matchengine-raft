@@ -10,10 +10,10 @@ use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
 use matchengine_raft::MatchEngineTypeConfig;
-use matchengine_raft::matchengine::Order;
-use matchengine_raft::matchengine::OrderSide;
-use matchengine_raft::matchengine::OrderType;
-use matchengine_raft::matchengine::TimeInForce;
+use matchengine_raft::order_book::Order;
+use matchengine_raft::order_book::OrderSide;
+use matchengine_raft::order_book::OrderType;
+use matchengine_raft::order_book::TimeInForce;
 use matchengine_raft::store::StateMachineData;
 use openraft::Entry;
 use openraft::LogId;
@@ -612,7 +612,7 @@ fn state_machine_data_conversion_roundtrips() {
         sequence: 4,
         stops: Vec::new(),
         last_trade_price: None,
-        symbol_config: matchengine_raft::matchengine::SymbolConfig::default(),
+        symbol_config: matchengine_raft::order_book::SymbolConfig::default(),
         symbol_locked: false,
         events: Vec::new(),
         events_evicted: 0,

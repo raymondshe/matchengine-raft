@@ -7,10 +7,11 @@
 //!
 //! Layout is packed (no implicit padding): fields are written in the order
 //! listed, and variable arrays start with a `u32` count, so a single taker's
-//! uncapped fill list cannot be truncated. Version 3 encodes every price and
-//! quantity as a scale-18 `i128` (16 bytes, little-endian), so no financial
-//! value crosses the wire as `f64`. A version bump is required for any change
-//! other than adding a field at the end of `STATUS`.
+//! uncapped fill list cannot be truncated. Version 5 encodes every price,
+//! quantity, quote volume and fee as a scale-18 `i128` (16 bytes, little-endian),
+//! so no financial value crosses the wire as `f64`, and carries the volume unit
+//! and fee asset per record. A version bump is required for any change other
+//! than adding a field at the end of `STATUS`.
 
 use super::BarRecord;
 use super::DepthSnapshotRecord;
@@ -20,14 +21,16 @@ use super::MessageBody;
 use super::StatusRecord;
 use super::TradeRecord;
 use crate::match_result::MatchEventKind;
-use crate::matchengine::Fixed;
-use crate::matchengine::OrderSide;
-use crate::matchengine::RejectReason;
+use crate::order_book::FeeAsset;
+use crate::order_book::Fixed;
+use crate::order_book::OrderSide;
+use crate::order_book::RejectReason;
+use crate::order_book::VolumeUnit;
 
 /// Magic bytes at the start of every message.
 pub const MAGIC: [u8; 4] = *b"AMKT";
 /// Current schema version.
-pub const VERSION: u8 = 3;
+pub const VERSION: u8 = 5;
 /// Header length in bytes.
 pub const HEADER_LEN: usize = 64;
 
@@ -151,6 +154,12 @@ fn encode_trade(record: &TradeRecord, out: &mut Vec<u8>) {
     out.extend_from_slice(&record.ts_ms.to_le_bytes());
     put_fixed(record.price, out);
     put_fixed(record.volume, out);
+    put_fixed(record.quote_volume, out);
+    put_fixed(record.taker_fee, out);
+    out.push(fee_asset_code(record.taker_fee_asset));
+    put_fixed(record.maker_fee, out);
+    out.push(fee_asset_code(record.maker_fee_asset));
+    out.push(u8::from(record.fee_overflow));
     out.push(side_code(record.taker_side));
     out.extend_from_slice(&record.taker_sequence.to_le_bytes());
     out.extend_from_slice(&record.maker_sequence.to_le_bytes());
@@ -190,6 +199,13 @@ fn encode_lifecycle(record: &LifecycleRecord, out: &mut Vec<u8>) {
     out.extend_from_slice(&record.counterparty_sequence.unwrap_or(0).to_le_bytes());
     put_fixed(record.price, out);
     put_fixed(record.volume, out);
+    put_fixed(record.quote_volume, out);
+    out.push(volume_unit_code(record.volume_unit));
+    put_fixed(record.taker_fee, out);
+    out.push(fee_asset_code(record.taker_fee_asset));
+    put_fixed(record.maker_fee, out);
+    out.push(fee_asset_code(record.maker_fee_asset));
+    out.push(u8::from(record.fee_overflow));
     out.push(reason_code(record.reason));
 }
 
@@ -230,6 +246,21 @@ fn put_option_fixed(value: Option<Fixed>, out: &mut Vec<u8>) {
             out.push(0);
             put_fixed(Fixed::ZERO, out);
         }
+    }
+}
+
+fn fee_asset_code(asset: Option<FeeAsset>) -> u8 {
+    match asset {
+        None => 0,
+        Some(FeeAsset::Base) => 1,
+        Some(FeeAsset::Quote) => 2,
+    }
+}
+
+fn volume_unit_code(unit: VolumeUnit) -> u8 {
+    match unit {
+        VolumeUnit::Base => 0,
+        VolumeUnit::Quote => 1,
     }
 }
 
@@ -275,7 +306,7 @@ mod tests {
     use crate::market_data::LevelUpdate;
     use crate::market_data::StatusRecord;
     use crate::market_data::flags;
-    use crate::matchengine::DepthLevel;
+    use crate::order_book::DepthLevel;
 
     fn fixed(value: &str) -> Fixed {
         value.parse().expect("valid test decimal")
@@ -386,6 +417,12 @@ mod tests {
                 ts_ms: 1_000,
                 price: fixed("100.5"),
                 volume: fixed("2"),
+                quote_volume: fixed("201"),
+                taker_fee: fixed("0.4"),
+                taker_fee_asset: Some(FeeAsset::Base),
+                maker_fee: fixed("0.2"),
+                maker_fee_asset: Some(FeeAsset::Quote),
+                fee_overflow: false,
                 taker_side: OrderSide::Buy,
                 taker_sequence: 4,
                 maker_sequence: 2,
@@ -396,6 +433,12 @@ mod tests {
                 ts_ms: 1_001,
                 price: fixed("101.000000000000000001"),
                 volume: fixed("3"),
+                quote_volume: fixed("303.000000000000000003"),
+                taker_fee: fixed("0.1"),
+                taker_fee_asset: Some(FeeAsset::Quote),
+                maker_fee: fixed("0.05"),
+                maker_fee_asset: Some(FeeAsset::Base),
+                fee_overflow: false,
                 taker_side: OrderSide::Sell,
                 taker_sequence: 5,
                 maker_sequence: 3,
@@ -410,6 +453,12 @@ mod tests {
         assert_eq!(1_000, reader.u64());
         assert_eq!(fixed("100.5").raw(), reader.i128());
         assert_eq!(fixed("2").raw(), reader.i128());
+        assert_eq!(fixed("201").raw(), reader.i128());
+        assert_eq!(fixed("0.4").raw(), reader.i128());
+        assert_eq!(1, reader.u8());
+        assert_eq!(fixed("0.2").raw(), reader.i128());
+        assert_eq!(2, reader.u8());
+        assert_eq!(0, reader.u8());
         assert_eq!(0, reader.u8());
         assert_eq!(4, reader.u64());
         assert_eq!(2, reader.u64());
@@ -419,6 +468,12 @@ mod tests {
         assert_eq!(1_001, reader.u64());
         assert_eq!(fixed("101.000000000000000001").raw(), reader.i128());
         assert_eq!(fixed("3").raw(), reader.i128());
+        assert_eq!(fixed("303.000000000000000003").raw(), reader.i128());
+        assert_eq!(fixed("0.1").raw(), reader.i128());
+        assert_eq!(2, reader.u8());
+        assert_eq!(fixed("0.05").raw(), reader.i128());
+        assert_eq!(1, reader.u8());
+        assert_eq!(0, reader.u8());
         assert_eq!(1, reader.u8());
         assert_eq!(5, reader.u64());
         assert_eq!(3, reader.u64());
@@ -527,6 +582,13 @@ mod tests {
             counterparty_sequence: Some(3),
             price: fixed("100"),
             volume: fixed("2"),
+            quote_volume: fixed("200"),
+            volume_unit: VolumeUnit::Base,
+            taker_fee: fixed("0.4"),
+            taker_fee_asset: Some(FeeAsset::Base),
+            maker_fee: fixed("0.2"),
+            maker_fee_asset: Some(FeeAsset::Quote),
+            fee_overflow: false,
             reason: None,
         }]);
         let bytes = encode(&message(lifecycle));
@@ -541,6 +603,13 @@ mod tests {
         assert_eq!(3, reader.u64());
         assert_eq!(fixed("100").raw(), reader.i128());
         assert_eq!(fixed("2").raw(), reader.i128());
+        assert_eq!(fixed("200").raw(), reader.i128());
+        assert_eq!(0, reader.u8()); // base volume
+        assert_eq!(fixed("0.4").raw(), reader.i128());
+        assert_eq!(1, reader.u8()); // taker fee asset: base
+        assert_eq!(fixed("0.2").raw(), reader.i128());
+        assert_eq!(2, reader.u8()); // maker fee asset: quote
+        assert_eq!(0, reader.u8()); // no overflow
         assert_eq!(0, reader.u8()); // no reason
 
         let bar = MessageBody::Bar(BarRecord {
@@ -578,6 +647,12 @@ mod tests {
                 ts_ms: 1_000,
                 price: fixed("100"),
                 volume: fixed("1"),
+                quote_volume: fixed("100"),
+                taker_fee: Fixed::ZERO,
+                taker_fee_asset: Some(FeeAsset::Base),
+                maker_fee: Fixed::ZERO,
+                maker_fee_asset: Some(FeeAsset::Quote),
+                fee_overflow: false,
                 taker_side: OrderSide::Buy,
                 taker_sequence: 1,
                 maker_sequence: i,
@@ -587,20 +662,20 @@ mod tests {
         let mut reader = Reader::new(&bytes, HEADER_LEN);
         assert_eq!(70_000, reader.u32());
         assert_eq!(
-            HEADER_LEN + 4 + 70_000 * 69,
+            HEADER_LEN + 4 + 70_000 * 120,
             bytes.len(),
             "every fill is encoded"
         );
     }
 
     #[test]
-    fn wire_version_is_v3() {
-        assert_eq!(3, VERSION);
+    fn wire_version_is_v5() {
+        assert_eq!(5, VERSION);
         let bytes = encode(&message(MessageBody::Gap(GapRecord {
             last_good_log_index: 0,
             last_good_ordinal: 0,
             dropped: 0,
         })));
-        assert_eq!(3, bytes[4]);
+        assert_eq!(5, bytes[4]);
     }
 }

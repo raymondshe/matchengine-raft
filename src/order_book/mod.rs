@@ -3,8 +3,15 @@ use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
 pub mod fixed;
+pub use fixed::AssetClass;
+pub use fixed::AssetId;
+pub use fixed::FeeAsset;
+pub use fixed::FeeAssetPolicy;
 pub use fixed::Fixed;
+pub use fixed::MAX_FEE_RATE;
+pub use fixed::MIN_FEE_RATE;
 pub use fixed::SymbolConfig;
+pub use fixed::VolumeUnit;
 
 /// Specifies whether an order is a buy (bid) or sell (ask) order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -142,7 +149,7 @@ pub struct Order {
     /// Whether this is a Buy or Sell order.
     pub side: OrderSide,
     /// Instrument id. It must match this process/cluster's configured
-    /// [`crate::matchengine::fixed::SymbolConfig`], which controls accepted
+    /// [`crate::order_book::fixed::SymbolConfig`], which controls accepted
     /// price and quantity precision; values are stored at the common 18-decimal
     /// scale. Multi-symbol means a separate process/cluster per symbol.
     #[serde(default)]
@@ -154,6 +161,28 @@ pub struct Order {
     /// For a resting iceberg order this is the currently displayed tranche;
     /// [`Order::open_volume`] reports the tranche plus the hidden reserve.
     pub volume: Fixed,
+
+    /// Gross size unit. `Base` means `volume` is a base quantity; `Quote`
+    /// means it is a quote amount. Quote limit orders are normalized to base
+    /// before resting; quote market orders use quote-budget matching.
+    #[serde(default)]
+    pub volume_unit: VolumeUnit,
+    /// The client's gross amount in `requested_volume_unit`, retained for
+    /// audit when a quote limit order is normalized to base. Zero means the
+    /// original amount was `volume`.
+    #[serde(default)]
+    pub requested_volume: Fixed,
+    /// The unit of `requested_volume`.
+    #[serde(default)]
+    pub requested_volume_unit: VolumeUnit,
+    /// Maker fee rate as a signed fraction of notional, set from the user
+    /// level at placement (`"0.001"` = 10 bps; negative = rebate).
+    #[serde(default)]
+    pub maker_fee_rate: Fixed,
+    /// Taker fee rate as a signed fraction of notional, set from the user
+    /// level at placement (`"0.001"` = 10 bps; negative = rebate).
+    #[serde(default)]
+    pub taker_fee_rate: Fixed,
 
     /// Unique identifier for the order.
     pub id: u64,
@@ -228,6 +257,11 @@ impl Order {
             symbol_id: 0,
             price: price.into(),
             volume: size.into(),
+            volume_unit: VolumeUnit::Base,
+            requested_volume: Fixed::ZERO,
+            requested_volume_unit: VolumeUnit::Base,
+            maker_fee_rate: Fixed::ZERO,
+            taker_fee_rate: Fixed::ZERO,
             id: 0,
             sequence,
             tif: TimeInForce::Gtc,
@@ -242,6 +276,19 @@ impl Order {
     /// Sets the instrument id without changing any other field.
     pub fn with_symbol(mut self, symbol_id: u32) -> Self {
         self.symbol_id = symbol_id;
+        self
+    }
+
+    /// Sets the maker and taker fee rates, both fractions of notional.
+    pub fn with_fee_rates(mut self, maker: impl Into<Fixed>, taker: impl Into<Fixed>) -> Self {
+        self.maker_fee_rate = maker.into();
+        self.taker_fee_rate = taker.into();
+        self
+    }
+
+    /// Sets the client volume unit; `volume` remains the gross amount in it.
+    pub fn with_volume_unit(mut self, unit: VolumeUnit) -> Self {
+        self.volume_unit = unit;
         self
     }
 
@@ -476,6 +523,23 @@ pub struct MatchResult {
     pub maker: Order,
     /// The quantity that was matched between the two orders.
     pub matches: Fixed,
+    /// Maker price × matched quantity, in quote units at scale 18. Zero when
+    /// the notional does not fit the fixed-point range.
+    pub notional: Fixed,
+    /// Taker fee: positive = charge, negative = rebate. Zero when the fee
+    /// cannot be represented exactly; see `fee_overflow`.
+    pub taker_fee: Fixed,
+    /// Asset in which the taker fee is charged or rebated.
+    pub taker_fee_asset: FeeAsset,
+    /// Maker fee: positive = charge, negative = rebate. Zero when the fee
+    /// cannot be represented exactly; see `fee_overflow`.
+    pub maker_fee: Fixed,
+    /// Asset in which the maker fee is charged or rebated.
+    pub maker_fee_asset: FeeAsset,
+    /// True when the notional or either fee overflowed the scale-18 `i128`
+    /// range. The fill itself is still valid; downstream must not assume the
+    /// zero fee amounts are real.
+    pub fee_overflow: bool,
 }
 
 /// Equality comparison for match results.
@@ -484,6 +548,12 @@ impl PartialEq for MatchResult {
         (self.taker == other.taker)
             && (self.maker == other.maker)
             && (self.matches == other.matches)
+            && (self.notional == other.notional)
+            && (self.taker_fee == other.taker_fee)
+            && (self.taker_fee_asset == other.taker_fee_asset)
+            && (self.maker_fee == other.maker_fee)
+            && (self.maker_fee_asset == other.maker_fee_asset)
+            && (self.fee_overflow == other.fee_overflow)
     }
 }
 
@@ -496,12 +566,46 @@ impl MatchResult {
     /// * `maker` - The resting order in the book
     /// * `matches` - The quantity that was matched
     pub fn new(taker: &Order, maker: &Order, matches: impl Into<Fixed>) -> Self {
+        Self::new_with_policy(taker, maker, matches, FeeAssetPolicy::Received)
+    }
+
+    /// Creates a fill and computes fees according to a pair-level fee policy.
+    pub fn new_with_policy(
+        taker: &Order,
+        maker: &Order,
+        matches: impl Into<Fixed>,
+        policy: FeeAssetPolicy,
+    ) -> Self {
+        let matches = matches.into();
+        let notional = Fixed::notional(maker.price, matches);
+        let taker_fee_asset = policy.fee_asset(taker.side);
+        let maker_fee_asset = policy.fee_asset(maker.side);
+        let fee = |asset: FeeAsset, rate: Fixed| match asset {
+            FeeAsset::Base => matches.checked_mul(rate),
+            FeeAsset::Quote => notional.and_then(|value| value.checked_mul(rate)),
+        };
+        let taker_fee = fee(taker_fee_asset, taker.taker_fee_rate);
+        let maker_fee = fee(maker_fee_asset, maker.maker_fee_rate);
         Self {
             taker: *taker,
             maker: *maker,
-            matches: matches.into(),
+            matches,
+            notional: notional.unwrap_or(Fixed::ZERO),
+            taker_fee: taker_fee.unwrap_or(Fixed::ZERO),
+            taker_fee_asset,
+            maker_fee: maker_fee.unwrap_or(Fixed::ZERO),
+            maker_fee_asset,
+            fee_overflow: notional.is_none() || taker_fee.is_none() || maker_fee.is_none(),
         }
     }
+}
+
+/// How the sweep tracks the taker's remaining size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SweepMode {
+    Base,
+    BuyQuote,
+    SellQuote,
 }
 
 /// Everything one submitted order did to the book: what
@@ -619,6 +723,15 @@ pub struct DepthChange {
     pub delta_volume: Fixed,
     /// Change in the number of resting orders at the level.
     pub delta_orders: i32,
+}
+
+/// Shared mutable state threaded through one sweep of a resting side.
+struct SweepContext<'a> {
+    config: &'a SymbolConfig,
+    record: bool,
+    journal: &'a mut Vec<DepthChange>,
+    track_gtd: bool,
+    gtd_dirty: &'a mut bool,
 }
 
 impl OrderBook {
@@ -882,7 +995,7 @@ impl OrderBook {
     ///
     /// * `order` - The order to process (will have its sequence number set)
     pub fn execute_order(&mut self, order: &mut Order) -> Outcome {
-        self.execute_order_inner(order, None)
+        self.execute_order_inner(order, SymbolConfig::default())
     }
 
     /// Executes an order with the configured symbol's precision configuration.
@@ -896,7 +1009,7 @@ impl OrderBook {
         order: &mut Order,
         config: SymbolConfig,
     ) -> Outcome {
-        self.execute_order_inner(order, Some(config))
+        self.execute_order_inner(order, config)
     }
 
     /// Consumes the next sequence and returns a rejected outcome without
@@ -911,16 +1024,48 @@ impl OrderBook {
         }
     }
 
-    fn execute_order_inner(&mut self, order: &mut Order, config: Option<SymbolConfig>) -> Outcome {
+    fn execute_order_inner(&mut self, order: &mut Order, config: SymbolConfig) -> Outcome {
         order.sequence = self.next_market_sequence();
 
         let mut outcome = Outcome {
             market_seq: order.sequence,
             ..Outcome::default()
         };
-        let rejection = validate_order(order)
-            .or_else(|| config.and_then(|config| validate_order_for_symbol(order, config)));
-        if let Some(reason) = rejection {
+        if order.requested_volume == Fixed::ZERO {
+            order.requested_volume = order.volume;
+            order.requested_volume_unit = order.volume_unit;
+        }
+        if order.volume_unit == VolumeUnit::Quote {
+            // Quote volume currently supports plain limit/market orders. Mixed
+            // unit normalization for iceberg tranches/FOK is not defined yet.
+            if order.display_volume > Fixed::ZERO
+                || order.hidden_volume > Fixed::ZERO
+                || order.tif == TimeInForce::Fok
+                || !order
+                    .volume
+                    .has_at_most_decimals(config.quote_asset.decimals)
+                || !order
+                    .requested_volume
+                    .has_at_most_decimals(config.quote_asset.decimals)
+            {
+                outcome.rejected = Some(RejectReason::InvalidOrder);
+                return outcome;
+            }
+        }
+        if order.volume_unit == VolumeUnit::Quote && order.live == OrderType::Limit {
+            // A quote limit order becomes a base-denominated resting order at
+            // its limit price. The original quote amount stays on the order.
+            let base = (order.volume / order.price).floor_to_multiple(config.base_lot);
+            if base <= Fixed::ZERO {
+                outcome.rejected = Some(RejectReason::InvalidOrder);
+                return outcome;
+            }
+            order.volume = base;
+            order.volume_unit = VolumeUnit::Base;
+        }
+        if let Some(reason) =
+            validate_order(order).or_else(|| validate_order_for_symbol(order, &config))
+        {
             outcome.rejected = Some(reason);
             return outcome;
         }
@@ -975,13 +1120,16 @@ impl OrderBook {
             OrderType::Market => None,
             OrderType::Limit => Some(order.price),
         };
-        let (fills, remainder) = self.sweep(order, limit);
+        let (fills, remainder) = self.sweep(order, limit, &config);
         outcome.fills = fills;
 
         if remainder > Fixed::ZERO {
-            if order.tif.is_immediate() || order.live == OrderType::Market {
-                // IOC/FOK remainders and market remainders are cancelled: a
-                // market or immediate order never rests.
+            if order.volume_unit == VolumeUnit::Quote
+                || order.tif.is_immediate()
+                || order.live == OrderType::Market
+            {
+                // Quote-market leftovers, IOC/FOK remainders and market
+                // remainders are cancelled; they never rest.
                 outcome.cancelled = Some(remainder);
             } else {
                 outcome.resting = Some(self.rest(order, remainder));
@@ -992,7 +1140,7 @@ impl OrderBook {
         if let Some(print) = outcome.fills.last() {
             self.last_trade_price = Some(print.maker.price);
         }
-        self.run_stops(&mut outcome);
+        self.run_stops(&mut outcome, &config);
 
         outcome
     }
@@ -1266,7 +1414,12 @@ impl OrderBook {
     /// instead of leaving the book and the taker keeps matching it, exactly as
     /// OrderBook-rs replenishes an iceberg tranche: to the taker it looks like
     /// several orders queued at that price.
-    fn sweep(&mut self, order: &Order, limit: Option<Fixed>) -> (Vec<MatchResult>, Fixed) {
+    fn sweep(
+        &mut self,
+        order: &Order,
+        limit: Option<Fixed>,
+        config: &SymbolConfig,
+    ) -> (Vec<MatchResult>, Fixed) {
         // The journal is a separate field, so the resting side and the journal
         // can be borrowed together without a second pass over the map.
         let record = self.record_depth;
@@ -1278,19 +1431,25 @@ impl OrderBook {
                 &mut self.asks,
                 order,
                 limit,
-                record,
-                &mut self.depth_journal,
-                track_gtd,
-                &mut gtd_dirty,
+                SweepContext {
+                    config,
+                    record,
+                    journal: &mut self.depth_journal,
+                    track_gtd,
+                    gtd_dirty: &mut gtd_dirty,
+                },
             ),
             OrderSide::Sell => Self::sweep_side(
                 &mut self.bids,
                 order,
                 limit,
-                record,
-                &mut self.depth_journal,
-                track_gtd,
-                &mut gtd_dirty,
+                SweepContext {
+                    config,
+                    record,
+                    journal: &mut self.depth_journal,
+                    track_gtd,
+                    gtd_dirty: &mut gtd_dirty,
+                },
             ),
         };
         self.gtd_scan_dirty = gtd_dirty;
@@ -1305,17 +1464,22 @@ impl OrderBook {
         resting: &mut BTreeMap<K, Order>,
         order: &Order,
         limit: Option<Fixed>,
-        record: bool,
-        journal: &mut Vec<DepthChange>,
-        track_gtd: bool,
-        gtd_dirty: &mut bool,
+        context: SweepContext<'_>,
     ) -> (Vec<MatchResult>, Fixed) {
         let mut results = Vec::new();
-        let mut remaining_volume = order.volume;
+        let mut remaining = order.volume;
+        let mode = if order.volume_unit == VolumeUnit::Quote {
+            match order.side {
+                OrderSide::Buy => SweepMode::BuyQuote,
+                OrderSide::Sell => SweepMode::SellQuote,
+            }
+        } else {
+            SweepMode::Base
+        };
 
         // Stop as soon as the taker is exhausted: a zero-volume taker must not
         // "match" the next maker and rewrite it.
-        while remaining_volume > Fixed::ZERO {
+        while remaining > Fixed::ZERO {
             // `first_entry` walks the tree once and keeps the position, so
             // removing a fully filled maker, shrinking a partially filled one
             // or refilling an iceberg below does not descend a second time.
@@ -1335,28 +1499,71 @@ impl OrderBook {
                 break;
             }
 
-            let match_volume = remaining_volume.min(maker.volume);
-            results.push(MatchResult {
-                taker: Order {
-                    volume: remaining_volume,
-                    ..*order
+            let by_base = remaining.min(maker.volume);
+            let match_volume = match mode {
+                SweepMode::Base => by_base,
+                SweepMode::BuyQuote => (remaining / maker.price)
+                    .floor_to_multiple(context.config.base_lot)
+                    .min(maker.volume),
+                SweepMode::SellQuote => (remaining / maker.price)
+                    .ceil_to_multiple(context.config.base_lot)
+                    .min(maker.volume),
+            };
+            if match_volume <= Fixed::ZERO {
+                break;
+            }
+            let notional = Fixed::notional(maker.price, match_volume);
+            if mode != SweepMode::Base && notional.is_none() {
+                // The quote budget cannot be represented; stop rather than
+                // spend an amount we cannot track.
+                break;
+            }
+            let notional = notional.unwrap_or(Fixed::ZERO);
+            let taker = Order {
+                volume: if mode == SweepMode::Base {
+                    remaining
+                } else {
+                    match_volume
                 },
-                maker,
-                matches: match_volume,
-            });
+                ..*order
+            };
+            results.push(MatchResult::new_with_policy(
+                &taker,
+                &maker,
+                match_volume,
+                context.config.fee_asset_policy,
+            ));
 
-            if maker.volume > remaining_volume {
-                // Partially filled: shrink the maker in place so it keeps
-                // its identity (id, side, live and sequence).
-                best.get_mut().volume = maker.volume - match_volume;
-                record_depth_change(journal, record, maker.side, maker.price, -match_volume, 0);
-                // Taker fully matched
-                remaining_volume = Fixed::ZERO;
+            let maker_remaining = maker.volume - match_volume;
+            if maker_remaining > Fixed::ZERO {
+                // Partially filled: shrink in place so the maker keeps its
+                // identity (id, side, live and sequence).
+                best.get_mut().volume = maker_remaining;
+                record_depth_change(
+                    context.journal,
+                    context.record,
+                    maker.side,
+                    maker.price,
+                    -match_volume,
+                    0,
+                );
+                if mode == SweepMode::Base {
+                    remaining = Fixed::ZERO;
+                } else {
+                    remaining = remaining.saturating_sub(notional);
+                }
                 break;
             }
 
-            // The visible tranche is gone.
-            remaining_volume -= match_volume;
+            // The maker is fully consumed. Update the taker remainder before
+            // the iceberg refill so the loop can continue on the same order.
+            match mode {
+                SweepMode::Base => remaining -= match_volume,
+                SweepMode::BuyQuote | SweepMode::SellQuote => {
+                    remaining = remaining.saturating_sub(notional);
+                }
+            }
+
             if maker.hidden_volume > Fixed::ZERO {
                 // Iceberg: refill one tranche from the hidden reserve and keep
                 // matching this same order.
@@ -1369,8 +1576,8 @@ impl OrderBook {
                 maker_slot.volume = draw;
                 maker_slot.hidden_volume = maker.hidden_volume - draw;
                 record_depth_change(
-                    journal,
-                    record,
+                    context.journal,
+                    context.record,
                     maker.side,
                     maker.price,
                     draw - match_volume,
@@ -1378,14 +1585,24 @@ impl OrderBook {
                 );
             } else {
                 best.remove();
-                if track_gtd && matches!(maker.tif, TimeInForce::Gtd(_)) {
-                    *gtd_dirty = true;
+                if context.track_gtd && matches!(maker.tif, TimeInForce::Gtd(_)) {
+                    *context.gtd_dirty = true;
                 }
-                record_depth_change(journal, record, maker.side, maker.price, -match_volume, -1);
+                record_depth_change(
+                    context.journal,
+                    context.record,
+                    maker.side,
+                    maker.price,
+                    -match_volume,
+                    -1,
+                );
+            }
+            if remaining <= Fixed::ZERO {
+                break;
             }
         }
 
-        (results, remaining_volume)
+        (results, remaining)
     }
 
     /// Volume the opposite side could execute for `order` right now: every
@@ -1431,7 +1648,7 @@ impl OrderBook {
     /// rested. Each child's prints move the last trade price again, so one trade
     /// can cascade through several stops; every turn removes a stop, so the
     /// cascade terminates.
-    fn run_stops(&mut self, outcome: &mut Outcome) {
+    fn run_stops(&mut self, outcome: &mut Outcome, config: &SymbolConfig) {
         loop {
             let Some(last_trade_price) = self.last_trade_price else {
                 return;
@@ -1454,7 +1671,7 @@ impl OrderBook {
                 OrderType::Limit => Some(stop.price),
             };
 
-            let (fills, remainder) = self.sweep(&stop, limit);
+            let (fills, remainder) = self.sweep(&stop, limit, config);
             if let Some(print) = fills.last() {
                 self.last_trade_price = Some(print.maker.price);
             }
@@ -1590,21 +1807,52 @@ fn amend_in_map<K: Ord>(
 /// The order must belong to the configured symbol; otherwise it is refused as
 /// an unsupported order. Price fields use `price_decimals`, quantity fields
 /// use `quantity_decimals`.
-fn validate_order_for_symbol(order: &Order, config: SymbolConfig) -> Option<RejectReason> {
+fn validate_order_for_symbol(order: &Order, config: &SymbolConfig) -> Option<RejectReason> {
     if order.symbol_id != config.symbol_id {
         return Some(RejectReason::UnsupportedOrder);
     }
     let price_ok = order.price.has_at_most_decimals(config.price_decimals)
-        && order.stop_price.has_at_most_decimals(config.price_decimals);
-    let quantity_ok = order.volume.has_at_most_decimals(config.quantity_decimals)
-        && order
-            .display_volume
-            .has_at_most_decimals(config.quantity_decimals)
-        && order
-            .hidden_volume
-            .has_at_most_decimals(config.quantity_decimals);
-    if !price_ok || !quantity_ok {
+        && order.stop_price.has_at_most_decimals(config.price_decimals)
+        && order.price.is_multiple_of(config.price_tick)
+        && order.stop_price.is_multiple_of(config.price_tick);
+    if !price_ok {
         return Some(RejectReason::InvalidOrder);
+    }
+    match order.volume_unit {
+        VolumeUnit::Base => {
+            let quantity_ok = order
+                .volume
+                .has_at_most_decimals(config.base_asset.decimals)
+                && order
+                    .display_volume
+                    .has_at_most_decimals(config.base_asset.decimals)
+                && order
+                    .hidden_volume
+                    .has_at_most_decimals(config.base_asset.decimals)
+                && order.volume.is_multiple_of(config.base_lot)
+                && order.display_volume.is_multiple_of(config.base_lot)
+                && order.hidden_volume.is_multiple_of(config.base_lot);
+            if !quantity_ok {
+                return Some(RejectReason::InvalidOrder);
+            }
+        }
+        VolumeUnit::Quote => {
+            // Quote volume is only supported for plain market orders. Iceberg
+            // tranches and FOK semantics need base normalization that is not
+            // defined yet.
+            if order.display_volume > Fixed::ZERO
+                || order.hidden_volume > Fixed::ZERO
+                || order.tif == TimeInForce::Fok
+            {
+                return Some(RejectReason::InvalidOrder);
+            }
+            if !order
+                .volume
+                .has_at_most_decimals(config.quote_asset.decimals)
+            {
+                return Some(RejectReason::InvalidOrder);
+            }
+        }
     }
     None
 }
@@ -1613,6 +1861,13 @@ fn validate_order_for_symbol(order: &Order, config: SymbolConfig) -> Option<Reje
 /// `None` means the order is admissible.
 fn validate_order(order: &Order) -> Option<RejectReason> {
     if !(order.volume.is_finite() && order.volume > Fixed::ZERO) {
+        return Some(RejectReason::InvalidOrder);
+    }
+    if order.maker_fee_rate < MIN_FEE_RATE
+        || order.maker_fee_rate > MAX_FEE_RATE
+        || order.taker_fee_rate < MIN_FEE_RATE
+        || order.taker_fee_rate > MAX_FEE_RATE
+    {
         return Some(RejectReason::InvalidOrder);
     }
     // A market order ignores its own price; a limit order (including a
@@ -2310,6 +2565,229 @@ mod tests {
             ob.best_ask().expect("only the 102 level survives").volume
         );
         assert_eq!(9.0, ob.best_bid().expect("10 - 1 bid remains").volume);
+    }
+
+    #[test]
+    fn fill_fees_use_taker_and_maker_rates() {
+        let rate = |value: &str| value.parse::<Fixed>().unwrap();
+        let mut ob = OrderBook::new();
+        let mut maker =
+            Order::new(OrderSide::Sell, 100, 2, 1).with_fee_rates(rate("0.001"), rate("0.002"));
+        ob.place_order(&mut maker);
+        let mut taker =
+            Order::new(OrderSide::Buy, 100, 1, 2).with_fee_rates(rate("0.003"), rate("0.004"));
+
+        let outcome = ob.execute_order(&mut taker);
+        assert_eq!(1, outcome.fills.len());
+        let fill = outcome.fills[0];
+        assert_eq!(rate("100"), fill.notional);
+        assert_eq!(
+            rate("0.004"),
+            fill.taker_fee,
+            "taker buys, so the taker fee is in base"
+        );
+        assert_eq!(FeeAsset::Base, fill.taker_fee_asset);
+        assert_eq!(
+            rate("0.1"),
+            fill.maker_fee,
+            "the maker sells, so its fee is in quote"
+        );
+        assert_eq!(FeeAsset::Quote, fill.maker_fee_asset);
+        assert!(!fill.fee_overflow);
+
+        let remaining = ob.best_ask().expect("the maker still has volume");
+        assert_eq!(rate("0.001"), remaining.maker_fee_rate);
+        assert_eq!(rate("0.002"), remaining.taker_fee_rate);
+    }
+
+    #[test]
+    fn maker_rebate_and_rested_taker_use_the_maker_rate() {
+        let rate = |value: &str| value.parse::<Fixed>().unwrap();
+        let mut ob = OrderBook::new();
+        let mut resting =
+            Order::new(OrderSide::Buy, 100, 2, 1).with_fee_rates(rate("-0.0005"), rate("0.01"));
+        ob.place_order(&mut resting);
+        let mut taker = Order::new(OrderSide::Sell, 100, 1, 2).with_fee_rates(rate("0"), rate("0"));
+
+        let outcome = ob.execute_order(&mut taker);
+        let fill = outcome.fills[0];
+        assert_eq!(rate("-0.0005"), fill.maker_fee);
+        assert_eq!(FeeAsset::Base, fill.maker_fee_asset);
+        assert_eq!(Fixed::ZERO, fill.taker_fee);
+        assert_eq!(FeeAsset::Quote, fill.taker_fee_asset);
+    }
+
+    #[test]
+    fn quote_limit_order_normalizes_to_base_at_the_limit_price() {
+        let config = SymbolConfig::new(0, 2, 4).unwrap();
+        let mut ob = OrderBook::new();
+        let mut order =
+            Order::new(OrderSide::Buy, 100, 1000, 1).with_volume_unit(VolumeUnit::Quote);
+        let outcome = ob.execute_order_with_symbol(&mut order, config);
+
+        assert_eq!(None, outcome.rejected);
+        assert_eq!(Fixed::from(10), order.volume);
+        assert_eq!(VolumeUnit::Base, order.volume_unit);
+        assert_eq!(Fixed::from(1000), order.requested_volume);
+        assert_eq!(VolumeUnit::Quote, order.requested_volume_unit);
+        assert_eq!(1, ob.bids.len());
+        assert_eq!(Fixed::from(10), ob.best_bid().unwrap().volume);
+
+        // The configured base lot can make a quote amount too small to place.
+        let config = SymbolConfig::new(0, 2, 0)
+            .unwrap()
+            .with_tick_and_lot("0.01".parse().unwrap(), "1".parse().unwrap());
+        let mut too_small =
+            Order::new(OrderSide::Buy, 100, 50, 2).with_volume_unit(VolumeUnit::Quote);
+        assert_eq!(
+            Some(RejectReason::InvalidOrder),
+            ob.execute_order_with_symbol(&mut too_small, config)
+                .rejected
+        );
+    }
+
+    #[test]
+    fn quote_market_buy_spends_the_budget_and_cancels_dust() {
+        let config = SymbolConfig::new(0, 2, 4).unwrap();
+        let mut ob = OrderBook::new();
+        let mut maker = Order::new(OrderSide::Sell, 100, 2, 1);
+        ob.place_order(&mut maker);
+
+        let mut taker = Order::new(OrderSide::Buy, 0, 150, 2).with_volume_unit(VolumeUnit::Quote);
+        taker.live = OrderType::Market;
+        let outcome = ob.execute_order_with_symbol(&mut taker, config.clone());
+
+        assert_eq!(1, outcome.fills.len());
+        assert_eq!(outcome.fills[0].matches, "1.5".parse::<Fixed>().unwrap());
+        assert_eq!(outcome.fills[0].notional, Fixed::from(150));
+        assert_eq!(None, outcome.cancelled);
+        assert_eq!(VolumeUnit::Quote, taker.volume_unit);
+        assert_eq!(
+            "0.5".parse::<Fixed>().unwrap(),
+            ob.best_ask().unwrap().volume
+        );
+
+        let mut dust_book = OrderBook::new();
+        let mut maker = Order::new(OrderSide::Sell, 100, 2, 3);
+        dust_book.place_order(&mut maker);
+        let mut dusty = Order::new(OrderSide::Buy, 0, "150.005".parse::<Fixed>().unwrap(), 4)
+            .with_volume_unit(VolumeUnit::Quote);
+        dusty.live = OrderType::Market;
+        let outcome = dust_book.execute_order_with_symbol(&mut dusty, config);
+        assert_eq!(outcome.fills[0].matches, "1.5".parse::<Fixed>().unwrap());
+        assert_eq!(Some("0.005".parse::<Fixed>().unwrap()), outcome.cancelled);
+    }
+
+    #[test]
+    fn quote_market_sell_targets_gross_proceeds_and_reports_overshoot() {
+        let config = SymbolConfig::new(0, 2, 4).unwrap();
+        let mut ob = OrderBook::new();
+        let mut maker = Order::new(OrderSide::Buy, 100, 2, 1);
+        ob.place_order(&mut maker);
+
+        let mut taker = Order::new(OrderSide::Sell, 0, "150.005".parse::<Fixed>().unwrap(), 2)
+            .with_volume_unit(VolumeUnit::Quote);
+        taker.live = OrderType::Market;
+        let outcome = ob.execute_order_with_symbol(&mut taker, config);
+        assert_eq!(1, outcome.fills.len());
+        assert_eq!(outcome.fills[0].matches, "1.5001".parse::<Fixed>().unwrap());
+        assert_eq!(
+            outcome.fills[0].notional,
+            "150.01".parse::<Fixed>().unwrap()
+        );
+        assert_eq!(None, outcome.cancelled);
+    }
+
+    #[test]
+    fn tick_and_lot_increments_are_enforced() {
+        let config = SymbolConfig::new(0, 2, 4).unwrap();
+        let mut ob = OrderBook::new();
+        let mut bad_price = Order::new(OrderSide::Buy, "100.001".parse::<Fixed>().unwrap(), 1, 1);
+        assert_eq!(
+            Some(RejectReason::InvalidOrder),
+            ob.execute_order_with_symbol(&mut bad_price, config.clone())
+                .rejected
+        );
+        let mut bad_lot = Order::new(OrderSide::Buy, 100, "0.00001".parse::<Fixed>().unwrap(), 2);
+        assert_eq!(
+            Some(RejectReason::InvalidOrder),
+            ob.execute_order_with_symbol(&mut bad_lot, config).rejected
+        );
+    }
+
+    #[test]
+    fn fee_asset_policies_charge_the_expected_asset() {
+        let rate = |value: &str| value.parse::<Fixed>().unwrap();
+        for (policy, taker_asset, maker_asset, taker_fee, maker_fee) in [
+            (
+                FeeAssetPolicy::Received,
+                FeeAsset::Base,
+                FeeAsset::Quote,
+                rate("0.004"),
+                rate("0.1"),
+            ),
+            (
+                FeeAssetPolicy::Quote,
+                FeeAsset::Quote,
+                FeeAsset::Quote,
+                rate("0.4"),
+                rate("0.1"),
+            ),
+            (
+                FeeAssetPolicy::Base,
+                FeeAsset::Base,
+                FeeAsset::Base,
+                rate("0.004"),
+                rate("0.001"),
+            ),
+        ] {
+            let config = SymbolConfig::new(0, 2, 8)
+                .unwrap()
+                .with_fee_asset_policy(policy);
+            let mut ob = OrderBook::new();
+            let mut maker =
+                Order::new(OrderSide::Sell, 100, 2, 1).with_fee_rates(rate("0.001"), rate("0"));
+            ob.place_order(&mut maker);
+            let mut taker =
+                Order::new(OrderSide::Buy, 100, 1, 2).with_fee_rates(rate("0"), rate("0.004"));
+            let outcome = ob.execute_order_with_symbol(&mut taker, config);
+            let fill = outcome.fills[0];
+            assert_eq!(taker_asset, fill.taker_fee_asset, "policy {policy:?}");
+            assert_eq!(maker_asset, fill.maker_fee_asset, "policy {policy:?}");
+            assert_eq!(taker_fee, fill.taker_fee, "policy {policy:?}");
+            assert_eq!(maker_fee, fill.maker_fee, "policy {policy:?}");
+        }
+    }
+
+    #[test]
+    fn fee_overflow_is_reported_explicitly() {
+        let huge = Fixed::from_units(10_000_000_000_000_000_000);
+        let maker = Order::new(OrderSide::Sell, huge, 1, 1);
+        let taker = Order::new(OrderSide::Buy, huge, 1, 2);
+        let fill = MatchResult::new(&taker, &maker, huge);
+        assert!(fill.fee_overflow);
+        assert_eq!(Fixed::ZERO, fill.notional);
+        assert_eq!(Fixed::ZERO, fill.taker_fee);
+        assert_eq!(Fixed::ZERO, fill.maker_fee);
+    }
+
+    #[test]
+    fn fee_rates_outside_the_supported_range_are_rejected() {
+        let rate = |value: &str| value.parse::<Fixed>().unwrap();
+        let mut ob = OrderBook::new();
+        let mut bad = Order::new(OrderSide::Buy, 100, 1, 1)
+            .with_fee_rates(rate("1.000000000000000001"), Fixed::ZERO);
+        assert_eq!(
+            Some(RejectReason::InvalidOrder),
+            ob.execute_order(&mut bad).rejected
+        );
+        let mut bad = Order::new(OrderSide::Buy, 100, 1, 2)
+            .with_fee_rates(Fixed::ZERO, rate("-1.000000000000000001"));
+        assert_eq!(
+            Some(RejectReason::InvalidOrder),
+            ob.execute_order(&mut bad).rejected
+        );
+        assert!(ob.bids.is_empty() && ob.asks.is_empty());
     }
 
     #[test]

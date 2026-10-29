@@ -16,8 +16,8 @@ use matchengine_raft::Transport;
 use matchengine_raft::build_match_engine_node;
 use matchengine_raft::client::MatchEngineClient;
 use matchengine_raft::default_raft_config;
-use matchengine_raft::matchengine::Order;
-use matchengine_raft::matchengine::OrderSide;
+use matchengine_raft::order_book::Order;
+use matchengine_raft::order_book::OrderSide;
 use matchengine_raft::store::MatchEngineRequest;
 use openraft::type_config::TypeConfigExt;
 
@@ -209,7 +209,7 @@ fn file_sink_records_stop_triggers_and_expiries() {
 
         // A sell stop at 95 parks off the book (sequence 2); no event yet.
         let mut stop = Order::new(OrderSide::Sell, 0.0, 5.0, 0);
-        stop.live = matchengine_raft::matchengine::OrderType::Market;
+        stop.live = matchengine_raft::order_book::OrderType::Market;
         stop.stop_price = 95.0.into();
         client.write(&place(stop)).await.unwrap().unwrap();
 
@@ -265,7 +265,7 @@ fn file_sink_records_stop_triggers_and_expiries() {
             .as_millis() as u64;
         let expiry = now_ms + 60_000;
         let mut gtd = Order::new(OrderSide::Buy, 90.0, 1.0, 0);
-        gtd.tif = matchengine_raft::matchengine::TimeInForce::Gtd(expiry);
+        gtd.tif = matchengine_raft::order_book::TimeInForce::Gtd(expiry);
         gtd.timestamp = 1_000; // overwritten by the leader at intake
         client.write(&place(gtd)).await.unwrap().unwrap();
         wait_for_events(&event_log, 7).await;

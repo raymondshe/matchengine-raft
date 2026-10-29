@@ -5,33 +5,31 @@ current branch state.
 
 **Current baseline:** the OpenRaft 0.10 port, durable WAL/snapshot storage and exact scale-18
 `Fixed` migration are done. Order prices/quantities, last trade, match events, depth/BBO, `/read`,
-the market-data feed and wire v3 are exact; snapshot v7 stores the fixed-point state and the
-single-symbol precision configuration. One process/cluster trades exactly one symbol; multi-symbol
-is isolated by running one process per symbol. The remaining work is fee capture, public-API
-hardening, stronger correctness evidence and measured performance.
+the market-data feed and wire v5 are exact; snapshot v9 stores fixed-point orders/events, the
+single-symbol precision configuration, asset metadata, volume units and maker/taker fee assets.
+One process/cluster trades exactly one symbol; multi-symbol is isolated by running one process per
+symbol. Base/quote volume and asset-aware fee deduction are done, and the market-data processor
+runs as a tokio task. The remaining work is public-API hardening, stronger correctness evidence,
+failure behavior and measured performance.
 
 Priority key: **P0** = correctness/security, do next; **P1** = production readiness; **P2** =
 important but not blocking; **P3** = later/optional.
 
 ## Top priorities
 
-1. **P0 — Add deterministic maker/taker fees.** Each order must carry its user-level maker and
-   taker fee rates from placement; every fill computes exact notional, taker fee and maker fee
-   without the engine knowing users or balances. Report fees through `/write`, `/events`, the
-   file sink and (if needed) the market-data feed. See §12.
-2. **P0 — Harden the public trust boundary.** `client_order_id` is unbounded, the gRPC listener is
+1. **P0 — Harden the public trust boundary.** `client_order_id` is unbounded, the gRPC listener is
    plaintext, and the snapshot receiver has no total-size cap. Bound IDs and request sizes, cap
    or stream snapshots, and decide TLS/mTLS plus HTTP authentication before any non-loopback
    exposure. Add hostile-input tests.
-3. **P1 — Build stronger correctness evidence.** Add randomized differential/property tests for
+2. **P1 — Build stronger correctness evidence.** Add randomized differential/property tests for
    the book (volume conservation, no crossed book, price-time priority, deterministic replay).
    The 18-digit exactness round trip across API, events, feed, wire and snapshot is now covered by
    `tests/cluster/test_exactness.rs`; keep that guard while adding a reference model.
-4. **P1 — Make failure and observability behavior explicit.** A dead gRPC server task currently
+3. **P1 — Make failure and observability behavior explicit.** A dead gRPC server task currently
    leaves the HTTP API serving a node peers cannot reach; two `Logger` middleware log every
    request twice; `test_cluster` leaks fixed ports and running nodes. Decide fail-fast versus
    degraded mode, collapse logging, and make the test own and stop its nodes.
-5. **P1 — Measure before optimizing.** Re-run the microbenchmarks after the `Fixed` migration, add
+4. **P1 — Measure before optimizing.** The post-fee microbenchmark baseline is recorded in §8; add
    submit → commit → apply → response latency and a 50k–500k fills/s feed load test. Only then
    consider per-level buckets or a compact resting record. The numbers in `docs/TRANSPORTS.md`
    are still guidance, not results.
@@ -50,18 +48,22 @@ Completed:
 - [x] `DepthLevel`, `DepthChange`, `spread`, `mid_price`, `/read` depth/BBO/spread/last-trade and
   the shadow book are exact. The shadow book is keyed by `Fixed`.
 - [x] Market-data `TradeRecord`, `BboRecord`, depth records, lifecycle and `BarRecord` are `Fixed`.
-  Wire **v3** encodes all prices/quantities as little-endian scale-18 `i128`.
-- [x] Snapshot **v7** stores the last trade and match events as `Fixed` plus the single-symbol
-  precision configuration; older snapshots are rejected.
+  Wire **v5** encodes prices, quantities, quote volume and fees as little-endian scale-18 `i128`.
+- [x] Snapshot **v9** stores the last trade, match events, asset metadata, tick/lot rules, fee
+  assets and fill fees as `Fixed`, plus the single-symbol precision configuration; older snapshots
+  are rejected.
 - [x] `Fixed::notional` multiplies through an `i256` intermediate and truncates toward zero at 18
   places; unit tests cover an intermediate that overflows `i128`.
+- [x] Fill fees use the taker order's taker rate and the maker order's maker rate; `MatchResult`
+  carries notional/fees/`fee_overflow`, events and the JSONL feed carry both fees, and snapshot v9
+  preserves the order rates and event fees.
 - [x] `tests/cluster/test_exactness.rs` round-trips 18 fractional digits through `/write`,
-  `/read`, `/events`, the JSONL feed, snapshot v7 and a restart.
-- [x] README/README_CN, AGENTS, DECIMAL, MATCH_RESULTS, MARKET_DATA_PLAN and AERON record wire v3,
-  snapshot v7 and the new decimal JSON output.
+  `/read`, `/events`, the JSONL feed, snapshot v9 and a restart.
+- [x] README/README_CN, AGENTS, DECIMAL, MATCH_RESULTS, MARKET_DATA_PLAN and AERON record wire v5,
+  snapshot v9 and the new decimal/fee JSON output.
 
-Note: wire v3 and snapshot v7 are breaking changes; existing data directories must be recreated
-and v2 feed consumers must implement the scale-18 integer layout.
+Note: wire v5 and snapshot v9 are breaking changes; existing data directories must be recreated
+and older feed consumers must implement the scale-18 integer layout, volume units and fee assets.
 
 ## 2. One process, one symbol [done]
 
@@ -71,13 +73,14 @@ routes two books or switches symbols after trading starts.
 
 Done:
 
-- [x] Replicated `StateMachineData.symbol_config` + `symbol_locked` in snapshot v7.
+- [x] Replicated `StateMachineData.symbol_config` + `symbol_locked` in snapshot v9.
   `MatchEngineRequest::ConfigureSymbol` sets the one symbol and its precision through Raft before
   trading.
 - [x] The configuration is locked after the first accepted order; changing symbol or precision
   while orders are open, or after trading starts, is refused.
-- [x] `Place` and `Amend` validate price/quantity decimals for that symbol; over-precision values
-  produce a `rejected` event. `Cancel`, `Amend` and `Place` reject a different `symbol_id`.
+- [x] `Place` and `Amend` validate price/quantity decimals, price tick and base lot for that
+  symbol; invalid values produce a `rejected` event. `Cancel`, `Amend` and `Place` reject a
+  different `symbol_id`.
 - [x] `/read symbol_config` and `/read symbol_id` expose the configuration; a publishing
   market-data feed is reset to the new symbol after a successful configuration change.
 - [x] `tests/cluster/test_symbols.rs` covers precision rejection, cross-symbol rejection, the
@@ -164,7 +167,6 @@ Done:
 
 Remaining:
 
-- [ ] **P0** Carry symbol isolation through the engine (see §2); the exactness migration is done.
 - [ ] **P1** Evaluate per-price-level buckets (`BTreeMap<price, VecDeque<Order>>` plus a
   sequence-keyed index) after the post-`Fixed` benchmarks. The current per-order `BTreeMap`
   descends the tree for every fill; the extended `Order` also grew the map value, which shows up
@@ -192,17 +194,18 @@ Done:
 
 - [x] Deterministic feed core: depth journal, `MatchEvent.side`, leader-stamped intake
   timestamps, shadow book, one TRADE per taker, BBO, depth snapshots/deltas, lifecycle, OHLC bars,
-  status cadence, gap marker, leader gating with reset snapshots, JSONL sink and wire encoder v3.
+  status cadence, gap marker, leader gating with reset snapshots, JSONL sink and wire encoder v5.
 - [x] Deterministic `market_seq`/`sub_seq`: identical keys across replicas, failover and restart.
 - [x] `marketdata_status` read key.
+- [x] The processor runs as a tokio task over a bounded tokio `mpsc` queue, with `watch`-driven
+  shutdown and `Notify`-driven snapshot wakeups; `try_send` keeps the matching path non-blocking.
+- [x] Processor state and shutdown are covered by unit tests and `test_market_data.rs`.
 
 Remaining:
 
 - [ ] **P1** Run a 50k–500k fills/s load test and record feed latency, queue depth and drop/GAP
-  behavior. The bounded `SyncSender` drops frames rather than blocking matching; operators need
-  to know when that happens.
-- [ ] **P1** Route the feed per symbol (see §2); the schema has `symbol_id`, but the engine still
-  has one book.
+  behavior. The bounded tokio `mpsc` queue drops frames rather than blocking matching; operators
+  need to know when that happens.
 - [ ] **P2** Fill `epoch` (leader generation) and `leader_id` instead of the current zeros; the
   header fields and leader watcher already exist.
 - [ ] **P2** Add a consumer SDK/reference decoder for the wire format; the encoder has golden
@@ -231,15 +234,18 @@ Current coverage:
   catches up from a live leader.
 - `test_late_join.rs`: a stale snapshot/WAL is superseded after a late rejoin.
 - `test_exactness.rs`: 18-fractional-digit values survive `/write`, `/read`, `/events`, the JSONL
-  feed, snapshot v7 and a restart.
+  feed, snapshot v9 and a restart.
 - `test_symbols.rs`: one-symbol config, over-precision rejection, cross-symbol rejection, the
   post-trade config lock and snapshot restart.
+- `test_fees.rs`: maker/taker fee rates, `/write`/`/events`/file-sink/feed fees and snapshot restart.
+- `test_fee_assets.rs`: ETF/fiat symbol metadata, tick/lot enforcement, quote-volume limit
+  normalization and quote-asset fee deduction.
 
 Remaining:
 
 - [ ] **P1** Randomized differential/property tests for matching invariants (see §5).
 - [x] Exactness across snapshot/restart/events/feed is covered by `test_exactness.rs`.
-- [ ] **P1** Per-symbol rejection tests once `SymbolConfig` is enforced (see §2).
+- [x] Per-symbol rejection, precision and lock tests are covered by `test_symbols.rs` (see §2).
 - [ ] **P1** Hostile-input tests for oversized `client_order_id`, oversized `/write` and `/events`
   payloads, malformed JSON and oversized snapshots (see §3).
 - [ ] **P1** End-to-end latency benchmark: submit → commit → apply → response, separated from
@@ -259,8 +265,10 @@ Remaining:
 - [x] Order-book micro-benchmarks: `cargo bench --bench matchengine` (wide/deep sweep, rest,
   rest with the market-data journal, partial fill, IOC cancel, iceberg refill, amend, cancel;
   best-of-5 per round).
-- [ ] **P1** Re-baseline every benchmark after the fixed-point and last-trade changes; record the
-  before/after numbers in `docs/DECIMAL.md`.
+- [ ] **P1** Port the current post-fee baseline into `docs/DECIMAL.md`. The 2026-10-29 run
+  measured: sweep 1k/100 levels 84.1µs, 20k/1 level 2.098ms, rest 43.2µs, rest+journal 46.6µs,
+  partial 57.2µs, IOC 110.6µs, iceberg 57.8µs, amend 79.3µs, cancel 91.8µs. Fee calculation adds
+  i256 per-fill work; decide whether a separate no-fee fast path is worth it.
 - [ ] **P1** Add end-to-end latency and throughput benchmarks (submit → commit → apply → response).
 - [ ] **P1** Load-test the market-data feed and record queue/drop behavior (see §6).
 - [ ] **P2** Consider per-level buckets or a compact resting record only if the post-`Fixed`
@@ -287,8 +295,8 @@ Done:
 - [x] `src/main.rs` is the only binary entry; `examples/sled.rs` is a dev-only playground and
   `sled` is a dev-dependency.
 - [x] The unused `match_engine.png` was removed and `logs/` is gitignored.
-- [x] README/README_CN, AGENTS, TODO, AERON and MATCH_RESULTS are synced with the WAL + snapshot
-  + gRPC design and snapshot v7 / wire v3.
+- [x] README/README_CN, AGENTS, TODO, AERON, MATCH_RESULTS, MARKET_DATA_PLAN and FEE_DEDUCTION are
+  synced with the WAL + snapshot + gRPC design and snapshot v9 / wire v5.
 - [x] `docs/DECIMAL.md` records the fixed-point research, BTC 18-decimal range analysis,
   microbenchmarks and the completed end-to-end migration.
 
@@ -296,11 +304,12 @@ Remaining:
 
 - [ ] **P2** Keep `AGENTS.md`, READMEs, `docs/DECIMAL.md` and this file in sync after future
   storage/wire changes.
+- [x] **P3** Rename `src/matchengine/` to `src/order_book/` (2026-10-29); the public module is
+  now `order_book`, while the package/binary name `matchengine-raft` is intentionally unchanged.
 - [ ] **P3** Decide whether to rename the remaining mixed-style modules before 1.0
-  (`src/matchengine/` → `matching_engine/`, `src/match_result/` → `match_events/`,
-  `src/network/raft.rs` → `http_raft.rs`, `raft_network_impl.rs` → `http_network.rs`). This is
-  import-breaking and offers no functional benefit today; the package/binary name
-  `matchengine-raft` is intentionally unchanged.
+  (`src/match_result/` → `match_events/`, `src/network/raft.rs` → `http_raft.rs`,
+  `raft_network_impl.rs` → `http_network.rs`). This is import-breaking and offers no functional
+  benefit today.
 
 ## 11. Decisions to record
 
@@ -308,61 +317,85 @@ These choices feed the priorities above; write them down as ADRs or doc notes wh
 
 - [x] `SymbolConfig` lives in replicated state as the single process/cluster symbol and locks
   after the first accepted order; precision changes are versioned by the Raft log/snapshot.
-- [x] Wire v3 representation: scale-18 `i128` mantissas; v2 consumers must upgrade and frames are
-  never silently reinterpreted.
+- [x] Wire v5 representation: scale-18 `i128` prices, quantities, quote volume and fees plus
+  volume units and fee assets; older consumers must upgrade and frames are never silently
+  reinterpreted.
 - [ ] External exposure model: TLS/mTLS, HTTP authentication, and whether the API is
   loopback/private-network only.
 - [ ] gRPC listener failure policy: fail-fast process exit vs degraded health state.
 - [x] Multi-symbol isolation: one process/cluster per symbol, never multiple books in one process.
 - [ ] Event time source for the clearing feed and per-instrument cursor retention.
 
-## 12. Maker and taker fees [P0]
+## 12. Maker and taker fees — done
 
-Goal: report the fee charged or rebated on every fill without teaching the matching engine about
-users, tiers or balances. The gateway resolves a user level to a maker/taker rate and places those
-rates on the order; the engine stores them in the replicated request and computes fees
+A process/cluster trades one symbol and never looks up users or balances. The gateway resolves a
+user level to maker/taker rates and places those rates on the order; the engine computes fees
 deterministically.
 
-Planned implementation:
+Done:
 
-- [ ] **P0** Add `maker_fee_rate` and `taker_fee_rate` to `Order` as signed `Fixed` fractions with
-  `serde(default)` zero. Recommended convention: `"0.001"` means 10 bps; a negative rate is a
-  rebate. Validate the accepted range (for example `-1..=1`) in `validate_order`.
-- [ ] **P0** The receiving gateway sets both rates from the user level when placing the order.
-  They travel in the Raft log and snapshot; the engine never looks up user information.
-- [ ] **P0** Compute one notional and two fees per fill:
-  - notional = maker price × matched quantity, through the `i256` path;
-  - taker fee = notional × `taker.taker_fee_rate`;
-  - maker fee = notional × `maker.maker_fee_rate`;
-  - positive = charge, negative = rebate. Document the rounding mode (recommended: truncate
-    toward zero at 18 places, then let settlement quantize to the quote asset's precision).
-- [ ] **P0** A taker pays its taker rate on the current fill. A resting maker pays/rebates its
-  maker rate when it is later filled. If a taker leaves a remainder that rests, its maker rate
-  applies to its future fills.
-- [ ] **P0** Add `notional`, `taker_fee` and `maker_fee` to `MatchResult`; add `taker_fee` and
-  `maker_fee` to `MatchEvent` and `StoredMatchEvent`. Preserve them through `/write`, `/events`
-  and `--match-event-log`; JSON emits decimal strings.
-- [ ] **P0** Decide whether the market-data clearing records also carry fees. If `TradeRecord`
-  and fill `LifecycleRecord` do, bump the feed wire format to **v4**; otherwise leave the feed
-  untouched.
-- [ ] **P0** Bump the snapshot to **v7** for the new order/event fields; older snapshots are
-  rejected and existing data directories must be recreated.
-- [ ] **P0** Preserve fee rates through amendments, iceberg refills, stop children and partial
-  fills. Fee fields belong to the order, not to the book or the user; a tier change requires
-  cancel/replace unless a later explicit rate-update request is added.
-- [ ] **P1** Define and test extreme-value behavior: notional or fee outside the supported
-  `i128` range should be rejected or reported explicitly, never silently charged as zero.
-- [ ] **P1** Tests: maker and taker rates simultaneously; negative maker rebate; 18-digit rates
-  and notional; partial fills; a taker that later rests; stop and iceberg children; duplicate
-  submission replay; `/events` and file-sink JSON; snapshot restart; wire v4 if the feed changes.
-- [ ] **P2** Update README/README_CN, AGENTS, MATCH_RESULTS, MARKET_DATA_PLAN, AERON and DECIMAL
-  with the fee convention, JSON shape and compatibility versions.
+- [x] `Order.maker_fee_rate` and `Order.taker_fee_rate` are signed `Fixed` fractions with
+  `serde(default)` zero. `"0.001"` means 10 bps; negative values are rebates. Rates are validated
+  to `-1..=1`.
+- [x] The gateway supplies both rates at placement; they travel in the Raft log, snapshot and
+  resting/amended/stop/iceberg order state.
+- [x] Per fill, notional = maker price × matched quantity through the `i256` path; taker fee =
+  notional × taker's taker rate; maker fee = notional × maker's maker rate. Fees truncate toward
+  zero at 18 places. Positive = charge, negative = rebate.
+- [x] A taker that later rests uses its maker rate on future fills. Amendments, iceberg refills and
+  stop children preserve the original order's rates.
+- [x] `MatchResult` carries `notional`, `taker_fee`, `maker_fee` and `fee_overflow`.
+  `MatchEvent`/`StoredMatchEvent` carry both fees and the flag.
+- [x] `/write` events, `/events`, the JSONL file sink and market-data `TRADE`/fill `LIFECYCLE`
+  records expose the fees and their assets. Wire is **v5**.
+- [x] Snapshot **v9** persists order rates, fee assets and event fees.
+- [x] Tests cover simultaneous maker/taker rates, negative maker rebates, rate validation, fee
+  overflow, 18-digit exactness, a taker that later rests, file/event/feed output and snapshot
+  restart.
 
-Decisions to settle before coding:
+Remaining (outside the matching engine):
 
-- Rate unit: signed `Fixed` fraction (recommended for consistency with prices/quantities) versus
-  integer bps/ppm.
-- Rounding mode and settlement precision; fee currency is assumed to be the quote asset.
-- Whether maker rebates are enabled by default and how negative fees are represented in reports.
-- Whether fees belong in the market-data feed or only in the clearing/event feed.
-- Validation range for rates and the handling of notional/fee overflow.
+- [ ] **P2** Define fee accounts/balances and settlement ownership in the clearing system. The
+  engine reports exact fees, their assets and the policy; clearing applies final asset rounding and
+  moves funds.
+- [ ] **P2** Decide whether fee tiers can change on a live order. Today a change requires
+  cancel/replace; amendments preserve the original rates.
+
+## 13. Base/quote volume and asset-aware fee deduction [done]
+
+Design: [`docs/FEE_DEDUCTION.md`](./docs/FEE_DEDUCTION.md).
+
+Done:
+
+- [x] `SymbolConfig` carries base/quote `AssetId`/`AssetClass`, per-asset settlement decimals,
+  `price_tick`, `base_lot` and `FeeAssetPolicy`.
+- [x] `Order.volume_unit` (`Base`/`Quote`) is replicated; quote limit orders normalize to base at
+  the limit price and zero-lot conversions are rejected.
+- [x] Quote-aware market sweeps: buy spends a gross quote budget; sell targets gross quote proceeds
+  and rounds the final base lot up, overshooting by at most one lot.
+- [x] Fee asset policies: received asset (default), quote asset and base asset. Events report the
+  actual fee asset per side.
+- [x] Gross base/quote volume, taker/maker fee assets and fees flow through `MatchResult`,
+  `MatchEvent`, `/events`, the file sink and the market-data feed.
+- [x] Tick/lot increments and per-asset precision are enforced on `Place` and `Amend`.
+- [x] Snapshot **v9** and market-data wire **v5** are implemented; old data directories must be
+  recreated.
+- [x] Tests cover QQQ/USD (ETF/fiat) tick/lot and quote volume in
+  `tests/cluster/test_fee_assets.rs`, plus quote fees, fee overflow, fee policies, the file sink,
+  `/events`, the feed and snapshot restart.
+
+Remaining extensions:
+
+- [ ] **P1** Define gateway responsibilities for equity/ETF sessions, holidays, auctions, T+1/T+2
+  settlement and corporate actions. The deterministic engine must not read a clock.
+- [ ] **P1** Decide whether fixed per-trade fees, per-share commissions, regulatory fees, minimum
+  tickets or taxes are in scope; notional-proportional rates do not cover them.
+- [ ] **P2** Add third-asset fee-token support only if a fee price and balance model are provided.
+- [ ] **P2** Decide whether mixed-unit iceberg/FOK orders should normalize tranches; quote volume
+  currently supports plain limit and market orders only.
+- [ ] **P2** Add a BTC/USDT (crypto/stablecoin) quote-volume case alongside the QQQ/USD test.
+
+Resolved decisions: quote limit sell rounds base quantity down to cap notional; quote market sell
+rounds up and permits a bounded overshoot; `volume` is always gross; the fee policy is per symbol;
+quote market-buy budgets are gross notional with quote fees charged additionally; the engine
+reports exact 18-scale fees and clearing applies final asset rounding.

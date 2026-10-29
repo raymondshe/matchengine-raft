@@ -1,16 +1,16 @@
-//! Market-data egress: a tap on `apply`, a shadow book and a publisher thread.
+//! Market-data egress: a tap on `apply`, a shadow book and a publisher task.
 //!
 //! This is the deterministic feed pipeline from `docs/MARKET_DATA_PLAN.md` and
-//! `docs/AERON_SOLUTION.md` Part II. The matching thread only records depth
-//! deltas it already knows ([`crate::matchengine::OrderBook::take_depth_journal`])
+//! `docs/AERON_SOLUTION.md` Part II. The matching path only records depth
+//! deltas it already knows ([`crate::order_book::OrderBook::take_depth_journal`])
 //! and hands them, with the entry's [`MatchEvent`]s, to a bounded channel. A
-//! dedicated thread owns the derived state and all encoding/IO:
+//! dedicated tokio task owns the derived state and all encoding/IO:
 //!
 //! ```text
 //! apply ──► MarketDataTap::publish (try_send, never blocks)
 //!                │
 //!                ▼
-//!        market-data thread
+//!        market-data task
 //!          shadow book · entry-driven batching · OHLC bars · wire encoding
 //!                │
 //!                ▼
@@ -37,22 +37,24 @@ use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
-use std::sync::mpsc::Receiver;
-use std::sync::mpsc::SyncSender;
-use std::sync::mpsc::TrySendError;
-use std::sync::mpsc::sync_channel;
-use std::thread::JoinHandle;
-use std::time::Duration;
+use tokio::sync::Notify;
+use tokio::sync::mpsc::Receiver;
+use tokio::sync::mpsc::Sender;
+use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::watch;
+use tokio::task::JoinHandle;
 
 use serde::Serialize;
 
 use crate::match_result::MatchEvent;
 use crate::match_result::MatchEventKind;
-use crate::matchengine::DepthChange;
-use crate::matchengine::DepthLevel;
-use crate::matchengine::Fixed;
-use crate::matchengine::OrderSide;
-use crate::matchengine::RejectReason;
+use crate::order_book::DepthChange;
+use crate::order_book::DepthLevel;
+use crate::order_book::FeeAsset;
+use crate::order_book::Fixed;
+use crate::order_book::OrderSide;
+use crate::order_book::RejectReason;
+use crate::order_book::VolumeUnit;
 
 pub mod wire;
 
@@ -232,6 +234,18 @@ pub struct TradeRecord {
     pub price: Fixed,
     /// Executed volume, scale 18.
     pub volume: Fixed,
+    /// Gross quote notional, scale 18.
+    pub quote_volume: Fixed,
+    /// Taker fee for this fill; positive = charge, negative = rebate.
+    pub taker_fee: Fixed,
+    /// Asset of `taker_fee`.
+    pub taker_fee_asset: Option<FeeAsset>,
+    /// Maker fee for this fill; positive = charge, negative = rebate.
+    pub maker_fee: Fixed,
+    /// Asset of `maker_fee`.
+    pub maker_fee_asset: Option<FeeAsset>,
+    /// True when the fee calculation overflowed the supported range.
+    pub fee_overflow: bool,
     /// Taker side (the maker's side is the opposite).
     pub taker_side: OrderSide,
     /// Taker order sequence.
@@ -298,6 +312,20 @@ pub struct LifecycleRecord {
     pub price: Fixed,
     /// Volume associated with the event, scale 18.
     pub volume: Fixed,
+    /// Gross quote notional for a fill; zero otherwise.
+    pub quote_volume: Fixed,
+    /// Unit of `volume`.
+    pub volume_unit: VolumeUnit,
+    /// Taker fee for a fill; zero for non-fill events.
+    pub taker_fee: Fixed,
+    /// Asset of `taker_fee`, when applicable.
+    pub taker_fee_asset: Option<FeeAsset>,
+    /// Maker fee for a fill; zero for non-fill events.
+    pub maker_fee: Fixed,
+    /// Asset of `maker_fee`, when applicable.
+    pub maker_fee_asset: Option<FeeAsset>,
+    /// True when a fill's fee calculation overflowed.
+    pub fee_overflow: bool,
     /// Rejection/expiry reason when present.
     pub reason: Option<RejectReason>,
 }
@@ -407,7 +435,7 @@ pub enum MessageBody {
     Bar(BarRecord),
 }
 
-/// A frame handed from `apply` to the market-data thread.
+/// A frame handed from `apply` to the market-data task.
 #[derive(Debug, Clone)]
 pub struct TapFrame {
     /// Raft log index of the entry.
@@ -450,7 +478,7 @@ pub struct SnapshotFrame {
     pub pending_stops: u32,
 }
 
-/// Messages consumed by the market-data thread.
+/// Messages consumed by the market-data task.
 #[derive(Debug)]
 pub enum Ingest {
     /// One applied entry.
@@ -562,13 +590,13 @@ pub struct TapChannels {
     pub enabled: Arc<AtomicBool>,
 }
 
-/// The matching thread's handle on the feed.
+/// The matching path's handle on the feed.
 ///
 /// `publish` is a `try_send`: it never blocks and never fails `apply`. The tap
 /// is cheap to clone; every clone feeds the same queue.
 #[derive(Clone)]
 pub struct MarketDataTap {
-    sender: SyncSender<Ingest>,
+    sender: Sender<Ingest>,
     stats: Arc<MarketDataStats>,
     dropped: Arc<AtomicU64>,
     gap_pending: Arc<AtomicBool>,
@@ -586,7 +614,7 @@ impl fmt::Debug for MarketDataTap {
 impl MarketDataTap {
     /// Creates a tap and the receiving side of its bounded queue.
     pub fn channel(capacity: usize) -> (Self, TapChannels) {
-        let (sender, receiver) = sync_channel(capacity.max(1));
+        let (sender, receiver) = tokio::sync::mpsc::channel(capacity.max(1));
         let stats = Arc::new(MarketDataStats::default());
         let dropped = Arc::new(AtomicU64::new(0));
         let gap_pending = Arc::new(AtomicBool::new(false));
@@ -621,7 +649,7 @@ impl MarketDataTap {
         self.stats.frames.fetch_add(1, Ordering::Relaxed);
         match self.sender.try_send(Ingest::Frame(frame)) {
             Ok(()) => {}
-            Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
+            Err(TrySendError::Full(_)) | Err(TrySendError::Closed(_)) => {
                 self.dropped.fetch_add(1, Ordering::Relaxed);
                 self.gap_pending.store(true, Ordering::Relaxed);
                 self.stats.dropped_frames.fetch_add(1, Ordering::Relaxed);
@@ -647,6 +675,7 @@ pub struct MarketDataControl {
     leader_only: bool,
     resetting: Arc<AtomicBool>,
     pending: Arc<Mutex<Option<SnapshotFrame>>>,
+    wake: Arc<Notify>,
 }
 
 impl MarketDataControl {
@@ -656,12 +685,14 @@ impl MarketDataControl {
         leader_only: bool,
         resetting: Arc<AtomicBool>,
         pending: Arc<Mutex<Option<SnapshotFrame>>>,
+        wake: Arc<Notify>,
     ) -> Self {
         Self {
             leader,
             leader_only,
             resetting,
             pending,
+            wake,
         }
     }
 
@@ -697,6 +728,7 @@ impl MarketDataControl {
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = Some(snapshot);
         self.resetting.store(true, Ordering::Relaxed);
+        self.wake.notify_one();
     }
 
     /// Takes the pending reset snapshot, if any (tests).
@@ -709,14 +741,15 @@ impl MarketDataControl {
     }
 }
 
-/// Owns the processor thread; created by [`crate::build_match_engine_node`].
+/// Owns the processor task; created by [`crate::build_match_engine_node`].
 pub struct MarketDataHandle {
     tap: MarketDataTap,
     leader: Arc<AtomicBool>,
     leader_only: bool,
     resetting: Arc<AtomicBool>,
     pending: Arc<Mutex<Option<SnapshotFrame>>>,
-    stop: Arc<AtomicBool>,
+    wake: Arc<Notify>,
+    stop: watch::Sender<bool>,
     join: Option<JoinHandle<()>>,
 }
 
@@ -727,8 +760,8 @@ impl fmt::Debug for MarketDataHandle {
 }
 
 impl MarketDataHandle {
-    /// Starts the processor thread with the configured sink.
-    pub fn start(config: MarketDataConfig, node_id: u64) -> io::Result<Self> {
+    /// Starts the tokio processor task with the configured sink.
+    pub async fn start(config: MarketDataConfig, node_id: u64) -> io::Result<Self> {
         let sink: Box<dyn MarketDataSink> = match &config.log_path {
             Some(path) => Box::new(JsonlSink::open(path, node_id)?),
             None => Box::new(NullSink),
@@ -742,7 +775,8 @@ impl MarketDataHandle {
         let leader = channels.enabled.clone();
         let resetting = Arc::new(AtomicBool::new(true));
         let pending = Arc::new(Mutex::new(None));
-        let stop = Arc::new(AtomicBool::new(false));
+        let wake = Arc::new(Notify::new());
+        let (stop, stop_rx) = watch::channel(false);
 
         let mut processor = MarketDataProcessor::new(
             config,
@@ -754,10 +788,12 @@ impl MarketDataHandle {
             channels.dropped,
             channels.gap_pending,
         );
-        let processor_stop = stop.clone();
-        let join = std::thread::Builder::new()
-            .name("market-data".to_string())
-            .spawn(move || processor.run(channels.receiver, processor_stop))?;
+        let processor_wake = wake.clone();
+        let join = tokio::spawn(async move {
+            processor
+                .run(channels.receiver, stop_rx, processor_wake)
+                .await;
+        });
 
         Ok(Self {
             tap,
@@ -765,6 +801,7 @@ impl MarketDataHandle {
             leader_only,
             resetting,
             pending,
+            wake,
             stop,
             join: Some(join),
         })
@@ -782,6 +819,7 @@ impl MarketDataHandle {
             self.leader_only,
             self.resetting.clone(),
             self.pending.clone(),
+            self.wake.clone(),
         )
     }
 
@@ -795,11 +833,11 @@ impl MarketDataHandle {
         self.control().push_snapshot(snapshot);
     }
 
-    /// Stops and joins the processor thread. Safe to call once.
-    pub fn shutdown(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
+    /// Stops and awaits the processor task. Safe to call once.
+    pub async fn shutdown(&mut self) {
+        let _ = self.stop.send(true);
         if let Some(join) = self.join.take() {
-            let _ = join.join();
+            let _ = join.await;
         }
     }
 }
@@ -1024,15 +1062,30 @@ impl MarketDataProcessor {
     }
 
     /// Runs the processor loop until `stop` is set.
-    fn run(&mut self, receiver: Receiver<Ingest>, stop: Arc<AtomicBool>) {
-        while !stop.load(Ordering::Relaxed) {
+    async fn run(
+        &mut self,
+        mut receiver: Receiver<Ingest>,
+        mut stop: watch::Receiver<bool>,
+        wake: Arc<Notify>,
+    ) {
+        loop {
+            if *stop.borrow() {
+                break;
+            }
             if let Some(snapshot) = self.take_pending() {
                 self.apply_snapshot(snapshot);
             }
-            match receiver.recv_timeout(Duration::from_millis(5)) {
-                Ok(Ingest::Frame(frame)) => self.ingest(frame),
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            tokio::select! {
+                message = receiver.recv() => match message {
+                    Some(Ingest::Frame(frame)) => self.ingest(frame),
+                    None => break,
+                },
+                _ = wake.notified() => {}
+                changed = stop.changed() => {
+                    if changed.is_err() || *stop.borrow() {
+                        break;
+                    }
+                }
             }
         }
     }
@@ -1198,9 +1251,15 @@ impl MarketDataProcessor {
                 ts_ms: frame.ts_ms,
                 price: event.price,
                 volume: event.volume,
+                quote_volume: event.quote_volume,
                 taker_side: event.side,
                 taker_sequence: event.order_sequence,
                 maker_sequence,
+                taker_fee: event.taker_fee,
+                taker_fee_asset: event.taker_fee_asset,
+                maker_fee: event.maker_fee,
+                maker_fee_asset: event.maker_fee_asset,
+                fee_overflow: event.fee_overflow,
             });
         }
 
@@ -1284,6 +1343,13 @@ impl MarketDataProcessor {
                     counterparty_sequence: event.counterparty_sequence,
                     price: event.price,
                     volume: event.volume,
+                    quote_volume: event.quote_volume,
+                    volume_unit: event.volume_unit,
+                    taker_fee: event.taker_fee,
+                    taker_fee_asset: event.taker_fee_asset,
+                    maker_fee: event.maker_fee,
+                    maker_fee_asset: event.maker_fee_asset,
+                    fee_overflow: event.fee_overflow,
                     reason: event.reason,
                 })
                 .collect();
@@ -1536,9 +1602,9 @@ impl MarketDataProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::matchengine::MatchResult;
-    use crate::matchengine::Order;
-    use crate::matchengine::fixed::SCALE;
+    use crate::order_book::MatchResult;
+    use crate::order_book::Order;
+    use crate::order_book::fixed::SCALE;
 
     #[derive(Clone, Default)]
     struct CollectSink(Arc<Mutex<Vec<MarketMessage>>>);

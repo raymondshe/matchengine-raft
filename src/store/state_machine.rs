@@ -48,12 +48,12 @@ use crate::match_result::MatchEvent;
 use crate::match_result::MatchEventKind;
 use crate::match_result::MatchResultSink;
 use crate::match_result::NoopSink;
-use crate::matchengine::Fixed;
-use crate::matchengine::Order;
-use crate::matchengine::OrderBook;
-use crate::matchengine::OrderSide;
-use crate::matchengine::RejectReason;
-use crate::matchengine::SymbolConfig;
+use crate::order_book::Fixed;
+use crate::order_book::Order;
+use crate::order_book::OrderBook;
+use crate::order_book::OrderSide;
+use crate::order_book::RejectReason;
+use crate::order_book::SymbolConfig;
 use crate::store::config::sync_dir;
 use crate::store::types::MatchEngineRequest;
 use crate::store::types::MatchEngineResponse;
@@ -70,9 +70,11 @@ const SNAPSHOT_MAGIC: &[u8; 7] = b"MRFSNAP";
 /// retained match-event window and the client-order-id dedupe map. Version 5 stores
 /// order prices and quantities as 18-scale fixed-point integers. Version 6 stores the
 /// last trade price and match events as fixed-point values. Version 7 adds the replicated
-/// single-symbol precision configuration. Postcard is not self-describing, so an older file is
+/// single-symbol precision configuration; version 8 adds maker/taker fee rates to orders and fee
+/// fields to stored match events; version 9 adds base/quote asset metadata, tick/lot rules, volume
+/// units, fee assets and gross quote notional. Postcard is not self-describing, so an older file is
 /// rejected with an explicit error instead of being decoded into a different shape.
-const SNAPSHOT_VERSION: u32 = 7;
+const SNAPSHOT_VERSION: u32 = 9;
 /// `magic + version + crc32 of the body`.
 const SNAPSHOT_HEADER_LEN: usize = SNAPSHOT_MAGIC.len() + 4 + 4;
 
@@ -119,6 +121,13 @@ pub struct StoredMatchEvent {
     pub previous_sequence: Option<u64>,
     pub price: Fixed,
     pub volume: Fixed,
+    pub quote_volume: Fixed,
+    pub volume_unit: crate::order_book::VolumeUnit,
+    pub taker_fee: Fixed,
+    pub taker_fee_asset: Option<crate::order_book::FeeAsset>,
+    pub maker_fee: Fixed,
+    pub maker_fee_asset: Option<crate::order_book::FeeAsset>,
+    pub fee_overflow: bool,
     pub reason: Option<RejectReason>,
 }
 
@@ -133,6 +142,13 @@ impl From<MatchEvent> for StoredMatchEvent {
             previous_sequence: event.previous_sequence,
             price: event.price,
             volume: event.volume,
+            quote_volume: event.quote_volume,
+            volume_unit: event.volume_unit,
+            taker_fee: event.taker_fee,
+            taker_fee_asset: event.taker_fee_asset,
+            maker_fee: event.maker_fee,
+            maker_fee_asset: event.maker_fee_asset,
+            fee_overflow: event.fee_overflow,
             reason: event.reason,
         }
     }
@@ -149,6 +165,13 @@ impl From<StoredMatchEvent> for MatchEvent {
             previous_sequence: event.previous_sequence,
             price: event.price,
             volume: event.volume,
+            quote_volume: event.quote_volume,
+            volume_unit: event.volume_unit,
+            taker_fee: event.taker_fee,
+            taker_fee_asset: event.taker_fee_asset,
+            maker_fee: event.maker_fee,
+            maker_fee_asset: event.maker_fee_asset,
+            fee_overflow: event.fee_overflow,
             reason: event.reason,
         }
     }
@@ -450,7 +473,7 @@ impl<C: RaftTypeConfig> StateMachineStoreInner<C> {
 
     /// The one symbol this process/cluster trades.
     pub fn symbol_config(&self) -> SymbolConfig {
-        self.symbol_config
+        self.symbol_config.clone()
     }
 
     /// Adds or updates this process/cluster's symbol and precision configuration.
@@ -462,7 +485,7 @@ impl<C: RaftTypeConfig> StateMachineStoreInner<C> {
     pub fn configure_symbol(&mut self, config: SymbolConfig) -> Result<(), String> {
         let config = config
             .validate()
-            .map_err(|_| "price_decimals and quantity_decimals must be 0..=18".to_string())?;
+            .map_err(|_| "invalid symbol precision, tick or lot".to_string())?;
         if self.symbol_locked {
             return Err("symbol configuration is locked after trading starts".to_string());
         }
@@ -485,7 +508,7 @@ impl<C: RaftTypeConfig> StateMachineStoreInner<C> {
         if order.symbol_id != self.symbol_config.symbol_id {
             return Err(RejectReason::UnsupportedOrder);
         }
-        Ok(self.symbol_config)
+        Ok(self.symbol_config.clone())
     }
 
     /// Validates the replacement values of an amendment at the configured
@@ -498,9 +521,14 @@ impl<C: RaftTypeConfig> StateMachineStoreInner<C> {
         volume: Option<Fixed>,
     ) -> Result<SymbolConfig, RejectReason> {
         let config = self.configured_symbol_for(order)?;
-        let price_ok = price.is_none_or(|value| value.has_at_most_decimals(config.price_decimals));
-        let volume_ok =
-            volume.is_none_or(|value| value.has_at_most_decimals(config.quantity_decimals));
+        let price_ok = price.is_none_or(|value| {
+            value.has_at_most_decimals(config.price_decimals)
+                && value.is_multiple_of(config.price_tick)
+        });
+        let volume_ok = volume.is_none_or(|value| {
+            value.has_at_most_decimals(config.base_asset.decimals)
+                && value.is_multiple_of(config.base_lot)
+        });
         if price_ok && volume_ok {
             Ok(config)
         } else {
@@ -515,7 +543,7 @@ impl<C: RaftTypeConfig> StateMachineStoreInner<C> {
             sequence: self.orderbook.sequence,
             stops: self.orderbook.stops.clone(),
             last_trade_price: self.orderbook.last_trade_price,
-            symbol_config: self.symbol_config,
+            symbol_config: self.symbol_config.clone(),
             symbol_locked: self.symbol_locked,
             events: self
                 .events
@@ -1112,7 +1140,7 @@ where
                         MatchEngineResponse::applied(market_seq, &events)
                     }
                     MatchEngineRequest::ConfigureSymbol { config } => {
-                        match self.configure_symbol_locked(&mut inner, *config) {
+                        match self.configure_symbol_locked(&mut inner, config.clone()) {
                             Ok(()) => MatchEngineResponse::new(format!(
                                 "symbol {} configured",
                                 config.symbol_id
@@ -1331,15 +1359,14 @@ mod tests {
 
     #[test]
     fn symbol_config_controls_precision_and_rejects_other_symbols() {
-        use crate::matchengine::SymbolConfig;
+        use crate::order_book::SymbolConfig;
 
         let mut inner = StateMachineStoreInner::<MatchEngineTypeConfig>::default();
         assert!(
             inner
                 .configure_symbol(SymbolConfig {
-                    symbol_id: 0,
                     price_decimals: 19,
-                    quantity_decimals: 2,
+                    ..SymbolConfig::default()
                 })
                 .is_err(),
             "more than 18 decimals is invalid"
@@ -1349,7 +1376,7 @@ mod tests {
             .unwrap();
 
         let mut too_precise = Order::new(
-            crate::matchengine::OrderSide::Buy,
+            crate::order_book::OrderSide::Buy,
             "100.255".parse::<Fixed>().unwrap(),
             "1.5".parse::<Fixed>().unwrap(),
             0,
@@ -1360,7 +1387,7 @@ mod tests {
         assert_eq!(Some(RejectReason::InvalidOrder), outcome.rejected);
 
         let mut valid = Order::new(
-            crate::matchengine::OrderSide::Buy,
+            crate::order_book::OrderSide::Buy,
             "100.25".parse::<Fixed>().unwrap(),
             "1.5".parse::<Fixed>().unwrap(),
             0,
@@ -1380,7 +1407,7 @@ mod tests {
 
         // A process configured for symbol 0 rejects an order routed to symbol 1.
         let mut other = Order::new(
-            crate::matchengine::OrderSide::Buy,
+            crate::order_book::OrderSide::Buy,
             "100.25".parse::<Fixed>().unwrap(),
             "1.5".parse::<Fixed>().unwrap(),
             0,
@@ -1397,7 +1424,7 @@ mod tests {
             .configure_symbol(SymbolConfig::new(7, 2, 2).unwrap())
             .unwrap();
         let mut symbol_seven = Order::new(
-            crate::matchengine::OrderSide::Buy,
+            crate::order_book::OrderSide::Buy,
             "100.25".parse::<Fixed>().unwrap(),
             "1.5".parse::<Fixed>().unwrap(),
             0,
@@ -1412,7 +1439,7 @@ mod tests {
 
     #[tokio::test]
     async fn symbol_configuration_resets_a_publishing_feed() {
-        use crate::matchengine::SymbolConfig;
+        use crate::order_book::SymbolConfig;
         use std::sync::atomic::AtomicBool;
 
         let dir = tempdir();
@@ -1420,7 +1447,13 @@ mod tests {
         let leader = Arc::new(AtomicBool::new(true));
         let resetting = Arc::new(AtomicBool::new(false));
         let pending = Arc::new(std::sync::Mutex::new(None));
-        let control = MarketDataControl::new(leader, true, resetting, pending);
+        let control = MarketDataControl::new(
+            leader,
+            true,
+            resetting,
+            pending,
+            Arc::new(tokio::sync::Notify::new()),
+        );
         store.set_market_data_control(control.clone(), 5);
 
         let mut inner = store.inner().lock().await;
@@ -1433,7 +1466,7 @@ mod tests {
 
     #[tokio::test]
     async fn market_data_snapshot_uses_configured_symbol() {
-        use crate::matchengine::SymbolConfig;
+        use crate::order_book::SymbolConfig;
 
         let dir = tempdir();
         let store = StateMachineStore::<MatchEngineTypeConfig>::open(dir.path()).unwrap();
@@ -1455,7 +1488,7 @@ mod tests {
         {
             let mut inner = store.inner().lock().await;
             inner.orderbook.place_order(&mut Order::new(
-                crate::matchengine::OrderSide::Buy,
+                crate::order_book::OrderSide::Buy,
                 10.0,
                 2.0,
                 0,
@@ -1485,8 +1518,8 @@ mod tests {
     async fn apply_publishes_rests_fills_and_cancels_to_the_sink() {
         use crate::match_result::MatchEventKind;
         use crate::match_result::MemorySink;
-        use crate::matchengine::Order;
-        use crate::matchengine::OrderSide;
+        use crate::order_book::Order;
+        use crate::order_book::OrderSide;
         use openraft::alias::EntryOf;
         use openraft::alias::EntryPayloadOf;
 
@@ -1595,8 +1628,8 @@ mod tests {
     #[tokio::test]
     async fn sink_failure_does_not_fail_apply() {
         use crate::match_result::MatchResultSink;
-        use crate::matchengine::Order;
-        use crate::matchengine::OrderSide;
+        use crate::order_book::Order;
+        use crate::order_book::OrderSide;
         use openraft::alias::EntryOf;
 
         #[derive(Debug)]
@@ -1643,10 +1676,10 @@ mod tests {
     async fn apply_publishes_ioc_stop_and_expiry_events() {
         use crate::match_result::MatchEventKind;
         use crate::match_result::MemorySink;
-        use crate::matchengine::Order;
-        use crate::matchengine::OrderSide;
-        use crate::matchengine::OrderType;
-        use crate::matchengine::TimeInForce;
+        use crate::order_book::Order;
+        use crate::order_book::OrderSide;
+        use crate::order_book::OrderType;
+        use crate::order_book::TimeInForce;
         use openraft::alias::EntryOf;
 
         fn entry(
@@ -1787,9 +1820,9 @@ mod tests {
     async fn apply_publishes_amended_and_rejected_events() {
         use crate::match_result::MatchEventKind;
         use crate::match_result::MemorySink;
-        use crate::matchengine::Order;
-        use crate::matchengine::OrderSide;
-        use crate::matchengine::RejectReason;
+        use crate::order_book::Order;
+        use crate::order_book::OrderSide;
+        use crate::order_book::RejectReason;
         use openraft::alias::EntryOf;
 
         fn entry(
@@ -1878,8 +1911,8 @@ mod tests {
         use crate::market_data::MarketDataTap;
         use crate::match_result::MatchEventKind;
         use crate::match_result::NoopSink;
-        use crate::matchengine::Order;
-        use crate::matchengine::OrderSide;
+        use crate::order_book::Order;
+        use crate::order_book::OrderSide;
         use openraft::alias::EntryOf;
 
         fn entry(
@@ -1893,16 +1926,16 @@ mod tests {
         }
 
         async fn next_frame(
-            receiver: &std::sync::mpsc::Receiver<Ingest>,
+            receiver: &mut tokio::sync::mpsc::Receiver<Ingest>,
         ) -> crate::market_data::TapFrame {
-            match receiver.recv_timeout(std::time::Duration::from_secs(2)) {
-                Ok(Ingest::Frame(frame)) => frame,
+            match receiver.recv().await {
+                Some(Ingest::Frame(frame)) => frame,
                 other => panic!("expected a frame, got {other:?}"),
             }
         }
 
         let dir = tempdir();
-        let (tap, channels) = MarketDataTap::channel(16);
+        let (tap, mut channels) = MarketDataTap::channel(16);
         let mut store = StateMachineStore::<MatchEngineTypeConfig>::open_with_sinks(
             dir.path(),
             Arc::new(NoopSink),
@@ -1918,7 +1951,7 @@ mod tests {
         ))]);
         store.apply(entries).await.unwrap();
 
-        let frame = next_frame(&channels.receiver).await;
+        let frame = next_frame(&mut channels.receiver).await;
         assert_eq!(1, frame.log_index);
         assert_eq!(0, frame.market_seq, "the bid's order sequence");
         assert_eq!(1_234, frame.ts_ms);
@@ -1938,7 +1971,7 @@ mod tests {
         ))]);
         store.apply(entries).await.unwrap();
 
-        let frame = next_frame(&channels.receiver).await;
+        let frame = next_frame(&mut channels.receiver).await;
         assert_eq!(2, frame.log_index);
         assert_eq!(1, frame.market_seq, "the ask's order sequence");
         assert_eq!(2_000, frame.ts_ms);
@@ -1985,12 +2018,11 @@ mod tests {
         use crate::market_data::MarketDataControl;
         use crate::market_data::MarketDataTap;
         use crate::match_result::NoopSink;
-        use crate::matchengine::Order;
-        use crate::matchengine::OrderSide;
+        use crate::order_book::Order;
+        use crate::order_book::OrderSide;
         use openraft::alias::EntryOf;
         use std::sync::Mutex;
         use std::sync::atomic::Ordering;
-        use std::time::Duration;
 
         fn entry(
             index: u64,
@@ -2003,7 +2035,7 @@ mod tests {
         }
 
         let dir = tempdir();
-        let (tap, channels) = MarketDataTap::channel(16);
+        let (tap, mut channels) = MarketDataTap::channel(16);
         // A follower: the tap gate is closed, so this entry never queues a frame.
         channels.enabled.store(false, Ordering::Relaxed);
         let mut store = StateMachineStore::<MatchEngineTypeConfig>::open_with_sinks(
@@ -2026,6 +2058,7 @@ mod tests {
             true,
             Arc::new(std::sync::atomic::AtomicBool::new(true)),
             Arc::new(Mutex::new(None)),
+            Arc::new(tokio::sync::Notify::new()),
         );
         store.start_market_data_feed(&control, 5).await;
         assert!(channels.enabled.load(Ordering::Relaxed), "gate opened");
@@ -2047,11 +2080,7 @@ mod tests {
         ))]);
         store.apply(entries).await.unwrap();
 
-        match channels
-            .receiver
-            .recv_timeout(Duration::from_secs(1))
-            .expect("post-snapshot frame")
-        {
+        match channels.receiver.recv().await.expect("post-snapshot frame") {
             Ingest::Frame(frame) => {
                 assert_eq!(2, frame.log_index);
                 assert_eq!(1, frame.market_seq);
@@ -2065,9 +2094,9 @@ mod tests {
     async fn cancel_and_amend_consume_sequences_and_purge_due_gtd() {
         use crate::match_result::MatchEventKind;
         use crate::match_result::MemorySink;
-        use crate::matchengine::Order;
-        use crate::matchengine::OrderSide;
-        use crate::matchengine::TimeInForce;
+        use crate::order_book::Order;
+        use crate::order_book::OrderSide;
+        use crate::order_book::TimeInForce;
         use openraft::alias::EntryOf;
 
         fn entry(
@@ -2156,8 +2185,8 @@ mod tests {
     async fn event_log_retains_pages_and_dedupes_submissions() {
         use crate::match_result::MatchEventKind;
         use crate::match_result::MemorySink;
-        use crate::matchengine::Order;
-        use crate::matchengine::OrderSide;
+        use crate::order_book::Order;
+        use crate::order_book::OrderSide;
         use openraft::alias::EntryOf;
 
         fn entry(
@@ -2265,8 +2294,8 @@ mod tests {
     #[tokio::test]
     async fn event_log_and_dedupe_survive_a_snapshot() {
         use crate::match_result::NoopSink;
-        use crate::matchengine::Order;
-        use crate::matchengine::OrderSide;
+        use crate::order_book::Order;
+        use crate::order_book::OrderSide;
         use openraft::alias::EntryOf;
 
         fn entry(

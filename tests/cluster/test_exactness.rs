@@ -16,10 +16,10 @@ use matchengine_raft::client::MatchEngineClient;
 use matchengine_raft::default_raft_config;
 use matchengine_raft::market_data::MarketDataConfig;
 use matchengine_raft::match_result::MatchEventKind;
-use matchengine_raft::matchengine::Fixed;
-use matchengine_raft::matchengine::Order;
-use matchengine_raft::matchengine::OrderSide;
 use matchengine_raft::network::api::EventsRequest;
+use matchengine_raft::order_book::Fixed;
+use matchengine_raft::order_book::Order;
+use matchengine_raft::order_book::OrderSide;
 use matchengine_raft::store::MatchEngineRequest;
 use openraft::type_config::TypeConfigExt;
 
@@ -158,7 +158,7 @@ fn exact_18_decimal_values_survive_api_events_feed_and_snapshot_restart() {
         assert_eq!("1.000000000000000002", bbo["ask_volume"]);
         assert_eq!("100.000000000000000001", bbo["last_trade"]);
 
-        // Write a snapshot and prove it is the fixed-point v7 format before
+        // Write a snapshot and prove it is the fixed-point v9 format before
         // restarting from it.
         let snapshot_meta = node.state_machine.persist_snapshot().await.unwrap();
         assert!(snapshot_meta.last_log_id.is_some());
@@ -166,9 +166,9 @@ fn exact_18_decimal_values_survive_api_events_feed_and_snapshot_restart() {
         let bytes = std::fs::read(&snapshot_path).unwrap();
         assert_eq!(b"MRFSNAP", &bytes[..7]);
         assert_eq!(
-            7,
+            9,
             u32::from_le_bytes(bytes[7..11].try_into().unwrap()),
-            "snapshot must be v7"
+            "snapshot must be v9"
         );
 
         node.shutdown().await.unwrap();

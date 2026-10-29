@@ -4,7 +4,7 @@ Status: **investigation and design only.** No Aeron code exists in this repo, no
 benchmarked, and no dependency was added. Part I (sections 1–10) assesses Aeron as the Raft
 transport and says not yet. Part II (sections 11–26) designs the market-data egress path — trades,
 spot/top-of-book, market depth and lifecycle events published to downstream subscribers — with all
-derivation, encoding and IO decoupled from the matching thread, and recommends Aeron there. Both parts record what was verified, what the integration would look like,
+derivation, encoding and IO decoupled from the matching path, and recommends Aeron there. Both parts record what was verified, what the integration would look like,
 and what should happen before anyone commits to it.
 
 Date: 2026-10-27 · Baseline: `openraft` 0.10.0-alpha.37, gRPC/tonic transport (HTTP/JSON remains
@@ -518,13 +518,13 @@ Aeron's design point:
    no broker process in the hot path.
 2. **Generation can be fully decoupled from matching.** `apply` already computes every fill and
    lifecycle event, and every book mutation already knows the level and volume it changes. The
-   matching thread therefore only appends those already-known values to a preallocated journal —
-   no book scans, no aggregation, no serialization, no IO. A separate market-data thread owns the
+   matching path therefore only appends those already-known values to a preallocated journal —
+   no book scans, no aggregation, no serialization, no IO. A separate market-data task owns the
    derived state (shadow level book, BBO, snapshots), does all encoding, and talks to Aeron. With
    the feed disabled the tap is one predictable branch, so matching cost is unchanged; that
    isolation is a hard requirement of the design, not an optimization (§13, §14).
 3. **Back-pressure is isolatable.** A slow subscriber must never stall `apply`; the queue plus a
-   dedicated publisher thread enforces that, matching the existing rule that a sink failure never
+   dedicated publisher task enforces that, matching the existing rule that a sink failure never
    fails `apply`.
 4. **Loss is recoverable.** Aeron does not store-and-forward (§3.2), so the design pairs the feed
    with periodic snapshots, gap markers and an optional Archive — and the Raft log remains the
@@ -585,10 +585,10 @@ stops are not depth either; they appear only as `LIFECYCLE` events (`triggered`)
    byte-diff test (§22) is the guard.
 2. **`apply` holds the state-machine lock, so the feed must not extend that critical section.**
    `publish_match_events` runs inside `apply` under `inner.lock().await`, and Aeron `offer` can
-   back-pressure, block on the client conductor or return retryable errors. The matching thread
+   back-pressure, block on the client conductor or return retryable errors. The matching path
    therefore does no derivation at all: it hands over the event batch and a small depth journal
    through a preallocated bounded ring (`try_push`, never blocking, never awaiting). The
-   market-data thread does everything else. A feed failure is logged and never fails `apply`.
+   market-data task does everything else. A feed failure is logged and never fails `apply`.
 3. **Every replica applies; the leader publishes.** The identity is frame-derived
    `(symbol_id, stream_id, market_seq, sub_seq)` (§16.1), so it is identical on every replica and
    across a leader change; the brief dual-publisher window during a handover is harmless under
@@ -599,11 +599,11 @@ stops are not depth either; they appear only as `LIFECYCLE` events (`triggered`)
 5. **Reading the live book from the feed path would tax matching.** `bids`/`asks` are per-order
    maps (`BTreeMap<(price, sequence), Order>`) with no aggregated level index, so a level total or
    a top-N snapshot requires tree scans. The design never does that inside `apply`: the market-data
-   thread keeps **shadow level books** (one per instrument) fed by the tap's journal, and a seeder
+   task keeps **shadow level books** (one per instrument) fed by the tap's journal, and a seeder
    task captures the
    real book only at startup, on leadership gain and (optionally) for reconciliation. The per-price
    bucket index in `TODO.md` §9 stays a matching-side optimization; the feed does not depend on it.
-6. **Prices and quantities are scale-18 integers.** Wire v3 encodes every financial value as a
+6. **Prices, quantities and fees are scale-18 integers.** Wire v5 encodes every financial value as a
    little-endian `i128` at 18 fractional digits; no public financial output crosses `f64`.
 7. **One process/cluster per symbol.** A process trades exactly one symbol; multi-symbol means
    running a separate process/cluster per symbol so CPU, memory, logs, snapshots and failures stay
@@ -619,7 +619,7 @@ stops are not depth either; they appear only as `LIFECYCLE` events (`triggered`)
 ## 14. Architecture
 
 ```
-                     matching thread (state-machine lock held)
+                     matching path (state-machine lock held)
 ┌──────────────────────────────────────────────────────────────────────────┐
 │ StateMachineStore::apply                                                 │
 │   MatchEvent batch ──────────────► MatchResultSink ──► JSONL/…  [as is]  │
@@ -629,7 +629,7 @@ stops are not depth either; they appear only as `LIFECYCLE` events (`triggered`)
 └──────────────────────────────────┼───────────────────────────────────────┘
                                    │ lock-free ring
 ┌──────────────────────────────────▼───────────────────────────────────────┐
-│ market-data thread (owns every !Send rusteron handle; takes no locks)    │
+│ market-data task (owns every !Send rusteron handle; takes no locks)    │
 │   shadow books per symbol ← journal (authoritative for the feed)         │
 │   BBO/spot · depth totals · entry batching · snapshot assembly · encoding │
 │   leader gate · snapshot boundary · gap policy · Archive (optional)      │
@@ -641,23 +641,23 @@ stops are not depth either; they appear only as `LIFECYCLE` events (`triggered`)
                           └──────────────────┘
 
 seeder task (rare: startup, leadership gain, optional reconciliation)
-   lock state machine → aggregate N levels → hand to the market-data thread
+   lock state machine → aggregate N levels → hand to the market-data task
 ```
 
 **Three parts, only one of them touches matching:**
 
-- **Tap (matching thread, inside `apply`).** Copies the entry's `MatchEvent` batch (which is `Copy`
+- **Tap (matching path, inside `apply`).** Copies the entry's `MatchEvent` batch (which is `Copy`
   and already built), the request's timestamp (the taker order's, or the cancel/expiry request's),
   and appends `(side, price, delta)` entries to a reusable journal at the points where the book
   already changes. O(1) per mutation, no tree walks, no serialization, no clock, no
   allocation once warm. The journal is cleared per batch; the queue is preallocated.
-- **Market-data thread.** Owns the shadow book for the process symbol, derives BBO/last trade, applies deltas,
+- **Market-data task.** Owns the shadow book for the process symbol, derives BBO/last trade, applies deltas,
   assembles snapshots, encodes messages, emits one batch per applied entry, offers to Aeron, retries
   back-pressure, counts gaps, and (optionally) records to an Archive. All CPU-heavy and IO work sits
   here.
 - **Seeder task.** The only component that reads the engine's book: it locks the state machine at
   startup, on leadership gain, and (optionally) on a reconciliation timer, aggregates the top-N
-  levels and hands the map to the market-data thread. It never runs per entry.
+  levels and hands the map to the market-data task. It never runs per entry.
 
 **Isolation rules (the "must not downgrade matching" contract):**
 
@@ -674,18 +674,18 @@ seeder task (rare: startup, leadership gain, optional reconciliation)
 Why a shadow book instead of reading the engine's book: it removes lock contention and all per-batch
 tree scans from the critical section, and it is the only way to keep depth exact for iceberg
 refills, which the event stream alone does not describe (the sweep knows the refilled tranche; the
-shadow book receives it as a journal delta). A dedicated thread also keeps the `!Send` `rusteron`
+shadow book receives it as a journal delta). A dedicated tokio task also keeps the `!Send` `rusteron`
 handles off the Raft runtime (§3.2).
 
 ## 15. Channels and streams
 
 | Stream | Product | Message size | Term length | Notes |
 |---|---|---|---|---|
-| 2001 | `TRADE` | ~69 B per fill | 2 MiB | one message per taker, all fills (uncapped; size the Aeron payload limit) |
+| 2001 | `TRADE` | ~102 B per fill | 2 MiB | one message per taker, all fills (uncapped; size the Aeron payload limit) |
 | 2002 | `BBO` | ~115 B | 1 MiB | one per book-changing entry |
 | 2003 | `DEPTH_SNAPSHOT` | ≤ ~1 KiB @ N=20 | 4 MiB | takeover/startup reset + resync |
 | 2004 | `DEPTH_DELTA` | ~37 B per touched level | 4 MiB | one message per entry with touched levels |
-| 2005 | `LIFECYCLE` | ~71 B | 2 MiB | may be private (see §21) |
+| 2005 | `LIFECYCLE` | ~104 B | 2 MiB | may be private (see §21) |
 | 2006 | `STATUS` | ~64 B | 256 KiB | deterministic cadence, gap flags |
 | 2007 | `BAR` | ~120 B | 1 MiB | OHLCV, one message per interval/window emitted |
 | 2010 | snapshot request (subscriber → engine) | ~24 B | 256 KiB | phase 3, optional |
@@ -722,7 +722,7 @@ Common header (64 bytes, little-endian) then the body:
 | Offset | Size | Field |
 |---|---|---|
 | 0 | 4 | magic `AMKT` |
-| 4 | 1 | `version` = 3 |
+| 4 | 1 | `version` = 4 |
 | 5 | 1 | `msg_type` (1 trade, 2 bbo, 3 depth snapshot, 4 depth delta, 5 lifecycle, 6 status, 7 gap, 8 bar) |
 | 6 | 2 | `flags` (bit0 snapshot, bit1 reset, bit2 gap, bit3 end-of-batch, bit4 reserved, bit5 partial bar, bit6 bar close) |
 | 8 | 8 | `market_seq` — replicated order/mutation sequence (§16.1) |
@@ -755,11 +755,11 @@ Bodies:
 
 | Type | Fields |
 |---|---|
-| `TRADE` | `count u32`, then per fill: `log_index u64`, `ordinal u32`, `ts_ms u64`, `price i128`, `volume i128`, `taker_side u8` (0 = buy aggressor, 1 = sell), `taker_seq u64`, `maker_seq u64` |
+| `TRADE` | `count u32`, then per fill: `log_index u64`, `ordinal u32`, `ts_ms u64`, `price i128`, `volume i128`, `taker_fee i128`, `maker_fee i128`, `fee_overflow u8`, `taker_side u8` (0 = buy aggressor, 1 = sell), `taker_seq u64`, `maker_seq u64` |
 | `BBO` | `present u8` + `last_trade i128`, `bid i128`, `bid_volume i128`, `ask i128`, `ask_volume i128`, `present u8` + `mid i128`, `present u8` + `spread i128` |
 | `DEPTH_DELTA` | `count u32`, then `[side u8, price i128, total_visible i128, orders u32]` per touched level |
 | `DEPTH_SNAPSHOT` | `bid_levels u32`, `ask_levels u32`, then level records, best first |
-| `LIFECYCLE` | `count u32`, then per event: `log_index u64`, `ordinal u32`, `ts_ms u64`, `kind u8`, `order_sequence u64`, `counterparty u64` (0 = none), `price i128`, `volume i128`, `reason u8` |
+| `LIFECYCLE` | `count u32`, then per event: `log_index u64`, `ordinal u32`, `ts_ms u64`, `kind u8`, `order_sequence u64`, `counterparty u64` (0 = none), `price i128`, `volume i128`, `taker_fee i128`, `maker_fee i128`, `fee_overflow u8`, `reason u8` |
 | `STATUS` | `last_market_seq u64`, `last_sub_seq u16`, `last_log_index u64`, `last_ordinal u32`, `applied_index u64`, `book_sequence u64`, `pending_stops u32` |
 | `GAP` | `last_good_log_index u64`, `last_good_ordinal u32`, `dropped u32`, `product u8` |
 | `BAR` | `interval_ms u32`, `window_start_ms u64`, `last_ts_ms u64`, `open i128`, `high i128`, `low i128`, `close i128`, `volume i128`, `trade_count u32`, `bar_seq u64` |
@@ -817,9 +817,10 @@ monotonically; `sub_seq` is per frame and needs no state.
 **Responses.** `/write` returns the assigned `market_seq` for `Place`, `Cancel`, `Amend` and
 `PurgeExpired` (previously `Cancel` returned null and `PurgeExpired` a count).
 
-**Wire version 3.** `market_seq` occupies the former `stream_seq` slot; `sub_seq` uses two of the
-reserved header bytes at offset 60. Version 3 encodes all prices/quantities as scale-18 `i128`
-(16 bytes each) instead of `f64`; the encoder and its golden tests cover the layout.
+**Wire version 5.** `market_seq` occupies the former `stream_seq` slot; `sub_seq` uses two of the
+reserved header bytes at offset 60. Version 5 encodes all prices, quantities, quote volumes and
+fees as scale-18 `i128` (16 bytes each) instead of `f64`, and carries the volume unit and fee asset
+per record; the encoder and its golden tests cover the layout.
 
 ## 17. Publishing rules
 
@@ -852,7 +853,7 @@ downstream (Kafka compaction, latest-value caches, chart aggregation) or must be
   the handover can be published as partial on both sides; OHLC merge is associative and consumers
   stitch by `(symbol, interval, window_start_ms)`.
 
-**Backpressure.** The matching thread never blocks: a full tap queue drops the frame, counts it and
+**Backpressure.** The matching path never blocks: a full tap queue drops the frame, counts it and
 sets a `GAP` flag for the next frame. If the sink or Aeron publication stalls, the processor slows,
 the queue fills and the feed degrades to `GAP` while consensus continues. `apply` latency is
 independent of the feed.
@@ -864,10 +865,11 @@ independent of the feed.
   those are committed, so they are not wrong — consumers dedupe on
   `(symbol_id, stream_id, market_seq, sub_seq)` (§16.1) and honour the `RESET`/snapshot ordering
   rule. The keys are replicated-state derived, so the handover does not reset the sequence space.
-- **Leader restart.** State is restored from the v7 snapshot plus log replay (v7 adds the
-  single-symbol precision configuration; v6 stores the last trade and match events as fixed-point;
-  v5 stored order prices/quantities; v4 carries the match-event window and submission dedupe map;
-  v3 added stops and `last_trade_price`); the seeder
+- **Leader restart.** State is restored from the v9 snapshot plus log replay (v9 adds asset
+  metadata, tick/lot rules, volume units and fee assets; v8 adds fee rates and fill fees; v7 adds
+  the single-symbol precision configuration; v6 stores the last trade and match events as
+  fixed-point; v5 stored order prices/quantities; v4 carries the match-event window and submission
+  dedupe map; v3 added stops and `last_trade_price`); the seeder
   captures the restored book and the snapshot-then-deltas rule applies. Replayed entries are below
   the reset boundary (the next `market_seq`) and are therefore suppressed.
 - **Follower installs a snapshot.** It is not publishing, but its shadow book is now stale (an
@@ -907,12 +909,12 @@ multicast is unavailable.
 | File | Change |
 |---|---|
 | `Cargo.toml` | optional `rusteron-client` + `rusteron-media-driver` behind a `market-data-aeron` feature (default off, so the default build stays pure Rust and `cargo test` needs no driver) |
-| `src/matchengine/mod.rs` | transient, optional depth journal: `rest`, `sweep` (partial fill, full consume, iceberg refill), `cancel` and `purge_expired` append `(symbol_id, side, price, delta)`; `#[serde(skip)]` so snapshots and the log are unchanged; zero work when disabled |
+| `src/order_book/mod.rs` | transient, optional depth journal: `rest`, `sweep` (partial fill, full consume, iceberg refill), `cancel` and `purge_expired` append `(symbol_id, side, price, delta)`; `#[serde(skip)]` so snapshots and the log are unchanged; zero work when disabled |
 | `src/market_data/mod.rs` | **new**: `MarketDataTap` (journal + event hand-off + bounded queue), `DepthJournal`, `ShadowBooks` (per symbol), `MarketDataConfig`, publisher trait |
 | `src/market_data/aeron.rs` | **new**: `AeronPublisher` (feature-gated) — publications, per-entry batching, retries, gap counters |
 | `src/match_result/mod.rs` | add `side: OrderSide` to `MatchEvent` (the order's own side; the maker's side on a fill is its opposite). Additive JSON field, needed for `TRADE.taker_side` and useful to every consumer. The frame carries the request's `timestamp` separately; events do not each need a copy |
 | `src/store/state_machine.rs` | after the event batch, hand events plus the drained journal to the tap (`try_push`); `capture_levels()` helper for the seeder; everything is a no-op when no tap is configured |
-| `src/lib.rs` | wire the tap, market-data thread, leader watch and seeder in `build_match_engine_node`; join them in `MatchEngineNode::shutdown` |
+| `src/lib.rs` | wire the tap, market-data task, leader watch and seeder in `build_match_engine_node`; join them in `MatchEngineNode::shutdown` |
 | `src/store/config.rs` | `MarketDataConfig { log_path, depth_levels, status_every, lifecycle_batch_max, bar_intervals_ms, queue_capacity, leader_only }` |
 | `src/main.rs` | `--market-data-*` flags and env equivalents, following `--match-event-log` (§20 config block) |
 | `src/network/api.rs` | `marketdata_status` read key (gate state, last published position, queue depth, shadow divergence counter) |
@@ -922,7 +924,7 @@ multicast is unavailable.
 The hot path records only what the operation already knows:
 
 ```rust
-// src/matchengine/mod.rs (sketch, not compilable)
+// src/order_book/mod.rs (sketch, not compilable)
 fn rest(&mut self, order: &Order, total: Fixed) -> Fixed {
     ...
     self.journal.push(order.side, order.price, +visible); // one append, no lookup
@@ -942,7 +944,7 @@ tap.try_publish(&events, inner.orderbook.take_journal()); // bounded, non-blocki
 - **Side is recorded with each delta**, which is also why `MatchEvent` needs the new `side` field:
   `TRADE` publishes the aggressor side and `LIFECYCLE` consumers need to know which side an event
   is about.
-- **The shadow level book lives on the market-data thread.** The wire still carries post-batch
+- **The shadow level book lives on the market-data task.** The wire still carries post-batch
   totals: the publisher applies its own deltas and emits the resulting total, which preserves the
   idempotence property in §16.
 - **Seeding is the seeder's job.** It locks the state machine only at startup, on leadership gain
@@ -1044,7 +1046,7 @@ snapshot resync.
   with a target budget set before implementation (guidance: single-digit nanoseconds per mutation,
   zero allocations after warmup); frame building, aggregation, encoding and Aeron entirely
   off-thread;
-- the market-data thread must be able to fall behind arbitrarily without changing apply latency —
+- the market-data task must be able to fall behind arbitrarily without changing apply latency —
   demonstrated by a test that stalls the publisher while submitting writes.
 
 **Benchmarks** (extend `benches/matchengine.rs` or add `benches/market_data.rs`): tap cost per
@@ -1110,10 +1112,10 @@ book.
   but survive duplication and simplify recovery.
 - Archive deployment: every node, or only the current leader? Retention and disk budget?
 - Are lifecycle events and order sequences public? If not, split streams and networks.
-- ~~Price encoding~~ Resolved: wire v3 carries scale-18 `i128` values; old v2 frames are not
-  silently reinterpreted.
+- ~~Price encoding~~ Resolved: wire v5 carries scale-18 `i128` prices, quantities and fees; old v2/v3
+  frames are not silently reinterpreted.
 - Journal vs event-only reconstruction: the journal is exact (iceberg refills, hidden volume) but
-  touches the book module; events alone would leave the tap fully outside `matchengine/` but need
+  touches the book module; events alone would leave the tap fully outside `order_book/` but need
   extra fields (`side`, maker remaining, refill) to reconstruct depth. Which boundary do we prefer?
 - Reconciliation cadence for the shadow book: never, on a timer, or only on a divergence alarm?
 - ~~Where does `symbol_id` come from?~~ Resolved: one process/cluster per symbol; the gateway

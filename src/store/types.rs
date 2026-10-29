@@ -4,9 +4,9 @@ use serde::Deserialize;
 use serde::Serialize;
 
 use crate::match_result::MatchEvent;
-use crate::matchengine::Fixed;
-use crate::matchengine::Order;
-use crate::matchengine::SymbolConfig;
+use crate::order_book::Fixed;
+use crate::order_book::Order;
+use crate::order_book::SymbolConfig;
 
 /// Application requests that can be applied to the Raft state machine.
 ///

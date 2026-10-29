@@ -31,6 +31,11 @@ pub const SCALE: i128 = 1_000_000_000_000_000_000;
 #[derive(Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Fixed(i128);
 
+/// Lowest accepted fee rate: a 100% rebate.
+pub const MIN_FEE_RATE: Fixed = Fixed::from_units(-1);
+/// Highest accepted fee rate: a 100% charge.
+pub const MAX_FEE_RATE: Fixed = Fixed::from_units(1);
+
 impl Fixed {
     /// Zero.
     pub const ZERO: Self = Self(0);
@@ -48,7 +53,7 @@ impl Fixed {
     /// Rebuilds a value from its scaled integer representation.
     ///
     /// This is the inverse of [`Fixed::raw`] and the constructor used by
-    /// wire-v3 decoders.
+    /// wire decoders.
     pub const fn from_raw(raw: i128) -> Self {
         Self(raw)
     }
@@ -78,6 +83,11 @@ impl Fixed {
         self.0.checked_sub(rhs.0).map(Self)
     }
 
+    /// Subtracts two values, saturating at the `i128` bounds.
+    pub fn saturating_sub(self, rhs: Self) -> Self {
+        Self(self.0.saturating_sub(rhs.0))
+    }
+
     /// Multiplies two fixed-point values through a 256-bit intermediate.
     ///
     /// The product is truncated toward zero to the common 18-digit scale.
@@ -85,6 +95,11 @@ impl Fixed {
     /// fit `i128`; this is the correct operation for price × quantity, whose
     /// unscaled intermediate can exceed `i128` even when the result fits.
     pub fn checked_mul(self, rhs: Self) -> Option<Self> {
+        // Fast path: most fills fit the unscaled product in i128.
+        if let Some(product) = self.0.checked_mul(rhs.0) {
+            return Some(Self(product / SCALE));
+        }
+
         let product = i256::I256::from_i128(self.0).checked_mul(i256::I256::from_i128(rhs.0))?;
         let scaled = product.checked_div(i256::I256::from_i128(SCALE))?;
         if scaled < i256::I256::from_i128(i128::MIN) || scaled > i256::I256::from_i128(i128::MAX) {
@@ -93,12 +108,55 @@ impl Fixed {
         Some(Self(scaled.as_i128()))
     }
 
+    /// Divides two fixed-point values through a 256-bit numerator.
+    ///
+    /// The result is truncated toward zero to 18 fractional digits. Returns
+    /// `None` on division by zero or when the result does not fit `i128`.
+    pub fn checked_div(self, rhs: Self) -> Option<Self> {
+        let numerator = i256::I256::from_i128(self.0).checked_mul(i256::I256::from_i128(SCALE))?;
+        let quotient = numerator.checked_div(i256::I256::from_i128(rhs.0))?;
+        if quotient < i256::I256::from_i128(i128::MIN)
+            || quotient > i256::I256::from_i128(i128::MAX)
+        {
+            return None;
+        }
+        Some(Self(quotient.as_i128()))
+    }
+
     /// Price × quantity, rounded toward zero to 18 fractional digits.
     ///
     /// This is an alias for [`Fixed::checked_mul`] with the notional use case
     /// spelled out; callers must decide how to handle an overflow.
     pub fn notional(price: Self, quantity: Self) -> Option<Self> {
         price.checked_mul(quantity)
+    }
+
+    /// Whether `self` is an exact multiple of `step`.
+    ///
+    /// A zero or negative `step` disables the check (legacy configurations).
+    pub fn is_multiple_of(self, step: Self) -> bool {
+        step.0 <= 0 || self.0 % step.0 == 0
+    }
+
+    /// Rounds down to the nearest multiple of `step`.
+    ///
+    /// A zero or negative `step` returns `self` unchanged.
+    pub fn floor_to_multiple(self, step: Self) -> Self {
+        if step.0 <= 0 {
+            return self;
+        }
+        Self(self.0.div_euclid(step.0) * step.0)
+    }
+
+    /// Rounds up to the nearest multiple of `step`.
+    ///
+    /// A zero or negative `step` returns `self` unchanged.
+    pub fn ceil_to_multiple(self, step: Self) -> Self {
+        if step.0 <= 0 {
+            return self;
+        }
+        let quotient = self.0.div_euclid(step.0) + i128::from(self.0.rem_euclid(step.0) != 0);
+        Self(quotient * step.0)
     }
 
     /// The midpoint between two values, rounded toward zero to 18 places.
@@ -255,9 +313,8 @@ impl Div for Fixed {
     type Output = Self;
 
     fn div(self, rhs: Self) -> Self::Output {
-        let quotient = self.0 / rhs.0;
-        let remainder = self.0 % rhs.0;
-        Self(quotient * SCALE + remainder * SCALE / rhs.0)
+        self.checked_div(rhs)
+            .expect("fixed-point division overflow")
     }
 }
 
@@ -325,35 +382,162 @@ impl fmt::Debug for Fixed {
     }
 }
 
-/// Per-symbol price and quantity precision.
+/// Asset class carried by a symbol's base/quote metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AssetClass {
+    /// National currency, e.g. USD or GBP.
+    Fiat,
+    /// Tokenised fiat, e.g. USDT or USDC.
+    Stablecoin,
+    /// Native crypto asset, e.g. BTC or ETH.
+    Crypto,
+    /// Listed equity, e.g. GOOGL.
+    Equity,
+    /// Exchange-traded fund, e.g. QQQ or VOO.
+    Etf,
+    /// Unknown/legacy asset metadata.
+    #[default]
+    Unknown,
+}
+
+/// Identity and settlement precision of one asset.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AssetId {
+    /// Human-readable asset code, e.g. `USD`, `USDT`, `QQQ` or `BTC`.
+    pub code: String,
+    /// Asset class; fiat and stablecoin are deliberately distinct.
+    pub class: AssetClass,
+    /// Settlement precision in fractional digits (0..=18).
+    pub decimals: u8,
+}
+
+impl AssetId {
+    /// Creates an asset id, rejecting unsupported settlement precision.
+    pub fn new(
+        code: impl Into<String>,
+        class: AssetClass,
+        decimals: u8,
+    ) -> Result<Self, ParseFixedError> {
+        if decimals > DECIMALS as u8 {
+            return Err(ParseFixedError);
+        }
+        Ok(Self {
+            code: code.into(),
+            class,
+            decimals,
+        })
+    }
+}
+
+/// Which side of an order's volume is specified by the client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum VolumeUnit {
+    /// Gross base quantity.
+    #[default]
+    Base,
+    /// Gross quote amount.
+    Quote,
+}
+
+/// Where a fill fee is charged/rebated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FeeAsset {
+    /// The pair's base asset.
+    Base,
+    /// The pair's quote asset.
+    Quote,
+}
+
+/// Pair-level fee deduction policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum FeeAssetPolicy {
+    /// Buyer fees in base, seller fees in quote.
+    #[default]
+    Received,
+    /// Both sides in quote.
+    Quote,
+    /// Both sides in base.
+    Base,
+}
+
+impl FeeAssetPolicy {
+    /// Asset used for a fee on `side`.
+    pub fn fee_asset(self, side: super::OrderSide) -> FeeAsset {
+        match (self, side) {
+            (Self::Received, super::OrderSide::Buy) => FeeAsset::Base,
+            (Self::Received, super::OrderSide::Sell) => FeeAsset::Quote,
+            (Self::Quote, _) => FeeAsset::Quote,
+            (Self::Base, _) => FeeAsset::Base,
+        }
+    }
+}
+
+/// Per-symbol configuration: one base asset, one quote asset, precision,
+/// tick/lot increments and the fee asset policy.
 ///
 /// The internal `Fixed` scale is always 18 so the matching engine can compare
 /// and add integers directly; this configuration validates and formats values
-/// at the API boundary for each instrument. A symbol may use fewer decimals
-/// (for example 2 for an equity or 8 for native BTC), but never more than 18.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// at the API boundary. A symbol may use fewer decimals (for example 2 for an
+/// equity or 8 for native BTC), but never more than 18.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SymbolConfig {
-    /// Instrument id (0 while the engine is single-symbol).
+    /// Instrument id (the process/cluster trades one symbol).
     pub symbol_id: u32,
+    /// Base asset and its settlement precision.
+    pub base_asset: AssetId,
+    /// Quote asset and its settlement precision.
+    pub quote_asset: AssetId,
     /// Accepted fractional digits for prices (0..=18).
     pub price_decimals: u8,
-    /// Accepted fractional digits for quantities (0..=18).
-    pub quantity_decimals: u8,
+    /// Minimum price increment; zero disables tick validation.
+    pub price_tick: Fixed,
+    /// Minimum base quantity increment; zero disables lot validation.
+    pub base_lot: Fixed,
+    /// Fee asset policy for this pair.
+    pub fee_asset_policy: FeeAssetPolicy,
+}
+
+fn default_symbol_assets(decimals: u8) -> (AssetId, AssetId) {
+    (
+        AssetId {
+            code: "BTC".to_string(),
+            class: AssetClass::Crypto,
+            decimals,
+        },
+        AssetId {
+            code: "USDT".to_string(),
+            class: AssetClass::Stablecoin,
+            decimals,
+        },
+    )
+}
+
+fn decimal_step(decimals: u8) -> Fixed {
+    Fixed(10i128.pow(DECIMALS - u32::from(decimals)))
 }
 
 impl Default for SymbolConfig {
-    /// The single-symbol default: symbol `0` accepting all 18 fractional digits.
+    /// The single-symbol default: BTC/USDT, symbol `0`, 18 fractional digits.
     fn default() -> Self {
+        let (base_asset, quote_asset) = default_symbol_assets(DECIMALS as u8);
         Self {
             symbol_id: 0,
+            base_asset,
+            quote_asset,
             price_decimals: DECIMALS as u8,
-            quantity_decimals: DECIMALS as u8,
+            price_tick: Fixed(1),
+            base_lot: Fixed(1),
+            fee_asset_policy: FeeAssetPolicy::Received,
         }
     }
 }
 
 impl SymbolConfig {
-    /// Creates a configuration, rejecting more than [`DECIMALS`] places.
+    /// Creates a configuration with default BTC/USDT asset metadata.
     pub fn new(
         symbol_id: u32,
         price_decimals: u8,
@@ -362,26 +546,77 @@ impl SymbolConfig {
         if price_decimals > DECIMALS as u8 || quantity_decimals > DECIMALS as u8 {
             return Err(ParseFixedError);
         }
+        let (base_asset, quote_asset) = default_symbol_assets(quantity_decimals);
         Ok(Self {
             symbol_id,
+            base_asset,
+            quote_asset,
             price_decimals,
-            quantity_decimals,
+            price_tick: decimal_step(price_decimals),
+            base_lot: decimal_step(quantity_decimals),
+            fee_asset_policy: FeeAssetPolicy::Received,
         })
     }
 
-    /// Validates this configuration, rejecting more than [`DECIMALS`] places.
-    pub fn validate(self) -> Result<Self, ParseFixedError> {
-        Self::new(self.symbol_id, self.price_decimals, self.quantity_decimals)
+    /// Replaces base/quote asset metadata.
+    pub fn with_assets(
+        mut self,
+        base_asset: AssetId,
+        quote_asset: AssetId,
+    ) -> Result<Self, ParseFixedError> {
+        if base_asset.decimals > DECIMALS as u8 || quote_asset.decimals > DECIMALS as u8 {
+            return Err(ParseFixedError);
+        }
+        self.base_asset = base_asset;
+        self.quote_asset = quote_asset;
+        self.base_lot = decimal_step(self.base_asset.decimals);
+        Ok(self)
+    }
+
+    /// Overrides tick/lot increments.
+    pub fn with_tick_and_lot(mut self, price_tick: Fixed, base_lot: Fixed) -> Self {
+        self.price_tick = price_tick;
+        self.base_lot = base_lot;
+        self
+    }
+
+    /// Overrides the fee asset policy.
+    pub fn with_fee_asset_policy(mut self, policy: FeeAssetPolicy) -> Self {
+        self.fee_asset_policy = policy;
+        self
+    }
+
+    /// Base asset precision.
+    pub fn base_decimals(&self) -> u8 {
+        self.base_asset.decimals
+    }
+
+    /// Quote asset precision.
+    pub fn quote_decimals(&self) -> u8 {
+        self.quote_asset.decimals
+    }
+
+    /// Validates this configuration.
+    pub fn validate(&self) -> Result<Self, ParseFixedError> {
+        if self.price_decimals > DECIMALS as u8
+            || self.base_asset.decimals > DECIMALS as u8
+            || self.quote_asset.decimals > DECIMALS as u8
+            || self.price_tick < Fixed::ZERO
+            || self.base_lot < Fixed::ZERO
+        {
+            return Err(ParseFixedError);
+        }
+        Ok(self.clone())
     }
 
     /// Parses a price at this symbol's precision.
-    pub fn parse_price(self, value: &str) -> Result<Fixed, ParseFixedError> {
+    pub fn parse_price(&self, value: &str) -> Result<Fixed, ParseFixedError> {
         Fixed::parse_with_decimals(value, self.price_decimals)
     }
 
-    /// Parses a quantity at this symbol's precision.
-    pub fn parse_quantity(self, value: &str) -> Result<Fixed, ParseFixedError> {
-        Fixed::parse_with_decimals(value, self.quantity_decimals)
+    /// Parses a base quantity at this symbol's precision.
+    pub fn parse_quantity(&self, value: &str) -> Result<Fixed, ParseFixedError> {
+        Fixed::parse_with_decimals(value, self.base_asset.decimals)
     }
 }
 

@@ -54,7 +54,7 @@ pub struct StorageConfig {
 
     /// Optional market-data egress configuration. `None` keeps the feed off;
     /// enabling it installs the tap on the state machine and starts the
-    /// publisher thread bounded by this configuration.
+    /// publisher task bounded by this configuration.
     pub market_data: Option<MarketDataConfig>,
 
     /// Maximum number of match events retained in the replicated event log.

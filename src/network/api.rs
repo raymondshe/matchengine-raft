@@ -423,8 +423,8 @@ where
     C: openraft::RaftTypeConfig<D = MatchEngineRequest, R = MatchEngineResponse>,
 {
     serde_json::json!({
-        "bids": inner.orderbook.depth(crate::matchengine::OrderSide::Buy, levels),
-        "asks": inner.orderbook.depth(crate::matchengine::OrderSide::Sell, levels),
+        "bids": inner.orderbook.depth(crate::order_book::OrderSide::Buy, levels),
+        "asks": inner.orderbook.depth(crate::order_book::OrderSide::Sell, levels),
     })
     .to_string()
 }
@@ -433,9 +433,9 @@ where
 mod tests {
     use super::*;
     use crate::MatchEngineTypeConfig;
-    use crate::matchengine::Order;
-    use crate::matchengine::OrderSide;
-    use crate::matchengine::SymbolConfig;
+    use crate::order_book::Order;
+    use crate::order_book::OrderSide;
+    use crate::order_book::SymbolConfig;
 
     fn book() -> StateMachineStoreInner<MatchEngineTypeConfig> {
         let mut inner = StateMachineStoreInner::<MatchEngineTypeConfig>::default();

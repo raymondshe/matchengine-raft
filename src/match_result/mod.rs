@@ -32,12 +32,14 @@ use std::sync::MutexGuard;
 use serde::Deserialize;
 use serde::Serialize;
 
-use crate::matchengine::Amendment;
-use crate::matchengine::Fixed;
-use crate::matchengine::MatchResult;
-use crate::matchengine::Order;
-use crate::matchengine::OrderSide;
-use crate::matchengine::RejectReason;
+use crate::order_book::Amendment;
+use crate::order_book::FeeAsset;
+use crate::order_book::Fixed;
+use crate::order_book::MatchResult;
+use crate::order_book::Order;
+use crate::order_book::OrderSide;
+use crate::order_book::RejectReason;
+use crate::order_book::VolumeUnit;
 
 /// Stable identity of one event: a Raft log index plus the event's position inside that entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -106,6 +108,31 @@ pub struct MatchEvent {
     /// stop's open volume for [`MatchEventKind::Triggered`]; the submitted volume for
     /// [`MatchEventKind::Rejected`]; the new open volume for [`MatchEventKind::Amended`].
     pub volume: Fixed,
+    /// Gross quote notional for a fill; zero for non-fill events.
+    #[serde(default)]
+    pub quote_volume: Fixed,
+    /// Unit of `volume`. Fills are base; a quote-market cancellation can be
+    /// quote.
+    #[serde(default)]
+    pub volume_unit: VolumeUnit,
+    /// Taker fee asset for a fill.
+    #[serde(default)]
+    pub taker_fee_asset: Option<FeeAsset>,
+    /// Maker fee asset for a fill.
+    #[serde(default)]
+    pub maker_fee_asset: Option<FeeAsset>,
+    /// Taker fee for a fill: positive = charge, negative = rebate. Zero for
+    /// non-fill events and when `fee_overflow` is true.
+    #[serde(default)]
+    pub taker_fee: Fixed,
+    /// Maker fee for a fill: positive = charge, negative = rebate. Zero for
+    /// non-fill events and when `fee_overflow` is true.
+    #[serde(default)]
+    pub maker_fee: Fixed,
+    /// True when the fill's notional or fee overflowed the scale-18 `i128`
+    /// range; the fee fields are then zero but must not be treated as real.
+    #[serde(default)]
+    pub fee_overflow: bool,
     /// The policy reason behind a rejection or expiry. Absent (and omitted from the JSON lines)
     /// for every other kind.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -139,6 +166,13 @@ impl MatchEvent {
                 previous_sequence: None,
                 price: m.maker.price,
                 volume: m.matches,
+                quote_volume: m.notional,
+                volume_unit: VolumeUnit::Base,
+                taker_fee_asset: Some(m.taker_fee_asset),
+                maker_fee_asset: Some(m.maker_fee_asset),
+                taker_fee: m.taker_fee,
+                maker_fee: m.maker_fee,
+                fee_overflow: m.fee_overflow,
                 reason: None,
             })
             .collect()
@@ -188,6 +222,13 @@ impl MatchEvent {
                 previous_sequence: None,
                 price: taker.price,
                 volume,
+                quote_volume: Fixed::ZERO,
+                volume_unit: taker.volume_unit,
+                taker_fee_asset: None,
+                maker_fee_asset: None,
+                taker_fee: Fixed::ZERO,
+                maker_fee: Fixed::ZERO,
+                fee_overflow: false,
                 reason: None,
             });
         }
@@ -223,6 +264,13 @@ impl MatchEvent {
             previous_sequence: None,
             price: order.price,
             volume,
+            quote_volume: Fixed::ZERO,
+            volume_unit: order.volume_unit,
+            taker_fee_asset: None,
+            maker_fee_asset: None,
+            taker_fee: Fixed::ZERO,
+            maker_fee: Fixed::ZERO,
+            fee_overflow: false,
             reason: None,
         }
     }
@@ -244,6 +292,13 @@ impl MatchEvent {
             previous_sequence: None,
             price: trigger_price,
             volume: stop.open_volume(),
+            quote_volume: Fixed::ZERO,
+            volume_unit: stop.volume_unit,
+            taker_fee_asset: None,
+            maker_fee_asset: None,
+            taker_fee: Fixed::ZERO,
+            maker_fee: Fixed::ZERO,
+            fee_overflow: false,
             reason: None,
         }
     }
@@ -259,6 +314,13 @@ impl MatchEvent {
             previous_sequence: None,
             price: expired.price,
             volume: expired.open_volume(),
+            quote_volume: Fixed::ZERO,
+            volume_unit: expired.volume_unit,
+            taker_fee_asset: None,
+            maker_fee_asset: None,
+            taker_fee: Fixed::ZERO,
+            maker_fee: Fixed::ZERO,
+            fee_overflow: false,
             reason: None,
         }
     }
@@ -279,6 +341,13 @@ impl MatchEvent {
             previous_sequence: None,
             price: order.price,
             volume: order.volume,
+            quote_volume: Fixed::ZERO,
+            volume_unit: order.volume_unit,
+            taker_fee_asset: None,
+            maker_fee_asset: None,
+            taker_fee: Fixed::ZERO,
+            maker_fee: Fixed::ZERO,
+            fee_overflow: false,
             reason: Some(reason),
         }
     }
@@ -295,6 +364,13 @@ impl MatchEvent {
             previous_sequence: Some(amendment.previous_sequence),
             price: amendment.order.price,
             volume: amendment.order.volume,
+            quote_volume: Fixed::ZERO,
+            volume_unit: amendment.order.volume_unit,
+            taker_fee_asset: None,
+            maker_fee_asset: None,
+            taker_fee: Fixed::ZERO,
+            maker_fee: Fixed::ZERO,
+            fee_overflow: false,
             reason: None,
         }
     }
@@ -460,7 +536,7 @@ struct FileRecord<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::matchengine::OrderSide;
+    use crate::order_book::OrderSide;
 
     fn order(side: OrderSide, price: f64, volume: f64, sequence: u64) -> Order {
         Order::new(side, price, volume, sequence)

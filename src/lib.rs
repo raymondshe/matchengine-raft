@@ -42,10 +42,10 @@ pub mod client;
 pub mod market_data;
 /// Pluggable processing of the match results (fills, rests, cancels) produced by the state machine.
 pub mod match_result;
-/// Matching engine module with order book implementation.
-pub mod matchengine;
 /// Network layer module for HTTP endpoints and Raft RPC.
 pub mod network;
+/// Order-book matching engine: orders, matching and exact fixed-point values.
+pub mod order_book;
 /// Storage layer module for Raft logs and state machine persistence.
 pub mod store;
 
@@ -121,12 +121,12 @@ impl MatchEngineNode {
         let _ = self.grpc_task.await;
 
         // Stop the feed before Raft: the watcher must not push snapshots for a
-        // shutting-down node, and the publisher thread joins here.
+        // shutting-down node, and the publisher task joins here.
         if let Some(task) = self.market_data_task.take() {
             task.abort();
         }
         if let Some(mut handle) = self.market_data.take() {
-            let _ = tokio::task::spawn_blocking(move || handle.shutdown()).await;
+            handle.shutdown().await;
         }
 
         self.raft
@@ -261,7 +261,7 @@ pub async fn build_match_engine_node(
     // Start the market-data publisher before the state machine so the tap can
     // be installed at open; it is node-local and never affects replication.
     let market_data = match &storage.market_data {
-        Some(config) => Some(MarketDataHandle::start(config.clone(), node_id)?),
+        Some(config) => Some(MarketDataHandle::start(config.clone(), node_id).await?),
         None => None,
     };
     // Load the latest snapshot, if any. openraft replays the retained log tail on top of it.
