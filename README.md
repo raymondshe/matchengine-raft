@@ -117,7 +117,7 @@ are what the Aeron adapter (streams 2001–2007) will publish next.
 
 ### Prerequisites
 
-- Rust 1.85 or later (the crate uses edition 2024)
+- Rust 1.89 or later (edition 2024; `actix-web` and `tonic` set the floor)
 - Cargo
 
 `protoc` is not required: the build script uses `protoc-bin-vendored` to compile

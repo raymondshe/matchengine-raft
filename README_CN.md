@@ -115,7 +115,7 @@
 
 ### 前置要求
 
-- Rust 1.85 或更高版本（本项目使用 edition 2024）
+- Rust 1.89 或更高版本（edition 2024；下限由 `actix-web` 和 `tonic` 决定）
 - Cargo
 
 无需安装 `protoc`：构建脚本通过 `protoc-bin-vendored` 编译 `proto/raft.proto`。

@@ -77,7 +77,7 @@ a new learner catches up from a live leader through log replication).
   `/get_linearizer`, `/linearizable_read`, `/follower_read`, `/read`.
 - [x] `README.md` snapshot section now describes `default_raft_config()` and the test-only
   `LogsSinceLast(10)` / `max_in_snapshot_log_to_keep = 0` override.
-- [x] `README.md` prerequisites updated to Rust 1.85 (edition 2024) and note that protoc is vendored.
+- [x] `README.md` prerequisites updated to Rust 1.89 (edition 2024) and note that protoc is vendored.
 - [x] README now describes the segmented WAL + snapshot storage design instead of Sled.
 - [x] `README.md` / `README_CN.md` project structure, transport flags, test suite and future work
   synced with `src/network/grpc/` and `tests/cluster/`.

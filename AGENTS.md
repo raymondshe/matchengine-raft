@@ -119,7 +119,7 @@ CI (`.github/workflows/ci.yml`) runs `cargo fmt --all -- --check`, `cargo clippy
 ## Docs vs code
 
 - Trust `src/` over prose. `README.md`, `README_CN.md` and `TODO.md` now match the
-  WAL + snapshot + gRPC design; README requires Rust ≥ 1.85 (edition 2024).
+  WAL + snapshot + gRPC design; README requires Rust ≥ 1.89 (edition 2024).
 - `docs/AERON_SOLUTION.md` and `docs/TRANSPORTS.md` are investigation documents: gRPC via `tonic`
   is implemented (`src/network/grpc/`) and is the default, HTTP remains selectable, and no transport
   benchmark exists. Read `docs/TRANSPORTS.md`'s status banner before treating its numbers as results.

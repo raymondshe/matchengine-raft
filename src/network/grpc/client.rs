@@ -394,7 +394,7 @@ where
                             break;
                         }
                         Some(Ok(msg)) => {
-                            let _ = inflight.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
+                            decrement_inflight(&inflight);
 
                             let result: Result<StreamAppendResult<C>, RPCError<C>> = decode(&msg.payload)
                                 .map_err(|e| RPCError::Network(NetworkError::new(&e)));
@@ -413,5 +413,20 @@ where
             let out: BoxStream<'s, Result<StreamAppendResult<C>, RPCError<C>>> = Box::pin(out);
             Ok(out)
         })
+    }
+}
+
+/// Decrements the in-flight append count.
+///
+/// `AtomicUsize::fetch_update` is deprecated on newer toolchains in favour of
+/// `try_update`, which is still unstable on this crate's MSRV. A
+/// compare-exchange loop works everywhere and keeps the checked subtraction.
+fn decrement_inflight(inflight: &AtomicUsize) {
+    let mut current = inflight.load(Ordering::SeqCst);
+    while let Some(next) = current.checked_sub(1) {
+        match inflight.compare_exchange(current, next, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return,
+            Err(actual) => current = actual,
+        }
     }
 }
