@@ -271,6 +271,13 @@ pub async fn build_match_engine_node(
         market_data.as_ref().map(|handle| handle.tap()),
         storage.max_events,
     )?;
+    if let Some(handle) = &market_data {
+        let depth_levels = storage
+            .market_data
+            .as_ref()
+            .map_or(10, |config| config.depth_levels);
+        state_machine_store.set_market_data_control(handle.control(), depth_levels);
+    }
 
     tracing::info!(
         node_id,
@@ -423,7 +430,7 @@ fn spawn_market_data_watch(
                 if !started {
                     started = true;
                     state_machine
-                        .start_market_data_feed(&control, depth_levels, 0)
+                        .start_market_data_feed(&control, depth_levels)
                         .await;
                 }
             } else if is_leader != leader {
@@ -432,7 +439,7 @@ fn spawn_market_data_watch(
                     // Capture and enqueue under the state-machine lock, then open
                     // the gate: the snapshot precedes every delta it covers.
                     state_machine
-                        .start_market_data_feed(&control, depth_levels, 0)
+                        .start_market_data_feed(&control, depth_levels)
                         .await;
                 } else {
                     control.set_leader(false);

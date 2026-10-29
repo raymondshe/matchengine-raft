@@ -612,6 +612,8 @@ fn state_machine_data_conversion_roundtrips() {
         sequence: 4,
         stops: Vec::new(),
         last_trade_price: None,
+        symbol_config: matchengine_raft::matchengine::SymbolConfig::default(),
+        symbol_locked: false,
         events: Vec::new(),
         events_evicted: 0,
         submissions: Vec::new(),

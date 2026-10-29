@@ -341,6 +341,17 @@ pub struct SymbolConfig {
     pub quantity_decimals: u8,
 }
 
+impl Default for SymbolConfig {
+    /// The single-symbol default: symbol `0` accepting all 18 fractional digits.
+    fn default() -> Self {
+        Self {
+            symbol_id: 0,
+            price_decimals: DECIMALS as u8,
+            quantity_decimals: DECIMALS as u8,
+        }
+    }
+}
+
 impl SymbolConfig {
     /// Creates a configuration, rejecting more than [`DECIMALS`] places.
     pub fn new(
@@ -356,6 +367,11 @@ impl SymbolConfig {
             price_decimals,
             quantity_decimals,
         })
+    }
+
+    /// Validates this configuration, rejecting more than [`DECIMALS`] places.
+    pub fn validate(self) -> Result<Self, ParseFixedError> {
+        Self::new(self.symbol_id, self.price_decimals, self.quantity_decimals)
     }
 
     /// Parses a price at this symbol's precision.

@@ -6,6 +6,7 @@ use serde::Serialize;
 use crate::match_result::MatchEvent;
 use crate::matchengine::Fixed;
 use crate::matchengine::Order;
+use crate::matchengine::SymbolConfig;
 
 /// Application requests that can be applied to the Raft state machine.
 ///
@@ -19,6 +20,7 @@ use crate::matchengine::Order;
 /// * `Cancel` - Removes an order from the order book
 /// * `Amend` - Changes the price and/or open volume of a resting limit order
 /// * `PurgeExpired` - Explicitly evicts expired orders (GTD is normally purged automatically)
+/// * `ConfigureSymbol` - Sets this process/cluster's symbol and price/quantity precision
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum MatchEngineRequest {
     /// Place a new order in the matching engine.
@@ -56,6 +58,13 @@ pub enum MatchEngineRequest {
         now_ms: u64,
         day_close_ms: Option<u64>,
     },
+    /// Add or update the accepted price/quantity precision for one symbol.
+    ///
+    /// The configuration is replicated and snapshotted. A process/cluster
+    /// trades exactly one symbol; multi-symbol means a separate process/cluster
+    /// per symbol. The configuration can only change before the first accepted
+    /// order and is locked once trading starts.
+    ConfigureSymbol { config: SymbolConfig },
 }
 
 impl MatchEngineRequest {
@@ -97,6 +106,9 @@ impl fmt::Display for MatchEngineRequest {
                 f,
                 "PurgeExpired {{ now_ms: {now_ms}, day_close_ms: {day_close_ms:?} }}"
             ),
+            MatchEngineRequest::ConfigureSymbol { config } => {
+                write!(f, "ConfigureSymbol {{ config: {config:?} }}")
+            }
         }
     }
 }
@@ -119,6 +131,10 @@ pub struct MatchEngineResponse {
     /// True when `events` holds only the first [`Self::MAX_EVENTS`] records.
     #[serde(default)]
     pub events_truncated: bool,
+    /// A non-fatal application error, for example an invalid symbol
+    /// configuration. It is omitted from successful responses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 impl MatchEngineResponse {
@@ -140,6 +156,7 @@ impl MatchEngineResponse {
             sequence: Some(sequence),
             events: events.iter().take(Self::MAX_EVENTS).copied().collect(),
             events_truncated: truncated,
+            error: None,
         }
     }
 
@@ -151,10 +168,19 @@ impl MatchEngineResponse {
             sequence: Some(sequence),
             events,
             events_truncated: truncated,
+            error: None,
         }
     }
 
     pub fn none() -> Self {
         Self::default()
+    }
+
+    /// A non-fatal application error (the write itself was committed).
+    pub fn error(message: impl Into<String>) -> Self {
+        Self {
+            error: Some(message.into()),
+            ..Self::default()
+        }
     }
 }

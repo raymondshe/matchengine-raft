@@ -15,6 +15,7 @@ use std::io::Cursor;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
@@ -52,6 +53,7 @@ use crate::matchengine::Order;
 use crate::matchengine::OrderBook;
 use crate::matchengine::OrderSide;
 use crate::matchengine::RejectReason;
+use crate::matchengine::SymbolConfig;
 use crate::store::config::sync_dir;
 use crate::store::types::MatchEngineRequest;
 use crate::store::types::MatchEngineResponse;
@@ -67,10 +69,10 @@ const SNAPSHOT_MAGIC: &[u8; 7] = b"MRFSNAP";
 /// timestamp) together with parked stops and the last trade price. Version 4 adds the
 /// retained match-event window and the client-order-id dedupe map. Version 5 stores
 /// order prices and quantities as 18-scale fixed-point integers. Version 6 stores the
-/// last trade price and match events as fixed-point values. Postcard is not self-describing,
-/// so an older file is rejected with an explicit error instead of being decoded into a
-/// different shape.
-const SNAPSHOT_VERSION: u32 = 6;
+/// last trade price and match events as fixed-point values. Version 7 adds the replicated
+/// single-symbol precision configuration. Postcard is not self-describing, so an older file is
+/// rejected with an explicit error instead of being decoded into a different shape.
+const SNAPSHOT_VERSION: u32 = 7;
 /// `magic + version + crc32 of the body`.
 const SNAPSHOT_HEADER_LEN: usize = SNAPSHOT_MAGIC.len() + 4 + 4;
 
@@ -180,6 +182,15 @@ pub struct StateMachineData {
     /// Price of the most recent trade, which elects parked stops.
     pub last_trade_price: Option<Fixed>,
 
+    /// The one symbol this process/cluster trades and its accepted precision.
+    #[serde(default)]
+    pub symbol_config: SymbolConfig,
+
+    /// Set once the first order is accepted, so the process cannot switch
+    /// symbols after trading has started.
+    #[serde(default)]
+    pub symbol_locked: bool,
+
     /// Retained match events, oldest first.
     #[serde(default)]
     pub events: Vec<StoredMatchEvent>,
@@ -206,6 +217,13 @@ pub struct StateMachineStoreInner<C: RaftTypeConfig> {
 
     /// The order book for the matching engine.
     pub orderbook: OrderBook,
+
+    /// The one symbol this process/cluster trades. Replicated so every node
+    /// validates orders identically; a process never trades two symbols.
+    symbol_config: SymbolConfig,
+
+    /// Whether trading has started under `symbol_config`.
+    symbol_locked: bool,
 
     /// The last built or installed snapshot, kept so it can be shipped to lagging peers.
     pub current_snapshot: Option<StoredSnapshot<C>>,
@@ -242,6 +260,8 @@ impl<C: RaftTypeConfig> Default for StateMachineStoreInner<C> {
             last_applied_log: None,
             last_membership: StoredMembership::default(),
             orderbook: OrderBook::new(),
+            symbol_config: SymbolConfig::default(),
+            symbol_locked: false,
             current_snapshot: None,
             market_data: None,
             events: VecDeque::new(),
@@ -263,6 +283,12 @@ impl<C: RaftTypeConfig> StateMachineStoreInner<C> {
         self.orderbook.stops.clear();
         self.orderbook.sequence = content.sequence;
         self.orderbook.last_trade_price = content.last_trade_price;
+
+        self.symbol_config = content
+            .symbol_config
+            .validate()
+            .unwrap_or_else(|_| SymbolConfig::default());
+        self.symbol_locked = content.symbol_locked;
 
         for order in &content.orders {
             self.orderbook.insert_order(order);
@@ -422,6 +448,66 @@ impl<C: RaftTypeConfig> StateMachineStoreInner<C> {
             .collect()
     }
 
+    /// The one symbol this process/cluster trades.
+    pub fn symbol_config(&self) -> SymbolConfig {
+        self.symbol_config
+    }
+
+    /// Adds or updates this process/cluster's symbol and precision configuration.
+    ///
+    /// A process trades exactly one symbol for its lifetime. The configuration
+    /// may only change before the first accepted order (and while the book is
+    /// empty); it is locked once trading starts. The change is replicated and
+    /// snapshotted, keeping every node's validation identical.
+    pub fn configure_symbol(&mut self, config: SymbolConfig) -> Result<(), String> {
+        let config = config
+            .validate()
+            .map_err(|_| "price_decimals and quantity_decimals must be 0..=18".to_string())?;
+        if self.symbol_locked {
+            return Err("symbol configuration is locked after trading starts".to_string());
+        }
+        let has_open_orders = !self.orderbook.bids.is_empty()
+            || !self.orderbook.asks.is_empty()
+            || !self.orderbook.stops.is_empty();
+        if has_open_orders {
+            return Err("cannot change the symbol configuration while orders are open".to_string());
+        }
+        self.symbol_config = config;
+        // A later stop must not compare against a print admitted under the
+        // previous symbol or precision.
+        self.orderbook.last_trade_price = None;
+        Ok(())
+    }
+
+    /// Resolves the configured symbol for an order, rejecting an order routed
+    /// to a different symbol.
+    fn configured_symbol_for(&self, order: &Order) -> Result<SymbolConfig, RejectReason> {
+        if order.symbol_id != self.symbol_config.symbol_id {
+            return Err(RejectReason::UnsupportedOrder);
+        }
+        Ok(self.symbol_config)
+    }
+
+    /// Validates the replacement values of an amendment at the configured
+    /// symbol's precision. The key fields were validated when the resting order
+    /// entered.
+    fn validate_amend_values(
+        &self,
+        order: &Order,
+        price: Option<Fixed>,
+        volume: Option<Fixed>,
+    ) -> Result<SymbolConfig, RejectReason> {
+        let config = self.configured_symbol_for(order)?;
+        let price_ok = price.is_none_or(|value| value.has_at_most_decimals(config.price_decimals));
+        let volume_ok =
+            volume.is_none_or(|value| value.has_at_most_decimals(config.quantity_decimals));
+        if price_ok && volume_ok {
+            Ok(config)
+        } else {
+            Err(RejectReason::InvalidOrder)
+        }
+    }
+
     /// Converts the state machine to a serializable content format.
     pub fn to_content(&self) -> StateMachineData {
         let mut content = StateMachineData {
@@ -429,6 +515,8 @@ impl<C: RaftTypeConfig> StateMachineStoreInner<C> {
             sequence: self.orderbook.sequence,
             stops: self.orderbook.stops.clone(),
             last_trade_price: self.orderbook.last_trade_price,
+            symbol_config: self.symbol_config,
+            symbol_locked: self.symbol_locked,
             events: self
                 .events
                 .iter()
@@ -460,6 +548,9 @@ pub struct StateMachineStore<C: RaftTypeConfig> {
     inner: Arc<Mutex<StateMachineStoreInner<C>>>,
     dir: Arc<PathBuf>,
     sink: Arc<dyn MatchResultSink>,
+    /// Set by `build_match_engine_node` when a market-data feed is enabled. It
+    /// lets a symbol configuration change reset consumers to the new symbol.
+    market_data_control: Arc<OnceLock<(MarketDataControl, usize)>>,
 }
 
 impl<C: RaftTypeConfig> Clone for StateMachineStore<C> {
@@ -468,6 +559,7 @@ impl<C: RaftTypeConfig> Clone for StateMachineStore<C> {
             inner: self.inner.clone(),
             dir: self.dir.clone(),
             sink: self.sink.clone(),
+            market_data_control: self.market_data_control.clone(),
         }
     }
 }
@@ -549,6 +641,7 @@ impl<C: RaftTypeConfig> StateMachineStore<C> {
             inner: Arc::new(Mutex::new(inner)),
             dir: Arc::new(dir),
             sink,
+            market_data_control: Arc::new(OnceLock::new()),
         })
     }
 
@@ -584,6 +677,34 @@ impl<C: RaftTypeConfig> StateMachineStore<C> {
         &self.sink
     }
 
+    /// Installs the market-data control handle and snapshot depth used when a
+    /// symbol configuration change must reset consumers.
+    pub fn set_market_data_control(&self, control: MarketDataControl, depth_levels: usize) {
+        let _ = self.market_data_control.set((control, depth_levels));
+    }
+
+    /// Resets a publishing feed to the current symbol after a config change.
+    fn publish_market_data_reset(&self, inner: &StateMachineStoreInner<C>) {
+        let Some((control, depth_levels)) = self.market_data_control.get() else {
+            return;
+        };
+        if control.is_publishing() {
+            control.push_snapshot(snapshot_from_inner(inner, *depth_levels));
+        }
+    }
+
+    /// Applies a symbol configuration and, if this node publishes market data,
+    /// resets the feed to the new symbol.
+    fn configure_symbol_locked(
+        &self,
+        inner: &mut StateMachineStoreInner<C>,
+        config: SymbolConfig,
+    ) -> Result<(), String> {
+        inner.configure_symbol(config)?;
+        self.publish_market_data_reset(inner);
+        Ok(())
+    }
+
     /// Publishes one entry's events, logging (but swallowing) sink failures.
     ///
     /// Failure must never fail `apply`: replicas that cannot reach their sink have to keep
@@ -613,6 +734,7 @@ impl<C: RaftTypeConfig> StateMachineStore<C> {
         log_index: u64,
         market_seq: u64,
         ts_ms: u64,
+        symbol_id: u32,
         events: &[MatchEvent],
     ) {
         let Some(tap) = inner.market_data.clone() else {
@@ -626,7 +748,7 @@ impl<C: RaftTypeConfig> StateMachineStore<C> {
             log_index,
             market_seq,
             ts_ms,
-            symbol_id: 0,
+            symbol_id,
             events: events.to_vec(),
             depth,
         });
@@ -652,13 +774,9 @@ where
     ///
     /// Called by the leader watcher on start-up and every leadership gain; it
     /// reads the book once (top-N levels) and never runs per entry.
-    pub async fn capture_market_data_snapshot(
-        &self,
-        depth_levels: usize,
-        symbol_id: u32,
-    ) -> SnapshotFrame {
+    pub async fn capture_market_data_snapshot(&self, depth_levels: usize) -> SnapshotFrame {
         let inner = self.inner.lock().await;
-        snapshot_from_inner(&inner, depth_levels, symbol_id)
+        snapshot_from_inner(&inner, depth_levels)
     }
 
     /// Captures a reset snapshot, queues it and only then opens the feed gate.
@@ -668,14 +786,9 @@ where
     /// published after the snapshot, and no frame applied after the capture can
     /// reach the processor before it (the snapshot is queued first, and the
     /// gate opens only after it).
-    pub async fn start_market_data_feed(
-        &self,
-        control: &MarketDataControl,
-        depth_levels: usize,
-        symbol_id: u32,
-    ) {
+    pub async fn start_market_data_feed(&self, control: &MarketDataControl, depth_levels: usize) {
         let inner = self.inner.lock().await;
-        control.push_snapshot(snapshot_from_inner(&inner, depth_levels, symbol_id));
+        control.push_snapshot(snapshot_from_inner(&inner, depth_levels));
         control.set_leader(true);
     }
 
@@ -786,7 +899,15 @@ where
 
                         let mut o = *order;
                         let log_index = entry.log_id.index;
-                        let outcome = inner.orderbook.execute_order(&mut o);
+                        let outcome = match inner.configured_symbol_for(&o) {
+                            Ok(config) => inner.orderbook.execute_order_with_symbol(&mut o, config),
+                            Err(reason) => inner.orderbook.reject_order(&mut o, reason),
+                        };
+                        if outcome.rejected.is_none() {
+                            // One process serves one symbol: lock the provisioned
+                            // configuration once trading starts.
+                            inner.symbol_locked = true;
+                        }
 
                         // Every event of this entry shares its log index and numbers its
                         // ordinals continuously, so a stop cascade stays one ordered batch.
@@ -858,6 +979,7 @@ where
                             log_index,
                             outcome.market_seq,
                             o.timestamp,
+                            o.symbol_id,
                             &events,
                         );
 
@@ -879,11 +1001,20 @@ where
                                 &expired,
                             ));
                         }
-                        if let Some(cancelled) = inner.orderbook.cancel(order) {
-                            events.push(MatchEvent::for_cancel_at(
+                        if inner.configured_symbol_for(order).is_ok() {
+                            if let Some(cancelled) = inner.orderbook.cancel(order) {
+                                events.push(MatchEvent::for_cancel_at(
+                                    log_index,
+                                    events.len() as u32,
+                                    &cancelled,
+                                ));
+                            }
+                        } else {
+                            events.push(MatchEvent::for_rejected(
                                 log_index,
                                 events.len() as u32,
-                                &cancelled,
+                                order,
+                                RejectReason::UnsupportedOrder,
                             ));
                         }
                         inner.record_events(&events);
@@ -893,6 +1024,7 @@ where
                             log_index,
                             market_seq,
                             order.timestamp,
+                            order.symbol_id,
                             &events,
                         );
                         MatchEngineResponse::applied(market_seq, &events)
@@ -917,21 +1049,29 @@ where
                                 &expired,
                             ));
                         }
-                        match inner
-                            .orderbook
-                            .amend_with_sequence(order, *price, *volume, market_seq)
-                        {
-                            Ok(amendment) => events.push(MatchEvent::for_amended(
-                                log_index,
-                                events.len() as u32,
-                                &amendment,
-                            )),
-                            Err(err) => events.push(MatchEvent::for_rejected(
+                        match inner.validate_amend_values(order, *price, *volume) {
+                            Err(reason) => events.push(MatchEvent::for_rejected(
                                 log_index,
                                 events.len() as u32,
                                 order,
-                                err.reason(),
+                                reason,
                             )),
+                            Ok(_) => match inner
+                                .orderbook
+                                .amend_with_sequence(order, *price, *volume, market_seq)
+                            {
+                                Ok(amendment) => events.push(MatchEvent::for_amended(
+                                    log_index,
+                                    events.len() as u32,
+                                    &amendment,
+                                )),
+                                Err(err) => events.push(MatchEvent::for_rejected(
+                                    log_index,
+                                    events.len() as u32,
+                                    order,
+                                    err.reason(),
+                                )),
+                            },
                         }
                         inner.record_events(&events);
                         self.publish_match_events(&events);
@@ -940,6 +1080,7 @@ where
                             log_index,
                             market_seq,
                             order.timestamp,
+                            order.symbol_id,
                             &events,
                         );
                         MatchEngineResponse::applied(market_seq, &events)
@@ -959,14 +1100,25 @@ where
                             .collect();
                         inner.record_events(&events);
                         self.publish_match_events(&events);
+                        let symbol_id = inner.symbol_config.symbol_id;
                         self.publish_market_frame(
                             &mut inner,
                             entry.log_id.index,
                             market_seq,
                             *now_ms,
+                            symbol_id,
                             &events,
                         );
                         MatchEngineResponse::applied(market_seq, &events)
+                    }
+                    MatchEngineRequest::ConfigureSymbol { config } => {
+                        match self.configure_symbol_locked(&mut inner, *config) {
+                            Ok(()) => MatchEngineResponse::new(format!(
+                                "symbol {} configured",
+                                config.symbol_id
+                            )),
+                            Err(error) => MatchEngineResponse::error(error),
+                        }
                     }
                 },
                 EntryPayload::Membership(mem) => {
@@ -1140,7 +1292,6 @@ where
 fn snapshot_from_inner<C: RaftTypeConfig>(
     inner: &StateMachineStoreInner<C>,
     depth_levels: usize,
-    symbol_id: u32,
 ) -> SnapshotFrame {
     let log_index = inner
         .last_applied_log
@@ -1154,7 +1305,7 @@ fn snapshot_from_inner<C: RaftTypeConfig>(
         log_index,
         market_seq: inner.orderbook.sequence, // next sequence: the reset boundary
         ts_ms,
-        symbol_id,
+        symbol_id: inner.symbol_config.symbol_id,
         bids: inner.orderbook.depth(OrderSide::Buy, depth_levels),
         asks: inner.orderbook.depth(OrderSide::Sell, depth_levels),
         last_trade: inner.orderbook.last_trade_price,
@@ -1176,6 +1327,124 @@ mod tests {
             CommittedLeaderIdOf::<MatchEngineTypeConfig>::new(term, 1),
             index,
         )
+    }
+
+    #[test]
+    fn symbol_config_controls_precision_and_rejects_other_symbols() {
+        use crate::matchengine::SymbolConfig;
+
+        let mut inner = StateMachineStoreInner::<MatchEngineTypeConfig>::default();
+        assert!(
+            inner
+                .configure_symbol(SymbolConfig {
+                    symbol_id: 0,
+                    price_decimals: 19,
+                    quantity_decimals: 2,
+                })
+                .is_err(),
+            "more than 18 decimals is invalid"
+        );
+        inner
+            .configure_symbol(SymbolConfig::new(0, 2, 2).unwrap())
+            .unwrap();
+
+        let mut too_precise = Order::new(
+            crate::matchengine::OrderSide::Buy,
+            "100.255".parse::<Fixed>().unwrap(),
+            "1.5".parse::<Fixed>().unwrap(),
+            0,
+        );
+        let outcome = inner
+            .orderbook
+            .execute_order_with_symbol(&mut too_precise, inner.symbol_config());
+        assert_eq!(Some(RejectReason::InvalidOrder), outcome.rejected);
+
+        let mut valid = Order::new(
+            crate::matchengine::OrderSide::Buy,
+            "100.25".parse::<Fixed>().unwrap(),
+            "1.5".parse::<Fixed>().unwrap(),
+            0,
+        );
+        let outcome = inner
+            .orderbook
+            .execute_order_with_symbol(&mut valid, inner.symbol_config());
+        assert_eq!(None, outcome.rejected);
+        assert_eq!(1, inner.orderbook.bids.len());
+
+        // The configured symbol precision cannot change after trading starts.
+        assert!(
+            inner
+                .configure_symbol(SymbolConfig::new(0, 3, 3).unwrap())
+                .is_err()
+        );
+
+        // A process configured for symbol 0 rejects an order routed to symbol 1.
+        let mut other = Order::new(
+            crate::matchengine::OrderSide::Buy,
+            "100.25".parse::<Fixed>().unwrap(),
+            "1.5".parse::<Fixed>().unwrap(),
+            0,
+        )
+        .with_symbol(1);
+        let outcome = inner
+            .orderbook
+            .execute_order_with_symbol(&mut other, inner.symbol_config());
+        assert_eq!(Some(RejectReason::UnsupportedOrder), outcome.rejected);
+
+        // A fresh process can be provisioned for a different symbol before trading.
+        let mut other_process = StateMachineStoreInner::<MatchEngineTypeConfig>::default();
+        other_process
+            .configure_symbol(SymbolConfig::new(7, 2, 2).unwrap())
+            .unwrap();
+        let mut symbol_seven = Order::new(
+            crate::matchengine::OrderSide::Buy,
+            "100.25".parse::<Fixed>().unwrap(),
+            "1.5".parse::<Fixed>().unwrap(),
+            0,
+        )
+        .with_symbol(7);
+        let outcome = other_process
+            .orderbook
+            .execute_order_with_symbol(&mut symbol_seven, other_process.symbol_config());
+        assert_eq!(None, outcome.rejected);
+        assert_eq!(7, other_process.symbol_config().symbol_id);
+    }
+
+    #[tokio::test]
+    async fn symbol_configuration_resets_a_publishing_feed() {
+        use crate::matchengine::SymbolConfig;
+        use std::sync::atomic::AtomicBool;
+
+        let dir = tempdir();
+        let store = StateMachineStore::<MatchEngineTypeConfig>::open(dir.path()).unwrap();
+        let leader = Arc::new(AtomicBool::new(true));
+        let resetting = Arc::new(AtomicBool::new(false));
+        let pending = Arc::new(std::sync::Mutex::new(None));
+        let control = MarketDataControl::new(leader, true, resetting, pending);
+        store.set_market_data_control(control.clone(), 5);
+
+        let mut inner = store.inner().lock().await;
+        store
+            .configure_symbol_locked(&mut inner, SymbolConfig::new(7, 2, 2).unwrap())
+            .unwrap();
+        let snapshot = control.take_pending().expect("a symbol reset was queued");
+        assert_eq!(7, snapshot.symbol_id);
+    }
+
+    #[tokio::test]
+    async fn market_data_snapshot_uses_configured_symbol() {
+        use crate::matchengine::SymbolConfig;
+
+        let dir = tempdir();
+        let store = StateMachineStore::<MatchEngineTypeConfig>::open(dir.path()).unwrap();
+        {
+            let mut inner = store.inner().lock().await;
+            inner
+                .configure_symbol(SymbolConfig::new(7, 2, 2).unwrap())
+                .unwrap();
+        }
+        let snapshot = store.capture_market_data_snapshot(5).await;
+        assert_eq!(7, snapshot.symbol_id);
     }
 
     #[tokio::test]
@@ -1688,7 +1957,7 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Relaxed)
         );
 
-        let snapshot = store.capture_market_data_snapshot(5, 0).await;
+        let snapshot = store.capture_market_data_snapshot(5).await;
         assert_eq!(2, snapshot.log_index);
         assert_eq!(2, snapshot.market_seq, "the next sequence is the boundary");
         assert_eq!(1, snapshot.bids.len(), "the bid remainder is captured");
@@ -1758,7 +2027,7 @@ mod tests {
             Arc::new(std::sync::atomic::AtomicBool::new(true)),
             Arc::new(Mutex::new(None)),
         );
-        store.start_market_data_feed(&control, 5, 0).await;
+        store.start_market_data_feed(&control, 5).await;
         assert!(channels.enabled.load(Ordering::Relaxed), "gate opened");
 
         let snapshot = control.take_pending().expect("snapshot queued");

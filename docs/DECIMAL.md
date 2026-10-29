@@ -1,10 +1,11 @@
 # Decimal and fixed-point options for price and volume
 
 Status: **implemented end-to-end.** `Order`, `OrderBook.last_trade_price`, match events,
-depth/BBO/spread, `/read`, the market-data feed, snapshot v6 and wire v3 use 18-scale `Fixed`
-integers. JSON emits decimal strings and accepts legacy numeric input. `SymbolConfig` defines
-per-symbol precision, but enforcement and multi-symbol routing are still pending. This document
-keeps the comparison and benchmarks that led to the integer representation.
+depth/BBO/spread, `/read`, the market-data feed, snapshot v7 and wire v3 use 18-scale `Fixed`
+integers. JSON emits decimal strings and accepts legacy numeric input. One process/cluster trades
+exactly one symbol, whose replicated `SymbolConfig` is enforced and locked after the first order;
+multi-symbol isolation is deployment-level (one process per symbol). This document keeps the
+comparison and benchmarks that led to the integer representation.
 
 ## Recommendation
 
@@ -218,22 +219,24 @@ Implemented in `src/matchengine/fixed.rs`, `Order` and the state machine:
   market-data records are `Fixed`. The shadow book is keyed by `Fixed`, not by `f64` bits.
 - Market-data wire **v3** encodes every price and quantity as a little-endian scale-18 `i128`
   (16 bytes); v2 frames are not silently reinterpreted.
-- Snapshot **v6** stores the last trade price and match events as fixed-point values. Older
-  snapshots are rejected with a clear error.
+- Snapshot **v7** stores the last trade price, match events and the single-symbol precision
+  configuration as fixed-point/deterministic values. Older snapshots are rejected with a clear
+  error.
 - `Fixed::notional(price, quantity)` multiplies through a 256-bit intermediate and truncates toward
   zero at 18 places. `Fixed * Fixed` uses the same checked path; the matching loop itself does not
   multiply price by quantity.
 - JSON emits decimal strings for all `Fixed` values, so 18-digit values round-trip exactly. Legacy
   numeric JSON payloads are still accepted on input.
-- `Order.symbol_id` identifies the instrument; `SymbolConfig` declares accepted price/quantity
-  decimals per symbol (0..=18). Values are normalized to the common 18-digit scale, so a 2-decimal
-  equity and an 18-decimal BTC market share one fast representation.
+- `Order.symbol_id` must match the process/cluster's configured symbol; `SymbolConfig` declares
+  the accepted price/quantity decimals (0..=18). Values are normalized to the common 18-digit
+  scale, so a 2-decimal process and an 18-decimal process share the same fast code path.
 
 Remaining exactness work:
 
-- `SymbolConfig` is not yet enforced by intake or `apply`, and the engine still has one book. Until
-  per-symbol books land, reject unsupported `symbol_id` values and enforce the configured decimals;
-  persist the registry in replicated state so validation cannot diverge.
+- `SymbolConfig` is replicated and enforced for the one symbol a process/cluster trades; orders
+  with a different `symbol_id` or excess precision are rejected. The configuration locks after the
+  first accepted order. Multi-symbol scaling is deployment-level: run a separate process/cluster
+  per symbol so resources and failures stay isolated.
 - `to_f64` and `From<f64>` remain for legacy JSON input and test assertions. No public financial
   output or replicated financial field passes through `f64`.
 - Notional settlement and fee rounding policies still need product decisions; the arithmetic
@@ -241,11 +244,10 @@ Remaining exactness work:
 
 Recommended next steps:
 
-1. Wire `SymbolConfig` into every instrument's intake and `apply` path and reject unsupported
-   symbols; add per-symbol books, reads and feed routing.
+1. Document the one-process-per-symbol deployment contract and add gateway routing/isolation.
 2. Define the notional/settlement rounding policy and use `Fixed::notional` or `i256` directly.
 3. Benchmark the matching loop and feed before/after; keep the "matching must not regress" gate.
-4. Record the wire v3/v6 compatibility policy in the deployment notes.
+4. Record the wire v3/v7 compatibility policy in the deployment notes.
 
 ## Decision summary
 
@@ -260,5 +262,6 @@ Recommended next steps:
 | Global compile-time fixed scale | `fixed` or custom integer newtypes |
 
 The former `f64` representation has been removed from replicated state and public financial outputs;
-legacy numeric JSON input is still accepted for compatibility. The remaining decimal work is
-per-symbol enforcement/routing, not the representation itself.
+legacy numeric JSON input is still accepted for compatibility. One process/cluster enforces one
+symbol's precision; multi-symbol isolation is deployment-level, not a second book in the same
+process.

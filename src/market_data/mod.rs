@@ -379,7 +379,7 @@ pub struct MarketMessage {
     pub leader_id: u64,
     /// Intake timestamp (Unix ms).
     pub ts_ms: u64,
-    /// Instrument id (0 until the engine is multi-symbol).
+    /// Instrument id of this process/cluster.
     pub symbol_id: u32,
     /// Message payload.
     pub body: MessageBody,
@@ -417,7 +417,7 @@ pub struct TapFrame {
     pub market_seq: u64,
     /// Intake timestamp of the request (Unix ms).
     pub ts_ms: u64,
-    /// Instrument id (0 today).
+    /// Instrument id of this process/cluster.
     pub symbol_id: u32,
     /// Events the entry produced.
     pub events: Vec<MatchEvent>,
@@ -436,7 +436,7 @@ pub struct SnapshotFrame {
     pub market_seq: u64,
     /// Capture timestamp (Unix ms).
     pub ts_ms: u64,
-    /// Instrument id (0 today).
+    /// Instrument id of this process/cluster.
     pub symbol_id: u32,
     /// Bid levels, best first.
     pub bids: Vec<DepthLevel>,
@@ -668,6 +668,11 @@ impl MarketDataControl {
     /// Suppresses emission until the next reset snapshot is applied.
     pub fn begin_reset(&self) {
         self.resetting.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether this node is currently allowed to publish (leader-only check).
+    pub fn is_publishing(&self) -> bool {
+        !self.leader_only || self.leader.load(Ordering::Relaxed)
     }
 
     /// Opens or closes the publish gate (the tap and processor share it).

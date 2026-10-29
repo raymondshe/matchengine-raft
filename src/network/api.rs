@@ -82,6 +82,7 @@ pub struct EventsStatus {
 /// - `Amend`: Change the price and/or open volume of a resting limit order
 /// - `PurgeExpired`: Evict GTD/Day orders whose deadline has passed (the
 ///   timestamps travel in the request, so the state machine stays deterministic)
+/// - `ConfigureSymbol`: Add or update a symbol's accepted price/quantity precision
 ///
 /// # Returns
 ///
@@ -121,7 +122,7 @@ fn stamp_intake_time(request: &mut MatchEngineRequest) {
         MatchEngineRequest::Place { order, .. }
         | MatchEngineRequest::Cancel { order }
         | MatchEngineRequest::Amend { order, .. } => order.timestamp = now_ms,
-        MatchEngineRequest::PurgeExpired { .. } => {}
+        MatchEngineRequest::PurgeExpired { .. } | MatchEngineRequest::ConfigureSymbol { .. } => {}
     }
 }
 
@@ -142,6 +143,8 @@ fn stamp_intake_time(request: &mut MatchEngineRequest) {
 /// - `orderbook_sequence`: Returns the current sequence number
 /// - `orderbook_sequance`: Accepted as a legacy spelling of the above
 /// - `marketdata_status`: Market-data feed counters and gate state (`{}` when the feed is off)
+/// - `symbol_config`: This process/cluster's replicated symbol and precision configuration
+/// - `symbol_id`: The one symbol this process/cluster trades
 ///
 /// Any other key returns an empty string.
 ///
@@ -400,6 +403,8 @@ where
             .last_trade_price
             .map_or_else(|| "null".to_string(), |value| value.to_string()),
         "orderbook_sequence" | "orderbook_sequance" => inner.orderbook.sequence.to_string(),
+        "symbol_config" => serde_json::to_string(&inner.symbol_config()).unwrap_or_default(),
+        "symbol_id" => inner.symbol_config().symbol_id.to_string(),
         _ if key.starts_with("orderbook_depth:") => {
             let levels = key
                 .trim_start_matches("orderbook_depth:")
@@ -430,6 +435,7 @@ mod tests {
     use crate::MatchEngineTypeConfig;
     use crate::matchengine::Order;
     use crate::matchengine::OrderSide;
+    use crate::matchengine::SymbolConfig;
 
     fn book() -> StateMachineStoreInner<MatchEngineTypeConfig> {
         let mut inner = StateMachineStoreInner::<MatchEngineTypeConfig>::default();
@@ -457,6 +463,16 @@ mod tests {
         let full: serde_json::Value =
             serde_json::from_str(&read_state(&inner, "orderbook_depth")).unwrap();
         assert_eq!(2, full["bids"].as_array().unwrap().len());
+    }
+
+    #[test]
+    fn read_symbol_config() {
+        let inner = StateMachineStoreInner::<MatchEngineTypeConfig>::default();
+        assert_eq!("0", read_state(&inner, "symbol_id"));
+        let config: SymbolConfig =
+            serde_json::from_str(&read_state(&inner, "symbol_config")).unwrap();
+        assert_eq!(SymbolConfig::default(), config);
+        assert_eq!("", read_state(&inner, "symbol_config:9"));
     }
 
     #[test]

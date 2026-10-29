@@ -141,9 +141,10 @@ pub struct Order {
     pub live: OrderType,
     /// Whether this is a Buy or Sell order.
     pub side: OrderSide,
-    /// Instrument id (0 until the engine is multi-symbol). The per-symbol
-    /// [`crate::matchengine::fixed::SymbolConfig`] controls accepted price and
-    /// quantity precision; values are stored at the common 18-decimal scale.
+    /// Instrument id. It must match this process/cluster's configured
+    /// [`crate::matchengine::fixed::SymbolConfig`], which controls accepted
+    /// price and quantity precision; values are stored at the common 18-decimal
+    /// scale. Multi-symbol means a separate process/cluster per symbol.
     #[serde(default)]
     pub symbol_id: u32,
     /// The price level for this order (for limit orders), scale 18.
@@ -881,13 +882,45 @@ impl OrderBook {
     ///
     /// * `order` - The order to process (will have its sequence number set)
     pub fn execute_order(&mut self, order: &mut Order) -> Outcome {
+        self.execute_order_inner(order, None)
+    }
+
+    /// Executes an order with the configured symbol's precision configuration.
+    ///
+    /// The configuration is authoritative at apply time: it rejects an
+    /// unsupported `symbol_id` and any price/quantity with more fractional
+    /// digits than the symbol declares. [`OrderBook::execute_order`] keeps the
+    /// legacy unchecked path for unit tests and callers that already validated.
+    pub fn execute_order_with_symbol(
+        &mut self,
+        order: &mut Order,
+        config: SymbolConfig,
+    ) -> Outcome {
+        self.execute_order_inner(order, Some(config))
+    }
+
+    /// Consumes the next sequence and returns a rejected outcome without
+    /// touching the book. Used when the symbol is unknown or differs from this
+    /// process's configured symbol.
+    pub fn reject_order(&mut self, order: &mut Order, reason: RejectReason) -> Outcome {
+        order.sequence = self.next_market_sequence();
+        Outcome {
+            market_seq: order.sequence,
+            rejected: Some(reason),
+            ..Outcome::default()
+        }
+    }
+
+    fn execute_order_inner(&mut self, order: &mut Order, config: Option<SymbolConfig>) -> Outcome {
         order.sequence = self.next_market_sequence();
 
         let mut outcome = Outcome {
             market_seq: order.sequence,
             ..Outcome::default()
         };
-        if let Some(reason) = validate_order(order) {
+        let rejection = validate_order(order)
+            .or_else(|| config.and_then(|config| validate_order_for_symbol(order, config)));
+        if let Some(reason) = rejection {
             outcome.rejected = Some(reason);
             return outcome;
         }
@@ -1550,6 +1583,30 @@ fn amend_in_map<K: Ord>(
         },
         true,
     )
+}
+
+/// Checks an order against a symbol's declared decimal precision.
+///
+/// The order must belong to the configured symbol; otherwise it is refused as
+/// an unsupported order. Price fields use `price_decimals`, quantity fields
+/// use `quantity_decimals`.
+fn validate_order_for_symbol(order: &Order, config: SymbolConfig) -> Option<RejectReason> {
+    if order.symbol_id != config.symbol_id {
+        return Some(RejectReason::UnsupportedOrder);
+    }
+    let price_ok = order.price.has_at_most_decimals(config.price_decimals)
+        && order.stop_price.has_at_most_decimals(config.price_decimals);
+    let quantity_ok = order.volume.has_at_most_decimals(config.quantity_decimals)
+        && order
+            .display_volume
+            .has_at_most_decimals(config.quantity_decimals)
+        && order
+            .hidden_volume
+            .has_at_most_decimals(config.quantity_decimals);
+    if !price_ok || !quantity_ok {
+        return Some(RejectReason::InvalidOrder);
+    }
+    None
 }
 
 /// Checks an order's shape and whether its type combination is supported;

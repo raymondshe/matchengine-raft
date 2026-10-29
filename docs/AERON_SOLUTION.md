@@ -504,7 +504,7 @@ Status: **core implemented; Aeron adapter pending.** The deterministic pipeline 
 `src/market_data/`: depth journal, tap, shadow book, OHLC bars, entry-driven sequencing, snapshots,
 leader gating, JSONL sink, the binary wire encoder and `/read marketdata_status`. U8 (deterministic
 `market_seq`/`sub_seq` keys) is implemented and tested; the Aeron transport (`rusteron` + media
-driver), Archive replay and multi-symbol routing remain. Progress and acceptance criteria:
+driver) and Archive replay remain; multi-symbol scaling is one process/cluster per symbol. Progress and acceptance criteria:
 `docs/MARKET_DATA_PLAN.md`. Every Aeron transport property quoted here comes
 from §3.2; nothing in this part has been benchmarked.
 
@@ -605,13 +605,12 @@ stops are not depth either; they appear only as `LIFECYCLE` events (`triggered`)
    bucket index in `TODO.md` §9 stays a matching-side optimization; the feed does not depend on it.
 6. **Prices and quantities are scale-18 integers.** Wire v3 encodes every financial value as a
    little-endian `i128` at 18 fractional digits; no public financial output crosses `f64`.
-7. **Multi-symbol is planned.** Today the state machine owns one book, but the next step is one
-   book per instrument inside the same state machine. The feed is designed for that from day one:
-   every message carries `symbol_id`, and all derived state — shadow books, OHLC aggregators, depth
-   snapshots, BBO — is keyed by it. Until the engine learns symbols, every message carries
-   `symbol_id = 0`; adding symbols later changes routing, not the schema. (Prerequisite on the
-   engine side: `symbol_id` on the order/request and a per-symbol book; the feed does not invent
-   it.)
+7. **One process/cluster per symbol.** A process trades exactly one symbol; multi-symbol means
+   running a separate process/cluster per symbol so CPU, memory, logs, snapshots and failures stay
+   isolated. The engine does not route multiple books. The feed schema still carries `symbol_id` on
+   every message, and all derived state — shadow books, OHLC aggregators, depth snapshots, BBO — is
+   keyed by it, but a deployment normally has one active value. The replicated `SymbolConfig` and
+   `symbol_locked` flag pin the process to its symbol and precision.
 8. **The disabled feed must be free.** The journal is optional and transient (`#[serde(skip)]`,
    not in snapshots); with no market-data sink configured each recording point is one predictable
    branch and nothing else. A benchmark gate (§22) compares matching with the feed on and off, so a
@@ -652,7 +651,7 @@ seeder task (rare: startup, leadership gain, optional reconciliation)
   and appends `(side, price, delta)` entries to a reusable journal at the points where the book
   already changes. O(1) per mutation, no tree walks, no serialization, no clock, no
   allocation once warm. The journal is cleared per batch; the queue is preallocated.
-- **Market-data thread.** Owns the per-symbol shadow books, derives BBO/last trade, applies deltas,
+- **Market-data thread.** Owns the shadow book for the process symbol, derives BBO/last trade, applies deltas,
   assembles snapshots, encodes messages, emits one batch per applied entry, offers to Aeron, retries
   back-pressure, counts gaps, and (optionally) records to an Archive. All CPU-heavy and IO work sits
   here.
@@ -704,8 +703,8 @@ flag; tests pin them.
   or a single collector that bridges to the bus (§19).
 
 One publication per stream so a large depth batch cannot head-of-line-block a trade or status.
-Streams are **multiplexed by `symbol_id`** — the six streams serve every instrument, so a
-multi-symbol engine does not multiply the channel count. Publications are created lazily on
+Streams are **multiplexed by `symbol_id`** — the six streams can serve several deployments, so
+multi-symbol scaling does not multiply the channel count. Publications are created lazily on
 leadership gain (`add_exclusive_publication`, single writer) and closed on loss. Memory: six
 publications × 1–4 MiB terms ≈ 8–24 MiB per node plus the driver's mappings; followers keep theirs
 closed but still run a driver because leadership can move.
@@ -733,7 +732,7 @@ Common header (64 bytes, little-endian) then the body:
 | 32 | 8 | `epoch` — Raft term (leader generation) |
 | 40 | 8 | `leader_id` |
 | 48 | 8 | `ts_ms` — **authoritative** event time: the taker order's `timestamp`, or the max in a batch |
-| 56 | 4 | `symbol_id` (0 until multi-symbol lands; see §13.7) |
+| 56 | 4 | `symbol_id` (the process/cluster symbol; see §13.7) |
 | 60 | 2 | `sub_seq` — index within `(stream, market_seq)`; 0 for a frame message, 1 for the reset BBO, `u16::MAX` for `GAP` |
 | 62 | 2 | reserved (0) |
 | 64 | … | body |
@@ -865,9 +864,10 @@ independent of the feed.
   those are committed, so they are not wrong — consumers dedupe on
   `(symbol_id, stream_id, market_seq, sub_seq)` (§16.1) and honour the `RESET`/snapshot ordering
   rule. The keys are replicated-state derived, so the handover does not reset the sequence space.
-- **Leader restart.** State is restored from the v6 snapshot plus log replay (v6 stores the last
-  trade and match events as fixed-point; v5 stored order prices/quantities; v4 carries the
-  match-event window and submission dedupe map; v3 added stops and `last_trade_price`); the seeder
+- **Leader restart.** State is restored from the v7 snapshot plus log replay (v7 adds the
+  single-symbol precision configuration; v6 stores the last trade and match events as fixed-point;
+  v5 stored order prices/quantities; v4 carries the match-event window and submission dedupe map;
+  v3 added stops and `last_trade_price`); the seeder
   captures the restored book and the snapshot-then-deltas rule applies. Replayed entries are below
   the reset boundary (the next `market_seq`) and are therefore suppressed.
 - **Follower installs a snapshot.** It is not publishing, but its shadow book is now stale (an
@@ -1002,8 +1002,8 @@ is the JSONL file above.
 - timestamps: every message's `ts_ms` is the mutating request's replicated intake timestamp
   (cancel/amend use their key order's; expiry uses `now_ms`); nothing is re-timed at publish time,
   and bar windows are aligned to that timestamp;
-- multi-symbol: interleaved fills for two symbols produce independent shadows, BBO and bars with no
-  cross-talk, and `symbol_id` routes every record;
+- one process per symbol: the configured `symbol_id` labels every record, and separate deployments
+  have independent shadows, BBO, bars and failure domains;
 - OHLC: reference aggregation over a random tape, epoch-aligned windows, multiple intervals,
   live-bar `partial` updates, and the window roll on the entry whose trade opens a new window;
 - encoder/decoder golden tests per message type, header flags, versioning, and a `u32` trade count
@@ -1057,7 +1057,7 @@ until measured** — same rule as Part I.
 
 | Phase | Deliverable | Exit criterion | Days |
 |---|---|---|---|
-| 1 | Depth journal + tap + per-symbol shadow books + in-process publisher (no Aeron); `symbol_id` plumbing (0 until the engine is multi-symbol); on/off benchmark gate; unit, determinism and shadow-equivalence tests | journal/journal-free benchmarks show no regression; shadow books match a fresh capture; default build unchanged | 3–4 |
+| 1 | Depth journal + tap + shadow book for the process symbol + in-process publisher (no Aeron); `symbol_id` plumbing for the configured process symbol; on/off benchmark gate; unit, determinism and shadow-equivalence tests | journal/journal-free benchmarks show no regression; shadow books match a fresh capture; default build unchanged | 3–4 |
 | 2 | `rusteron` behind a feature; trades + BBO streams; embedded driver in tests | subscriber receives scripted trades/BBO over IPC and UDP; apply latency unchanged under a stalled publisher | 3–5 |
 | 3 | Depth snapshots + post-batch totals, seeder on takeover, status/gap streams, deterministic sequencing (§16.1/U8), OHLC bars, `/read` status | mid-stream subscriber reconstructs the book; gap → resync works; identical keys across replicas; bars match an independent aggregation | 4–6 |
 | 4 | Leader gating, failover + back-pressure tests, metrics, reconciliation alarm | leader kill produces `RESET` + snapshot, no loss after dedupe | 3–4 |
@@ -1082,7 +1082,7 @@ book.
 | Anyone adds a clock read to the feed and breaks replica determinism | High | every timestamp is the mutating request's intake time, carried through the log; the two-replica byte-diff test covers bars too |
 | The tap creeps into the matching loop (scans, allocations, encoding) | High | isolation rules in §14; journal only records values the operation already has; on/off benchmark gate in §22; code review checklist for the matching module |
 | Shadow book diverges from the engine | Medium | journal is exact by construction; equivalence test over scripted and randomized workloads; reconciliation counter plus snapshot resync |
-| Multi-symbol fan-out multiplies derived state and traffic | Medium | shared streams with `symbol_id` routing; per-symbol shadow books sized for the actual symbol count; consider sharding a busy symbol onto its own channel set |
+| Multi-symbol fan-out multiplies derived state and traffic | Medium | run one process/cluster per symbol; the feed schema still carries `symbol_id` for routing and dedupe across deployments |
 | Shedding silently hides lifecycle records | Medium | only `rested` is shed above `lifecycle_batch_max`, the count is exposed in `STATUS`, and the tape is recoverable from the log |
 | Intake timestamps can be skewed or non-monotonic (clock step, leader handover) | Medium | the leader stamps the timestamp at intake and it is replicated with the log entry; ordering never uses it; bars expose `window_start_ms`/`last_ts_ms` and merge associatively across handovers |
 | Tap queue capacity is wrong for a deployment | Medium | configurable; overflow is counted and marked with `GAP`; size it with the load test |
@@ -1116,9 +1116,8 @@ book.
   touches the book module; events alone would leave the tap fully outside `matchengine/` but need
   extra fields (`side`, maker remaining, refill) to reconstruct depth. Which boundary do we prefer?
 - Reconciliation cadence for the shadow book: never, on a timer, or only on a divergence alarm?
-- Where does `symbol_id` come from (client-supplied on the order, or assigned by the gateway), and
-  who owns the symbol table? How many symbols per node at launch, and what is the expected split of
-  traffic between them?
+- ~~Where does `symbol_id` come from?~~ Resolved: one process/cluster per symbol; the gateway
+  routes orders to the right deployment, and the engine rejects a mismatched `symbol_id`.
 - Do bars belong on the same feed or on a separate analytics feed with different retention?
 - Default bar intervals per venue: is `1s,1m` enough, or does the first consumer need `5m/1h` too?
 - Default rates and bursts per venue: what is the target consumer's capacity, and who owns the

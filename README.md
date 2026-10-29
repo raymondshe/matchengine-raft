@@ -318,7 +318,9 @@ tests/
     ├── test_market_data.rs    # Market-data feed: snapshot, trades, BBO, depth, bars
     ├── test_events.rs         # Event log: write events, cursor, retention, dedupe
     ├── test_membership.rs     # Leader failover + learner catch-up from a live log
-    └── test_late_join.rs      # Stale node rejoins and catches up from live members
+    ├── test_late_join.rs      # Stale node rejoins and catches up from live members
+    ├── test_exactness.rs      # 18-digit values through API, events, feed and snapshot restart
+    └── test_symbols.rs        # One-symbol config, precision rejection and symbol lock
 ```
 
 ## Storage Implementation
@@ -348,7 +350,7 @@ avoiding a second fsync per batch.
 ### Snapshots (`src/store/state_machine.rs`)
 
 The state machine (order book + sequence counter + retained match-event window + submission dedupe
-map) stays in memory so applying entries is fast. Snapshot v6 is written as
+map) stays in memory so applying entries is fast. Snapshot v7 is written as
 `snapshot/current.snap` using the same atomic temp-file/rename protocol; `install_snapshot`
 validates the incoming bytes before replacing the durable copy, so a bad snapshot cannot destroy a
 good one.
@@ -361,6 +363,8 @@ pub struct StateMachineData {
     pub sequence: u64,
     pub stops: Vec<Order>,
     pub last_trade_price: Option<Fixed>,
+    pub symbol_config: SymbolConfig, // the one symbol this process/cluster trades
+    pub symbol_locked: bool,         // true after the first accepted order
     pub events: Vec<StoredMatchEvent>, // retained match events, oldest first
     pub events_evicted: u64,
     pub submissions: Vec<SubmissionRecord>, // client_order_id dedupe, oldest first
@@ -478,7 +482,7 @@ POST /write { Place | Cancel | Amend | PurgeExpired }
 `Place` accepts an optional `client_order_id`; retrying it returns the original sequence and
 events instead of placing a second order. The event window is bounded by `--max-events` (env
 `MAX_EVENTS`, default 262144); the submission map has a separate fixed 262144-record cap so retry
-resolution never depends on a node-local flag. Both are included in snapshot v6. `GET /events/status` reports the
+resolution never depends on a node-local flag. Both are included in snapshot v7. `GET /events/status` reports the
 oldest/last retained id and eviction counters; consumers resume from `next_after` and dedupe on
 `event_id`.
 
@@ -541,8 +545,8 @@ designed in `docs/AERON_SOLUTION.md` Part II and implemented in `src/market_data
 
 The shipped sink is JSONL for debugging. The same messages have a binary encoding in
 `src/market_data/wire.rs` (64-byte header, version 3, scale-18 `i128` bodies), and `MarketDataSink`
-is the seam the Aeron adapter will implement (next phase). The schema is multi-symbol ready
-(`symbol_id`, 0 today). Tuning: `--market-data-depth`, `--market-data-status-every`,
+is the seam the Aeron adapter will implement (next phase). Every message carries the configured
+process `symbol_id`, so separate per-symbol deployments can share a bus. Tuning: `--market-data-depth`, `--market-data-status-every`,
 `--market-data-bar-intervals-ms`, `--market-data-leader-only`.
 
 `/read marketdata_status` returns the feed counters and the leader gate.
@@ -614,10 +618,11 @@ directions are capped at 64 MiB. `Unavailable` maps to `RPCError::Unreachable`, 
 
 ### Application APIs
 
-- `POST /write` - Submit a `Place`, `Cancel`, `Amend` or `PurgeExpired` request through Raft. The
-  response is the assigned `market_seq` for every mutating request (for a `Place`, also the order
-  sequence) plus the entry's first events (capped at 512). `Place` accepts an optional
-  `client_order_id` for idempotent retries.
+- `POST /write` - Submit a `Place`, `Cancel`, `Amend`, `PurgeExpired` or `ConfigureSymbol` request
+  through Raft. Order/mutation requests return the assigned `market_seq` (for a `Place`, also the
+  order sequence) plus the entry's first events (capped at 512). `ConfigureSymbol` returns a status
+  string and uses the `error` field on refusal; it does not consume a market sequence. `Place`
+  accepts an optional `client_order_id` for idempotent retries.
 - `POST /read` - Read from the local state machine (may be stale)
 - `POST /linearizable_read` - Linearizable read; the request must reach the leader
 - `POST /follower_read` - Linearizable read served locally after fetching a linearizer from the leader
@@ -632,6 +637,7 @@ pub enum MatchEngineRequest {
     Cancel { order: Order },
     Amend { order: Order, price: Option<Fixed>, volume: Option<Fixed> },
     PurgeExpired { now_ms: u64, day_close_ms: Option<u64> },
+    ConfigureSymbol { config: SymbolConfig },
 }
 
 pub struct MatchEngineResponse {
@@ -639,11 +645,13 @@ pub struct MatchEngineResponse {
     pub sequence: Option<u64>,        // assigned market_seq
     pub events: Vec<MatchEvent>,      // first 512 events of the entry
     pub events_truncated: bool,       // true when more events exist
+    pub error: Option<String>,        // non-fatal application error
 }
 ```
 
-Every mutating request consumes one `market_seq`; `Place` also uses it as the order sequence.
-The response carries at most 512 events; the full batch is available from `/events`.
+Every order/mutation request consumes one `market_seq`; `Place` also uses it as the order
+sequence, while `ConfigureSymbol` does not consume one. The response carries at most 512 events;
+the full batch is available from `/events`.
 `client_order_id` is optional and only affects `Place`: a retry returns the original sequence and
 events instead of placing a second order.
 
@@ -659,12 +667,16 @@ order book:
 - `marketdata_status` - market-data feed counters and gate state (`{}` when the feed is off)
 - `orderbook_sequence` - the order sequence counter (`orderbook_sequance` is accepted as a legacy
   alias)
+- `symbol_config` - this process/cluster's replicated symbol and precision configuration
+- `symbol_id` - the one symbol this process/cluster trades
 
 Prices and quantities are stored internally as exact 18-scale fixed-point integers. JSON accepts
 either decimal strings or legacy numbers; match events, `/read` and the market-data feed emit
-decimal strings so 18-decimal values round-trip exactly. `SymbolConfig` defines each instrument's
-accepted price/quantity decimals (maximum 18), but enforcement and multi-symbol routing are still
-pending; values are normalized to the common 18-decimal scale.
+decimal strings so 18-decimal values round-trip exactly. A process/cluster trades exactly one
+symbol: `SymbolConfig` is replicated and snapshotted, prices and quantities with more decimals than
+configured are rejected, and orders routed to another `symbol_id` are refused. Scaling to several
+symbols means running one process/cluster per symbol, so resources and failures stay isolated.
+Values are normalized to the common 18-decimal scale.
 
 Example order payload accepted by `/write` (note the field name `sequence`):
 
@@ -673,6 +685,17 @@ Example order payload accepted by `/write` (note the field name `sequence`):
 ```
 
 `client_order_id` is optional; omit it for the old non-idempotent behaviour.
+
+Set this process's symbol and accepted precision before trading:
+
+```json
+{"ConfigureSymbol": {"config": {"symbol_id": 0, "price_decimals": 2, "quantity_decimals": 2}}}
+```
+
+The configuration is replicated and locked once the first order is accepted. Changing it while
+orders are open, or after trading has started, is refused. A successful change on a publishing
+node also queues a market-data reset snapshot for the new symbol. The response uses the optional
+`error` field for this non-fatal case; the write itself is still committed.
 
 Every order-type field (`tif`, `post_only`, `stop_price`, `display_volume`, `hidden_volume`,
 `timestamp`) is optional and defaults to "plain GTC limit order":
@@ -700,13 +723,15 @@ placeholder). `sequence` is still required by the deserializer.
 | `tests/cluster/test_events.rs` | `/write` returns events, `/events` pages by cursor, `client_order_id` retries do not duplicate an order, and `--max-events` eviction is visible in `/events/status` |
 | `tests/cluster/test_membership.rs` | Kill the elected leader: a surviving voter takes over with the committed book and accepts new writes. A learner added after the writes catches up through normal log replication, is promoted, and writes through its own node |
 | `tests/cluster/test_late_join.rs` | A node with a stale snapshot/WAL is removed, misses 40 writes while the leader snapshots and purges, then rejoins as a learner and catches up from the live cluster |
-| `tests/cluster/test_exactness.rs` | An 18-fractional-digit price and quantity round-trip through `/write`, `/read`, `/events`, the JSONL market-data feed, snapshot v6 and a restart without passing through `f64` |
+| `tests/cluster/test_exactness.rs` | An 18-fractional-digit price and quantity round-trip through `/write`, `/read`, `/events`, the JSONL market-data feed, snapshot v7 and a restart without passing through `f64` |
+| `tests/cluster/test_symbols.rs` | `ConfigureSymbol` sets the process symbol/precision, rejects over-precision and cross-symbol orders, locks the configuration once trading starts, and survives snapshot restart |
 
 Every integration test uses a unique temporary data directory. The cluster test uses fixed ports
 `21001-21003` (gRPC `22001-22003`), the snapshot test `21101-21102`, the restart tests
 `21201-21204`, the match-result tests `21301`/`21302`, the market-data test `21303`, the event-log test
 `21304`, the failover test `21401-21403`, the learner catch-up test `21501-21502`, the late-join
-test `21601-21603` and the exactness test `21701` (gRPC `22701`); stop leftover processes
+test `21601-21603`, the exactness test `21701` (gRPC `22701`) and the symbol-config test `21801`
+(gRPC `22801`); stop leftover processes
 (`pkill -f matchengine-raft`) before rerunning.
 
 ## Performance and Current Limits
@@ -730,8 +755,9 @@ Still missing:
 - The gRPC listener has no TLS/mTLS.
 - Snapshot installation still buffers the whole snapshot in memory.
 - `Order` prices/quantities, `last_trade_price`, match events, depth/BBO/spread, the JSONL feed
-  and wire v3 use exact 18-scale fixed-point integers. Snapshot v6 and wire v3 are breaking
-  changes from earlier builds. Per-symbol `SymbolConfig` enforcement/routing is still pending. See
+  and wire v3 use exact 18-scale fixed-point integers. Snapshot v7 and wire v3 are breaking
+  changes from earlier builds. `SymbolConfig` is replicated and locked for one symbol per
+  process/cluster; multi-symbol deployments run one process per symbol. See
   [`docs/DECIMAL.md`](./docs/DECIMAL.md).
 
 Known gaps and the roadmap are tracked in [`TODO.md`](./TODO.md).

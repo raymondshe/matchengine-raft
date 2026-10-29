@@ -20,8 +20,8 @@ the message bytes this plan produces, and adding a media driver is a separate op
   derivation, encoding and IO run on a separate thread.
 - Delivery: leader-only by default; snapshot + deltas; BBO and depth totals per applied entry; one
   uncapped `TRADE` per taker; `GAP` only on a hard failure. Trades are never sampled.
-- Multi-symbol ready schema (`symbol_id` in every message); the engine currently runs one book, so
-  the value is `0` until the engine learns symbols.
+- Multi-symbol ready schema (`symbol_id` in every message). One process/cluster trades exactly one
+  symbol, so the value is the configured process symbol; multi-symbol means separate deployments.
 
 ## Work units
 
@@ -143,8 +143,8 @@ stable across restart and failover: `(symbol_id, stream_id, market_seq, sub_seq)
 - **Aeron adapter**: a `MarketDataSink` that encodes via `wire.rs` and offers to streams 2001+;
   `rusteron-client` + an embedded driver in tests, feature-gated (`market-data-aeron`).
 - **Archive** recording/replay and the snapshot-request stream.
-- **Multi-symbol routing**: `symbol_id` on orders and per-symbol books in the state machine; the
-  message schema already carries the field.
+- **Multi-symbol deployment**: one process/cluster per symbol; the message schema already carries
+  `symbol_id` for routing and dedupe across deployments.
 - **Aeron Cluster / Raft transport**: untouched by this work (Part I gate).
 
 ## Message catalogue and streams (reference)
@@ -180,8 +180,8 @@ leader id, `ts_ms`, `symbol_id`, `sub_seq`, reserved.
 - U1–U6 added no crates. The later exactness work added `i256` for price × quantity; the Aeron
   adapter is the only other planned dependency.
 - The feed state (journal, shadow book, bars) is transient and absent from snapshots. U1–U6 kept
-  `SNAPSHOT_VERSION` 3; the later exactness work bumped it to 6 for the replicated order/event
-  fields, not for feed state.
+  `SNAPSHOT_VERSION` 3; later exactness/symbol work bumped it to 7 for the replicated order/event
+  fields plus the single-symbol precision configuration, not for feed state.
 
 ## Progress
 
@@ -194,20 +194,20 @@ leader id, `ts_ms`, `symbol_id`, `sub_seq`, reserved.
 | U5 | **done** | `MarketDataConfig` on `StorageConfig`, all CLI flags (incl. `--market-data-leader-only`), leader watcher, source-gated tap, end-to-end test on 21303 |
 | U6 | **done** | README/README_CN/AGENTS/TODO/AERON updates; bench `rest 1k bids + journal` |
 | U8 | **done** | deterministic `(market_seq, sub_seq)` across replicas; all mutations sequenced; auto GTD purge; one TRADE per taker; wire v3 |
-| U7 | deferred | Aeron adapter, Archive, multi-symbol engine |
+| U7 | deferred | Aeron adapter and Archive replay; multi-symbol is deployment-level (one process per symbol) |
 
 ## Verification (2026-10-28)
 
 | Check | Result |
 |---|---|
-| `cargo test` | **102 unit + 30 integration** tests pass (current; includes the exactness test) |
+| `cargo test` | **106 unit + 31 integration** tests pass (current; includes exactness and symbol-config tests) |
 | `cargo check --all-targets` | **0 warnings** |
 | `cargo test --test cluster test_market_data` | passed; checks `market_seq` anchors for place/amend/cancel and the uncapped trade message |
 | U8 determinism | two processors fed identical frames emit identical messages; a takeover snapshot continues the same keys; wire v3 golden tests (scale-18 `i128`) |
 | automatic purge | `Place`/`Cancel`/`Amend` purge due GTD at intake time; `Day` only via `PurgeExpired`; guarded by the earliest-expiry index (no scan without GTD) |
 | `matchengine-raft --help` | all feed flags present, including `--market-data-status-every` and `--market-data-leader-only` |
-| Snapshot/log formats | U8 itself kept `SNAPSHOT_VERSION` 3; later work bumped it to 4 (event window + dedupe map), 5 (fixed-point order prices/quantities) and 6 (last trade + match events fixed-point). `market_seq` lives in the existing `OrderBook::sequence` |
-| Dependencies | none added |
+| Snapshot/log formats | U8 itself kept `SNAPSHOT_VERSION` 3; later work bumped it to 4 (event window + dedupe map), 5 (fixed-point order prices/quantities), 6 (last trade + match events fixed-point) and 7 (single-symbol precision configuration). `market_seq` lives in the existing `OrderBook::sequence` |
+| Dependencies | `i256 0.2.5` added for exact notional multiplication; no other dependencies |
 
 Bench (best-of-5 per round, after the earliest-expiry guard): rest 1k bids **40.1 µs**, rest 1k +
 journal **42.8 µs** (~7% with the tap on), sweep 1k/100 levels 49.1 µs, deep 20k sweep 929.5 µs,
@@ -245,5 +245,5 @@ Messages are identified by `(symbol_id, stream_id, market_seq, sub_seq)`:
    state-machine lock, opening the gate only afterwards, and gating the tap at the source so
    follower frames never queue ahead of a takeover snapshot.
 
-U1–U6 acceptance criteria are met. U7 (Aeron adapter, Archive replay, multi-symbol engine) remains
+U1–U6 acceptance criteria are met. U7 (Aeron adapter, Archive replay, multi-symbol deployment) remains
 deferred; `epoch`/`leader_id` are still 0 on the wire until the adapter epoch is wired.

@@ -9,3 +9,4 @@ mod test_membership;
 mod test_restart;
 mod test_snapshot;
 mod test_storage;
+mod test_symbols;

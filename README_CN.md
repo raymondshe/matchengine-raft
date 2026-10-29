@@ -312,7 +312,9 @@ tests/
     ├── test_market_data.rs    # 行情 feed：快照、成交、BBO、深度、K 线
     ├── test_events.rs         # 事件日志：写响应、游标、保留、幂等
     ├── test_membership.rs     # 领导者故障切换 + 学习者从活动日志追赶
-    └── test_late_join.rs      # 过期节点重新加入并从活动成员追赶
+    ├── test_late_join.rs      # 过期节点重新加入并从活动成员追赶
+    ├── test_exactness.rs      # 18 位小数经 API、事件、行情和快照重启
+    └── test_symbols.rs        # 单标的配置、精度拒绝和配置锁定
 ```
 
 ## 存储实现
@@ -334,7 +336,7 @@ Raft 日志追加写入 `log/NNNNNNNNNN.wal` 分段文件：
 
 ### 快照（`src/store/state_machine.rs`）
 
-状态机（订单簿 + 序列号 + 保留的撮合事件窗口 + 提交去重表）常驻内存以保证 apply 速度。快照 v6 写入 `snapshot/current.snap`，通过临时文件 → fsync → rename → 目录 fsync 原子替换；`install_snapshot` 会先校验收到的数据再替换磁盘副本，坏快照不会破坏已有的好快照。
+状态机（订单簿 + 序列号 + 保留的撮合事件窗口 + 提交去重表）常驻内存以保证 apply 速度。快照 v7 写入 `snapshot/current.snap`，通过临时文件 → fsync → rename → 目录 fsync 原子替换；`install_snapshot` 会先校验收到的数据再替换磁盘副本，坏快照不会破坏已有的好快照。
 
 快照负载是 postcard 编码的 `StateMachineData`：
 
@@ -344,6 +346,8 @@ pub struct StateMachineData {
     pub sequence: u64,
     pub stops: Vec<Order>,
     pub last_trade_price: Option<Fixed>,
+    pub symbol_config: SymbolConfig, // the one symbol this process/cluster trades
+    pub symbol_locked: bool,         // true after the first accepted order
     pub events: Vec<StoredMatchEvent>,      // 保留的撮合事件，按 EventId 排序
     pub events_evicted: u64,
     pub submissions: Vec<SubmissionRecord>, // client_order_id 去重记录
@@ -433,7 +437,7 @@ pub struct StateMachineData {
 API 读取：
 
 ```
-POST /write { Place | Cancel | Amend | PurgeExpired }
+POST /write { Place | Cancel | Amend | PurgeExpired | ConfigureSymbol }
         │
         ▼
   StateMachineStore::apply  （每个副本都执行）
@@ -452,7 +456,7 @@ POST /write { Place | Cancel | Amend | PurgeExpired }
 
 `Place` 支持可选的 `client_order_id`；用同一个 id 重试会返回原序列号和事件，而不会重复下单。
 事件窗口由 `--max-events`（环境变量 `MAX_EVENTS`，默认 262144）限制；提交去重表另有固定的
-262144 条上限，避免重试结果依赖节点本地参数。两者都包含在快照 v6 中。
+262144 条上限，避免重试结果依赖节点本地参数。两者都包含在快照 v7 中。
 `GET /events/status` 报告最旧/最新保留 id 和淘汰计数；消费者从 `next_after` 继续，并按 `event_id`
 去重。
 
@@ -511,8 +515,8 @@ POST /events
   或拖慢。
 
 当前 sink 是用于调试的 JSONL。同样的消息在 `src/market_data/wire.rs` 有二进制编码（64 字节头、
-版本 3、scale-18 `i128`、小端消息体），`MarketDataSink` 就是后续 Aeron 适配器的接入点。模式已支持多标的
-（`symbol_id`，当前为 0）。可调参数：`--market-data-depth`、`--market-data-status-every`、
+版本 3、scale-18 `i128`、小端消息体），`MarketDataSink` 就是后续 Aeron 适配器的接入点。每条消息携带
+当前进程配置的 `symbol_id`，便于多个按标的部署共享总线。可调参数：`--market-data-depth`、`--market-data-status-every`、
 `--market-data-bar-intervals-ms`、`--market-data-leader-only`。
 
 `/read marketdata_status` 返回 feed 计数器和领导者门控状态。
@@ -581,9 +585,10 @@ gRPC 传输在 `--http-addr` 端口 + 1000 上暴露相同操作（`AppendEntrie
 
 ### 应用 API
 
-- `POST /write` - 通过 Raft 提交 `Place`、`Cancel`、`Amend` 或 `PurgeExpired` 请求。所有变更请求的
-  响应都是分配的 `market_seq`（`Place` 同时是订单序列号），并携带该条目的首批事件（上限 512）。
-  `Place` 支持可选的 `client_order_id`，用于幂等重试。
+- `POST /write` - 通过 Raft 提交 `Place`、`Cancel`、`Amend`、`PurgeExpired` 或 `ConfigureSymbol` 请求。
+  订单/变更请求返回分配的 `market_seq`（`Place` 同时是订单序列号），并携带该条目的首批事件（上限 512）。
+  `ConfigureSymbol` 返回状态字符串，拒绝时使用 `error` 字段，不消耗市场序列号。`Place` 支持可选的
+  `client_order_id`，用于幂等重试。
 - `POST /read` - 从本地状态机读取（可能读到旧值）
 - `POST /linearizable_read` - 线性一致性读；请求必须到达领导者
 - `POST /follower_read` - 从领导者获取 linearizer 后在本地完成的线性一致性读
@@ -598,6 +603,7 @@ pub enum MatchEngineRequest {
     Cancel { order: Order },
     Amend { order: Order, price: Option<Fixed>, volume: Option<Fixed> },
     PurgeExpired { now_ms: u64, day_close_ms: Option<u64> },
+    ConfigureSymbol { config: SymbolConfig },
 }
 
 pub struct MatchEngineResponse {
@@ -605,11 +611,12 @@ pub struct MatchEngineResponse {
     pub sequence: Option<u64>,        // 分配的 market_seq
     pub events: Vec<MatchEvent>,      // 本条目的前 512 个事件
     pub events_truncated: bool,       // 还有更多事件时为 true
+    pub error: Option<String>,        // 非致命的应用层错误
 }
 ```
 
-每个变更请求消耗一个 `market_seq`；`Place` 同时把它作为订单序列号。响应最多携带 512 个事件，
-完整批次从 `/events` 读取。`client_order_id` 可选，只影响 `Place`：同一 id 重试返回原序列号和
+每个订单/变更请求消耗一个 `market_seq`；`Place` 同时把它作为订单序列号，`ConfigureSymbol` 不消耗。
+响应最多携带 512 个事件，完整批次从 `/events` 读取。`client_order_id` 可选，只影响 `Place`：同一 id 重试返回原序列号和
 事件，不会重复下单。
 
 `/read`、`/linearizable_read` 和 `/follower_read` 接收 JSON 字符串键，用于读取订单簿的命名视图：
@@ -621,8 +628,10 @@ pub struct MatchEngineResponse {
 - `orderbook_spread` - 最优卖价减最优买价（任一侧为空时为 `null`）
 - `marketdata_status` - 行情 feed 计数器与门控状态（feed 关闭时为 `{}`）
 - `orderbook_sequence` - 订单序列号计数器（兼容旧拼写 `orderbook_sequance`）
+- `symbol_config` - 当前进程/集群复制的标的与精度配置
+- `symbol_id` - 当前进程/集群唯一支持的标的
 
-价格和数量在内部使用精确的 18 位定点整数。JSON 接受十进制字符串或旧版数字；撮合事件、`/read` 和行情输出十进制字符串，以精确往返 18 位小数。`SymbolConfig` 定义每个标的价格/数量允许的小数位（最多 18），但校验和多标的路由仍待完成；内部统一归一化到 18 位。
+价格和数量在内部使用精确的 18 位定点整数。JSON 接受十进制字符串或旧版数字；撮合事件、`/read` 和行情输出十进制字符串，以精确往返 18 位小数。一个进程/集群只交易一个标的：`SymbolConfig` 随 Raft 复制并写入快照，超过配置小数位的价格/数量会被拒绝，`symbol_id` 不匹配的订单也会被拒绝。扩展多标的方式是每个标的运行独立的进程/集群，从而隔离资源与故障；内部统一归一化到 18 位。
 
 `/write` 接受的订单示例（注意字段名是 `sequence`）：
 
@@ -631,6 +640,14 @@ pub struct MatchEngineResponse {
 ```
 
 `client_order_id` 可选；省略时保持旧的非幂等行为。
+
+交易前设置当前进程的标的与允许精度：
+
+```json
+{"ConfigureSymbol": {"config": {"symbol_id": 0, "price_decimals": 2, "quantity_decimals": 2}}}
+```
+
+配置会随 Raft 复制，并在首个订单被接受后锁定。有挂单或已经开始交易后修改配置会被拒绝。在正在发布行情的节点上，成功修改还会为新标的排队一个重置快照。该非致命错误通过响应的可选 `error` 字段返回，写入本身仍会提交。
 
 所有订单类型字段（`tif`、`post_only`、`stop_price`、`display_volume`、`hidden_volume`、
 `timestamp`）都是可选的，默认就是普通的 GTC 限价单：
@@ -657,12 +674,13 @@ pub struct MatchEngineResponse {
 | `tests/cluster/test_events.rs` | `/write` 返回事件、`/events` 游标分页、`client_order_id` 重试不重复下单、`--max-events` 淘汰与 `/events/status` 计数 |
 | `tests/cluster/test_membership.rs` | 杀掉当前领导者：存活的投票节点接管已提交订单簿并接受新写入；写入后加入的学习者通过普通日志复制追赶、晋升成员并从自己的节点写入 |
 | `tests/cluster/test_late_join.rs` | 带过期快照/WAL 的节点被移出集群、错过 40 次写入（期间领导者生成快照并 purge），再以学习者身份重新加入并从活动集群追赶 |
-| `tests/cluster/test_exactness.rs` | 18 位小数的价格/数量经 `/write`、`/read`、`/events`、JSONL 行情、快照 v6 和重启后仍然精确，全程不经过 `f64` |
+| `tests/cluster/test_exactness.rs` | 18 位小数的价格/数量经 `/write`、`/read`、`/events`、JSONL 行情、快照 v7 和重启后仍然精确，全程不经过 `f64` |
+| `tests/cluster/test_symbols.rs` | `ConfigureSymbol` 设置进程标的/精度，拒绝超精度和跨标的订单，交易开始后锁定配置，并在快照重启后保留配置 |
 
 所有集成测试都使用唯一的临时数据目录。集群测试固定使用端口 `21001-21003`（gRPC
 `22001-22003`），快照测试使用 `21101-21102`，重启测试使用 `21201-21204`，撮合结果测试使用
 `21301`/`21302`、行情数据测试 `21303`、事件日志测试 `21304`、故障切换测试
-`21401-21403`、学习者追赶测试 `21501-21502`、过期节点重入测试 `21601-21603`、精度往返测试 `21701`（gRPC `22701`）；重跑前请先停止残留进程
+`21401-21403`、学习者追赶测试 `21501-21502`、过期节点重入测试 `21601-21603`、精度往返测试 `21701`（gRPC `22701`）、标的配置测试 `21801`（gRPC `22801`）；重跑前请先停止残留进程
 （`pkill -f matchengine-raft`）。
 
 ## 性能与当前限制
@@ -681,7 +699,7 @@ pub struct MatchEngineResponse {
 - 没有传输基准工具，`docs/TRANSPORTS.md` 中的数字只是指导值，不是实测结果。
 - gRPC 监听器尚未配置 TLS/mTLS。
 - 快照安装仍整体缓冲在内存中。
-- `Order` 的价格/数量、`last_trade_price`、撮合事件、深度/BBO/spread、JSONL 行情和 wire v3 均使用精确的 18 位定点整数。快照 v6 和 wire v3 是相对旧版本的破坏性变更；按标的 `SymbolConfig` 的校验与路由仍待完成。18 位 BTC 分析、微基准和迁移记录见
+- `Order` 的价格/数量、`last_trade_price`、撮合事件、深度/BBO/spread、JSONL 行情和 wire v3 均使用精确的 18 位定点整数。快照 v7 和 wire v3 是相对旧版本的破坏性变更；每个进程/集群只支持一个标的，`SymbolConfig` 已复制并在交易开始后锁定。多标的通过独立进程/集群隔离。18 位 BTC 分析、微基准和迁移记录见
   [`docs/DECIMAL.md`](./docs/DECIMAL.md)。
 
 已知差距与路线图统一记录在 [`TODO.md`](./TODO.md)。

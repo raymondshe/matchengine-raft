@@ -5,37 +5,33 @@ current branch state.
 
 **Current baseline:** the OpenRaft 0.10 port, durable WAL/snapshot storage and exact scale-18
 `Fixed` migration are done. Order prices/quantities, last trade, match events, depth/BBO, `/read`,
-the market-data feed and wire v3 are exact; snapshot v6 stores the fixed-point state. Maker/taker
-fees are not implemented yet (§12). The remaining work is per-symbol enforcement/routing, fee
-capture, public-API hardening, stronger correctness evidence and measured performance.
+the market-data feed and wire v3 are exact; snapshot v7 stores the fixed-point state and the
+single-symbol precision configuration. One process/cluster trades exactly one symbol; multi-symbol
+is isolated by running one process per symbol. The remaining work is fee capture, public-API
+hardening, stronger correctness evidence and measured performance.
 
 Priority key: **P0** = correctness/security, do next; **P1** = production readiness; **P2** =
 important but not blocking; **P3** = later/optional.
 
 ## Top priorities
 
-1. **P0 — Make per-symbol configuration real.** `SymbolConfig` exists but is not used by intake
-   or `apply`, and every order still matches in one book regardless of `symbol_id`. Until
-   per-symbol books exist, reject unsupported `symbol_id` values and reject prices/quantities
-   outside the configured decimals. Put the registry in replicated state so validation cannot
-   diverge between nodes. Then route books, reads, events and the feed by symbol.
-2. **P0 — Add deterministic maker/taker fees.** Each order must carry its user-level maker and
+1. **P0 — Add deterministic maker/taker fees.** Each order must carry its user-level maker and
    taker fee rates from placement; every fill computes exact notional, taker fee and maker fee
    without the engine knowing users or balances. Report fees through `/write`, `/events`, the
    file sink and (if needed) the market-data feed. See §12.
-3. **P0 — Harden the public trust boundary.** `client_order_id` is unbounded, the gRPC listener is
+2. **P0 — Harden the public trust boundary.** `client_order_id` is unbounded, the gRPC listener is
    plaintext, and the snapshot receiver has no total-size cap. Bound IDs and request sizes, cap
    or stream snapshots, and decide TLS/mTLS plus HTTP authentication before any non-loopback
    exposure. Add hostile-input tests.
-4. **P1 — Build stronger correctness evidence.** Add randomized differential/property tests for
+3. **P1 — Build stronger correctness evidence.** Add randomized differential/property tests for
    the book (volume conservation, no crossed book, price-time priority, deterministic replay).
    The 18-digit exactness round trip across API, events, feed, wire and snapshot is now covered by
    `tests/cluster/test_exactness.rs`; keep that guard while adding a reference model.
-5. **P1 — Make failure and observability behavior explicit.** A dead gRPC server task currently
+4. **P1 — Make failure and observability behavior explicit.** A dead gRPC server task currently
    leaves the HTTP API serving a node peers cannot reach; two `Logger` middleware log every
    request twice; `test_cluster` leaks fixed ports and running nodes. Decide fail-fast versus
    degraded mode, collapse logging, and make the test own and stop its nodes.
-6. **P1 — Measure before optimizing.** Re-run the microbenchmarks after the `Fixed` migration, add
+5. **P1 — Measure before optimizing.** Re-run the microbenchmarks after the `Fixed` migration, add
    submit → commit → apply → response latency and a 50k–500k fills/s feed load test. Only then
    consider per-level buckets or a compact resting record. The numbers in `docs/TRANSPORTS.md`
    are still guidance, not results.
@@ -55,45 +51,45 @@ Completed:
   the shadow book are exact. The shadow book is keyed by `Fixed`.
 - [x] Market-data `TradeRecord`, `BboRecord`, depth records, lifecycle and `BarRecord` are `Fixed`.
   Wire **v3** encodes all prices/quantities as little-endian scale-18 `i128`.
-- [x] Snapshot **v6** stores the last trade and match events as `Fixed`; older snapshots are
-  rejected.
+- [x] Snapshot **v7** stores the last trade and match events as `Fixed` plus the single-symbol
+  precision configuration; older snapshots are rejected.
 - [x] `Fixed::notional` multiplies through an `i256` intermediate and truncates toward zero at 18
   places; unit tests cover an intermediate that overflows `i128`.
 - [x] `tests/cluster/test_exactness.rs` round-trips 18 fractional digits through `/write`,
-  `/read`, `/events`, the JSONL feed, snapshot v6 and a restart.
+  `/read`, `/events`, the JSONL feed, snapshot v7 and a restart.
 - [x] README/README_CN, AGENTS, DECIMAL, MATCH_RESULTS, MARKET_DATA_PLAN and AERON record wire v3,
-  snapshot v6 and the new decimal JSON output.
+  snapshot v7 and the new decimal JSON output.
 
-Note: wire v3 and snapshot v6 are breaking changes; existing data directories must be recreated
+Note: wire v3 and snapshot v7 are breaking changes; existing data directories must be recreated
 and v2 feed consumers must implement the scale-18 integer layout.
 
-## 2. Per-symbol configuration and routing [P0/P1]
+## 2. One process, one symbol [done]
+
+Decision: one process/cluster supports exactly one symbol. Multi-symbol runs one process/cluster
+per symbol, so CPU, memory, logs, snapshots and failure domains stay isolated. The engine never
+routes two books or switches symbols after trading starts.
 
 Done:
 
-- [x] `Fixed` uses a common 18-digit internal scale, so symbols can configure fewer decimals
-  without a separate matching representation.
-- [x] `SymbolConfig` validates 0..=18 decimals and can parse prices/quantities at the configured
-  precision.
-- [x] `Order.symbol_id` is serialized with a default of `0` for backward compatibility.
+- [x] Replicated `StateMachineData.symbol_config` + `symbol_locked` in snapshot v7.
+  `MatchEngineRequest::ConfigureSymbol` sets the one symbol and its precision through Raft before
+  trading.
+- [x] The configuration is locked after the first accepted order; changing symbol or precision
+  while orders are open, or after trading starts, is refused.
+- [x] `Place` and `Amend` validate price/quantity decimals for that symbol; over-precision values
+  produce a `rejected` event. `Cancel`, `Amend` and `Place` reject a different `symbol_id`.
+- [x] `/read symbol_config` and `/read symbol_id` expose the configuration; a publishing
+  market-data feed is reset to the new symbol after a successful configuration change.
+- [x] `tests/cluster/test_symbols.rs` covers precision rejection, cross-symbol rejection, the
+  symbol lock and snapshot restart.
+- [x] Documented the deployment contract: one cluster/process group per symbol, separate data
+  directories, ports, service-discovery names and market-data streams.
 
 Remaining:
 
-- [ ] **P0** Wire `SymbolConfig` into `Place`/`Amend` intake and into `apply`; reject values with
-  more fractional digits than the symbol allows instead of accepting the global 18-digit bound.
-- [ ] **P0** Persist the symbol registry in replicated state/snapshots, not only in node-local
-  config, so every replica validates and replays the same thing. Define how a config change is
-  proposed and versioned.
-- [ ] **P0** Until per-symbol books land, reject any `symbol_id` other than the configured one.
-  Today a non-zero `symbol_id` is accepted and matched against symbol `0`.
-- [ ] **P1** Route `OrderBook` by `symbol_id` (per-symbol books, sequence streams and stop stores),
-  and make `/read` keys symbol-aware (or expose a single-symbol read guard).
-- [ ] **P1** Route events, match-result cursors, market-data messages and depth/BBO by symbol.
-  The feed schema already carries `symbol_id`; the matching and read paths do not.
-- [ ] **P1** Test a 2-decimal symbol and an 18-decimal symbol side by side: sub-tick rejection,
-  exact 18-digit acceptance, and no cross-symbol matching.
-- [ ] **P2** Add symbol lifecycle operations (add, update precision, disable) through Raft rather
-  than restarting a node with a different local config.
+- [ ] **P1** Add a gateway/deployment-level symbol guard so a client cannot send a symbol-1 order to
+  a symbol-0 process (the engine already rejects it; fail earlier and cheaper).
+- [ ] **P2** Add a provisioning helper for `ConfigureSymbol` and a pre-trade readiness check.
 
 ## 3. Public trust boundary and request safety [P0/P1]
 
@@ -180,7 +176,7 @@ Remaining:
   replenishment, stop-protection collars, market-to-limit and self-trade prevention.
 - [ ] **P2** Phase 4 of match-result delivery: long-poll/short-poll `/events` (`wait_ms`), gRPC
   `StreamEvents`, and an optional MQ bridge sidecar. Decide event time and per-instrument cursors
-  once multi-symbol lands.
+  for multi-symbol deployments.
 - [ ] **P2** Add randomized differential/property tests for the book (volume conservation, no
   crossed book, priority, deterministic replay) and keep a small reference model in the test
   suite.
@@ -235,7 +231,9 @@ Current coverage:
   catches up from a live leader.
 - `test_late_join.rs`: a stale snapshot/WAL is superseded after a late rejoin.
 - `test_exactness.rs`: 18-fractional-digit values survive `/write`, `/read`, `/events`, the JSONL
-  feed, snapshot v6 and a restart.
+  feed, snapshot v7 and a restart.
+- `test_symbols.rs`: one-symbol config, over-precision rejection, cross-symbol rejection, the
+  post-trade config lock and snapshot restart.
 
 Remaining:
 
@@ -290,7 +288,7 @@ Done:
   `sled` is a dev-dependency.
 - [x] The unused `match_engine.png` was removed and `logs/` is gitignored.
 - [x] README/README_CN, AGENTS, TODO, AERON and MATCH_RESULTS are synced with the WAL + snapshot
-  + gRPC design and snapshot v6 / wire v3.
+  + gRPC design and snapshot v7 / wire v3.
 - [x] `docs/DECIMAL.md` records the fixed-point research, BTC 18-decimal range analysis,
   microbenchmarks and the completed end-to-end migration.
 
@@ -308,14 +306,14 @@ Remaining:
 
 These choices feed the priorities above; write them down as ADRs or doc notes when made.
 
-- [ ] Where `SymbolConfig` lives (replicated registry vs node-local policy) and how precision
-  changes are versioned.
+- [x] `SymbolConfig` lives in replicated state as the single process/cluster symbol and locks
+  after the first accepted order; precision changes are versioned by the Raft log/snapshot.
 - [x] Wire v3 representation: scale-18 `i128` mantissas; v2 consumers must upgrade and frames are
   never silently reinterpreted.
 - [ ] External exposure model: TLS/mTLS, HTTP authentication, and whether the API is
   loopback/private-network only.
 - [ ] gRPC listener failure policy: fail-fast process exit vs degraded health state.
-- [ ] Per-symbol `/read` keys, event cursors and market-data stream keys.
+- [x] Multi-symbol isolation: one process/cluster per symbol, never multiple books in one process.
 - [ ] Event time source for the clearing feed and per-instrument cursor retention.
 
 ## 12. Maker and taker fees [P0]
