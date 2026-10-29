@@ -337,7 +337,7 @@ tests/
     ├── main.rs              # Single integration test target
     ├── common.rs            # Unique temp data dirs
     ├── test_cluster.rs      # 3-node cluster, both transports
-    ├── test_snapshot.rs     # Snapshot build/purge + learner install over gRPC
+    ├── test_snapshot.rs     # Snapshot build/purge, learner install + periodic timer
     ├── test_storage.rs      # WAL and snapshot formats
     ├── test_restart.rs      # Restart recovery: log replay and snapshot
     ├── test_match_results.rs # Match events in the JSONL file sink
@@ -581,9 +581,12 @@ process `symbol_id`, so separate per-symbol deployments can share a bus. Tuning:
 
 ### Snapshot configuration
 
-`default_raft_config()` (`src/lib.rs`) sets only the heartbeat and election timings; snapshot
-policy comes from openraft's defaults (`LogsSinceLast(5000)`, keeping 1000 covered logs). Tests
-that need a snapshot quickly override it:
+`default_raft_config()` (`src/lib.rs`) sets `snapshot_policy = LogsSinceLast(100_000)` and the
+node also runs a 30-minute snapshot timer (`StorageConfig::snapshot_interval`, default
+`DEFAULT_SNAPSHOT_INTERVAL`). The timer only requests a snapshot when new entries have been
+applied since the last one, so an idle node does not rewrite the same file. `--snapshot-interval-ms`
+(env `SNAPSHOT_INTERVAL_MS`) overrides the interval; `0` disables the timer while leaving the
+100,000-entry policy active. Tests that need a snapshot quickly override the policy:
 
 ```rust
 let mut config = default_raft_config();
@@ -591,7 +594,8 @@ config.snapshot_policy = SnapshotPolicy::LogsSinceLast(10);
 config.max_in_snapshot_log_to_keep = 0; // purge everything the snapshot covers
 ```
 
-- A snapshot is built after the configured number of applied log entries (5000 by default).
+- A snapshot is built after the configured number of applied log entries (100,000 by default),
+  or after 30 minutes when newer entries exist.
 - Logs covered by a snapshot plus `max_in_snapshot_log_to_keep` are purged. The snapshot test sets
   both values so a joining learner cannot catch up by log replication and must install a snapshot.
 
@@ -768,8 +772,10 @@ placeholder). `sequence` is still required by the deserializer.
 
 | Test | What it proves |
 |---|---|
+| `src/order_book/property_tests.rs` | Randomized differential tests against a reference model plus mixed GTC/IOC/FOK/GTD/Day/market/post-only/iceberg/stop orders and positive, zero and rebate fee rates under all fee-asset policies: visible book, fills, priority, no crossed book, volume conservation, sequence/last-trade state and deterministic replay |
+| `src/order_book/conformance_tests.rs` | Explicit market-FOK, no-liquidity market, hidden-iceberg cancel/expiry, parked-stop GTD/Day expiry and fee-reporting cases for market, IOC and stop-child fills |
 | `tests/cluster/test_cluster.rs` | 3-node cluster: init, learner, membership, write/read, linearizable read, leader forwarding, membership shrink; runs over gRPC by default and HTTP with `MATCHENGINE_TEST_TRANSPORT=http` |
-| `tests/cluster/test_snapshot.rs` | Snapshot creation, log purge, and a learner installing the purged state over the gRPC snapshot stream |
+| `tests/cluster/test_snapshot.rs` | Snapshot creation, log purge, a learner installing the purged state over the gRPC snapshot stream, and the periodic snapshot timer with the log-count policy disabled |
 | `tests/cluster/test_storage.rs` | WAL framing, torn-tail truncation, segment rotation, a 20k-record multi-segment reopen, truncate/purge across segments, vote/committed persistence, snapshot build/install/reopen, corrupt-file rejection |
 | `tests/cluster/test_restart.rs` | Full node restart recovering the order book and sequence via WAL replay and via snapshot + tail; also 2k-order large-log replay and a multi-chunk (~120 KB) snapshot boot |
 | `tests/cluster/test_match_results.rs` | A node started with `--match-event-log` records rest/fill/cancel events in log order while the `/write` response stays unchanged; a second node checks stop triggers, GTD expiry and the new `/read` keys |
@@ -784,7 +790,7 @@ placeholder). `sequence` is still required by the deserializer.
 | `tests/cluster/test_request_limits.rs` | Oversized JSON bodies, malformed input, invalid/oversized `client_order_id`s, oversized read keys and out-of-range event pages are rejected with `400`/`413` before Raft changes the book |
 
 Every integration test uses a unique temporary data directory. The cluster test uses fixed ports
-`21001-21003` (gRPC `22001-22003`), the snapshot test `21101-21102`, the restart tests
+`21001-21003` (gRPC `22001-22003`), the snapshot tests `21101-21103`, the restart tests
 `21201-21204`, the match-result tests `21301`/`21302`, the market-data test `21303`, the event-log test
 `21304`, the failover test `21401-21403`, the learner catch-up test `21501-21502`, the late-join
 test `21601-21603`, the exactness test `21701` (gRPC `22701`), the symbol-config test `21801` (gRPC `22801`), the fee test `21901` (gRPC `22901`), the

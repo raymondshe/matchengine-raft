@@ -14,7 +14,9 @@
 
 use std::path::Path;
 use std::path::PathBuf;
+use std::time::Duration;
 
+use crate::DEFAULT_SNAPSHOT_INTERVAL;
 use crate::MatchEngineNodeId;
 use crate::market_data::MarketDataConfig;
 use crate::store::state_machine::DEFAULT_MAX_EVENTS;
@@ -29,6 +31,8 @@ pub const MATCH_EVENT_LOG_ENV: &str = "MATCH_EVENT_LOG";
 pub const MARKET_DATA_LOG_ENV: &str = "MARKET_DATA_LOG";
 /// Environment variable that overrides the match-event retention limit.
 pub const MAX_EVENTS_ENV: &str = "MAX_EVENTS";
+/// Environment variable that overrides the periodic snapshot interval in milliseconds.
+pub const SNAPSHOT_INTERVAL_MS_ENV: &str = "SNAPSHOT_INTERVAL_MS";
 
 /// Default root directory for node data.
 pub const DEFAULT_DATA_DIR: &str = "/tmp/matchengine-raft";
@@ -60,6 +64,11 @@ pub struct StorageConfig {
     /// Maximum number of match events retained in the replicated event log.
     /// The same limit bounds the client-order-id dedupe map.
     pub max_events: usize,
+
+    /// How often the node asks Raft to build a snapshot when new entries have
+    /// been applied. `Duration::ZERO` disables the timer; the log-count policy
+    /// still applies.
+    pub snapshot_interval: Duration,
 }
 
 impl Default for StorageConfig {
@@ -76,6 +85,11 @@ impl Default for StorageConfig {
             .ok()
             .and_then(|value| value.parse().ok())
             .unwrap_or(DEFAULT_MAX_EVENTS);
+        let snapshot_interval = std::env::var(SNAPSHOT_INTERVAL_MS_ENV)
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .map(Duration::from_millis)
+            .unwrap_or(DEFAULT_SNAPSHOT_INTERVAL);
 
         Self {
             data_dir,
@@ -83,6 +97,7 @@ impl Default for StorageConfig {
             match_event_log,
             market_data,
             max_events,
+            snapshot_interval,
         }
     }
 }
@@ -96,6 +111,7 @@ impl StorageConfig {
             match_event_log: None,
             market_data: None,
             max_events: DEFAULT_MAX_EVENTS,
+            snapshot_interval: DEFAULT_SNAPSHOT_INTERVAL,
         }
     }
 
@@ -120,6 +136,12 @@ impl StorageConfig {
     /// Sets the match-event retention limit (also bounds submission dedupe).
     pub fn with_max_events(mut self, max_events: usize) -> Self {
         self.max_events = max_events;
+        self
+    }
+
+    /// Sets the periodic snapshot interval; zero disables the timer.
+    pub fn with_snapshot_interval(mut self, interval: Duration) -> Self {
+        self.snapshot_interval = interval;
         self
     }
 
@@ -165,6 +187,20 @@ mod tests {
         assert_eq!(
             Path::new("/data/cluster-a-1/snapshot"),
             config.snapshot_dir(1)
+        );
+    }
+
+    #[test]
+    fn snapshot_interval_defaults_to_thirty_minutes_and_is_configurable() {
+        assert_eq!(
+            DEFAULT_SNAPSHOT_INTERVAL,
+            StorageConfig::new("/data").snapshot_interval
+        );
+        assert_eq!(
+            Duration::from_millis(250),
+            StorageConfig::new("/data")
+                .with_snapshot_interval(Duration::from_millis(250))
+                .snapshot_interval
         );
     }
 

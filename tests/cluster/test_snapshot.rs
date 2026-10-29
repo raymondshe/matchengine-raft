@@ -5,6 +5,7 @@ use std::time::Instant;
 use matchengine_raft::MatchEngineTypeConfig;
 use matchengine_raft::StorageConfig;
 use matchengine_raft::Transport;
+use matchengine_raft::build_match_engine_node;
 use matchengine_raft::client::MatchEngineClient;
 use matchengine_raft::default_raft_config;
 use matchengine_raft::order_book::Order;
@@ -153,5 +154,82 @@ async fn test_grpc_snapshot_install_inner() -> anyhow::Result<()> {
         serde_json::from_str(&client2.read(&"orderbook_orders".to_string()).await?)?;
     assert_eq!(30, orders.len());
 
+    Ok(())
+}
+
+/// Even with the log-count policy disabled, a timer must build a snapshot for
+/// a node that keeps applying entries.
+#[test]
+fn test_periodic_snapshot_timer() {
+    MatchEngineTypeConfig::run(test_periodic_snapshot_timer_inner()).unwrap();
+}
+
+async fn test_periodic_snapshot_timer_inner() -> anyhow::Result<()> {
+    let addr = "127.0.0.1:21103";
+    let temp = crate::common::TempDir::new("periodic-snapshot");
+    let storage = StorageConfig::new(temp.path())
+        .with_instance_prefix("periodic-snapshot")
+        .with_snapshot_interval(Duration::from_millis(50));
+
+    let mut config = default_raft_config();
+    config.snapshot_policy = SnapshotPolicy::Never;
+    let node = build_match_engine_node(
+        1,
+        addr.to_string(),
+        Transport::Grpc,
+        config,
+        storage.clone(),
+    )
+    .await?;
+
+    let client = MatchEngineClient::<MatchEngineTypeConfig>::new(1, addr.to_string());
+    client.init().await??;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Ok(metrics) = client.metrics().await
+            && metrics.current_leader == Some(1)
+        {
+            break;
+        }
+        if Instant::now() > deadline {
+            anyhow::bail!("node 1 never became leader");
+        }
+        MatchEngineTypeConfig::sleep(Duration::from_millis(50)).await;
+    }
+
+    for i in 0..5 {
+        client
+            .write(&MatchEngineRequest::place(Order::new(
+                OrderSide::Buy,
+                100.0 - f64::from(i),
+                1.0,
+                0,
+            )))
+            .await??;
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let metrics = client.metrics().await?;
+        if metrics.snapshot.map(|id| id.index).unwrap_or(0) >= 5 {
+            break;
+        }
+        if Instant::now() > deadline {
+            anyhow::bail!(
+                "periodic snapshot did not cover the applied entries: snapshot={:?}, applied={:?}",
+                metrics.snapshot,
+                metrics.last_applied
+            );
+        }
+        MatchEngineTypeConfig::sleep(Duration::from_millis(50)).await;
+    }
+
+    let snapshot_path = storage.snapshot_dir(1).join("current.snap");
+    assert!(
+        snapshot_path.exists(),
+        "the timer must persist the snapshot file"
+    );
+
+    node.shutdown().await?;
     Ok(())
 }

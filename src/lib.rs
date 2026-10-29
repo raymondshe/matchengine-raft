@@ -17,6 +17,7 @@ use actix_web::web;
 use actix_web::web::Data;
 use openraft::BasicNode;
 use openraft::Config;
+use openraft::SnapshotPolicy;
 use openraft::async_runtime::WatchReceiver;
 
 use crate::app::MatchEngineApp;
@@ -94,6 +95,7 @@ pub struct MatchEngineNode {
     grpc_task: tokio::task::JoinHandle<()>,
     market_data: Option<MarketDataHandle>,
     market_data_task: Option<tokio::task::JoinHandle<()>>,
+    snapshot_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl MatchEngineNode {
@@ -129,6 +131,11 @@ impl MatchEngineNode {
         }
         if let Some(mut handle) = self.market_data.take() {
             handle.shutdown().await;
+        }
+
+        // Stop the periodic snapshot timer before shutting Raft down.
+        if let Some(task) = self.snapshot_task.take() {
+            task.abort();
         }
 
         self.raft
@@ -182,12 +189,19 @@ pub async fn start_match_engine_node_with_transport(
     start_match_engine_node_with_config(node_id, http_addr, transport, default_raft_config()).await
 }
 
+/// Snapshot after this many applied log entries even if the timer has not fired.
+pub const DEFAULT_SNAPSHOT_LOG_THRESHOLD: u64 = 100_000;
+
+/// Periodic snapshot interval used when no explicit storage setting is supplied.
+pub const DEFAULT_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(30 * 60);
+
 /// The Raft configuration used by the binary and the integration tests.
 pub fn default_raft_config() -> Config {
     Config {
         heartbeat_interval: 500,
         election_timeout_min: 1500,
         election_timeout_max: 3000,
+        snapshot_policy: SnapshotPolicy::LogsSinceLast(DEFAULT_SNAPSHOT_LOG_THRESHOLD),
         ..Default::default()
     }
 }
@@ -224,6 +238,59 @@ pub async fn start_match_engine_node_with_storage(
         .await?
         .run()
         .await
+}
+
+/// Returns true when the state machine has applied entries not covered by the
+/// latest snapshot.
+///
+/// The periodic timer uses this to avoid rebuilding an identical snapshot on a
+/// completely idle node.
+fn snapshot_is_due(last_applied: Option<u64>, snapshot: Option<u64>) -> bool {
+    last_applied.is_some_and(|applied| applied > snapshot.unwrap_or(0))
+}
+
+/// Starts the periodic snapshot timer.
+///
+/// `interval == Duration::ZERO` disables the timer; the log-count policy still
+/// applies. The task checks whether new entries were applied since the last
+/// snapshot, so an idle node does not rewrite the same snapshot every tick.
+fn spawn_snapshot_timer(
+    raft: MatchEngineRaft,
+    interval: Duration,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if interval.is_zero() {
+        return None;
+    }
+
+    Some(tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // `interval` fires its first tick immediately; that is startup, not a
+        // 30-minute boundary.
+        ticker.tick().await;
+
+        loop {
+            ticker.tick().await;
+            let metrics = raft.metrics().borrow_watched().clone();
+            let last_applied = metrics.last_applied.map(|id| id.index);
+            let snapshot = metrics.snapshot.map(|id| id.index);
+            if !snapshot_is_due(last_applied, snapshot) {
+                continue;
+            }
+
+            match raft.trigger().snapshot().await {
+                Ok(()) => tracing::info!(
+                    last_applied = ?last_applied,
+                    snapshot = ?snapshot,
+                    "periodic snapshot requested"
+                ),
+                Err(error) => {
+                    tracing::warn!(%error, "periodic snapshot request failed");
+                    return;
+                }
+            }
+        }
+    }))
 }
 
 /// Warns when the node is bound to a non-loopback address.
@@ -319,6 +386,10 @@ pub async fn build_match_engine_node(
     )
     .await
     .map_err(|e| std::io::Error::other(format!("failed to create Raft instance: {e}")))?;
+
+    // The log-count policy bounds the WAL; this timer also bounds snapshot age
+    // even on a mostly idle or low-volume node.
+    let snapshot_task = spawn_snapshot_timer(raft.clone(), storage.snapshot_interval);
 
     // The feed follows leadership: on every gain it resets consumers with a
     // snapshot, then publishes this node's applied entries.
@@ -425,6 +496,7 @@ pub async fn build_match_engine_node(
         grpc_task,
         market_data,
         market_data_task,
+        snapshot_task,
     })
 }
 
@@ -472,4 +544,26 @@ fn spawn_market_data_watch(
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn periodic_snapshot_only_runs_when_new_entries_are_applied() {
+        assert!(!snapshot_is_due(None, None));
+        assert!(!snapshot_is_due(Some(0), None));
+        assert!(!snapshot_is_due(Some(10), Some(10)));
+        assert!(snapshot_is_due(Some(11), Some(10)));
+        assert!(snapshot_is_due(Some(1), None));
+    }
+
+    #[test]
+    fn default_config_snapshots_every_100k_log_entries() {
+        assert!(matches!(
+            default_raft_config().snapshot_policy,
+            SnapshotPolicy::LogsSinceLast(DEFAULT_SNAPSHOT_LOG_THRESHOLD)
+        ));
+    }
 }

@@ -327,7 +327,7 @@ tests/
     ├── main.rs              # 单一集成测试目标
     ├── common.rs            # 唯一临时数据目录
     ├── test_cluster.rs      # 3 节点集群，两种传输
-    ├── test_snapshot.rs     # 快照生成/purge + 学习者通过 gRPC 安装
+    ├── test_snapshot.rs     # 快照生成/purge、学习者安装 + 周期定时器
     ├── test_storage.rs      # WAL 与快照格式
     ├── test_restart.rs      # 重启恢复：日志重放与快照
     ├── test_match_results.rs # 撮合事件写入 JSONL 文件 sink
@@ -547,8 +547,11 @@ POST /events
 
 ### 快照配置
 
-`default_raft_config()`（`src/lib.rs`）只设置心跳和选举时间，快照策略沿用 openraft 默认值
-（`LogsSinceLast(5000)`，保留 1000 条已覆盖日志）。需要快速生成快照的测试会覆盖它：
+`default_raft_config()`（`src/lib.rs`）设置 `snapshot_policy = LogsSinceLast(100_000)`，节点还会运行
+30 分钟快照定时器（`StorageConfig::snapshot_interval`，默认 `DEFAULT_SNAPSHOT_INTERVAL`）。只有上次快照后
+有新 entry 被应用时才会请求快照，因此空闲节点不会重复写同一个文件。可用 `--snapshot-interval-ms`
+（环境变量 `SNAPSHOT_INTERVAL_MS`）覆盖间隔；设为 `0` 会关闭定时器，但保留 100,000 条日志策略。
+需要快速生成快照的测试会覆盖该策略：
 
 ```rust
 let mut config = default_raft_config();
@@ -556,7 +559,7 @@ config.snapshot_policy = SnapshotPolicy::LogsSinceLast(10);
 config.max_in_snapshot_log_to_keep = 0; // 清理快照已覆盖的全部日志
 ```
 
-- 每应用配置数量的日志构建一次快照（默认 5000 条）。
+- 达到配置的已应用日志条数（默认 100,000 条）后构建快照；有新 entry 时也会每 30 分钟构建一次。
 - 快照覆盖的日志加上 `max_in_snapshot_log_to_keep` 之后会被 purge。快照测试同时调小这两个值，
   使后加入的学习者无法只靠日志复制追上，必须安装快照。
 
@@ -710,8 +713,10 @@ pub struct MatchEngineResponse {
 
 | 测试 | 验证内容 |
 |---|---|
+| `src/order_book/property_tests.rs` | 针对参考模型的随机差分测试，并混合覆盖 GTC/IOC/FOK/GTD/Day、市价、Post-Only、冰山和止损单，以及正费率、零费率和返佣费率下的全部扣费资产策略：可见订单簿、成交、优先级、无交叉盘、数量守恒、序列号/最后成交价状态和确定性重放 |
+| `src/order_book/conformance_tests.rs` | 市价 FOK、无流动性市价单、冰山隐藏量与撤单/过期、挂起止损的 GTD/Day 过期，以及市价/IOC/止损子单成交的费用报告 |
 | `tests/cluster/test_cluster.rs` | 3 节点集群：初始化、学习者、成员变更、读写、线性一致性读、领导者转发、缩容；默认走 gRPC，设置 `MATCHENGINE_TEST_TRANSPORT=http` 后走 HTTP |
-| `tests/cluster/test_snapshot.rs` | 快照生成、日志 purge，以及学习者通过 gRPC 快照流安装已 purge 的状态 |
+| `tests/cluster/test_snapshot.rs` | 快照生成、日志 purge、学习者通过 gRPC 快照流安装已 purge 的状态，以及关闭日志计数策略时的周期快照定时器 |
 | `tests/cluster/test_storage.rs` | WAL 帧格式、撕裂尾部截断、分段轮转、2 万条跨段日志重开、跨段 truncate/purge、vote/committed 持久化、快照构建/安装/重开、损坏文件拒绝 |
 | `tests/cluster/test_restart.rs` | 完整节点重启后通过日志重放恢复，以及通过快照 + 尾部恢复订单簿和序列号；另含 2000 单大日志重放和多分块（约 120 KB）快照启动 |
 | `tests/cluster/test_match_results.rs` | 以 `--match-event-log` 启动的节点按日志顺序记录 rest/fill/cancel 事件，同时 `/write` 响应保持不变；第二个节点验证止损触发、GTD 过期和新增的 `/read` 键 |
@@ -726,7 +731,7 @@ pub struct MatchEngineResponse {
 | `tests/cluster/test_request_limits.rs` | 超大 JSON 请求体、畸形输入、非法/超长 `client_order_id`、超长 read key 和越界事件分页在进入 Raft 前以 `400`/`413` 拒绝 |
 
 所有集成测试都使用唯一的临时数据目录。集群测试固定使用端口 `21001-21003`（gRPC
-`22001-22003`），快照测试使用 `21101-21102`，重启测试使用 `21201-21204`，撮合结果测试使用
+`22001-22003`），快照测试使用 `21101-21103`，重启测试使用 `21201-21204`，撮合结果测试使用
 `21301`/`21302`、行情数据测试 `21303`、事件日志测试 `21304`、故障切换测试
 `21401-21403`、学习者追赶测试 `21501-21502`、过期节点重入测试 `21601-21603`、精度往返测试 `21701`（gRPC `22701`）、标的配置测试 `21801`（gRPC `22801`）、费用测试 `21901`（gRPC `22901`）、费用资产测试 `21902`（gRPC `22902`）、请求限制测试 `21903`（gRPC `22903`）；重跑前请先停止残留进程
 （`pkill -f matchengine-raft`）。

@@ -1,7 +1,9 @@
 use std::path::PathBuf;
+use std::time::Duration;
 
 use clap::Parser;
 use env_logger::Env;
+use matchengine_raft::DEFAULT_SNAPSHOT_INTERVAL;
 use matchengine_raft::StorageConfig;
 use matchengine_raft::Transport;
 use matchengine_raft::market_data::MarketDataConfig;
@@ -39,6 +41,18 @@ pub struct Opt {
     /// dedupe uses a separate fixed cap so retries cannot diverge across nodes.
     #[clap(long, env = "MAX_EVENTS", default_value_t = DEFAULT_MAX_EVENTS)]
     pub max_events: usize,
+
+    /// Periodic snapshot interval in milliseconds (0 disables the timer).
+    ///
+    /// The default asks Raft for a snapshot every 30 minutes when new entries
+    /// have been applied; the log-count policy also snapshots at 100,000
+    /// entries.
+    #[clap(
+        long,
+        env = "SNAPSHOT_INTERVAL_MS",
+        default_value_t = DEFAULT_SNAPSHOT_INTERVAL.as_millis() as u64
+    )]
+    pub snapshot_interval_ms: u64,
 
     /// Append every applied match event (fills, rests, cancels) to this JSONL file.
     ///
@@ -86,7 +100,8 @@ async fn main() -> std::io::Result<()> {
 
     let mut storage = StorageConfig::new(options.data_dir)
         .with_instance_prefix(options.instance_prefix)
-        .with_max_events(options.max_events);
+        .with_max_events(options.max_events)
+        .with_snapshot_interval(Duration::from_millis(options.snapshot_interval_ms));
     if let Some(path) = options.match_event_log {
         storage = storage.with_match_event_log(path);
     }

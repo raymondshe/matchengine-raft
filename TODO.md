@@ -18,19 +18,16 @@ important but not blocking; **P3** = later/optional.
 
 ## Top priorities
 
-The P0 public-trust-boundary work is complete: ids, request bodies, events pages, read keys and
-snapshot streams are bounded at the edge, and the loopback/private-network deployment contract is
-documented and enforced with a startup warning.
+The P0 public-trust-boundary work and the P1 randomized differential/property tests are complete:
+ids, request bodies, events pages, read keys and snapshot streams are bounded at the edge, and the
+order book is checked against a reference model for pricing, priority, volume conservation and
+deterministic replay, including mixed order types and fee-rate styles.
 
-1. **P1 — Build stronger correctness evidence.** Add randomized differential/property tests for
-   the book (volume conservation, no crossed book, price-time priority, deterministic replay).
-   The 18-digit exactness round trip across API, events, feed, wire and snapshot is now covered by
-   `tests/cluster/test_exactness.rs`; keep that guard while adding a reference model.
-2. **P1 — Make failure and observability behavior explicit.** A dead gRPC server task currently
+1. **P1 — Make failure and observability behavior explicit.** A dead gRPC server task currently
    leaves the HTTP API serving a node peers cannot reach; two `Logger` middleware log every
    request twice; `test_cluster` leaks fixed ports and running nodes. Decide fail-fast versus
    degraded mode, collapse logging, and make the test own and stop its nodes.
-3. **P1 — Measure before optimizing.** The post-fee microbenchmark baseline is recorded in §8; add
+2. **P1 — Measure before optimizing.** The post-fee microbenchmark baseline is recorded in §8; add
    submit → commit → apply → response latency and a 50k–500k fills/s feed load test. Only then
    consider per-level buckets or a compact resting record. The numbers in `docs/TRANSPORTS.md`
    are still guidance, not results.
@@ -132,6 +129,9 @@ Persistence is done:
   equivalents.
 - [x] Restart recovery via log replay and snapshot; large-log, large-snapshot and late-join
   coverage.
+- [x] Default snapshot policy: `LogsSinceLast(100_000)` plus a 30-minute timer that only fires
+  when newer entries exist; `StorageConfig::snapshot_interval` and `--snapshot-interval-ms` tune
+  the timer (`0` disables it).
 
 Remaining:
 
@@ -166,6 +166,14 @@ Done:
 - [x] `Amend` for plain resting limit orders; same-price reductions keep priority, price/size
   changes re-insert under a new sequence; crossing amendments are refused.
 - [x] `spread`, `mid_price` and `depth` views plus `orderbook_depth`/`orderbook_spread` read keys.
+- [x] Randomized differential/property tests against a small reference model: visible book,
+  fills, price-time priority, no crossed book, volume conservation, sequence/last-trade state and
+  deterministic replay.
+- [x] Randomized mixed-order coverage for GTC/IOC/FOK/GTD/Day, market, post-only, iceberg and
+  stop orders, with positive, zero and rebate maker/taker rates under Received/Quote/Base fee
+  policies.
+- [x] Explicit conformance cases for market FOK, empty-book market orders, hidden iceberg
+  cancel/expiry, parked-stop GTD/Day expiry and fee reporting on market/IOC/stop-child fills.
 
 Remaining:
 
@@ -181,9 +189,6 @@ Remaining:
 - [ ] **P2** Phase 4 of match-result delivery: long-poll/short-poll `/events` (`wait_ms`), gRPC
   `StreamEvents`, and an optional MQ bridge sidecar. Decide event time and per-instrument cursors
   for multi-symbol deployments.
-- [ ] **P2** Add randomized differential/property tests for the book (volume conservation, no
-  crossed book, priority, deterministic replay) and keep a small reference model in the test
-  suite.
 - [ ] **P3** Consider protobuf/Avro on the public HTTP API. Raft RPCs already use postcard over
   gRPC.
 
@@ -221,7 +226,10 @@ Remaining:
 Current coverage:
 
 - Unit tests cover the order book, fixed-point parsing, Raft-address derivation and snapshot
-  framing.
+  framing. `src/order_book/property_tests.rs` runs randomized traces against a reference model,
+  including mixed order types and fee-rate styles; `conformance_tests.rs` covers the explicit
+  edge cases. `apply` event tests cover market, IOC, FOK, post-only, iceberg, stop-child
+  cancellation and automatic GTD expiry.
 - `tests/cluster/test_cluster.rs`: 3 nodes, both transports, init/membership/read/write.
 - `test_snapshot.rs`: snapshot build/purge and learner install over gRPC.
 - `test_storage.rs`: WAL framing, torn-tail truncation, segment rotation, 20k-record multi-segment
@@ -247,7 +255,7 @@ Current coverage:
 
 Remaining:
 
-- [ ] **P1** Randomized differential/property tests for matching invariants (see §5).
+- [x] **P1** Randomized differential/property tests for matching invariants (see §5).
 - [x] Exactness across snapshot/restart/events/feed is covered by `test_exactness.rs`.
 - [x] Per-symbol rejection, precision and lock tests are covered by `test_symbols.rs` (see §2).
 - [x] **P0** Hostile-input tests for oversized `client_order_id`, oversized `/write` and `/events`

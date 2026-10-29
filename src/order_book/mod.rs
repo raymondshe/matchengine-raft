@@ -2,7 +2,11 @@ use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
+#[cfg(test)]
+mod conformance_tests;
 pub mod fixed;
+#[cfg(test)]
+mod property_tests;
 pub use fixed::AssetClass;
 pub use fixed::AssetId;
 pub use fixed::FeeAsset;

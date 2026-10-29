@@ -1814,6 +1814,333 @@ mod tests {
         assert_eq!(7, expired.event_id.log_index);
     }
 
+    /// Market, IOC, FOK, post-only and iceberg paths all emit the same
+    /// match-result fields as plain limit orders.
+    #[tokio::test]
+    async fn apply_publishes_market_ioc_fok_post_only_and_iceberg_events() {
+        use crate::match_result::MatchEventKind;
+        use crate::match_result::MemorySink;
+        use crate::order_book::FeeAsset;
+        use crate::order_book::Fixed;
+        use crate::order_book::Order;
+        use crate::order_book::OrderSide;
+        use crate::order_book::OrderType;
+        use crate::order_book::RejectReason;
+        use crate::order_book::TimeInForce;
+        use openraft::alias::EntryOf;
+        use openraft::alias::EntryPayloadOf;
+
+        fn entry(
+            index: u64,
+            payload: EntryPayloadOf<MatchEngineTypeConfig>,
+        ) -> EntryOf<MatchEngineTypeConfig> {
+            Entry {
+                log_id: log_id(1, index),
+                payload,
+            }
+        }
+
+        fn rate(value: &str) -> Fixed {
+            value.parse().expect("valid fixed-point rate")
+        }
+
+        let dir = tempdir();
+        let sink = Arc::new(MemorySink::new());
+        let mut store =
+            StateMachineStore::<MatchEngineTypeConfig>::open_with_sink(dir.path(), sink.clone())
+                .unwrap();
+
+        let maker =
+            Order::new(OrderSide::Sell, 100.0, 5.0, 0).with_fee_rates(rate("0.001"), rate("0.002"));
+        let mut market =
+            Order::new(OrderSide::Buy, 0.0, 8.0, 0).with_fee_rates(rate("0.003"), rate("0.004"));
+        market.live = OrderType::Market;
+        let mut ioc = Order::new(OrderSide::Buy, 100.0, 5.0, 0);
+        ioc.tif = TimeInForce::Ioc;
+        let mut fok = Order::new(OrderSide::Buy, 100.0, 5.0, 0);
+        fok.tif = TimeInForce::Fok;
+        let ask = Order::new(OrderSide::Sell, 100.0, 5.0, 0);
+        let mut post_cross = Order::new(OrderSide::Buy, 100.0, 4.0, 0);
+        post_cross.post_only = true;
+        let mut post_rest = Order::new(OrderSide::Buy, 99.0, 4.0, 0);
+        post_rest.post_only = true;
+        let mut iceberg = Order::new(OrderSide::Sell, 101.0, 10.0, 0)
+            .with_fee_rates(rate("0.001"), rate("0.002"));
+        iceberg.display_volume = rate("4");
+        let mut sweep =
+            Order::new(OrderSide::Buy, 0.0, 6.0, 0).with_fee_rates(rate("0.003"), rate("0.004"));
+        sweep.live = OrderType::Market;
+
+        let entries = futures::stream::iter(vec![
+            Ok((
+                entry(1, EntryPayload::Normal(MatchEngineRequest::place(maker))),
+                None,
+            )),
+            Ok((
+                entry(2, EntryPayload::Normal(MatchEngineRequest::place(market))),
+                None,
+            )),
+            Ok((
+                entry(3, EntryPayload::Normal(MatchEngineRequest::place(ioc))),
+                None,
+            )),
+            Ok((
+                entry(4, EntryPayload::Normal(MatchEngineRequest::place(fok))),
+                None,
+            )),
+            Ok((
+                entry(5, EntryPayload::Normal(MatchEngineRequest::place(ask))),
+                None,
+            )),
+            Ok((
+                entry(
+                    6,
+                    EntryPayload::Normal(MatchEngineRequest::place(post_cross)),
+                ),
+                None,
+            )),
+            Ok((
+                entry(
+                    7,
+                    EntryPayload::Normal(MatchEngineRequest::Cancel {
+                        order: Order::new(OrderSide::Sell, 100.0, 5.0, 4),
+                    }),
+                ),
+                None,
+            )),
+            Ok((
+                entry(
+                    8,
+                    EntryPayload::Normal(MatchEngineRequest::place(post_rest)),
+                ),
+                None,
+            )),
+            Ok((
+                entry(9, EntryPayload::Normal(MatchEngineRequest::place(iceberg))),
+                None,
+            )),
+            Ok((
+                entry(10, EntryPayload::Normal(MatchEngineRequest::place(sweep))),
+                None,
+            )),
+        ]);
+        store.apply(entries).await.unwrap();
+
+        let events = sink.events();
+        assert_eq!(12, events.len(), "unexpected events: {events:?}");
+
+        assert_eq!(MatchEventKind::Rested, events[0].kind);
+        assert_eq!(0, events[0].order_sequence);
+
+        let market_fill = &events[1];
+        assert_eq!(MatchEventKind::Fill, market_fill.kind);
+        assert_eq!(1, market_fill.order_sequence);
+        assert_eq!(Some(0), market_fill.counterparty_sequence);
+        assert_eq!(Fixed::from(5), market_fill.volume);
+        assert_eq!(Fixed::from(500), market_fill.quote_volume);
+        assert_eq!(Fixed::from(0.02), market_fill.taker_fee);
+        assert_eq!(Some(FeeAsset::Base), market_fill.taker_fee_asset);
+        assert_eq!(Fixed::from(0.5), market_fill.maker_fee);
+        assert_eq!(Some(FeeAsset::Quote), market_fill.maker_fee_asset);
+
+        assert_eq!(MatchEventKind::Cancelled, events[2].kind);
+        assert_eq!(1, events[2].order_sequence);
+        assert_eq!(Fixed::from(3), events[2].volume);
+
+        assert_eq!(MatchEventKind::Cancelled, events[3].kind);
+        assert_eq!(2, events[3].order_sequence);
+        assert_eq!(Fixed::from(5), events[3].volume);
+
+        assert_eq!(MatchEventKind::Rejected, events[4].kind);
+        assert_eq!(3, events[4].order_sequence);
+        assert_eq!(Some(RejectReason::FokUnfillable), events[4].reason);
+
+        assert_eq!(MatchEventKind::Rested, events[5].kind);
+        assert_eq!(4, events[5].order_sequence);
+
+        assert_eq!(MatchEventKind::Rejected, events[6].kind);
+        assert_eq!(5, events[6].order_sequence);
+        assert_eq!(Some(RejectReason::PostOnlyWouldCross), events[6].reason);
+
+        assert_eq!(MatchEventKind::Cancelled, events[7].kind);
+        assert_eq!(4, events[7].order_sequence);
+        assert_eq!(Fixed::from(5), events[7].volume);
+
+        assert_eq!(MatchEventKind::Rested, events[8].kind);
+        assert_eq!(7, events[8].order_sequence);
+        assert_eq!(Fixed::from(4), events[8].volume);
+
+        assert_eq!(MatchEventKind::Rested, events[9].kind);
+        assert_eq!(8, events[9].order_sequence);
+        assert_eq!(Fixed::from(4), events[9].volume, "only the visible tranche");
+
+        let first_iceberg_fill = &events[10];
+        assert_eq!(MatchEventKind::Fill, first_iceberg_fill.kind);
+        assert_eq!(9, first_iceberg_fill.order_sequence);
+        assert_eq!(Some(8), first_iceberg_fill.counterparty_sequence);
+        assert_eq!(Fixed::from(4), first_iceberg_fill.volume);
+        assert_eq!(Fixed::from(404), first_iceberg_fill.quote_volume);
+        assert_eq!(Fixed::from(0.016), first_iceberg_fill.taker_fee);
+        assert_eq!(Fixed::from(0.404), first_iceberg_fill.maker_fee);
+        assert_eq!(0, first_iceberg_fill.event_id.ordinal);
+
+        let second_iceberg_fill = &events[11];
+        assert_eq!(MatchEventKind::Fill, second_iceberg_fill.kind);
+        assert_eq!(Some(8), second_iceberg_fill.counterparty_sequence);
+        assert_eq!(Fixed::from(2), second_iceberg_fill.volume);
+        assert_eq!(Fixed::from(202), second_iceberg_fill.quote_volume);
+        assert_eq!(Fixed::from(0.008), second_iceberg_fill.taker_fee);
+        assert_eq!(Fixed::from(0.202), second_iceberg_fill.maker_fee);
+        assert_eq!(1, second_iceberg_fill.event_id.ordinal);
+    }
+
+    /// A stop child that cannot fully execute emits the trigger, its fills and
+    /// the cancelled remainder in one entry, all tied to the stop's identity.
+    #[tokio::test]
+    async fn apply_publishes_stop_trigger_with_cancelled_child() {
+        use crate::match_result::MatchEventKind;
+        use crate::match_result::MemorySink;
+        use crate::order_book::FeeAsset;
+        use crate::order_book::Fixed;
+        use crate::order_book::Order;
+        use crate::order_book::OrderSide;
+        use crate::order_book::OrderType;
+        use openraft::alias::EntryOf;
+        use openraft::alias::EntryPayloadOf;
+
+        fn entry(
+            index: u64,
+            payload: EntryPayloadOf<MatchEngineTypeConfig>,
+        ) -> EntryOf<MatchEngineTypeConfig> {
+            Entry {
+                log_id: log_id(1, index),
+                payload,
+            }
+        }
+
+        fn rate(value: &str) -> Fixed {
+            value.parse().expect("valid fixed-point rate")
+        }
+
+        let dir = tempdir();
+        let sink = Arc::new(MemorySink::new());
+        let mut store =
+            StateMachineStore::<MatchEngineTypeConfig>::open_with_sink(dir.path(), sink.clone())
+                .unwrap();
+
+        let bid =
+            Order::new(OrderSide::Buy, 95.0, 3.0, 0).with_fee_rates(rate("0.001"), rate("0.002"));
+        let mut stop =
+            Order::new(OrderSide::Sell, 0.0, 5.0, 0).with_fee_rates(rate("0.003"), rate("0.004"));
+        stop.live = OrderType::Market;
+        stop.stop_price = rate("95");
+        let trigger =
+            Order::new(OrderSide::Sell, 95.0, 1.0, 0).with_fee_rates(rate("0.003"), rate("0.004"));
+
+        let entries = futures::stream::iter(vec![
+            Ok((
+                entry(1, EntryPayload::Normal(MatchEngineRequest::place(bid))),
+                None,
+            )),
+            Ok((
+                entry(2, EntryPayload::Normal(MatchEngineRequest::place(stop))),
+                None,
+            )),
+            Ok((
+                entry(3, EntryPayload::Normal(MatchEngineRequest::place(trigger))),
+                None,
+            )),
+        ]);
+        store.apply(entries).await.unwrap();
+
+        let events = sink.events();
+        assert_eq!(5, events.len(), "unexpected events: {events:?}");
+        assert_eq!(MatchEventKind::Rested, events[0].kind);
+        assert_eq!(MatchEventKind::Fill, events[1].kind);
+        assert_eq!(Fixed::from(1), events[1].volume);
+        assert_eq!(Fixed::from(0.38), events[1].taker_fee);
+        assert_eq!(Some(FeeAsset::Quote), events[1].taker_fee_asset);
+        assert_eq!(Fixed::from(0.001), events[1].maker_fee);
+        assert_eq!(Some(FeeAsset::Base), events[1].maker_fee_asset);
+
+        assert_eq!(MatchEventKind::Triggered, events[2].kind);
+        assert_eq!(1, events[2].order_sequence);
+        assert_eq!(Fixed::from(95), events[2].price);
+        assert_eq!(Fixed::from(5), events[2].volume);
+
+        assert_eq!(MatchEventKind::Fill, events[3].kind);
+        assert_eq!(1, events[3].order_sequence);
+        assert_eq!(Fixed::from(2), events[3].volume);
+        assert_eq!(Fixed::from(190), events[3].quote_volume);
+        assert_eq!(Fixed::from(0.76), events[3].taker_fee);
+        assert_eq!(Some(FeeAsset::Quote), events[3].taker_fee_asset);
+        assert_eq!(Fixed::from(0.002), events[3].maker_fee);
+        assert_eq!(Some(FeeAsset::Base), events[3].maker_fee_asset);
+
+        assert_eq!(MatchEventKind::Cancelled, events[4].kind);
+        assert_eq!(1, events[4].order_sequence);
+        assert_eq!(Fixed::from(3), events[4].volume);
+        assert_eq!(3, events[4].event_id.ordinal);
+    }
+
+    /// A later request's intake timestamp purges an expired GTD order before
+    /// matching; the expiry is published before the new order's events.
+    #[tokio::test]
+    async fn apply_publishes_automatic_gtd_expiry_before_matching() {
+        use crate::match_result::MatchEventKind;
+        use crate::match_result::MemorySink;
+        use crate::order_book::Fixed;
+        use crate::order_book::Order;
+        use crate::order_book::OrderSide;
+        use crate::order_book::TimeInForce;
+        use openraft::alias::EntryOf;
+        use openraft::alias::EntryPayloadOf;
+
+        fn entry(
+            index: u64,
+            payload: EntryPayloadOf<MatchEngineTypeConfig>,
+        ) -> EntryOf<MatchEngineTypeConfig> {
+            Entry {
+                log_id: log_id(1, index),
+                payload,
+            }
+        }
+
+        let dir = tempdir();
+        let sink = Arc::new(MemorySink::new());
+        let mut store =
+            StateMachineStore::<MatchEngineTypeConfig>::open_with_sink(dir.path(), sink.clone())
+                .unwrap();
+
+        let mut gtd = Order::new(OrderSide::Buy, 100.0, 5.0, 0);
+        gtd.tif = TimeInForce::Gtd(2_000);
+        gtd.timestamp = 1_000;
+        let mut taker = Order::new(OrderSide::Sell, 100.0, 1.0, 0);
+        taker.timestamp = 2_000;
+
+        let entries = futures::stream::iter(vec![
+            Ok((
+                entry(1, EntryPayload::Normal(MatchEngineRequest::place(gtd))),
+                None,
+            )),
+            Ok((
+                entry(2, EntryPayload::Normal(MatchEngineRequest::place(taker))),
+                None,
+            )),
+        ]);
+        store.apply(entries).await.unwrap();
+
+        let events = sink.events();
+        assert_eq!(3, events.len(), "unexpected events: {events:?}");
+        assert_eq!(MatchEventKind::Rested, events[0].kind);
+        assert_eq!(MatchEventKind::Expired, events[1].kind);
+        assert_eq!(0, events[1].order_sequence);
+        assert_eq!(Fixed::from(5), events[1].volume);
+        assert_eq!(MatchEventKind::Rested, events[2].kind);
+        assert_eq!(1, events[2].order_sequence);
+        assert_eq!(Fixed::from(1), events[2].volume);
+    }
+
     /// Amendment goes through `apply`: the event carries both identities and the
     /// book keeps the new size; a failed amend publishes a rejection.
     #[tokio::test]
