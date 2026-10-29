@@ -25,6 +25,7 @@
 - [API 参考](#api-参考)
 - [测试](#测试)
 - [性能与当前限制](#性能与当前限制)
+- [联系方式](#联系方式)
 
 ## 功能特性
 
@@ -684,6 +685,10 @@ pub struct MatchEngineResponse {
   [`docs/DECIMAL.md`](./docs/DECIMAL.md)。
 
 已知差距与路线图统一记录在 [`TODO.md`](./TODO.md)。
+
+## 联系方式
+
+- Google Chat: [rshen.sy@gmail.com](https://chat.google.com/u/0/dm/rshen.sy@gmail.com)
 
 ## 致谢
 

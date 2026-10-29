@@ -25,6 +25,7 @@ A practical implementation of a distributed matching engine built upon [OpenRaft
 - [API Reference](#api-reference)
 - [Testing](#testing)
 - [Performance and Current Limits](#performance-and-current-limits)
+- [Contact](#contact)
 
 ## Features
 
@@ -734,6 +735,10 @@ Still missing:
   [`docs/DECIMAL.md`](./docs/DECIMAL.md).
 
 Known gaps and the roadmap are tracked in [`TODO.md`](./TODO.md).
+
+## Contact
+
+- Google Chat: [rshen.sy@gmail.com](https://chat.google.com/u/0/dm/rshen.sy@gmail.com)
 
 ## Credits
 
