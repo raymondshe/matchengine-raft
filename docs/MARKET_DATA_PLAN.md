@@ -106,7 +106,7 @@ channel tap, and the status JSON matches the counters.
 
 ### U6 — Docs, benchmarks, gates
 
-- README/README_CN, `GUIDE_cn.md`, `AGENTS.md`, `TODO.md`; update the AERON Part II status banner.
+- README/README_CN, `AGENTS.md`, `TODO.md`; update the AERON Part II status banner.
 - Bench: `market-data tap off/on` and journal cost per mutation (the "matching must not regress"
   gate).
 

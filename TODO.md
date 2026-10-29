@@ -79,8 +79,8 @@ vote/committed persistence, snapshot build/install/reopen), `tests/cluster/test_
 - [x] README now describes the segmented WAL + snapshot storage design instead of Sled.
 - [x] `README.md` / `README_CN.md` project structure, transport flags, test suite and future work
   synced with `src/network/grpc/` and `tests/cluster/`.
-- [x] `GUIDE_cn.md` rewritten for the current design (WAL + snapshots + gRPC); the
-  `ExampleStore`/combined `RaftStorage`/sled description is gone.
+- [x] `GUIDE_cn.md` folded into `README.md` / `README_CN.md` and removed; its unique WAL, snapshot,
+  transport, event-log, performance and roadmap details now live in the READMEs.
 - [x] `docs/AERON_SOLUTION.md` and `docs/TRANSPORTS.md` updated: gRPC is adopted, storage is
   durable, and all remaining performance numbers are labelled as guidance.
 - [x] `docs/MATCH_RESULTS.md` writes down how fills/cancels reach the order/clearing system.

@@ -13,8 +13,6 @@
 
 A practical implementation of a distributed matching engine built upon [OpenRaft](https://github.com/datafuselabs/openraft). Raft logs are persisted in a hand-written segmented write-ahead log and the state machine is made durable with atomic snapshots, so a node recovers all committed state after a restart.
 
-> **Note**: For a more detailed guide in Chinese, please refer to [GUIDE_cn.md](./GUIDE_cn.md).
-
 ## Table of Contents
 
 - [Features](#features)
@@ -26,6 +24,7 @@ A practical implementation of a distributed matching engine built upon [OpenRaft
 - [Cluster Management](#cluster-management)
 - [API Reference](#api-reference)
 - [Testing](#testing)
+- [Performance and Current Limits](#performance-and-current-limits)
 
 ## Features
 
@@ -106,6 +105,7 @@ are what the Aeron adapter (streams 2001–2007) will publish next.
    - Deterministic expiry (`PurgeExpired` carries the timestamps through the log) and stop
      election on the replicated last trade price
    - Example of a real-world state machine application
+   - `OrderBook::execute_order` is the full lifecycle; `place_order` is a fills-only wrapper
 
 4. **Market-Data Egress** ([`market_data/`](./src/market_data/))
    - `apply` hands match events and a depth journal to a bounded tap (`try_send`; matching never waits)
@@ -333,6 +333,9 @@ Raft log entries are appended to `log/NNNNNNNNNN.wal` segment files:
 - All blocking IO runs on `spawn_blocking`; the async runtime only encodes and decodes.
 - Segments are 64 MiB by default and are deleted only when a purge fully covers them. The active
   segment is rotated before deletion, so a purge never leaves a hole.
+- Each segment starts with an `MRFT` magic and a `u32` format version. `LogStore` implements
+  `RaftLogStorage` (`get_log_state`, `read_vote`/`save_vote`, `read_committed`/`save_committed`,
+  `append`, `truncate_after`, `purge`, `get_log_reader`).
 
 Vote and the last purged log id are safety-critical and rare, so they live in a small `log/state`
 file that is rewritten atomically (temp file → fsync → rename → directory fsync). The committed
@@ -343,9 +346,32 @@ avoiding a second fsync per batch.
 
 The state machine (order book + sequence counter + retained match-event window + submission dedupe
 map) stays in memory so applying entries is fast. Snapshot v4 is written as
-`snapshot/current.snap` (magic + version + CRC32 + postcard metadata + postcard state) using the
-same atomic temp-file/rename protocol. `install_snapshot` validates the incoming bytes before
-replacing the durable copy, so a bad snapshot cannot destroy a good one.
+`snapshot/current.snap` using the same atomic temp-file/rename protocol; `install_snapshot`
+validates the incoming bytes before replacing the durable copy, so a bad snapshot cannot destroy a
+good one.
+
+The snapshot payload is postcard-encoded `StateMachineData`:
+
+```rust
+pub struct StateMachineData {
+    pub orders: Vec<Order>,
+    pub sequence: u64,
+    pub stops: Vec<Order>,
+    pub last_trade_price: Option<f64>,
+    pub events: Vec<StoredMatchEvent>, // retained match events, oldest first
+    pub events_evicted: u64,
+    pub submissions: Vec<SubmissionRecord>, // client_order_id dedupe, oldest first
+    pub submissions_evicted: u64,
+}
+```
+
+`StoredMatchEvent` mirrors `MatchEvent` but always writes both optional fields; `MatchEvent` omits
+absent options from JSON, which postcard cannot decode positionally. Event identity stays
+`(log_index, ordinal)`, so no extra counter is stored. The file framing is:
+
+```text
+"MRFSNAP" | version u32 | crc32 u32 | postcard(SnapshotPayload)
+```
 
 ### Per-node data directory
 
@@ -468,6 +494,28 @@ The replicated event log is the durable clearing feed: it survives restarts and 
 and retries are collapsed by `client_order_id`. See `docs/MATCH_RESULTS.md` for the consumer
 contract.
 
+Cursor example:
+
+```json
+POST /events
+{"after": {"log_index": 100, "ordinal": 3}, "limit": 500}
+```
+
+```json
+{"Ok": {
+  "events": [ ... ],
+  "next_after": {"log_index": 140, "ordinal": 1},
+  "oldest_event_id": {"log_index": 1, "ordinal": 0},
+  "last_event_id": {"log_index": 140, "ordinal": 1},
+  "has_more": true
+}}
+```
+
+Omitting `after` starts at the oldest retained event; `limit` is capped at 1000. If your cursor is
+older than `oldest_event_id`, the window has evicted events and clearing must resync out of band.
+`GET /events/status` reports `retained_events`, `evictions_total`, `retention_limit`,
+`submission_retention_limit` and `submission_evictions_total`.
+
 ### Market-data feed (opt-in)
 
 `--market-data-log <file>` (env `MARKET_DATA_LOG`) turns on the deterministic market-data egress
@@ -548,6 +596,9 @@ Mounted on the public HTTP listener and used by the HTTP/JSON transport:
 
 The gRPC transport exposes the same operations on `--http-addr` port + 1000
 (`AppendEntries`, `Vote`, `InstallSnapshot`, `AppendStream`); see `proto/raft.proto`.
+Unary append/vote use `RPCOption::soft_ttl`, snapshots stream in 256 KiB chunks, and both message
+directions are capped at 64 MiB. `Unavailable` maps to `RPCError::Unreachable`, timeouts to
+`RPCError::Timeout`, and other statuses to `RPCError::Network`.
 
 ### Admin APIs
 
@@ -569,6 +620,29 @@ The gRPC transport exposes the same operations on `--http-addr` port + 1000
 - `POST /follower_read` - Linearizable read served locally after fetching a linearizer from the leader
 - `POST /events` - Read a page of the replicated match-event log (`after`, `limit`); linearizable and leader-only
 - `GET /events/status` - Retained event window, eviction counters and retention limit
+
+The Rust request/response types behind `/write` are:
+
+```rust
+pub enum MatchEngineRequest {
+    Place { order: Order, client_order_id: Option<String> },
+    Cancel { order: Order },
+    Amend { order: Order, price: Option<f64>, volume: Option<f64> },
+    PurgeExpired { now_ms: u64, day_close_ms: Option<u64> },
+}
+
+pub struct MatchEngineResponse {
+    pub value: Option<String>,        // sequence string for compatibility
+    pub sequence: Option<u64>,        // assigned market_seq
+    pub events: Vec<MatchEvent>,      // first 512 events of the entry
+    pub events_truncated: bool,       // true when more events exist
+}
+```
+
+Every mutating request consumes one `market_seq`; `Place` also uses it as the order sequence.
+The response carries at most 512 events; the full batch is available from `/events`.
+`client_order_id` is optional and only affects `Place`: a retry returns the original sequence and
+events instead of placing a second order.
 
 `/read`, `/linearizable_read` and `/follower_read` accept a JSON string key naming a view of the
 order book:
@@ -621,6 +695,28 @@ Every integration test uses a unique temporary data directory. The cluster test 
 the match-result tests `21301`/`21302`, the market-data test `21303` and the event-log test
 `21304`; stop leftover processes
 (`pkill -f matchengine-raft`) before rerunning.
+
+## Performance and Current Limits
+
+Implemented performance choices:
+
+- One `write_all` + one `sync_data` per replicated append batch, so N entries in one AppendEntries
+  RPC cost one fsync.
+- `pread` reads against cached file handles, so replication can read while an append is in flight.
+- The order book, event window and dedupe map stay in memory; `apply` does no disk IO.
+- gRPC uses bidirectional `AppendStream` for pipelined replication and separate replication,
+  heartbeat and snapshot connections per peer.
+- Snapshots stream in 256 KiB chunks; `log/state` and `snapshot/current.snap` are replaced
+  atomically.
+- The event window is bounded by `--max-events` and paged through `/events`; `/read
+  orderbook_orders` does not clone it.
+
+Still missing:
+
+- No transport benchmark harness; numbers in `docs/TRANSPORTS.md` are guidance, not measurements.
+- The gRPC listener has no TLS/mTLS.
+- Snapshot installation still buffers the whole snapshot in memory.
+- `price`/`volume` are `f64`; integer ticks/decimals are a planned migration.
 
 Known gaps and the roadmap are tracked in [`TODO.md`](./TODO.md).
 

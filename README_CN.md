@@ -13,8 +13,6 @@
 
 这是一个基于 [OpenRaft](https://github.com/datafuselabs/openraft) 构建的分布式撮合引擎的实践实现。Raft 日志持久化在自研的分段预写日志（WAL）中，状态机通过原子快照落盘，因此节点重启后可以恢复全部已提交状态。
 
-> **注意**: 更详细的中文指南请参考 [GUIDE_cn.md](./GUIDE_cn.md)。
-
 ## 目录
 
 - [功能特性](#功能特性)
@@ -26,6 +24,7 @@
 - [集群管理](#集群管理)
 - [API 参考](#api-参考)
 - [测试](#测试)
+- [性能与当前限制](#性能与当前限制)
 
 ## 功能特性
 
@@ -104,6 +103,7 @@
    - 订单类型：GTC、IOC、FOK、GTD、Day、Post-Only、冰山单、止损市价单、止损限价单
    - 确定性过期（`PurgeExpired` 通过日志携带时间戳）与基于复制的最后成交价触发止损
    - 现实世界状态机应用的示例
+   - `OrderBook::execute_order` 是完整生命周期，`place_order` 是只返回成交的兼容包装
 
 4. **行情数据出口** ([`market_data/`](./src/market_data/))
    - `apply` 将撮合事件和深度日志交给有界 tap（`try_send`，撮合路径永不等待）
@@ -323,12 +323,38 @@ Raft 日志追加写入 `log/NNNNNNNNNN.wal` 分段文件：
 - 读取使用 `pread`（`read_at`）和缓存的文件句柄，复制任务可以在追加进行时并发读取，磁盘 IO 期间不持有全局锁。
 - 所有阻塞 IO 都放在 `spawn_blocking` 中执行，异步运行时只负责编解码。
 - 分段默认 64 MiB；只有被 purge 完全覆盖的分段才会删除，删除前先轮转活跃分段，保证日志不出现空洞。
+- 每个分段以 `MRFT` magic 和 `u32` 格式版本开头。`LogStore` 实现 `RaftLogStorage`
+  （`get_log_state`、`read_vote`/`save_vote`、`read_committed`/`save_committed`、`append`、
+  `truncate_after`、`purge`、`get_log_reader`）。
 
 投票和最后一次 purge 的日志 id 属于安全关键且低频的状态，单独存放在 `log/state` 文件中，采用原子重写（临时文件 → fsync → rename → 目录 fsync）。committed 日志 id 追加到 WAL 尾部但不单独 fsync，随下一次 append 一起持久化，避免每批次多一次 fsync。
 
 ### 快照（`src/store/state_machine.rs`）
 
-状态机（订单簿 + 序列号 + 保留的撮合事件窗口 + 提交去重表）常驻内存以保证 apply 速度。快照 v4 写入 `snapshot/current.snap`（magic + 版本 + CRC32 + postcard 元数据 + postcard 状态），同样通过临时文件 + rename 原子替换。`install_snapshot` 会先校验收到的数据再替换磁盘副本，坏快照不会破坏已有的好快照。
+状态机（订单簿 + 序列号 + 保留的撮合事件窗口 + 提交去重表）常驻内存以保证 apply 速度。快照 v4 写入 `snapshot/current.snap`，通过临时文件 → fsync → rename → 目录 fsync 原子替换；`install_snapshot` 会先校验收到的数据再替换磁盘副本，坏快照不会破坏已有的好快照。
+
+快照负载是 postcard 编码的 `StateMachineData`：
+
+```rust
+pub struct StateMachineData {
+    pub orders: Vec<Order>,
+    pub sequence: u64,
+    pub stops: Vec<Order>,
+    pub last_trade_price: Option<f64>,
+    pub events: Vec<StoredMatchEvent>,      // 保留的撮合事件，按 EventId 排序
+    pub events_evicted: u64,
+    pub submissions: Vec<SubmissionRecord>, // client_order_id 去重记录
+    pub submissions_evicted: u64,
+}
+```
+
+`StoredMatchEvent` 是 `MatchEvent` 的快照镜像，总是写入两个可选字段；`MatchEvent` 在 JSON
+中会省略空字段，而 postcard 是位置编码，不能省略。事件身份仍是 `(log_index, ordinal)`，不额外
+存计数器。文件 framing 为：
+
+```text
+"MRFSNAP" | version u32 | crc32 u32 | postcard(SnapshotPayload)
+```
 
 ### 每节点数据目录
 
@@ -441,6 +467,28 @@ POST /write { Place | Cancel | Amend | PurgeExpired }
 复制事件日志是可靠的清结算 feed：它能在重启和学习者快照后恢复，`client_order_id` 会折叠重试。
 消费者契约见 `docs/MATCH_RESULTS.md`。
 
+游标示例：
+
+```json
+POST /events
+{"after": {"log_index": 100, "ordinal": 3}, "limit": 500}
+```
+
+```json
+{"Ok": {
+  "events": [ ... ],
+  "next_after": {"log_index": 140, "ordinal": 1},
+  "oldest_event_id": {"log_index": 1, "ordinal": 0},
+  "last_event_id": {"log_index": 140, "ordinal": 1},
+  "has_more": true
+}}
+```
+
+省略 `after` 时从最旧保留事件开始；`limit` 服务端上限为 1000。如果游标小于 `oldest_event_id`，
+说明事件已被保留策略淘汰，清结算需要带外重建。`GET /events/status` 返回 `retained_events`、
+`evictions_total`、`retention_limit`、`submission_retention_limit` 和
+`submission_evictions_total`。
+
 ### 行情数据 feed（可选）
 
 `--market-data-log <file>`（环境变量 `MARKET_DATA_LOG`）开启 `docs/AERON_SOLUTION.md` 第二部分
@@ -514,7 +562,10 @@ config.max_in_snapshot_log_to_keep = 0; // 清理快照已覆盖的全部日志
 - `POST /snapshot` - 安装完整快照 RPC
 
 gRPC 传输在 `--http-addr` 端口 + 1000 上暴露相同操作（`AppendEntries`、`Vote`、
-`InstallSnapshot`、`AppendStream`），定义见 `proto/raft.proto`。
+`InstallSnapshot`、`AppendStream`），定义见 `proto/raft.proto`。一元 append/vote 使用
+`RPCOption::soft_ttl`，快照按 256 KiB 分块，双向消息上限均为 64 MiB；`Unavailable` 映射为
+`RPCError::Unreachable`，超时映射为 `RPCError::Timeout`，其他状态映射为
+`RPCError::Network`。
 
 ### 管理 API
 
@@ -535,6 +586,28 @@ gRPC 传输在 `--http-addr` 端口 + 1000 上暴露相同操作（`AppendEntrie
 - `POST /follower_read` - 从领导者获取 linearizer 后在本地完成的线性一致性读
 - `POST /events` - 分页读取复制的撮合事件日志（`after`、`limit`）；线性一致，仅领导者
 - `GET /events/status` - 保留事件窗口、淘汰计数和保留上限
+
+`/write` 背后的 Rust 类型：
+
+```rust
+pub enum MatchEngineRequest {
+    Place { order: Order, client_order_id: Option<String> },
+    Cancel { order: Order },
+    Amend { order: Order, price: Option<f64>, volume: Option<f64> },
+    PurgeExpired { now_ms: u64, day_close_ms: Option<u64> },
+}
+
+pub struct MatchEngineResponse {
+    pub value: Option<String>,        // 兼容旧调用：序列号字符串
+    pub sequence: Option<u64>,        // 分配的 market_seq
+    pub events: Vec<MatchEvent>,      // 本条目的前 512 个事件
+    pub events_truncated: bool,       // 还有更多事件时为 true
+}
+```
+
+每个变更请求消耗一个 `market_seq`；`Place` 同时把它作为订单序列号。响应最多携带 512 个事件，
+完整批次从 `/events` 读取。`client_order_id` 可选，只影响 `Place`：同一 id 重试返回原序列号和
+事件，不会重复下单。
 
 `/read`、`/linearizable_read` 和 `/follower_read` 接收 JSON 字符串键，用于读取订单簿的命名视图：
 
@@ -582,6 +655,24 @@ gRPC 传输在 `--http-addr` 端口 + 1000 上暴露相同操作（`AppendEntrie
 `22001-22003`），快照测试使用 `21101-21102`，重启测试使用 `21201-21202`，撮合结果测试使用
 `21301`/`21302`、行情数据测试 `21303`、事件日志测试 `21304`；重跑前请先停止残留进程
 （`pkill -f matchengine-raft`）。
+
+## 性能与当前限制
+
+已实现的性能设计：
+
+- 每个复制追加批次一次 `write_all` + 一次 `sync_data`，一次 AppendEntries 中的 N 条记录只付一次 fsync。
+- `pread` 读取配缓存文件句柄，追加与复制读取互不阻塞。
+- 订单簿、事件窗口和去重表常驻内存，`apply` 不做磁盘 IO。
+- gRPC 使用双向 `AppendStream` 流水线复制，并为每个对端维护独立的复制、心跳、快照连接。
+- 快照按 256 KiB 分块传输；`log/state` 和 `snapshot/current.snap` 都原子替换。
+- 事件窗口由 `--max-events` 限制并通过 `/events` 分页；`/read orderbook_orders` 不会复制事件窗口。
+
+仍缺少：
+
+- 没有传输基准工具，`docs/TRANSPORTS.md` 中的数字只是指导值，不是实测结果。
+- gRPC 监听器尚未配置 TLS/mTLS。
+- 快照安装仍整体缓冲在内存中。
+- `price`/`volume` 仍是 `f64`，整数 tick/Decimal 是计划中的迁移。
 
 已知差距与路线图统一记录在 [`TODO.md`](./TODO.md)。
 
