@@ -5,9 +5,9 @@ current branch state.
 
 **Current baseline:** the OpenRaft 0.10 port, durable WAL/snapshot storage and exact scale-18
 `Fixed` migration are done. Order prices/quantities, last trade, match events, depth/BBO, `/read`,
-the market-data feed and wire v3 are exact; snapshot v6 stores the fixed-point state. The remaining
-work is per-symbol enforcement/routing, public-API hardening, stronger correctness evidence and
-measured performance.
+the market-data feed and wire v3 are exact; snapshot v6 stores the fixed-point state. Maker/taker
+fees are not implemented yet (§12). The remaining work is per-symbol enforcement/routing, fee
+capture, public-API hardening, stronger correctness evidence and measured performance.
 
 Priority key: **P0** = correctness/security, do next; **P1** = production readiness; **P2** =
 important but not blocking; **P3** = later/optional.
@@ -19,19 +19,23 @@ important but not blocking; **P3** = later/optional.
    per-symbol books exist, reject unsupported `symbol_id` values and reject prices/quantities
    outside the configured decimals. Put the registry in replicated state so validation cannot
    diverge between nodes. Then route books, reads, events and the feed by symbol.
-2. **P0 — Harden the public trust boundary.** `client_order_id` is unbounded, the gRPC listener is
+2. **P0 — Add deterministic maker/taker fees.** Each order must carry its user-level maker and
+   taker fee rates from placement; every fill computes exact notional, taker fee and maker fee
+   without the engine knowing users or balances. Report fees through `/write`, `/events`, the
+   file sink and (if needed) the market-data feed. See §12.
+3. **P0 — Harden the public trust boundary.** `client_order_id` is unbounded, the gRPC listener is
    plaintext, and the snapshot receiver has no total-size cap. Bound IDs and request sizes, cap
    or stream snapshots, and decide TLS/mTLS plus HTTP authentication before any non-loopback
    exposure. Add hostile-input tests.
-3. **P1 — Build stronger correctness evidence.** Add randomized differential/property tests for
+4. **P1 — Build stronger correctness evidence.** Add randomized differential/property tests for
    the book (volume conservation, no crossed book, price-time priority, deterministic replay).
    The 18-digit exactness round trip across API, events, feed, wire and snapshot is now covered by
    `tests/cluster/test_exactness.rs`; keep that guard while adding a reference model.
-4. **P1 — Make failure and observability behavior explicit.** A dead gRPC server task currently
+5. **P1 — Make failure and observability behavior explicit.** A dead gRPC server task currently
    leaves the HTTP API serving a node peers cannot reach; two `Logger` middleware log every
    request twice; `test_cluster` leaks fixed ports and running nodes. Decide fail-fast versus
    degraded mode, collapse logging, and make the test own and stop its nodes.
-5. **P1 — Measure before optimizing.** Re-run the microbenchmarks after the `Fixed` migration, add
+6. **P1 — Measure before optimizing.** Re-run the microbenchmarks after the `Fixed` migration, add
    submit → commit → apply → response latency and a 50k–500k fills/s feed load test. Only then
    consider per-level buckets or a compact resting record. The numbers in `docs/TRANSPORTS.md`
    are still guidance, not results.
@@ -313,3 +317,54 @@ These choices feed the priorities above; write them down as ADRs or doc notes wh
 - [ ] gRPC listener failure policy: fail-fast process exit vs degraded health state.
 - [ ] Per-symbol `/read` keys, event cursors and market-data stream keys.
 - [ ] Event time source for the clearing feed and per-instrument cursor retention.
+
+## 12. Maker and taker fees [P0]
+
+Goal: report the fee charged or rebated on every fill without teaching the matching engine about
+users, tiers or balances. The gateway resolves a user level to a maker/taker rate and places those
+rates on the order; the engine stores them in the replicated request and computes fees
+deterministically.
+
+Planned implementation:
+
+- [ ] **P0** Add `maker_fee_rate` and `taker_fee_rate` to `Order` as signed `Fixed` fractions with
+  `serde(default)` zero. Recommended convention: `"0.001"` means 10 bps; a negative rate is a
+  rebate. Validate the accepted range (for example `-1..=1`) in `validate_order`.
+- [ ] **P0** The receiving gateway sets both rates from the user level when placing the order.
+  They travel in the Raft log and snapshot; the engine never looks up user information.
+- [ ] **P0** Compute one notional and two fees per fill:
+  - notional = maker price × matched quantity, through the `i256` path;
+  - taker fee = notional × `taker.taker_fee_rate`;
+  - maker fee = notional × `maker.maker_fee_rate`;
+  - positive = charge, negative = rebate. Document the rounding mode (recommended: truncate
+    toward zero at 18 places, then let settlement quantize to the quote asset's precision).
+- [ ] **P0** A taker pays its taker rate on the current fill. A resting maker pays/rebates its
+  maker rate when it is later filled. If a taker leaves a remainder that rests, its maker rate
+  applies to its future fills.
+- [ ] **P0** Add `notional`, `taker_fee` and `maker_fee` to `MatchResult`; add `taker_fee` and
+  `maker_fee` to `MatchEvent` and `StoredMatchEvent`. Preserve them through `/write`, `/events`
+  and `--match-event-log`; JSON emits decimal strings.
+- [ ] **P0** Decide whether the market-data clearing records also carry fees. If `TradeRecord`
+  and fill `LifecycleRecord` do, bump the feed wire format to **v4**; otherwise leave the feed
+  untouched.
+- [ ] **P0** Bump the snapshot to **v7** for the new order/event fields; older snapshots are
+  rejected and existing data directories must be recreated.
+- [ ] **P0** Preserve fee rates through amendments, iceberg refills, stop children and partial
+  fills. Fee fields belong to the order, not to the book or the user; a tier change requires
+  cancel/replace unless a later explicit rate-update request is added.
+- [ ] **P1** Define and test extreme-value behavior: notional or fee outside the supported
+  `i128` range should be rejected or reported explicitly, never silently charged as zero.
+- [ ] **P1** Tests: maker and taker rates simultaneously; negative maker rebate; 18-digit rates
+  and notional; partial fills; a taker that later rests; stop and iceberg children; duplicate
+  submission replay; `/events` and file-sink JSON; snapshot restart; wire v4 if the feed changes.
+- [ ] **P2** Update README/README_CN, AGENTS, MATCH_RESULTS, MARKET_DATA_PLAN, AERON and DECIMAL
+  with the fee convention, JSON shape and compatibility versions.
+
+Decisions to settle before coding:
+
+- Rate unit: signed `Fixed` fraction (recommended for consistency with prices/quantities) versus
+  integer bps/ppm.
+- Rounding mode and settlement precision; fee currency is assumed to be the quote asset.
+- Whether maker rebates are enabled by default and how negative fees are represented in reports.
+- Whether fees belong in the market-data feed or only in the clearing/event feed.
+- Validation range for rates and the handling of notional/fee overflow.
