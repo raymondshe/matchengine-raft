@@ -570,6 +570,10 @@ fn state_machine_data_conversion_roundtrips() {
         sequence: 4,
         stops: Vec::new(),
         last_trade_price: None,
+        events: Vec::new(),
+        events_evicted: 0,
+        submissions: Vec::new(),
+        submissions_evicted: 0,
     };
 
     let bytes = postcard::to_allocvec(&data).unwrap();

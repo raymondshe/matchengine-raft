@@ -73,7 +73,7 @@ fn market_data_feed_publishes_trades_bbo_depth_and_bars() {
             "market data published before the reset snapshot: {events:?}"
         );
 
-        let place = |order: Order| MatchEngineRequest::Place { order };
+        let place = |order: Order| MatchEngineRequest::place(order);
 
         // Two bids rest, then a sell fills four of the best bid.
         client

@@ -186,7 +186,9 @@ impl<C: RaftTypeConfig> Disk<C> {
             .iter()
             .find(|s| s.seq == seq)
             .map(|s| s.path.clone())
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("segment {seq} is gone")))?;
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, format!("segment {seq} is gone"))
+            })?;
 
         let file = OpenOptions::new().read(true).append(true).open(&path)?;
         file.set_len(len)?;
@@ -212,7 +214,9 @@ struct Inner<C: RaftTypeConfig> {
 
 impl<C: RaftTypeConfig> Inner<C> {
     fn append_blocking(&self, entries: Vec<C::Entry>) -> io::Result<()>
-    where C::Entry: Clone {
+    where
+        C::Entry: Clone,
+    {
         if entries.is_empty() {
             return Ok(());
         }
@@ -223,7 +227,9 @@ impl<C: RaftTypeConfig> Inner<C> {
 
         let mut disk = self.disk.write().unwrap();
 
-        if disk.writer_len > SEGMENT_HEADER_LEN && disk.writer_len + buf.len() as u64 > self.segment_size {
+        if disk.writer_len > SEGMENT_HEADER_LEN
+            && disk.writer_len + buf.len() as u64 > self.segment_size
+        {
             disk.rotate(&self.dir)?;
         }
 
@@ -258,11 +264,14 @@ impl<C: RaftTypeConfig> Inner<C> {
             let mut index = self.index.write().unwrap();
             for (index_value, offset, len) in locs {
                 // `offset` is relative to the batch buffer; shift it onto the segment.
-                index.insert(index_value, RecordLoc {
-                    seq,
-                    offset: base + offset,
-                    len,
-                });
+                index.insert(
+                    index_value,
+                    RecordLoc {
+                        seq,
+                        offset: base + offset,
+                        len,
+                    },
+                );
             }
         }
 
@@ -275,7 +284,9 @@ impl<C: RaftTypeConfig> Inner<C> {
         let payload = encode_record::<C>(&WalRecord::Committed(committed.clone()))?;
 
         let mut disk = self.disk.write().unwrap();
-        if disk.writer_len > SEGMENT_HEADER_LEN && disk.writer_len + payload.len() as u64 > self.segment_size {
+        if disk.writer_len > SEGMENT_HEADER_LEN
+            && disk.writer_len + payload.len() as u64 > self.segment_size
+        {
             disk.rotate(&self.dir)?;
         }
         let base = disk.writer_len;
@@ -368,7 +379,11 @@ impl<C: RaftTypeConfig> Inner<C> {
 
         let mut state = self.state.write().unwrap();
         state.last_purged = Some(log_id.clone());
-        if state.last_log_id.as_ref().is_some_and(|last| last.index <= log_id.index) {
+        if state
+            .last_log_id
+            .as_ref()
+            .is_some_and(|last| last.index <= log_id.index)
+        {
             state.last_log_id = None;
         }
         drop(state);
@@ -397,7 +412,12 @@ impl<C: RaftTypeConfig> Inner<C> {
         };
 
         // Drop whole segments after the cut, then truncate the segment that contains it.
-        let stale: Vec<u32> = disk.segments.iter().filter(|s| s.seq > cut.0).map(|s| s.seq).collect();
+        let stale: Vec<u32> = disk
+            .segments
+            .iter()
+            .filter(|s| s.seq > cut.0)
+            .map(|s| s.seq)
+            .collect();
         for seq in &stale {
             if let Some(segment) = disk.segments.iter().find(|s| s.seq == *seq) {
                 let _ = std::fs::remove_file(&segment.path);
@@ -427,7 +447,11 @@ impl<C: RaftTypeConfig> Inner<C> {
                     .iter()
                     .find(|(_, loc)| loc.seq == cut.0)
                     .map(|(index, _)| *index);
-                segment.last_index = index.iter().next_back().filter(|(_, loc)| loc.seq == cut.0).map(|(index, _)| *index);
+                segment.last_index = index
+                    .iter()
+                    .next_back()
+                    .filter(|(_, loc)| loc.seq == cut.0)
+                    .map(|(index, _)| *index);
             }
         }
 
@@ -439,7 +463,11 @@ impl<C: RaftTypeConfig> Inner<C> {
         // A commit marker that pointed past the truncated suffix is no longer meaningful.
         match &state.last_log_id {
             Some(last) => {
-                if state.committed.as_ref().is_some_and(|committed| committed.index > last.index) {
+                if state
+                    .committed
+                    .as_ref()
+                    .is_some_and(|committed| committed.index > last.index)
+                {
                     state.committed = state.last_log_id.clone();
                 }
             }
@@ -473,7 +501,10 @@ impl<C: RaftTypeConfig> Inner<C> {
                 ));
             }
             if crc32fast::hash(&buf[8..]) != crc {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "log record checksum mismatch"));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "log record checksum mismatch",
+                ));
             }
 
             match decode_record::<C>(&buf[8..])? {
@@ -498,7 +529,9 @@ impl<C: RaftTypeConfig> Inner<C> {
             .iter()
             .find(|s| s.seq == seq)
             .map(|s| s.path.clone())
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("segment {seq} is gone")))?;
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, format!("segment {seq} is gone"))
+            })?;
 
         let file = Arc::new(File::open(path)?);
         self.disk.write().unwrap().readers.insert(seq, file.clone());
@@ -524,7 +557,9 @@ impl<C: RaftTypeConfig> Clone for LogStore<C> {
 
 impl<C: RaftTypeConfig> std::fmt::Debug for LogStore<C> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LogStore").field("dir", &self.inner.dir).finish()
+        f.debug_struct("LogStore")
+            .field("dir", &self.inner.dir)
+            .finish()
     }
 }
 
@@ -546,7 +581,10 @@ impl<C: RaftTypeConfig> LogStore<C> {
         // The state file is written atomically, so a decode failure is real corruption.
         if let Some(bytes) = read_state_file(&dir)? {
             let persisted: PersistedState<C> = postcard::from_bytes(&bytes).map_err(|e| {
-                io::Error::new(io::ErrorKind::InvalidData, format!("corrupt log state file: {e}"))
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("corrupt log state file: {e}"),
+                )
             })?;
             state.vote = persisted.vote;
             state.last_purged = persisted.last_purged;
@@ -565,7 +603,11 @@ impl<C: RaftTypeConfig> LogStore<C> {
             });
 
             // No surviving entry can be at or below the purge marker, so do not report one.
-            if state.last_log_id.as_ref().is_some_and(|last| last.index <= purged.index) {
+            if state
+                .last_log_id
+                .as_ref()
+                .is_some_and(|last| last.index <= purged.index)
+            {
                 state.last_log_id = None;
             }
         }
@@ -579,7 +621,10 @@ impl<C: RaftTypeConfig> LogStore<C> {
         }
 
         let active = segments.last().expect("a segment exists");
-        let writer = OpenOptions::new().read(true).append(true).open(&active.path)?;
+        let writer = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(&active.path)?;
         let writer_len = writer.metadata()?.len();
         let writer_seq = active.seq;
 
@@ -610,7 +655,9 @@ impl<C: RaftTypeConfig> LogStore<C> {
     }
 
     async fn append_entries(&self, entries: Vec<C::Entry>) -> io::Result<()>
-    where C::Entry: Clone + Send + 'static {
+    where
+        C::Entry: Clone + Send + 'static,
+    {
         if entries.is_empty() {
             return Ok(());
         }
@@ -686,7 +733,9 @@ where
     }
 
     async fn append<I>(&mut self, entries: I, callback: IOFlushed<C>) -> Result<(), io::Error>
-    where I: IntoIterator<Item = C::Entry> + openraft::OptionalSend {
+    where
+        I: IntoIterator<Item = C::Entry> + openraft::OptionalSend,
+    {
         let entries: Vec<C::Entry> = entries.into_iter().collect();
         self.append_entries(entries).await?;
         callback.io_completed(Ok(()));
@@ -742,7 +791,9 @@ type EncodedLocs = Vec<(u64, u64, u32)>;
 
 /// Encodes a batch into one buffer, returning each entry's offset and payload length.
 fn encode_entries<C: RaftTypeConfig>(entries: &[C::Entry]) -> io::Result<(Vec<u8>, EncodedLocs)>
-where C::Entry: Clone {
+where
+    C::Entry: Clone,
+{
     let mut buf = Vec::with_capacity(entries.len() * 128);
     let mut locs = Vec::with_capacity(entries.len());
 
@@ -823,7 +874,10 @@ fn recover_segment<C: RaftTypeConfig>(
     if version != SEGMENT_VERSION {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("segment {} has unsupported version {version}", path.display()),
+            format!(
+                "segment {} has unsupported version {version}",
+                path.display()
+            ),
         ));
     }
 
@@ -924,7 +978,8 @@ fn read_state_file(dir: &Path) -> io::Result<Option<Vec<u8>>> {
 fn write_state_file<C: RaftTypeConfig>(dir: &Path, state: &PersistedState<C>) -> io::Result<()> {
     let tmp = dir.join(format!("{STATE_FILE}.tmp"));
     let path = dir.join(STATE_FILE);
-    let bytes = postcard::to_allocvec(state).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let bytes =
+        postcard::to_allocvec(state).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
     let mut file = File::create(&tmp)?;
     file.write_all(&bytes)?;

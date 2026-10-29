@@ -9,6 +9,8 @@
 
 # Match Engine Raft
 
+[![CI](https://github.com/raymondshe/matchengine-raft/actions/workflows/ci.yml/badge.svg)](https://github.com/raymondshe/matchengine-raft/actions/workflows/ci.yml)
+
 A practical implementation of a distributed matching engine built upon [OpenRaft](https://github.com/datafuselabs/openraft). Raft logs are persisted in a hand-written segmented write-ahead log and the state machine is made durable with atomic snapshots, so a node recovers all committed state after a restart.
 
 > **Note**: For a more detailed guide in Chinese, please refer to [GUIDE_cn.md](./GUIDE_cn.md).
@@ -34,6 +36,7 @@ A practical implementation of a distributed matching engine built upon [OpenRaft
 - **HTTP Server**: Built with [Actix-web](https://docs.rs/actix-web) providing both internal Raft APIs and external application APIs
 - **Read Consistency Options**: Local reads, linearizable reads through the leader, and linearizable follower reads
 - **Smart Client**: A Rust client that automatically tracks and redirects requests to the current leader
+- **Durable Match-Event Feed**: A replicated, snapshotted event log served by `POST /events`, with cursor pagination, retention limits and `client_order_id` idempotency
 
 ## Architecture Overview
 
@@ -282,7 +285,7 @@ src/
 │   ├── mod.rs               # Tap, depth journal consumer, shadow book, deterministic publisher
 │   └── wire.rs              # 64-byte binary header + message bodies (Aeron-ready)
 ├── match_result/
-│   └── mod.rs               # MatchEvent ids + pluggable MatchResultSink (noop/memory/file)
+│   └── mod.rs               # MatchEvent ids, sinks, replicated event-log integration
 ├── network/
 │   ├── api.rs               # Application HTTP endpoints
 │   ├── management.rs        # Admin HTTP endpoints
@@ -297,7 +300,7 @@ src/
 ├── store/
 │   ├── mod.rs               # Storage module
 │   ├── log_store.rs         # Segmented WAL + vote/purge state
-│   ├── state_machine.rs     # In-memory state machine + snapshots
+│   ├── state_machine.rs     # State machine, event log + snapshots
 │   ├── types.rs             # Request/response types
 │   └── config.rs            # Storage layout / per-node directories
 proto/
@@ -311,7 +314,8 @@ tests/
     ├── test_storage.rs      # WAL and snapshot formats
     ├── test_restart.rs      # Restart recovery: log replay and snapshot
     ├── test_match_results.rs # Match events in the JSONL file sink
-    └── test_market_data.rs    # Market-data feed: snapshot, trades, BBO, depth, bars
+    ├── test_market_data.rs    # Market-data feed: snapshot, trades, BBO, depth, bars
+    └── test_events.rs         # Event log: write events, cursor, retention, dedupe
 ```
 
 ## Storage Implementation
@@ -337,10 +341,11 @@ avoiding a second fsync per batch.
 
 ### Snapshots (`src/store/state_machine.rs`)
 
-The state machine (order book + sequence counter) stays in memory so applying entries is fast.
-Snapshots are written as `snapshot/current.snap` (magic + version + CRC32 + postcard metadata
-+ postcard state) using the same atomic temp-file/rename protocol. `install_snapshot` validates the
-incoming bytes before replacing the durable copy, so a bad snapshot cannot destroy a good one.
+The state machine (order book + sequence counter + retained match-event window + submission dedupe
+map) stays in memory so applying entries is fast. Snapshot v4 is written as
+`snapshot/current.snap` (magic + version + CRC32 + postcard metadata + postcard state) using the
+same atomic temp-file/rename protocol. `install_snapshot` validates the incoming bytes before
+replacing the durable copy, so a bad snapshot cannot destroy a good one.
 
 ### Per-node data directory
 
@@ -419,10 +424,9 @@ order exactly like `Cancel` — side, current price and sequence — and each ne
 ### Match-result processing
 
 `apply` turns every `MatchResult` into a `MatchEvent` (`fill`, `rested`, `cancelled`, `triggered`,
-`expired`, `rejected` or `amended`) and hands it
-to a pluggable `MatchResultSink` (`src/match_result/mod.rs`). Events are derived from the applied log
-entry alone, so every replica produces the same ids; the sink itself is node-local and never
-influences the replicated state:
+`expired`, `rejected` or `amended`). Events are derived from the applied log entry alone, so every
+replica produces the same ids. Bounded batches are returned in the `/write` response and appended
+to a replicated, snapshotted event log; the cursor API serves clearing and audit consumers:
 
 ```
 POST /write { Place | Cancel | Amend | PurgeExpired }
@@ -430,19 +434,27 @@ POST /write { Place | Cancel | Amend | PurgeExpired }
         ▼
   StateMachineStore::apply  (every replica)
         │
-        ├──► order book + sequence ──► snapshot        [replicated state]
+        ├──► order book + sequence + event window ──► snapshot   [replicated state]
         │
-        └──► MatchEvent  (fill/rested/cancelled/…)     [id = log position]
+        ├──► MatchEvent batch ──► /write response                [capped at 512]
+        │
+        └──► POST /events + GET /events/status                   [cursor + retention]
                     │
                     ▼
-          MatchResultSink                              [node-local, best effort]
-            ├── NoopSink      default: events dropped
-            ├── FileLogSink   --match-event-log -> JSONL
-            └── (future)      replicated event log + /events cursor
+          MatchResultSink                                     [node-local, best effort]
+            ├── NoopSink      default: no local side effect
+            └── FileLogSink   --match-event-log -> JSONL
 ```
 
-The default sink drops the events, so the engine behaves as before. To inspect them, enable the
-file sink:
+`Place` accepts an optional `client_order_id`; retrying it returns the original sequence and
+events instead of placing a second order. The event window is bounded by `--max-events` (env
+`MAX_EVENTS`, default 262144); the submission map has a separate fixed 262144-record cap so retry
+resolution never depends on a node-local flag. Both are included in snapshot v4. `GET /events/status` reports the
+oldest/last retained id and eviction counters; consumers resume from `next_after` and dedupe on
+`event_id`.
+
+The file sink remains a debugging aid: node-local, not replicated or fsynced, and replayed entries
+are written again after a restart. To inspect events locally:
 
 ```bash
 ./target/release/matchengine-raft --id 1 --http-addr 127.0.0.1:21001 \
@@ -452,9 +464,9 @@ file sink:
 Each line is one event, for example
 `{"node_id":1,"event_id":{"log_index":42,"ordinal":0},"kind":"fill","order_sequence":7,"counterparty_sequence":3,"price":100.0,"volume":10.0}`.
 
-The file sink is a debugging aid: it is node-local, is not replicated or fsynced, and replaying the
-log after a restart writes the replayed events again. The durable clearing feed (a replicated event
-log, `/events` cursor reads and idempotent submission) is designed in `docs/MATCH_RESULTS.md`.
+The replicated event log is the durable clearing feed: it survives restarts and learner snapshots,
+and retries are collapsed by `client_order_id`. See `docs/MATCH_RESULTS.md` for the consumer
+contract.
 
 ### Market-data feed (opt-in)
 
@@ -550,10 +562,13 @@ The gRPC transport exposes the same operations on `--http-addr` port + 1000
 
 - `POST /write` - Submit a `Place`, `Cancel`, `Amend` or `PurgeExpired` request through Raft. The
   response is the assigned `market_seq` for every mutating request (for a `Place`, also the order
-  sequence).
+  sequence) plus the entry's first events (capped at 512). `Place` accepts an optional
+  `client_order_id` for idempotent retries.
 - `POST /read` - Read from the local state machine (may be stale)
 - `POST /linearizable_read` - Linearizable read; the request must reach the leader
 - `POST /follower_read` - Linearizable read served locally after fetching a linearizer from the leader
+- `POST /events` - Read a page of the replicated match-event log (`after`, `limit`); linearizable and leader-only
+- `GET /events/status` - Retained event window, eviction counters and retention limit
 
 `/read`, `/linearizable_read` and `/follower_read` accept a JSON string key naming a view of the
 order book:
@@ -571,8 +586,10 @@ order book:
 Example order payload accepted by `/write` (note the field name `sequence`):
 
 ```json
-{"Place": {"order": {"live": "Limit", "side": "Buy", "price": 4000.0, "volume": 4.4, "id": 1, "sequence": 1}}}
+{"Place": {"order": {"live": "Limit", "side": "Buy", "price": 4000.0, "volume": 4.4, "id": 1, "sequence": 1}, "client_order_id": "order-123"}}
 ```
+
+`client_order_id` is optional; omit it for the old non-idempotent behaviour.
 
 Every order-type field (`tif`, `post_only`, `stop_price`, `display_volume`, `hidden_volume`,
 `timestamp`) is optional and defaults to "plain GTC limit order":
@@ -597,10 +614,12 @@ placeholder). `sequence` is still required by the deserializer.
 | `tests/cluster/test_restart.rs` | Full node restart recovering the order book and sequence via WAL replay, and via snapshot + tail |
 | `tests/cluster/test_match_results.rs` | A node started with `--match-event-log` records rest/fill/cancel events in log order while the `/write` response stays unchanged; a second node checks stop triggers, GTD expiry and the new `/read` keys |
 | `tests/cluster/test_market_data.rs` | A node started with `--market-data-log` publishes a reset snapshot, one trade message per taker, BBO, post-entry depth totals and a closed OHLC bar; the assertions check `market_seq` anchors and `/read marketdata_status` counters |
+| `tests/cluster/test_events.rs` | `/write` returns events, `/events` pages by cursor, `client_order_id` retries do not duplicate an order, and `--max-events` eviction is visible in `/events/status` |
 
 Every integration test uses a unique temporary data directory. The cluster test uses fixed ports
 `21001-21003` (gRPC `22001-22003`), the snapshot test `21101-21102`, the restart test `21201-21202`
-the match-result tests `21301`/`21302` and the market-data test `21303`; stop leftover processes
+the match-result tests `21301`/`21302`, the market-data test `21303` and the event-log test
+`21304`; stop leftover processes
 (`pkill -f matchengine-raft`) before rerunning.
 
 Known gaps and the roadmap are tracked in [`TODO.md`](./TODO.md).

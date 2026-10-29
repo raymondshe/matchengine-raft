@@ -7,8 +7,9 @@ Single-crate Rust project (edition 2024): a Raft-replicated order-book matching 
 - Build and run one node: `cargo run --bin matchengine-raft -- --id 1 --http-addr 127.0.0.1:21001 --transport grpc`
   - `--transport` is `grpc` (default) or `http`; it selects **outbound** Raft RPC only. The node always serves both the HTTP API on `--http-addr` and gRPC on the same host at `port + 1000`.
   - `--data-dir` (env `RAFT_DATA_DIR`, default `/tmp/matchengine-raft`) and `--instance-prefix` (env `RAFT_INSTANCE_PREFIX`, default `matchengine`) place durable state in `<data-dir>/<prefix>-<id>/{log,snapshot}`.
-  - `--match-event-log <file>` (env `MATCH_EVENT_LOG`) appends every applied fill/rest/cancel to a JSONL file. Debug aid only: node-local, not replicated, duplicates lines when the log is replayed after a restart.
+  - `--match-event-log <file>` (env `MATCH_EVENT_LOG`) appends every applied fill/rest/cancel to a JSONL file. Debug aid only: node-local, not replicated, duplicates lines when the log is replayed after a restart. The durable feed is the replicated event log served by `/events`; `--max-events` (env `MAX_EVENTS`, default 262144) bounds it.
   - `--market-data-log <file>` (env `MARKET_DATA_LOG`) enables the deterministic market-data feed (`src/market_data/`) and appends its messages as JSONL. Leader-only by default; `--market-data-depth`, `--market-data-status-every`, `--market-data-bar-intervals-ms` and `--market-data-leader-only` tune it.
+CI (`.github/workflows/ci.yml`) runs `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings` and `cargo test` on push/PR. `Cargo.lock` is tracked (do not add it back to `.gitignore`).
 - `cargo test` runs everything (a single integration target, `cluster`, ~10s once built). Focus it with `cargo test --test cluster`.
   - `MATCHENGINE_TEST_TRANSPORT=http cargo test --test cluster` runs the cluster suite over the legacy HTTP/JSON transport.
   - `cargo bench --bench matchengine` runs the order-book micro-benchmarks (no framework, prints best-of-5 per-round times).
@@ -24,9 +25,9 @@ Single-crate Rust project (edition 2024): a Raft-replicated order-book matching 
 ## Where things are wired
 
 - `build_match_engine_node()` in `src/lib.rs` is the only composition point: it opens `LogStore`/`StateMachineStore` from a `StorageConfig`, creates the Raft config, `TransportNetworkFactory`, binds the gRPC listener, starts the tonic server and registers every actix route. It returns a `MatchEngineNode` whose `run()` waits for shutdown and whose `shutdown()` stops HTTP, gRPC and Raft cleanly (needed before reopening the same storage).
-- Match-result processing is pluggable: `src/match_result/mod.rs` defines `MatchEvent`/`EventId` and the `MatchResultSink` trait (`NoopSink`, `MemorySink`, `FileLogSink`). `build_match_engine_node` installs `NoopSink`, or a `FileLogSink` when `StorageConfig::match_event_log` is set, via `StateMachineStore::open_with_sink`. `apply` derives events from the entry alone and publishes them through `publish_match_events`; sink errors are logged and never fail the apply.
+- Match-result processing is pluggable: `src/match_result/mod.rs` defines `MatchEvent`/`EventId` and the `MatchResultSink` trait (`NoopSink`, `MemorySink`, `FileLogSink`). `build_match_engine_node` installs `NoopSink`, or a `FileLogSink` when `StorageConfig::match_event_log` is set, via `StateMachineStore::open_with_sinks_and_retention`. `apply` derives events from the entry alone, appends them to the replicated event window, returns the first 512 in `/write`, and publishes them through `publish_match_events`; sink errors are logged and never fail the apply. `POST /events` serves the window with an `(log_index, ordinal)` cursor; `GET /events/status` reports retention. `Place { client_order_id }` dedupes retries through a fixed 262144-record map (`MAX_SUBMISSIONS`), kept independent of `--max-events` so retry resolution cannot diverge across nodes.
 - `start_match_engine_node_with_transport()`, `start_match_engine_node_with_config()` and `start_match_engine_node_with_storage()` are thin build+run wrappers for the binary, tests and benchmarks.
-- Actual HTTP routes: `/init`, `/add-learner`, `/change-membership`, `GET /metrics`, `/get_linearizer`, `/write`, `/read`, `/linearizable_read`, `/follower_read`, and Raft RPC `/vote`, `/append`, `/snapshot`. There is no `/raft-append`, `/raft-vote`, `/raft-snapshot` or `/consistent_read`.
+- Actual HTTP routes: `/init`, `/add-learner`, `/change-membership`, `GET /metrics`, `/get_linearizer`, `/write`, `/read`, `/linearizable_read`, `/follower_read`, `POST /events`, `GET /events/status`, and Raft RPC `/vote`, `/append`, `/snapshot`. There is no `/raft-append`, `/raft-vote`, `/raft-snapshot` or `/consistent_read`.
 - gRPC Raft service (`proto/raft.proto`, `src/network/grpc/`): `AppendEntries`, `Vote`, `InstallSnapshot` (client-streaming chunks), `AppendStream` (bidirectional, used by `stream_append`). Envelopes are protobuf; payloads are `postcard`-encoded openraft types.
 - Raft port convention: `BasicNode.addr` stays the HTTP API address, and the Raft transport lives at `raft_addr_from_http(addr)` = same host, port + `RAFT_PORT_OFFSET` (1000). `src/network/mod.rs` owns the derivation and the `Transport` enum.
 - `/init` takes a JSON array, so a single-node cluster must be initialised with `-d '[]'`. A bare POST or `-d '{}'` fails deserialization ("invalid type: map, expected a sequence"); all scripts now send `'[]'`.
@@ -35,6 +36,10 @@ Single-crate Rust project (edition 2024): a Raft-replicated order-book matching 
 
 ## Branch state — read before changing storage or network code
 
+- **Breaking wire/disk change (2026-10-29):** `MatchEngineRequest::Place` now carries
+  `client_order_id`, so the postcard payload of new Raft entries differs from older builds.
+  Snapshot v4 also rejects v3. Wipe the node's `--data-dir` when moving an existing example
+  deployment across this change; there is no log-entry migration.
 - Upgraded to `openraft` 0.10.0-alpha.37 from crates.io (git pin and the `openraft-legacy` dependency are gone). Installing it is a normal `cargo fetch`; no git checkout needed.
 - The node now runs **gRPC (tonic) by default** for peer-to-peer Raft RPCs; the HTTP/JSON implementation is retained and selectable with `--transport http`.
   - `src/network/grpc/client.rs`: `RaftNetworkV2` implementation with unary append/vote, a custom `stream_append` over `AppendStream`, and chunked `full_snapshot` that honours the `cancel` future.
@@ -46,12 +51,12 @@ Single-crate Rust project (edition 2024): a Raft-replicated order-book matching 
 - Deadlines: unary vote/append and each `stream_append` request in flight get `RPCOption::soft_ttl()`. `stream_append` only times a wait while a request is in flight (the heartbeat worker polls for a response before the feeder necessarily sends), and `full_snapshot` has no per-RPC deadline — it is bounded by the `cancel` future and HTTP/2 keep-alive, because a legitimate snapshot can outlive one heartbeat interval.
 - Each peer gets separate gRPC connections for replication, heartbeat and snapshot (openraft's `new_heartbeat_client` / `new_snapshot_client` default to `new_client`, and each `GrpcNetwork` owns its own lazy channel), so a snapshot cannot head-of-line-block a vote.
 - Storage is **durable**. `src/store/log_store.rs` is a hand-written segmented WAL: `log/NNNNNNNNNN.wal` with an 8-byte `MRFT`+version header, `[len u32 LE][crc32 u32 LE][postcard payload]` records, one `write_all` + one `sync_data` per openraft append batch, `pread` reads, and blocking IO on `spawn_blocking`. Recovery walks segments and truncates a torn tail. Vote + `last_purged` live in an atomically rewritten `log/state`; `committed` is a WAL record that becomes durable with the next append (no second fsync).
-- `src/store/state_machine.rs` keeps the order book + sequence in memory and persists `snapshot/current.snap` (magic `MRFSNAP` + version + postcard meta + postcard content) via temp file → fsync → rename → dir fsync. Snapshot version is 3 (v2 added nothing beyond dropping the KV map; v3 carries the extended `Order`, parked stops and the last trade price). Older files are rejected on open. `install_snapshot` validates before replacing the durable copy. Restart = open snapshot, then openraft replays the retained log tail.
+- `src/store/state_machine.rs` keeps the order book + sequence + event window in memory and persists `snapshot/current.snap` (magic `MRFSNAP` + version + postcard meta + postcard content) via temp file → fsync → rename → dir fsync. Snapshot version is 4 (v3 added the extended `Order`, parked stops and last trade price; v4 adds the retained `MatchEvent` window and client-order-id dedupe map). Older files are rejected on open. `install_snapshot` validates before replacing the durable copy. Restart = open snapshot, then openraft replays the retained log tail.
 - `src/store/config.rs` owns `StorageConfig` (`data_dir`, `instance_prefix`, `node_dir`/`log_dir`/`snapshot_dir`). The old sled-backed `src/store/store.rs` and the `walkdir` dependency are gone; `sled` remains only for the `sled_test.rs` playground binary.
 
 ## Test gotchas
 
-- `tests/cluster/test_cluster.rs` boots 3 nodes in threads on fixed ports 127.0.0.1:21001-21003 (gRPC 22001-22003) and never shuts them down. `test_snapshot.rs` uses 21101-21102 (gRPC 22101-22102); `test_restart.rs` uses 21201 and 21202 (gRPC 22201-22202); `test_match_results.rs` uses 21301 and 21302 (gRPC 22301/22302), `test_market_data.rs` uses 21303 (gRPC 22303), and both shut their nodes down. Kill leftovers (`./test.sh kill`, i.e. `pkill -f matchengine-raft`) before rerunning or the bind fails.
+- `tests/cluster/test_cluster.rs` boots 3 nodes in threads on fixed ports 127.0.0.1:21001-21003 (gRPC 22001-22003) and never shuts them down. `test_snapshot.rs` uses 21101-21102 (gRPC 22101-22102); `test_restart.rs` uses 21201 and 21202 (gRPC 22201-22202); `test_match_results.rs` uses 21301 and 21302 (gRPC 22301/22302), `test_market_data.rs` uses 21303 (gRPC 22303), `test_events.rs` uses 21304 (gRPC 22304), and the latter three shut their nodes down. Kill leftovers (`./test.sh kill`, i.e. `pkill -f matchengine-raft`) before rerunning or the bind fails.
 - `test_snapshot.rs` polls `metrics().current_leader` after `init`; without that wait the first write can race the election and fail with `NotLeader`.
 - The cluster test asserts an exact `LinearizableReadError` message string naming node 1; changing error formatting breaks it.
 - The snapshot test depends on `snapshot_policy = LogsSinceLast(10)` and `max_in_snapshot_log_to_keep = 0`: the learner must join after the covered log has been purged, otherwise it catches up by log replication and the test proves nothing.
@@ -121,9 +126,7 @@ Single-crate Rust project (edition 2024): a Raft-replicated order-book matching 
 - `docs/MARKET_DATA_PLAN.md` tracks the market-data egress implementation (tap, shadow book,
   deterministic `market_seq`/`sub_seq` sequencing, binary wire format v2, JSONL sink, leader
   gating); the Aeron adapter is still the next phase.
-- `docs/MATCH_RESULTS.md` describes match-result delivery. Phase 1a is implemented: `apply`
-  publishes `Fill`/`Rested`/`Cancelled`/`Triggered`/`Expired`/`Rejected`/`Amended` events to a
-  `MatchResultSink`, and `--match-event-log`
-  installs a file sink for debugging. Still proposals: events in the `/write` response, the
-  replicated event log, `/events` and `client_order_id` dedupe. Do not describe those as existing
-  behaviour.
+- `docs/MATCH_RESULTS.md` describes match-result delivery. Phases 1a–3 are implemented: events in
+  `/write`, a replicated bounded event log in snapshots (v4), `POST /events` +
+  `GET /events/status`, and `client_order_id` submission dedupe. `--match-event-log` remains a
+  node-local debugging sink. Phase 4 (long-poll, gRPC streaming, MQ bridge) is still a proposal.

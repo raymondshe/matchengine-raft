@@ -30,7 +30,8 @@ use crate::network::raft::FullSnapshotRequest;
 pub struct NetworkFactory {}
 
 impl<C> RaftNetworkFactory<C> for NetworkFactory
-where C: RaftTypeConfig<Node = BasicNode>
+where
+    C: RaftTypeConfig<Node = BasicNode>,
 {
     type Network = Network<C>;
 
@@ -41,7 +42,8 @@ where C: RaftTypeConfig<Node = BasicNode>
 }
 
 pub struct Network<C>
-where C: RaftTypeConfig
+where
+    C: RaftTypeConfig,
 {
     addr: String,
     client: Client,
@@ -49,7 +51,8 @@ where C: RaftTypeConfig
 }
 
 impl<C> Network<C>
-where C: RaftTypeConfig
+where
+    C: RaftTypeConfig,
 {
     pub fn new(addr: String) -> Self {
         let client = Client::builder().no_proxy().build().unwrap();
@@ -97,7 +100,8 @@ where C: RaftTypeConfig
 }
 
 impl<C> RaftNetworkV2<C> for Network<C>
-where C: RaftTypeConfig<Node = BasicNode>
+where
+    C: RaftTypeConfig<Node = BasicNode>,
 {
     /// Snapshot data is transmitted as a single JSON payload, therefore it has to be fully
     /// buffered: the follower rebuilds it into a `Cursor<Vec<u8>>` before installing it.
@@ -111,15 +115,25 @@ where C: RaftTypeConfig<Node = BasicNode>
     ) -> Result<AppendEntriesResponse<C>, RPCError<C>> {
         // A raft-level rejection (higher term, conflicting log, ...) is reported as a transport
         // error: `RPCError<C>` carries only timeout/unreachable/network variants.
-        match self.request::<_, _, RaftError<C>>("append", req, &option).await? {
+        match self
+            .request::<_, _, RaftError<C>>("append", req, &option)
+            .await?
+        {
             Ok(resp) => Ok(resp),
             Err(e) => Err(RPCError::Network(NetworkError::new(&e))),
         }
     }
 
     #[tracing::instrument(level = "debug", skip_all, err(Debug))]
-    async fn vote(&mut self, req: VoteRequest<C>, option: RPCOption) -> Result<VoteResponse<C>, RPCError<C>> {
-        match self.request::<_, _, RaftError<C>>("vote", req, &option).await? {
+    async fn vote(
+        &mut self,
+        req: VoteRequest<C>,
+        option: RPCOption,
+    ) -> Result<VoteResponse<C>, RPCError<C>> {
+        match self
+            .request::<_, _, RaftError<C>>("vote", req, &option)
+            .await?
+        {
             Ok(resp) => Ok(resp),
             Err(e) => Err(RPCError::Network(NetworkError::new(&e))),
         }
@@ -143,8 +157,10 @@ where C: RaftTypeConfig<Node = BasicNode>
             data: snapshot.snapshot.into_inner(),
         };
 
-        let res: Result<SnapshotResponse<C>, StreamingError<C>> =
-            self.request("snapshot", req, &option).await.map_err(StreamingError::from)?;
+        let res: Result<SnapshotResponse<C>, StreamingError<C>> = self
+            .request("snapshot", req, &option)
+            .await
+            .map_err(StreamingError::from)?;
 
         res
     }

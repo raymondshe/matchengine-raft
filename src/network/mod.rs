@@ -38,9 +38,9 @@ impl std::fmt::Display for Transport {
 /// - `[::1]:21001` -> `[::1]:22001`
 pub fn raft_addr_from_http(http_addr: &str) -> Result<String, String> {
     let (host, port) = split_host_port(http_addr)?;
-    let port = port
-        .checked_add(RAFT_PORT_OFFSET)
-        .ok_or_else(|| format!("raft port for {http_addr} exceeds 65535 with offset {RAFT_PORT_OFFSET}"))?;
+    let port = port.checked_add(RAFT_PORT_OFFSET).ok_or_else(|| {
+        format!("raft port for {http_addr} exceeds 65535 with offset {RAFT_PORT_OFFSET}")
+    })?;
     Ok(format!("{host}:{port}"))
 }
 
@@ -78,8 +78,14 @@ mod tests {
 
     #[test]
     fn derives_raft_addr_for_ipv4_and_hostnames() {
-        assert_eq!("127.0.0.1:22001", raft_addr_from_http("127.0.0.1:21001").unwrap());
-        assert_eq!("localhost:21000", raft_addr_from_http("localhost:20000").unwrap());
+        assert_eq!(
+            "127.0.0.1:22001",
+            raft_addr_from_http("127.0.0.1:21001").unwrap()
+        );
+        assert_eq!(
+            "localhost:21000",
+            raft_addr_from_http("localhost:20000").unwrap()
+        );
     }
 
     #[test]

@@ -4,17 +4,17 @@ use std::panic::PanicHookInfo;
 use std::thread;
 use std::time::Duration;
 
+use maplit::btreemap;
+use maplit::btreeset;
+use matchengine_raft::MatchEngineTypeConfig;
 use matchengine_raft::StorageConfig;
+use matchengine_raft::Transport;
 use matchengine_raft::client::MatchEngineClient;
 use matchengine_raft::default_raft_config;
 use matchengine_raft::matchengine::Order;
 use matchengine_raft::matchengine::OrderSide;
 use matchengine_raft::start_match_engine_node_with_storage;
 use matchengine_raft::store::MatchEngineRequest;
-use matchengine_raft::MatchEngineTypeConfig;
-use matchengine_raft::Transport;
-use maplit::btreemap;
-use maplit::btreeset;
 use openraft::BasicNode;
 use openraft::async_runtime::AsyncRuntime;
 use openraft::type_config::TypeConfigExt;
@@ -22,9 +22,7 @@ use openraft::type_config::alias::AsyncRuntimeOf;
 use tracing_subscriber::EnvFilter;
 
 pub fn log_panic(panic: &PanicHookInfo) {
-    let backtrace = {
-        format!("{:?}", Backtrace::force_capture())
-    };
+    let backtrace = { format!("{:?}", Backtrace::force_capture()) };
 
     eprintln!("{}", panic);
 
@@ -36,7 +34,12 @@ pub fn log_panic(panic: &PanicHookInfo) {
             panic.line = location.line(),
             panic.column = location.column(),
         );
-        eprintln!("{}:{}:{}", location.file(), location.line(), location.column());
+        eprintln!(
+            "{}:{}:{}",
+            location.file(),
+            location.line(),
+            location.column()
+        );
     } else {
         tracing::error!(message = %panic, backtrace = %backtrace);
     }
@@ -145,10 +148,16 @@ async fn test_cluster_inner() -> anyhow::Result<()> {
     println!("=== metrics after add-learner");
     let x = client.metrics().await?;
 
-    assert_eq!(&vec![btreeset![1]], x.membership_config.membership().get_joint_config());
+    assert_eq!(
+        &vec![btreeset![1]],
+        x.membership_config.membership().get_joint_config()
+    );
 
-    let nodes_in_cluster =
-        x.membership_config.nodes().map(|(nid, node)| (*nid, node.clone())).collect::<BTreeMap<_, _>>();
+    let nodes_in_cluster = x
+        .membership_config
+        .nodes()
+        .map(|(nid, node)| (*nid, node.clone()))
+        .collect::<BTreeMap<_, _>>();
     assert_eq!(
         btreemap! {
             1 => BasicNode::new("127.0.0.1:21001"),
@@ -176,9 +185,12 @@ async fn test_cluster_inner() -> anyhow::Result<()> {
 
     println!("=== write a resting buy order");
     let response = client
-        .write(&MatchEngineRequest::Place {
-            order: Order::new(OrderSide::Buy, 100.0, 10.0, 0),
-        })
+        .write(&MatchEngineRequest::place(Order::new(
+            OrderSide::Buy,
+            100.0,
+            10.0,
+            0,
+        )))
         .await??;
     assert_eq!(Some("0".to_string()), response.data.value);
 
@@ -204,9 +216,12 @@ async fn test_cluster_inner() -> anyhow::Result<()> {
 
     println!("=== write a crossing sell to node 2");
     let response = client2
-        .write(&MatchEngineRequest::Place {
-            order: Order::new(OrderSide::Sell, 100.0, 4.0, 0),
-        })
+        .write(&MatchEngineRequest::place(Order::new(
+            OrderSide::Sell,
+            100.0,
+            4.0,
+            0,
+        )))
         .await??;
     assert_eq!(Some("1".to_string()), response.data.value);
 
@@ -214,27 +229,42 @@ async fn test_cluster_inner() -> anyhow::Result<()> {
 
     // --- The book holds the 6 that did not trade, on every node.
 
-    for (name, node_client) in [("node 1", &client), ("node 2", &client2), ("node 3", &client3)] {
+    for (name, node_client) in [
+        ("node 1", &client),
+        ("node 2", &client2),
+        ("node 3", &client3),
+    ] {
         println!("=== read `orderbook_orders` on {name}");
-        let orders: Vec<Order> = serde_json::from_str(&node_client.read(&"orderbook_orders".to_string()).await?)?;
+        let orders: Vec<Order> =
+            serde_json::from_str(&node_client.read(&"orderbook_orders".to_string()).await?)?;
         assert_eq!(1, orders.len(), "unexpected book on {name}: {orders:?}");
         assert_eq!(6.0, orders[0].volume);
     }
 
     println!("=== linearizable_read `orderbook_sequence` on node 1");
-    assert_eq!("2", client.linearizable_read(&"orderbook_sequence".to_string()).await??);
+    assert_eq!(
+        "2",
+        client
+            .linearizable_read(&"orderbook_sequence".to_string())
+            .await??
+    );
 
     // A fresh client bound to node 2: the previous one learned the leader while forwarding,
     // and this assertion is about what the follower itself answers.
     let client2 = MatchEngineClient::<MatchEngineTypeConfig>::new(2, get_addr(2)?);
 
-    println!("=== linearizable_read `orderbook_sequence` on node 2 MUST return LinearizableReadError");
-    let x = client2.linearizable_read(&"orderbook_sequence".to_string()).await?;
+    println!(
+        "=== linearizable_read `orderbook_sequence` on node 2 MUST return LinearizableReadError"
+    );
+    let x = client2
+        .linearizable_read(&"orderbook_sequence".to_string())
+        .await?;
     match x {
         Err(e) => {
             let s = e.to_string();
             let expect_err: String =
-                "has to forward request to: Some(1), Some(BasicNode { addr: \"127.0.0.1:21001\" })".to_string();
+                "has to forward request to: Some(1), Some(BasicNode { addr: \"127.0.0.1:21001\" })"
+                    .to_string();
 
             assert_eq!(s, expect_err);
         }
@@ -250,17 +280,28 @@ async fn test_cluster_inner() -> anyhow::Result<()> {
 
     println!("=== metrics after change-membership to {{3}}");
     let x = client.metrics().await?;
-    assert_eq!(&vec![btreeset![3]], x.membership_config.membership().get_joint_config());
+    assert_eq!(
+        &vec![btreeset![3]],
+        x.membership_config.membership().get_joint_config()
+    );
 
     println!("=== write a resting buy to node-3");
     client3
-        .write(&MatchEngineRequest::Place {
-            order: Order::new(OrderSide::Buy, 99.0, 1.0, 0),
-        })
+        .write(&MatchEngineRequest::place(Order::new(
+            OrderSide::Buy,
+            99.0,
+            1.0,
+            0,
+        )))
         .await??;
 
     println!("=== read `orderbook_orders` on node-3");
-    let orders: Vec<Order> = serde_json::from_str(&client3.read(&"orderbook_orders".to_string()).await?)?;
-    assert_eq!(2, orders.len(), "the shrunk cluster lost an order: {orders:?}");
+    let orders: Vec<Order> =
+        serde_json::from_str(&client3.read(&"orderbook_orders".to_string()).await?)?;
+    assert_eq!(
+        2,
+        orders.len(),
+        "the shrunk cluster lost an order: {orders:?}"
+    );
     Ok(())
 }

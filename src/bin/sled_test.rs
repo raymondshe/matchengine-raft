@@ -1,4 +1,3 @@
-
 use std::convert::TryInto;
 
 #[actix_web::main]
@@ -9,7 +8,7 @@ async fn main() -> std::io::Result<()> {
     for i in 0..1000 {
         let key = (i as u64).to_be_bytes();
         let val = (i as u64).to_be_bytes();
-        db.insert(&key, &val)?;
+        db.insert(key, val.to_vec())?;
     }
 
     let k1: u64 = 30;
@@ -19,14 +18,14 @@ async fn main() -> std::io::Result<()> {
 
     for kv in db.range(k2.to_be_bytes()..) {
         println!("entry {:?}", kv);
-        println!("key {:?} value {:?}", 
-        u64::from_be_bytes(kv.clone().unwrap().0[0..8].try_into().unwrap()),
-        u64::from_be_bytes(kv.unwrap().1[0..8].try_into().unwrap())
-    );
-
+        println!(
+            "key {:?} value {:?}",
+            u64::from_be_bytes(kv.clone().unwrap().0[0..8].try_into().unwrap()),
+            u64::from_be_bytes(kv.unwrap().1[0..8].try_into().unwrap())
+        );
     }
 
-/*
+    /*
     // Atomic compare-and-swap.
     db.compare_and_swap(
         b"yo!",      // key

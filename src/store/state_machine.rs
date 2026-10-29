@@ -7,6 +7,8 @@
 //! Snapshots are written to `<dir>/current.snap` with a small framing header, then fsynced and
 //! renamed into place, so a crash never leaves a half-written snapshot visible.
 
+use std::collections::BTreeMap;
+use std::collections::VecDeque;
 use std::fmt;
 use std::io;
 use std::io::Cursor;
@@ -40,12 +42,15 @@ use crate::market_data::MarketDataControl;
 use crate::market_data::MarketDataTap;
 use crate::market_data::SnapshotFrame;
 use crate::market_data::TapFrame;
+use crate::match_result::EventId;
 use crate::match_result::MatchEvent;
+use crate::match_result::MatchEventKind;
 use crate::match_result::MatchResultSink;
 use crate::match_result::NoopSink;
 use crate::matchengine::Order;
 use crate::matchengine::OrderBook;
 use crate::matchengine::OrderSide;
+use crate::matchengine::RejectReason;
 use crate::store::config::sync_dir;
 use crate::store::types::MatchEngineRequest;
 use crate::store::types::MatchEngineResponse;
@@ -58,10 +63,11 @@ const SNAPSHOT_MAGIC: &[u8; 7] = b"MRFSNAP";
 ///
 /// Version 2 dropped the key-value store from [`StateMachineData`]. Version 3 added the
 /// extended [`Order`] fields (time in force, post-only, stop price, iceberg tranches,
-/// timestamp) together with parked stops and the last trade price. Postcard is not
+/// timestamp) together with parked stops and the last trade price. Version 4 adds the
+/// retained match-event window and the client-order-id dedupe map. Postcard is not
 /// self-describing, so an older file is rejected with an explicit error instead of being
 /// decoded into a different shape.
-const SNAPSHOT_VERSION: u32 = 3;
+const SNAPSHOT_VERSION: u32 = 4;
 /// `magic + version + crc32 of the body`.
 const SNAPSHOT_HEADER_LEN: usize = SNAPSHOT_MAGIC.len() + 4 + 4;
 
@@ -82,6 +88,80 @@ struct SnapshotPayload<C: RaftTypeConfig> {
     data: Vec<u8>,
 }
 
+/// Default number of match events retained in the state machine.
+pub const DEFAULT_MAX_EVENTS: usize = 262_144;
+
+/// Number of `client_order_id` records retained for submission dedupe.
+///
+/// This is intentionally independent of [`DEFAULT_MAX_EVENTS`]: the dedupe
+/// map influences matching (a retry must resolve identically on every replica),
+/// while the event window is feed-only. Keeping it fixed avoids making state
+/// transitions depend on a node-local CLI flag.
+pub const MAX_SUBMISSIONS: usize = 262_144;
+
+/// Snapshot representation of [`MatchEvent`].
+///
+/// `MatchEvent` omits absent optional fields from JSON, which postcard cannot
+/// decode positionally. This mirror always writes both options, so snapshots
+/// stay self-consistent without changing the debug JSONL format.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct StoredMatchEvent {
+    pub event_id: EventId,
+    pub kind: MatchEventKind,
+    pub order_sequence: u64,
+    pub side: OrderSide,
+    pub counterparty_sequence: Option<u64>,
+    pub previous_sequence: Option<u64>,
+    pub price: f64,
+    pub volume: f64,
+    pub reason: Option<RejectReason>,
+}
+
+impl From<MatchEvent> for StoredMatchEvent {
+    fn from(event: MatchEvent) -> Self {
+        Self {
+            event_id: event.event_id,
+            kind: event.kind,
+            order_sequence: event.order_sequence,
+            side: event.side,
+            counterparty_sequence: event.counterparty_sequence,
+            previous_sequence: event.previous_sequence,
+            price: event.price,
+            volume: event.volume,
+            reason: event.reason,
+        }
+    }
+}
+
+impl From<StoredMatchEvent> for MatchEvent {
+    fn from(event: StoredMatchEvent) -> Self {
+        Self {
+            event_id: event.event_id,
+            kind: event.kind,
+            order_sequence: event.order_sequence,
+            side: event.side,
+            counterparty_sequence: event.counterparty_sequence,
+            previous_sequence: event.previous_sequence,
+            price: event.price,
+            volume: event.volume,
+            reason: event.reason,
+        }
+    }
+}
+
+/// One successful `Place` keyed by its client idempotency key.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct SubmissionRecord {
+    /// The client-supplied idempotency key.
+    pub client_order_id: String,
+    /// Sequence assigned to the original placement.
+    pub order_sequence: u64,
+    /// Log index of the original placement, used to recover its events.
+    pub log_index: u64,
+    /// Number of events the original entry produced.
+    pub event_count: u32,
+}
+
 /// Data contained in the Raft state machine.
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]
 pub struct StateMachineData {
@@ -96,6 +176,22 @@ pub struct StateMachineData {
 
     /// Price of the most recent trade, which elects parked stops.
     pub last_trade_price: Option<f64>,
+
+    /// Retained match events, oldest first.
+    #[serde(default)]
+    pub events: Vec<StoredMatchEvent>,
+
+    /// Number of events evicted from the retained window.
+    #[serde(default)]
+    pub events_evicted: u64,
+
+    /// Client-order-id dedupe records, oldest first.
+    #[serde(default)]
+    pub submissions: Vec<SubmissionRecord>,
+
+    /// Number of client-order-id records evicted.
+    #[serde(default)]
+    pub submissions_evicted: u64,
 }
 
 /// Inner storage for the state machine.
@@ -114,6 +210,27 @@ pub struct StateMachineStoreInner<C: RaftTypeConfig> {
     /// Optional market-data tap: node-local, derived, never part of the
     /// replicated state or of snapshots.
     pub market_data: Option<MarketDataTap>,
+
+    /// Bounded, replicated window of match events, oldest first.
+    events: VecDeque<MatchEvent>,
+
+    /// Events evicted from the front of `events`.
+    events_evicted: u64,
+
+    /// Client-order-id dedupe lookup.
+    submissions: BTreeMap<String, SubmissionRecord>,
+
+    /// Submission lookup order, used to evict the oldest ids first.
+    submission_order: VecDeque<SubmissionRecord>,
+
+    /// Client-order-id records evicted from the map.
+    submissions_evicted: u64,
+
+    /// Maximum number of retained events.
+    max_events: usize,
+
+    /// Maximum number of retained client-order-id records.
+    max_submissions: usize,
 }
 
 impl<C: RaftTypeConfig> Default for StateMachineStoreInner<C> {
@@ -124,6 +241,13 @@ impl<C: RaftTypeConfig> Default for StateMachineStoreInner<C> {
             orderbook: OrderBook::new(),
             current_snapshot: None,
             market_data: None,
+            events: VecDeque::new(),
+            events_evicted: 0,
+            submissions: BTreeMap::new(),
+            submission_order: VecDeque::new(),
+            submissions_evicted: 0,
+            max_events: DEFAULT_MAX_EVENTS,
+            max_submissions: MAX_SUBMISSIONS,
         }
     }
 }
@@ -145,6 +269,154 @@ impl<C: RaftTypeConfig> StateMachineStoreInner<C> {
         // the seeder rather than deltas that predate the restore.
         self.orderbook.take_depth_journal();
         self.orderbook.rebuild_derived_indexes();
+
+        self.events = content.events.into_iter().map(MatchEvent::from).collect();
+        self.events_evicted = content.events_evicted;
+        self.submissions.clear();
+        self.submission_order.clear();
+        for record in content.submissions {
+            self.submissions
+                .insert(record.client_order_id.clone(), record.clone());
+            self.submission_order.push_back(record);
+        }
+        self.submissions_evicted = content.submissions_evicted;
+        self.trim_events();
+        self.trim_submissions();
+    }
+
+    /// Appends one applied entry's events and trims the retained window.
+    fn record_events(&mut self, events: &[MatchEvent]) {
+        self.events.extend(events.iter().copied());
+        self.trim_events();
+    }
+
+    fn trim_events(&mut self) {
+        while self.events.len() > self.max_events {
+            self.events.pop_front();
+            self.events_evicted += 1;
+        }
+    }
+
+    /// Records a successful (or rejected) `Place` for idempotent retries.
+    fn record_submission(
+        &mut self,
+        client_order_id: String,
+        order_sequence: u64,
+        log_index: u64,
+        event_count: u32,
+    ) {
+        let record = SubmissionRecord {
+            client_order_id: client_order_id.clone(),
+            order_sequence,
+            log_index,
+            event_count,
+        };
+        self.submissions.insert(client_order_id, record.clone());
+        self.submission_order.push_back(record);
+        self.trim_submissions();
+    }
+
+    fn trim_submissions(&mut self) {
+        while self.submission_order.len() > self.max_submissions {
+            let Some(old) = self.submission_order.pop_front() else {
+                break;
+            };
+            let still_current = self
+                .submissions
+                .get(&old.client_order_id)
+                .is_some_and(|current| {
+                    current.order_sequence == old.order_sequence
+                        && current.log_index == old.log_index
+                });
+            if still_current {
+                self.submissions.remove(&old.client_order_id);
+            }
+            self.submissions_evicted += 1;
+        }
+    }
+
+    /// Events retained for the entry that produced `record`, capped at the
+    /// response limit. The boolean is true when the response is incomplete.
+    fn submission_events(&self, record: &SubmissionRecord) -> (Vec<MatchEvent>, bool) {
+        let cap = MatchEngineResponse::MAX_EVENTS;
+        let mut events = Vec::new();
+        let mut total = 0u32;
+        for event in &self.events {
+            if event.event_id.log_index == record.log_index {
+                total = total.saturating_add(1);
+                if events.len() < cap {
+                    events.push(*event);
+                }
+            }
+        }
+        let truncated = total > cap as u32 || total < record.event_count;
+        (events, truncated)
+    }
+
+    fn duplicate_response(&self, record: &SubmissionRecord) -> MatchEngineResponse {
+        let (events, truncated) = self.submission_events(record);
+        MatchEngineResponse::duplicate(record.order_sequence, events, truncated)
+    }
+
+    /// Returns events strictly after `after`, up to `limit`, and whether more
+    /// remain in the retained window.
+    pub fn events_since(
+        &self,
+        after: Option<EventId>,
+        limit: usize,
+    ) -> (Vec<MatchEvent>, Option<EventId>, bool) {
+        let mut events = Vec::new();
+        let mut has_more = false;
+        for event in &self.events {
+            if after.is_some_and(|cursor| event.event_id <= cursor) {
+                continue;
+            }
+            if events.len() == limit {
+                has_more = true;
+                break;
+            }
+            events.push(*event);
+        }
+        let next_after = events.last().map_or(after, |event| Some(event.event_id));
+        (events, next_after, has_more)
+    }
+
+    pub fn oldest_event_id(&self) -> Option<EventId> {
+        self.events.front().map(|event| event.event_id)
+    }
+
+    pub fn last_event_id(&self) -> Option<EventId> {
+        self.events.back().map(|event| event.event_id)
+    }
+
+    pub fn retained_event_count(&self) -> usize {
+        self.events.len()
+    }
+
+    pub fn events_evicted(&self) -> u64 {
+        self.events_evicted
+    }
+
+    pub fn submissions_evicted(&self) -> u64 {
+        self.submissions_evicted
+    }
+
+    pub fn event_retention_limit(&self) -> usize {
+        self.max_events
+    }
+
+    pub fn submission_retention_limit(&self) -> usize {
+        self.max_submissions
+    }
+
+    /// Resting orders without cloning the event log or submission map.
+    pub fn orders(&self) -> Vec<Order> {
+        self.orderbook
+            .bids
+            .values()
+            .chain(self.orderbook.asks.values())
+            .copied()
+            .collect()
     }
 
     /// Converts the state machine to a serializable content format.
@@ -154,6 +426,15 @@ impl<C: RaftTypeConfig> StateMachineStoreInner<C> {
             sequence: self.orderbook.sequence,
             stops: self.orderbook.stops.clone(),
             last_trade_price: self.orderbook.last_trade_price,
+            events: self
+                .events
+                .iter()
+                .copied()
+                .map(StoredMatchEvent::from)
+                .collect(),
+            events_evicted: self.events_evicted,
+            submissions: self.submission_order.iter().cloned().collect(),
+            submissions_evicted: self.submissions_evicted,
         };
 
         let mut bids: Vec<Order> = self.orderbook.bids.values().cloned().collect();
@@ -229,10 +510,24 @@ impl<C: RaftTypeConfig> StateMachineStore<C> {
         sink: Arc<dyn MatchResultSink>,
         market_data: Option<MarketDataTap>,
     ) -> io::Result<Self> {
+        Self::open_with_sinks_and_retention(dir, sink, market_data, DEFAULT_MAX_EVENTS)
+    }
+
+    /// Like [`StateMachineStore::open_with_sinks`], with an explicit event
+    /// retention limit. The same limit bounds the client-order-id dedupe map.
+    pub fn open_with_sinks_and_retention(
+        dir: impl Into<PathBuf>,
+        sink: Arc<dyn MatchResultSink>,
+        market_data: Option<MarketDataTap>,
+        max_events: usize,
+    ) -> io::Result<Self> {
         let dir = dir.into();
         std::fs::create_dir_all(&dir)?;
 
-        let mut inner = StateMachineStoreInner::<C>::default();
+        let mut inner = StateMachineStoreInner::<C> {
+            max_events,
+            ..StateMachineStoreInner::default()
+        };
 
         if let Some((meta, data)) = read_snapshot_file::<C>(&dir)? {
             let content = decode_content(&data)?;
@@ -252,6 +547,24 @@ impl<C: RaftTypeConfig> StateMachineStore<C> {
             dir: Arc::new(dir),
             sink,
         })
+    }
+
+    /// Test-only constructor with independent event and submission limits.
+    #[cfg(test)]
+    pub(crate) async fn open_with_limits(
+        dir: impl Into<PathBuf>,
+        sink: Arc<dyn MatchResultSink>,
+        market_data: Option<MarketDataTap>,
+        max_events: usize,
+        max_submissions: usize,
+    ) -> io::Result<Self> {
+        let store = Self::open_with_sinks_and_retention(dir, sink, market_data, max_events)?;
+        {
+            let mut inner = store.inner.lock().await;
+            inner.max_submissions = max_submissions;
+            inner.trim_submissions();
+        }
+        Ok(store)
     }
 
     /// Directory that holds this state machine's snapshot.
@@ -458,7 +771,16 @@ where
             let response = match &entry.payload {
                 EntryPayload::Blank => MatchEngineResponse::none(),
                 EntryPayload::Normal(req) => match req {
-                    MatchEngineRequest::Place { order } => {
+                    MatchEngineRequest::Place {
+                        order,
+                        client_order_id,
+                    } => 'place: {
+                        if let Some(client_order_id) = client_order_id
+                            && let Some(record) = inner.submissions.get(client_order_id).cloned()
+                        {
+                            break 'place inner.duplicate_response(&record);
+                        }
+
                         let mut o = *order;
                         let log_index = entry.log_id.index;
                         let outcome = inner.orderbook.execute_order(&mut o);
@@ -518,6 +840,15 @@ where
                                 }
                             }
                         }
+                        inner.record_events(&events);
+                        if let Some(client_order_id) = client_order_id {
+                            inner.record_submission(
+                                client_order_id.clone(),
+                                o.sequence,
+                                log_index,
+                                events.len() as u32,
+                            );
+                        }
                         self.publish_match_events(&events);
                         self.publish_market_frame(
                             &mut inner,
@@ -527,9 +858,7 @@ where
                             &events,
                         );
 
-                        MatchEngineResponse {
-                            value: Some(o.sequence.to_string()),
-                        }
+                        MatchEngineResponse::applied(o.sequence, &events)
                     }
                     MatchEngineRequest::Cancel { order } => {
                         let log_index = entry.log_id.index;
@@ -554,6 +883,7 @@ where
                                 &cancelled,
                             ));
                         }
+                        inner.record_events(&events);
                         self.publish_match_events(&events);
                         self.publish_market_frame(
                             &mut inner,
@@ -562,7 +892,7 @@ where
                             order.timestamp,
                             &events,
                         );
-                        MatchEngineResponse::new(market_seq.to_string())
+                        MatchEngineResponse::applied(market_seq, &events)
                     }
                     MatchEngineRequest::Amend {
                         order,
@@ -600,6 +930,7 @@ where
                                 err.reason(),
                             )),
                         }
+                        inner.record_events(&events);
                         self.publish_match_events(&events);
                         self.publish_market_frame(
                             &mut inner,
@@ -608,7 +939,7 @@ where
                             order.timestamp,
                             &events,
                         );
-                        MatchEngineResponse::new(market_seq.to_string())
+                        MatchEngineResponse::applied(market_seq, &events)
                     }
                     MatchEngineRequest::PurgeExpired {
                         now_ms,
@@ -623,6 +954,7 @@ where
                                 MatchEvent::for_expired(entry.log_id.index, ordinal as u32, order)
                             })
                             .collect();
+                        inner.record_events(&events);
                         self.publish_match_events(&events);
                         self.publish_market_frame(
                             &mut inner,
@@ -631,7 +963,7 @@ where
                             *now_ms,
                             &events,
                         );
-                        MatchEngineResponse::new(market_seq.to_string())
+                        MatchEngineResponse::applied(market_seq, &events)
                     }
                 },
                 EntryPayload::Membership(mem) => {
@@ -907,18 +1239,24 @@ mod tests {
             Ok((
                 entry(
                     1,
-                    EntryPayload::Normal(MatchEngineRequest::Place {
-                        order: Order::new(OrderSide::Sell, 100.0, 5.0, 0),
-                    }),
+                    EntryPayload::Normal(MatchEngineRequest::place(Order::new(
+                        OrderSide::Sell,
+                        100.0,
+                        5.0,
+                        0,
+                    ))),
                 ),
                 None,
             )),
             Ok((
                 entry(
                     2,
-                    EntryPayload::Normal(MatchEngineRequest::Place {
-                        order: Order::new(OrderSide::Buy, 100.0, 8.0, 0),
-                    }),
+                    EntryPayload::Normal(MatchEngineRequest::place(Order::new(
+                        OrderSide::Buy,
+                        100.0,
+                        8.0,
+                        0,
+                    ))),
                 ),
                 None,
             )),
@@ -1011,9 +1349,12 @@ mod tests {
 
         let entry = EntryOf::<MatchEngineTypeConfig> {
             log_id: log_id(1, 1),
-            payload: EntryPayload::Normal(MatchEngineRequest::Place {
-                order: Order::new(OrderSide::Buy, 100.0, 1.0, 0),
-            }),
+            payload: EntryPayload::Normal(MatchEngineRequest::place(Order::new(
+                OrderSide::Buy,
+                100.0,
+                1.0,
+                0,
+            ))),
         };
         let entries = futures::stream::iter(vec![Ok((entry, None))]);
 
@@ -1062,52 +1403,58 @@ mod tests {
 
         let entries = futures::stream::iter(vec![
             Ok((
-                entry(
-                    1,
-                    EntryPayload::Normal(MatchEngineRequest::Place { order: gtd }),
-                ),
+                entry(1, EntryPayload::Normal(MatchEngineRequest::place(gtd))),
                 None,
             )),
             Ok((
                 entry(
                     2,
-                    EntryPayload::Normal(MatchEngineRequest::Place {
-                        order: Order::new(OrderSide::Buy, 100.0, 10.0, 0),
-                    }),
+                    EntryPayload::Normal(MatchEngineRequest::place(Order::new(
+                        OrderSide::Buy,
+                        100.0,
+                        10.0,
+                        0,
+                    ))),
                 ),
                 None,
             )),
             Ok((
                 entry(
                     3,
-                    EntryPayload::Normal(MatchEngineRequest::Place {
-                        order: Order::new(OrderSide::Buy, 95.0, 10.0, 0),
-                    }),
+                    EntryPayload::Normal(MatchEngineRequest::place(Order::new(
+                        OrderSide::Buy,
+                        95.0,
+                        10.0,
+                        0,
+                    ))),
                 ),
                 None,
             )),
             Ok((
-                entry(
-                    4,
-                    EntryPayload::Normal(MatchEngineRequest::Place { order: stop }),
-                ),
+                entry(4, EntryPayload::Normal(MatchEngineRequest::place(stop))),
                 None,
             )),
             Ok((
                 entry(
                     5,
-                    EntryPayload::Normal(MatchEngineRequest::Place {
-                        order: Order::new(OrderSide::Sell, 100.0, 10.0, 0),
-                    }),
+                    EntryPayload::Normal(MatchEngineRequest::place(Order::new(
+                        OrderSide::Sell,
+                        100.0,
+                        10.0,
+                        0,
+                    ))),
                 ),
                 None,
             )),
             Ok((
                 entry(
                     6,
-                    EntryPayload::Normal(MatchEngineRequest::Place {
-                        order: Order::new(OrderSide::Sell, 95.0, 3.0, 0),
-                    }),
+                    EntryPayload::Normal(MatchEngineRequest::place(Order::new(
+                        OrderSide::Sell,
+                        95.0,
+                        3.0,
+                        0,
+                    ))),
                 ),
                 None,
             )),
@@ -1194,10 +1541,7 @@ mod tests {
         let bid = Order::new(OrderSide::Buy, 100.0, 10.0, 0);
         let entries = futures::stream::iter(vec![
             Ok((
-                entry(
-                    1,
-                    EntryPayload::Normal(MatchEngineRequest::Place { order: bid }),
-                ),
+                entry(1, EntryPayload::Normal(MatchEngineRequest::place(bid))),
                 None,
             )),
             Ok((
@@ -1297,10 +1641,7 @@ mod tests {
         let mut bid = Order::new(OrderSide::Buy, 100.0, 10.0, 0);
         bid.timestamp = 1_234;
         let entries = futures::stream::iter(vec![Ok((
-            entry(
-                1,
-                EntryPayload::Normal(MatchEngineRequest::Place { order: bid }),
-            ),
+            entry(1, EntryPayload::Normal(MatchEngineRequest::place(bid))),
             None,
         ))]);
         store.apply(entries).await.unwrap();
@@ -1320,10 +1661,7 @@ mod tests {
         let mut ask = Order::new(OrderSide::Sell, 100.0, 4.0, 0);
         ask.timestamp = 2_000;
         let entries = futures::stream::iter(vec![Ok((
-            entry(
-                2,
-                EntryPayload::Normal(MatchEngineRequest::Place { order: ask }),
-            ),
+            entry(2, EntryPayload::Normal(MatchEngineRequest::place(ask))),
             None,
         ))]);
         store.apply(entries).await.unwrap();
@@ -1406,10 +1744,7 @@ mod tests {
         let mut bid = Order::new(OrderSide::Buy, 100.0, 5.0, 0);
         bid.timestamp = 1_000;
         let entries = futures::stream::iter(vec![Ok((
-            entry(
-                1,
-                EntryPayload::Normal(MatchEngineRequest::Place { order: bid }),
-            ),
+            entry(1, EntryPayload::Normal(MatchEngineRequest::place(bid))),
             None,
         ))]);
         store.apply(entries).await.unwrap();
@@ -1435,10 +1770,7 @@ mod tests {
         let mut ask = Order::new(OrderSide::Sell, 101.0, 1.0, 0);
         ask.timestamp = 2_000;
         let entries = futures::stream::iter(vec![Ok((
-            entry(
-                2,
-                EntryPayload::Normal(MatchEngineRequest::Place { order: ask }),
-            ),
+            entry(2, EntryPayload::Normal(MatchEngineRequest::place(ask))),
             None,
         ))]);
         store.apply(entries).await.unwrap();
@@ -1489,10 +1821,7 @@ mod tests {
         cancel_key.timestamp = 2_000;
         let entries = futures::stream::iter(vec![
             Ok((
-                entry(
-                    1,
-                    EntryPayload::Normal(MatchEngineRequest::Place { order: gtd }),
-                ),
+                entry(1, EntryPayload::Normal(MatchEngineRequest::place(gtd))),
                 None,
             )),
             Ok((
@@ -1548,5 +1877,186 @@ mod tests {
         let path = std::env::temp_dir().join(unique);
         std::fs::create_dir_all(&path).unwrap();
         TempDir(path)
+    }
+
+    /// Events are replicated, bounded, paged and deduplicated by client id.
+    #[tokio::test]
+    async fn event_log_retains_pages_and_dedupes_submissions() {
+        use crate::match_result::MatchEventKind;
+        use crate::match_result::MemorySink;
+        use crate::matchengine::Order;
+        use crate::matchengine::OrderSide;
+        use openraft::alias::EntryOf;
+
+        fn entry(
+            index: u64,
+            payload: EntryPayloadOf<MatchEngineTypeConfig>,
+        ) -> EntryOf<MatchEngineTypeConfig> {
+            Entry {
+                log_id: log_id(1, index),
+                payload,
+            }
+        }
+
+        fn place(
+            index: u64,
+            side: OrderSide,
+            price: f64,
+            client_id: &str,
+        ) -> EntryResponder<MatchEngineTypeConfig> {
+            (
+                entry(
+                    index,
+                    EntryPayload::Normal(MatchEngineRequest::place_with_client_id(
+                        Order::new(side, price, 1.0, 0),
+                        client_id,
+                    )),
+                ),
+                None,
+            )
+        }
+
+        let dir = tempdir();
+        let sink = Arc::new(MemorySink::new());
+        let mut store = StateMachineStore::<MatchEngineTypeConfig>::open_with_limits(
+            dir.path(),
+            sink.clone(),
+            None,
+            3,
+            3,
+        )
+        .await
+        .unwrap();
+
+        let entries = futures::stream::iter(vec![
+            Ok(place(1, OrderSide::Buy, 100.0, "a")),
+            Ok(place(2, OrderSide::Buy, 99.0, "b")),
+            // Same id, different order: must not place a second order.
+            Ok(place(3, OrderSide::Sell, 50.0, "a")),
+        ]);
+        store.apply(entries).await.unwrap();
+
+        let content = store.to_content().await;
+        assert_eq!(2, content.orders.len(), "the duplicate did not place");
+        assert_eq!(
+            2, content.sequence,
+            "the duplicate did not consume a sequence"
+        );
+        assert_eq!(2, content.submissions.len());
+        assert_eq!(2, content.events.len());
+        assert_eq!(2, sink.events().len(), "the duplicate produced no events");
+
+        // Two more entries push the oldest events and submission out of the window.
+        let entries = futures::stream::iter(vec![
+            Ok(place(4, OrderSide::Buy, 98.0, "c")),
+            Ok(place(5, OrderSide::Buy, 97.0, "d")),
+        ]);
+        store.apply(entries).await.unwrap();
+
+        let content = store.to_content().await;
+        assert_eq!(3, content.events.len(), "window is capped");
+        assert_eq!(1, content.events_evicted);
+        assert_eq!(3, content.submissions.len(), "submission map is capped");
+        assert_eq!(1, content.submissions_evicted);
+
+        let inner = store.inner().lock().await;
+        assert_eq!(
+            Some(EventId {
+                log_index: 2,
+                ordinal: 0
+            }),
+            inner.oldest_event_id()
+        );
+        assert_eq!(
+            Some(EventId {
+                log_index: 5,
+                ordinal: 0
+            }),
+            inner.last_event_id()
+        );
+        let (page, next, has_more) = inner.events_since(None, 2);
+        assert_eq!(2, page.len());
+        assert!(has_more);
+        assert_eq!(Some(page[1].event_id), next);
+        let (page2, _, has_more2) = inner.events_since(next, 2);
+        assert_eq!(1, page2.len());
+        assert!(!has_more2);
+        assert_eq!(MatchEventKind::Rested, page2[0].kind);
+
+        // An evicted client id is no longer deduplicated; it is a new submission.
+        drop(inner);
+        let entries = futures::stream::iter(vec![Ok(place(6, OrderSide::Buy, 96.0, "a"))]);
+        store.apply(entries).await.unwrap();
+        assert_eq!(5, store.to_content().await.orders.len());
+    }
+
+    #[tokio::test]
+    async fn event_log_and_dedupe_survive_a_snapshot() {
+        use crate::match_result::NoopSink;
+        use crate::matchengine::Order;
+        use crate::matchengine::OrderSide;
+        use openraft::alias::EntryOf;
+
+        fn entry(
+            index: u64,
+            payload: EntryPayloadOf<MatchEngineTypeConfig>,
+        ) -> EntryOf<MatchEngineTypeConfig> {
+            Entry {
+                log_id: log_id(1, index),
+                payload,
+            }
+        }
+
+        let dir = tempdir();
+        let mut store = StateMachineStore::<MatchEngineTypeConfig>::open_with_sinks_and_retention(
+            dir.path(),
+            Arc::new(NoopSink),
+            None,
+            8,
+        )
+        .unwrap();
+
+        let entries = futures::stream::iter(vec![Ok((
+            entry(
+                1,
+                EntryPayload::Normal(MatchEngineRequest::place_with_client_id(
+                    Order::new(OrderSide::Buy, 100.0, 5.0, 0),
+                    "snapshot-id",
+                )),
+            ),
+            None,
+        ))]);
+        store.apply(entries).await.unwrap();
+        store.persist_snapshot().await.unwrap();
+
+        let reopened = StateMachineStore::<MatchEngineTypeConfig>::open_with_sinks_and_retention(
+            dir.path(),
+            Arc::new(NoopSink),
+            None,
+            8,
+        )
+        .unwrap();
+        let content = reopened.to_content().await;
+        assert_eq!(1, content.orders.len());
+        assert_eq!(1, content.sequence);
+        assert_eq!(1, content.events.len());
+        assert_eq!(1, content.submissions.len());
+
+        // The retry is still a duplicate after restarting from the snapshot.
+        let mut store = reopened;
+        let entries = futures::stream::iter(vec![Ok((
+            entry(
+                2,
+                EntryPayload::Normal(MatchEngineRequest::place_with_client_id(
+                    Order::new(OrderSide::Sell, 50.0, 1.0, 0),
+                    "snapshot-id",
+                )),
+            ),
+            None,
+        ))]);
+        store.apply(entries).await.unwrap();
+        let content = store.to_content().await;
+        assert_eq!(1, content.orders.len());
+        assert_eq!(1, content.sequence);
     }
 }

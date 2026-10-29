@@ -2,6 +2,7 @@ use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
 use actix_web::Responder;
+use actix_web::get;
 use actix_web::post;
 use actix_web::web;
 use actix_web::web::Data;
@@ -11,23 +12,63 @@ use openraft::errors::Infallible;
 use openraft::errors::LinearizableReadError;
 use openraft::errors::decompose::DecomposeResult;
 use openraft::raft::linearizable_read::Linearizer;
+use serde::Deserialize;
+use serde::Serialize;
 use web::Json;
 
 use crate::MatchEngineTypeConfig;
 use crate::app::MatchEngineApp;
 use crate::client::FollowerReadError;
+use crate::match_result::EventId;
+use crate::match_result::MatchEvent;
 use crate::store::MatchEngineRequest;
 use crate::store::MatchEngineResponse;
 use crate::store::state_machine::StateMachineStoreInner;
 
-/**
- * Application API endpoints for interacting with the Raft state machine.
- *
- * These endpoints provide external access to the distributed state machine.
- * Write operations go through the Raft consensus protocol to ensure
- * consistency, while read operations can be either local (fast but possibly
- * stale) or consistent (goes through leader check).
- */
+// Application API endpoints for interacting with the Raft state machine.
+//
+// Write operations go through the Raft consensus protocol to ensure
+// consistency, while read operations can be either local (fast but possibly
+// stale) or consistent (goes through leader check).
+
+/// Default page size for `POST /events`.
+pub const DEFAULT_EVENTS_PAGE: usize = 500;
+/// Hard cap on one `/events` response.
+pub const MAX_EVENTS_PAGE: usize = 1_000;
+
+/// Cursor request for `POST /events`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct EventsRequest {
+    /// Return events strictly after this id. Omit to start at the oldest
+    /// retained event.
+    #[serde(default)]
+    pub after: Option<EventId>,
+    /// Page size; capped server-side at [`MAX_EVENTS_PAGE`].
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+/// One page of the replicated match-event log.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventsResponse {
+    pub events: Vec<MatchEvent>,
+    pub next_after: Option<EventId>,
+    pub oldest_event_id: Option<EventId>,
+    pub last_event_id: Option<EventId>,
+    pub has_more: bool,
+}
+
+/// Retention and position counters for the event log.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventsStatus {
+    pub oldest_event_id: Option<EventId>,
+    pub last_event_id: Option<EventId>,
+    pub retained_events: usize,
+    pub evictions_total: u64,
+    pub retention_limit: usize,
+    pub submission_retention_limit: usize,
+    pub submission_evictions_total: u64,
+}
 
 /// Writes data to the Raft state machine.
 ///
@@ -53,7 +94,15 @@ pub async fn write(
 ) -> actix_web::Result<impl Responder> {
     let mut request = req.into_inner();
     stamp_intake_time(&mut request);
-    let response = app.raft.client_write(request).await.decompose().unwrap();
+    let response = match app.raft.client_write(request).await.decompose() {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::error!(%error, "client write failed");
+            return Err(actix_web::error::ErrorInternalServerError(
+                error.to_string(),
+            ));
+        }
+    };
     Ok(Json(response))
 }
 
@@ -69,7 +118,7 @@ fn stamp_intake_time(request: &mut MatchEngineRequest) {
         .unwrap_or_default();
 
     match request {
-        MatchEngineRequest::Place { order }
+        MatchEngineRequest::Place { order, .. }
         | MatchEngineRequest::Cancel { order }
         | MatchEngineRequest::Amend { order, .. } => order.timestamp = now_ms,
         MatchEngineRequest::PurgeExpired { .. } => {}
@@ -124,16 +173,29 @@ pub async fn linearizable_read(
     app: Data<MatchEngineApp>,
     req: Json<String>,
 ) -> actix_web::Result<impl Responder> {
-    let ret = app
+    let ret = match app
         .raft
         .get_read_linearizer(ReadPolicy::ReadIndex)
         .await
         .decompose()
-        .unwrap();
+    {
+        Ok(ret) => ret,
+        Err(error) => {
+            tracing::error!(%error, "linearizable read setup failed");
+            return Err(actix_web::error::ErrorInternalServerError(
+                error.to_string(),
+            ));
+        }
+    };
 
     match ret {
         Ok(linearizer) => {
-            linearizer.await_ready(&app.raft).await.unwrap();
+            if let Err(error) = linearizer.await_ready(&app.raft).await {
+                tracing::error!(%error, "linearizable read wait failed");
+                return Err(actix_web::error::ErrorInternalServerError(
+                    error.to_string(),
+                ));
+            }
 
             let inner = app.state_machine_store.inner().lock().await;
             let value = read_state(&inner, &req.0);
@@ -141,8 +203,85 @@ pub async fn linearizable_read(
             let res: Result<String, LinearizableReadError<MatchEngineTypeConfig>> = Ok(value);
             Ok(Json(res))
         }
-        Err(e) => Ok(Json(Err(e))),
+        Err(e) => {
+            let res: Result<String, LinearizableReadError<MatchEngineTypeConfig>> = Err(e);
+            Ok(Json(res))
+        }
     }
+}
+
+/// Reads a page of the replicated match-event log.
+///
+/// The read is linearizable (leader-only) so clearing sees committed events;
+/// consumers resume from `next_after` and dedupe on `event_id`.
+#[post("/events")]
+pub async fn events(
+    app: Data<MatchEngineApp>,
+    req: Json<EventsRequest>,
+) -> actix_web::Result<impl Responder> {
+    let ret = match app
+        .raft
+        .get_read_linearizer(ReadPolicy::ReadIndex)
+        .await
+        .decompose()
+    {
+        Ok(ret) => ret,
+        Err(error) => {
+            tracing::error!(%error, "event read setup failed");
+            return Err(actix_web::error::ErrorInternalServerError(
+                error.to_string(),
+            ));
+        }
+    };
+
+    let linearizer = match ret {
+        Ok(linearizer) => linearizer,
+        Err(error) => {
+            let res: Result<EventsResponse, LinearizableReadError<MatchEngineTypeConfig>> =
+                Err(error);
+            return Ok(Json(res));
+        }
+    };
+
+    if let Err(error) = linearizer.await_ready(&app.raft).await {
+        tracing::error!(%error, "event read wait failed");
+        return Err(actix_web::error::ErrorInternalServerError(
+            error.to_string(),
+        ));
+    }
+
+    let inner = app.state_machine_store.inner().lock().await;
+    let limit = req
+        .limit
+        .unwrap_or(DEFAULT_EVENTS_PAGE)
+        .clamp(1, MAX_EVENTS_PAGE);
+    let (events, next_after, has_more) = inner.events_since(req.after, limit);
+    let response = EventsResponse {
+        events,
+        next_after,
+        oldest_event_id: inner.oldest_event_id(),
+        last_event_id: inner.last_event_id(),
+        has_more,
+    };
+    let res: Result<EventsResponse, LinearizableReadError<MatchEngineTypeConfig>> = Ok(response);
+    Ok(Json(res))
+}
+
+/// Reports the retained event window and eviction counters.
+#[get("/events/status")]
+pub async fn events_status(app: Data<MatchEngineApp>) -> actix_web::Result<impl Responder> {
+    let inner = app.state_machine_store.inner().lock().await;
+    let status = EventsStatus {
+        oldest_event_id: inner.oldest_event_id(),
+        last_event_id: inner.last_event_id(),
+        retained_events: inner.retained_event_count(),
+        evictions_total: inner.events_evicted(),
+        retention_limit: inner.event_retention_limit(),
+        submission_retention_limit: inner.submission_retention_limit(),
+        submission_evictions_total: inner.submissions_evicted(),
+    };
+    let res: Result<EventsStatus, Infallible> = Ok(status);
+    Ok(Json(res))
 }
 
 /// Perform a linearizable read on a follower by obtaining a linearizer from the leader
@@ -244,10 +383,7 @@ where
     C: openraft::RaftTypeConfig<D = MatchEngineRequest, R = MatchEngineResponse>,
 {
     match key {
-        "orderbook_orders" => {
-            let content = inner.to_content();
-            serde_json::to_string(&content.orders).unwrap_or_default()
-        }
+        "orderbook_orders" => serde_json::to_string(&inner.orders()).unwrap_or_default(),
         "orderbook_stops" => serde_json::to_string(&inner.orderbook.stops).unwrap_or_default(),
         "orderbook_depth" => depth_json(inner, 10),
         "orderbook_spread" => serde_json::to_string(&inner.orderbook.spread()).unwrap_or_default(),

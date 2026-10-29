@@ -131,7 +131,9 @@ pub struct StateMachineData {
 "MRFSNAP" | version u32 | crc32 u32 | postcard(SnapshotPayload)
 ```
 
-`SnapshotPayload` 包含 `SnapshotMeta` 和 postcard 编码的 `StateMachineData`。写盘流程是
+`SnapshotPayload` 包含 `SnapshotMeta` 和 postcard 编码的 `StateMachineData`。快照版本为 4：
+除订单簿、序列号、止损单和最后成交价外，还包含保留的撮合事件窗口和 `client_order_id` 去重表。
+写盘流程是
 临时文件 → `fsync` → `rename` → 目录 `fsync`；`install_snapshot` 会先校验 magic、版本、CRC 和
 内容，再替换磁盘上的副本，坏快照不会破坏已有的好快照。启动时如果快照损坏，节点会直接报错，
 而不是静默从空状态启动。
@@ -276,6 +278,8 @@ curl -X POST -H "Content-Type: application/json" \
 | `POST /read` | 本地读，可能过期 | 直接读本地状态机 |
 | `POST /linearizable_read` | 线性一致 | 必须到达领导者，先获取 linearizer 再等待状态机追上 |
 | `POST /follower_read` | 线性一致 | follower 向领导者请求 linearizer，本地等待后读取 |
+| `POST /events` | 线性一致 | 按 `(log_index, ordinal)` 游标分页读取复制的撮合事件日志 |
+| `GET /events/status` | 本地读 | 保留事件窗口、淘汰计数和保留上限 |
 
 三个端点都接收 JSON 字符串键，用于读取订单簿的命名视图：
 
@@ -308,6 +312,7 @@ curl -X POST -H "Content-Type: application/json" \
 | `tests/cluster/test_snapshot.rs` | 快照生成、日志 purge、学习者通过 gRPC 安装快照 |
 | `tests/cluster/test_storage.rs` | WAL 帧、撕裂尾部、段轮转、跨段 truncate/purge、vote/committed、快照构建/安装/重开、损坏检测 |
 | `tests/cluster/test_restart.rs` | 完整节点重启：日志重放恢复和快照 + 尾部恢复 |
+| `tests/cluster/test_events.rs` | `/write` 事件、`/events` 游标、`client_order_id` 重试、保留窗口 |
 
 每个集成测试使用唯一的临时数据目录。测试端口固定：集群测试 `21001-21003`（gRPC
 `22001-22003`），快照测试 `21101-21102`，重启测试 `21201-21202`。重跑前先清理残留进程：

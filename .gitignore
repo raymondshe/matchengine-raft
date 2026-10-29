@@ -1,4 +1,3 @@
 target
 *.log
-Cargo.lock
 my_db

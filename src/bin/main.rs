@@ -6,6 +6,7 @@ use matchengine_raft::StorageConfig;
 use matchengine_raft::Transport;
 use matchengine_raft::market_data::MarketDataConfig;
 use matchengine_raft::start_match_engine_node_with_storage;
+use matchengine_raft::store::state_machine::DEFAULT_MAX_EVENTS;
 
 #[derive(Parser, Clone, Debug)]
 #[clap(author, version, about, long_about = None)]
@@ -31,6 +32,13 @@ pub struct Opt {
     /// Prefix of the per-node directory, so independent clusters can share one data dir.
     #[clap(long, env = "RAFT_INSTANCE_PREFIX", default_value = "matchengine")]
     pub instance_prefix: String,
+
+    /// Maximum number of match events retained in the replicated event log.
+    ///
+    /// Set 0 to disable history (`/events` then returns nothing). Submission
+    /// dedupe uses a separate fixed cap so retries cannot diverge across nodes.
+    #[clap(long, env = "MAX_EVENTS", default_value_t = DEFAULT_MAX_EVENTS)]
+    pub max_events: usize,
 
     /// Append every applied match event (fills, rests, cancels) to this JSONL file.
     ///
@@ -76,8 +84,9 @@ async fn main() -> std::io::Result<()> {
     // Parse the parameters passed by arguments.
     let options = Opt::parse();
 
-    let mut storage =
-        StorageConfig::new(options.data_dir).with_instance_prefix(options.instance_prefix);
+    let mut storage = StorageConfig::new(options.data_dir)
+        .with_instance_prefix(options.instance_prefix)
+        .with_max_events(options.max_events);
     if let Some(path) = options.match_event_log {
         storage = storage.with_match_event_log(path);
     }

@@ -33,13 +33,19 @@ pub struct FullSnapshotRequest<C: RaftTypeConfig> {
 // --- Raft communication
 
 #[post("/vote")]
-pub async fn vote(app: Data<MatchEngineApp>, req: Json<VoteRequest<MatchEngineTypeConfig>>) -> actix_web::Result<impl Responder> {
+pub async fn vote(
+    app: Data<MatchEngineApp>,
+    req: Json<VoteRequest<MatchEngineTypeConfig>>,
+) -> actix_web::Result<impl Responder> {
     let res = app.raft.vote(req.0).await;
     Ok(Json(res))
 }
 
 #[post("/append")]
-pub async fn append(app: Data<MatchEngineApp>, req: Json<AppendEntriesRequest<MatchEngineTypeConfig>>) -> actix_web::Result<impl Responder> {
+pub async fn append(
+    app: Data<MatchEngineApp>,
+    req: Json<AppendEntriesRequest<MatchEngineTypeConfig>>,
+) -> actix_web::Result<impl Responder> {
     let res = app.raft.append_entries(req.0).await;
     Ok(Json(res))
 }
@@ -54,10 +60,11 @@ pub async fn snapshot(
         snapshot: Cursor::new(req.data.clone()),
     };
 
-    let res: Result<_, StreamingError<MatchEngineTypeConfig>> = match app.raft.install_full_snapshot(req.vote.clone(), snapshot).await {
-        Ok(resp) => Ok(resp),
-        Err(e) => Err(StreamingError::Network(NetworkError::new(&e))),
-    };
+    let res: Result<_, StreamingError<MatchEngineTypeConfig>> =
+        match app.raft.install_full_snapshot(req.vote, snapshot).await {
+            Ok(resp) => Ok(resp),
+            Err(e) => Err(StreamingError::Network(NetworkError::new(&e))),
+        };
 
     Ok(Json(res))
 }

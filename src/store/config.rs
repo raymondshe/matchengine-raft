@@ -17,6 +17,7 @@ use std::path::PathBuf;
 
 use crate::MatchEngineNodeId;
 use crate::market_data::MarketDataConfig;
+use crate::store::state_machine::DEFAULT_MAX_EVENTS;
 
 /// Environment variable that overrides [`StorageConfig::data_dir`].
 pub const DATA_DIR_ENV: &str = "RAFT_DATA_DIR";
@@ -26,6 +27,8 @@ pub const INSTANCE_PREFIX_ENV: &str = "RAFT_INSTANCE_PREFIX";
 pub const MATCH_EVENT_LOG_ENV: &str = "MATCH_EVENT_LOG";
 /// Environment variable that enables the market-data JSONL feed.
 pub const MARKET_DATA_LOG_ENV: &str = "MARKET_DATA_LOG";
+/// Environment variable that overrides the match-event retention limit.
+pub const MAX_EVENTS_ENV: &str = "MAX_EVENTS";
 
 /// Default root directory for node data.
 pub const DEFAULT_DATA_DIR: &str = "/tmp/matchengine-raft";
@@ -53,6 +56,10 @@ pub struct StorageConfig {
     /// enabling it installs the tap on the state machine and starts the
     /// publisher thread bounded by this configuration.
     pub market_data: Option<MarketDataConfig>,
+
+    /// Maximum number of match events retained in the replicated event log.
+    /// The same limit bounds the client-order-id dedupe map.
+    pub max_events: usize,
 }
 
 impl Default for StorageConfig {
@@ -65,12 +72,17 @@ impl Default for StorageConfig {
         let match_event_log = std::env::var_os(MATCH_EVENT_LOG_ENV).map(PathBuf::from);
         let market_data = std::env::var_os(MARKET_DATA_LOG_ENV)
             .map(|path| MarketDataConfig::jsonl(PathBuf::from(path)));
+        let max_events = std::env::var(MAX_EVENTS_ENV)
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(DEFAULT_MAX_EVENTS);
 
         Self {
             data_dir,
             instance_prefix,
             match_event_log,
             market_data,
+            max_events,
         }
     }
 }
@@ -83,6 +95,7 @@ impl StorageConfig {
             instance_prefix: DEFAULT_INSTANCE_PREFIX.to_string(),
             match_event_log: None,
             market_data: None,
+            max_events: DEFAULT_MAX_EVENTS,
         }
     }
 
@@ -101,6 +114,12 @@ impl StorageConfig {
     /// Enables the market-data egress with `config`.
     pub fn with_market_data(mut self, config: MarketDataConfig) -> Self {
         self.market_data = Some(config);
+        self
+    }
+
+    /// Sets the match-event retention limit (also bounds submission dedupe).
+    pub fn with_max_events(mut self, max_events: usize) -> Self {
+        self.max_events = max_events;
         self
     }
 
@@ -158,6 +177,13 @@ mod tests {
             Some(PathBuf::from("/data/events.jsonl")),
             config.match_event_log
         );
+    }
+
+    #[test]
+    fn event_retention_is_configurable() {
+        assert_eq!(DEFAULT_MAX_EVENTS, StorageConfig::new("/data").max_events);
+        let config = StorageConfig::new("/data").with_max_events(32);
+        assert_eq!(32, config.max_events);
     }
 
     #[test]

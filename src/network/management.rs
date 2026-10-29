@@ -38,33 +38,73 @@ pub struct LinearizerData {
 /// This should be done before adding a node as a member into the cluster
 /// (by calling `change-membership`)
 #[post("/add-learner")]
-pub async fn add_learner(app: Data<MatchEngineApp>, req: Json<(MatchEngineNodeId, String)>) -> actix_web::Result<impl Responder> {
+pub async fn add_learner(
+    app: Data<MatchEngineApp>,
+    req: Json<(MatchEngineNodeId, String)>,
+) -> actix_web::Result<impl Responder> {
     let node_id = req.0.0;
-    let node = BasicNode { addr: req.0.1.clone() };
-    let res = app.raft.add_learner(node_id, node, true).await.decompose().unwrap();
+    let node = BasicNode {
+        addr: req.0.1.clone(),
+    };
+    let res = match app.raft.add_learner(node_id, node, true).await.decompose() {
+        Ok(res) => res,
+        Err(error) => {
+            tracing::error!(%error, "add learner failed");
+            return Err(actix_web::error::ErrorInternalServerError(
+                error.to_string(),
+            ));
+        }
+    };
     Ok(Json(res))
 }
 
 /// Changes specified learners to members, or remove members.
 #[post("/change-membership")]
-pub async fn change_membership(app: Data<MatchEngineApp>, req: Json<BTreeSet<MatchEngineNodeId>>) -> actix_web::Result<impl Responder> {
-    let res = app.raft.change_membership(req.0, false).await.decompose().unwrap();
+pub async fn change_membership(
+    app: Data<MatchEngineApp>,
+    req: Json<BTreeSet<MatchEngineNodeId>>,
+) -> actix_web::Result<impl Responder> {
+    let res = match app.raft.change_membership(req.0, false).await.decompose() {
+        Ok(res) => res,
+        Err(error) => {
+            tracing::error!(%error, "change membership failed");
+            return Err(actix_web::error::ErrorInternalServerError(
+                error.to_string(),
+            ));
+        }
+    };
     Ok(Json(res))
 }
 
 /// Initialize a single-node cluster if the `req` is empty vec.
 /// Otherwise initialize a cluster with the `req` specified vec of node-id and node-address
 #[post("/init")]
-pub async fn init(app: Data<MatchEngineApp>, req: Json<Vec<(MatchEngineNodeId, String)>>) -> actix_web::Result<impl Responder> {
+pub async fn init(
+    app: Data<MatchEngineApp>,
+    req: Json<Vec<(MatchEngineNodeId, String)>>,
+) -> actix_web::Result<impl Responder> {
     let mut nodes = BTreeMap::new();
     if req.0.is_empty() {
-        nodes.insert(app.id, BasicNode { addr: app.addr.clone() });
+        nodes.insert(
+            app.id,
+            BasicNode {
+                addr: app.addr.clone(),
+            },
+        );
     } else {
         for (id, addr) in req.0.into_iter() {
             nodes.insert(id, BasicNode { addr });
         }
     };
-    let res = app.raft.initialize(nodes).await.decompose().unwrap();
+    let res = match app.raft.initialize(nodes).await.decompose() {
+        Ok(res) => res,
+        Err(error) => {
+            tracing::error!(%error, "initialize failed");
+            return Err(actix_web::error::ErrorInternalServerError(
+                error.to_string(),
+            ));
+        }
+    };
     Ok(Json(res))
 }
 
@@ -84,7 +124,20 @@ pub async fn metrics(app: Data<MatchEngineApp>) -> actix_web::Result<impl Respon
 /// machine to catch up before performing a linearizable read.
 #[post("/get_linearizer")]
 pub async fn get_linearizer(app: Data<MatchEngineApp>) -> actix_web::Result<impl Responder> {
-    let linearizer = app.raft.get_read_linearizer(ReadPolicy::ReadIndex).await.decompose().unwrap();
+    let linearizer = match app
+        .raft
+        .get_read_linearizer(ReadPolicy::ReadIndex)
+        .await
+        .decompose()
+    {
+        Ok(linearizer) => linearizer,
+        Err(error) => {
+            tracing::error!(%error, "get linearizer failed");
+            return Err(actix_web::error::ErrorInternalServerError(
+                error.to_string(),
+            ));
+        }
+    };
 
     let data = match linearizer {
         Ok(lin) => {

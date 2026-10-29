@@ -20,6 +20,10 @@ use reqwest::Client;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
+use crate::network::api::EventsRequest;
+use crate::network::api::EventsResponse;
+use crate::network::api::EventsStatus;
+
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct FollowerReadError {
     pub message: String,
@@ -34,7 +38,8 @@ impl fmt::Display for FollowerReadError {
 impl std::error::Error for FollowerReadError {}
 
 pub struct MatchEngineClient<C>
-where C: RaftTypeConfig
+where
+    C: RaftTypeConfig,
 {
     /// The leader node to send request to.
     ///
@@ -45,7 +50,8 @@ where C: RaftTypeConfig
 }
 
 impl<C> MatchEngineClient<C>
-where C: RaftTypeConfig<Node = BasicNode>
+where
+    C: RaftTypeConfig<Node = BasicNode>,
 {
     /// Create a client with a leader node id and a node manager to get node address by node id.
     pub fn new(leader_id: C::NodeId, leader_addr: String) -> Self {
@@ -63,7 +69,10 @@ where C: RaftTypeConfig<Node = BasicNode>
     /// will be applied to state machine.
     ///
     /// The result of applying the request will be returned.
-    pub async fn write(&self, req: &C::D) -> Result<Result<ClientWriteResponse<C>, ClientWriteError<C>>, RPCError<C>> {
+    pub async fn write(
+        &self,
+        req: &C::D,
+    ) -> Result<Result<ClientWriteResponse<C>, ClientWriteError<C>>, RPCError<C>> {
         self.send_with_forwarding("write", Some(req), 3).await
     }
 
@@ -82,7 +91,8 @@ where C: RaftTypeConfig<Node = BasicNode>
         &self,
         req: &String,
     ) -> Result<Result<String, LinearizableReadError<C>>, RPCError<C>> {
-        self.send_with_forwarding("linearizable_read", Some(req), 0).await
+        self.send_with_forwarding("linearizable_read", Some(req), 0)
+            .await
     }
 
     /// Same as linearizable_read() but will automatically forward the request to the current leader
@@ -91,7 +101,27 @@ where C: RaftTypeConfig<Node = BasicNode>
         &self,
         req: &String,
     ) -> Result<Result<String, LinearizableReadError<C>>, RPCError<C>> {
-        self.send_with_forwarding("linearizable_read", Some(req), 3).await
+        self.send_with_forwarding("linearizable_read", Some(req), 3)
+            .await
+    }
+
+    /// Read a page of the replicated match-event log.
+    ///
+    /// The request is forwarded to the current leader when necessary. Resume
+    /// from `next_after` and deduplicate on `event_id`.
+    pub async fn events(
+        &self,
+        req: &EventsRequest,
+    ) -> Result<Result<EventsResponse, LinearizableReadError<C>>, RPCError<C>> {
+        self.send_with_forwarding("events", Some(req), 3).await
+    }
+
+    /// Retention/position counters for the event log.
+    pub async fn events_status(&self) -> Result<EventsStatus, RPCError<C>> {
+        let res = self
+            .send::<_, _, Infallible>("events/status", None::<&()>)
+            .await?;
+        Ok(res.unwrap())
     }
 
     /// Perform a linearizable read on a follower.
@@ -100,7 +130,10 @@ where C: RaftTypeConfig<Node = BasicNode>
     /// waits for the local state machine to catch up, then reads from the local state machine.
     ///
     /// Returns the value if successful, or an error from the follower.
-    pub async fn follower_read(&self, req: &String) -> Result<Result<String, FollowerReadError>, RPCError<C>> {
+    pub async fn follower_read(
+        &self,
+        req: &String,
+    ) -> Result<Result<String, FollowerReadError>, RPCError<C>> {
         self.send("follower_read", Some(req)).await
     }
 
@@ -123,7 +156,8 @@ where C: RaftTypeConfig<Node = BasicNode>
         &self,
         req: (C::NodeId, String),
     ) -> Result<Result<ClientWriteResponse<C>, ClientWriteError<C>>, RPCError<C>> {
-        self.send_with_forwarding("add-learner", Some(&req), 0).await
+        self.send_with_forwarding("add-learner", Some(&req), 0)
+            .await
     }
 
     /// Change membership to the specified set of nodes.
@@ -134,7 +168,8 @@ where C: RaftTypeConfig<Node = BasicNode>
         &self,
         req: &BTreeSet<C::NodeId>,
     ) -> Result<Result<ClientWriteResponse<C>, ClientWriteError<C>>, RPCError<C>> {
-        self.send_with_forwarding("change-membership", Some(req), 0).await
+        self.send_with_forwarding("change-membership", Some(req), 0)
+            .await
     }
 
     /// Get the metrics about the cluster.
@@ -143,7 +178,9 @@ where C: RaftTypeConfig<Node = BasicNode>
     /// membership config, replication status etc.
     /// See [`RaftMetrics`].
     pub async fn metrics(&self) -> Result<RaftMetrics<C>, RPCError<C>> {
-        let res = self.send::<_, _, Infallible>("metrics", None::<&()>).await?;
+        let res = self
+            .send::<_, _, Infallible>("metrics", None::<&()>)
+            .await?;
         Ok(res.unwrap())
     }
 
@@ -153,7 +190,11 @@ where C: RaftTypeConfig<Node = BasicNode>
     ///
     /// It sends out a POST request if `req` is Some. Otherwise a GET request.
     /// The remote endpoint must respond a reply in form of `Result<Resp, Err>`.
-    async fn send<Req, Resp, Err>(&self, uri: &str, req: Option<&Req>) -> Result<Result<Resp, Err>, RPCError<C>>
+    async fn send<Req, Resp, Err>(
+        &self,
+        uri: &str,
+        req: Option<&Req>,
+    ) -> Result<Result<Resp, Err>, RPCError<C>>
     where
         Req: Serialize + fmt::Debug + 'static,
         Resp: Serialize + DeserializeOwned,
@@ -195,7 +236,10 @@ where C: RaftTypeConfig<Node = BasicNode>
             }
         })?;
 
-        let res: Result<Resp, Err> = resp.json().await.map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
+        let res: Result<Resp, Err> = resp
+            .json()
+            .await
+            .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
         println!(
             "<<< client recv reply from {}: {}",
             url,
@@ -220,7 +264,8 @@ where C: RaftTypeConfig<Node = BasicNode>
     where
         Req: Serialize + fmt::Debug + 'static,
         Resp: Serialize + DeserializeOwned,
-        Err: std::error::Error + Serialize + DeserializeOwned + TryAsRef<ForwardToLeader<C>> + Clone,
+        Err:
+            std::error::Error + Serialize + DeserializeOwned + TryAsRef<ForwardToLeader<C>> + Clone,
     {
         loop {
             let res: Result<Resp, Err> = self.send(uri, req).await?;

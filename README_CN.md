@@ -9,6 +9,8 @@
 
 # Match Engine Raft
 
+[![CI](https://github.com/raymondshe/matchengine-raft/actions/workflows/ci.yml/badge.svg)](https://github.com/raymondshe/matchengine-raft/actions/workflows/ci.yml)
+
 这是一个基于 [OpenRaft](https://github.com/datafuselabs/openraft) 构建的分布式撮合引擎的实践实现。Raft 日志持久化在自研的分段预写日志（WAL）中，状态机通过原子快照落盘，因此节点重启后可以恢复全部已提交状态。
 
 > **注意**: 更详细的中文指南请参考 [GUIDE_cn.md](./GUIDE_cn.md)。
@@ -34,6 +36,7 @@
 - **HTTP 服务器**: 基于 [Actix-web](https://docs.rs/actix-web) 构建，同时提供内部 Raft API 和外部应用 API
 - **多种读取一致性**: 本地读、经领导者的一致性读，以及线性一致性的 follower read
 - **智能客户端**: Rust 客户端自动跟踪并将请求重定向到当前领导者
+- **持久化撮合事件 Feed**: 复制且随快照持久化的事件日志，通过 `POST /events` 游标分页读取，支持保留上限和 `client_order_id` 幂等重试
 
 ## 架构概述
 
@@ -291,7 +294,7 @@ src/
 ├── store/
 │   ├── mod.rs               # 存储模块
 │   ├── log_store.rs         # 分段 WAL + 投票/purge 状态
-│   ├── state_machine.rs     # 内存状态机 + 快照
+│   ├── state_machine.rs     # 状态机、事件日志 + 快照
 │   ├── types.rs             # 请求/应答类型
 │   └── config.rs            # 存储布局 / 每节点目录
 proto/
@@ -305,7 +308,8 @@ tests/
     ├── test_storage.rs      # WAL 与快照格式
     ├── test_restart.rs      # 重启恢复：日志重放与快照
     ├── test_match_results.rs # 撮合事件写入 JSONL 文件 sink
-    └── test_market_data.rs    # 行情 feed：快照、成交、BBO、深度、K 线
+    ├── test_market_data.rs    # 行情 feed：快照、成交、BBO、深度、K 线
+    └── test_events.rs         # 事件日志：写响应、游标、保留、幂等
 ```
 
 ## 存储实现
@@ -324,7 +328,7 @@ Raft 日志追加写入 `log/NNNNNNNNNN.wal` 分段文件：
 
 ### 快照（`src/store/state_machine.rs`）
 
-状态机（订单簿 + 序列号）常驻内存以保证 apply 速度。快照写入 `snapshot/current.snap`（magic + 版本 + CRC32 + postcard 元数据 + postcard 状态），同样通过临时文件 + rename 原子替换。`install_snapshot` 会先校验收到的数据再替换磁盘副本，坏快照不会破坏已有的好快照。
+状态机（订单簿 + 序列号 + 保留的撮合事件窗口 + 提交去重表）常驻内存以保证 apply 速度。快照 v4 写入 `snapshot/current.snap`（magic + 版本 + CRC32 + postcard 元数据 + postcard 状态），同样通过临时文件 + rename 原子替换。`install_snapshot` 会先校验收到的数据再替换磁盘副本，坏快照不会破坏已有的好快照。
 
 ### 每节点数据目录
 
@@ -395,9 +399,9 @@ Raft 日志追加写入 `log/NNNNNNNNNN.wal` 分段文件：
 ### 撮合结果处理
 
 `apply` 会把每个 `MatchResult` 转换成 `MatchEvent`（`fill` / `rested` / `cancelled` / `triggered` /
-`expired` / `rejected` / `amended`），再交给可替换的
-`MatchResultSink`（`src/match_result/mod.rs`）。事件只由已应用的日志条目推导，因此每个副本产生相同的
-id；sink 本身是节点本地配置，绝不会影响复制状态：
+`expired` / `rejected` / `amended`）。事件只由已应用的日志条目推导，因此每个副本产生相同的 id。
+有界批次会随 `/write` 响应返回，并追加到复制且随快照持久化的事件日志；清结算与审计消费者通过游标
+API 读取：
 
 ```
 POST /write { Place | Cancel | Amend | PurgeExpired }
@@ -405,18 +409,26 @@ POST /write { Place | Cancel | Amend | PurgeExpired }
         ▼
   StateMachineStore::apply  （每个副本都执行）
         │
-        ├──► 订单簿 + 序列号 ──► 快照               [复制状态]
+        ├──► 订单簿 + 序列号 + 事件窗口 ──► 快照    [复制状态]
         │
-        └──► MatchEvent（fill/rested/cancelled/…） [id = 日志位置]
+        ├──► MatchEvent 批次 ──► /write 响应        [上限 512]
+        │
+        └──► POST /events + GET /events/status      [游标 + 保留策略]
                     │
                     ▼
           MatchResultSink                           [节点本地，尽力而为]
-            ├── NoopSink      默认：直接丢弃
-            ├── FileLogSink   --match-event-log -> JSONL
-            └── （规划中）     复制事件日志 + /events 游标
+            ├── NoopSink      默认：无本地副作用
+            └── FileLogSink   --match-event-log -> JSONL
 ```
 
-默认的 sink 直接丢弃事件，因此引擎行为与以前一致。需要观察事件时启用文件 sink：
+`Place` 支持可选的 `client_order_id`；用同一个 id 重试会返回原序列号和事件，而不会重复下单。
+事件窗口由 `--max-events`（环境变量 `MAX_EVENTS`，默认 262144）限制；提交去重表另有固定的
+262144 条上限，避免重试结果依赖节点本地参数。两者都包含在快照 v4 中。
+`GET /events/status` 报告最旧/最新保留 id 和淘汰计数；消费者从 `next_after` 继续，并按 `event_id`
+去重。
+
+文件 sink 仍只是调试工具：仅写本地文件，不参与复制，也不 fsync，重启后重放会把同一批事件再写一遍。
+需要观察事件时启用：
 
 ```bash
 ./target/release/matchengine-raft --id 1 --http-addr 127.0.0.1:21001 \
@@ -426,8 +438,8 @@ POST /write { Place | Cancel | Amend | PurgeExpired }
 每行一个事件，例如
 `{"node_id":1,"event_id":{"log_index":42,"ordinal":0},"kind":"fill","order_sequence":7,"counterparty_sequence":3,"price":100.0,"volume":10.0}`。
 
-文件 sink 只是调试工具：仅写本地文件，不参与复制，也不 fsync，重启后重放日志会把同一批事件再写一遍。
-可靠的清结算分发（复制的事件日志、`/events` 游标读取、幂等提交）设计方案见 `docs/MATCH_RESULTS.md`。
+复制事件日志是可靠的清结算 feed：它能在重启和学习者快照后恢复，`client_order_id` 会折叠重试。
+消费者契约见 `docs/MATCH_RESULTS.md`。
 
 ### 行情数据 feed（可选）
 
@@ -516,10 +528,13 @@ gRPC 传输在 `--http-addr` 端口 + 1000 上暴露相同操作（`AppendEntrie
 ### 应用 API
 
 - `POST /write` - 通过 Raft 提交 `Place`、`Cancel`、`Amend` 或 `PurgeExpired` 请求。所有变更请求的
-  响应都是分配的 `market_seq`（`Place` 同时是订单序列号）。
+  响应都是分配的 `market_seq`（`Place` 同时是订单序列号），并携带该条目的首批事件（上限 512）。
+  `Place` 支持可选的 `client_order_id`，用于幂等重试。
 - `POST /read` - 从本地状态机读取（可能读到旧值）
 - `POST /linearizable_read` - 线性一致性读；请求必须到达领导者
 - `POST /follower_read` - 从领导者获取 linearizer 后在本地完成的线性一致性读
+- `POST /events` - 分页读取复制的撮合事件日志（`after`、`limit`）；线性一致，仅领导者
+- `GET /events/status` - 保留事件窗口、淘汰计数和保留上限
 
 `/read`、`/linearizable_read` 和 `/follower_read` 接收 JSON 字符串键，用于读取订单簿的命名视图：
 
@@ -534,8 +549,10 @@ gRPC 传输在 `--http-addr` 端口 + 1000 上暴露相同操作（`AppendEntrie
 `/write` 接受的订单示例（注意字段名是 `sequence`）：
 
 ```json
-{"Place": {"order": {"live": "Limit", "side": "Buy", "price": 4000.0, "volume": 4.4, "id": 1, "sequence": 1}}}
+{"Place": {"order": {"live": "Limit", "side": "Buy", "price": 4000.0, "volume": 4.4, "id": 1, "sequence": 1}, "client_order_id": "order-123"}}
 ```
+
+`client_order_id` 可选；省略时保持旧的非幂等行为。
 
 所有订单类型字段（`tif`、`post_only`、`stop_price`、`display_volume`、`hidden_volume`、
 `timestamp`）都是可选的，默认就是普通的 GTC 限价单：
@@ -559,10 +576,12 @@ gRPC 传输在 `--http-addr` 端口 + 1000 上暴露相同操作（`AppendEntrie
 | `tests/cluster/test_restart.rs` | 完整节点重启后通过日志重放恢复，以及通过快照 + 尾部恢复订单簿和序列号 |
 | `tests/cluster/test_match_results.rs` | 以 `--match-event-log` 启动的节点按日志顺序记录 rest/fill/cancel 事件，同时 `/write` 响应保持不变；第二个节点验证止损触发、GTD 过期和新增的 `/read` 键 |
 | `tests/cluster/test_market_data.rs` | 以 `--market-data-log` 启动的节点发布重置快照、每个 taker 一条成交消息、BBO、批后深度总量和一根已收盘 K 线；断言同时检查 `market_seq` 锚点与 `/read marketdata_status` 计数器 |
+| `tests/cluster/test_events.rs` | `/write` 返回事件、`/events` 游标分页、`client_order_id` 重试不重复下单、`--max-events` 淘汰与 `/events/status` 计数 |
 
 所有集成测试都使用唯一的临时数据目录。集群测试固定使用端口 `21001-21003`（gRPC
 `22001-22003`），快照测试使用 `21101-21102`，重启测试使用 `21201-21202`，撮合结果测试使用
-`21301`/`21302`、行情数据测试 `21303`；重跑前请先停止残留进程（`pkill -f matchengine-raft`）。
+`21301`/`21302`、行情数据测试 `21303`、事件日志测试 `21304`；重跑前请先停止残留进程
+（`pkill -f matchengine-raft`）。
 
 已知差距与路线图统一记录在 [`TODO.md`](./TODO.md)。
 

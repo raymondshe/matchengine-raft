@@ -50,25 +50,34 @@ impl RaftGrpcService {
 
 #[tonic::async_trait]
 impl RaftService for RaftGrpcService {
-    type AppendStreamStream = Pin<Box<dyn Stream<Item = Result<AppendResponse, Status>> + Send + 'static>>;
+    type AppendStreamStream =
+        Pin<Box<dyn Stream<Item = Result<AppendResponse, Status>> + Send + 'static>>;
 
-    async fn append_entries(&self, request: Request<AppendRequest>) -> Result<Response<AppendResponse>, Status> {
-        let req: AppendEntriesRequest<MatchEngineTypeConfig> = decode(&request.into_inner().payload)
-            .map_err(|e| Status::invalid_argument(format!("decode AppendEntries: {e}")))?;
+    async fn append_entries(
+        &self,
+        request: Request<AppendRequest>,
+    ) -> Result<Response<AppendResponse>, Status> {
+        let req: AppendEntriesRequest<MatchEngineTypeConfig> =
+            decode(&request.into_inner().payload)
+                .map_err(|e| Status::invalid_argument(format!("decode AppendEntries: {e}")))?;
 
         let result = self.raft.append_entries(req).await;
-        let payload =
-            encode(&result).map_err(|e| Status::internal(format!("encode AppendEntries response: {e}")))?;
+        let payload = encode(&result)
+            .map_err(|e| Status::internal(format!("encode AppendEntries response: {e}")))?;
 
         Ok(Response::new(AppendResponse { payload }))
     }
 
-    async fn vote(&self, request: Request<VoteCallRequest>) -> Result<Response<VoteCallResponse>, Status> {
+    async fn vote(
+        &self,
+        request: Request<VoteCallRequest>,
+    ) -> Result<Response<VoteCallResponse>, Status> {
         let req: VoteRequest<MatchEngineTypeConfig> = decode(&request.into_inner().payload)
             .map_err(|e| Status::invalid_argument(format!("decode Vote: {e}")))?;
 
         let result = self.raft.vote(req).await;
-        let payload = encode(&result).map_err(|e| Status::internal(format!("encode Vote response: {e}")))?;
+        let payload =
+            encode(&result).map_err(|e| Status::internal(format!("encode Vote response: {e}")))?;
 
         Ok(Response::new(VoteCallResponse { payload }))
     }
@@ -87,14 +96,16 @@ impl RaftService for RaftGrpcService {
 
         while let Some(chunk) = stream.message().await? {
             if !chunk.vote.is_empty() {
-                vote = Some(
-                    decode(&chunk.vote).map_err(|e| Status::invalid_argument(format!("decode snapshot vote: {e}")))?,
-                );
+                vote =
+                    Some(decode(&chunk.vote).map_err(|e| {
+                        Status::invalid_argument(format!("decode snapshot vote: {e}"))
+                    })?);
             }
             if !chunk.meta.is_empty() {
-                meta = Some(
-                    decode(&chunk.meta).map_err(|e| Status::invalid_argument(format!("decode snapshot meta: {e}")))?,
-                );
+                meta =
+                    Some(decode(&chunk.meta).map_err(|e| {
+                        Status::invalid_argument(format!("decode snapshot meta: {e}"))
+                    })?);
             }
             if chunk.offset != received {
                 return Err(Status::invalid_argument(format!(
@@ -134,16 +145,20 @@ impl RaftService for RaftGrpcService {
             snapshot: Cursor::new(data),
         };
 
-        let result: Result<SnapshotResponse<MatchEngineTypeConfig>, StreamingError<MatchEngineTypeConfig>> =
-            match self.raft.install_full_snapshot(vote, snapshot).await {
-                Ok(resp) => Ok(resp),
-                Err(e) => Err(StreamingError::Network(NetworkError::new(&e))),
-            };
+        let result: Result<
+            SnapshotResponse<MatchEngineTypeConfig>,
+            StreamingError<MatchEngineTypeConfig>,
+        > = match self.raft.install_full_snapshot(vote, snapshot).await {
+            Ok(resp) => Ok(resp),
+            Err(e) => Err(StreamingError::Network(NetworkError::new(&e))),
+        };
 
-        let payload =
-            encode(&result).map_err(|e| Status::internal(format!("encode snapshot response: {e}")))?;
+        let payload = encode(&result)
+            .map_err(|e| Status::internal(format!("encode snapshot response: {e}")))?;
 
-        Ok(Response::new(crate::network::grpc::pb::SnapshotResponse { payload }))
+        Ok(Response::new(crate::network::grpc::pb::SnapshotResponse {
+            payload,
+        }))
     }
 
     /// One response per request, in order. `Raft::stream_append` pipelines
@@ -189,9 +204,13 @@ impl RaftService for RaftGrpcService {
                 let out = match item {
                     Ok(result) => match encode(&result) {
                         Ok(payload) => Ok(AppendResponse { payload }),
-                        Err(e) => Err(Status::internal(format!("encode streamed AppendEntries response: {e}"))),
+                        Err(e) => Err(Status::internal(format!(
+                            "encode streamed AppendEntries response: {e}"
+                        ))),
                     },
-                    Err(fatal) => Err(Status::internal(format!("raft stream append failed: {fatal}"))),
+                    Err(fatal) => Err(Status::internal(format!(
+                        "raft stream append failed: {fatal}"
+                    ))),
                 };
                 let fatal = out.is_err();
 

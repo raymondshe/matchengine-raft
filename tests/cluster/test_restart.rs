@@ -35,7 +35,10 @@ struct TempDir(PathBuf);
 
 impl TempDir {
     fn new(label: &str) -> Self {
-        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
             "matchengine-restart-{label}-{}-{nanos}-{seq}",
@@ -78,8 +81,19 @@ async fn wait_for_leader(client: &MatchEngineClient<C>) -> anyhow::Result<()> {
     }
 }
 
-async fn start(addr: &str, storage: &StorageConfig, config: Config) -> anyhow::Result<MatchEngineNode> {
-    let node = build_match_engine_node(1, addr.to_string(), Transport::Grpc, config, storage.clone()).await?;
+async fn start(
+    addr: &str,
+    storage: &StorageConfig,
+    config: Config,
+) -> anyhow::Result<MatchEngineNode> {
+    let node = build_match_engine_node(
+        1,
+        addr.to_string(),
+        Transport::Grpc,
+        config,
+        storage.clone(),
+    )
+    .await?;
     Ok(node)
 }
 
@@ -97,7 +111,7 @@ async fn place_orders(client: &MatchEngineClient<C>) -> anyhow::Result<()> {
     ];
 
     for order in orders {
-        let response = client.write(&MatchEngineRequest::Place { order }).await??;
+        let response = client.write(&MatchEngineRequest::place(order)).await??;
         assert!(response.data.value.is_some());
     }
     Ok(())
@@ -109,9 +123,12 @@ async fn place_orders(client: &MatchEngineClient<C>) -> anyhow::Result<()> {
 async fn place_resting_orders(client: &MatchEngineClient<C>, count: u64) -> anyhow::Result<()> {
     for i in 0..count {
         client
-            .write(&MatchEngineRequest::Place {
-                order: Order::new(OrderSide::Sell, 100.0 + i as f64, 1.0, 0),
-            })
+            .write(&MatchEngineRequest::place(Order::new(
+                OrderSide::Sell,
+                100.0 + i as f64,
+                1.0,
+                0,
+            )))
             .await??;
     }
     Ok(())
@@ -131,7 +148,10 @@ async fn assert_order_state(
     );
 
     let sequence = client.read(&"orderbook_sequence".to_string()).await?;
-    assert_eq!(expected_sequence, sequence, "sequence counter not recovered");
+    assert_eq!(
+        expected_sequence, sequence,
+        "sequence counter not recovered"
+    );
     Ok(())
 }
 
@@ -170,17 +190,25 @@ fn restart_recovers_from_log_replay() {
 
         // The recovered node is still writable.
         client
-            .write(&MatchEngineRequest::Place {
-                order: Order::new(OrderSide::Buy, 8.0, 1.0, 0),
-            })
+            .write(&MatchEngineRequest::place(Order::new(
+                OrderSide::Buy,
+                8.0,
+                1.0,
+                0,
+            )))
             .await
             .unwrap()
             .unwrap();
-        assert_eq!("4", client.read(&"orderbook_sequence".to_string()).await.unwrap());
-        let orders: Vec<Order> = serde_json::from_str(
-            &client.read(&"orderbook_orders".to_string()).await.unwrap(),
-        )
-        .unwrap();
+        assert_eq!(
+            "4",
+            client
+                .read(&"orderbook_sequence".to_string())
+                .await
+                .unwrap()
+        );
+        let orders: Vec<Order> =
+            serde_json::from_str(&client.read(&"orderbook_orders".to_string()).await.unwrap())
+                .unwrap();
         assert_eq!(4, orders.len());
 
         node.shutdown().await.unwrap();

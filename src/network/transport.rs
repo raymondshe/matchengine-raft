@@ -39,7 +39,10 @@ pub struct TransportNetworkFactory {
 
 impl TransportNetworkFactory {
     pub fn new(local_id: MatchEngineNodeId, transport: Transport) -> Self {
-        Self { local_id, transport }
+        Self {
+            local_id,
+            transport,
+        }
     }
 }
 
@@ -49,7 +52,9 @@ impl RaftNetworkFactory<MatchEngineTypeConfig> for TransportNetworkFactory {
     async fn new_client(&mut self, target: MatchEngineNodeId, node: &BasicNode) -> Self::Network {
         match self.transport {
             Transport::Http => TransportNetwork::Http(HttpNetwork::new(node.addr.clone())),
-            Transport::Grpc => TransportNetwork::Grpc(GrpcNetwork::new(self.local_id, target, &node.addr)),
+            Transport::Grpc => {
+                TransportNetwork::Grpc(GrpcNetwork::new(self.local_id, target, &node.addr))
+            }
         }
     }
 }
@@ -90,10 +95,15 @@ impl RaftNetworkV2<MatchEngineTypeConfig> for TransportNetwork {
         snapshot: SnapshotOf<MatchEngineTypeConfig, Self::SnapshotData>,
         cancel: impl Future<Output = ReplicationClosed> + OptionalSend + 'static,
         option: RPCOption,
-    ) -> Result<SnapshotResponse<MatchEngineTypeConfig>, StreamingError<MatchEngineTypeConfig>> {
+    ) -> Result<SnapshotResponse<MatchEngineTypeConfig>, StreamingError<MatchEngineTypeConfig>>
+    {
         match self {
-            TransportNetwork::Http(n) => RaftNetworkV2::full_snapshot(n, vote, snapshot, cancel, option).await,
-            TransportNetwork::Grpc(n) => RaftNetworkV2::full_snapshot(n, vote, snapshot, cancel, option).await,
+            TransportNetwork::Http(n) => {
+                RaftNetworkV2::full_snapshot(n, vote, snapshot, cancel, option).await
+            }
+            TransportNetwork::Grpc(n) => {
+                RaftNetworkV2::full_snapshot(n, vote, snapshot, cancel, option).await
+            }
         }
     }
 
@@ -104,12 +114,18 @@ impl RaftNetworkV2<MatchEngineTypeConfig> for TransportNetwork {
     ) -> BoxFuture<
         's,
         Result<
-            BoxStream<'s, Result<StreamAppendResult<MatchEngineTypeConfig>, RPCError<MatchEngineTypeConfig>>>,
+            BoxStream<
+                's,
+                Result<StreamAppendResult<MatchEngineTypeConfig>, RPCError<MatchEngineTypeConfig>>,
+            >,
             RPCError<MatchEngineTypeConfig>,
         >,
     >
     where
-        S: Stream<Item = AppendEntriesRequest<MatchEngineTypeConfig>> + OptionalSend + Unpin + 'static,
+        S: Stream<Item = AppendEntriesRequest<MatchEngineTypeConfig>>
+            + OptionalSend
+            + Unpin
+            + 'static,
     {
         match self {
             TransportNetwork::Http(n) => RaftNetworkV2::stream_append(n, input, option),

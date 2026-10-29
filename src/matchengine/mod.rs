@@ -294,13 +294,7 @@ impl Ord for BidKey {
         } else if self.price > other.price {
             Ordering::Less
         } else {
-            if self.sequence > other.sequence {
-                Ordering::Greater
-            } else if self.sequence < other.sequence {
-                Ordering::Less
-            } else {
-                Ordering::Equal
-            }
+            self.sequence.cmp(&other.sequence)
         }
     }
 }
@@ -308,7 +302,7 @@ impl Ord for BidKey {
 /// PartialOrd implementation delegating to Ord.
 impl PartialOrd for BidKey {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(&other))
+        Some(self.cmp(other))
     }
 }
 
@@ -348,13 +342,7 @@ impl Ord for AskKey {
         } else if self.price > other.price {
             Ordering::Greater
         } else {
-            if self.sequence > other.sequence {
-                Ordering::Greater
-            } else if self.sequence < other.sequence {
-                Ordering::Less
-            } else {
-                Ordering::Equal
-            }
+            self.sequence.cmp(&other.sequence)
         }
     }
 }
@@ -362,7 +350,7 @@ impl Ord for AskKey {
 /// PartialOrd implementation delegating to Ord.
 impl PartialOrd for AskKey {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(&other))
+        Some(self.cmp(other))
     }
 }
 
@@ -401,7 +389,7 @@ pub mod vectorize {
         V: Deserialize<'de>,
     {
         let container: Vec<_> = serde::Deserialize::deserialize(des)?;
-        Ok(T::from_iter(container.into_iter()))
+        Ok(T::from_iter(container))
     }
 }
 
@@ -487,9 +475,9 @@ impl MatchResult {
     /// * `matches` - The quantity that was matched
     pub fn new(taker: &Order, maker: &Order, matches: f64) -> Self {
         Self {
-            taker: taker.clone(),
-            maker: maker.clone(),
-            matches: matches,
+            taker: *taker,
+            maker: *maker,
+            matches,
         }
     }
 }
@@ -815,7 +803,7 @@ impl OrderBook {
                         price: order.price,
                         sequence: order.sequence,
                     },
-                    order.clone(),
+                    *order,
                 );
             }
             OrderSide::Sell => {
@@ -824,7 +812,7 @@ impl OrderBook {
                         price: order.price,
                         sequence: order.sequence,
                     },
-                    order.clone(),
+                    *order,
                 );
             }
         }

@@ -52,7 +52,8 @@ use crate::network::grpc::pb::raft_service_client::RaftServiceClient;
 use crate::network::raft_addr_from_http;
 
 pub struct GrpcNetwork<C>
-where C: RaftTypeConfig
+where
+    C: RaftTypeConfig,
 {
     local_id: C::NodeId,
     target: C::NodeId,
@@ -62,7 +63,8 @@ where C: RaftTypeConfig
 }
 
 impl<C> GrpcNetwork<C>
-where C: RaftTypeConfig<Node = BasicNode>
+where
+    C: RaftTypeConfig<Node = BasicNode>,
 {
     pub fn new(local_id: C::NodeId, target: C::NodeId, api_addr: &str) -> Self {
         let (raft_addr, channel) = match raft_addr_from_http(api_addr) {
@@ -103,11 +105,19 @@ where C: RaftTypeConfig<Node = BasicNode>
     }
 
     fn map_status(&self, status: Status, action: RPCTypes, ttl: Duration) -> RPCError<C> {
-        map_status(status, action, ttl, self.local_id.clone(), self.target.clone())
+        map_status(
+            status,
+            action,
+            ttl,
+            self.local_id.clone(),
+            self.target.clone(),
+        )
     }
 
     async fn unary<T, F>(&self, action: RPCTypes, ttl: Duration, fut: F) -> Result<T, RPCError<C>>
-    where F: Future<Output = Result<tonic::Response<T>, Status>> {
+    where
+        F: Future<Output = Result<tonic::Response<T>, Status>>,
+    {
         match tokio::time::timeout(ttl, fut).await {
             Err(_) => Err(RPCError::Timeout(self.timeout(action, ttl))),
             Ok(Err(status)) => Err(self.map_status(status, action, ttl)),
@@ -127,8 +137,16 @@ fn make_channel(addr: &str) -> Result<Channel, String> {
     Ok(endpoint.connect_lazy())
 }
 
-fn map_status<C>(status: Status, action: RPCTypes, ttl: Duration, id: C::NodeId, target: C::NodeId) -> RPCError<C>
-where C: RaftTypeConfig {
+fn map_status<C>(
+    status: Status,
+    action: RPCTypes,
+    ttl: Duration,
+    id: C::NodeId,
+    target: C::NodeId,
+) -> RPCError<C>
+where
+    C: RaftTypeConfig,
+{
     match status.code() {
         Code::Unavailable => RPCError::Unreachable(Unreachable::new(&status)),
         Code::DeadlineExceeded => RPCError::Timeout(Timeout {
@@ -142,7 +160,8 @@ where C: RaftTypeConfig {
 }
 
 impl<C> RaftNetworkV2<C> for GrpcNetwork<C>
-where C: RaftTypeConfig<Node = BasicNode>
+where
+    C: RaftTypeConfig<Node = BasicNode>,
 {
     /// Snapshots are streamed as chunks and reassembled by the follower, but the
     /// state machine still installs a contiguous buffer.
@@ -172,13 +191,21 @@ where C: RaftTypeConfig<Node = BasicNode>
     }
 
     #[tracing::instrument(level = "debug", skip_all, err(Debug))]
-    async fn vote(&mut self, req: VoteRequest<C>, option: RPCOption) -> Result<VoteResponse<C>, RPCError<C>> {
+    async fn vote(
+        &mut self,
+        req: VoteRequest<C>,
+        option: RPCOption,
+    ) -> Result<VoteResponse<C>, RPCError<C>> {
         let payload = encode(&req).map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
         let mut client = self.client()?;
         let ttl = option.soft_ttl();
 
         let resp = self
-            .unary(RPCTypes::Vote, ttl, client.vote(VoteCallRequest { payload }))
+            .unary(
+                RPCTypes::Vote,
+                ttl,
+                client.vote(VoteCallRequest { payload }),
+            )
             .await?;
 
         let result: Result<VoteResponse<C>, openraft::errors::RaftError<C>> =
@@ -249,10 +276,12 @@ where C: RaftTypeConfig<Node = BasicNode>
         let call = async {
             let (_, response): ((), Result<tonic::Response<PbSnapshotResponse>, Status>) =
                 tokio::join!(feed, client.install_snapshot(ReceiverStream::new(rx)));
-            let response = response.map_err(|status| self.map_status(status, RPCTypes::InstallSnapshot, ttl))?;
+            let response = response
+                .map_err(|status| self.map_status(status, RPCTypes::InstallSnapshot, ttl))?;
 
-            let result: Result<SnapshotResponse<C>, StreamingError<C>> = decode(&response.into_inner().payload)
-                .map_err(|e| StreamingError::Network(NetworkError::new(&e)))?;
+            let result: Result<SnapshotResponse<C>, StreamingError<C>> =
+                decode(&response.into_inner().payload)
+                    .map_err(|e| StreamingError::Network(NetworkError::new(&e)))?;
             result
         };
 
@@ -313,13 +342,23 @@ where C: RaftTypeConfig<Node = BasicNode>
 
             let response = tokio::time::timeout(ttl, client.append_stream(ReceiverStream::new(rx)))
                 .await
-                .map_err(|_| RPCError::Timeout(Timeout {
-                    action: RPCTypes::AppendEntries,
-                    id: local_id.clone(),
-                    target: target.clone(),
-                    timeout: ttl,
-                }))?
-                .map_err(|status| map_status(status, RPCTypes::AppendEntries, ttl, local_id.clone(), target.clone()))?;
+                .map_err(|_| {
+                    RPCError::Timeout(Timeout {
+                        action: RPCTypes::AppendEntries,
+                        id: local_id.clone(),
+                        target: target.clone(),
+                        timeout: ttl,
+                    })
+                })?
+                .map_err(|status| {
+                    map_status(
+                        status,
+                        RPCTypes::AppendEntries,
+                        ttl,
+                        local_id.clone(),
+                        target.clone(),
+                    )
+                })?;
 
             let mut stream = response.into_inner();
 

@@ -1,5 +1,3 @@
-#![allow(clippy::uninlined_format_args)]
-
 //! Match Engine Raft
 //!
 //! A practical implementation of a distributed matching engine built upon OpenRaft.
@@ -267,10 +265,11 @@ pub async fn build_match_engine_node(
         None => None,
     };
     // Load the latest snapshot, if any. openraft replays the retained log tail on top of it.
-    let state_machine_store = StateMachineStore::open_with_sinks(
+    let state_machine_store = StateMachineStore::open_with_sinks_and_retention(
         storage.snapshot_dir(node_id),
         match_result_sink,
         market_data.as_ref().map(|handle| handle.tap()),
+        storage.max_events,
     )?;
 
     tracing::info!(
@@ -372,6 +371,8 @@ pub async fn build_match_engine_node(
             .service(api::read)
             .service(api::linearizable_read)
             .service(api::follower_read)
+            .service(api::events)
+            .service(api::events_status)
     })
     .keep_alive(Duration::from_secs(5));
 

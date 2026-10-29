@@ -52,9 +52,12 @@ fn file_sink_records_rests_fills_and_cancels() {
 
         // A buy that cannot match rests in full (sequence 0).
         let response = client
-            .write(&MatchEngineRequest::Place {
-                order: Order::new(OrderSide::Buy, 100.0, 10.0, 0),
-            })
+            .write(&MatchEngineRequest::place(Order::new(
+                OrderSide::Buy,
+                100.0,
+                10.0,
+                0,
+            )))
             .await
             .unwrap()
             .unwrap();
@@ -66,9 +69,12 @@ fn file_sink_records_rests_fills_and_cancels() {
 
         // A sell of 4 crosses it: 4 fill, 6 stay on the bid (sequence 1).
         client
-            .write(&MatchEngineRequest::Place {
-                order: Order::new(OrderSide::Sell, 100.0, 4.0, 0),
-            })
+            .write(&MatchEngineRequest::place(Order::new(
+                OrderSide::Sell,
+                100.0,
+                4.0,
+                0,
+            )))
             .await
             .unwrap()
             .unwrap();
@@ -187,7 +193,7 @@ fn file_sink_records_stop_triggers_and_expiries() {
         client.init().await.unwrap().unwrap();
         wait_for_leader(&client).await;
 
-        let place = |order: Order| MatchEngineRequest::Place { order };
+        let place = |order: Order| MatchEngineRequest::place(order);
 
         // Two bids park liquidity at 100 and 95 (sequences 0 and 1).
         client

@@ -3,6 +3,7 @@ use std::fmt;
 use serde::Deserialize;
 use serde::Serialize;
 
+use crate::match_result::MatchEvent;
 use crate::matchengine::Order;
 
 /// Application requests that can be applied to the Raft state machine.
@@ -20,7 +21,14 @@ use crate::matchengine::Order;
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum MatchEngineRequest {
     /// Place a new order in the matching engine.
-    Place { order: Order },
+    Place {
+        order: Order,
+        /// Optional client-supplied idempotency key. A retry with the same key
+        /// returns the original sequence and events instead of placing a second
+        /// order. Omit it for the old, non-idempotent behaviour.
+        #[serde(default)]
+        client_order_id: Option<String>,
+    },
     /// Cancel an existing order from the matching engine.
     Cancel { order: Order },
     /// Amend a resting limit order. `order` identifies it exactly like `Cancel`
@@ -49,10 +57,28 @@ pub enum MatchEngineRequest {
     },
 }
 
+impl MatchEngineRequest {
+    /// Builds a `Place` without an idempotency key.
+    pub fn place(order: Order) -> Self {
+        Self::Place {
+            order,
+            client_order_id: None,
+        }
+    }
+
+    /// Builds a `Place` with a client idempotency key.
+    pub fn place_with_client_id(order: Order, client_order_id: impl Into<String>) -> Self {
+        Self::Place {
+            order,
+            client_order_id: Some(client_order_id.into()),
+        }
+    }
+}
+
 impl fmt::Display for MatchEngineRequest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            MatchEngineRequest::Place { order } => write!(f, "Place {{ order: {:?} }}", order),
+            MatchEngineRequest::Place { order, .. } => write!(f, "Place {{ order: {:?} }}", order),
             MatchEngineRequest::Cancel { order } => write!(f, "Cancel {{ order: {:?} }}", order),
             MatchEngineRequest::Amend {
                 order,
@@ -78,20 +104,56 @@ impl fmt::Display for MatchEngineRequest {
 ///
 /// This is the result of a successful write operation, containing
 /// any output from applying the request.
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct MatchEngineResponse {
     /// The value returned from the state machine application, if any.
     pub value: Option<String>,
+    /// Explicit sequence assigned to the mutating request.
+    #[serde(default)]
+    pub sequence: Option<u64>,
+    /// Events produced by this entry, capped at [`Self::MAX_EVENTS`]. The full
+    /// set is in the replicated event log served by `POST /events`.
+    #[serde(default)]
+    pub events: Vec<MatchEvent>,
+    /// True when `events` holds only the first [`Self::MAX_EVENTS`] records.
+    #[serde(default)]
+    pub events_truncated: bool,
 }
 
 impl MatchEngineResponse {
+    /// Maximum number of events embedded in a `/write` response.
+    pub const MAX_EVENTS: usize = 512;
+
     pub fn new(value: impl Into<String>) -> Self {
         MatchEngineResponse {
             value: Some(value.into()),
+            ..Self::default()
+        }
+    }
+
+    /// A mutating response carrying the assigned sequence and its events.
+    pub fn applied(sequence: u64, events: &[MatchEvent]) -> Self {
+        let truncated = events.len() > Self::MAX_EVENTS;
+        Self {
+            value: Some(sequence.to_string()),
+            sequence: Some(sequence),
+            events: events.iter().take(Self::MAX_EVENTS).copied().collect(),
+            events_truncated: truncated,
+        }
+    }
+
+    /// A duplicate submission's response: the original sequence and whatever
+    /// remains of its events in the retained window.
+    pub fn duplicate(sequence: u64, events: Vec<MatchEvent>, truncated: bool) -> Self {
+        Self {
+            value: Some(sequence.to_string()),
+            sequence: Some(sequence),
+            events,
+            events_truncated: truncated,
         }
     }
 
     pub fn none() -> Self {
-        MatchEngineResponse { value: None }
+        Self::default()
     }
 }

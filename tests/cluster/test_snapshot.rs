@@ -96,9 +96,12 @@ async fn test_grpc_snapshot_install_inner() -> anyhow::Result<()> {
     // Prices are distinct so nothing crosses and every order stays in the book.
     for i in 0..30 {
         client1
-            .write(&MatchEngineRequest::Place {
-                order: Order::new(OrderSide::Buy, 100.0 - f64::from(i), 1.0, 0),
-            })
+            .write(&MatchEngineRequest::place(Order::new(
+                OrderSide::Buy,
+                100.0 - f64::from(i),
+                1.0,
+                0,
+            )))
             .await??;
     }
 
@@ -146,7 +149,8 @@ async fn test_grpc_snapshot_install_inner() -> anyhow::Result<()> {
     }
 
     // The snapshot, not log replay, carried the book: all 30 orders are present.
-    let orders: Vec<Order> = serde_json::from_str(&client2.read(&"orderbook_orders".to_string()).await?)?;
+    let orders: Vec<Order> =
+        serde_json::from_str(&client2.read(&"orderbook_orders".to_string()).await?)?;
     assert_eq!(30, orders.len());
 
     Ok(())

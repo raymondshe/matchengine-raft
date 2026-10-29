@@ -32,8 +32,8 @@ The dead sled file `src/store/store.rs` was deleted.
 
 ## 3. Correctness / robustness in the request path
 
-- [ ] Replace `.decompose().unwrap()` in `src/network/api.rs` and `src/network/management.rs` with real error handling. Today a request that must be forwarded to the leader panics the worker instead of returning the forward hint.
-- [ ] `src/network/api.rs:96` — `linearizer.await_ready(...).unwrap()` can panic; return the error to the caller.
+- [x] Replace `.decompose().unwrap()` in `src/network/api.rs` and `src/network/management.rs` with real error handling. Forwarding already returned the `ForwardToLeader` body; the unwrap panicked on fatal `RaftError`s. Fatal errors now return HTTP 500 instead of killing the worker.
+- [x] `linearizer.await_ready(...).unwrap()` is gone: fatal wait errors return HTTP 500, and recoverable `LinearizableReadError`s stay in the JSON result.
 - [x] Scripts now send the correct `sequence` field.
 - [x] Fix issue #1: `place_order` no longer emits a phantom zero-quantity
   `MatchResult` when the taker is exactly filled, and partially filled makers are
@@ -49,9 +49,8 @@ The dead sled file `src/store/store.rs` was deleted.
 
 ## 4. Dependency cleanup
 
-- [ ] Unused: `uuid`, `thiserror`, `async-trait`, `rand` (no references in `src/` or `tests/`).
-- [x] `walkdir` dropped with the deleted `src/store/store.rs`. `sled` is only used by the playground binary `src/bin/sled_test.rs`.
-- [ ] Stale version constraints vs. what `Cargo.lock` actually resolves: `actix-web = "4.0.0-rc.2"` (resolved 4.13), `uuid = 0.8.1`, `env_logger = 0.9.0`.
+- [x] Unused dependencies: `uuid` and `rand` were removed earlier; `thiserror` and `async-trait` are now removed too. `walkdir` went with the deleted `src/store/store.rs`; `sled` is only used by the playground binary `src/bin/sled_test.rs`.
+- [x] Dependency versions are current (`actix-web 4.18.1`, `env_logger 0.11.11`, etc.) and `Cargo.lock` is committed.
 
 ## 5. Tests
 
@@ -59,11 +58,12 @@ Unit tests cover the order book, the Raft-address derivation and the snapshot fi
 Integration coverage is `tests/cluster/test_cluster.rs` (3 nodes, both transports),
 `tests/cluster/test_snapshot.rs` (snapshot build, purge, learner install over gRPC),
 `tests/cluster/test_storage.rs` (WAL framing, torn-tail truncation, purge/truncate across segments,
-vote/committed persistence, snapshot build/install/reopen) and `tests/cluster/test_restart.rs`
-(full node restart via log replay and via snapshot).
+vote/committed persistence, snapshot build/install/reopen), `tests/cluster/test_restart.rs`
+(full node restart via log replay and via snapshot), and `tests/cluster/test_events.rs`
+(`/write` events, `/events` cursor, retention, submission dedupe).
 
-- [ ] Add unit tests for the order book: partial fills, cancel of an already-filled order, price-time priority (`BidKey`/`AskKey` ordering).
-- [ ] Add negative tests: write to a follower, unknown `/read` key, malformed `Place` payload.
+- [x] Order-book unit tests cover partial fills, maker identity, priority, IOC/FOK, icebergs, stops, expiry, amend rules and depth views.
+- [ ] Add negative API tests for unknown `/read` keys and malformed `Place` payloads (follower forwarding is covered).
 - [ ] `tests/cluster/test_cluster.rs` binds fixed ports 21001-21003 and leaves 3 nodes running after the test finishes; parameterize ports and shut the nodes down.
 - [x] Test restart recovery (both log replay and snapshot boot paths).
 - [x] Test match-result processing: `apply` -> sink events (rest/fill/cancel), failing-sink
@@ -84,7 +84,8 @@ vote/committed persistence, snapshot build/install/reopen) and `tests/cluster/te
 - [x] `docs/AERON_SOLUTION.md` and `docs/TRANSPORTS.md` updated: gRPC is adopted, storage is
   durable, and all remaining performance numbers are labelled as guidance.
 - [x] `docs/MATCH_RESULTS.md` writes down how fills/cancels reach the order/clearing system.
-  Phase 1a of it is implemented; the durable event log and `/events` are still proposals.
+  Phases 1a–3 are implemented (write-response events, replicated event log, `/events`, dedupe);
+  phase 4 (streaming/MQ bridge) remains optional.
 - [ ] Keep `AGENTS.md` and this file in sync after code changes; both are maintained by hand.
 
 ## 7. Scripts
@@ -101,18 +102,22 @@ vote/committed persistence, snapshot build/install/reopen) and `tests/cluster/te
 
 ## 8. Repo hygiene
 
-- [ ] No CI exists. Add GitHub Actions running `cargo build`, `cargo test`, `cargo fmt --check`, `cargo clippy -- -D warnings`.
-- [ ] `Cargo.lock` is in `.gitignore` but the crate produces a binary — usually committed for binaries. Decide one way.
-- [ ] `src/lib.rs` starts with `#![allow(clippy::uninlined_format_args)]`; fix the lints and drop the allow.
+- [x] GitHub Actions runs `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings` and `cargo test` (`.github/workflows/ci.yml`).
+- [x] `Cargo.lock` is no longer ignored and is part of this change (commit it with the source).
+- [x] The crate-level `#![allow(clippy::uninlined_format_args)]` is gone; clippy is clean with `-D warnings`.
 
 ## 9. Matching engine
 
 - [x] Route match results through a replaceable `MatchResultSink` (`MatchEvent` with
   `(log_index, ordinal)` ids; `Noop`/`Memory`/`File` sinks; `--match-event-log` file log for
   debugging). `apply` publishes best-effort and never lets a sink failure affect the state machine.
-- [ ] Deliver fills and cancels durably to the order/clearing system: events in the `/write`
-  response, a bounded replicated event log, `/events` cursor reads, and `client_order_id` dedupe.
-  Design: `docs/MATCH_RESULTS.md` (phases 1b–3).
+- [x] Deliver fills and cancels durably to the order/clearing system: events in the `/write`
+  response (capped at 512 with `events_truncated`), a bounded replicated event log snapshotted with
+  the state (v4), `POST /events` cursor reads, `GET /events/status`, and `client_order_id` submission
+  dedupe. Design: `docs/MATCH_RESULTS.md` (phases 1b–3).
+- [ ] Phase 4 of match-result delivery: long-poll/short-poll `/events` (`wait_ms`), gRPC
+  `StreamEvents`, and an optional MQ bridge sidecar. Also decide event time in the clearing feed
+  and per-instrument cursors once multi-symbol lands.
 - [x] Order types (semantics modelled on
   [OrderBook-rs](https://github.com/joaquinbejar/OrderBook-rs)): GTC, IOC, FOK, GTD, Day,
   post-only, iceberg (display tranche + hidden reserve), market, stop-market and stop-limit.
@@ -142,6 +147,8 @@ vote/committed persistence, snapshot build/install/reopen) and `tests/cluster/te
   map value from 40 to ~88 bytes, which shows up as roughly 1.5–1.7x on the copy-heavy benches; a
   compact resting record or per-level buckets would recover it.
 - [ ] `impl PartialEq for Order` ignores `id`, so two different orders at the same price/size compare equal.
+- [ ] Bound `client_order_id` length (and decide the accepted character set) before exposing `/write`
+  to untrusted clients; today only the HTTP payload limit bounds a single key.
 - [ ] `Order::sequence` is required by the public deserializer even though `place_order()` overwrites
   it; make it optional (serde default) so callers do not have to send a value the engine ignores.
 - [ ] Payloads on the public HTTP API are JSON; consider protobuf/Avro there too. Raft RPCs already use `postcard` over gRPC.

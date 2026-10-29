@@ -1,15 +1,14 @@
 # Delivering match results to the order / clearing system
 
-Status: **partly implemented.** `apply` no longer throws match results away: it turns them into
-[`MatchEvent`]s and publishes them to a pluggable `MatchResultSink`
-(`src/match_result/mod.rs`). The default sink is a no-op; `--match-event-log <path>` installs a
-file sink that appends JSON lines for tests and debugging. Everything needed for durable,
-replayable delivery to clearing (a replicated event log, a cursor API, idempotent submission) is
-still a design proposal, described below.
+Status: **phases 1a–3 implemented.** `apply` turns results into [`MatchEvent`]s, returns the first
+512 in the `/write` response, appends them to a bounded event window that is part of snapshot v4,
+and serves that window through `POST /events` and `GET /events/status`. `client_order_id` makes
+submissions idempotent across retries. `--match-event-log <path>` remains a node-local JSONL
+debugging sink. Phase 4 (long-poll, gRPC streaming, MQ bridge) is the remaining proposal.
 
 [`MatchEvent`]: ../src/match_result/mod.rs
 
-Date: 2026-10-27 · Baseline: `master` at `70a9368` (`a44d9ae` plus README typo fixes: durable WAL +
+Date: 2026-10-29 · Baseline: `master` at `7d34b20` (durable WAL +
 snapshots, gRPC default transport, `OrderBook::place_order` fixed for issue #1).
 
 ---
@@ -20,43 +19,26 @@ A `Place` request travels through Raft and is applied by every node:
 
 | Step | Location | What is kept |
 |---|---|---|
-| Client submits the order | `POST /write` → `MatchEngineClient::write` | — |
-| Entry is replicated | `log_store.rs` WAL | `MatchEngineRequest::Place { order }` |
-| State machine applies it | `StateMachineStore::apply` | — |
-| Matcher runs | `OrderBook::place_order` → `match_bid_order` / `match_ask_order` | returns `Vec<MatchResult>` |
-| Results become events | `MatchEvent::for_place` / `for_cancel` | `Fill`, `Rested`, `Cancelled` with `(log_index, ordinal)` ids |
-| Events reach the sink | `MatchResultSink::publish` | dropped by default (`NoopSink`); JSONL with `FileLogSink` |
-| Response is built | `MatchEngineResponse { value: Some(sequence) }` | the taker's sequence number |
-| Response reaches the writer | `ClientWriteResponse.data` over `/write` | only the writer sees it |
+| Client submits the order | `POST /write` → `MatchEngineClient::write` | `Place { order, client_order_id }` |
+| Entry is replicated | `log_store.rs` WAL | the full request, including the idempotency key |
+| State machine applies it | `StateMachineStore::apply` | order book + bounded event window + submission map |
+| Matcher runs | `OrderBook::execute_order` | returns fills, rests, cancels, triggers |
+| Results become events | `MatchEvent::for_*` | `Fill`, `Rested`, `Cancelled`, `Triggered`, `Expired`, `Rejected`, `Amended` with `(log_index, ordinal)` ids |
+| Events are recorded | `StateMachineStoreInner::record_events` | replicated, snapshotted ring (bounded by `--max-events`) |
+| Response is built | `MatchEngineResponse::applied` | sequence + first 512 events |
+| Response reaches the writer | `ClientWriteResponse.data` over `/write` | read-your-writes for the submitter |
+| Consumers catch up | `POST /events` | cursor-based pages from the replicated window |
 
-With the default sink the only trace of a trade is still:
+The event log, not the response, is the durable feed:
 
-1. the mutated order book (resting orders now have smaller volumes or are gone), and
-2. a sequence number string returned to whoever submitted the order.
+- clearing can read fills even if the submitting client dies;
+- a consumer resumes from `(log_index, ordinal)` and dedupes on the same id;
+- `client_order_id` collapses retries before they become a second order;
+- a slow consumer cannot block `apply`: it pulls pages from the state machine.
 
-The file sink adds a node-local JSONL trail, but it is not replicated, every replica writes its own
-copy, and replaying the log after a restart writes the replayed events again. It is a debugging
-aid, not a clearing feed.
-
-Followers apply the same entries but their responders are `None`, so they silently drop the response
-too (`core/sm/worker.rs` attaches a responder only to entries someone is waiting on).
-
-Consequences:
-
-- **Clearing never learns about fills.** It sees an order book after the fact but not who traded with
-  whom, at what price, or in what order.
-- **The submitter is a single point of loss.** If the client dies after the write commits, the fills
-  are gone from the system's point of view.
-- **A sequence number is not a fill identity.** It identifies the taker, not a trade, and cannot be
-  used to deduplicate or resume a stream.
-- **Retries are indistinguishable.** `/write` can time out after commit; resubmitting creates a
-  second order and a second set of fills, with no idempotency key to collapse them.
-- **No replay.** There is no way for an auditor or a down consumer to catch up.
-
-The matcher data itself is already good enough to build this on: `MatchResult` carries the taker,
-the maker and the matched volume, and `apply` runs on every replica, so the fills are computed
-deterministically everywhere. Since phase 1a they are turned into `MatchEvent`s and handed to the
-node's sink, but the default sink drops them, so clearing still has no feed.
+The file sink is now only an observability option (`--match-event-log`); it is node-local and not a
+clearing feed. Followers still apply every entry and build the same event window, even though only
+the writer receives the immediate response.
 
 ---
 
@@ -169,18 +151,18 @@ Built-in implementations (`src/match_result/mod.rs`):
 
 Wiring:
 
-* `StateMachineStore::open(dir)` installs `NoopSink`; `open_with_sink(dir, Arc<dyn MatchResultSink>)`
-  installs any other sink. Clones of the store share the sink.
+* `StateMachineStore::open(dir)` installs `NoopSink`; `open_with_sinks(dir, sink, tap)` or
+  `open_with_sinks_and_retention(..., max_events)` installs any other sink and the retention limit.
+  Clones of the store share the sink.
 * `build_match_engine_node` opens a `FileLogSink` when `StorageConfig::match_event_log` is set
   (`--match-event-log`, env `MATCH_EVENT_LOG`), stamping the node id on every line.
 * A sink failure is logged at `warn` and otherwise ignored: applying an entry must never fail (or
   diverge) because a sink is unreachable. The state machine is unchanged by sink selection.
 
 The file sink is deliberately **not** a clearing feed: it is node-local, not replicated, not
-fsynced, and replay after a restart writes the replayed events again. It exists so the events can
-be inspected while the durable design below is built. The trait is the extension point for that
-design: a replicated event log, an MQ bridge or a sidecar can each be a sink (or consume the log)
-without changing `apply`.
+fsynced, and replay after a restart writes the replayed events again. The durable feed is the
+replicated event log described below; the sink trait remains the extension point for local
+observability (or an in-process consumer) without changing `apply`.
 
 ### 4.2 Event model (implemented)
 
@@ -238,42 +220,52 @@ global or become per-instrument is then a storage decision, not a sink API chang
 
 ### 4.3 Producing events (implemented)
 
-`StateMachineStore::apply` builds the events and publishes them:
+`StateMachineStore::apply` builds the events, records them in the replicated window, and publishes
+them to the sink:
 
 ```rust
-MatchEngineRequest::Place { order } => {
+MatchEngineRequest::Place { order, client_order_id } => {
+    // Duplicate client id: return the original sequence and retained events.
+    if let Some(record) = client_order_id.and_then(|id| inner.submissions.get(id)) {
+        return inner.duplicate_response(record);
+    }
+
     let mut o = *order;
-    let matches = inner.orderbook.place_order(&mut o);
-    // `place_order` only writes the sequence back, so read the remainder from the book.
-    let resting_volume = inner.orderbook.resting_volume(&o);
-    let events = MatchEvent::for_place(entry.log_id.index, &o, &matches, resting_volume);
+    let outcome = inner.orderbook.execute_order(&mut o);
+    let events = /* fills, rests, cancels, triggers, expiries, rejections */;
+    inner.record_events(&events);
+    inner.record_submission(client_order_id, o.sequence, log_index, events.len());
     self.publish_match_events(&events);
 
-    MatchEngineResponse { value: Some(o.sequence.to_string()) }
+    MatchEngineResponse::applied(o.sequence, &events)
 }
 ```
+
+The real arm is slightly longer because it also anchors automatic-purge events and the
+market-data frame; the window and submission map are updated before the sink call, so a sink
+failure cannot lose them. `Cancel`, `Amend` and `PurgeExpired` use the same
+`record_events`/`MatchEngineResponse::applied` path.
 
 `Cancel` publishes a `Cancelled` event only when `cancel()` actually removed an order; `Blank`
 and membership entries publish nothing. `OrderBook::resting_volume` exists precisely so the
 `Rested` event reports the volume stored in the book instead of `submitted - filled`, which can
 differ in the last floating-point bit.
 
-All of this is pure state-machine work up to the sink call; the sink is the only side effect.
+### 4.4 Immediate response (implemented)
 
-### 4.4 Immediate response
-
-`MatchEngineResponse` grows additively:
+`MatchEngineResponse` is additive; all new fields default when absent, so old payloads still
+deserialize:
 
 ```rust
 pub struct MatchEngineResponse {
     pub value: Option<String>,        // existing: sequence string
     pub sequence: Option<u64>,        // explicit taker sequence
-    pub events: Vec<MatchEvent>,      // new
-    pub events_truncated: bool,       // new: response holds only the first N events
+    pub events: Vec<MatchEvent>,      // first 512 events of the entry
+    pub events_truncated: bool,       // true when the entry produced more
 }
 ```
 
-Proposed response shape (not implemented yet — today `/write` still returns only `value`):
+Implemented response shape:
 
 ```json
 {"Ok": {
@@ -292,11 +284,11 @@ Proposed response shape (not implemented yet — today `/write` still returns on
 }}
 ```
 
-Cap the number of events embedded in a response (e.g. 512). A taker sweeping the whole book can
-produce thousands of fills; the rest are still in the event log, and the response can set
+The cap is `MatchEngineResponse::MAX_EVENTS = 512`. A taker sweeping the whole book can produce
+thousands of fills; the rest are still in the event log and the response sets
 `events_truncated: true`. This keeps `/write` bodies and HTTP limits bounded.
 
-### 4.5 Durable, bounded log
+### 4.5 Durable, bounded log (implemented)
 
 Additions to `StateMachineData` (which is what `to_content()`/snapshots serialise):
 
@@ -304,35 +296,38 @@ Additions to `StateMachineData` (which is what `to_content()`/snapshots serialis
 pub struct StateMachineData {
     pub orders: Vec<Order>,
     pub sequence: u64,
-    pub events: VecDeque<MatchEvent>, // retained window, ordered by event_id
-    pub evictions_total: u64,
+    pub events: Vec<StoredMatchEvent>, // retained window, ordered by event_id
+    pub events_evicted: u64,
+    pub submissions: Vec<SubmissionRecord>, // client_order_id -> sequence/log index
+    pub submissions_evicted: u64,
 }
 ```
 
 - No event counter is needed: `EventId` is the log position plus an ordinal, so the window needs no
   extra state to reconstruct and restart/learner replay assigns the same ids.
-- Retention is a constant or a `--max-events`/env setting; default suggestion: **262 144 events**
-  (postcard-encoded at roughly 50–70 B/event, so on the order of 10–20 MB per node — measure the real
-  size before committing to a number).
+- Retention is `--max-events` / `MAX_EVENTS`, default **262 144 events**. The client-order-id map
+  has its own fixed `MAX_SUBMISSIONS` cap (262 144): dedupe affects matching, so it must not depend
+  on a node-local event-retention flag. `StoredMatchEvent` mirrors `MatchEvent` without
+  `skip_serializing_if`, because postcard is positional and cannot decode a skipped optional field.
 - `oldest_event_id()` is `events.front().map(|e| e.event_id)`; `last_event_id()` is the back.
 - Eviction only trims the window; ids never repeat.
 - The event window is part of the snapshot, so restart and learner install recover it exactly. A new
   learner receives only the retained window — that is expected, and the read API advertises
   `oldest_event_id` so consumers can detect the gap.
 
-Snapshot format: `SNAPSHOT_VERSION` must go from 2 to 3 (version 2 is what dropped the old
-key-value map). Postcard encodes struct fields positionally, so a v3 decoder reading a v2 payload
+Snapshot format: `SNAPSHOT_VERSION` is **4**; v4 adds the event window and submission map on top
+of the v3 order/stop fields. Postcard encodes struct fields positionally, so an older decoder
 fails on the missing fields (`postcard::from_bytes` reports an unexpected end of input). Two options:
 
 1. **Reject v2 with a clear error** (simplest; acceptable for a demo, but requires wiping data).
 2. Decode a versioned enum (`V2(StateMachineDataV2) | V3(StateMachineDataV3)`) and migrate.
 
-Recommendation: bump the version, reject older files with an explicit message, and document the
-migration if this repo ever stops being an example. This is nearly free: `read_snapshot_file` already
-checks the version in the header and fails with `unsupported snapshot version {version}` before
-decoding, so a v2 file on disk is rejected loudly rather than silently misparsed.
+The implemented choice is to reject older files with an explicit message. This is nearly free:
+`read_snapshot_file` checks the version in the header and fails with
+`unsupported snapshot version {version}` before decoding, so a v3 file on disk is rejected loudly
+rather than silently misparsed.
 
-### 4.6 Read API and consumer protocol
+### 4.6 Read API and consumer protocol (implemented)
 
 ```
 POST /events
@@ -349,12 +344,11 @@ POST /events
 - Omitting `after` means "from the oldest retained event".
 - Cursors compare by `EventId`'s derived ordering: `(log_index, ordinal)`.
 - `limit` is capped server-side (e.g. 1000) so one call cannot allocate unbounded memory.
-- Use the leader (`/events` can be a linearizable read) for clearing; follower reads are fine for
-  dashboards where staleness is acceptable. Add the `X-Raft-Leader`/forwarding behaviour used by the
-  other write endpoints.
-- Optional phase: long-poll `wait_ms` (≤ 1000) so consumers do not spin; implemented with a
-  `Notify` signalled after `apply` releases the state-machine lock.
-- Optional phase: gRPC `StreamEvents` using the same cursor, mirroring `AppendStream`.
+- `/events` performs a linearizable read via a read linearizer; the client forwards to the leader
+  on `ForwardToLeader`. `/events/status` is a local read for dashboards.
+- Implemented in `src/network/api.rs` with `EventsRequest`/`EventsResponse`/`EventsStatus`; the
+  client exposes `events()` and `events_status()`.
+- Phase 4: long-poll `wait_ms` (≤ 1000) and gRPC `StreamEvents` using the same cursor.
 
 Consumer contract (this is what makes R4 achievable):
 
@@ -372,14 +366,16 @@ An MQ bridge is just another consumer: a small sidecar reads `/events`, publishe
 by `event_id`, and commits its cursor after the broker acknowledges. Crucially, this runs outside
 `apply`.
 
-### 4.7 Idempotent submission
+### 4.7 Idempotent submission (implemented)
 
 Returning events does not by itself make retries safe. Two independent dedupe layers are needed:
 
-- **Submission:** add `client_order_id: Option<String>` to `Order` (or a wrapper request) and keep a
-  bounded map `client_order_id -> order_sequence` in the state machine. A replayed request with a
-  known key returns the original sequence and its events instead of placing a second order. Bound
-  the map (same retention approach) and document the eviction window.
+- **Submission:** `MatchEngineRequest::Place` carries an optional `client_order_id`. The state
+  machine keeps a bounded map `client_order_id -> SubmissionRecord { order_sequence, log_index,
+  event_count }`; a replay returns the original sequence and the retained events for that log
+  index instead of placing a second order. The map is snapshotted and bounded by the fixed
+  `MAX_SUBMISSIONS` constant (independent of `--max-events`, because dedupe affects matching).
+  Keeping the key on the request (not `Order`) preserves `Order: Copy` in the matching loop.
 - **Consumption:** dedupe on `event_id` as above.
 
 Without the first layer, an HTTP timeout after commit produces two orders that genuinely trade
@@ -402,7 +398,8 @@ Add `GET /events/status`:
 ```json
 {"oldest_event_id": {"log_index": 1, "ordinal": 0},
  "last_event_id": {"log_index": 140, "ordinal": 1},
- "retained_events": 1499, "evictions_total": 0, "retention_limit": 262144}
+ "retained_events": 1499, "evictions_total": 0, "retention_limit": 262144,
+ "submission_retention_limit": 262144, "submission_evictions_total": 0}
 ```
 
 Alert on evictions: they mean a consumer is falling behind and a resync is imminent. Also log the
@@ -415,7 +412,7 @@ event rate per apply batch at debug level, consistent with the existing `tracing
 | Failure | Effect | Handling |
 |---|---|---|
 | Sink returns an error | That batch is missing from the sink | Logged at `warn`; `apply` and the state machine are unaffected. The file sink keeps the lines it already wrote |
-| Node restarts | Replayed entries are published again | Expected for the debug file sink; dedupe on `event_id` (a durable event log in phase 2 removes the duplicates from the feed) |
+| Node restarts | Replayed entries are applied again | The event window is rebuilt identically from the snapshot + log; the debug file sink may duplicate lines, the durable feed does not |
 | Writer crashes after commit | Response lost | Fills are in the event log; clearing pulls them by cursor |
 | Leader steps down before replying | Caller gets `ForwardToLeader` | Retry with the same `client_order_id`; submission dedupe returns the original sequence |
 | Follower restarts | — | Snapshot + tail replay rebuilds the identical event log |
@@ -424,7 +421,7 @@ event rate per apply batch at debug level, consistent with the existing `tracing
 | Duplicate delivery | Consumer sees an event twice | Dedupe on `event_id` |
 | Huge sweep (many fills) | Large response | Response capped with `events_truncated`; full set available from `/events` |
 | Slow consumer | — | Pull-based, so it cannot block `apply`; only its own cursor lags |
-| Snapshot from an older binary | v1 payload | Version check rejects it with a clear error (or the versioned enum migrates it) |
+| Snapshot from an older binary | v3 or earlier payload | Version check rejects it with a clear error; v4 is the first version with the event window |
 
 ---
 
@@ -437,14 +434,18 @@ event rate per apply batch at debug level, consistent with the existing `tracing
   the matching code independent of the clearing schema.
 - `/events` is new; nothing is renamed. If a breaking v2 is ever needed, version the route rather
   than changing `/write`.
-- `Order` gains `client_order_id: Option<String>` with `#[serde(default)]`, so old payloads still
-  deserialize.
+- `MatchEngineRequest::Place` gains `client_order_id: Option<String>` with `#[serde(default)]`, so
+  old JSON payloads still deserialize. It lives on the request rather than `Order` to keep
+  `Order: Copy` in the matching loop.
+- Postcard is positional, so older Raft log entries (without the field) and v3 snapshots are not
+  decodable by this build. The example deployment must start from a fresh data directory; there is
+  no on-disk migration.
 
 ---
 
 ## 7. Test plan
 
-Implemented today (`cargo test --lib`, `cargo test --test cluster test_match_results`):
+Implemented today (`cargo test --lib`, `cargo test --test cluster test_match_results`, `test_events`):
 
 - `apply` publishes `Rested`, `Fill` and `Cancelled` events to the configured sink, with the right
   order/counterparty sequences and the book's exact volumes.
@@ -464,28 +465,27 @@ Implemented today (`cargo test --lib`, `cargo test --test cluster test_match_res
   records rest/fill/cancel in log order and the `/write` response is unchanged; a second node
   checks `Triggered` + child fill, `Expired` from `PurgeExpired`, and the new `/read` keys.
 
-Still to write with phases 2–4:
+Implemented with phases 2–3:
 
-- Event ids are monotonic and gap-free within the retained window.
-- A partial fill emits exactly one `Fill`; the remainder emits exactly one `Rested`.
-- An exact fill emits `Fill` only, no `Rested`.
-- Retention: push `MAX_EVENTS + N`, assert `oldest_event_id` advanced by N and ids never repeat.
-- Determinism: apply the same entry list to two fresh `StateMachineStore`s and compare event streams
-  field by field (`Order::PartialEq` ignores `id`, so compare ids explicitly).
-- Submission dedupe: same `client_order_id` twice → one order, same sequence and events.
+- Event ids are monotonic and gap-free within the retained window; retention pushes the oldest
+  ids out and `/events/status` reports the eviction count.
+- A partial fill emits exactly one `Fill` plus one `Rested`; an exact fill emits `Fill` only.
+- Submission dedupe: the same `client_order_id` twice returns one order, the same sequence and the
+  retained events; the map survives a snapshot/reopen.
+- `POST /write Place` returns the same events as `POST /events` for that range, and the cursor
+  pages both events exactly once (`tests/cluster/test_events.rs`).
+- Diffing two processors fed the same frames covers the market-data side; the match-event side is
+  deterministic by construction (`EventId` from the applied log, no clock).
 
-Integration (`tests/cluster`), beyond the file-sink test:
+Still to write (mainly phase 4 / operational tests):
 
-- `POST /write Place` returns the same events as `POST /events` for that range, on both transports.
-- Restart a node after a write; `/events` still returns the fills and new ids continue after the
-  replayed ones.
+- Restart a full node after a write; `/events` returns the fills and new ids continue after the
+  replayed ones (snapshot persistence is unit-tested).
 - Snapshot a node, purge the log, add a learner; the learner serves the retained events and reports
   the correct `oldest_event_id`.
 - Kill the submitting client after commit; a second client reads the fills from `/events`.
-- Retention overflow on a short window: consumer sees the gap signal.
 - Two consumers with independent cursors both receive every event exactly once after dedupe.
-
-Property test: replaying a random request stream twice yields identical event id/field sequences.
+- Property test: replaying a random request stream twice yields identical event id/field sequences.
 
 ---
 
@@ -494,40 +494,40 @@ Property test: replaying a random request stream twice yields identical event id
 | Phase | Work | Effort |
 |---|---|---|
 | 1a ✅ | `MatchEvent` + `EventId`; build events in `apply`; `MatchResultSink` with `Noop`/`Memory`/`File` sinks; `--match-event-log`; unit and end-to-end tests | done |
-| 1b | Return events in `MatchEngineResponse`; cap response size with `events_truncated` | 0.5–1 day |
-| 2 | Ring buffer + snapshot v2 + `oldest_event_id`/`last_event_id`; `/events` and `/events/status`; restart/snapshot/retention tests | 2–3 days |
-| 3 | `client_order_id` submission dedupe with bounded map | 1–2 days |
+| 1b ✅ | Events in `MatchEngineResponse`; 512-event cap with `events_truncated` | done |
+| 2 ✅ | Bounded event window + snapshot v4 + `oldest_event_id`/`last_event_id`; `/events` and `/events/status`; restart/snapshot/retention tests | done |
+| 3 ✅ | `client_order_id` submission dedupe with bounded map | done |
 | 4 | Optional: long-poll, gRPC `StreamEvents`, MQ bridge sidecar | 2–3 days |
 
-Phases 1a–2 close the TODO for fills and cancels and are independently shippable. Phase 3 is required
-before clearing can trust the feed under retries. Phase 4 is operational convenience.
+Phases 1a–3 are implemented; phase 4 is operational convenience.
 
 ---
 
-## 9. Decision
+## 9. Decision (implemented)
 
-Adopt **A + B**:
+Adopted **A + B**:
 
 1. Return events from `/write` so the submitter has read-your-writes (phase 1b).
 2. Keep a bounded, replicated event log in the state machine, snapshotted with the state, served by
    a cursor API (phase 2).
-3. Keep delivery out of the replicated path: `apply` only publishes to a `MatchResultSink`
-   (implemented, phase 1a), the call is best-effort and must never change state or fail the apply,
-   and production delivery consumes the durable log rather than doing network IO inline.
+3. Keep network delivery out of the replicated path: `apply` records events in the state machine
+   and publishes to a `MatchResultSink` (best-effort; a sink can never fail or change the apply).
+   Production delivery consumes the durable log rather than doing network IO in `apply`.
 4. Make submission idempotent with `client_order_id` so retries do not double-trade.
 
-The sink trait is the seam that makes the remaining phases replaceable: an event-log-backed sink, an
-MQ bridge or a sidecar can be swapped in at startup without touching `OrderBook` or `apply`.
+The sink trait remains the seam for local debug/observability; the replicated event log is the
+durable feed. An MQ bridge or sidecar consumes `/events` without touching `OrderBook` or `apply`.
 
-This satisfies R1–R10 with no new consensus machinery, no change to the Raft log entry format, and no
-new failure domain. The cost is a bounded amount of extra state per snapshot and one new read
-endpoint.
+This satisfies R1–R10 with no new consensus machinery and no new failure domain. The Raft log entry
+format gains the optional `client_order_id`; the cost is a bounded amount of extra state per snapshot
+and two read endpoints (`/events`, `/events/status`).
 
 ---
 
 ## 10. Open questions
 
-1. **Retention default** — 262k events is a guess; measure postcard size and pick a memory budget.
+1. **Retention default** — 262k events is now the `--max-events` default; measure the real postcard
+   footprint on the target deployment and tune it.
 2. **Scope of v1 events** — answered for now: `Rested`, `Fill`, `Cancelled`, `Triggered`, `Expired`,
    `Rejected` and `Amended` are all emitted. Revisit if clearing only wants fills and the extra
    volume matters.
@@ -539,5 +539,5 @@ endpoint.
 5. **Cancel identity** — `cancel()` currently keys on `(price, sequence)`, which clearing has from
    the events, but humans think in `order id`; consider an order-id index as a follow-up.
 6. **Multi-instrument** — global `event_id` vs per-instrument; revisit when a second book exists.
-7. **Snapshot migration** — reject v1 or write a `V1 | V2` decoder? Decide before the first
-   deployment that has data worth keeping.
+7. **Snapshot migration** — v4 rejects older snapshots. Add a versioned decoder only if a
+   deployment has data worth carrying across a future format change.
