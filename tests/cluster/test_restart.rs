@@ -271,3 +271,116 @@ fn restart_recovers_from_snapshot() {
         node.shutdown().await.unwrap();
     });
 }
+
+/// Directory size, used to prove a test actually produced a large log or snapshot.
+fn directory_size(dir: &std::path::Path) -> u64 {
+    std::fs::read_dir(dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.metadata().map(|meta| meta.len()).unwrap_or(0))
+        .sum()
+}
+
+/// A large WAL with no snapshot: restart must replay every committed entry.
+#[test]
+fn restart_recovers_large_log() {
+    C::run(async {
+        let addr = "127.0.0.1:21203";
+        let temp = TempDir::new("large-log");
+        let storage = StorageConfig::new(temp.0.clone()).with_instance_prefix("large-log");
+
+        // High enough that this test never snapshots; recovery is pure WAL replay.
+        let config = test_config(SnapshotPolicy::LogsSinceLast(1_000_000));
+        let node = start(addr, &storage, config.clone()).await.unwrap();
+        let client = make_client(addr);
+        client.init().await.unwrap().unwrap();
+        wait_for_leader(&client).await.unwrap();
+
+        place_resting_orders(&client, 2_000).await.unwrap();
+        assert_order_state(&client, 2_000, "2000").await.unwrap();
+
+        let log_size = directory_size(&storage.log_dir(1));
+        assert!(
+            log_size > 100_000,
+            "expected a large WAL, got {log_size} bytes"
+        );
+        assert!(
+            !storage.snapshot_dir(1).join("current.snap").exists(),
+            "large-log test must exercise replay, not snapshot boot"
+        );
+
+        node.shutdown().await.unwrap();
+
+        let node = start(addr, &storage, config).await.unwrap();
+        let client = make_client(addr);
+        wait_for_leader(&client).await.unwrap();
+        assert_order_state(&client, 2_000, "2000").await.unwrap();
+
+        // The recovered node remains writable.
+        client
+            .write(&MatchEngineRequest::place(Order::new(
+                OrderSide::Buy,
+                1.0,
+                1.0,
+                0,
+            )))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_order_state(&client, 2_001, "2001").await.unwrap();
+
+        node.shutdown().await.unwrap();
+    });
+}
+
+/// A large snapshot: restart must boot from the snapshot file, not the purged log.
+#[test]
+fn restart_recovers_large_snapshot() {
+    C::run(async {
+        let addr = "127.0.0.1:21204";
+        let temp = TempDir::new("large-snapshot");
+        let storage = StorageConfig::new(temp.0.clone()).with_instance_prefix("large-snapshot");
+
+        let config = test_config(SnapshotPolicy::LogsSinceLast(100));
+        let node = start(addr, &storage, config.clone()).await.unwrap();
+        let client = make_client(addr);
+        client.init().await.unwrap().unwrap();
+        wait_for_leader(&client).await.unwrap();
+
+        place_resting_orders(&client, 2_000).await.unwrap();
+        assert_order_state(&client, 2_000, "2000").await.unwrap();
+
+        // Wait until a large snapshot exists and its log is purged.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let metrics = client.metrics().await.unwrap();
+            let snapshot = metrics.snapshot.map(|log_id| log_id.index);
+            let purged = metrics.purged.map(|log_id| log_id.index);
+            if let (Some(snapshot), Some(purged)) = (snapshot, purged)
+                && purged >= snapshot
+            {
+                break;
+            }
+            if Instant::now() > deadline {
+                panic!("snapshot/purge did not happen: snapshot={snapshot:?}, purged={purged:?}");
+            }
+            C::sleep(Duration::from_millis(100)).await;
+        }
+
+        let snapshot_file = storage.snapshot_dir(1).join("current.snap");
+        let snapshot_size = std::fs::metadata(&snapshot_file).unwrap().len();
+        assert!(
+            snapshot_size > 128 * 1024,
+            "expected a multi-chunk-sized snapshot, got {snapshot_size} bytes"
+        );
+
+        node.shutdown().await.unwrap();
+
+        let node = start(addr, &storage, config).await.unwrap();
+        let client = make_client(addr);
+        wait_for_leader(&client).await.unwrap();
+        assert_order_state(&client, 2_000, "2000").await.unwrap();
+
+        node.shutdown().await.unwrap();
+    });
+}

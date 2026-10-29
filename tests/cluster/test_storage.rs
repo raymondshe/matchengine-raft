@@ -351,6 +351,48 @@ fn purge_deletes_covered_segments_and_persists_the_marker() {
     });
 }
 
+/// Reopening a WAL with many segments must replay every record, not just the
+/// active segment. The tiny segment size forces rotation without writing 64 MiB.
+#[test]
+fn reopen_replays_large_multi_segment_log() {
+    let dir = TempDir::new("large-wal");
+    const ENTRIES: u64 = 20_000;
+    const BATCH: u64 = 500;
+
+    block_on(async {
+        let store = Store::open_with_segment_size(dir.path(), 4_096).unwrap();
+        let mut next = 0u64;
+        while next < ENTRIES {
+            let end = (next + BATCH).min(ENTRIES);
+            append(&store, (next..end).map(blank).collect()).await;
+            next = end;
+        }
+
+        assert!(
+            wal_files(dir.path()).len() > 10,
+            "expected many rotated segments, got {}",
+            wal_files(dir.path()).len()
+        );
+        assert_eq!(
+            (0..ENTRIES).collect::<Vec<_>>(),
+            indexes(&read(&store, 0..ENTRIES).await)
+        );
+    });
+
+    block_on(async {
+        let store = Store::open(dir.path()).unwrap();
+        assert_eq!(
+            (0..ENTRIES).collect::<Vec<_>>(),
+            indexes(&read(&store, 0..ENTRIES).await)
+        );
+
+        // The reopened WAL is still appendable.
+        append(&store, vec![blank(ENTRIES)]).await;
+        let tail = read(&store, ENTRIES - 2..ENTRIES + 1).await;
+        assert_eq!(vec![ENTRIES - 2, ENTRIES - 1, ENTRIES], indexes(&tail));
+    });
+}
+
 #[test]
 fn vote_and_committed_survive_reopen() {
     let dir = TempDir::new("hard-state");

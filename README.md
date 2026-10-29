@@ -316,7 +316,8 @@ tests/
     ├── test_match_results.rs # Match events in the JSONL file sink
     ├── test_market_data.rs    # Market-data feed: snapshot, trades, BBO, depth, bars
     ├── test_events.rs         # Event log: write events, cursor, retention, dedupe
-    └── test_membership.rs     # Leader failover + learner catch-up from a live log
+    ├── test_membership.rs     # Leader failover + learner catch-up from a live log
+    └── test_late_join.rs      # Stale node rejoins and catches up from live members
 ```
 
 ## Storage Implementation
@@ -685,18 +686,19 @@ placeholder). `sequence` is still required by the deserializer.
 |---|---|
 | `tests/cluster/test_cluster.rs` | 3-node cluster: init, learner, membership, write/read, linearizable read, leader forwarding, membership shrink; runs over gRPC by default and HTTP with `MATCHENGINE_TEST_TRANSPORT=http` |
 | `tests/cluster/test_snapshot.rs` | Snapshot creation, log purge, and a learner installing the purged state over the gRPC snapshot stream |
-| `tests/cluster/test_storage.rs` | WAL framing, torn-tail truncation, segment rotation, truncate/purge across segments, vote/committed persistence, snapshot build/install/reopen, corrupt-file rejection |
-| `tests/cluster/test_restart.rs` | Full node restart recovering the order book and sequence via WAL replay, and via snapshot + tail |
+| `tests/cluster/test_storage.rs` | WAL framing, torn-tail truncation, segment rotation, a 20k-record multi-segment reopen, truncate/purge across segments, vote/committed persistence, snapshot build/install/reopen, corrupt-file rejection |
+| `tests/cluster/test_restart.rs` | Full node restart recovering the order book and sequence via WAL replay and via snapshot + tail; also 2k-order large-log replay and a >128 KiB snapshot boot |
 | `tests/cluster/test_match_results.rs` | A node started with `--match-event-log` records rest/fill/cancel events in log order while the `/write` response stays unchanged; a second node checks stop triggers, GTD expiry and the new `/read` keys |
 | `tests/cluster/test_market_data.rs` | A node started with `--market-data-log` publishes a reset snapshot, one trade message per taker, BBO, post-entry depth totals and a closed OHLC bar; the assertions check `market_seq` anchors and `/read marketdata_status` counters |
 | `tests/cluster/test_events.rs` | `/write` returns events, `/events` pages by cursor, `client_order_id` retries do not duplicate an order, and `--max-events` eviction is visible in `/events/status` |
 | `tests/cluster/test_membership.rs` | Kill the elected leader: a surviving voter takes over with the committed book and accepts new writes. A learner added after the writes catches up through normal log replication, is promoted, and writes through its own node |
+| `tests/cluster/test_late_join.rs` | A node with a stale snapshot/WAL is removed, misses 40 writes while the leader snapshots and purges, then rejoins as a learner and catches up from the live cluster |
 
 Every integration test uses a unique temporary data directory. The cluster test uses fixed ports
-`21001-21003` (gRPC `22001-22003`), the snapshot test `21101-21102`, the restart test `21201-21202`
-the match-result tests `21301`/`21302`, the market-data test `21303`, the event-log test
-`21304`, the failover test `21401-21403` and the learner catch-up test `21501-21502`; stop leftover
-processes
+`21001-21003` (gRPC `22001-22003`), the snapshot test `21101-21102`, the restart tests
+`21201-21204`, the match-result tests `21301`/`21302`, the market-data test `21303`, the event-log test
+`21304`, the failover test `21401-21403`, the learner catch-up test `21501-21502` and the late-join
+test `21601-21603`; stop leftover processes
 (`pkill -f matchengine-raft`) before rerunning.
 
 ## Performance and Current Limits

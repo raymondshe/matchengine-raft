@@ -57,12 +57,14 @@ The dead sled file `src/store/store.rs` was deleted.
 Unit tests cover the order book, the Raft-address derivation and the snapshot file format.
 Integration coverage is `tests/cluster/test_cluster.rs` (3 nodes, both transports),
 `tests/cluster/test_snapshot.rs` (snapshot build, purge, learner install over gRPC),
-`tests/cluster/test_storage.rs` (WAL framing, torn-tail truncation, purge/truncate across segments,
-vote/committed persistence, snapshot build/install/reopen), `tests/cluster/test_restart.rs`
-(full node restart via log replay and via snapshot), `tests/cluster/test_events.rs`
+`tests/cluster/test_storage.rs` (WAL framing, torn-tail truncation, segment rotation, 20k-record
+multi-segment reopen, purge/truncate across segments, vote/committed persistence, snapshot
+build/install/reopen), `tests/cluster/test_restart.rs` (full node restart via log replay and via
+snapshot, plus 2k-order large-log replay and >128 KiB snapshot boot), `tests/cluster/test_events.rs`
 (`/write` events, `/events` cursor, retention, submission dedupe), and
 `tests/cluster/test_membership.rs` (leader failover preserves the committed book and accepts writes;
-a new learner catches up from a live leader through log replication).
+a new learner catches up from a live leader through log replication), and
+`tests/cluster/test_late_join.rs` (a stale snapshot/WAL is superseded after a late rejoin).
 
 - [x] Order-book unit tests cover partial fills, maker identity, priority, IOC/FOK, icebergs, stops, expiry, amend rules and depth views.
 - [ ] Add negative API tests for unknown `/read` keys and malformed `Place` payloads (follower forwarding is covered).
