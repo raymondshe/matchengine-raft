@@ -59,15 +59,15 @@ sleep 1
 
 echo "Start 3 uninitialized matchengine-raft servers..."
 
-nohup ./target/debug/matchengine-raft  --id 1 --http-addr 127.0.0.1:21001 > n1.log &
+nohup ./target/debug/matchengine-raft  --id 1 --http-addr 127.0.0.1:21001 > n1.log 2>&1 &
 sleep 1
 echo "Server 1 started"
 
-nohup ./target/debug/matchengine-raft  --id 2 --http-addr 127.0.0.1:21002 > n2.log &
+nohup ./target/debug/matchengine-raft  --id 2 --http-addr 127.0.0.1:21002 > n2.log 2>&1 &
 sleep 1
 echo "Server 2 started"
 
-nohup ./target/debug/matchengine-raft  --id 3 --http-addr 127.0.0.1:21003 > n3.log &
+nohup ./target/debug/matchengine-raft  --id 3 --http-addr 127.0.0.1:21003 > n3.log 2>&1 &
 sleep 1
 echo "Server 3 started"
 sleep 1

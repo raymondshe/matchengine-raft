@@ -315,7 +315,8 @@ tests/
     ├── test_restart.rs      # Restart recovery: log replay and snapshot
     ├── test_match_results.rs # Match events in the JSONL file sink
     ├── test_market_data.rs    # Market-data feed: snapshot, trades, BBO, depth, bars
-    └── test_events.rs         # Event log: write events, cursor, retention, dedupe
+    ├── test_events.rs         # Event log: write events, cursor, retention, dedupe
+    └── test_membership.rs     # Leader failover + learner catch-up from a live log
 ```
 
 ## Storage Implementation
@@ -689,11 +690,13 @@ placeholder). `sequence` is still required by the deserializer.
 | `tests/cluster/test_match_results.rs` | A node started with `--match-event-log` records rest/fill/cancel events in log order while the `/write` response stays unchanged; a second node checks stop triggers, GTD expiry and the new `/read` keys |
 | `tests/cluster/test_market_data.rs` | A node started with `--market-data-log` publishes a reset snapshot, one trade message per taker, BBO, post-entry depth totals and a closed OHLC bar; the assertions check `market_seq` anchors and `/read marketdata_status` counters |
 | `tests/cluster/test_events.rs` | `/write` returns events, `/events` pages by cursor, `client_order_id` retries do not duplicate an order, and `--max-events` eviction is visible in `/events/status` |
+| `tests/cluster/test_membership.rs` | Kill the elected leader: a surviving voter takes over with the committed book and accepts new writes. A learner added after the writes catches up through normal log replication, is promoted, and writes through its own node |
 
 Every integration test uses a unique temporary data directory. The cluster test uses fixed ports
 `21001-21003` (gRPC `22001-22003`), the snapshot test `21101-21102`, the restart test `21201-21202`
-the match-result tests `21301`/`21302`, the market-data test `21303` and the event-log test
-`21304`; stop leftover processes
+the match-result tests `21301`/`21302`, the market-data test `21303`, the event-log test
+`21304`, the failover test `21401-21403` and the learner catch-up test `21501-21502`; stop leftover
+processes
 (`pkill -f matchengine-raft`) before rerunning.
 
 ## Performance and Current Limits

@@ -59,8 +59,10 @@ Integration coverage is `tests/cluster/test_cluster.rs` (3 nodes, both transport
 `tests/cluster/test_snapshot.rs` (snapshot build, purge, learner install over gRPC),
 `tests/cluster/test_storage.rs` (WAL framing, torn-tail truncation, purge/truncate across segments,
 vote/committed persistence, snapshot build/install/reopen), `tests/cluster/test_restart.rs`
-(full node restart via log replay and via snapshot), and `tests/cluster/test_events.rs`
-(`/write` events, `/events` cursor, retention, submission dedupe).
+(full node restart via log replay and via snapshot), `tests/cluster/test_events.rs`
+(`/write` events, `/events` cursor, retention, submission dedupe), and
+`tests/cluster/test_membership.rs` (leader failover preserves the committed book and accepts writes;
+a new learner catches up from a live leader through log replication).
 
 - [x] Order-book unit tests cover partial fills, maker identity, priority, IOC/FOK, icebergs, stops, expiry, amend rules and depth views.
 - [ ] Add negative API tests for unknown `/read` keys and malformed `Place` payloads (follower forwarding is covered).

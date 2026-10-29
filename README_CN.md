@@ -309,7 +309,8 @@ tests/
     ├── test_restart.rs      # 重启恢复：日志重放与快照
     ├── test_match_results.rs # 撮合事件写入 JSONL 文件 sink
     ├── test_market_data.rs    # 行情 feed：快照、成交、BBO、深度、K 线
-    └── test_events.rs         # 事件日志：写响应、游标、保留、幂等
+    ├── test_events.rs         # 事件日志：写响应、游标、保留、幂等
+    └── test_membership.rs     # 领导者故障切换 + 学习者从活动日志追赶
 ```
 
 ## 存储实现
@@ -650,10 +651,12 @@ pub struct MatchEngineResponse {
 | `tests/cluster/test_match_results.rs` | 以 `--match-event-log` 启动的节点按日志顺序记录 rest/fill/cancel 事件，同时 `/write` 响应保持不变；第二个节点验证止损触发、GTD 过期和新增的 `/read` 键 |
 | `tests/cluster/test_market_data.rs` | 以 `--market-data-log` 启动的节点发布重置快照、每个 taker 一条成交消息、BBO、批后深度总量和一根已收盘 K 线；断言同时检查 `market_seq` 锚点与 `/read marketdata_status` 计数器 |
 | `tests/cluster/test_events.rs` | `/write` 返回事件、`/events` 游标分页、`client_order_id` 重试不重复下单、`--max-events` 淘汰与 `/events/status` 计数 |
+| `tests/cluster/test_membership.rs` | 杀掉当前领导者：存活的投票节点接管已提交订单簿并接受新写入；写入后加入的学习者通过普通日志复制追赶、晋升成员并从自己的节点写入 |
 
 所有集成测试都使用唯一的临时数据目录。集群测试固定使用端口 `21001-21003`（gRPC
 `22001-22003`），快照测试使用 `21101-21102`，重启测试使用 `21201-21202`，撮合结果测试使用
-`21301`/`21302`、行情数据测试 `21303`、事件日志测试 `21304`；重跑前请先停止残留进程
+`21301`/`21302`、行情数据测试 `21303`、事件日志测试 `21304`、故障切换测试
+`21401-21403`、学习者追赶测试 `21501-21502`；重跑前请先停止残留进程
 （`pkill -f matchengine-raft`）。
 
 ## 性能与当前限制

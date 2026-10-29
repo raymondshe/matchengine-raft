@@ -101,7 +101,7 @@ kill_node() {
 }
 
 start_node() {
-    nohup ./target/debug/matchengine-raft  --id $1 --http-addr 127.0.0.1:2100$1 > n$1.log &
+    nohup ./target/debug/matchengine-raft  --id $1 --http-addr 127.0.0.1:2100$1 > n$1.log 2>&1 &
 }
 
 change_membership () {
