@@ -2,6 +2,9 @@
 
 set -o errexit
 
+# Always run from the repository root.
+cd "$(dirname "$0")/.."
+
 kill() {
     if [ "$(uname)" = "Darwin" ]; then
         SERVICE='matchengine-raft'

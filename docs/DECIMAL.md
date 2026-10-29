@@ -1,12 +1,10 @@
 # Decimal and fixed-point options for price and volume
 
-Status: **core implemented; remaining boundary migration.** `Order` now stores `price`, `volume`,
-`stop_price`, `display_volume` and `hidden_volume` as 18-scale `Fixed` integers, with per-symbol
-`SymbolConfig` for accepted decimals. Match events, market data and the wire format still convert
-at the `f64` boundary. The original problem remains relevant for those paths:
-binary floating point cannot represent most decimal values exactly, and equality, ordering,
-rounding and aggregation can drift between the API, the matching loop, snapshots and the wire
-format. This document compares the practical Rust options and recommends a migration path.
+Status: **implemented end-to-end.** `Order`, `OrderBook.last_trade_price`, match events,
+depth/BBO/spread, `/read`, the market-data feed, snapshot v6 and wire v3 use 18-scale `Fixed`
+integers. JSON emits decimal strings and accepts legacy numeric input. `SymbolConfig` defines
+per-symbol precision, but enforcement and multi-symbol routing are still pending. This document
+keeps the comparison and benchmarks that led to the integer representation.
 
 ## Recommendation
 
@@ -163,7 +161,7 @@ pub struct Order {
 - **Fit here:** useful implementation building blocks for a custom tick type, not a complete
   decimal API.
 
-### 8. `f64` (current)
+### 8. `f64` (former)
 
 - **Representation:** binary floating point.
 - **Properties:** fast and compact, but cannot represent `0.1` exactly, has non-associative
@@ -206,47 +204,54 @@ BTC-like 18-decimal operands (`123456.123456789012345678` and
 
 The arithmetic ranking is unchanged; the decisive BTC issue is range, not primitive cost.
 
-## Implementation status and remaining work
+## Implementation status
 
-Implemented in `src/matchengine/fixed.rs` and `Order`:
+Implemented in `src/matchengine/fixed.rs`, `Order` and the state machine:
 
 - `price`, `volume`, `stop_price`, `display_volume` and `hidden_volume` use a common-scale
   `Fixed(i128)` with 18 fractional digits.
+- `OrderBook.last_trade_price` is `Option<Fixed>`, so stops are elected by the exact print and the
+  value survives snapshots without an `f64` round trip.
+- `MatchEvent.price/volume` and `StoredMatchEvent` are `Fixed`; `/events`, `/write` events and the
+  JSONL file sink emit decimal strings.
+- `DepthLevel`, `DepthChange`, `spread`, `mid_price`, `/read` depth/BBO/spread/last-trade and the
+  market-data records are `Fixed`. The shadow book is keyed by `Fixed`, not by `f64` bits.
+- Market-data wire **v3** encodes every price and quantity as a little-endian scale-18 `i128`
+  (16 bytes); v2 frames are not silently reinterpreted.
+- Snapshot **v6** stores the last trade price and match events as fixed-point values. Older
+  snapshots are rejected with a clear error.
+- `Fixed::notional(price, quantity)` multiplies through a 256-bit intermediate and truncates toward
+  zero at 18 places. `Fixed * Fixed` uses the same checked path; the matching loop itself does not
+  multiply price by quantity.
+- JSON emits decimal strings for all `Fixed` values, so 18-digit values round-trip exactly. Legacy
+  numeric JSON payloads are still accepted on input.
 - `Order.symbol_id` identifies the instrument; `SymbolConfig` declares accepted price/quantity
   decimals per symbol (0..=18). Values are normalized to the common 18-digit scale, so a 2-decimal
   equity and an 18-decimal BTC market share one fast representation.
-- `Fixed` is `Copy`, allocation-free, exact in postcard/snapshots, and JSON emits decimal strings;
-  legacy numeric JSON is still accepted on input.
-- `Order`/book keys/matching comparisons and volume arithmetic use integers. Snapshot is v5;
-  `MatchResult.matches` is also `Fixed`.
 
-Still converted at the `f64` boundary:
+Remaining exactness work:
 
-- `src/match_result/mod.rs`: `MatchEvent.price/volume` are still `f64` for JSON/event compatibility.
-- `src/market_data/mod.rs` and `wire.rs`: shadow levels, BBO, trades, bars and the binary wire
-  format still use `f64`; those are the next migration (wire v3).
-- `/read` depth/BBO/spread values and market-data JSON still expose `f64`.
-- Notional multiplication needs an `i256`/`U256` intermediate; the current `Fixed * Fixed`
-  operator is not intended for price × quantity.
-- `SymbolConfig` is the validation/intake policy; multi-symbol book routing is still pending.
+- `SymbolConfig` is not yet enforced by intake or `apply`, and the engine still has one book. Until
+  per-symbol books land, reject unsupported `symbol_id` values and enforce the configured decimals;
+  persist the registry in replicated state so validation cannot diverge.
+- `to_f64` and `From<f64>` remain for legacy JSON input and test assertions. No public financial
+  output or replicated financial field passes through `f64`.
+- Notional settlement and fee rounding policies still need product decisions; the arithmetic
+  primitive is in place.
 
-Recommended remaining order:
+Recommended next steps:
 
-1. Convert `MatchEvent`, depth, BBO, trades and bars to `Fixed`; emit decimal strings in JSON and
-   fixed-point integers in wire v3.
-2. Use `i256` for notional and settlement calculations, with explicit rounding at the boundary.
-3. Wire `SymbolConfig` into every instrument's intake path and enforce its decimals instead of the
-   global 18-digit bound.
-4. Benchmark the matching loop and feed before/after; keep the "matching must not regress" gate.
-
-If the integer refactor must be staged further, use `fastnum D128` when 18-decimal BTC notional
-must be represented before the event/wire migration lands.
+1. Wire `SymbolConfig` into every instrument's intake and `apply` path and reject unsupported
+   symbols; add per-symbol books, reads and feed routing.
+2. Define the notional/settlement rounding policy and use `Fixed::notional` or `i256` directly.
+3. Benchmark the matching loop and feed before/after; keep the "matching must not regress" gate.
+4. Record the wire v3/v6 compatibility policy in the deployment notes.
 
 ## Decision summary
 
 | Requirement | Best choice |
 |---|---|
-| Maximum matching performance, exact exchange semantics | 18-scale `Fixed(i128)` (implemented in `Order`) |
+| Maximum matching performance, exact exchange semantics | 18-scale `Fixed(i128)` (implemented end-to-end) |
 | BTC 18-decimal price/quantity/notional, no allocation | `fastnum D128` |
 | Minimal change from `f64`, 28 digits, proven range | `rust_decimal` |
 | Fixed-size, 38–76 digits, no allocation | `fastnum D128/D256` |
@@ -254,6 +259,6 @@ must be represented before the event/wire migration lands.
 | IEEE 754 decimal128 contract | `decimal` (decNumber), only if required |
 | Global compile-time fixed scale | `fixed` or custom integer newtypes |
 
-The current `f64` representation should be treated as a known correctness and determinism gap, not
-a performance feature. Integer ticks are the recommended target; `rust_decimal` is the safest
-bridge if the full migration cannot land at once.
+The former `f64` representation has been removed from replicated state and public financial outputs;
+legacy numeric JSON input is still accepted for compatibility. The remaining decimal work is
+per-symbol enforcement/routing, not the representation itself.

@@ -135,7 +135,7 @@ cargo build
 查看集群运行的最简单方式是运行提供的测试脚本：
 
 ```shell
-./test-cluster.sh
+./scripts/test-cluster.sh
 ```
 
 该脚本会构建并启动一个 3 节点集群（`127.0.0.1:21001-21003`，gRPC Raft 位于
@@ -235,41 +235,39 @@ curl -X POST -H "Content-Type: application/json" \
 
 ### 使用辅助脚本
 
-项目还包含 `test.sh`，可以更方便地管理集群：
+项目还包含 `scripts/test.sh`，可以更方便地管理集群：
 
 ```shell
 # 启动节点
-./test.sh start-node 1
+./scripts/test.sh start-node 1
 
 # 初始化节点 1，并把另外两个节点添加为学习者
-./test.sh build-cluster 1
+./scripts/test.sh build-cluster 1
 
 # 将学习者提升为投票成员
-./test.sh change-membership
+./scripts/test.sh change-membership
 
 # 查看指标
-./test.sh metrics 1
+./scripts/test.sh metrics 1
 
 # 下单
-./test.sh place-order 1
+./scripts/test.sh place-order 1
 
 # 读取序列号
-./test.sh get-seq 1
+./scripts/test.sh get-seq 1
 
 # 清理（数据目录会被重命名，不会被删除）
-./test.sh clean
+./scripts/test.sh clean
 ```
 
-`test.sh` 把所有状态保存在 `RAFT_DATA_DIR`（默认 `/tmp/matchengine-raft`）下，因此
+`scripts/test.sh` 把所有状态保存在 `RAFT_DATA_DIR`（默认 `/tmp/matchengine-raft`）下，因此
 `place-order` 的结果在 `start-node`/`kill` 循环后仍然存在。
 
 ## 项目结构
 
 ```
 src/
-├── bin/
-│   ├── main.rs              # 服务器入口（参数、环境变量、存储配置）
-│   └── sled_test.rs         # 游乐场二进制（本地 sled 目录已 gitignore）
+├── main.rs                  # 服务器入口（参数、环境变量、存储配置）
 ├── client.rs                # 支持领导者转发的智能客户端
 ├── lib.rs                   # 节点组装、服务与关闭
 ├── app.rs                   # 应用状态
@@ -299,6 +297,8 @@ src/
 │   └── config.rs            # 存储布局 / 每节点目录
 proto/
 └── raft.proto               # gRPC Raft 服务定义
+examples/
+└── sled.rs                  # 游乐场示例（本地 sled 目录，不安装）
 tests/
 └── cluster/
     ├── main.rs              # 单一集成测试目标
@@ -333,7 +333,7 @@ Raft 日志追加写入 `log/NNNNNNNNNN.wal` 分段文件：
 
 ### 快照（`src/store/state_machine.rs`）
 
-状态机（订单簿 + 序列号 + 保留的撮合事件窗口 + 提交去重表）常驻内存以保证 apply 速度。快照 v5 写入 `snapshot/current.snap`，通过临时文件 → fsync → rename → 目录 fsync 原子替换；`install_snapshot` 会先校验收到的数据再替换磁盘副本，坏快照不会破坏已有的好快照。
+状态机（订单簿 + 序列号 + 保留的撮合事件窗口 + 提交去重表）常驻内存以保证 apply 速度。快照 v6 写入 `snapshot/current.snap`，通过临时文件 → fsync → rename → 目录 fsync 原子替换；`install_snapshot` 会先校验收到的数据再替换磁盘副本，坏快照不会破坏已有的好快照。
 
 快照负载是 postcard 编码的 `StateMachineData`：
 
@@ -342,7 +342,7 @@ pub struct StateMachineData {
     pub orders: Vec<Order>,
     pub sequence: u64,
     pub stops: Vec<Order>,
-    pub last_trade_price: Option<f64>,
+    pub last_trade_price: Option<Fixed>,
     pub events: Vec<StoredMatchEvent>,      // 保留的撮合事件，按 EventId 排序
     pub events_evicted: u64,
     pub submissions: Vec<SubmissionRecord>, // client_order_id 去重记录
@@ -451,7 +451,7 @@ POST /write { Place | Cancel | Amend | PurgeExpired }
 
 `Place` 支持可选的 `client_order_id`；用同一个 id 重试会返回原序列号和事件，而不会重复下单。
 事件窗口由 `--max-events`（环境变量 `MAX_EVENTS`，默认 262144）限制；提交去重表另有固定的
-262144 条上限，避免重试结果依赖节点本地参数。两者都包含在快照 v5 中。
+262144 条上限，避免重试结果依赖节点本地参数。两者都包含在快照 v6 中。
 `GET /events/status` 报告最旧/最新保留 id 和淘汰计数；消费者从 `next_after` 继续，并按 `event_id`
 去重。
 
@@ -510,7 +510,7 @@ POST /events
   或拖慢。
 
 当前 sink 是用于调试的 JSONL。同样的消息在 `src/market_data/wire.rs` 有二进制编码（64 字节头、
-版本 2、小端消息体），`MarketDataSink` 就是后续 Aeron 适配器的接入点。模式已支持多标的
+版本 3、scale-18 `i128`、小端消息体），`MarketDataSink` 就是后续 Aeron 适配器的接入点。模式已支持多标的
 （`symbol_id`，当前为 0）。可调参数：`--market-data-depth`、`--market-data-status-every`、
 `--market-data-bar-intervals-ms`、`--market-data-leader-only`。
 
@@ -621,7 +621,7 @@ pub struct MatchEngineResponse {
 - `marketdata_status` - 行情 feed 计数器与门控状态（feed 关闭时为 `{}`）
 - `orderbook_sequence` - 订单序列号计数器（兼容旧拼写 `orderbook_sequance`）
 
-价格和数量在内部使用精确的 18 位定点整数。JSON 接受十进制字符串或旧版数字；超过 15 位有效数字时请使用字符串，`/read` 会输出字符串以精确往返 18 位小数。每个标的可通过 `SymbolConfig` 配置价格/数量允许的小数位（最多 18），内部统一归一化到 18 位。
+价格和数量在内部使用精确的 18 位定点整数。JSON 接受十进制字符串或旧版数字；撮合事件、`/read` 和行情输出十进制字符串，以精确往返 18 位小数。`SymbolConfig` 定义每个标的价格/数量允许的小数位（最多 18），但校验和多标的路由仍待完成；内部统一归一化到 18 位。
 
 `/write` 接受的订单示例（注意字段名是 `sequence`）：
 
@@ -650,17 +650,18 @@ pub struct MatchEngineResponse {
 | `tests/cluster/test_cluster.rs` | 3 节点集群：初始化、学习者、成员变更、读写、线性一致性读、领导者转发、缩容；默认走 gRPC，设置 `MATCHENGINE_TEST_TRANSPORT=http` 后走 HTTP |
 | `tests/cluster/test_snapshot.rs` | 快照生成、日志 purge，以及学习者通过 gRPC 快照流安装已 purge 的状态 |
 | `tests/cluster/test_storage.rs` | WAL 帧格式、撕裂尾部截断、分段轮转、2 万条跨段日志重开、跨段 truncate/purge、vote/committed 持久化、快照构建/安装/重开、损坏文件拒绝 |
-| `tests/cluster/test_restart.rs` | 完整节点重启后通过日志重放恢复，以及通过快照 + 尾部恢复订单簿和序列号；另含 2000 单大日志重放和 >128 KiB 大快照启动 |
+| `tests/cluster/test_restart.rs` | 完整节点重启后通过日志重放恢复，以及通过快照 + 尾部恢复订单簿和序列号；另含 2000 单大日志重放和多分块（约 120 KB）快照启动 |
 | `tests/cluster/test_match_results.rs` | 以 `--match-event-log` 启动的节点按日志顺序记录 rest/fill/cancel 事件，同时 `/write` 响应保持不变；第二个节点验证止损触发、GTD 过期和新增的 `/read` 键 |
 | `tests/cluster/test_market_data.rs` | 以 `--market-data-log` 启动的节点发布重置快照、每个 taker 一条成交消息、BBO、批后深度总量和一根已收盘 K 线；断言同时检查 `market_seq` 锚点与 `/read marketdata_status` 计数器 |
 | `tests/cluster/test_events.rs` | `/write` 返回事件、`/events` 游标分页、`client_order_id` 重试不重复下单、`--max-events` 淘汰与 `/events/status` 计数 |
 | `tests/cluster/test_membership.rs` | 杀掉当前领导者：存活的投票节点接管已提交订单簿并接受新写入；写入后加入的学习者通过普通日志复制追赶、晋升成员并从自己的节点写入 |
 | `tests/cluster/test_late_join.rs` | 带过期快照/WAL 的节点被移出集群、错过 40 次写入（期间领导者生成快照并 purge），再以学习者身份重新加入并从活动集群追赶 |
+| `tests/cluster/test_exactness.rs` | 18 位小数的价格/数量经 `/write`、`/read`、`/events`、JSONL 行情、快照 v6 和重启后仍然精确，全程不经过 `f64` |
 
 所有集成测试都使用唯一的临时数据目录。集群测试固定使用端口 `21001-21003`（gRPC
 `22001-22003`），快照测试使用 `21101-21102`，重启测试使用 `21201-21204`，撮合结果测试使用
 `21301`/`21302`、行情数据测试 `21303`、事件日志测试 `21304`、故障切换测试
-`21401-21403`、学习者追赶测试 `21501-21502`、过期节点重入测试 `21601-21603`；重跑前请先停止残留进程
+`21401-21403`、学习者追赶测试 `21501-21502`、过期节点重入测试 `21601-21603`、精度往返测试 `21701`（gRPC `22701`）；重跑前请先停止残留进程
 （`pkill -f matchengine-raft`）。
 
 ## 性能与当前限制
@@ -679,7 +680,7 @@ pub struct MatchEngineResponse {
 - 没有传输基准工具，`docs/TRANSPORTS.md` 中的数字只是指导值，不是实测结果。
 - gRPC 监听器尚未配置 TLS/mTLS。
 - 快照安装仍整体缓冲在内存中。
-- `Order` 的价格/数量已使用精确的 18 位定点整数，并支持按标的小数位配置；撮合事件、行情和线格式仍在边界转换为 `f64`。剩余迁移、18 位 BTC 分析和微基准见
+- `Order` 的价格/数量、`last_trade_price`、撮合事件、深度/BBO/spread、JSONL 行情和 wire v3 均使用精确的 18 位定点整数。快照 v6 和 wire v3 是相对旧版本的破坏性变更；按标的 `SymbolConfig` 的校验与路由仍待完成。18 位 BTC 分析、微基准和迁移记录见
   [`docs/DECIMAL.md`](./docs/DECIMAL.md)。
 
 已知差距与路线图统一记录在 [`TODO.md`](./TODO.md)。

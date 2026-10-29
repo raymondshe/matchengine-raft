@@ -603,8 +603,8 @@ stops are not depth either; they appear only as `LIFECYCLE` events (`triggered`)
    task captures the
    real book only at startup, on leadership gain and (optionally) for reconciliation. The per-price
    bucket index in `TODO.md` §9 stays a matching-side optimization; the feed does not depend on it.
-6. **Prices are `f64`.** The payload encodes the bits as-is (with a documented caveat); the
-   ticks/decimals migration in `TODO.md` §9 would bump the payload version.
+6. **Prices and quantities are scale-18 integers.** Wire v3 encodes every financial value as a
+   little-endian `i128` at 18 fractional digits; no public financial output crosses `f64`.
 7. **Multi-symbol is planned.** Today the state machine owns one book, but the next step is one
    book per instrument inside the same state machine. The feed is designed for that from day one:
    every message carries `symbol_id`, and all derived state — shadow books, OHLC aggregators, depth
@@ -682,11 +682,11 @@ handles off the Raft runtime (§3.2).
 
 | Stream | Product | Message size | Term length | Notes |
 |---|---|---|---|---|
-| 2001 | `TRADE` | ~53 B per fill | 2 MiB | one message per taker, all fills (uncapped; size the Aeron payload limit) |
-| 2002 | `BBO` | ~48 B | 1 MiB | one per book-changing entry |
+| 2001 | `TRADE` | ~69 B per fill | 2 MiB | one message per taker, all fills (uncapped; size the Aeron payload limit) |
+| 2002 | `BBO` | ~115 B | 1 MiB | one per book-changing entry |
 | 2003 | `DEPTH_SNAPSHOT` | ≤ ~1 KiB @ N=20 | 4 MiB | takeover/startup reset + resync |
-| 2004 | `DEPTH_DELTA` | ≤ ~512 B typical | 4 MiB | one message per entry with touched levels |
-| 2005 | `LIFECYCLE` | ~48 B | 2 MiB | may be private (see §21) |
+| 2004 | `DEPTH_DELTA` | ~37 B per touched level | 4 MiB | one message per entry with touched levels |
+| 2005 | `LIFECYCLE` | ~71 B | 2 MiB | may be private (see §21) |
 | 2006 | `STATUS` | ~64 B | 256 KiB | deterministic cadence, gap flags |
 | 2007 | `BAR` | ~120 B | 1 MiB | OHLCV, one message per interval/window emitted |
 | 2010 | snapshot request (subscriber → engine) | ~24 B | 256 KiB | phase 3, optional |
@@ -723,7 +723,7 @@ Common header (64 bytes, little-endian) then the body:
 | Offset | Size | Field |
 |---|---|---|
 | 0 | 4 | magic `AMKT` |
-| 4 | 1 | `version` = 2 |
+| 4 | 1 | `version` = 3 |
 | 5 | 1 | `msg_type` (1 trade, 2 bbo, 3 depth snapshot, 4 depth delta, 5 lifecycle, 6 status, 7 gap, 8 bar) |
 | 6 | 2 | `flags` (bit0 snapshot, bit1 reset, bit2 gap, bit3 end-of-batch, bit4 reserved, bit5 partial bar, bit6 bar close) |
 | 8 | 8 | `market_seq` — replicated order/mutation sequence (§16.1) |
@@ -756,14 +756,14 @@ Bodies:
 
 | Type | Fields |
 |---|---|
-| `TRADE` | `count u32`, then per fill: `log_index u64`, `ordinal u32`, `ts_ms u64`, `price f64`, `volume f64`, `taker_side u8` (0 = buy aggressor, 1 = sell), `taker_seq u64`, `maker_seq u64` |
-| `BBO` | `last_trade f64`, `bid f64`, `bid_volume f64`, `ask f64`, `ask_volume f64`, `mid f64`, `spread f64` |
-| `DEPTH_DELTA` | `count u32`, then `[side u8, price f64, total_visible f64, orders u32]` per touched level |
+| `TRADE` | `count u32`, then per fill: `log_index u64`, `ordinal u32`, `ts_ms u64`, `price i128`, `volume i128`, `taker_side u8` (0 = buy aggressor, 1 = sell), `taker_seq u64`, `maker_seq u64` |
+| `BBO` | `present u8` + `last_trade i128`, `bid i128`, `bid_volume i128`, `ask i128`, `ask_volume i128`, `present u8` + `mid i128`, `present u8` + `spread i128` |
+| `DEPTH_DELTA` | `count u32`, then `[side u8, price i128, total_visible i128, orders u32]` per touched level |
 | `DEPTH_SNAPSHOT` | `bid_levels u32`, `ask_levels u32`, then level records, best first |
-| `LIFECYCLE` | `count u32`, then per event: `log_index u64`, `ordinal u32`, `ts_ms u64`, `kind u8`, `order_sequence u64`, `counterparty u64` (0 = none), `price f64`, `volume f64`, `reason u8` |
+| `LIFECYCLE` | `count u32`, then per event: `log_index u64`, `ordinal u32`, `ts_ms u64`, `kind u8`, `order_sequence u64`, `counterparty u64` (0 = none), `price i128`, `volume i128`, `reason u8` |
 | `STATUS` | `last_market_seq u64`, `last_sub_seq u16`, `last_log_index u64`, `last_ordinal u32`, `applied_index u64`, `book_sequence u64`, `pending_stops u32` |
 | `GAP` | `last_good_log_index u64`, `last_good_ordinal u32`, `dropped u32`, `product u8` |
-| `BAR` | `interval_ms u32`, `window_start_ms u64`, `last_ts_ms u64`, `open f64`, `high f64`, `low f64`, `close f64`, `volume f64`, `trade_count u32`, `bar_seq u64` |
+| `BAR` | `interval_ms u32`, `window_start_ms u64`, `last_ts_ms u64`, `open i128`, `high i128`, `low i128`, `close i128`, `volume i128`, `trade_count u32`, `bar_seq u64` |
 
 **Why post-batch totals instead of increments:** a duplicated delta is harmless, a delta applied on
 top of a dropped predecessor is not. Totals plus per-stream ordering make the feed idempotent and
@@ -818,8 +818,9 @@ monotonically; `sub_seq` is per frame and needs no state.
 **Responses.** `/write` returns the assigned `market_seq` for `Place`, `Cancel`, `Amend` and
 `PurgeExpired` (previously `Cancel` returned null and `PurgeExpired` a count).
 
-**Wire version 2.** `market_seq` occupies the former `stream_seq` slot; `sub_seq` uses two of the
-reserved header bytes at offset 60. The encoder and its golden tests cover the layout.
+**Wire version 3.** `market_seq` occupies the former `stream_seq` slot; `sub_seq` uses two of the
+reserved header bytes at offset 60. Version 3 encodes all prices/quantities as scale-18 `i128`
+(16 bytes each) instead of `f64`; the encoder and its golden tests cover the layout.
 
 ## 17. Publishing rules
 
@@ -864,9 +865,9 @@ independent of the feed.
   those are committed, so they are not wrong — consumers dedupe on
   `(symbol_id, stream_id, market_seq, sub_seq)` (§16.1) and honour the `RESET`/snapshot ordering
   rule. The keys are replicated-state derived, so the handover does not reset the sequence space.
-- **Leader restart.** State is restored from the v5 snapshot plus log replay (v5 stores fixed-point
-  prices/quantities; v4 carries the match-event window and submission dedupe map; v3 added stops
-  and `last_trade_price`); the seeder
+- **Leader restart.** State is restored from the v6 snapshot plus log replay (v6 stores the last
+  trade and match events as fixed-point; v5 stored order prices/quantities; v4 carries the
+  match-event window and submission dedupe map; v3 added stops and `last_trade_price`); the seeder
   captures the restored book and the snapshot-then-deltas rule applies. Replayed entries are below
   the reset boundary (the next `market_seq`) and are therefore suppressed.
 - **Follower installs a snapshot.** It is not publishing, but its shadow book is now stale (an
@@ -913,7 +914,7 @@ multicast is unavailable.
 | `src/store/state_machine.rs` | after the event batch, hand events plus the drained journal to the tap (`try_push`); `capture_levels()` helper for the seeder; everything is a no-op when no tap is configured |
 | `src/lib.rs` | wire the tap, market-data thread, leader watch and seeder in `build_match_engine_node`; join them in `MatchEngineNode::shutdown` |
 | `src/store/config.rs` | `MarketDataConfig { log_path, depth_levels, status_every, lifecycle_batch_max, bar_intervals_ms, queue_capacity, leader_only }` |
-| `src/bin/main.rs` | `--market-data-*` flags and env equivalents, following `--match-event-log` (§20 config block) |
+| `src/main.rs` | `--market-data-*` flags and env equivalents, following `--match-event-log` (§20 config block) |
 | `src/network/api.rs` | `marketdata_status` read key (gate state, last published position, queue depth, shadow divergence counter) |
 | `tests/cluster/test_market_data.rs` | **new**: embedded driver, subscriber, failover, resync and shadow-book equivalence tests |
 | `benches/market_data.rs` | **new**: tap cost with the feed on/off, shadow-book update cost, end-to-end latency |
@@ -922,7 +923,7 @@ The hot path records only what the operation already knows:
 
 ```rust
 // src/matchengine/mod.rs (sketch, not compilable)
-fn rest(&mut self, order: &Order, total: f64) -> f64 {
+fn rest(&mut self, order: &Order, total: Fixed) -> Fixed {
     ...
     self.journal.push(order.side, order.price, +visible); // one append, no lookup
     ...
@@ -1109,8 +1110,8 @@ book.
   but survive duplication and simplify recovery.
 - Archive deployment: every node, or only the current leader? Retention and disk budget?
 - Are lifecycle events and order sequences public? If not, split streams and networks.
-- Price encoding: keep `f64` bits until the ticks/decimals migration lands, or make the payload
-  decimal from day one and carry both?
+- ~~Price encoding~~ Resolved: wire v3 carries scale-18 `i128` values; old v2 frames are not
+  silently reinterpreted.
 - Journal vs event-only reconstruction: the journal is exact (iceberg refills, hidden volume) but
   touches the book module; events alone would leave the tap fully outside `matchengine/` but need
   extra fields (`side`, maker remaining, refill) to reconstruct depth. Which boundary do we prefer?

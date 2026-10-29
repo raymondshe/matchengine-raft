@@ -447,7 +447,7 @@ async fn fill_sm(sm: &Sm) {
         .place_order(&mut Order::new(OrderSide::Sell, 20.0, 4.0, 0));
 
     // A parked stop and a last trade price: both travel in snapshots too.
-    inner.orderbook.last_trade_price = Some(10.0);
+    inner.orderbook.last_trade_price = Some(10.0.into());
     let mut stop = Order::new(OrderSide::Sell, 0.0, 4.0, 0);
     stop.live = OrderType::Market;
     stop.stop_price = 5.0.into();
@@ -474,7 +474,7 @@ fn snapshot_survives_reopen() {
         assert_eq!(104, content.sequence);
         assert_eq!(1, content.stops.len(), "the parked stop must survive");
         assert_eq!(
-            Some(10.0),
+            Some(10.0.into()),
             content.last_trade_price,
             "and so must the last trade"
         );
@@ -532,7 +532,7 @@ fn install_snapshot_replaces_state_and_is_durable() {
         let content = target.to_content().await;
         assert_eq!(3, content.orders.len());
         assert_eq!(1, content.stops.len(), "the parked stop is installed too");
-        assert_eq!(Some(10.0), content.last_trade_price);
+        assert_eq!(Some(10.0.into()), content.last_trade_price);
     });
 
     // A restarted node must boot from the installed snapshot even without any log replay.

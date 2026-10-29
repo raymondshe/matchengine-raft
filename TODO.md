@@ -1,214 +1,315 @@
 # TODO
 
-Current snapshot of known gaps. Priorities assume the goal is to finish the openraft 0.10 port and restore the features the README advertises. This file is the working TODO list and roadmap: the `Future Work` lists that used to live in `README.md` / `README_CN.md` were folded into the sections below. See `AGENTS.md` for day-to-day commands and branch state.
+Last reviewed: 2026-10-29. This is the working roadmap; see `AGENTS.md` for commands and the
+current branch state.
 
-## 1. openraft 0.10 migration — done in code, two loose ends
+**Current baseline:** the OpenRaft 0.10 port, durable WAL/snapshot storage and exact scale-18
+`Fixed` migration are done. Order prices/quantities, last trade, match events, depth/BBO, `/read`,
+the market-data feed and wire v3 are exact; snapshot v6 stores the fixed-point state. The remaining
+work is per-symbol enforcement/routing, public-API hardening, stronger correctness evidence and
+measured performance.
 
-Done: dependency moved to `openraft` 0.10.0-alpha.37 from crates.io, `openraft-legacy` removed, `src/network/raft_network_impl.rs` implements `RaftNetworkV2` natively, `POST /snapshot` uses `Raft::install_full_snapshot` with the v2 `FullSnapshotRequest`, and `SnapshotData` moved from `RaftTypeConfig` to `RaftStateMachine`/`NetSnapshot`.
+Priority key: **P0** = correctness/security, do next; **P1** = production readiness; **P2** =
+important but not blocking; **P3** = later/optional.
 
-- [ ] Move off the alpha once openraft 0.10 ships a stable release (also drop any remaining `0.10.0-alpha` churn in `Cargo.lock`).
-- [ ] `RaftNetworkV2::pre_vote` is left at its default (unconditional grant), so openraft's Pre-Vote is a no-op here. Implement it over a gRPC `PreVote` call + `Raft::pre_vote()` if Pre-Vote is ever enabled.
-- [ ] `transfer_leader` uses the default. `stream_append` is now a bidirectional gRPC stream on the gRPC transport; the HTTP transport still falls back to sequential unary calls.
+## Top priorities
 
-## 2. Persistence — done
+1. **P0 — Make per-symbol configuration real.** `SymbolConfig` exists but is not used by intake
+   or `apply`, and every order still matches in one book regardless of `symbol_id`. Until
+   per-symbol books exist, reject unsupported `symbol_id` values and reject prices/quantities
+   outside the configured decimals. Put the registry in replicated state so validation cannot
+   diverge between nodes. Then route books, reads, events and the feed by symbol.
+2. **P0 — Harden the public trust boundary.** `client_order_id` is unbounded, the gRPC listener is
+   plaintext, and the snapshot receiver has no total-size cap. Bound IDs and request sizes, cap
+   or stream snapshots, and decide TLS/mTLS plus HTTP authentication before any non-loopback
+   exposure. Add hostile-input tests.
+3. **P1 — Build stronger correctness evidence.** Add randomized differential/property tests for
+   the book (volume conservation, no crossed book, price-time priority, deterministic replay).
+   The 18-digit exactness round trip across API, events, feed, wire and snapshot is now covered by
+   `tests/cluster/test_exactness.rs`; keep that guard while adding a reference model.
+4. **P1 — Make failure and observability behavior explicit.** A dead gRPC server task currently
+   leaves the HTTP API serving a node peers cannot reach; two `Logger` middleware log every
+   request twice; `test_cluster` leaks fixed ports and running nodes. Decide fail-fast versus
+   degraded mode, collapse logging, and make the test own and stop its nodes.
+5. **P1 — Measure before optimizing.** Re-run the microbenchmarks after the `Fixed` migration, add
+   submit → commit → apply → response latency and a 50k–500k fills/s feed load test. Only then
+   consider per-level buckets or a compact resting record. The numbers in `docs/TRANSPORTS.md`
+   are still guidance, not results.
 
-Storage is now durable: `src/store/log_store.rs` is a hand-written segmented write-ahead log
-(`MRFT` segments, CRC32-framed postcard records, one `write_all` + one `sync_data` per openraft
-append batch, `pread` reads), and `src/store/state_machine.rs` keeps the state machine in memory
-but writes `snapshot/current.snap` atomically (temp file → fsync → rename → dir fsync).
+## 1. Exact fixed-point end-to-end — done
 
-Layout per node is `<data_dir>/<instance_prefix>-<node_id>/{log,snapshot}`; `StorageConfig`
-(`src/store/config.rs`) selects it and the binary exposes `--data-dir` / `--instance-prefix`
-(`RAFT_DATA_DIR` / `RAFT_INSTANCE_PREFIX`). Recovery = load the latest snapshot, then let openraft
-replay the retained log tail on top. Vote and `last_purged` live in an atomically rewritten
-`log/state` file; `committed` rides on the WAL tail and is made durable by the next append.
-The dead sled file `src/store/store.rs` was deleted.
+Completed:
 
-- [x] Persistent Raft log and vote storage.
-- [x] Durable state machine snapshots with atomic replacement.
-- [x] Per-node data directories and CLI/env configuration.
-- [x] Restart recovery covered by `tests/cluster/test_restart.rs` (log replay and snapshot paths).
-- [x] Storage unit/integration tests in `tests/cluster/test_storage.rs`.
+- [x] `Order.price`, `volume`, `stop_price`, `display_volume` and `hidden_volume` are scale-18
+  `Fixed(i128)`; book keys, `MatchResult.matches`, amendment values and matching arithmetic use
+  the same representation.
+- [x] `OrderBook.last_trade_price` is `Option<Fixed>`; stop election and snapshots no longer round
+  a print through `f64`.
+- [x] `MatchEvent.price/volume` and `StoredMatchEvent` are `Fixed`; `/events`, `/write` events and
+  the file sink emit decimal strings.
+- [x] `DepthLevel`, `DepthChange`, `spread`, `mid_price`, `/read` depth/BBO/spread/last-trade and
+  the shadow book are exact. The shadow book is keyed by `Fixed`.
+- [x] Market-data `TradeRecord`, `BboRecord`, depth records, lifecycle and `BarRecord` are `Fixed`.
+  Wire **v3** encodes all prices/quantities as little-endian scale-18 `i128`.
+- [x] Snapshot **v6** stores the last trade and match events as `Fixed`; older snapshots are
+  rejected.
+- [x] `Fixed::notional` multiplies through an `i256` intermediate and truncates toward zero at 18
+  places; unit tests cover an intermediate that overflows `i128`.
+- [x] `tests/cluster/test_exactness.rs` round-trips 18 fractional digits through `/write`,
+  `/read`, `/events`, the JSONL feed, snapshot v6 and a restart.
+- [x] README/README_CN, AGENTS, DECIMAL, MATCH_RESULTS, MARKET_DATA_PLAN and AERON record wire v3,
+  snapshot v6 and the new decimal JSON output.
 
-## 3. Correctness / robustness in the request path
+Note: wire v3 and snapshot v6 are breaking changes; existing data directories must be recreated
+and v2 feed consumers must implement the scale-18 integer layout.
 
-- [x] Replace `.decompose().unwrap()` in `src/network/api.rs` and `src/network/management.rs` with real error handling. Forwarding already returned the `ForwardToLeader` body; the unwrap panicked on fatal `RaftError`s. Fatal errors now return HTTP 500 instead of killing the worker.
-- [x] `linearizer.await_ready(...).unwrap()` is gone: fatal wait errors return HTTP 500, and recoverable `LinearizableReadError`s stay in the JSON result.
-- [x] Scripts now send the correct `sequence` field.
-- [x] Fix issue #1: `place_order` no longer emits a phantom zero-quantity
-  `MatchResult` when the taker is exactly filled, and partially filled makers are
-  shrunk in place instead of rebuilt with `Order::new` (which reset `id` to 0).
-  Covered by `exact_fill_*`, `partial_fill_preserves_maker_identity` and
-  `full_sweep_leaves_book_empty_without_phantom_trades` in `src/matchengine/mod.rs`.
-- [ ] `Order::sequence` is still required by the deserializer even though `place_order()` overwrites
-  it; make it optional (`#[serde(default)]`) so clients need not send a value the engine ignores.
-- [x] Collapse the three duplicated `orderbook_sequance` compatibility arms in
-  `src/network/api.rs` into one `read_state` helper used by `/read`, `/linearizable_read` and
-  `/follower_read` (done together with removing the KV store).
-- [ ] `src/lib.rs` registers two `Logger` middlewares — every request is logged twice. Keep one.
+## 2. Per-symbol configuration and routing [P0/P1]
 
-## 4. Dependency cleanup
+Done:
 
-- [x] Unused dependencies: `uuid` and `rand` were removed earlier; `thiserror` and `async-trait` are now removed too. `walkdir` went with the deleted `src/store/store.rs`; `sled` is only used by the playground binary `src/bin/sled_test.rs`.
-- [x] Dependency versions are current (`actix-web 4.18.1`, `env_logger 0.11.11`, etc.) and `Cargo.lock` is committed.
+- [x] `Fixed` uses a common 18-digit internal scale, so symbols can configure fewer decimals
+  without a separate matching representation.
+- [x] `SymbolConfig` validates 0..=18 decimals and can parse prices/quantities at the configured
+  precision.
+- [x] `Order.symbol_id` is serialized with a default of `0` for backward compatibility.
 
-## 5. Tests
+Remaining:
 
-Unit tests cover the order book, the Raft-address derivation and the snapshot file format.
-Integration coverage is `tests/cluster/test_cluster.rs` (3 nodes, both transports),
-`tests/cluster/test_snapshot.rs` (snapshot build, purge, learner install over gRPC),
-`tests/cluster/test_storage.rs` (WAL framing, torn-tail truncation, segment rotation, 20k-record
-multi-segment reopen, purge/truncate across segments, vote/committed persistence, snapshot
-build/install/reopen), `tests/cluster/test_restart.rs` (full node restart via log replay and via
-snapshot, plus 2k-order large-log replay and >128 KiB snapshot boot), `tests/cluster/test_events.rs`
-(`/write` events, `/events` cursor, retention, submission dedupe), and
-`tests/cluster/test_membership.rs` (leader failover preserves the committed book and accepts writes;
-a new learner catches up from a live leader through log replication), and
-`tests/cluster/test_late_join.rs` (a stale snapshot/WAL is superseded after a late rejoin).
+- [ ] **P0** Wire `SymbolConfig` into `Place`/`Amend` intake and into `apply`; reject values with
+  more fractional digits than the symbol allows instead of accepting the global 18-digit bound.
+- [ ] **P0** Persist the symbol registry in replicated state/snapshots, not only in node-local
+  config, so every replica validates and replays the same thing. Define how a config change is
+  proposed and versioned.
+- [ ] **P0** Until per-symbol books land, reject any `symbol_id` other than the configured one.
+  Today a non-zero `symbol_id` is accepted and matched against symbol `0`.
+- [ ] **P1** Route `OrderBook` by `symbol_id` (per-symbol books, sequence streams and stop stores),
+  and make `/read` keys symbol-aware (or expose a single-symbol read guard).
+- [ ] **P1** Route events, match-result cursors, market-data messages and depth/BBO by symbol.
+  The feed schema already carries `symbol_id`; the matching and read paths do not.
+- [ ] **P1** Test a 2-decimal symbol and an 18-decimal symbol side by side: sub-tick rejection,
+  exact 18-digit acceptance, and no cross-symbol matching.
+- [ ] **P2** Add symbol lifecycle operations (add, update precision, disable) through Raft rather
+  than restarting a node with a different local config.
 
-- [x] Order-book unit tests cover partial fills, maker identity, priority, IOC/FOK, icebergs, stops, expiry, amend rules and depth views.
-- [ ] Add negative API tests for unknown `/read` keys and malformed `Place` payloads (follower forwarding is covered).
-- [ ] `tests/cluster/test_cluster.rs` binds fixed ports 21001-21003 and leaves 3 nodes running after the test finishes; parameterize ports and shut the nodes down.
-- [x] Test restart recovery (both log replay and snapshot boot paths).
-- [x] Test match-result processing: `apply` -> sink events (rest/fill/cancel), failing-sink
-  isolation, file-sink JSONL format, and an end-to-end `--match-event-log` node test.
+## 3. Public trust boundary and request safety [P0/P1]
 
-## 6. Docs
+- [ ] **P0** Bound `client_order_id`: define a small byte limit (for example 128 bytes), an
+  accepted character set and empty-string behavior. Today a client can grow the 262144-record
+  dedupe map with arbitrarily large keys.
+- [ ] **P0** Set explicit limits for `/write`, `/events` and `/read` payloads/cursors; reject
+  oversized or malformed input before it reaches the Raft proposal.
+- [ ] **P0** Cap the total bytes a snapshot stream may allocate, or spool chunks to a temporary
+  file. The gRPC receiver currently accepts chunks until the stream ends while extending an
+  in-memory buffer.
+- [ ] **P0** Decide and document transport security: TLS/mTLS for the gRPC listener and
+  authentication/authorization for the HTTP API, or an explicit loopback/private-network-only
+  deployment contract. Nothing is configured today.
+- [ ] **P1** Add a health/readiness endpoint that reports gRPC listener health, Raft leadership
+  and storage state.
+- [ ] **P1** Decide whether a died gRPC server task should stop the process (fail fast) or leave
+  the node in a degraded, clearly reported state. `src/lib.rs` currently only logs it.
+- [ ] **P2** Remove the duplicate `Logger` middleware in `src/lib.rs`; every request is logged
+  twice.
+- [ ] **P2** Make `Order::sequence` optional in the public deserializer (`#[serde(default)]`) so
+  clients need not send a value that `place_order()` overwrites.
+- [ ] **P2** Make `impl PartialEq for Order` include `id` (and the other identity fields); today
+  two different orders with the same sequence/price/volume compare equal.
 
-- [x] `README.md` API list corrected to the real routes: `/vote`, `/append`, `/snapshot`,
-  `/get_linearizer`, `/linearizable_read`, `/follower_read`, `/read`.
-- [x] `README.md` snapshot section now describes `default_raft_config()` and the test-only
-  `LogsSinceLast(10)` / `max_in_snapshot_log_to_keep = 0` override.
-- [x] `README.md` prerequisites updated to Rust 1.89 (edition 2024) and note that protoc is vendored.
-- [x] README now describes the segmented WAL + snapshot storage design instead of Sled.
-- [x] `README.md` / `README_CN.md` project structure, transport flags, test suite and future work
-  synced with `src/network/grpc/` and `tests/cluster/`.
-- [x] `GUIDE_cn.md` folded into `README.md` / `README_CN.md` and removed; its unique WAL, snapshot,
-  transport, event-log, performance and roadmap details now live in the READMEs.
-- [x] `docs/AERON_SOLUTION.md` and `docs/TRANSPORTS.md` updated: gRPC is adopted, storage is
-  durable, and all remaining performance numbers are labelled as guidance.
-- [x] `docs/MATCH_RESULTS.md` writes down how fills/cancels reach the order/clearing system.
-  Phases 1a–3 are implemented (write-response events, replicated event log, `/events`, dedupe);
-  phase 4 (streaming/MQ bridge) remains optional.
-- [ ] Keep `AGENTS.md` and this file in sync after code changes; both are maintained by hand.
+## 4. Persistence, Raft and transport
 
-## 7. Scripts
+Persistence is done:
 
-- [x] `open-cluster.sh` now calls `/init` and forms a cluster.
-- [x] **Fixed `/init` in every script.** `test-cluster.sh`, `open-cluster.sh` and `test.sh build-cluster`
-  send `'[]'` (a single-node init); previously `'{}'` was rejected by openraft.
-- [x] Scripts send `sequence`, not `sequance`, and `test.sh get-seq` reads `orderbook_sequence`.
-- [x] `test.sh` `build-cluster`/`metrics`/`place-order`/`get-seq` default to node 1 when no node is
-  given; `change-membership` defaults to `[1,2,3]`.
-- [x] Order loops use a POSIX arithmetic loop instead of bash-only `JSON+=` / `{1..1500}`.
-- [ ] `test.sh` and `test-match.sh` still duplicate the same order-placement loop; `test-matrics.sh`
-  is a one-call stub. Consolidate.
+- [x] Segmented WAL (`MRFT` header, CRC32-framed postcard records, one `write_all` + one
+  `sync_data` per append batch, `pread` reads, torn-tail recovery).
+- [x] Atomic snapshots (`MRFSNAP`, temp file → fsync → rename → directory fsync) with validation
+  before replacing the durable copy.
+- [x] Per-node directories from `StorageConfig`; `--data-dir` / `--instance-prefix` and env
+  equivalents.
+- [x] Restart recovery via log replay and snapshot; large-log, large-snapshot and late-join
+  coverage.
 
-## 8. Repo hygiene
+Remaining:
 
-- [x] GitHub Actions runs `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings` and `cargo test` (`.github/workflows/ci.yml`).
-- [x] `Cargo.lock` is no longer ignored and is part of this change (commit it with the source).
-- [x] The crate-level `#![allow(clippy::uninlined_format_args)]` is gone; clippy is clean with `-D warnings`.
+- [ ] **P2** Move off `openraft` 0.10.0-alpha once a stable 0.10 release exists; latest published
+  is still `0.10.0-alpha.37`.
+- [ ] **P2** Implement `RaftNetworkV2::pre_vote` over gRPC and
+  `Raft::pre_vote()`, or explicitly document that Pre-Vote is unsupported and keep it disabled.
+- [ ] **P2** Decide whether `transfer_leader` should use openraft's default or get an explicit
+  transport implementation; record the decision.
+- [ ] **P2** Consider streaming snapshot bytes into the state machine or a temp file instead of
+  buffering the whole snapshot. The current API needs a contiguous buffer, but the receiver's
+  total allocation still needs a policy (see §3).
+- [ ] **P2** Add a benchmark harness for the transport comparison: L1 RPC microbenchmark and L2
+  3-node commit latency over HTTP/JSON and gRPC. The current `docs/TRANSPORTS.md` numbers are
+  guidance only.
+- [ ] **P2** Revisit TLS and keep the gRPC listener's failure behavior aligned with the health
+  policy in §3.
+- [ ] **P3** Aeron remains gated on a measured bottleneck; no adapter is adopted.
 
-## 9. Matching engine
+## 5. Matching-engine features and correctness
 
-- [x] Route match results through a replaceable `MatchResultSink` (`MatchEvent` with
-  `(log_index, ordinal)` ids; `Noop`/`Memory`/`File` sinks; `--match-event-log` file log for
-  debugging). `apply` publishes best-effort and never lets a sink failure affect the state machine.
-- [x] Deliver fills and cancels durably to the order/clearing system: events in the `/write`
-  response (capped at 512 with `events_truncated`), a bounded replicated event log snapshotted with
-  the state (v5), `POST /events` cursor reads, `GET /events/status`, and `client_order_id` submission
-  dedupe. Design: `docs/MATCH_RESULTS.md` (phases 1b–3).
-- [ ] Phase 4 of match-result delivery: long-poll/short-poll `/events` (`wait_ms`), gRPC
-  `StreamEvents`, and an optional MQ bridge sidecar. Also decide event time in the clearing feed
-  and per-instrument cursors once multi-symbol lands.
-- [x] Order types (semantics modelled on
-  [OrderBook-rs](https://github.com/joaquinbejar/OrderBook-rs)): GTC, IOC, FOK, GTD, Day,
-  post-only, iceberg (display tranche + hidden reserve), market, stop-market and stop-limit.
-  Expiry is deterministic via `PurgeExpired { now_ms, day_close_ms }`; stops park off the book and
-  are elected by the replicated last trade price. Events: `triggered`, `expired`, `rejected` join
-  `fill`/`rested`/`cancelled`.
-- [x] Order amendment (`Amend`): price and/or open volume of a plain resting limit order, keyed by
-  side + current price + sequence. Same-price reductions keep time priority; price changes and size
-  increases re-insert under a new sequence. Crossing amendments are refused; icebergs, stops and
-  market orders are cancel + re-place. `spread`/`mid_price`/`depth` helpers and the
-  `orderbook_depth`/`orderbook_spread` read keys are in place.
-- [ ] Amend parked stops (change trigger price/volume) and icebergs (tranche semantics); a
-  sequence→location index would also allow cancel/amend by sequence alone, at the cost of index
-  maintenance in the sweep or tombstone compaction.
-- [ ] OrderBook-rs types not ported yet: trailing stops (watermark + trail amount, child on a new
-  print), pegged orders (reference price offsets), custom reserve replenishment, stop-protection
-  collars, market-to-limit, and self-trade prevention.
-- [x] Automatic GTD purge: every admissible `Place`/`Cancel`/`Amend` purges GTD orders due at its
-  intake timestamp before applying, using the replicated sequence/timestamp. `Day` still needs the
-  explicit `PurgeExpired { now_ms, day_close_ms }` because it requires a market close.
-- [x] `Order` price/quantity use 18-scale fixed-point integers with per-symbol `SymbolConfig`
-  (max 18 decimals). Match events, market data and the wire format still convert at the `f64`
-  boundary; migrate those next. Candidate comparison, 18-decimal BTC range analysis,
-  microbenchmarks and migration plan: [`docs/DECIMAL.md`](./docs/DECIMAL.md).
-- [ ] The book is a per-order `BTreeMap<BidKey/AskKey, Order>`; every fill descends the tree once
-  and sweeps touch one entry per order. Bucketing orders per price level
-  (`BTreeMap<price, VecDeque<Order>>` plus a sequence-keyed index so cancels stay O(log n)) would
-  make full-level sweeps O(1) per order. Measured headroom and current numbers: `cargo bench
-  --bench matchengine`. The extended `Order` (time in force, stop, iceberg fields) also grew the
-  map value from 40 to ~88 bytes, which shows up as roughly 1.5–1.7x on the copy-heavy benches; a
-  compact resting record or per-level buckets would recover it.
-- [ ] `impl PartialEq for Order` ignores `id`, so two different orders at the same price/size compare equal.
-- [ ] Bound `client_order_id` length (and decide the accepted character set) before exposing `/write`
-  to untrusted clients; today only the HTTP payload limit bounds a single key.
-- [ ] `Order::sequence` is required by the public deserializer even though `place_order()` overwrites
-  it; make it optional (serde default) so callers do not have to send a value the engine ignores.
-- [ ] Payloads on the public HTTP API are JSON; consider protobuf/Avro there too. Raft RPCs already use `postcard` over gRPC.
+Done:
 
-## 12. Market data
+- [x] Replaceable `MatchResultSink` (`MatchEvent` with `(log_index, ordinal)` ids;
+  `Noop`/`Memory`/`File` sinks; `--match-event-log` debugging sink). Sink failures never affect
+  `apply`.
+- [x] Durable event delivery: events in `/write` (capped at 512), bounded replicated event log,
+  `POST /events`, `GET /events/status`, and `client_order_id` dedupe.
+- [x] GTC, IOC, FOK, GTD, Day, post-only, iceberg, market, stop-market and stop-limit.
+- [x] Deterministic GTD purge on every admissible mutation; stops elected by replicated
+  `last_trade_price`; `triggered`, `expired` and `rejected` events.
+- [x] `Amend` for plain resting limit orders; same-price reductions keep priority, price/size
+  changes re-insert under a new sequence; crossing amendments are refused.
+- [x] `spread`, `mid_price` and `depth` views plus `orderbook_depth`/`orderbook_spread` read keys.
+
+Remaining:
+
+- [ ] **P0** Carry symbol isolation through the engine (see §2); the exactness migration is done.
+- [ ] **P1** Evaluate per-price-level buckets (`BTreeMap<price, VecDeque<Order>>` plus a
+  sequence-keyed index) after the post-`Fixed` benchmarks. The current per-order `BTreeMap`
+  descends the tree for every fill; the extended `Order` also grew the map value, which shows up
+  on copy-heavy benches.
+- [ ] **P2** Amend parked stops (trigger price/volume) and icebergs (tranche semantics); consider
+  a sequence → location index for cancel/amend by sequence alone, with index maintenance or
+  tombstones.
+- [ ] **P2** Port the missing OrderBook-rs types: trailing stops, pegged orders, custom reserve
+  replenishment, stop-protection collars, market-to-limit and self-trade prevention.
+- [ ] **P2** Phase 4 of match-result delivery: long-poll/short-poll `/events` (`wait_ms`), gRPC
+  `StreamEvents`, and an optional MQ bridge sidecar. Decide event time and per-instrument cursors
+  once multi-symbol lands.
+- [ ] **P2** Add randomized differential/property tests for the book (volume conservation, no
+  crossed book, priority, deterministic replay) and keep a small reference model in the test
+  suite.
+- [ ] **P3** Consider protobuf/Avro on the public HTTP API. Raft RPCs already use postcard over
+  gRPC.
+
+## 6. Market data
 
 Design: `docs/AERON_SOLUTION.md` Part II; implementation plan and progress:
 `docs/MARKET_DATA_PLAN.md`.
 
-- [x] Deterministic feed core: depth journal in `OrderBook`, `MatchEvent.side`, leader-stamped
-  intake timestamps, shadow book, deterministic processor (one TRADE per taker, BBO, depth
-  snapshots/deltas, lifecycle, OHLC bars, status cadence, gap), leader gating with reset
-  snapshots, JSONL sink, binary wire encoder v2 and `marketdata_status` read.
-- [ ] Aeron adapter: implement `MarketDataSink` with `rusteron-client` + an embedded driver in
-  tests, feature-gated (`market-data-aeron`); see AERON_SOLUTION §20/§23.
-- [ ] Archive recording/replay and the snapshot-request stream (2003/2010).
-- [ ] Multi-symbol engine: `symbol_id` on orders and per-symbol books; the feed schema already
-  carries the field and the shadow/bars are keyed by it.
-- [x] Deterministic market-data sequencing (`market_seq`, `sub_seq`): every mutation consumes the
-  replicated sequence, boundaries are entry-driven, one TRADE per taker (uncapped), status every
-  `status_every`, wire v2. Keys are identical across replicas, failover and restart. Design:
-  AERON §16.1; plan U8.
-- [ ] Wire `epoch` (leader generation) and `leader_id` instead of the current zeros; the header
-  fields exist and the leader watcher already knows the term.
-- [ ] Consumer SDK/reference decoder for the wire format (the encoder is covered by golden tests).
-- [ ] Load test at the 50k-500k fills/s target and record feed latency/backpressure numbers.
-
-
-## 10. Transport
-
-gRPC (`tonic`) is implemented and is the default for peer-to-peer Raft RPCs; HTTP/JSON remains
-selectable with `--transport http`. Aeron was investigated (`docs/AERON_SOLUTION.md`) and is still not
-adopted: it stays gated on a measured bottleneck that has not been demonstrated.
-
 Done:
 
-- [x] Binary payload codec (`postcard`) inside protobuf envelopes; JSON stays on the public HTTP API.
-- [x] Bidirectional `stream_append` (`AppendStream`) so replication pipelines instead of alternating send/receive.
-- [x] Snapshot transfer as 256 KiB chunks with offsets, a terminal marker and cancellation; covered by `tests/cluster/test_snapshot.rs`.
-- [x] Separate replication / heartbeat / snapshot channels per peer, so a snapshot cannot block a vote.
+- [x] Deterministic feed core: depth journal, `MatchEvent.side`, leader-stamped intake
+  timestamps, shadow book, one TRADE per taker, BBO, depth snapshots/deltas, lifecycle, OHLC bars,
+  status cadence, gap marker, leader gating with reset snapshots, JSONL sink and wire encoder v3.
+- [x] Deterministic `market_seq`/`sub_seq`: identical keys across replicas, failover and restart.
+- [x] `marketdata_status` read key.
 
 Remaining:
 
-- [ ] Build the benchmark harness described in `docs/TRANSPORTS.md` §5 (L1 RPC microbenchmark + L2 3-node commit latency) and record the HTTP/JSON vs gRPC comparison. All current numbers in `docs/TRANSPORTS.md` are guidance, not results.
-- [ ] Decide on TLS/mTLS for the gRPC listener before the order flow crosses a trust boundary; tonic supports it but nothing is configured.
-- [ ] Implement `pre_vote` and `transfer_leader` RPCs if openraft enables those paths; both currently use trait defaults.
-- [ ] Consider streaming snapshot bytes into the state machine instead of buffering the whole snapshot in memory; the current in-memory state machine requires a contiguous buffer anyway. The gRPC receiver also accepts an unbounded chunk total, so a hostile peer can force allocation up to its own message cap.
-- [ ] A gRPC server task that dies is only logged (`src/lib.rs`); the HTTP API keeps serving while peers can no longer reach this node. Decide whether that should stop the process.
+- [ ] **P1** Run a 50k–500k fills/s load test and record feed latency, queue depth and drop/GAP
+  behavior. The bounded `SyncSender` drops frames rather than blocking matching; operators need
+  to know when that happens.
+- [ ] **P1** Route the feed per symbol (see §2); the schema has `symbol_id`, but the engine still
+  has one book.
+- [ ] **P2** Fill `epoch` (leader generation) and `leader_id` instead of the current zeros; the
+  header fields and leader watcher already exist.
+- [ ] **P2** Add a consumer SDK/reference decoder for the wire format; the encoder has golden
+  tests, the consumer side has none.
+- [ ] **P2** Archive recording/replay and the snapshot-request stream (2003/2010).
+- [ ] **P3** Aeron adapter: `MarketDataSink` with `rusteron-client` plus an embedded driver in
+  tests, feature-gated (`market-data-aeron`); see AERON_SOLUTION §20/§23.
 
-## 11. Client library and benchmarks
+## 7. Tests and CI
 
-- [ ] Harden `src/client.rs` before it is used outside the examples: retry/backoff on transient RPC errors, configurable timeouts, and a typed error for "no known leader" instead of a bare message.
-- [x] Order-book micro-benchmarks: `cargo bench --bench matchengine` (sweep wide/deep, rest, rest
-  with the market-data journal, partial fill, IOC cancel, iceberg refill, amend, cancel; best-of-5
-  per round, no framework).
-- [ ] Add end-to-end latency benchmarks (submit → commit → apply → response) next to the transport harness in §10, so matching and replication costs can be separated.
+Current coverage:
+
+- Unit tests cover the order book, fixed-point parsing, Raft-address derivation and snapshot
+  framing.
+- `tests/cluster/test_cluster.rs`: 3 nodes, both transports, init/membership/read/write.
+- `test_snapshot.rs`: snapshot build/purge and learner install over gRPC.
+- `test_storage.rs`: WAL framing, torn-tail truncation, segment rotation, 20k-record multi-segment
+  reopen, purge/truncate, vote/committed persistence, snapshot build/install/reopen.
+- `test_restart.rs`: restart via log replay and via snapshot, 2k-order large-log replay and a
+  multi-chunk (~120 KB) snapshot boot.
+- `test_events.rs`: `/write` events, `/events` cursor, retention, submission dedupe.
+- `test_match_results.rs`: file-sink rest/fill/cancel ordering, stop trigger, GTD expiry and read
+  keys.
+- `test_market_data.rs`: feed snapshot, trades, BBO, depth and bars.
+- `test_membership.rs`: leader failover preserves the committed book and accepts writes; a learner
+  catches up from a live leader.
+- `test_late_join.rs`: a stale snapshot/WAL is superseded after a late rejoin.
+- `test_exactness.rs`: 18-fractional-digit values survive `/write`, `/read`, `/events`, the JSONL
+  feed, snapshot v6 and a restart.
+
+Remaining:
+
+- [ ] **P1** Randomized differential/property tests for matching invariants (see §5).
+- [x] Exactness across snapshot/restart/events/feed is covered by `test_exactness.rs`.
+- [ ] **P1** Per-symbol rejection tests once `SymbolConfig` is enforced (see §2).
+- [ ] **P1** Hostile-input tests for oversized `client_order_id`, oversized `/write` and `/events`
+  payloads, malformed JSON and oversized snapshots (see §3).
+- [ ] **P1** End-to-end latency benchmark: submit → commit → apply → response, separated from
+  matching and replication costs.
+- [ ] **P2** Add negative API tests for unknown `/read` keys and malformed `Place` payloads.
+  Follower forwarding is already covered.
+- [ ] **P2** Parameterize ports and shut down the nodes in `test_cluster.rs`; it currently binds
+  21001–21003 and leaves them running.
+- [ ] **P2** Run the cluster suite over the HTTP transport in CI
+  (`MATCHENGINE_TEST_TRANSPORT=http`), not just locally.
+- [ ] **P2** Add an MSRV job for Rust 1.89; CI currently uses stable only.
+- [ ] **P2** Keep `AGENTS.md` and this file in sync after code changes; both are maintained by
+  hand.
+
+## 8. Performance and capacity
+
+- [x] Order-book micro-benchmarks: `cargo bench --bench matchengine` (wide/deep sweep, rest,
+  rest with the market-data journal, partial fill, IOC cancel, iceberg refill, amend, cancel;
+  best-of-5 per round).
+- [ ] **P1** Re-baseline every benchmark after the fixed-point and last-trade changes; record the
+  before/after numbers in `docs/DECIMAL.md`.
+- [ ] **P1** Add end-to-end latency and throughput benchmarks (submit → commit → apply → response).
+- [ ] **P1** Load-test the market-data feed and record queue/drop behavior (see §6).
+- [ ] **P2** Consider per-level buckets or a compact resting record only if the post-`Fixed`
+  numbers justify the complexity.
+- [ ] **P2** Add a benchmark regression gate (threshold or recorded baseline) to CI.
+- [ ] **P2** Build the transport benchmark harness (see §4).
+
+## 9. Client library
+
+- [ ] **P2** Harden `src/client.rs` before use outside examples: retry/backoff on transient RPC
+  errors, configurable timeouts, and a typed "no known leader" error instead of a bare message.
+- [ ] **P2** Add integration coverage for leader forwarding, failover and retry behavior.
+- [ ] **P2** Support the chosen TLS/authentication configuration (see §3).
+
+## 10. Docs, repo hygiene and naming
+
+Done:
+
+- [x] GitHub Actions runs `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D
+  warnings` and `cargo test`.
+- [x] `Cargo.lock` is tracked; clippy is clean with `-D warnings`.
+- [x] `scripts/` holds every shell helper; scripts resolve the repo root themselves and write
+  logs under `logs/`, not the repository root.
+- [x] `src/main.rs` is the only binary entry; `examples/sled.rs` is a dev-only playground and
+  `sled` is a dev-dependency.
+- [x] The unused `match_engine.png` was removed and `logs/` is gitignored.
+- [x] README/README_CN, AGENTS, TODO, AERON and MATCH_RESULTS are synced with the WAL + snapshot
+  + gRPC design and snapshot v6 / wire v3.
+- [x] `docs/DECIMAL.md` records the fixed-point research, BTC 18-decimal range analysis,
+  microbenchmarks and the completed end-to-end migration.
+
+Remaining:
+
+- [ ] **P2** Keep `AGENTS.md`, READMEs, `docs/DECIMAL.md` and this file in sync after future
+  storage/wire changes.
+- [ ] **P3** Decide whether to rename the remaining mixed-style modules before 1.0
+  (`src/matchengine/` → `matching_engine/`, `src/match_result/` → `match_events/`,
+  `src/network/raft.rs` → `http_raft.rs`, `raft_network_impl.rs` → `http_network.rs`). This is
+  import-breaking and offers no functional benefit today; the package/binary name
+  `matchengine-raft` is intentionally unchanged.
+
+## 11. Decisions to record
+
+These choices feed the priorities above; write them down as ADRs or doc notes when made.
+
+- [ ] Where `SymbolConfig` lives (replicated registry vs node-local policy) and how precision
+  changes are versioned.
+- [x] Wire v3 representation: scale-18 `i128` mantissas; v2 consumers must upgrade and frames are
+  never silently reinterpreted.
+- [ ] External exposure model: TLS/mTLS, HTTP authentication, and whether the API is
+  loopback/private-network only.
+- [ ] gRPC listener failure policy: fail-fast process exit vs degraded health state.
+- [ ] Per-symbol `/read` keys, event cursors and market-data stream keys.
+- [ ] Event time source for the clearing feed and per-instrument cursor retention.

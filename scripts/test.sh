@@ -2,6 +2,9 @@
 
 set -o errexit
 
+# Always run from the repository root.
+cd "$(dirname "$0")/.."
+
 kill() {
     if [ "$(uname)" = "Darwin" ]; then
         SERVICE='matchengine-raft'
@@ -101,7 +104,8 @@ kill_node() {
 }
 
 start_node() {
-    nohup ./target/debug/matchengine-raft  --id $1 --http-addr 127.0.0.1:2100$1 > n$1.log 2>&1 &
+    mkdir -p logs
+    nohup ./target/debug/matchengine-raft  --id $1 --http-addr 127.0.0.1:2100$1 > logs/n$1.log 2>&1 &
 }
 
 change_membership () {

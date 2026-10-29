@@ -7,8 +7,10 @@
 //!
 //! Layout is packed (no implicit padding): fields are written in the order
 //! listed, and variable arrays start with a `u32` count, so a single taker's
-//! uncapped fill list cannot be truncated. A version bump is required for any
-//! change other than adding a field at the end of `STATUS`.
+//! uncapped fill list cannot be truncated. Version 3 encodes every price and
+//! quantity as a scale-18 `i128` (16 bytes, little-endian), so no financial
+//! value crosses the wire as `f64`. A version bump is required for any change
+//! other than adding a field at the end of `STATUS`.
 
 use super::BarRecord;
 use super::DepthSnapshotRecord;
@@ -18,13 +20,14 @@ use super::MessageBody;
 use super::StatusRecord;
 use super::TradeRecord;
 use crate::match_result::MatchEventKind;
+use crate::matchengine::Fixed;
 use crate::matchengine::OrderSide;
 use crate::matchengine::RejectReason;
 
 /// Magic bytes at the start of every message.
 pub const MAGIC: [u8; 4] = *b"AMKT";
 /// Current schema version.
-pub const VERSION: u8 = 2;
+pub const VERSION: u8 = 3;
 /// Header length in bytes.
 pub const HEADER_LEN: usize = 64;
 
@@ -99,13 +102,13 @@ fn encode_body(body: &MessageBody, out: &mut Vec<u8>) {
             }
         }
         MessageBody::Bbo(bbo) => {
-            put_option_f64(bbo.last_trade, out);
-            out.extend_from_slice(&bbo.bid.to_le_bytes());
-            out.extend_from_slice(&bbo.bid_volume.to_le_bytes());
-            out.extend_from_slice(&bbo.ask.to_le_bytes());
-            out.extend_from_slice(&bbo.ask_volume.to_le_bytes());
-            put_option_f64(bbo.mid, out);
-            put_option_f64(bbo.spread, out);
+            put_option_fixed(bbo.last_trade, out);
+            put_fixed(bbo.bid, out);
+            put_fixed(bbo.bid_volume, out);
+            put_fixed(bbo.ask, out);
+            put_fixed(bbo.ask_volume, out);
+            put_option_fixed(bbo.mid, out);
+            put_option_fixed(bbo.spread, out);
         }
         MessageBody::DepthSnapshot(snapshot) => {
             encode_depth_snapshot(snapshot, out);
@@ -146,8 +149,8 @@ fn encode_trade(record: &TradeRecord, out: &mut Vec<u8>) {
     out.extend_from_slice(&record.log_index.to_le_bytes());
     out.extend_from_slice(&record.ordinal.to_le_bytes());
     out.extend_from_slice(&record.ts_ms.to_le_bytes());
-    out.extend_from_slice(&record.price.to_le_bytes());
-    out.extend_from_slice(&record.volume.to_le_bytes());
+    put_fixed(record.price, out);
+    put_fixed(record.volume, out);
     out.push(side_code(record.taker_side));
     out.extend_from_slice(&record.taker_sequence.to_le_bytes());
     out.extend_from_slice(&record.maker_sequence.to_le_bytes());
@@ -170,10 +173,10 @@ fn encode_depth_snapshot(snapshot: &DepthSnapshotRecord, out: &mut Vec<u8>) {
     }
 }
 
-fn encode_level(side: OrderSide, price: f64, volume: f64, orders: u32, out: &mut Vec<u8>) {
+fn encode_level(side: OrderSide, price: Fixed, volume: Fixed, orders: u32, out: &mut Vec<u8>) {
     out.push(side_code(side));
-    out.extend_from_slice(&price.to_le_bytes());
-    out.extend_from_slice(&volume.to_le_bytes());
+    put_fixed(price, out);
+    put_fixed(volume, out);
     out.extend_from_slice(&orders.to_le_bytes());
 }
 
@@ -185,8 +188,8 @@ fn encode_lifecycle(record: &LifecycleRecord, out: &mut Vec<u8>) {
     out.extend_from_slice(&record.order_sequence.to_le_bytes());
     out.push(side_code(record.side));
     out.extend_from_slice(&record.counterparty_sequence.unwrap_or(0).to_le_bytes());
-    out.extend_from_slice(&record.price.to_le_bytes());
-    out.extend_from_slice(&record.volume.to_le_bytes());
+    put_fixed(record.price, out);
+    put_fixed(record.volume, out);
     out.push(reason_code(record.reason));
 }
 
@@ -204,24 +207,28 @@ fn encode_bar(bar: &BarRecord, out: &mut Vec<u8>) {
     out.extend_from_slice(&(bar.interval_ms as u32).to_le_bytes());
     out.extend_from_slice(&bar.window_start_ms.to_le_bytes());
     out.extend_from_slice(&bar.last_ts_ms.to_le_bytes());
-    out.extend_from_slice(&bar.open.to_le_bytes());
-    out.extend_from_slice(&bar.high.to_le_bytes());
-    out.extend_from_slice(&bar.low.to_le_bytes());
-    out.extend_from_slice(&bar.close.to_le_bytes());
-    out.extend_from_slice(&bar.volume.to_le_bytes());
+    put_fixed(bar.open, out);
+    put_fixed(bar.high, out);
+    put_fixed(bar.low, out);
+    put_fixed(bar.close, out);
+    put_fixed(bar.volume, out);
     out.extend_from_slice(&bar.trade_count.to_le_bytes());
     out.extend_from_slice(&bar.bar_seq.to_le_bytes());
 }
 
-fn put_option_f64(value: Option<f64>, out: &mut Vec<u8>) {
+fn put_fixed(value: Fixed, out: &mut Vec<u8>) {
+    out.extend_from_slice(&value.raw().to_le_bytes());
+}
+
+fn put_option_fixed(value: Option<Fixed>, out: &mut Vec<u8>) {
     match value {
         Some(value) => {
             out.push(1);
-            out.extend_from_slice(&value.to_le_bytes());
+            put_fixed(value, out);
         }
         None => {
             out.push(0);
-            out.extend_from_slice(&0f64.to_le_bytes());
+            put_fixed(Fixed::ZERO, out);
         }
     }
 }
@@ -270,6 +277,10 @@ mod tests {
     use crate::market_data::flags;
     use crate::matchengine::DepthLevel;
 
+    fn fixed(value: &str) -> Fixed {
+        value.parse().expect("valid test decimal")
+    }
+
     struct Reader<'a> {
         bytes: &'a [u8],
         offset: usize,
@@ -307,8 +318,14 @@ mod tests {
             value
         }
 
-        fn f64(&mut self) -> f64 {
-            f64::from_bits(self.u64())
+        fn i128(&mut self) -> i128 {
+            let value = i128::from_le_bytes(
+                self.bytes[self.offset..self.offset + 16]
+                    .try_into()
+                    .unwrap(),
+            );
+            self.offset += 16;
+            value
         }
     }
 
@@ -367,8 +384,8 @@ mod tests {
                 log_index: 10,
                 ordinal: 0,
                 ts_ms: 1_000,
-                price: 100.5,
-                volume: 2.0,
+                price: fixed("100.5"),
+                volume: fixed("2"),
                 taker_side: OrderSide::Buy,
                 taker_sequence: 4,
                 maker_sequence: 2,
@@ -377,8 +394,8 @@ mod tests {
                 log_index: 11,
                 ordinal: 1,
                 ts_ms: 1_001,
-                price: 101.0,
-                volume: 3.0,
+                price: fixed("101.000000000000000001"),
+                volume: fixed("3"),
                 taker_side: OrderSide::Sell,
                 taker_sequence: 5,
                 maker_sequence: 3,
@@ -391,8 +408,8 @@ mod tests {
         assert_eq!(10, reader.u64());
         assert_eq!(0, reader.u32());
         assert_eq!(1_000, reader.u64());
-        assert_eq!(100.5, reader.f64());
-        assert_eq!(2.0, reader.f64());
+        assert_eq!(fixed("100.5").raw(), reader.i128());
+        assert_eq!(fixed("2").raw(), reader.i128());
         assert_eq!(0, reader.u8());
         assert_eq!(4, reader.u64());
         assert_eq!(2, reader.u64());
@@ -400,8 +417,8 @@ mod tests {
         assert_eq!(11, reader.u64());
         assert_eq!(1, reader.u32());
         assert_eq!(1_001, reader.u64());
-        assert_eq!(101.0, reader.f64());
-        assert_eq!(3.0, reader.f64());
+        assert_eq!(fixed("101.000000000000000001").raw(), reader.i128());
+        assert_eq!(fixed("3").raw(), reader.i128());
         assert_eq!(1, reader.u8());
         assert_eq!(5, reader.u64());
         assert_eq!(3, reader.u64());
@@ -411,13 +428,13 @@ mod tests {
     fn depth_snapshot_and_delta_encode_levels() {
         let snapshot = MessageBody::DepthSnapshot(DepthSnapshotRecord {
             bids: vec![DepthLevel {
-                price: 100.0,
-                volume: 5.0,
+                price: fixed("100"),
+                volume: fixed("5"),
                 orders: 2,
             }],
             asks: vec![DepthLevel {
-                price: 101.0,
-                volume: 1.5,
+                price: fixed("101"),
+                volume: fixed("1.5"),
                 orders: 1,
             }],
         });
@@ -426,19 +443,19 @@ mod tests {
         assert_eq!(1, reader.u32());
         assert_eq!(1, reader.u32());
         assert_eq!(0, reader.u8());
-        assert_eq!(100.0, reader.f64());
-        assert_eq!(5.0, reader.f64());
+        assert_eq!(fixed("100").raw(), reader.i128());
+        assert_eq!(fixed("5").raw(), reader.i128());
         assert_eq!(2, reader.u32());
         assert_eq!(1, reader.u8());
-        assert_eq!(101.0, reader.f64());
-        assert_eq!(1.5, reader.f64());
+        assert_eq!(fixed("101").raw(), reader.i128());
+        assert_eq!(fixed("1.5").raw(), reader.i128());
         assert_eq!(1, reader.u32());
 
         let delta = MessageBody::DepthDelta(vec![LevelUpdate {
             side: OrderSide::Sell,
             level: DepthLevel {
-                price: 99.0,
-                volume: 4.0,
+                price: fixed("99"),
+                volume: fixed("4"),
                 orders: 1,
             },
         }]);
@@ -446,34 +463,34 @@ mod tests {
         let mut reader = Reader::new(&bytes, HEADER_LEN);
         assert_eq!(1, reader.u32());
         assert_eq!(1, reader.u8());
-        assert_eq!(99.0, reader.f64());
-        assert_eq!(4.0, reader.f64());
+        assert_eq!(fixed("99").raw(), reader.i128());
+        assert_eq!(fixed("4").raw(), reader.i128());
         assert_eq!(1, reader.u32());
     }
 
     #[test]
     fn bbo_encodes_presence_flags() {
         let body = MessageBody::Bbo(BboRecord {
-            last_trade: Some(100.0),
-            bid: 99.5,
-            bid_volume: 3.0,
-            ask: 100.5,
-            ask_volume: 4.0,
-            mid: Some(100.0),
-            spread: Some(1.0),
+            last_trade: Some(fixed("100")),
+            bid: fixed("99.5"),
+            bid_volume: fixed("3"),
+            ask: fixed("100.5"),
+            ask_volume: fixed("4"),
+            mid: Some(fixed("100")),
+            spread: Some(fixed("1")),
         });
         let bytes = encode(&message(body));
         let mut reader = Reader::new(&bytes, HEADER_LEN);
         assert_eq!(1, reader.u8());
-        assert_eq!(100.0, reader.f64());
-        assert_eq!(99.5, reader.f64());
-        assert_eq!(3.0, reader.f64());
-        assert_eq!(100.5, reader.f64());
-        assert_eq!(4.0, reader.f64());
+        assert_eq!(fixed("100").raw(), reader.i128());
+        assert_eq!(fixed("99.5").raw(), reader.i128());
+        assert_eq!(fixed("3").raw(), reader.i128());
+        assert_eq!(fixed("100.5").raw(), reader.i128());
+        assert_eq!(fixed("4").raw(), reader.i128());
         assert_eq!(1, reader.u8());
-        assert_eq!(100.0, reader.f64());
+        assert_eq!(fixed("100").raw(), reader.i128());
         assert_eq!(1, reader.u8());
-        assert_eq!(1.0, reader.f64());
+        assert_eq!(fixed("1").raw(), reader.i128());
     }
 
     #[test]
@@ -508,8 +525,8 @@ mod tests {
             order_sequence: 8,
             side: OrderSide::Buy,
             counterparty_sequence: Some(3),
-            price: 100.0,
-            volume: 2.0,
+            price: fixed("100"),
+            volume: fixed("2"),
             reason: None,
         }]);
         let bytes = encode(&message(lifecycle));
@@ -522,19 +539,19 @@ mod tests {
         assert_eq!(8, reader.u64());
         assert_eq!(0, reader.u8()); // Buy
         assert_eq!(3, reader.u64());
-        assert_eq!(100.0, reader.f64());
-        assert_eq!(2.0, reader.f64());
+        assert_eq!(fixed("100").raw(), reader.i128());
+        assert_eq!(fixed("2").raw(), reader.i128());
         assert_eq!(0, reader.u8()); // no reason
 
         let bar = MessageBody::Bar(BarRecord {
             interval_ms: 1_000,
             window_start_ms: 1_000,
             last_ts_ms: 1_800,
-            open: 100.0,
-            high: 101.0,
-            low: 99.0,
-            close: 100.5,
-            volume: 7.0,
+            open: fixed("100"),
+            high: fixed("101"),
+            low: fixed("99"),
+            close: fixed("100.5"),
+            volume: fixed("7"),
             trade_count: 3,
             bar_seq: 4,
         });
@@ -543,11 +560,11 @@ mod tests {
         assert_eq!(1_000, reader.u32());
         assert_eq!(1_000, reader.u64());
         assert_eq!(1_800, reader.u64());
-        assert_eq!(100.0, reader.f64());
-        assert_eq!(101.0, reader.f64());
-        assert_eq!(99.0, reader.f64());
-        assert_eq!(100.5, reader.f64());
-        assert_eq!(7.0, reader.f64());
+        assert_eq!(fixed("100").raw(), reader.i128());
+        assert_eq!(fixed("101").raw(), reader.i128());
+        assert_eq!(fixed("99").raw(), reader.i128());
+        assert_eq!(fixed("100.5").raw(), reader.i128());
+        assert_eq!(fixed("7").raw(), reader.i128());
         assert_eq!(3, reader.u32());
         assert_eq!(4, reader.u64());
     }
@@ -559,8 +576,8 @@ mod tests {
                 log_index: i,
                 ordinal: 0,
                 ts_ms: 1_000,
-                price: 100.0,
-                volume: 1.0,
+                price: fixed("100"),
+                volume: fixed("1"),
                 taker_side: OrderSide::Buy,
                 taker_sequence: 1,
                 maker_sequence: i,
@@ -570,9 +587,20 @@ mod tests {
         let mut reader = Reader::new(&bytes, HEADER_LEN);
         assert_eq!(70_000, reader.u32());
         assert_eq!(
-            HEADER_LEN + 4 + 70_000 * 53,
+            HEADER_LEN + 4 + 70_000 * 69,
             bytes.len(),
             "every fill is encoded"
         );
+    }
+
+    #[test]
+    fn wire_version_is_v3() {
+        assert_eq!(3, VERSION);
+        let bytes = encode(&message(MessageBody::Gap(GapRecord {
+            last_good_log_index: 0,
+            last_good_ordinal: 0,
+            dropped: 0,
+        })));
+        assert_eq!(3, bytes[4]);
     }
 }

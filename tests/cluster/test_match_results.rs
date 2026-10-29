@@ -82,14 +82,14 @@ fn file_sink_records_rests_fills_and_cancels() {
         let events = wait_for_events(&event_log, 2).await;
         assert_eq!("rested", events[0]["kind"]);
         assert_eq!(0, events[0]["order_sequence"]);
-        assert_eq!(10.0, events[0]["volume"]);
+        assert_eq!("10", events[0]["volume"]);
         assert_eq!(1, events[0]["node_id"]);
 
         assert_eq!("fill", events[1]["kind"]);
         assert_eq!(1, events[1]["order_sequence"]);
         assert_eq!(0, events[1]["counterparty_sequence"]);
-        assert_eq!(100.0, events[1]["price"]);
-        assert_eq!(4.0, events[1]["volume"]);
+        assert_eq!("100", events[1]["price"]);
+        assert_eq!("4", events[1]["volume"]);
         assert_eq!(1, events[1]["node_id"]);
 
         // The fill is a later entry than the rest it matched against.
@@ -110,7 +110,7 @@ fn file_sink_records_rests_fills_and_cancels() {
         let cancelled = &events[2];
         assert_eq!("cancelled", cancelled["kind"]);
         assert_eq!(0, cancelled["order_sequence"]);
-        assert_eq!(6.0, cancelled["volume"]);
+        assert_eq!("6", cancelled["volume"]);
         assert_eq!(1, cancelled["node_id"]);
         assert!(
             cancelled["event_id"]["log_index"].as_u64().unwrap() > fill_index,
@@ -238,8 +238,8 @@ fn file_sink_records_stop_triggers_and_expiries() {
             .find(|event| event["kind"] == "triggered")
             .expect("the stop must be elected");
         assert_eq!(2, triggered["order_sequence"]);
-        assert_eq!(95.0, triggered["price"]);
-        assert_eq!(5.0, triggered["volume"]);
+        assert_eq!("95", triggered["price"]);
+        assert_eq!("5", triggered["volume"]);
 
         // The child executes as a market order and its fill follows the trigger
         // inside the same log entry.
@@ -251,7 +251,7 @@ fn file_sink_records_stop_triggers_and_expiries() {
                     && event["event_id"]["log_index"] == triggered["event_id"]["log_index"]
             })
             .expect("the stop's child must print");
-        assert_eq!(5.0, child["volume"]);
+        assert_eq!("5", child["volume"]);
         assert_eq!(
             triggered["event_id"]["ordinal"].as_u64().unwrap() + 1,
             child["event_id"]["ordinal"].as_u64().unwrap()
@@ -302,7 +302,7 @@ fn file_sink_records_stop_triggers_and_expiries() {
             .find(|event| event["kind"] == "expired")
             .expect("the GTD order expires");
         assert_eq!(5, expired["order_sequence"]);
-        assert_eq!(1.0, expired["volume"]);
+        assert_eq!("1", expired["volume"]);
 
         // New read keys: the stop store is empty and the last trade printed 95.
         let stops = client.read(&"orderbook_stops".to_string()).await.unwrap();
@@ -311,7 +311,7 @@ fn file_sink_records_stop_triggers_and_expiries() {
             .read(&"orderbook_last_trade_price".to_string())
             .await
             .unwrap();
-        assert_eq!("95.0", last);
+        assert_eq!("95", last);
 
         node.shutdown().await.unwrap();
     });

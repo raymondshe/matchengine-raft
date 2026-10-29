@@ -386,15 +386,19 @@ where
         "orderbook_orders" => serde_json::to_string(&inner.orders()).unwrap_or_default(),
         "orderbook_stops" => serde_json::to_string(&inner.orderbook.stops).unwrap_or_default(),
         "orderbook_depth" => depth_json(inner, 10),
-        "orderbook_spread" => serde_json::to_string(&inner.orderbook.spread()).unwrap_or_default(),
+        "orderbook_spread" => inner
+            .orderbook
+            .spread()
+            .map_or_else(|| "null".to_string(), |value| value.to_string()),
         "marketdata_status" => inner
             .market_data
             .as_ref()
             .map(|tap| tap.status_json())
             .unwrap_or_else(|| "{}".to_string()),
-        "orderbook_last_trade_price" => {
-            serde_json::to_string(&inner.orderbook.last_trade_price).unwrap_or_default()
-        }
+        "orderbook_last_trade_price" => inner
+            .orderbook
+            .last_trade_price
+            .map_or_else(|| "null".to_string(), |value| value.to_string()),
         "orderbook_sequence" | "orderbook_sequance" => inner.orderbook.sequence.to_string(),
         _ if key.starts_with("orderbook_depth:") => {
             let levels = key
@@ -445,10 +449,10 @@ mod tests {
         let depth: serde_json::Value =
             serde_json::from_str(&read_state(&inner, "orderbook_depth:1")).unwrap();
         assert_eq!(1, depth["bids"].as_array().unwrap().len());
-        assert_eq!(100.0, depth["bids"][0]["price"]);
-        assert_eq!(5.0, depth["bids"][0]["volume"]);
+        assert_eq!("100", depth["bids"][0]["price"]);
+        assert_eq!("5", depth["bids"][0]["volume"]);
         assert_eq!(2, depth["bids"][0]["orders"]);
-        assert_eq!(101.0, depth["asks"][0]["price"]);
+        assert_eq!("101", depth["asks"][0]["price"]);
 
         let full: serde_json::Value =
             serde_json::from_str(&read_state(&inner, "orderbook_depth")).unwrap();
@@ -458,7 +462,7 @@ mod tests {
     #[test]
     fn read_spread_and_unknown_keys() {
         let inner = book();
-        assert_eq!("1.0", read_state(&inner, "orderbook_spread"));
+        assert_eq!("1", read_state(&inner, "orderbook_spread"));
         assert_eq!("", read_state(&inner, "nope"));
         assert_eq!("{}", read_state(&inner, "marketdata_status"));
     }

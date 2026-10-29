@@ -53,7 +53,7 @@ This project extends the [example-raft-kv](https://github.com/datafuselabs/openr
                                         │                           ▼
                                         │             ┌──────────────────────────────────────┐
                                         │             │  Market-data thread (leader-gated)   │
-                                        │             │     shadow book · OHLC · wire v2     │
+                                        │             │     shadow book · OHLC · wire v3     │
                                         │             │   deterministic market_seq/sub_seq   │
                                         │             └──────────────────────────────────────┘
                                         │                                 │ MarketDataSink
@@ -83,7 +83,7 @@ handlers stay on the `--http-addr` listener, so a node serves both transports re
 one it dials.
 
 Market-data egress is node-local and off the consensus path: the tap is a bounded `try_send`, so a
-slow subscriber can never block `apply`. The JSONL sink is for debugging; the same wire-v2 messages
+slow subscriber can never block `apply`. The JSONL sink is for debugging; the same wire-v3 messages
 are what the Aeron adapter (streams 2001–2007) will publish next.
 
 ### Key Components
@@ -109,7 +109,7 @@ are what the Aeron adapter (streams 2001–2007) will publish next.
 
 4. **Market-Data Egress** ([`market_data/`](./src/market_data/))
    - `apply` hands match events and a depth journal to a bounded tap (`try_send`; matching never waits)
-   - A leader-gated thread keeps a shadow book, derives BBO/OHLC bars and encodes wire v2
+   - A leader-gated thread keeps a shadow book, derives BBO/OHLC bars and encodes wire v3
    - Keys are `(symbol_id, stream_id, market_seq, sub_seq)`; one uncapped `TRADE` per taker
    - JSONL sink today; Aeron streams 2001–2007 are the next phase
 
@@ -138,7 +138,7 @@ cargo build
 The easiest way to see the cluster in action is to run the provided test script:
 
 ```shell
-./test-cluster.sh
+./scripts/test-cluster.sh
 ```
 
 This script builds, starts a 3-node cluster on `127.0.0.1:21001-21003` (gRPC Raft on
@@ -241,41 +241,39 @@ You should be able to see the order from any node!
 
 ### Using the Helper Script
 
-The project also includes `test.sh` for more convenient cluster management:
+The project also includes `scripts/test.sh` for more convenient cluster management:
 
 ```shell
 # Start a node
-./test.sh start-node 1
+./scripts/test.sh start-node 1
 
 # Initialize node 1 and add the other two as learners
-./test.sh build-cluster 1
+./scripts/test.sh build-cluster 1
 
 # Promote the learners to voters
-./test.sh change-membership
+./scripts/test.sh change-membership
 
 # Check metrics
-./test.sh metrics 1
+./scripts/test.sh metrics 1
 
 # Place orders
-./test.sh place-order 1
+./scripts/test.sh place-order 1
 
 # Read the sequence counter
-./test.sh get-seq 1
+./scripts/test.sh get-seq 1
 
 # Clean up (the data directory is renamed, not deleted)
-./test.sh clean
+./scripts/test.sh clean
 ```
 
-`test.sh` keeps all state under `RAFT_DATA_DIR` (default `/tmp/matchengine-raft`), so
+`scripts/test.sh` keeps all state under `RAFT_DATA_DIR` (default `/tmp/matchengine-raft`), so
 `place-order` results survive `start-node`/`kill` cycles.
 
 ## Project Structure
 
 ```
 src/
-├── bin/
-│   ├── main.rs              # Server entry point (flags, env, storage config)
-│   └── sled_test.rs         # Playground binary (gitignored local sled dir)
+├── main.rs                  # Server entry point (flags, env, storage config)
 ├── client.rs                # Smart client with leader forwarding
 ├── lib.rs                   # Node composition, servers, shutdown
 ├── app.rs                   # Application state
@@ -305,6 +303,8 @@ src/
 │   └── config.rs            # Storage layout / per-node directories
 proto/
 └── raft.proto               # gRPC Raft service definition
+examples/
+└── sled.rs                  # Playground (local sled dir, not installed)
 tests/
 └── cluster/
     ├── main.rs              # Single integration test target
@@ -347,7 +347,7 @@ avoiding a second fsync per batch.
 ### Snapshots (`src/store/state_machine.rs`)
 
 The state machine (order book + sequence counter + retained match-event window + submission dedupe
-map) stays in memory so applying entries is fast. Snapshot v5 is written as
+map) stays in memory so applying entries is fast. Snapshot v6 is written as
 `snapshot/current.snap` using the same atomic temp-file/rename protocol; `install_snapshot`
 validates the incoming bytes before replacing the durable copy, so a bad snapshot cannot destroy a
 good one.
@@ -359,7 +359,7 @@ pub struct StateMachineData {
     pub orders: Vec<Order>,
     pub sequence: u64,
     pub stops: Vec<Order>,
-    pub last_trade_price: Option<f64>,
+    pub last_trade_price: Option<Fixed>,
     pub events: Vec<StoredMatchEvent>, // retained match events, oldest first
     pub events_evicted: u64,
     pub submissions: Vec<SubmissionRecord>, // client_order_id dedupe, oldest first
@@ -477,7 +477,7 @@ POST /write { Place | Cancel | Amend | PurgeExpired }
 `Place` accepts an optional `client_order_id`; retrying it returns the original sequence and
 events instead of placing a second order. The event window is bounded by `--max-events` (env
 `MAX_EVENTS`, default 262144); the submission map has a separate fixed 262144-record cap so retry
-resolution never depends on a node-local flag. Both are included in snapshot v5. `GET /events/status` reports the
+resolution never depends on a node-local flag. Both are included in snapshot v6. `GET /events/status` reports the
 oldest/last retained id and eviction counters; consumers resume from `next_after` and dedupe on
 `event_id`.
 
@@ -539,7 +539,7 @@ designed in `docs/AERON_SOLUTION.md` Part II and implemented in `src/market_data
   queue drops frames and emits a `GAP`; `apply` is never blocked or slowed by a subscriber.
 
 The shipped sink is JSONL for debugging. The same messages have a binary encoding in
-`src/market_data/wire.rs` (64-byte header, version 2, little-endian bodies), and `MarketDataSink`
+`src/market_data/wire.rs` (64-byte header, version 3, scale-18 `i128` bodies), and `MarketDataSink`
 is the seam the Aeron adapter will implement (next phase). The schema is multi-symbol ready
 (`symbol_id`, 0 today). Tuning: `--market-data-depth`, `--market-data-status-every`,
 `--market-data-bar-intervals-ms`, `--market-data-leader-only`.
@@ -660,10 +660,10 @@ order book:
   alias)
 
 Prices and quantities are stored internally as exact 18-scale fixed-point integers. JSON accepts
-either decimal strings or legacy numbers; strings are recommended for more than 15 significant
-digits, and `/read` emits strings so 18-decimal values round-trip exactly. Each instrument can
-configure its accepted price/quantity decimals with `SymbolConfig` (maximum 18); values are
-normalized to the common 18-decimal scale.
+either decimal strings or legacy numbers; match events, `/read` and the market-data feed emit
+decimal strings so 18-decimal values round-trip exactly. `SymbolConfig` defines each instrument's
+accepted price/quantity decimals (maximum 18), but enforcement and multi-symbol routing are still
+pending; values are normalized to the common 18-decimal scale.
 
 Example order payload accepted by `/write` (note the field name `sequence`):
 
@@ -693,18 +693,19 @@ placeholder). `sequence` is still required by the deserializer.
 | `tests/cluster/test_cluster.rs` | 3-node cluster: init, learner, membership, write/read, linearizable read, leader forwarding, membership shrink; runs over gRPC by default and HTTP with `MATCHENGINE_TEST_TRANSPORT=http` |
 | `tests/cluster/test_snapshot.rs` | Snapshot creation, log purge, and a learner installing the purged state over the gRPC snapshot stream |
 | `tests/cluster/test_storage.rs` | WAL framing, torn-tail truncation, segment rotation, a 20k-record multi-segment reopen, truncate/purge across segments, vote/committed persistence, snapshot build/install/reopen, corrupt-file rejection |
-| `tests/cluster/test_restart.rs` | Full node restart recovering the order book and sequence via WAL replay and via snapshot + tail; also 2k-order large-log replay and a >128 KiB snapshot boot |
+| `tests/cluster/test_restart.rs` | Full node restart recovering the order book and sequence via WAL replay and via snapshot + tail; also 2k-order large-log replay and a multi-chunk (~120 KB) snapshot boot |
 | `tests/cluster/test_match_results.rs` | A node started with `--match-event-log` records rest/fill/cancel events in log order while the `/write` response stays unchanged; a second node checks stop triggers, GTD expiry and the new `/read` keys |
 | `tests/cluster/test_market_data.rs` | A node started with `--market-data-log` publishes a reset snapshot, one trade message per taker, BBO, post-entry depth totals and a closed OHLC bar; the assertions check `market_seq` anchors and `/read marketdata_status` counters |
 | `tests/cluster/test_events.rs` | `/write` returns events, `/events` pages by cursor, `client_order_id` retries do not duplicate an order, and `--max-events` eviction is visible in `/events/status` |
 | `tests/cluster/test_membership.rs` | Kill the elected leader: a surviving voter takes over with the committed book and accepts new writes. A learner added after the writes catches up through normal log replication, is promoted, and writes through its own node |
 | `tests/cluster/test_late_join.rs` | A node with a stale snapshot/WAL is removed, misses 40 writes while the leader snapshots and purges, then rejoins as a learner and catches up from the live cluster |
+| `tests/cluster/test_exactness.rs` | An 18-fractional-digit price and quantity round-trip through `/write`, `/read`, `/events`, the JSONL market-data feed, snapshot v6 and a restart without passing through `f64` |
 
 Every integration test uses a unique temporary data directory. The cluster test uses fixed ports
 `21001-21003` (gRPC `22001-22003`), the snapshot test `21101-21102`, the restart tests
 `21201-21204`, the match-result tests `21301`/`21302`, the market-data test `21303`, the event-log test
-`21304`, the failover test `21401-21403`, the learner catch-up test `21501-21502` and the late-join
-test `21601-21603`; stop leftover processes
+`21304`, the failover test `21401-21403`, the learner catch-up test `21501-21502`, the late-join
+test `21601-21603` and the exactness test `21701` (gRPC `22701`); stop leftover processes
 (`pkill -f matchengine-raft`) before rerunning.
 
 ## Performance and Current Limits
@@ -727,9 +728,10 @@ Still missing:
 - No transport benchmark harness; numbers in `docs/TRANSPORTS.md` are guidance, not measurements.
 - The gRPC listener has no TLS/mTLS.
 - Snapshot installation still buffers the whole snapshot in memory.
-- `Order` price/quantity now use exact 18-scale fixed-point integers with per-symbol decimal
-  config; match events, market data and the wire format still convert at the f64 boundary. See
-  [`docs/DECIMAL.md`](./docs/DECIMAL.md) for the remaining migration.
+- `Order` prices/quantities, `last_trade_price`, match events, depth/BBO/spread, the JSONL feed
+  and wire v3 use exact 18-scale fixed-point integers. Snapshot v6 and wire v3 are breaking
+  changes from earlier builds. Per-symbol `SymbolConfig` enforcement/routing is still pending. See
+  [`docs/DECIMAL.md`](./docs/DECIMAL.md).
 
 Known gaps and the roadmap are tracked in [`TODO.md`](./TODO.md).
 

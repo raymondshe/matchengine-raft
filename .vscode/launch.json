@@ -13,7 +13,7 @@
             "cwd": "${workspaceFolder}",
             "env": {
                 "RUST_LOG": "debug",
-                "RUST_BACKTRACE=1": "1"
+                "RUST_BACKTRACE": "1"
             }
         },
         {

@@ -50,6 +50,7 @@ use crate::match_result::MatchEvent;
 use crate::match_result::MatchEventKind;
 use crate::matchengine::DepthChange;
 use crate::matchengine::DepthLevel;
+use crate::matchengine::Fixed;
 use crate::matchengine::OrderSide;
 use crate::matchengine::RejectReason;
 
@@ -227,10 +228,10 @@ pub struct TradeRecord {
     pub ordinal: u32,
     /// Taker order's intake timestamp (Unix ms).
     pub ts_ms: u64,
-    /// Execution price (maker price).
-    pub price: f64,
-    /// Executed volume.
-    pub volume: f64,
+    /// Execution price (maker price), scale 18.
+    pub price: Fixed,
+    /// Executed volume, scale 18.
+    pub volume: Fixed,
     /// Taker side (the maker's side is the opposite).
     pub taker_side: OrderSide,
     /// Taker order sequence.
@@ -243,19 +244,19 @@ pub struct TradeRecord {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct BboRecord {
     /// Last trade price, if any.
-    pub last_trade: Option<f64>,
-    /// Best bid price.
-    pub bid: f64,
+    pub last_trade: Option<Fixed>,
+    /// Best bid price; zero when there is no bid.
+    pub bid: Fixed,
     /// Visible volume at the best bid.
-    pub bid_volume: f64,
-    /// Best ask price.
-    pub ask: f64,
+    pub bid_volume: Fixed,
+    /// Best ask price; zero when there is no ask.
+    pub ask: Fixed,
     /// Visible volume at the best ask.
-    pub ask_volume: f64,
-    /// `(bid + ask) / 2` when both sides exist.
-    pub mid: Option<f64>,
+    pub ask_volume: Fixed,
+    /// `(bid + ask) / 2` when both sides exist (truncated to 18 places).
+    pub mid: Option<Fixed>,
     /// `ask - bid` when both sides exist.
-    pub spread: Option<f64>,
+    pub spread: Option<Fixed>,
 }
 
 /// Full top-N depth for one instrument.
@@ -293,10 +294,10 @@ pub struct LifecycleRecord {
     pub side: OrderSide,
     /// Maker sequence on a fill.
     pub counterparty_sequence: Option<u64>,
-    /// Price associated with the event.
-    pub price: f64,
-    /// Volume associated with the event.
-    pub volume: f64,
+    /// Price associated with the event, scale 18.
+    pub price: Fixed,
+    /// Volume associated with the event, scale 18.
+    pub volume: Fixed,
     /// Rejection/expiry reason when present.
     pub reason: Option<RejectReason>,
 }
@@ -311,15 +312,15 @@ pub struct BarRecord {
     /// Last trade timestamp included.
     pub last_ts_ms: u64,
     /// First trade price in the window.
-    pub open: f64,
+    pub open: Fixed,
     /// Highest trade price.
-    pub high: f64,
+    pub high: Fixed,
     /// Lowest trade price.
-    pub low: f64,
+    pub low: Fixed,
     /// Last trade price.
-    pub close: f64,
+    pub close: Fixed,
     /// Summed trade volume.
-    pub volume: f64,
+    pub volume: Fixed,
     /// Number of fills aggregated.
     pub trade_count: u32,
     /// Monotonic per `(symbol, interval)`.
@@ -442,7 +443,7 @@ pub struct SnapshotFrame {
     /// Ask levels, best first.
     pub asks: Vec<DepthLevel>,
     /// Last trade price, if any.
-    pub last_trade: Option<f64>,
+    pub last_trade: Option<Fixed>,
     /// Replicated book sequence counter.
     pub book_sequence: u64,
     /// Parked stop orders.
@@ -804,17 +805,17 @@ impl MarketDataHandle {
 
 #[derive(Debug, Clone, Copy)]
 struct LevelState {
-    price: f64,
-    volume: f64,
+    price: Fixed,
+    volume: Fixed,
     orders: u32,
 }
 
 /// Visible book per instrument, fed by the depth journal.
 #[derive(Debug, Default)]
 struct ShadowBook {
-    bids: BTreeMap<u64, LevelState>,
-    asks: BTreeMap<u64, LevelState>,
-    last_trade: Option<f64>,
+    bids: BTreeMap<Fixed, LevelState>,
+    asks: BTreeMap<Fixed, LevelState>,
+    last_trade: Option<Fixed>,
 }
 
 impl ShadowBook {
@@ -823,26 +824,26 @@ impl ShadowBook {
             OrderSide::Buy => &mut self.bids,
             OrderSide::Sell => &mut self.asks,
         };
-        let key = change.price.to_bits();
+        let key = change.price;
         let level = map.entry(key).or_insert(LevelState {
             price: change.price,
-            volume: 0.0,
+            volume: Fixed::ZERO,
             orders: 0,
         });
         level.volume += change.delta_volume;
         let orders = i64::from(level.orders) + i64::from(change.delta_orders);
         level.orders = orders.max(0) as u32;
-        if level.volume <= 1e-12 && level.orders == 0 {
+        if level.volume <= Fixed::ZERO && level.orders == 0 {
             map.remove(&key);
         }
     }
 
-    fn reset(&mut self, bids: &[DepthLevel], asks: &[DepthLevel], last_trade: Option<f64>) {
+    fn reset(&mut self, bids: &[DepthLevel], asks: &[DepthLevel], last_trade: Option<Fixed>) {
         self.bids = bids
             .iter()
             .map(|level| {
                 (
-                    level.price.to_bits(),
+                    level.price,
                     LevelState {
                         price: level.price,
                         volume: level.volume,
@@ -855,7 +856,7 @@ impl ShadowBook {
             .iter()
             .map(|level| {
                 (
-                    level.price.to_bits(),
+                    level.price,
                     LevelState {
                         price: level.price,
                         volume: level.volume,
@@ -875,10 +876,10 @@ impl ShadowBook {
         self.asks.values().next().copied()
     }
 
-    fn level(&self, side: OrderSide, price_bits: u64) -> Option<LevelState> {
+    fn level(&self, side: OrderSide, price: Fixed) -> Option<LevelState> {
         match side {
-            OrderSide::Buy => self.bids.get(&price_bits).copied(),
-            OrderSide::Sell => self.asks.get(&price_bits).copied(),
+            OrderSide::Buy => self.bids.get(&price).copied(),
+            OrderSide::Sell => self.asks.get(&price).copied(),
         }
     }
 
@@ -906,17 +907,17 @@ struct BarAgg {
     interval_ms: u64,
     window_start_ms: u64,
     last_ts_ms: u64,
-    open: f64,
-    high: f64,
-    low: f64,
-    close: f64,
-    volume: f64,
+    open: Fixed,
+    high: Fixed,
+    low: Fixed,
+    close: Fixed,
+    volume: Fixed,
     trade_count: u32,
     last_live_ms: u64,
 }
 
 impl BarAgg {
-    fn new(interval_ms: u64, window_start_ms: u64, ts_ms: u64, first_price: f64) -> Self {
+    fn new(interval_ms: u64, window_start_ms: u64, ts_ms: u64, first_price: Fixed) -> Self {
         Self {
             interval_ms,
             window_start_ms,
@@ -925,13 +926,13 @@ impl BarAgg {
             high: first_price,
             low: first_price,
             close: first_price,
-            volume: 0.0,
+            volume: Fixed::ZERO,
             trade_count: 0,
             last_live_ms: ts_ms,
         }
     }
 
-    fn update(&mut self, ts_ms: u64, price: f64, volume: f64) {
+    fn update(&mut self, ts_ms: u64, price: Fixed, volume: Fixed) {
         self.high = self.high.max(price);
         self.low = self.low.min(price);
         self.close = price;
@@ -1166,14 +1167,14 @@ impl MarketDataProcessor {
             .map_or(0, |event| event.event_id.ordinal);
 
         // Visible depth: apply the journal, then publish post-batch totals.
-        let mut touched: BTreeSet<(u8, u64)> = BTreeSet::new();
+        let mut touched: BTreeSet<(u8, Fixed)> = BTreeSet::new();
         for change in &frame.depth {
             let side = match change.side {
                 OrderSide::Buy => 0u8,
                 OrderSide::Sell => 1u8,
             };
             self.shadow.entry(symbol).or_default().apply(*change);
-            touched.insert((side, change.price.to_bits()));
+            touched.insert((side, change.price));
         }
 
         // Fills: all of them go into one TRADE message (no chunking).
@@ -1201,13 +1202,13 @@ impl MarketDataProcessor {
         if !touched.is_empty() {
             let mut updates = Vec::new();
             if let Some(book) = self.shadow.get(&symbol) {
-                for (side, price_bits) in &touched {
+                for (side, price) in &touched {
                     let side = if *side == 0 {
                         OrderSide::Buy
                     } else {
                         OrderSide::Sell
                     };
-                    if let Some(level) = book.level(side, *price_bits) {
+                    if let Some(level) = book.level(side, *price) {
                         updates.push(LevelUpdate {
                             side,
                             level: DepthLevel {
@@ -1363,10 +1364,14 @@ impl MarketDataProcessor {
         if bid.is_none() && ask.is_none() && book.last_trade.is_none() {
             return;
         }
-        let (bid_price, bid_volume) = bid.map_or((0.0, 0.0), |level| (level.price, level.volume));
-        let (ask_price, ask_volume) = ask.map_or((0.0, 0.0), |level| (level.price, level.volume));
+        let (bid_price, bid_volume) = bid.map_or((Fixed::ZERO, Fixed::ZERO), |level| {
+            (level.price, level.volume)
+        });
+        let (ask_price, ask_volume) = ask.map_or((Fixed::ZERO, Fixed::ZERO), |level| {
+            (level.price, level.volume)
+        });
         let mid = if bid.is_some() && ask.is_some() {
-            Some((bid_price + ask_price) / 2.0)
+            bid_price.midpoint(ask_price)
         } else {
             None
         };
@@ -1406,7 +1411,7 @@ impl MarketDataProcessor {
         ts_ms: u64,
         events: &[MatchEvent],
     ) {
-        let fills: Vec<(f64, f64)> = events
+        let fills: Vec<(Fixed, Fixed)> = events
             .iter()
             .filter(|event| event.kind == MatchEventKind::Fill)
             .map(|event| (event.price, event.volume))
@@ -1528,6 +1533,7 @@ mod tests {
     use super::*;
     use crate::matchengine::MatchResult;
     use crate::matchengine::Order;
+    use crate::matchengine::fixed::SCALE;
 
     #[derive(Clone, Default)]
     struct CollectSink(Arc<Mutex<Vec<MarketMessage>>>);
@@ -1658,8 +1664,8 @@ mod tests {
     fn depth(side: OrderSide, price: f64, delta_volume: f64, delta_orders: i32) -> DepthChange {
         DepthChange {
             side,
-            price,
-            delta_volume,
+            price: price.into(),
+            delta_volume: delta_volume.into(),
             delta_orders,
         }
     }
@@ -1671,16 +1677,16 @@ mod tests {
             ts_ms: 5_000,
             symbol_id: 0,
             bids: vec![DepthLevel {
-                price: 100.0,
-                volume: 5.0,
+                price: 100.0.into(),
+                volume: 5.0.into(),
                 orders: 1,
             }],
             asks: vec![DepthLevel {
-                price: 101.0,
-                volume: 4.0,
+                price: 101.0.into(),
+                volume: 4.0.into(),
                 orders: 1,
             }],
-            last_trade: Some(100.5),
+            last_trade: Some(100.5.into()),
             book_sequence: market_seq + 1,
             pending_stops: 1,
         }
@@ -1726,9 +1732,9 @@ mod tests {
                 _ => None,
             })
             .expect("bbo message");
-        assert_eq!(Some(100.5), bbo.last_trade);
-        assert_eq!((99.5, 3.0), (bbo.bid, bbo.bid_volume));
-        assert_eq!((100.5, 5.0), (bbo.ask, bbo.ask_volume));
+        assert_eq!(Some(100.5.into()), bbo.last_trade);
+        assert_eq!((99.5.into(), 3.0.into()), (bbo.bid, bbo.bid_volume));
+        assert_eq!((100.5.into(), 5.0.into()), (bbo.ask, bbo.ask_volume));
 
         let depth = messages
             .iter()
@@ -1789,7 +1795,9 @@ mod tests {
             .messages()
             .iter()
             .filter_map(|message| match &message.body {
-                MessageBody::DepthDelta(updates) => Some((updates[0].level.volume * 10.0) as u64),
+                MessageBody::DepthDelta(updates) => {
+                    Some(updates[0].level.volume.raw() as u64 / (SCALE / 10) as u64)
+                }
                 _ => None,
             })
             .collect();
@@ -1863,7 +1871,13 @@ mod tests {
         let mut events = Vec::new();
         for _ in 0..3 {
             let order = Order::new(OrderSide::Buy, 100.0, 1.0, 0);
-            events.extend(MatchEvent::for_place_at(1, 0, &order, &[], Some(1.0)));
+            events.extend(MatchEvent::for_place_at(
+                1,
+                0,
+                &order,
+                &[],
+                Some(1.0.into()),
+            ));
         }
         for sequence in 0..2 {
             let mut order = Order::new(OrderSide::Buy, 100.0, 1.0, sequence);

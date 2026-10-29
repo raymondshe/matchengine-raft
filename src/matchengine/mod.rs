@@ -442,7 +442,7 @@ pub struct OrderBook {
     /// Price of the most recent trade, if there has been one. This is what
     /// elects parked stops, so it is part of the replicated state.
     #[serde(default)]
-    pub last_trade_price: Option<f64>,
+    pub last_trade_price: Option<Fixed>,
     /// Transient journal of visible-depth changes for the market-data tap.
     /// Never part of a snapshot; drained after each applied entry.
     #[serde(skip)]
@@ -593,11 +593,11 @@ impl AmendError {
 /// One aggregated price level of the book, as returned by [`OrderBook::depth`].
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct DepthLevel {
-    /// Price of the level.
-    pub price: f64,
+    /// Price of the level, scale 18.
+    pub price: Fixed,
     /// Total visible volume resting at the level (hidden iceberg reserve is
-    /// excluded, matching what the book itself can trade).
-    pub volume: f64,
+    /// excluded, matching what the book itself can trade), scale 18.
+    pub volume: Fixed,
     /// Number of orders at the level.
     pub orders: u32,
 }
@@ -611,10 +611,11 @@ pub struct DepthLevel {
 pub struct DepthChange {
     /// Side of the book the level belongs to.
     pub side: OrderSide,
-    /// Price of the level.
-    pub price: f64,
-    /// Change in visible resting volume (hidden iceberg reserve is excluded).
-    pub delta_volume: f64,
+    /// Price of the level, scale 18.
+    pub price: Fixed,
+    /// Change in visible resting volume (hidden iceberg reserve is excluded),
+    /// scale 18.
+    pub delta_volume: Fixed,
     /// Change in the number of resting orders at the level.
     pub delta_orders: i32,
 }
@@ -727,8 +728,8 @@ impl OrderBook {
         if self.record_depth {
             self.depth_journal.push(DepthChange {
                 side,
-                price: price.to_f64(),
-                delta_volume: delta_volume.to_f64(),
+                price,
+                delta_volume,
                 delta_orders,
             });
         }
@@ -753,18 +754,21 @@ impl OrderBook {
     /// Best ask minus best bid, if both sides of the book are populated.
     ///
     /// A crossed book never exists after a successful submission, so the
-    /// spread is non-negative for a live book.
-    pub fn spread(&self) -> Option<f64> {
+    /// spread is non-negative for a live book. Returns `None` if the
+    /// subtraction overflows the fixed-point range.
+    pub fn spread(&self) -> Option<Fixed> {
         match (self.best_bid(), self.best_ask()) {
-            (Some(bid), Some(ask)) => Some((ask.price - bid.price).into()),
+            (Some(bid), Some(ask)) => ask.price.checked_sub(bid.price),
             _ => None,
         }
     }
 
     /// Midpoint between the best bid and the best ask, if both exist.
-    pub fn mid_price(&self) -> Option<f64> {
+    ///
+    /// Returns `None` if either side is empty or the integer sum overflows.
+    pub fn mid_price(&self) -> Option<Fixed> {
         match (self.best_bid(), self.best_ask()) {
-            (Some(bid), Some(ask)) => Some((bid.price.to_f64() + ask.price.to_f64()) / 2.0),
+            (Some(bid), Some(ask)) => bid.price.midpoint(ask.price),
             _ => None,
         }
     }
@@ -787,17 +791,15 @@ impl OrderBook {
         };
 
         for order in orders {
-            let same_level = depth
-                .last()
-                .is_some_and(|level| level.price == order.price.to_f64());
+            let same_level = depth.last().is_some_and(|level| level.price == order.price);
             if same_level {
                 let level = depth.last_mut().expect("checked above");
-                level.volume += order.volume.to_f64();
+                level.volume += order.volume;
                 level.orders += 1;
             } else if depth.len() < levels {
                 depth.push(DepthLevel {
-                    price: order.price.to_f64(),
-                    volume: order.volume.to_f64(),
+                    price: order.price,
+                    volume: order.volume,
                     orders: 1,
                 });
             } else {
@@ -903,7 +905,7 @@ impl OrderBook {
         if order.is_stop() {
             if self
                 .last_trade_price
-                .is_some_and(|last| order.stop_elected(Fixed::from(last)))
+                .is_some_and(|last| order.stop_elected(last))
             {
                 outcome.rejected = Some(RejectReason::StopWouldTrigger);
             } else {
@@ -955,7 +957,7 @@ impl OrderBook {
 
         // Any trade moves the last trade price, which may elect parked stops.
         if let Some(print) = outcome.fills.last() {
-            self.last_trade_price = Some(print.maker.price.to_f64());
+            self.last_trade_price = Some(print.maker.price);
         }
         self.run_stops(&mut outcome);
 
@@ -1048,12 +1050,12 @@ impl OrderBook {
         market_seq: u64,
     ) -> Result<Amendment, AmendError> {
         if let Some(price) = price
-            && !(price.is_finite() && price > 0.0)
+            && !(price.is_finite() && price > Fixed::ZERO)
         {
             return Err(AmendError::InvalidPrice);
         }
         if let Some(volume) = volume
-            && !(volume.is_finite() && volume > 0.0)
+            && !(volume.is_finite() && volume > Fixed::ZERO)
         {
             return Err(AmendError::InvalidVolume);
         }
@@ -1280,7 +1282,7 @@ impl OrderBook {
 
         // Stop as soon as the taker is exhausted: a zero-volume taker must not
         // "match" the next maker and rewrite it.
-        while remaining_volume > 0.0 {
+        while remaining_volume > Fixed::ZERO {
             // `first_entry` walks the tree once and keeps the position, so
             // removing a fully filled maker, shrinking a partially filled one
             // or refilling an iceberg below does not descend a second time.
@@ -1322,10 +1324,10 @@ impl OrderBook {
 
             // The visible tranche is gone.
             remaining_volume -= match_volume;
-            if maker.hidden_volume > 0.0 {
+            if maker.hidden_volume > Fixed::ZERO {
                 // Iceberg: refill one tranche from the hidden reserve and keep
                 // matching this same order.
-                let draw = if maker.display_volume > 0.0 {
+                let draw = if maker.display_volume > Fixed::ZERO {
                     maker.display_volume.min(maker.hidden_volume)
                 } else {
                     maker.hidden_volume
@@ -1404,7 +1406,7 @@ impl OrderBook {
             let Some(index) = self
                 .stops
                 .iter()
-                .position(|stop| stop.stop_elected(Fixed::from(last_trade_price)))
+                .position(|stop| stop.stop_elected(last_trade_price))
             else {
                 return;
             };
@@ -1421,14 +1423,14 @@ impl OrderBook {
 
             let (fills, remainder) = self.sweep(&stop, limit);
             if let Some(print) = fills.last() {
-                self.last_trade_price = Some(print.maker.price.to_f64());
+                self.last_trade_price = Some(print.maker.price);
             }
 
             outcome.triggers.push(StopExecution {
                 stop,
-                trigger_price: Fixed::from(trigger_price),
+                trigger_price,
                 fills,
-                cancelled: (remainder > 0.0).then_some(remainder),
+                cancelled: (remainder > Fixed::ZERO).then_some(remainder),
             });
         }
     }
@@ -1489,8 +1491,8 @@ fn record_depth_change(
     if record {
         journal.push(DepthChange {
             side,
-            price: price.to_f64(),
-            delta_volume: delta_volume.to_f64(),
+            price,
+            delta_volume,
             delta_orders,
         });
     }
@@ -1553,17 +1555,17 @@ fn amend_in_map<K: Ord>(
 /// Checks an order's shape and whether its type combination is supported;
 /// `None` means the order is admissible.
 fn validate_order(order: &Order) -> Option<RejectReason> {
-    if !(order.volume.is_finite() && order.volume > 0.0) {
+    if !(order.volume.is_finite() && order.volume > Fixed::ZERO) {
         return Some(RejectReason::InvalidOrder);
     }
     // A market order ignores its own price; a limit order (including a
     // stop-limit child) needs a positive one.
-    if order.live == OrderType::Limit && !(order.price.is_finite() && order.price > 0.0) {
+    if order.live == OrderType::Limit && !(order.price.is_finite() && order.price > Fixed::ZERO) {
         return Some(RejectReason::InvalidOrder);
     }
     // A stop price is a price, not a size: any non-negative finite value is
     // fine (`0.0` means "no stop").
-    if !order.stop_price.is_finite() || order.stop_price < 0.0 {
+    if !order.stop_price.is_finite() || order.stop_price < Fixed::ZERO {
         return Some(RejectReason::InvalidOrder);
     }
     // An iceberg displays whole tranches: anything outside (0, volume] is nonsense.
@@ -1577,12 +1579,12 @@ fn validate_order(order: &Order) -> Option<RejectReason> {
     // Combinations this engine does not define: post-only and stops are their
     // own admission paths, and neither can also be an iceberg or immediate.
     if order.post_only
-        && (order.live != OrderType::Limit || order.is_stop() || order.display_volume > 0.0)
+        && (order.live != OrderType::Limit || order.is_stop() || order.display_volume > Fixed::ZERO)
     {
         return Some(RejectReason::InvalidOrder);
     }
     if order.is_stop()
-        && (order.post_only || order.display_volume > 0.0 || order.tif.is_immediate())
+        && (order.post_only || order.display_volume > Fixed::ZERO || order.tif.is_immediate())
     {
         return Some(RejectReason::InvalidOrder);
     }
@@ -2179,7 +2181,7 @@ mod tests {
         let mut taker = resting_order(OrderSide::Sell, 100.0, 10.0, 4);
         let outcome = ob.execute_order(&mut taker);
         assert!(outcome.triggers.is_empty());
-        assert_eq!(Some(100.0), ob.last_trade_price);
+        assert_eq!(Some(100.0), ob.last_trade_price.map(Fixed::to_f64));
 
         // A print at 95 elects the stop: the market child sweeps 5 off the bid.
         let mut taker = resting_order(OrderSide::Sell, 95.0, 3.0, 5);
@@ -2207,7 +2209,7 @@ mod tests {
         assert!(trigger.cancelled.is_none());
         assert!(ob.stops.is_empty(), "an elected stop leaves the book");
         assert_eq!(2.0, ob.best_bid().expect("10 - 3 - 5 = 2").volume);
-        assert_eq!(Some(95.0), ob.last_trade_price);
+        assert_eq!(Some(95.0), ob.last_trade_price.map(Fixed::to_f64));
     }
 
     #[test]
@@ -2254,13 +2256,65 @@ mod tests {
     }
 
     #[test]
+    fn exact_last_trade_price_does_not_round_stop_election() {
+        let mut ob = OrderBook::new();
+        let stop_price: Fixed = "100.000000000000000001".parse().unwrap();
+        let trade_price: Fixed = "100.000000000000000002".parse().unwrap();
+
+        let mut bid = Order::new(OrderSide::Buy, trade_price, 1, 1);
+        ob.place_order(&mut bid);
+        let mut stop = Order::new(OrderSide::Sell, Fixed::ZERO, 1, 2);
+        stop.live = OrderType::Market;
+        stop.stop_price = stop_price;
+        ob.execute_order(&mut stop);
+        assert!(ob.stops.len() == 1, "the stop parks");
+
+        // A print above a sell stop must not elect it. Both values collapse to
+        // the same f64, so a conversion here would incorrectly trigger it.
+        let mut taker = Order::new(OrderSide::Sell, trade_price, 1, 3);
+        let outcome = ob.execute_order(&mut taker);
+        assert_eq!(Some(trade_price), ob.last_trade_price);
+        assert!(outcome.triggers.is_empty(), "100...002 is above 100...001");
+        assert_eq!(1, ob.stops.len());
+
+        // A print exactly at the stop price does elect it.
+        let mut bid = Order::new(OrderSide::Buy, stop_price, 1, 4);
+        ob.place_order(&mut bid);
+        let mut taker = Order::new(OrderSide::Sell, stop_price, 1, 5);
+        let outcome = ob.execute_order(&mut taker);
+        assert_eq!(1, outcome.triggers.len());
+        assert_eq!(stop_price, outcome.triggers[0].trigger_price);
+        assert!(ob.stops.is_empty());
+    }
+
+    #[test]
+    fn spread_and_midpoint_keep_18_decimals() {
+        let mut ob = OrderBook::new();
+        let bid_price: Fixed = "100.000000000000000001".parse().unwrap();
+        let ask_price: Fixed = "100.000000000000000003".parse().unwrap();
+        let mut bid = Order::new(OrderSide::Buy, bid_price, 1, 1);
+        let mut ask = Order::new(OrderSide::Sell, ask_price, 1, 2);
+        ob.place_order(&mut bid);
+        ob.place_order(&mut ask);
+
+        assert_eq!(
+            Some("0.000000000000000002".parse::<Fixed>().unwrap()),
+            ob.spread()
+        );
+        assert_eq!(
+            Some("100.000000000000000002".parse::<Fixed>().unwrap()),
+            ob.mid_price()
+        );
+    }
+
+    #[test]
     fn stop_that_the_last_trade_already_crossed_is_refused() {
         let mut ob = OrderBook::new();
         let mut bid = resting_order(OrderSide::Buy, 100.0, 10.0, 1);
         ob.place_order(&mut bid);
         let mut taker = resting_order(OrderSide::Sell, 100.0, 5.0, 2);
         ob.place_order(&mut taker);
-        assert_eq!(Some(100.0), ob.last_trade_price);
+        assert_eq!(Some(100.0), ob.last_trade_price.map(Fixed::to_f64));
 
         // A sell stop at or above the last trade would fire immediately, so a
         // stop never turns into a market order on entry.
@@ -2429,7 +2483,7 @@ mod tests {
         assert_eq!(Some(3.0), outcome.triggers[1].cancelled.map(Fixed::to_f64));
         assert!(ob.stops.is_empty());
         assert!(ob.bids.is_empty());
-        assert_eq!(Some(90.0), ob.last_trade_price);
+        assert_eq!(Some(90.0), ob.last_trade_price.map(Fixed::to_f64));
     }
 
     #[test]
@@ -2611,13 +2665,13 @@ mod tests {
         assert_eq!(
             vec![
                 DepthLevel {
-                    price: 100.0,
-                    volume: 3.0,
+                    price: 100.0.into(),
+                    volume: 3.0.into(),
                     orders: 2
                 },
                 DepthLevel {
-                    price: 99.0,
-                    volume: 3.0,
+                    price: 99.0.into(),
+                    volume: 3.0.into(),
                     orders: 1
                 },
             ],
@@ -2628,8 +2682,8 @@ mod tests {
         assert_eq!(2, asks.len());
         assert_eq!(101.0, asks[0].price);
 
-        assert_eq!(Some(1.0), ob.spread());
-        assert_eq!(Some(100.5), ob.mid_price());
+        assert_eq!(Some(1.0), ob.spread().map(Fixed::to_f64));
+        assert_eq!(Some(100.5), ob.mid_price().map(Fixed::to_f64));
         assert!(ob.depth(OrderSide::Buy, 0).is_empty());
     }
 
@@ -2659,12 +2713,14 @@ mod tests {
     // --- Depth journal
 
     fn sum_depth(journal: &[DepthChange], side: OrderSide, price: f64) -> (f64, i32) {
-        journal
+        let price = Fixed::from(price);
+        let (volume, orders) = journal
             .iter()
             .filter(|change| change.side == side && change.price == price)
-            .fold((0.0, 0), |(volume, orders), change| {
+            .fold((Fixed::ZERO, 0), |(volume, orders), change| {
                 (volume + change.delta_volume, orders + change.delta_orders)
-            })
+            });
+        (volume.to_f64(), orders)
     }
 
     #[test]
@@ -2677,8 +2733,8 @@ mod tests {
         assert_eq!(
             vec![DepthChange {
                 side: OrderSide::Sell,
-                price: 100.0,
-                delta_volume: 10.0,
+                price: 100.0.into(),
+                delta_volume: 10.0.into(),
                 delta_orders: 1,
             }],
             ob.take_depth_journal()
@@ -2689,8 +2745,8 @@ mod tests {
         assert_eq!(
             vec![DepthChange {
                 side: OrderSide::Sell,
-                price: 100.0,
-                delta_volume: -4.0,
+                price: 100.0.into(),
+                delta_volume: (-4.0).into(),
                 delta_orders: 0,
             }],
             ob.take_depth_journal()
@@ -2701,8 +2757,8 @@ mod tests {
         assert_eq!(
             vec![DepthChange {
                 side: OrderSide::Sell,
-                price: 100.0,
-                delta_volume: -6.0,
+                price: 100.0.into(),
+                delta_volume: (-6.0).into(),
                 delta_orders: -1,
             }],
             ob.take_depth_journal()
@@ -2721,8 +2777,8 @@ mod tests {
         assert_eq!(
             vec![DepthChange {
                 side: OrderSide::Sell,
-                price: 100.0,
-                delta_volume: 4.0,
+                price: 100.0.into(),
+                delta_volume: 4.0.into(),
                 delta_orders: 1,
             }],
             ob.take_depth_journal()
@@ -2753,8 +2809,8 @@ mod tests {
         assert_eq!(
             vec![DepthChange {
                 side: OrderSide::Buy,
-                price: 100.0,
-                delta_volume: -6.0,
+                price: 100.0.into(),
+                delta_volume: (-6.0).into(),
                 delta_orders: 0,
             }],
             ob.take_depth_journal()

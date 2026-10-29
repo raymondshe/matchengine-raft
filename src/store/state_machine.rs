@@ -47,6 +47,7 @@ use crate::match_result::MatchEvent;
 use crate::match_result::MatchEventKind;
 use crate::match_result::MatchResultSink;
 use crate::match_result::NoopSink;
+use crate::matchengine::Fixed;
 use crate::matchengine::Order;
 use crate::matchengine::OrderBook;
 use crate::matchengine::OrderSide;
@@ -65,10 +66,11 @@ const SNAPSHOT_MAGIC: &[u8; 7] = b"MRFSNAP";
 /// extended [`Order`] fields (time in force, post-only, stop price, iceberg tranches,
 /// timestamp) together with parked stops and the last trade price. Version 4 adds the
 /// retained match-event window and the client-order-id dedupe map. Version 5 stores
-/// order prices and quantities as 18-scale fixed-point integers. Postcard is not
-/// self-describing, so an older file is rejected with an explicit error instead of being
-/// decoded into a different shape.
-const SNAPSHOT_VERSION: u32 = 5;
+/// order prices and quantities as 18-scale fixed-point integers. Version 6 stores the
+/// last trade price and match events as fixed-point values. Postcard is not self-describing,
+/// so an older file is rejected with an explicit error instead of being decoded into a
+/// different shape.
+const SNAPSHOT_VERSION: u32 = 6;
 /// `magic + version + crc32 of the body`.
 const SNAPSHOT_HEADER_LEN: usize = SNAPSHOT_MAGIC.len() + 4 + 4;
 
@@ -113,8 +115,8 @@ pub struct StoredMatchEvent {
     pub side: OrderSide,
     pub counterparty_sequence: Option<u64>,
     pub previous_sequence: Option<u64>,
-    pub price: f64,
-    pub volume: f64,
+    pub price: Fixed,
+    pub volume: Fixed,
     pub reason: Option<RejectReason>,
 }
 
@@ -176,7 +178,7 @@ pub struct StateMachineData {
     pub stops: Vec<Order>,
 
     /// Price of the most recent trade, which elects parked stops.
-    pub last_trade_price: Option<f64>,
+    pub last_trade_price: Option<Fixed>,
 
     /// Retained match events, oldest first.
     #[serde(default)]
@@ -806,14 +808,14 @@ where
                                     events.len() as u32,
                                     &o,
                                     &outcome.fills,
-                                    outcome.resting.map(Into::into),
+                                    outcome.resting,
                                 ));
                                 if let Some(volume) = outcome.cancelled {
                                     events.push(MatchEvent::for_cancelled_volume(
                                         log_index,
                                         events.len() as u32,
                                         &o,
-                                        volume.into(),
+                                        volume,
                                     ));
                                 }
                                 for trigger in &outcome.triggers {
@@ -821,7 +823,7 @@ where
                                         log_index,
                                         events.len() as u32,
                                         &trigger.stop,
-                                        trigger.trigger_price.into(),
+                                        trigger.trigger_price,
                                     ));
                                     events.extend(MatchEvent::for_fills(
                                         log_index,
@@ -835,7 +837,7 @@ where
                                             log_index,
                                             events.len() as u32,
                                             &trigger.stop,
-                                            volume.into(),
+                                            volume,
                                         ));
                                     }
                                 }
@@ -1691,7 +1693,7 @@ mod tests {
         assert_eq!(2, snapshot.market_seq, "the next sequence is the boundary");
         assert_eq!(1, snapshot.bids.len(), "the bid remainder is captured");
         assert_eq!(6.0, snapshot.bids[0].volume);
-        assert_eq!(Some(100.0), snapshot.last_trade);
+        assert_eq!(Some(100.0.into()), snapshot.last_trade);
 
         let status = store
             .inner()

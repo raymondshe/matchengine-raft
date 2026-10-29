@@ -33,6 +33,7 @@ use serde::Deserialize;
 use serde::Serialize;
 
 use crate::matchengine::Amendment;
+use crate::matchengine::Fixed;
 use crate::matchengine::MatchResult;
 use crate::matchengine::Order;
 use crate::matchengine::OrderSide;
@@ -99,12 +100,12 @@ pub struct MatchEvent {
     pub previous_sequence: Option<u64>,
     /// Execution price for a fill, the trigger price for a stop election, the order price
     /// otherwise.
-    pub price: f64,
+    pub price: Fixed,
     /// Executed volume for a fill; resting remainder for [`MatchEventKind::Rested`]; the volume
     /// that was still open for [`MatchEventKind::Cancelled`] and [`MatchEventKind::Expired`]; the
     /// stop's open volume for [`MatchEventKind::Triggered`]; the submitted volume for
     /// [`MatchEventKind::Rejected`]; the new open volume for [`MatchEventKind::Amended`].
-    pub volume: f64,
+    pub volume: Fixed,
     /// The policy reason behind a rejection or expiry. Absent (and omitted from the JSON lines)
     /// for every other kind.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -136,8 +137,8 @@ impl MatchEvent {
                 side: taker_side,
                 counterparty_sequence: Some(m.maker.sequence),
                 previous_sequence: None,
-                price: m.maker.price.into(),
-                volume: m.matches.into(),
+                price: m.maker.price,
+                volume: m.matches,
                 reason: None,
             })
             .collect()
@@ -152,7 +153,7 @@ impl MatchEvent {
         log_index: u64,
         taker: &Order,
         matches: &[MatchResult],
-        resting_volume: Option<f64>,
+        resting_volume: Option<Fixed>,
     ) -> Vec<MatchEvent> {
         Self::for_place_at(log_index, 0, taker, matches, resting_volume)
     }
@@ -164,7 +165,7 @@ impl MatchEvent {
         first_ordinal: u32,
         taker: &Order,
         matches: &[MatchResult],
-        resting_volume: Option<f64>,
+        resting_volume: Option<Fixed>,
     ) -> Vec<MatchEvent> {
         let mut events = Self::for_fills(
             log_index,
@@ -185,7 +186,7 @@ impl MatchEvent {
                 side: taker.side,
                 counterparty_sequence: None,
                 previous_sequence: None,
-                price: taker.price.into(),
+                price: taker.price,
                 volume,
                 reason: None,
             });
@@ -202,12 +203,7 @@ impl MatchEvent {
 
     /// [`MatchEvent::for_cancel`] at an explicit ordinal.
     pub fn for_cancel_at(log_index: u64, ordinal: u32, cancelled: &Order) -> MatchEvent {
-        Self::for_cancelled_volume(
-            log_index,
-            ordinal,
-            cancelled,
-            cancelled.open_volume().into(),
-        )
+        Self::for_cancelled_volume(log_index, ordinal, cancelled, cancelled.open_volume())
     }
 
     /// A `Cancelled` event with an explicit open volume: the unexecuted remainder of an IOC
@@ -216,7 +212,7 @@ impl MatchEvent {
         log_index: u64,
         ordinal: u32,
         order: &Order,
-        volume: f64,
+        volume: Fixed,
     ) -> MatchEvent {
         MatchEvent {
             event_id: EventId { log_index, ordinal },
@@ -225,7 +221,7 @@ impl MatchEvent {
             side: order.side,
             counterparty_sequence: None,
             previous_sequence: None,
-            price: order.price.into(),
+            price: order.price,
             volume,
             reason: None,
         }
@@ -237,7 +233,7 @@ impl MatchEvent {
         log_index: u64,
         ordinal: u32,
         stop: &Order,
-        trigger_price: f64,
+        trigger_price: Fixed,
     ) -> MatchEvent {
         MatchEvent {
             event_id: EventId { log_index, ordinal },
@@ -247,7 +243,7 @@ impl MatchEvent {
             counterparty_sequence: None,
             previous_sequence: None,
             price: trigger_price,
-            volume: stop.open_volume().into(),
+            volume: stop.open_volume(),
             reason: None,
         }
     }
@@ -261,8 +257,8 @@ impl MatchEvent {
             side: expired.side,
             counterparty_sequence: None,
             previous_sequence: None,
-            price: expired.price.into(),
-            volume: expired.open_volume().into(),
+            price: expired.price,
+            volume: expired.open_volume(),
             reason: None,
         }
     }
@@ -281,8 +277,8 @@ impl MatchEvent {
             side: order.side,
             counterparty_sequence: None,
             previous_sequence: None,
-            price: order.price.into(),
-            volume: order.volume.into(),
+            price: order.price,
+            volume: order.volume,
             reason: Some(reason),
         }
     }
@@ -297,8 +293,8 @@ impl MatchEvent {
             side: amendment.order.side,
             counterparty_sequence: None,
             previous_sequence: Some(amendment.previous_sequence),
-            price: amendment.order.price.into(),
-            volume: amendment.order.volume.into(),
+            price: amendment.order.price,
+            volume: amendment.order.volume,
             reason: None,
         }
     }
@@ -508,7 +504,7 @@ mod tests {
         let maker = order(OrderSide::Sell, 98.0, 4.0, 1);
         let matches = vec![MatchResult::new(&taker, &maker, 4.0)];
 
-        let events = MatchEvent::for_place(9, &taker, &matches, Some(6.0));
+        let events = MatchEvent::for_place(9, &taker, &matches, Some(6.0.into()));
 
         assert_eq!(2, events.len());
         let rested = &events[1];
@@ -563,7 +559,7 @@ mod tests {
     fn memory_sink_records_published_events() {
         let sink = MemorySink::new();
         let taker = order(OrderSide::Buy, 10.0, 2.0, 1);
-        let events = MatchEvent::for_place(3, &taker, &[], Some(2.0));
+        let events = MatchEvent::for_place(3, &taker, &[], Some(2.0.into()));
 
         sink.publish(&events).unwrap();
         sink.publish(&[MatchEvent::for_cancel(4, &taker)]).unwrap();
@@ -588,7 +584,7 @@ mod tests {
             1,
             &taker,
             &[MatchResult::new(&taker, &maker, 4.0)],
-            Some(6.0),
+            Some(6.0.into()),
         );
         sink.publish(&events).unwrap();
         sink.publish(&[MatchEvent::for_cancel(2, &taker)]).unwrap();
@@ -599,10 +595,10 @@ mod tests {
         assert_eq!(serde_json::json!("fill"), lines[0]["kind"]);
         assert_eq!(serde_json::json!(1), lines[0]["event_id"]["log_index"]);
         assert_eq!(serde_json::json!(0), lines[0]["event_id"]["ordinal"]);
-        assert_eq!(serde_json::json!(4.0), lines[0]["volume"]);
+        assert_eq!(serde_json::json!("4"), lines[0]["volume"]);
         assert_eq!(serde_json::json!(1), lines[0]["counterparty_sequence"]);
         assert_eq!(serde_json::json!("rested"), lines[1]["kind"]);
-        assert_eq!(serde_json::json!(6.0), lines[1]["volume"]);
+        assert_eq!(serde_json::json!("6"), lines[1]["volume"]);
         assert_eq!(serde_json::json!("cancelled"), lines[2]["kind"]);
         assert_eq!(serde_json::json!(2), lines[2]["event_id"]["log_index"]);
     }
@@ -694,7 +690,7 @@ mod tests {
     fn trigger_expiry_and_rejection_events_carry_their_semantics() {
         let stop = order(OrderSide::Sell, 0.0, 5.0, 8);
 
-        let triggered = MatchEvent::for_triggered(40, 1, &stop, 95.0);
+        let triggered = MatchEvent::for_triggered(40, 1, &stop, 95.0.into());
         assert_eq!(MatchEventKind::Triggered, triggered.kind);
         assert_eq!(
             EventId {
@@ -726,7 +722,7 @@ mod tests {
     fn cancel_with_an_explicit_remainder_reports_that_remainder() {
         let taker = order(OrderSide::Buy, 100.0, 9.0, 4);
 
-        let event = MatchEvent::for_cancelled_volume(7, 2, &taker, 3.5);
+        let event = MatchEvent::for_cancelled_volume(7, 2, &taker, 3.5.into());
 
         assert_eq!(MatchEventKind::Cancelled, event.kind);
         assert_eq!(

@@ -45,7 +45,15 @@ impl Fixed {
         self.0
     }
 
-    /// Converts to `f64` for legacy JSON/market-data boundaries.
+    /// Rebuilds a value from its scaled integer representation.
+    ///
+    /// This is the inverse of [`Fixed::raw`] and the constructor used by
+    /// wire-v3 decoders.
+    pub const fn from_raw(raw: i128) -> Self {
+        Self(raw)
+    }
+
+    /// Converts to `f64` for legacy callers and tests. Public financial outputs do not use it.
     pub fn to_f64(self) -> f64 {
         self.0 as f64 / SCALE as f64
     }
@@ -63,6 +71,41 @@ impl Fixed {
     /// Returns the smaller of `self` and `other`.
     pub fn min(self, other: impl Into<Self>) -> Self {
         std::cmp::min(self, other.into())
+    }
+
+    /// Subtracts two values, returning `None` on integer overflow.
+    pub fn checked_sub(self, rhs: Self) -> Option<Self> {
+        self.0.checked_sub(rhs.0).map(Self)
+    }
+
+    /// Multiplies two fixed-point values through a 256-bit intermediate.
+    ///
+    /// The product is truncated toward zero to the common 18-digit scale.
+    /// Returns `None` when the unscaled product or the scaled result does not
+    /// fit `i128`; this is the correct operation for price × quantity, whose
+    /// unscaled intermediate can exceed `i128` even when the result fits.
+    pub fn checked_mul(self, rhs: Self) -> Option<Self> {
+        let product = i256::I256::from_i128(self.0).checked_mul(i256::I256::from_i128(rhs.0))?;
+        let scaled = product.checked_div(i256::I256::from_i128(SCALE))?;
+        if scaled < i256::I256::from_i128(i128::MIN) || scaled > i256::I256::from_i128(i128::MAX) {
+            return None;
+        }
+        Some(Self(scaled.as_i128()))
+    }
+
+    /// Price × quantity, rounded toward zero to 18 fractional digits.
+    ///
+    /// This is an alias for [`Fixed::checked_mul`] with the notional use case
+    /// spelled out; callers must decide how to handle an overflow.
+    pub fn notional(price: Self, quantity: Self) -> Option<Self> {
+        price.checked_mul(quantity)
+    }
+
+    /// The midpoint between two values, rounded toward zero to 18 places.
+    ///
+    /// Returns `None` if the integer addition overflows.
+    pub fn midpoint(self, other: Self) -> Option<Self> {
+        self.0.checked_add(other.0).map(|sum| Self(sum / 2))
     }
 
     /// Fixed-point values are always finite.
@@ -203,10 +246,8 @@ impl Mul for Fixed {
     type Output = Self;
 
     fn mul(self, rhs: Self) -> Self::Output {
-        // The matching path does not multiply price by quantity; this is here
-        // for generic arithmetic. Use a wide-enough intermediate when notional
-        // support is added.
-        Self((self.0 * rhs.0) / SCALE)
+        self.checked_mul(rhs)
+            .expect("fixed-point multiplication overflow")
     }
 }
 
@@ -482,5 +523,35 @@ mod tests {
         let b: Fixed = "0.2".parse().unwrap();
         assert_eq!("0.3", (a + b).to_string());
         assert_eq!("0.1", (a * 1.0).to_string());
+    }
+
+    #[test]
+    fn notional_uses_a_256_bit_intermediate() {
+        // Both operands fit i128, but their unscaled product does not.
+        let price = Fixed::from_units(1_000_000_000_000);
+        let quantity = Fixed::from_units(100_000_000);
+        let notional = Fixed::notional(price, quantity).expect("the scaled result fits");
+        assert_eq!("100000000000000000000", notional.to_string());
+        assert_eq!(
+            Some(Fixed::from_units(100_000_000_000_000_000_000)),
+            Some(notional)
+        );
+
+        let very_large = Fixed::from_units(i128::MAX / SCALE);
+        assert_eq!(None, very_large.checked_mul(very_large));
+    }
+
+    #[test]
+    fn midpoint_is_exact_at_the_scale() {
+        let a: Fixed = "100.000000000000000001".parse().unwrap();
+        let b: Fixed = "100.000000000000000002".parse().unwrap();
+        assert_eq!(
+            "100.000000000000000001",
+            a.midpoint(b).expect("no overflow").to_string()
+        );
+        assert_eq!(
+            None,
+            Fixed::from_units(i128::MAX / SCALE).midpoint(Fixed::from_units(i128::MAX / SCALE))
+        );
     }
 }

@@ -154,8 +154,8 @@ fn market_data_feed_publishes_trades_bbo_depth_and_bars() {
                 .flatten()
                 .any(|level| {
                     level["side"] == "Buy"
-                        && level["level"]["price"] == 100.0
-                        && level["level"]["volume"] == 3.0
+                        && level["level"]["price"] == "100"
+                        && level["level"]["volume"] == "3"
                 })
         };
         let events = wait_for_events(&event_log, |events| {
@@ -180,7 +180,7 @@ fn market_data_feed_publishes_trades_bbo_depth_and_bars() {
             .find(|event| {
                 event["body"]["trade"]
                     .as_array()
-                    .is_some_and(|records| records.iter().any(|r| r["volume"] == 4.0))
+                    .is_some_and(|records| records.iter().any(|r| r["volume"] == "4"))
             })
             .expect("the four-fill trade");
         assert_eq!(sell_seq, first_trade_message["market_seq"]);
@@ -189,8 +189,8 @@ fn market_data_feed_publishes_trades_bbo_depth_and_bars() {
             .as_array()
             .and_then(|records| records.first())
             .expect("at least one fill is published");
-        assert_eq!(100.0, first_trade["price"]);
-        assert_eq!(4.0, first_trade["volume"]);
+        assert_eq!("100", first_trade["price"]);
+        assert_eq!("4", first_trade["volume"]);
         assert_eq!("Sell", first_trade["taker_side"]);
         assert!(
             first_trade["ts_ms"].as_u64().unwrap() > 1_000,
@@ -201,11 +201,11 @@ fn market_data_feed_publishes_trades_bbo_depth_and_bars() {
         // BBO eventually shows the resting ask and the last trade.
         let bbo = events
             .iter()
-            .find(|event| event["body"]["bbo"]["ask"] == 101.0)
+            .find(|event| event["body"]["bbo"]["ask"] == "101")
             .expect("a BBO with the resting ask");
-        assert_eq!(100.0, bbo["body"]["bbo"]["bid"]);
-        assert_eq!(100.0, bbo["body"]["bbo"]["last_trade"]);
-        assert_eq!(1.0, bbo["body"]["bbo"]["spread"]);
+        assert_eq!("100", bbo["body"]["bbo"]["bid"]);
+        assert_eq!("100", bbo["body"]["bbo"]["last_trade"]);
+        assert_eq!("1", bbo["body"]["bbo"]["spread"]);
 
         // The first second-bar aggregates the first fill.
         let bar = events
@@ -213,8 +213,8 @@ fn market_data_feed_publishes_trades_bbo_depth_and_bars() {
             .find(|event| event["body"].get("bar").is_some())
             .expect("a closed bar");
         assert_eq!(1_000, bar["body"]["bar"]["interval_ms"]);
-        assert_eq!(100.0, bar["body"]["bar"]["open"]);
-        assert_eq!(100.0, bar["body"]["bar"]["close"]);
+        assert_eq!("100", bar["body"]["bar"]["open"]);
+        assert_eq!("100", bar["body"]["bar"]["close"]);
         assert!(bar["body"]["bar"]["trade_count"].as_u64().unwrap() >= 1);
 
         // The quantity amendment shows up as a post-batch depth total.
@@ -224,8 +224,8 @@ fn market_data_feed_publishes_trades_bbo_depth_and_bars() {
             .flatten()
             .find(|level| {
                 level["side"] == "Buy"
-                    && level["level"]["price"] == 100.0
-                    && level["level"]["volume"] == 3.0
+                    && level["level"]["price"] == "100"
+                    && level["level"]["volume"] == "3"
             })
             .expect("the amendment's post-batch total");
         assert_eq!(1, amended["level"]["orders"]);
@@ -237,8 +237,8 @@ fn market_data_feed_publishes_trades_bbo_depth_and_bars() {
                     .is_some_and(|levels| {
                         levels.iter().any(|level| {
                             level["side"] == "Buy"
-                                && level["level"]["price"] == 100.0
-                                && level["level"]["volume"] == 3.0
+                                && level["level"]["price"] == "100"
+                                && level["level"]["volume"] == "3"
                         })
                     })
             })

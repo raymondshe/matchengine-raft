@@ -1,3 +1,4 @@
 target
 *.log
+logs/
 my_db
