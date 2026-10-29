@@ -4,6 +4,7 @@ use serde::Deserialize;
 use serde::Serialize;
 
 use crate::match_result::MatchEvent;
+use crate::matchengine::Fixed;
 use crate::matchengine::Order;
 
 /// Application requests that can be applied to the Raft state machine.
@@ -38,10 +39,10 @@ pub enum MatchEngineRequest {
         order: Order,
         /// New price; omitted/`null` keeps the current one.
         #[serde(default)]
-        price: Option<f64>,
+        price: Option<Fixed>,
         /// New open volume; omitted/`null` keeps the current one.
         #[serde(default)]
-        volume: Option<f64>,
+        volume: Option<Fixed>,
     },
     /// Explicitly evict orders whose time in force has expired at `now_ms`.
     ///

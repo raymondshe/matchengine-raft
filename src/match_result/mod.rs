@@ -136,8 +136,8 @@ impl MatchEvent {
                 side: taker_side,
                 counterparty_sequence: Some(m.maker.sequence),
                 previous_sequence: None,
-                price: m.maker.price,
-                volume: m.matches,
+                price: m.maker.price.into(),
+                volume: m.matches.into(),
                 reason: None,
             })
             .collect()
@@ -185,7 +185,7 @@ impl MatchEvent {
                 side: taker.side,
                 counterparty_sequence: None,
                 previous_sequence: None,
-                price: taker.price,
+                price: taker.price.into(),
                 volume,
                 reason: None,
             });
@@ -202,7 +202,12 @@ impl MatchEvent {
 
     /// [`MatchEvent::for_cancel`] at an explicit ordinal.
     pub fn for_cancel_at(log_index: u64, ordinal: u32, cancelled: &Order) -> MatchEvent {
-        Self::for_cancelled_volume(log_index, ordinal, cancelled, cancelled.open_volume())
+        Self::for_cancelled_volume(
+            log_index,
+            ordinal,
+            cancelled,
+            cancelled.open_volume().into(),
+        )
     }
 
     /// A `Cancelled` event with an explicit open volume: the unexecuted remainder of an IOC
@@ -220,7 +225,7 @@ impl MatchEvent {
             side: order.side,
             counterparty_sequence: None,
             previous_sequence: None,
-            price: order.price,
+            price: order.price.into(),
             volume,
             reason: None,
         }
@@ -242,7 +247,7 @@ impl MatchEvent {
             counterparty_sequence: None,
             previous_sequence: None,
             price: trigger_price,
-            volume: stop.open_volume(),
+            volume: stop.open_volume().into(),
             reason: None,
         }
     }
@@ -256,8 +261,8 @@ impl MatchEvent {
             side: expired.side,
             counterparty_sequence: None,
             previous_sequence: None,
-            price: expired.price,
-            volume: expired.open_volume(),
+            price: expired.price.into(),
+            volume: expired.open_volume().into(),
             reason: None,
         }
     }
@@ -276,8 +281,8 @@ impl MatchEvent {
             side: order.side,
             counterparty_sequence: None,
             previous_sequence: None,
-            price: order.price,
-            volume: order.volume,
+            price: order.price.into(),
+            volume: order.volume.into(),
             reason: Some(reason),
         }
     }
@@ -292,8 +297,8 @@ impl MatchEvent {
             side: amendment.order.side,
             counterparty_sequence: None,
             previous_sequence: Some(amendment.previous_sequence),
-            price: amendment.order.price,
-            volume: amendment.order.volume,
+            price: amendment.order.price.into(),
+            volume: amendment.order.volume.into(),
             reason: None,
         }
     }
@@ -771,8 +776,8 @@ mod tests {
             market_seq: 9,
             order,
             previous_sequence: 5,
-            previous_price: 100.0,
-            previous_volume: 4.0,
+            previous_price: 100.0.into(),
+            previous_volume: 4.0.into(),
         };
 
         let event = MatchEvent::for_amended(12, 0, &amendment);

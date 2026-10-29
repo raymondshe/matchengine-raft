@@ -64,10 +64,11 @@ const SNAPSHOT_MAGIC: &[u8; 7] = b"MRFSNAP";
 /// Version 2 dropped the key-value store from [`StateMachineData`]. Version 3 added the
 /// extended [`Order`] fields (time in force, post-only, stop price, iceberg tranches,
 /// timestamp) together with parked stops and the last trade price. Version 4 adds the
-/// retained match-event window and the client-order-id dedupe map. Postcard is not
+/// retained match-event window and the client-order-id dedupe map. Version 5 stores
+/// order prices and quantities as 18-scale fixed-point integers. Postcard is not
 /// self-describing, so an older file is rejected with an explicit error instead of being
 /// decoded into a different shape.
-const SNAPSHOT_VERSION: u32 = 4;
+const SNAPSHOT_VERSION: u32 = 5;
 /// `magic + version + crc32 of the body`.
 const SNAPSHOT_HEADER_LEN: usize = SNAPSHOT_MAGIC.len() + 4 + 4;
 
@@ -805,14 +806,14 @@ where
                                     events.len() as u32,
                                     &o,
                                     &outcome.fills,
-                                    outcome.resting,
+                                    outcome.resting.map(Into::into),
                                 ));
                                 if let Some(volume) = outcome.cancelled {
                                     events.push(MatchEvent::for_cancelled_volume(
                                         log_index,
                                         events.len() as u32,
                                         &o,
-                                        volume,
+                                        volume.into(),
                                     ));
                                 }
                                 for trigger in &outcome.triggers {
@@ -820,7 +821,7 @@ where
                                         log_index,
                                         events.len() as u32,
                                         &trigger.stop,
-                                        trigger.trigger_price,
+                                        trigger.trigger_price.into(),
                                     ));
                                     events.extend(MatchEvent::for_fills(
                                         log_index,
@@ -834,7 +835,7 @@ where
                                             log_index,
                                             events.len() as u32,
                                             &trigger.stop,
-                                            volume,
+                                            volume.into(),
                                         ));
                                     }
                                 }
@@ -1399,7 +1400,7 @@ mod tests {
 
         let mut stop = Order::new(OrderSide::Sell, 0.0, 5.0, 0);
         stop.live = OrderType::Market;
-        stop.stop_price = 95.0;
+        stop.stop_price = 95.0.into();
 
         let entries = futures::stream::iter(vec![
             Ok((
@@ -1550,7 +1551,7 @@ mod tests {
                     EntryPayload::Normal(MatchEngineRequest::Amend {
                         order: bid,
                         price: None,
-                        volume: Some(12.0),
+                        volume: Some(12.0.into()),
                     }),
                 ),
                 None,
@@ -1560,7 +1561,7 @@ mod tests {
                     3,
                     EntryPayload::Normal(MatchEngineRequest::Amend {
                         order: Order::new(OrderSide::Buy, 100.0, 1.0, 42),
-                        price: Some(99.0),
+                        price: Some(99.0.into()),
                         volume: None,
                     }),
                 ),

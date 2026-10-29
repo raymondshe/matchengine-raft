@@ -347,7 +347,7 @@ avoiding a second fsync per batch.
 ### Snapshots (`src/store/state_machine.rs`)
 
 The state machine (order book + sequence counter + retained match-event window + submission dedupe
-map) stays in memory so applying entries is fast. Snapshot v4 is written as
+map) stays in memory so applying entries is fast. Snapshot v5 is written as
 `snapshot/current.snap` using the same atomic temp-file/rename protocol; `install_snapshot`
 validates the incoming bytes before replacing the durable copy, so a bad snapshot cannot destroy a
 good one.
@@ -477,7 +477,7 @@ POST /write { Place | Cancel | Amend | PurgeExpired }
 `Place` accepts an optional `client_order_id`; retrying it returns the original sequence and
 events instead of placing a second order. The event window is bounded by `--max-events` (env
 `MAX_EVENTS`, default 262144); the submission map has a separate fixed 262144-record cap so retry
-resolution never depends on a node-local flag. Both are included in snapshot v4. `GET /events/status` reports the
+resolution never depends on a node-local flag. Both are included in snapshot v5. `GET /events/status` reports the
 oldest/last retained id and eviction counters; consumers resume from `next_after` and dedupe on
 `event_id`.
 
@@ -629,7 +629,7 @@ The Rust request/response types behind `/write` are:
 pub enum MatchEngineRequest {
     Place { order: Order, client_order_id: Option<String> },
     Cancel { order: Order },
-    Amend { order: Order, price: Option<f64>, volume: Option<f64> },
+    Amend { order: Order, price: Option<Fixed>, volume: Option<Fixed> },
     PurgeExpired { now_ms: u64, day_close_ms: Option<u64> },
 }
 
@@ -659,10 +659,16 @@ order book:
 - `orderbook_sequence` - the order sequence counter (`orderbook_sequance` is accepted as a legacy
   alias)
 
+Prices and quantities are stored internally as exact 18-scale fixed-point integers. JSON accepts
+either decimal strings or legacy numbers; strings are recommended for more than 15 significant
+digits, and `/read` emits strings so 18-decimal values round-trip exactly. Each instrument can
+configure its accepted price/quantity decimals with `SymbolConfig` (maximum 18); values are
+normalized to the common 18-decimal scale.
+
 Example order payload accepted by `/write` (note the field name `sequence`):
 
 ```json
-{"Place": {"order": {"live": "Limit", "side": "Buy", "price": 4000.0, "volume": 4.4, "id": 1, "sequence": 1}, "client_order_id": "order-123"}}
+{"Place": {"order": {"live": "Limit", "side": "Buy", "price": "4000.25", "volume": "4.4", "id": 1, "sequence": 1}, "client_order_id": "order-123"}}
 ```
 
 `client_order_id` is optional; omit it for the old non-idempotent behaviour.
@@ -721,7 +727,9 @@ Still missing:
 - No transport benchmark harness; numbers in `docs/TRANSPORTS.md` are guidance, not measurements.
 - The gRPC listener has no TLS/mTLS.
 - Snapshot installation still buffers the whole snapshot in memory.
-- `price`/`volume` are `f64`; integer ticks/decimals are a planned migration.
+- `Order` price/quantity now use exact 18-scale fixed-point integers with per-symbol decimal
+  config; match events, market data and the wire format still convert at the f64 boundary. See
+  [`docs/DECIMAL.md`](./docs/DECIMAL.md) for the remaining migration.
 
 Known gaps and the roadmap are tracked in [`TODO.md`](./TODO.md).
 

@@ -36,10 +36,10 @@ CI (`.github/workflows/ci.yml`) runs `cargo fmt --all -- --check`, `cargo clippy
 
 ## Branch state — read before changing storage or network code
 
-- **Breaking wire/disk change (2026-10-29):** `MatchEngineRequest::Place` now carries
-  `client_order_id`, so the postcard payload of new Raft entries differs from older builds.
-  Snapshot v4 also rejects v3. Wipe the node's `--data-dir` when moving an existing example
-  deployment across this change; there is no log-entry migration.
+- **Breaking wire/disk change (2026-10-29):** `Order.price`/`volume` (and the stop/iceberg
+  fields) are now 18-scale `Fixed` integers, so postcard log entries and snapshots differ from
+  older builds. Snapshot v5 also rejects v4. Wipe the node's `--data-dir` when moving an existing
+  example deployment across this change; there is no log-entry migration.
 - Upgraded to `openraft` 0.10.0-alpha.37 from crates.io (git pin and the `openraft-legacy` dependency are gone). Installing it is a normal `cargo fetch`; no git checkout needed.
 - The node now runs **gRPC (tonic) by default** for peer-to-peer Raft RPCs; the HTTP/JSON implementation is retained and selectable with `--transport http`.
   - `src/network/grpc/client.rs`: `RaftNetworkV2` implementation with unary append/vote, a custom `stream_append` over `AppendStream`, and chunked `full_snapshot` that honours the `cancel` future.
@@ -51,7 +51,7 @@ CI (`.github/workflows/ci.yml`) runs `cargo fmt --all -- --check`, `cargo clippy
 - Deadlines: unary vote/append and each `stream_append` request in flight get `RPCOption::soft_ttl()`. `stream_append` only times a wait while a request is in flight (the heartbeat worker polls for a response before the feeder necessarily sends), and `full_snapshot` has no per-RPC deadline — it is bounded by the `cancel` future and HTTP/2 keep-alive, because a legitimate snapshot can outlive one heartbeat interval.
 - Each peer gets separate gRPC connections for replication, heartbeat and snapshot (openraft's `new_heartbeat_client` / `new_snapshot_client` default to `new_client`, and each `GrpcNetwork` owns its own lazy channel), so a snapshot cannot head-of-line-block a vote.
 - Storage is **durable**. `src/store/log_store.rs` is a hand-written segmented WAL: `log/NNNNNNNNNN.wal` with an 8-byte `MRFT`+version header, `[len u32 LE][crc32 u32 LE][postcard payload]` records, one `write_all` + one `sync_data` per openraft append batch, `pread` reads, and blocking IO on `spawn_blocking`. Recovery walks segments and truncates a torn tail. Vote + `last_purged` live in an atomically rewritten `log/state`; `committed` is a WAL record that becomes durable with the next append (no second fsync).
-- `src/store/state_machine.rs` keeps the order book + sequence + event window in memory and persists `snapshot/current.snap` (magic `MRFSNAP` + version + postcard meta + postcard content) via temp file → fsync → rename → dir fsync. Snapshot version is 4 (v3 added the extended `Order`, parked stops and last trade price; v4 adds the retained `MatchEvent` window and client-order-id dedupe map). Older files are rejected on open. `install_snapshot` validates before replacing the durable copy. Restart = open snapshot, then openraft replays the retained log tail.
+- `src/store/state_machine.rs` keeps the order book + sequence + event window in memory and persists `snapshot/current.snap` (magic `MRFSNAP` + version + postcard meta + postcard content) via temp file → fsync → rename → dir fsync. Snapshot version is 5 (v3 added the extended `Order`, parked stops and last trade price; v4 added the retained `MatchEvent` window and client-order-id dedupe map; v5 stores prices/quantities as 18-scale `Fixed` integers). Older files are rejected on open. `install_snapshot` validates before replacing the durable copy. Restart = open snapshot, then openraft replays the retained log tail.
 - `src/store/config.rs` owns `StorageConfig` (`data_dir`, `instance_prefix`, `node_dir`/`log_dir`/`snapshot_dir`). The old sled-backed `src/store/store.rs` and the `walkdir` dependency are gone; `sled` remains only for the `sled_test.rs` playground binary.
 
 ## Test gotchas
@@ -71,8 +71,8 @@ CI (`.github/workflows/ci.yml`) runs `cargo fmt --all -- --check`, `cargo clippy
   use it to rebuild a resting order. Regression tests: `exact_fill_*`,
   `partial_fill_preserves_maker_identity` in `src/matchengine/mod.rs`.
 - Order types live as flat fields on `Order` (`tif`, `post_only`, `stop_price`, `display_volume`,
-  `hidden_volume`, `timestamp`), all with serde defaults. `stop_price`/`display_volume` use `0.0`
-  as "none" so the record stays cheap to copy in the matching loop. `apply` never reads a clock:
+  `hidden_volume`, `timestamp`), all with serde defaults. `stop_price`/`display_volume` use `Fixed::ZERO`
+  (JSON `0`) as "none" so the record stays cheap to copy in the matching loop. `apply` never reads a clock:
   every admissible mutating request purges due GTD orders at its intake timestamp; `Day` still needs
   the explicit `PurgeExpired { now_ms, day_close_ms }`. Stops are elected by
   `OrderBook::last_trade_price`, which is replicated state. Parked stops live in
@@ -126,7 +126,11 @@ CI (`.github/workflows/ci.yml`) runs `cargo fmt --all -- --check`, `cargo clippy
 - `docs/MARKET_DATA_PLAN.md` tracks the market-data egress implementation (tap, shadow book,
   deterministic `market_seq`/`sub_seq` sequencing, binary wire format v2, JSONL sink, leader
   gating); the Aeron adapter is still the next phase.
+- `docs/DECIMAL.md` compares integer ticks, `rust_decimal`, `fastnum`, `bigdecimal`, `decimal`
+  and `fixed`, with microbenchmarks, an 18-decimal BTC range analysis and a migration plan. `Order`
+  now uses 18-scale `Fixed` integers and `SymbolConfig`; events/market data still convert at the
+  `f64` boundary.
 - `docs/MATCH_RESULTS.md` describes match-result delivery. Phases 1a–3 are implemented: events in
-  `/write`, a replicated bounded event log in snapshots (v4), `POST /events` +
+  `/write`, a replicated bounded event log in snapshots (v5), `POST /events` +
   `GET /events/status`, and `client_order_id` submission dedupe. `--match-event-log` remains a
   node-local debugging sink. Phase 4 (long-poll, gRPC streaming, MQ bridge) is still a proposal.

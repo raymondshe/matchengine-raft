@@ -864,8 +864,9 @@ independent of the feed.
   those are committed, so they are not wrong — consumers dedupe on
   `(symbol_id, stream_id, market_seq, sub_seq)` (§16.1) and honour the `RESET`/snapshot ordering
   rule. The keys are replicated-state derived, so the handover does not reset the sequence space.
-- **Leader restart.** State is restored from the v4 snapshot plus log replay (v4 carries the
-  match-event window and submission dedupe map; v3 added stops and `last_trade_price`); the seeder
+- **Leader restart.** State is restored from the v5 snapshot plus log replay (v5 stores fixed-point
+  prices/quantities; v4 carries the match-event window and submission dedupe map; v3 added stops
+  and `last_trade_price`); the seeder
   captures the restored book and the snapshot-then-deltas rule applies. Replayed entries are below
   the reset boundary (the next `market_seq`) and are therefore suppressed.
 - **Follower installs a snapshot.** It is not publishing, but its shadow book is now stale (an

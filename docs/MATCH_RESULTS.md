@@ -1,7 +1,7 @@
 # Delivering match results to the order / clearing system
 
 Status: **phases 1a–3 implemented.** `apply` turns results into [`MatchEvent`]s, returns the first
-512 in the `/write` response, appends them to a bounded event window that is part of snapshot v4,
+512 in the `/write` response, appends them to a bounded event window that is part of snapshot v5,
 and serves that window through `POST /events` and `GET /events/status`. `client_order_id` makes
 submissions idempotent across retries. `--match-event-log <path>` remains a node-local JSONL
 debugging sink. Phase 4 (long-poll, gRPC streaming, MQ bridge) is the remaining proposal.
@@ -315,8 +315,8 @@ pub struct StateMachineData {
   learner receives only the retained window — that is expected, and the read API advertises
   `oldest_event_id` so consumers can detect the gap.
 
-Snapshot format: `SNAPSHOT_VERSION` is **4**; v4 adds the event window and submission map on top
-of the v3 order/stop fields. Postcard encodes struct fields positionally, so an older decoder
+Snapshot format: `SNAPSHOT_VERSION` is **5**; v5 stores fixed-point order prices/quantities, v4
+added the event window and submission map on top of the v3 order/stop fields. Postcard encodes struct fields positionally, so an older decoder
 fails on the missing fields (`postcard::from_bytes` reports an unexpected end of input). Two options:
 
 1. **Reject v2 with a clear error** (simplest; acceptable for a demo, but requires wiping data).
@@ -421,7 +421,7 @@ event rate per apply batch at debug level, consistent with the existing `tracing
 | Duplicate delivery | Consumer sees an event twice | Dedupe on `event_id` |
 | Huge sweep (many fills) | Large response | Response capped with `events_truncated`; full set available from `/events` |
 | Slow consumer | — | Pull-based, so it cannot block `apply`; only its own cursor lags |
-| Snapshot from an older binary | v3 or earlier payload | Version check rejects it with a clear error; v4 is the first version with the event window |
+| Snapshot from an older binary | v4 or earlier payload | Version check rejects it with a clear error; v5 is the first fixed-point snapshot |
 
 ---
 
@@ -495,7 +495,7 @@ Still to write (mainly phase 4 / operational tests):
 |---|---|---|
 | 1a ✅ | `MatchEvent` + `EventId`; build events in `apply`; `MatchResultSink` with `Noop`/`Memory`/`File` sinks; `--match-event-log`; unit and end-to-end tests | done |
 | 1b ✅ | Events in `MatchEngineResponse`; 512-event cap with `events_truncated` | done |
-| 2 ✅ | Bounded event window + snapshot v4 + `oldest_event_id`/`last_event_id`; `/events` and `/events/status`; restart/snapshot/retention tests | done |
+| 2 ✅ | Bounded event window + snapshot v4/v5 + `oldest_event_id`/`last_event_id`; `/events` and `/events/status`; restart/snapshot/retention tests | done |
 | 3 ✅ | `client_order_id` submission dedupe with bounded map | done |
 | 4 | Optional: long-poll, gRPC `StreamEvents`, MQ bridge sidecar | 2–3 days |
 
@@ -539,5 +539,5 @@ and two read endpoints (`/events`, `/events/status`).
 5. **Cancel identity** — `cancel()` currently keys on `(price, sequence)`, which clearing has from
    the events, but humans think in `order id`; consider an order-id index as a follow-up.
 6. **Multi-instrument** — global `event_id` vs per-instrument; revisit when a second book exists.
-7. **Snapshot migration** — v4 rejects older snapshots. Add a versioned decoder only if a
+7. **Snapshot migration** — v5 rejects older snapshots. Add a versioned decoder only if a
    deployment has data worth carrying across a future format change.

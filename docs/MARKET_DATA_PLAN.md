@@ -203,7 +203,7 @@ leader id, `ts_ms`, `symbol_id`, `sub_seq`, reserved.
 | U8 determinism | two processors fed identical frames emit identical messages; a takeover snapshot continues the same keys; wire v2 golden tests |
 | automatic purge | `Place`/`Cancel`/`Amend` purge due GTD at intake time; `Day` only via `PurgeExpired`; guarded by the earliest-expiry index (no scan without GTD) |
 | `matchengine-raft --help` | all feed flags present, including `--market-data-status-every` and `--market-data-leader-only` |
-| Snapshot/log formats | U8 itself kept `SNAPSHOT_VERSION` 3; the later match-event work bumps it to 4 (event window + dedupe map). `market_seq` lives in the existing `OrderBook::sequence` |
+| Snapshot/log formats | U8 itself kept `SNAPSHOT_VERSION` 3; later work bumped it to 4 (event window + dedupe map) and 5 (fixed-point order prices/quantities). `market_seq` lives in the existing `OrderBook::sequence` |
 | Dependencies | none added |
 
 Bench (best-of-5 per round, after the earliest-expiry guard): rest 1k bids **40.1 µs**, rest 1k +

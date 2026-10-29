@@ -333,7 +333,7 @@ Raft 日志追加写入 `log/NNNNNNNNNN.wal` 分段文件：
 
 ### 快照（`src/store/state_machine.rs`）
 
-状态机（订单簿 + 序列号 + 保留的撮合事件窗口 + 提交去重表）常驻内存以保证 apply 速度。快照 v4 写入 `snapshot/current.snap`，通过临时文件 → fsync → rename → 目录 fsync 原子替换；`install_snapshot` 会先校验收到的数据再替换磁盘副本，坏快照不会破坏已有的好快照。
+状态机（订单簿 + 序列号 + 保留的撮合事件窗口 + 提交去重表）常驻内存以保证 apply 速度。快照 v5 写入 `snapshot/current.snap`，通过临时文件 → fsync → rename → 目录 fsync 原子替换；`install_snapshot` 会先校验收到的数据再替换磁盘副本，坏快照不会破坏已有的好快照。
 
 快照负载是 postcard 编码的 `StateMachineData`：
 
@@ -451,7 +451,7 @@ POST /write { Place | Cancel | Amend | PurgeExpired }
 
 `Place` 支持可选的 `client_order_id`；用同一个 id 重试会返回原序列号和事件，而不会重复下单。
 事件窗口由 `--max-events`（环境变量 `MAX_EVENTS`，默认 262144）限制；提交去重表另有固定的
-262144 条上限，避免重试结果依赖节点本地参数。两者都包含在快照 v4 中。
+262144 条上限，避免重试结果依赖节点本地参数。两者都包含在快照 v5 中。
 `GET /events/status` 报告最旧/最新保留 id 和淘汰计数；消费者从 `next_after` 继续，并按 `event_id`
 去重。
 
@@ -595,7 +595,7 @@ gRPC 传输在 `--http-addr` 端口 + 1000 上暴露相同操作（`AppendEntrie
 pub enum MatchEngineRequest {
     Place { order: Order, client_order_id: Option<String> },
     Cancel { order: Order },
-    Amend { order: Order, price: Option<f64>, volume: Option<f64> },
+    Amend { order: Order, price: Option<Fixed>, volume: Option<Fixed> },
     PurgeExpired { now_ms: u64, day_close_ms: Option<u64> },
 }
 
@@ -621,10 +621,12 @@ pub struct MatchEngineResponse {
 - `marketdata_status` - 行情 feed 计数器与门控状态（feed 关闭时为 `{}`）
 - `orderbook_sequence` - 订单序列号计数器（兼容旧拼写 `orderbook_sequance`）
 
+价格和数量在内部使用精确的 18 位定点整数。JSON 接受十进制字符串或旧版数字；超过 15 位有效数字时请使用字符串，`/read` 会输出字符串以精确往返 18 位小数。每个标的可通过 `SymbolConfig` 配置价格/数量允许的小数位（最多 18），内部统一归一化到 18 位。
+
 `/write` 接受的订单示例（注意字段名是 `sequence`）：
 
 ```json
-{"Place": {"order": {"live": "Limit", "side": "Buy", "price": 4000.0, "volume": 4.4, "id": 1, "sequence": 1}, "client_order_id": "order-123"}}
+{"Place": {"order": {"live": "Limit", "side": "Buy", "price": "4000.25", "volume": "4.4", "id": 1, "sequence": 1}, "client_order_id": "order-123"}}
 ```
 
 `client_order_id` 可选；省略时保持旧的非幂等行为。
@@ -677,7 +679,8 @@ pub struct MatchEngineResponse {
 - 没有传输基准工具，`docs/TRANSPORTS.md` 中的数字只是指导值，不是实测结果。
 - gRPC 监听器尚未配置 TLS/mTLS。
 - 快照安装仍整体缓冲在内存中。
-- `price`/`volume` 仍是 `f64`，整数 tick/Decimal 是计划中的迁移。
+- `Order` 的价格/数量已使用精确的 18 位定点整数，并支持按标的小数位配置；撮合事件、行情和线格式仍在边界转换为 `f64`。剩余迁移、18 位 BTC 分析和微基准见
+  [`docs/DECIMAL.md`](./docs/DECIMAL.md)。
 
 已知差距与路线图统一记录在 [`TODO.md`](./TODO.md)。
 

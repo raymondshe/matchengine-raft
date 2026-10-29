@@ -117,7 +117,7 @@ a new learner catches up from a live leader through log replication), and
   debugging). `apply` publishes best-effort and never lets a sink failure affect the state machine.
 - [x] Deliver fills and cancels durably to the order/clearing system: events in the `/write`
   response (capped at 512 with `events_truncated`), a bounded replicated event log snapshotted with
-  the state (v4), `POST /events` cursor reads, `GET /events/status`, and `client_order_id` submission
+  the state (v5), `POST /events` cursor reads, `GET /events/status`, and `client_order_id` submission
   dedupe. Design: `docs/MATCH_RESULTS.md` (phases 1b–3).
 - [ ] Phase 4 of match-result delivery: long-poll/short-poll `/events` (`wait_ms`), gRPC
   `StreamEvents`, and an optional MQ bridge sidecar. Also decide event time in the clearing feed
@@ -142,7 +142,10 @@ a new learner catches up from a live leader through log replication), and
 - [x] Automatic GTD purge: every admissible `Place`/`Cancel`/`Amend` purges GTD orders due at its
   intake timestamp before applying, using the replicated sequence/timestamp. `Day` still needs the
   explicit `PurgeExpired { now_ms, day_close_ms }` because it requires a market close.
-- [ ] `price`/`volume` are `f64` — money should use integer ticks/decimal.
+- [x] `Order` price/quantity use 18-scale fixed-point integers with per-symbol `SymbolConfig`
+  (max 18 decimals). Match events, market data and the wire format still convert at the `f64`
+  boundary; migrate those next. Candidate comparison, 18-decimal BTC range analysis,
+  microbenchmarks and migration plan: [`docs/DECIMAL.md`](./docs/DECIMAL.md).
 - [ ] The book is a per-order `BTreeMap<BidKey/AskKey, Order>`; every fill descends the tree once
   and sweeps touch one entry per order. Bucketing orders per price level
   (`BTreeMap<price, VecDeque<Order>>` plus a sequence-keyed index so cancels stay O(log n)) would

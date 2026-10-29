@@ -117,7 +117,7 @@ fn main() {
             taker.tif = matchengine_raft::matchengine::TimeInForce::Ioc;
             let outcome = ioc_book.execute_order(&mut taker);
             assert_eq!(1, outcome.fills.len());
-            assert_eq!(Some(1.0), outcome.cancelled);
+            assert_eq!(Some(1.0), outcome.cancelled.map(|v| v.to_f64()));
         }
         assert!(ioc_book.asks.is_empty());
     });
@@ -126,7 +126,7 @@ fn main() {
     bench("iceberg replenish 1k", 100, || {
         let mut ob = OrderBook::new();
         let mut iceberg = resting(OrderSide::Sell, 100.0, 1000.0);
-        iceberg.display_volume = 1.0;
+        iceberg.display_volume = 1.0.into();
         ob.place_order(&mut iceberg);
         for _ in 0..1000u32 {
             let mut taker = resting(OrderSide::Buy, 100.0, 1.0);
@@ -146,7 +146,7 @@ fn main() {
             orders.push(bid);
         }
         for order in &orders {
-            let amended = ob.amend(order, None, Some(5.0)).expect("amendable");
+            let amended = ob.amend(order, None, Some(5.0.into())).expect("amendable");
             assert_eq!(order.sequence, amended.order.sequence);
         }
         assert_eq!(1000, ob.bids.len());

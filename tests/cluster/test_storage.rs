@@ -450,7 +450,7 @@ async fn fill_sm(sm: &Sm) {
     inner.orderbook.last_trade_price = Some(10.0);
     let mut stop = Order::new(OrderSide::Sell, 0.0, 4.0, 0);
     stop.live = OrderType::Market;
-    stop.stop_price = 5.0;
+    stop.stop_price = 5.0.into();
     stop.tif = TimeInForce::Gtd(9_000);
     stop.timestamp = 1_000;
     inner.orderbook.execute_order(&mut stop);

@@ -210,7 +210,7 @@ fn file_sink_records_stop_triggers_and_expiries() {
         // A sell stop at 95 parks off the book (sequence 2); no event yet.
         let mut stop = Order::new(OrderSide::Sell, 0.0, 5.0, 0);
         stop.live = matchengine_raft::matchengine::OrderType::Market;
-        stop.stop_price = 95.0;
+        stop.stop_price = 95.0.into();
         client.write(&place(stop)).await.unwrap().unwrap();
 
         wait_for_events(&event_log, 2).await;

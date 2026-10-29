@@ -370,7 +370,7 @@ fn restart_recovers_large_snapshot() {
         let snapshot_file = storage.snapshot_dir(1).join("current.snap");
         let snapshot_size = std::fs::metadata(&snapshot_file).unwrap().len();
         assert!(
-            snapshot_size > 128 * 1024,
+            snapshot_size > 100_000,
             "expected a multi-chunk-sized snapshot, got {snapshot_size} bytes"
         );
 

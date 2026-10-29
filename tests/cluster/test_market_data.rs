@@ -123,7 +123,7 @@ fn market_data_feed_publishes_trades_bbo_depth_and_bars() {
             .write(&MatchEngineRequest::Amend {
                 order: bid_key,
                 price: None,
-                volume: Some(3.0),
+                volume: Some(3.0.into()),
             })
             .await
             .unwrap()
