@@ -19,6 +19,7 @@
 - [架构概述](#架构概述)
 - [快速开始](#快速开始)
 - [运行集群](#运行集群)
+- [安全与部署边界](#安全与部署边界)
 - [项目结构](#项目结构)
 - [存储实现](#存储实现)
 - [集群管理](#集群管理)
@@ -32,7 +33,7 @@
 - **持久化 Raft 存储**: 带校验和的分段预写日志，每个复制批次一次 fsync；状态机通过原子文件快照持久化
 - **崩溃恢复**: 重启时加载快照并重放保留的日志尾部，日志重放与快照两条恢复路径均有集成测试覆盖
 - **gRPC 复制**: 基于 [tonic](https://docs.rs/tonic) 的传输层，支持双向 `stream_append`、分块快照传输，并为每个对端维护独立的复制/心跳/快照通道；可用 `--transport http` 切回 HTTP/JSON
-- **撮合引擎**: 包含一个简单的订单簿撮合引擎作为示例应用
+- **撮合引擎**: 完整的订单簿实现，支持价格-时间优先、GTC/IOC/FOK/GTD/Day、Post-Only、冰山单、止损单、改单/撤单，以及按成交名义金额计算 maker/taker 费用并支持可配置扣费资产
 - **HTTP 服务器**: 基于 [Actix-web](https://docs.rs/actix-web) 构建，同时提供内部 Raft API 和外部应用 API
 - **多种读取一致性**: 本地读、经领导者的一致性读，以及线性一致性的 follower read
 - **智能客户端**: Rust 客户端自动跟踪并将请求重定向到当前领导者
@@ -264,6 +265,26 @@ curl -X POST -H "Content-Type: application/json" \
 `scripts/test.sh` 把所有状态保存在 `RAFT_DATA_DIR`（默认 `/tmp/matchengine-raft`）下，因此
 `place-order` 的结果在 `start-node`/`kill` 循环后仍然存在。
 
+## 安全与部署边界
+
+HTTP API 与 gRPC Raft 监听端口（HTTP 端口 + 1000）**没有 TLS、mTLS 或认证**。这是明确的部署契约：
+只能绑定回环地址或可信私有网络，并对两个端口设置防火墙；在传输安全和 API 认证实现之前，不得暴露到公网。
+
+节点绑定非回环地址时会记录警告。请求在进入 Raft 之前就在边缘层受限：
+
+| 入口 | 限制 |
+|---|---|
+| 应用/管理 JSON 请求体 | 1 MiB（`MAX_REQUEST_BODY_BYTES`） |
+| `client_order_id` | 1–128 字节，仅限 ASCII 字母/数字及 `. _ - :`；拒绝空字符串 |
+| `/read` 键 | 1–128 个可打印 ASCII 字节 |
+| `/events` 分页大小 | 1–1000 个事件 |
+| HTTP Raft append 请求体 / gRPC 消息 | 64 MiB（`MAX_HTTP_RAFT_BODY_BYTES` / `MAX_MESSAGE_SIZE`） |
+| HTTP 快照请求体 | 256 MiB（`MAX_SNAPSHOT_BYTES`） |
+| gRPC 快照流 | 总量 256 MiB，在追加每个 chunk 前检查 |
+
+畸形 JSON 和非法字段返回 `400`；超大请求体返回 `413`。复制的 `client_order_id` 去重表最多保留
+262,144 条记录，因此键长度限制也限制了该表的内存占用。
+
 ## 项目结构
 
 ```
@@ -494,7 +515,7 @@ POST /events
 }}
 ```
 
-省略 `after` 时从最旧保留事件开始；`limit` 服务端上限为 1000。如果游标小于 `oldest_event_id`，
+省略 `after` 时从最旧保留事件开始；`limit` 必须在 1–1000 之间。如果游标小于 `oldest_event_id`，
 说明事件已被保留策略淘汰，清结算需要带外重建。`GET /events/status` 返回 `retained_events`、
 `evictions_total`、`retention_limit`、`submission_retention_limit` 和
 `submission_evictions_total`。
@@ -622,7 +643,8 @@ pub struct MatchEngineResponse {
 响应最多携带 512 个事件，完整批次从 `/events` 读取。成交事件携带 `quote_volume`、`volume_unit`、
 `taker_fee`/`taker_fee_asset` 和 `maker_fee`/`maker_fee_asset`；行情 `TRADE` 与成交 `LIFECYCLE`
 记录也包含相同字段（wire v5）。`client_order_id` 可选，只影响 `Place`：同一 id 重试返回原序列号和
-事件，不会重复下单。
+事件，不会重复下单。长度必须为 1–128 个可打印 ASCII 字节，字符集为 `[A-Za-z0-9._:-]`；空字符串会被拒绝，
+不需要幂等时请省略该字段。
 
 `/read`、`/linearizable_read` 和 `/follower_read` 接收 JSON 字符串键，用于读取订单簿的命名视图：
 
@@ -701,11 +723,12 @@ pub struct MatchEngineResponse {
 | `tests/cluster/test_symbols.rs` | `ConfigureSymbol` 设置进程标的/精度，拒绝超精度和跨标的订单，交易开始后锁定配置，并在快照重启后保留配置 |
 | `tests/cluster/test_fees.rs` | 吃单/挂单费率产生精确的成交费用，经 `/write`、`/events`、文件 sink 和行情 feed 输出，并在快照重启后保留 |
 | `tests/cluster/test_fee_assets.rs` | QQQ/USD ETF/法币元数据、tick/lot、quote 数量限价单归一化和 quote 资产扣费 |
+| `tests/cluster/test_request_limits.rs` | 超大 JSON 请求体、畸形输入、非法/超长 `client_order_id`、超长 read key 和越界事件分页在进入 Raft 前以 `400`/`413` 拒绝 |
 
 所有集成测试都使用唯一的临时数据目录。集群测试固定使用端口 `21001-21003`（gRPC
 `22001-22003`），快照测试使用 `21101-21102`，重启测试使用 `21201-21204`，撮合结果测试使用
 `21301`/`21302`、行情数据测试 `21303`、事件日志测试 `21304`、故障切换测试
-`21401-21403`、学习者追赶测试 `21501-21502`、过期节点重入测试 `21601-21603`、精度往返测试 `21701`（gRPC `22701`）、标的配置测试 `21801`（gRPC `22801`）、费用测试 `21901`（gRPC `22901`）、费用资产测试 `21902`（gRPC `22902`）；重跑前请先停止残留进程
+`21401-21403`、学习者追赶测试 `21501-21502`、过期节点重入测试 `21601-21603`、精度往返测试 `21701`（gRPC `22701`）、标的配置测试 `21801`（gRPC `22801`）、费用测试 `21901`（gRPC `22901`）、费用资产测试 `21902`（gRPC `22902`）、请求限制测试 `21903`（gRPC `22903`）；重跑前请先停止残留进程
 （`pkill -f matchengine-raft`）。
 
 ## 性能与当前限制

@@ -52,7 +52,7 @@ openraft does not have one network workload; it has three with opposite requirem
 |---|---|---|---|
 | `vote` / `pre_vote` | ~100 B | rare, bursty during elections | tail latency; must not queue behind data |
 | `append_entries` | 1 KB – 1 MB | constant | throughput and p99; benefits from batching and pipelining |
-| `full_snapshot` | 1 MB – GB | rare | must not block the other two; needs streaming and backpressure |
+| `full_snapshot` | 1 MB – 256 MiB | rare | must not block the other two; needs streaming and backpressure |
 
 Contract beyond raw speed:
 

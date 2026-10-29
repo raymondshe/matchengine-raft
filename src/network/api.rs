@@ -35,6 +35,69 @@ use crate::store::state_machine::StateMachineStoreInner;
 pub const DEFAULT_EVENTS_PAGE: usize = 500;
 /// Hard cap on one `/events` response.
 pub const MAX_EVENTS_PAGE: usize = 1_000;
+/// Maximum JSON body accepted by the application and management API.
+///
+/// Raft snapshot and append bodies use their own larger caps because they carry
+/// state-machine data rather than a single order.
+pub const MAX_REQUEST_BODY_BYTES: usize = 1024 * 1024;
+/// Maximum accepted `client_order_id` length in bytes.
+pub const MAX_CLIENT_ORDER_ID_BYTES: usize = 128;
+/// Maximum accepted `/read` key length in bytes.
+pub const MAX_READ_KEY_BYTES: usize = 128;
+
+/// Validates a client idempotency key before it can enter the Raft log.
+///
+/// Empty keys are rejected: omit the field to disable idempotency. Restricting
+/// the character set keeps ids printable and prevents control characters from
+/// leaking into logs or JSONL sinks.
+fn validate_client_order_id(id: &str) -> Result<(), String> {
+    if id.is_empty() {
+        return Err(
+            "client_order_id must not be empty; omit it to disable idempotency".to_string(),
+        );
+    }
+    if id.len() > MAX_CLIENT_ORDER_ID_BYTES {
+        return Err(format!(
+            "client_order_id exceeds {MAX_CLIENT_ORDER_ID_BYTES} bytes"
+        ));
+    }
+    if !id
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':'))
+    {
+        return Err(
+            "client_order_id may only contain ASCII letters, digits, '.', '_', '-' and ':'"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// Validates a `/read` key before it reaches the state machine.
+fn validate_read_key(key: &str) -> Result<(), String> {
+    if key.is_empty() {
+        return Err("read key must not be empty".to_string());
+    }
+    if key.len() > MAX_READ_KEY_BYTES {
+        return Err(format!("read key exceeds {MAX_READ_KEY_BYTES} bytes"));
+    }
+    if !key.bytes().all(|byte| byte.is_ascii_graphic()) {
+        return Err("read key must contain only printable ASCII characters".to_string());
+    }
+    Ok(())
+}
+
+/// Validates an `/events` cursor request.
+fn validate_events_request(req: &EventsRequest) -> Result<(), String> {
+    if let Some(limit) = req.limit
+        && !(1..=MAX_EVENTS_PAGE).contains(&limit)
+    {
+        return Err(format!(
+            "events limit must be between 1 and {MAX_EVENTS_PAGE}"
+        ));
+    }
+    Ok(())
+}
 
 /// Cursor request for `POST /events`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -43,7 +106,7 @@ pub struct EventsRequest {
     /// retained event.
     #[serde(default)]
     pub after: Option<EventId>,
-    /// Page size; capped server-side at [`MAX_EVENTS_PAGE`].
+    /// Page size; must be between 1 and [`MAX_EVENTS_PAGE`].
     #[serde(default)]
     pub limit: Option<usize>,
 }
@@ -94,6 +157,13 @@ pub async fn write(
     req: Json<MatchEngineRequest>,
 ) -> actix_web::Result<impl Responder> {
     let mut request = req.into_inner();
+    if let MatchEngineRequest::Place {
+        client_order_id: Some(client_order_id),
+        ..
+    } = &request
+    {
+        validate_client_order_id(client_order_id).map_err(actix_web::error::ErrorBadRequest)?;
+    }
     stamp_intake_time(&mut request);
     let response = match app.raft.client_write(request).await.decompose() {
         Ok(response) => response,
@@ -156,8 +226,10 @@ pub async fn read(
     app: Data<MatchEngineApp>,
     req: Json<String>,
 ) -> actix_web::Result<impl Responder> {
+    let key = req.into_inner();
+    validate_read_key(&key).map_err(actix_web::error::ErrorBadRequest)?;
     let inner = app.state_machine_store.inner().lock().await;
-    let value = read_state(&inner, &req.0);
+    let value = read_state(&inner, &key);
     let res: Result<String, Infallible> = Ok(value);
     Ok(Json(res))
 }
@@ -176,6 +248,8 @@ pub async fn linearizable_read(
     app: Data<MatchEngineApp>,
     req: Json<String>,
 ) -> actix_web::Result<impl Responder> {
+    let key = req.into_inner();
+    validate_read_key(&key).map_err(actix_web::error::ErrorBadRequest)?;
     let ret = match app
         .raft
         .get_read_linearizer(ReadPolicy::ReadIndex)
@@ -201,7 +275,7 @@ pub async fn linearizable_read(
             }
 
             let inner = app.state_machine_store.inner().lock().await;
-            let value = read_state(&inner, &req.0);
+            let value = read_state(&inner, &key);
 
             let res: Result<String, LinearizableReadError<MatchEngineTypeConfig>> = Ok(value);
             Ok(Json(res))
@@ -222,6 +296,7 @@ pub async fn events(
     app: Data<MatchEngineApp>,
     req: Json<EventsRequest>,
 ) -> actix_web::Result<impl Responder> {
+    validate_events_request(&req).map_err(actix_web::error::ErrorBadRequest)?;
     let ret = match app
         .raft
         .get_read_linearizer(ReadPolicy::ReadIndex)
@@ -300,6 +375,8 @@ pub async fn follower_read(
     app: Data<MatchEngineApp>,
     req: Json<String>,
 ) -> actix_web::Result<impl Responder> {
+    let key = req.into_inner();
+    validate_read_key(&key).map_err(actix_web::error::ErrorBadRequest)?;
     // 1. Get current leader
     let leader_id = match app.raft.current_leader().await {
         Some(id) => id,
@@ -372,7 +449,7 @@ pub async fn follower_read(
 
     // 5. Read from local state machine
     let inner = app.state_machine_store.inner().lock().await;
-    let value = read_state(&inner, &req.0);
+    let value = read_state(&inner, &key);
 
     Ok(Json(Ok(value)))
 }
@@ -481,5 +558,58 @@ mod tests {
         assert_eq!("1", read_state(&inner, "orderbook_spread"));
         assert_eq!("", read_state(&inner, "nope"));
         assert_eq!("{}", read_state(&inner, "marketdata_status"));
+    }
+
+    #[test]
+    fn client_order_ids_are_bounded_and_printable() {
+        assert!(validate_client_order_id("order-123_A:b.c").is_ok());
+        assert!(validate_client_order_id(&"a".repeat(MAX_CLIENT_ORDER_ID_BYTES)).is_ok());
+        assert!(validate_client_order_id("").is_err());
+        assert!(validate_client_order_id(&"a".repeat(MAX_CLIENT_ORDER_ID_BYTES + 1)).is_err());
+        assert!(validate_client_order_id("has space").is_err());
+        assert!(validate_client_order_id("slash/not-allowed").is_err());
+        assert!(validate_client_order_id("café").is_err());
+    }
+
+    #[test]
+    fn read_keys_are_bounded_ascii_and_non_empty() {
+        assert!(validate_read_key("orderbook_depth:20").is_ok());
+        assert!(validate_read_key("").is_err());
+        assert!(validate_read_key(&"a".repeat(MAX_READ_KEY_BYTES + 1)).is_err());
+        assert!(validate_read_key("line\nbreak").is_err());
+        assert!(validate_read_key("café").is_err());
+    }
+
+    #[test]
+    fn event_limits_are_explicit() {
+        assert!(validate_events_request(&EventsRequest::default()).is_ok());
+        assert!(
+            validate_events_request(&EventsRequest {
+                after: None,
+                limit: Some(1),
+            })
+            .is_ok()
+        );
+        assert!(
+            validate_events_request(&EventsRequest {
+                after: None,
+                limit: Some(MAX_EVENTS_PAGE),
+            })
+            .is_ok()
+        );
+        assert!(
+            validate_events_request(&EventsRequest {
+                after: None,
+                limit: Some(0),
+            })
+            .is_err()
+        );
+        assert!(
+            validate_events_request(&EventsRequest {
+                after: None,
+                limit: Some(MAX_EVENTS_PAGE + 1),
+            })
+            .is_err()
+        );
     }
 }

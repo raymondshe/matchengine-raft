@@ -4,6 +4,7 @@
 //! This crate provides all the components needed to run a Raft-based distributed
 //! system with an order-book matching engine as the state machine.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -12,6 +13,7 @@ use actix_web::HttpServer;
 use actix_web::dev::ServerHandle;
 use actix_web::middleware;
 use actix_web::middleware::Logger;
+use actix_web::web;
 use actix_web::web::Data;
 use openraft::BasicNode;
 use openraft::Config;
@@ -224,6 +226,21 @@ pub async fn start_match_engine_node_with_storage(
         .await
 }
 
+/// Warns when the node is bound to a non-loopback address.
+///
+/// The HTTP API and gRPC Raft listener have no TLS or authentication. The
+/// supported deployment contract is loopback or a trusted private network.
+fn warn_if_non_loopback_bind(http_addr: &str) {
+    if let Ok(addr) = http_addr.parse::<SocketAddr>()
+        && !addr.ip().is_loopback()
+    {
+        tracing::warn!(
+            %http_addr,
+            "HTTP and gRPC listeners have no TLS or authentication; bind to loopback or a trusted private network"
+        );
+    }
+}
+
 /// Builds a node without waiting for it to stop.
 ///
 /// The returned [`MatchEngineNode`] owns both servers and the Raft instance, so
@@ -236,6 +253,7 @@ pub async fn build_match_engine_node(
     config: Config,
     storage: StorageConfig,
 ) -> std::io::Result<MatchEngineNode> {
+    warn_if_non_loopback_bind(&http_addr);
     // The Raft transport lives on a derived port so `BasicNode.addr` keeps one
     // meaning (the public API address). Bind it before Raft starts so a port
     // conflict fails startup instead of surfacing as an unreachable peer.
@@ -363,6 +381,10 @@ pub async fn build_match_engine_node(
             .wrap(Logger::new("%a %{User-Agent}i"))
             .wrap(middleware::Compress::default())
             .app_data(app_data.clone())
+            // Bound request bodies before JSON extraction can allocate or
+            // propose anything. Snapshot and append bodies use explicit caps
+            // in `network::raft`.
+            .app_data(web::JsonConfig::default().limit(api::MAX_REQUEST_BODY_BYTES))
             // raft internal RPC
             .service(raft::append)
             .service(raft::snapshot)

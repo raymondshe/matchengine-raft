@@ -19,6 +19,7 @@ A practical implementation of a distributed matching engine built upon [OpenRaft
 - [Architecture Overview](#architecture-overview)
 - [Getting Started](#getting-started)
 - [Running the Cluster](#running-the-cluster)
+- [Security and Deployment Boundary](#security-and-deployment-boundary)
 - [Project Structure](#project-structure)
 - [Storage Implementation](#storage-implementation)
 - [Cluster Management](#cluster-management)
@@ -32,7 +33,7 @@ A practical implementation of a distributed matching engine built upon [OpenRaft
 - **Persistent Raft Storage**: A segmented, checksummed write-ahead log with one fsync per replicated batch, plus atomic file snapshots for the state machine
 - **Crash Recovery**: A restarted node loads its snapshot and replays the retained log tail; recovery is covered by integration tests
 - **gRPC Replication**: A [tonic](https://docs.rs/tonic) transport with bidirectional `stream_append`, chunked snapshot transfer and separate per-peer channels; HTTP/JSON remains selectable with `--transport http`
-- **Matching Engine**: Includes a simple order book matching engine as an example application
+- **Matching Engine**: Full order-book implementation with price-time priority, GTC/IOC/FOK/GTD/Day, post-only, iceberg and stop orders, amend/cancel, and notional-proportional maker/taker fee deduction with configurable fee assets
 - **HTTP Server**: Built with [Actix-web](https://docs.rs/actix-web) providing both internal Raft APIs and external application APIs
 - **Read Consistency Options**: Local reads, linearizable reads through the leader, and linearizable follower reads
 - **Smart Client**: A Rust client that automatically tracks and redirects requests to the current leader
@@ -269,6 +270,30 @@ The project also includes `scripts/test.sh` for more convenient cluster manageme
 
 `scripts/test.sh` keeps all state under `RAFT_DATA_DIR` (default `/tmp/matchengine-raft`), so
 `place-order` results survive `start-node`/`kill` cycles.
+
+## Security and Deployment Boundary
+
+The HTTP API and the gRPC Raft listener (HTTP port + 1000) have **no TLS, mTLS or authentication**.
+This is an explicit deployment contract: run them only on loopback or a trusted private network,
+and firewall both ports. Do not expose either listener to the public internet until transport
+security and API authentication are implemented.
+
+The node logs a warning when it is bound to a non-loopback address. Request handling is bounded at
+the edge, before Raft proposes anything:
+
+| Surface | Limit |
+|---|---|
+| Application/management JSON bodies | 1 MiB (`MAX_REQUEST_BODY_BYTES`) |
+| `client_order_id` | 1–128 bytes, ASCII letters/digits plus `. _ - :`; empty rejected |
+| `/read` key | 1–128 printable ASCII bytes |
+| `/events` page size | 1–1000 events |
+| HTTP Raft append body / gRPC message | 64 MiB (`MAX_HTTP_RAFT_BODY_BYTES` / `MAX_MESSAGE_SIZE`) |
+| HTTP snapshot body | 256 MiB (`MAX_SNAPSHOT_BYTES`) |
+| gRPC snapshot stream | 256 MiB total, checked before each chunk is appended |
+
+Malformed JSON and invalid fields return `400`; oversized bodies return `413`. The replicated
+`client_order_id` dedupe map retains at most 262,144 records, so the key bound also bounds its
+memory.
 
 ## Project Structure
 
@@ -521,7 +546,7 @@ POST /events
 }}
 ```
 
-Omitting `after` starts at the oldest retained event; `limit` is capped at 1000. If your cursor is
+Omitting `after` starts at the oldest retained event; `limit` must be between 1 and 1000. If your cursor is
 older than `oldest_event_id`, the window has evicted events and clearing must resync out of band.
 `GET /events/status` reports `retained_events`, `evictions_total`, `retention_limit`,
 `submission_retention_limit` and `submission_evictions_total`.
@@ -658,7 +683,8 @@ the full batch is available from `/events`. Fill events carry
 `quote_volume`, `volume_unit`, `taker_fee`/`taker_fee_asset` and `maker_fee`/`maker_fee_asset`;
 the same fields are on market-data `TRADE` and fill `LIFECYCLE` records (wire v5).
 `client_order_id` is optional and only affects `Place`: a retry returns the original sequence and
-events instead of placing a second order.
+events instead of placing a second order. It must be 1–128 printable ASCII bytes from
+`[A-Za-z0-9._:-]`; an empty value is rejected, so omit the field to disable idempotency.
 
 `/read`, `/linearizable_read` and `/follower_read` accept a JSON string key naming a view of the
 order book:
@@ -755,13 +781,15 @@ placeholder). `sequence` is still required by the deserializer.
 | `tests/cluster/test_symbols.rs` | `ConfigureSymbol` sets the process symbol/precision, rejects over-precision and cross-symbol orders, locks the configuration once trading starts, and survives snapshot restart |
 | `tests/cluster/test_fees.rs` | Maker and taker fee rates produce exact fill fees in `/write`, `/events`, the file sink and the market-data feed, and survive snapshot restart |
 | `tests/cluster/test_fee_assets.rs` | QQQ/USD ETF/fiat metadata, tick/lot enforcement, quote-volume limit normalization and quote-asset fee deduction |
+| `tests/cluster/test_request_limits.rs` | Oversized JSON bodies, malformed input, invalid/oversized `client_order_id`s, oversized read keys and out-of-range event pages are rejected with `400`/`413` before Raft changes the book |
 
 Every integration test uses a unique temporary data directory. The cluster test uses fixed ports
 `21001-21003` (gRPC `22001-22003`), the snapshot test `21101-21102`, the restart tests
 `21201-21204`, the match-result tests `21301`/`21302`, the market-data test `21303`, the event-log test
 `21304`, the failover test `21401-21403`, the learner catch-up test `21501-21502`, the late-join
-test `21601-21603`, the exactness test `21701` (gRPC `22701`), the symbol-config test `21801` (gRPC `22801`), the fee test `21901` (gRPC `22901`) and the
-fee-asset test `21902` (gRPC `22902`); stop leftover processes
+test `21601-21603`, the exactness test `21701` (gRPC `22701`), the symbol-config test `21801` (gRPC `22801`), the fee test `21901` (gRPC `22901`), the
+fee-asset test `21902` (gRPC `22902`) and the request-limit test `21903` (gRPC `22903`); stop
+leftover processes
 (`pkill -f matchengine-raft`) before rerunning.
 
 ## Performance and Current Limits

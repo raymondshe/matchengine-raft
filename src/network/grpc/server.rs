@@ -28,6 +28,7 @@ use tonic::Streaming;
 
 use crate::MatchEngineRaft;
 use crate::MatchEngineTypeConfig;
+use crate::network::MAX_SNAPSHOT_BYTES;
 use crate::network::grpc::STREAM_APPEND_CHANNEL_SIZE;
 use crate::network::grpc::decode;
 use crate::network::grpc::encode;
@@ -46,6 +47,28 @@ impl RaftGrpcService {
     pub fn new(raft: MatchEngineRaft) -> Self {
         Self { raft }
     }
+}
+
+/// Appends one snapshot chunk while enforcing the total receive budget.
+///
+/// The state machine needs a contiguous buffer, so the cap must be checked
+/// before extending: an offset-bearing peer could otherwise stream forever.
+fn append_snapshot_data(
+    data: &mut Vec<u8>,
+    received: &mut u64,
+    chunk: &[u8],
+) -> Result<(), Status> {
+    let next = received
+        .checked_add(chunk.len() as u64)
+        .ok_or_else(|| Status::resource_exhausted("snapshot size overflow"))?;
+    if next > MAX_SNAPSHOT_BYTES as u64 {
+        return Err(Status::resource_exhausted(format!(
+            "snapshot exceeds {MAX_SNAPSHOT_BYTES} bytes"
+        )));
+    }
+    data.extend_from_slice(chunk);
+    *received = next;
+    Ok(())
 }
 
 #[tonic::async_trait]
@@ -115,8 +138,7 @@ impl RaftService for RaftGrpcService {
             }
 
             if !chunk.data.is_empty() {
-                data.extend_from_slice(&chunk.data);
-                received += chunk.data.len() as u64;
+                append_snapshot_data(&mut data, &mut received, &chunk.data)?;
             }
 
             if chunk.done {
@@ -226,5 +248,31 @@ impl RaftService for RaftGrpcService {
         });
 
         Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_data_is_capped_before_allocation() {
+        let mut data = Vec::new();
+        let mut received = 0;
+        append_snapshot_data(&mut data, &mut received, b"1234").unwrap();
+        assert_eq!(4, received);
+        assert_eq!(b"1234", data.as_slice());
+
+        let mut at_limit = Vec::new();
+        let mut received = MAX_SNAPSHOT_BYTES as u64 - 1;
+        append_snapshot_data(&mut at_limit, &mut received, b"x").unwrap();
+        assert_eq!(MAX_SNAPSHOT_BYTES as u64, received);
+        assert!(append_snapshot_data(&mut at_limit, &mut received, b"x").is_err());
+        assert_eq!(1, at_limit.len());
+
+        let mut overflow = Vec::new();
+        let mut received = u64::MAX;
+        assert!(append_snapshot_data(&mut overflow, &mut received, b"x").is_err());
+        assert!(overflow.is_empty());
     }
 }

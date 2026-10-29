@@ -9,27 +9,28 @@ the market-data feed and wire v5 are exact; snapshot v9 stores fixed-point order
 single-symbol precision configuration, asset metadata, volume units and maker/taker fee assets.
 One process/cluster trades exactly one symbol; multi-symbol is isolated by running one process per
 symbol. Base/quote volume and asset-aware fee deduction are done, and the market-data processor
-runs as a tokio task. The remaining work is public-API hardening, stronger correctness evidence,
-failure behavior and measured performance.
+runs as a tokio task. Edge request/snapshot limits and the loopback/private-network contract are in
+place; the remaining work is stronger correctness evidence, failure behavior, measured performance
+and TLS/authentication for future public exposure.
 
 Priority key: **P0** = correctness/security, do next; **P1** = production readiness; **P2** =
 important but not blocking; **P3** = later/optional.
 
 ## Top priorities
 
-1. **P0 — Harden the public trust boundary.** `client_order_id` is unbounded, the gRPC listener is
-   plaintext, and the snapshot receiver has no total-size cap. Bound IDs and request sizes, cap
-   or stream snapshots, and decide TLS/mTLS plus HTTP authentication before any non-loopback
-   exposure. Add hostile-input tests.
-2. **P1 — Build stronger correctness evidence.** Add randomized differential/property tests for
+The P0 public-trust-boundary work is complete: ids, request bodies, events pages, read keys and
+snapshot streams are bounded at the edge, and the loopback/private-network deployment contract is
+documented and enforced with a startup warning.
+
+1. **P1 — Build stronger correctness evidence.** Add randomized differential/property tests for
    the book (volume conservation, no crossed book, price-time priority, deterministic replay).
    The 18-digit exactness round trip across API, events, feed, wire and snapshot is now covered by
    `tests/cluster/test_exactness.rs`; keep that guard while adding a reference model.
-3. **P1 — Make failure and observability behavior explicit.** A dead gRPC server task currently
+2. **P1 — Make failure and observability behavior explicit.** A dead gRPC server task currently
    leaves the HTTP API serving a node peers cannot reach; two `Logger` middleware log every
    request twice; `test_cluster` leaks fixed ports and running nodes. Decide fail-fast versus
    degraded mode, collapse logging, and make the test own and stop its nodes.
-4. **P1 — Measure before optimizing.** The post-fee microbenchmark baseline is recorded in §8; add
+3. **P1 — Measure before optimizing.** The post-fee microbenchmark baseline is recorded in §8; add
    submit → commit → apply → response latency and a 50k–500k fills/s feed load test. Only then
    consider per-level buckets or a compact resting record. The numbers in `docs/TRANSPORTS.md`
    are still guidance, not results.
@@ -94,19 +95,20 @@ Remaining:
   a symbol-0 process (the engine already rejects it; fail earlier and cheaper).
 - [ ] **P2** Add a provisioning helper for `ConfigureSymbol` and a pre-trade readiness check.
 
-## 3. Public trust boundary and request safety [P0/P1]
+## 3. Public trust boundary and request safety [P1]
 
-- [ ] **P0** Bound `client_order_id`: define a small byte limit (for example 128 bytes), an
-  accepted character set and empty-string behavior. Today a client can grow the 262144-record
-  dedupe map with arbitrarily large keys.
-- [ ] **P0** Set explicit limits for `/write`, `/events` and `/read` payloads/cursors; reject
-  oversized or malformed input before it reaches the Raft proposal.
-- [ ] **P0** Cap the total bytes a snapshot stream may allocate, or spool chunks to a temporary
-  file. The gRPC receiver currently accepts chunks until the stream ends while extending an
-  in-memory buffer.
-- [ ] **P0** Decide and document transport security: TLS/mTLS for the gRPC listener and
-  authentication/authorization for the HTTP API, or an explicit loopback/private-network-only
-  deployment contract. Nothing is configured today.
+- [x] **P0** Bound `client_order_id` to 1–128 printable ASCII bytes from `[A-Za-z0-9._:-]`;
+  empty strings are rejected and invalid ids return `400` before the Raft proposal.
+- [x] **P0** Cap application JSON bodies at 1 MiB, validate `/read` keys at 1–128 printable ASCII
+  bytes, and reject `/events` limits outside 1–1000 with `400`. Malformed JSON and oversized
+  bodies fail in the extractor.
+- [x] **P0** Cap HTTP snapshot bodies and gRPC snapshot streams at 256 MiB, checking the gRPC
+  cumulative total before each chunk is appended.
+- [x] **P0** Adopt and document a loopback/trusted-private-network-only deployment contract because
+  TLS/mTLS and HTTP authentication are not implemented. The node warns when bound to a
+  non-loopback address.
+- [ ] **P1** Implement TLS/mTLS and API authentication before allowing public exposure, then
+  replace the loopback/private-network warning with an enforced policy.
 - [ ] **P1** Add a health/readiness endpoint that reports gRPC listener health, Raft leadership
   and storage state.
 - [ ] **P1** Decide whether a died gRPC server task should stop the process (fail fast) or leave
@@ -240,14 +242,16 @@ Current coverage:
 - `test_fees.rs`: maker/taker fee rates, `/write`/`/events`/file-sink/feed fees and snapshot restart.
 - `test_fee_assets.rs`: ETF/fiat symbol metadata, tick/lot enforcement, quote-volume limit
   normalization and quote-asset fee deduction.
+- `test_request_limits.rs`: oversized bodies, malformed JSON, invalid/oversized client ids,
+  oversized read keys and out-of-range event pages are rejected before Raft.
 
 Remaining:
 
 - [ ] **P1** Randomized differential/property tests for matching invariants (see §5).
 - [x] Exactness across snapshot/restart/events/feed is covered by `test_exactness.rs`.
 - [x] Per-symbol rejection, precision and lock tests are covered by `test_symbols.rs` (see §2).
-- [ ] **P1** Hostile-input tests for oversized `client_order_id`, oversized `/write` and `/events`
-  payloads, malformed JSON and oversized snapshots (see §3).
+- [x] **P0** Hostile-input tests for oversized `client_order_id`, oversized `/write` and `/events`
+  payloads, malformed JSON, oversized read keys and oversized snapshots (see §3).
 - [ ] **P1** End-to-end latency benchmark: submit → commit → apply → response, separated from
   matching and replication costs.
 - [ ] **P2** Add negative API tests for unknown `/read` keys and malformed `Place` payloads.
@@ -320,8 +324,9 @@ These choices feed the priorities above; write them down as ADRs or doc notes wh
 - [x] Wire v5 representation: scale-18 `i128` prices, quantities, quote volume and fees plus
   volume units and fee assets; older consumers must upgrade and frames are never silently
   reinterpreted.
-- [ ] External exposure model: TLS/mTLS, HTTP authentication, and whether the API is
-  loopback/private-network only.
+- [x] External exposure model: no TLS/mTLS or HTTP authentication; the supported contract is
+  loopback or a trusted private network, with edge request/snapshot limits.
+- [ ] TLS/mTLS and HTTP authentication for any future non-private exposure.
 - [ ] gRPC listener failure policy: fail-fast process exit vs degraded health state.
 - [x] Multi-symbol isolation: one process/cluster per symbol, never multiple books in one process.
 - [ ] Event time source for the clearing feed and per-instrument cursor retention.

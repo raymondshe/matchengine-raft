@@ -357,7 +357,8 @@ POST /events
 
 - Omitting `after` means "from the oldest retained event".
 - Cursors compare by `EventId`'s derived ordering: `(log_index, ordinal)`.
-- `limit` is capped server-side (e.g. 1000) so one call cannot allocate unbounded memory.
+- `limit` must be between 1 and 1000; out-of-range values are rejected with `400` rather than
+  silently clamped, so one call cannot allocate unbounded memory.
 - `/events` performs a linearizable read via a read linearizer; the client forwards to the leader
   on `ForwardToLeader`. `/events/status` is a local read for dashboards.
 - Implemented in `src/network/api.rs` with `EventsRequest`/`EventsResponse`/`EventsStatus`; the
@@ -390,6 +391,8 @@ Returning events does not by itself make retries safe. Two independent dedupe la
   index instead of placing a second order. The map is snapshotted and bounded by the fixed
   `MAX_SUBMISSIONS` constant (independent of `--max-events`, because dedupe affects matching).
   Keeping the key on the request (not `Order`) preserves `Order: Copy` in the matching loop.
+  The edge validates the key before proposing: 1–128 bytes from `[A-Za-z0-9._:-]`, with empty
+  strings rejected (omit the field to disable idempotency).
 - **Consumption:** dedupe on `event_id` as above.
 
 Without the first layer, an HTTP timeout after commit produces two orders that genuinely trade

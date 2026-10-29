@@ -8,6 +8,7 @@ mod test_late_join;
 mod test_market_data;
 mod test_match_results;
 mod test_membership;
+mod test_request_limits;
 mod test_restart;
 mod test_snapshot;
 mod test_storage;

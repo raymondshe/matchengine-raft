@@ -28,7 +28,9 @@ pub enum MatchEngineRequest {
         order: Order,
         /// Optional client-supplied idempotency key. A retry with the same key
         /// returns the original sequence and events instead of placing a second
-        /// order. Omit it for the old, non-idempotent behaviour.
+        /// order. Omit it for the old, non-idempotent behaviour. The HTTP edge
+        /// requires 1–128 bytes from `[A-Za-z0-9._:-]`; empty values are
+        /// rejected before the request reaches Raft.
         #[serde(default)]
         client_order_id: Option<String>,
     },

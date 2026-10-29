@@ -9,6 +9,19 @@ pub mod transport;
 /// `BasicNode.addr` keeps one meaning (the API address) for every node.
 pub const RAFT_PORT_OFFSET: u16 = 1000;
 
+/// Maximum HTTP/JSON body accepted by the legacy Raft append RPC.
+///
+/// Matches the gRPC message cap; append batches are the only public Raft body
+/// that routinely grows beyond a single order.
+pub const MAX_HTTP_RAFT_BODY_BYTES: usize = 64 * 1024 * 1024;
+
+/// Maximum snapshot size accepted by either transport.
+///
+/// The state machine still installs one contiguous buffer, so the receiver
+/// enforces a hard total before allocating. This is large enough for the
+/// retained event window and order book while bounding a hostile peer.
+pub const MAX_SNAPSHOT_BYTES: usize = 256 * 1024 * 1024;
+
 /// Which transport the node uses for outbound Raft RPCs.
 ///
 /// The server always accepts both: the HTTP endpoints remain mounted on the API
