@@ -329,7 +329,7 @@ tests/
     ├── test_cluster.rs      # 3 节点集群，两种传输
     ├── test_snapshot.rs     # 快照生成/purge、学习者安装 + 周期定时器
     ├── test_storage.rs      # WAL 与快照格式
-    ├── test_restart.rs      # 重启恢复：日志重放与快照
+    ├── test_restart.rs      # 重启恢复：日志重放、快照 + WAL 尾部
     ├── test_match_results.rs # 撮合事件写入 JSONL 文件 sink
     ├── test_market_data.rs    # 行情 feed：快照、成交、BBO、深度、K 线
     ├── test_events.rs         # 事件日志：写响应、游标、保留、幂等
@@ -567,10 +567,13 @@ config.max_in_snapshot_log_to_keep = 0; // 清理快照已覆盖的全部日志
 
 启动时节点会：
 1. 恢复 WAL 索引、投票和 purge 标记（并丢弃撕裂的尾部）。
-2. 如果存在 `snapshot/current.snap`，加载它并重建订单簿。
-3. 由 openraft 在其上重放保留的日志尾部。
+2. 选择并加载 `snapshot/current.snap`（如果存在）。该文件原子替换，因此始终是最新的完整快照；
+   崩溃只会留下不会被选中的 `.tmp` 文件。
+3. 从快照元数据恢复状态机的 `last_applied`，再由 openraft 重放日志索引大于快照最后日志索引的
+   保留 WAL 条目。
 
-单节点集群因此可以恢复所有活动订单和序列号，无论恢复路径是纯日志重放还是快照 + 尾部重放。两条路径都由 `tests/cluster/test_restart.rs` 覆盖。
+单节点集群因此可以恢复所有活动订单、序列号、保留事件窗口和幂等去重表，无论恢复路径是纯日志重放
+还是快照 + 更新的 WAL 尾部。两条路径都由 `tests/cluster/test_restart.rs` 覆盖。
 
 ## 集群管理
 
@@ -718,7 +721,7 @@ pub struct MatchEngineResponse {
 | `tests/cluster/test_cluster.rs` | 3 节点集群：初始化、学习者、成员变更、读写、线性一致性读、领导者转发、缩容；默认走 gRPC，设置 `MATCHENGINE_TEST_TRANSPORT=http` 后走 HTTP |
 | `tests/cluster/test_snapshot.rs` | 快照生成、日志 purge、学习者通过 gRPC 快照流安装已 purge 的状态，以及关闭日志计数策略时的周期快照定时器 |
 | `tests/cluster/test_storage.rs` | WAL 帧格式、撕裂尾部截断、分段轮转、2 万条跨段日志重开、跨段 truncate/purge、vote/committed 持久化、快照构建/安装/重开、损坏文件拒绝 |
-| `tests/cluster/test_restart.rs` | 完整节点重启后通过日志重放恢复，以及通过快照 + 尾部恢复订单簿和序列号；另含 2000 单大日志重放和多分块（约 120 KB）快照启动 |
+| `tests/cluster/test_restart.rs` | 完整节点重启后通过日志重放恢复，以及通过快照 + 更新的 WAL 尾部恢复订单簿、序列号、事件窗口和幂等表；另含 2000 单大日志重放和多分块（约 120 KB）快照启动 |
 | `tests/cluster/test_match_results.rs` | 以 `--match-event-log` 启动的节点按日志顺序记录 rest/fill/cancel 事件，同时 `/write` 响应保持不变；第二个节点验证止损触发、GTD 过期和新增的 `/read` 键 |
 | `tests/cluster/test_market_data.rs` | 以 `--market-data-log` 启动的节点发布重置快照、每个 taker 一条成交消息、BBO、批后深度总量和一根已收盘 K 线；断言同时检查 `market_seq` 锚点与 `/read marketdata_status` 计数器 |
 | `tests/cluster/test_events.rs` | `/write` 返回事件、`/events` 游标分页、`client_order_id` 重试不重复下单、`--max-events` 淘汰与 `/events/status` 计数 |
@@ -731,7 +734,7 @@ pub struct MatchEngineResponse {
 | `tests/cluster/test_request_limits.rs` | 超大 JSON 请求体、畸形输入、非法/超长 `client_order_id`、超长 read key 和越界事件分页在进入 Raft 前以 `400`/`413` 拒绝 |
 
 所有集成测试都使用唯一的临时数据目录。集群测试固定使用端口 `21001-21003`（gRPC
-`22001-22003`），快照测试使用 `21101-21103`，重启测试使用 `21201-21204`，撮合结果测试使用
+`22001-22003`），快照测试使用 `21101-21103`，重启测试使用 `21201-21205`，撮合结果测试使用
 `21301`/`21302`、行情数据测试 `21303`、事件日志测试 `21304`、故障切换测试
 `21401-21403`、学习者追赶测试 `21501-21502`、过期节点重入测试 `21601-21603`、精度往返测试 `21701`（gRPC `22701`）、标的配置测试 `21801`（gRPC `22801`）、费用测试 `21901`（gRPC `22901`）、费用资产测试 `21902`（gRPC `22902`）、请求限制测试 `21903`（gRPC `22903`）；重跑前请先停止残留进程
 （`pkill -f matchengine-raft`）。

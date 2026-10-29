@@ -127,8 +127,9 @@ Persistence is done:
   before replacing the durable copy.
 - [x] Per-node directories from `StorageConfig`; `--data-dir` / `--instance-prefix` and env
   equivalents.
-- [x] Restart recovery via log replay and snapshot; large-log, large-snapshot and late-join
-  coverage.
+- [x] Restart recovery via log replay and snapshot + newer WAL tail; the snapshot load restores
+  the event window and dedupe map before openraft replays tail entries. Large-log,
+  large-snapshot and late-join coverage.
 - [x] Default snapshot policy: `LogsSinceLast(100_000)` plus a 30-minute timer that only fires
   when newer entries exist; `StorageConfig::snapshot_interval` and `--snapshot-interval-ms` tune
   the timer (`0` disables it).
@@ -234,8 +235,8 @@ Current coverage:
 - `test_snapshot.rs`: snapshot build/purge and learner install over gRPC.
 - `test_storage.rs`: WAL framing, torn-tail truncation, segment rotation, 20k-record multi-segment
   reopen, purge/truncate, vote/committed persistence, snapshot build/install/reopen.
-- `test_restart.rs`: restart via log replay and via snapshot, 2k-order large-log replay and a
-  multi-chunk (~120 KB) snapshot boot.
+- `test_restart.rs`: restart via log replay and via snapshot + newer WAL tail (including event
+  window and dedupe), 2k-order large-log replay and a multi-chunk (~120 KB) snapshot boot.
 - `test_events.rs`: `/write` events, `/events` cursor, retention, submission dedupe.
 - `test_match_results.rs`: file-sink rest/fill/cancel ordering, stop trigger, GTD expiry and read
   keys.

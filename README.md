@@ -339,7 +339,7 @@ tests/
     ├── test_cluster.rs      # 3-node cluster, both transports
     ├── test_snapshot.rs     # Snapshot build/purge, learner install + periodic timer
     ├── test_storage.rs      # WAL and snapshot formats
-    ├── test_restart.rs      # Restart recovery: log replay and snapshot
+    ├── test_restart.rs      # Restart recovery: log replay, snapshot + WAL tail
     ├── test_match_results.rs # Match events in the JSONL file sink
     ├── test_market_data.rs    # Market-data feed: snapshot, trades, BBO, depth, bars
     ├── test_events.rs         # Event log: write events, cursor, retention, dedupe
@@ -603,12 +603,14 @@ config.max_in_snapshot_log_to_keep = 0; // purge everything the snapshot covers
 
 On startup the node:
 1. Recovers the WAL index, vote and purge marker (discarding a torn tail).
-2. Loads `snapshot/current.snap` if it exists and rebuilds the order book.
-3. Lets openraft replay the retained log tail on top of the restored state.
+2. Selects and loads `snapshot/current.snap` if it exists. The file is replaced atomically, so it
+   is always the latest complete snapshot; a crash leaves only an ignored `.tmp` file.
+3. Sets the state machine's `last_applied` from the snapshot metadata and lets openraft replay
+   retained WAL entries whose log index is greater than the snapshot's last log id.
 
-A single-node cluster therefore comes back with all live orders and its sequence counter, whether
-recovery is pure log replay or snapshot + tail. Both paths are covered by
-`tests/cluster/test_restart.rs`.
+A single-node cluster therefore comes back with all live orders, the sequence counter, the retained
+event window and the idempotency map, whether recovery is pure log replay or snapshot + newer WAL
+tail. Both paths are covered by `tests/cluster/test_restart.rs`.
 
 ## Cluster Management
 
@@ -777,7 +779,7 @@ placeholder). `sequence` is still required by the deserializer.
 | `tests/cluster/test_cluster.rs` | 3-node cluster: init, learner, membership, write/read, linearizable read, leader forwarding, membership shrink; runs over gRPC by default and HTTP with `MATCHENGINE_TEST_TRANSPORT=http` |
 | `tests/cluster/test_snapshot.rs` | Snapshot creation, log purge, a learner installing the purged state over the gRPC snapshot stream, and the periodic snapshot timer with the log-count policy disabled |
 | `tests/cluster/test_storage.rs` | WAL framing, torn-tail truncation, segment rotation, a 20k-record multi-segment reopen, truncate/purge across segments, vote/committed persistence, snapshot build/install/reopen, corrupt-file rejection |
-| `tests/cluster/test_restart.rs` | Full node restart recovering the order book and sequence via WAL replay and via snapshot + tail; also 2k-order large-log replay and a multi-chunk (~120 KB) snapshot boot |
+| `tests/cluster/test_restart.rs` | Full node restart recovering the order book, sequence, event window and idempotency map via WAL replay and via snapshot + newer WAL tail; also 2k-order large-log replay and a multi-chunk (~120 KB) snapshot boot |
 | `tests/cluster/test_match_results.rs` | A node started with `--match-event-log` records rest/fill/cancel events in log order while the `/write` response stays unchanged; a second node checks stop triggers, GTD expiry and the new `/read` keys |
 | `tests/cluster/test_market_data.rs` | A node started with `--market-data-log` publishes a reset snapshot, one trade message per taker, BBO, post-entry depth totals and a closed OHLC bar; the assertions check `market_seq` anchors and `/read marketdata_status` counters |
 | `tests/cluster/test_events.rs` | `/write` returns events, `/events` pages by cursor, `client_order_id` retries do not duplicate an order, and `--max-events` eviction is visible in `/events/status` |
@@ -791,7 +793,7 @@ placeholder). `sequence` is still required by the deserializer.
 
 Every integration test uses a unique temporary data directory. The cluster test uses fixed ports
 `21001-21003` (gRPC `22001-22003`), the snapshot tests `21101-21103`, the restart tests
-`21201-21204`, the match-result tests `21301`/`21302`, the market-data test `21303`, the event-log test
+`21201-21205`, the match-result tests `21301`/`21302`, the market-data test `21303`, the event-log test
 `21304`, the failover test `21401-21403`, the learner catch-up test `21501-21502`, the late-join
 test `21601-21603`, the exactness test `21701` (gRPC `22701`), the symbol-config test `21801` (gRPC `22801`), the fee test `21901` (gRPC `22901`), the
 fee-asset test `21902` (gRPC `22902`) and the request-limit test `21903` (gRPC `22903`); stop

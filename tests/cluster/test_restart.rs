@@ -2,8 +2,9 @@
 //!
 //! Each test boots a single-node cluster on its own port, places orders, stops the
 //! node through [`MatchEngineNode::shutdown`], then builds a new node on the same
-//! storage directory and verifies that the order book and the sequence counter came
-//! back.
+//! storage directory and verifies that the order book, sequence counter, event
+//! window and idempotency map came back. The snapshot + WAL-tail case loads the
+//! latest snapshot first and then applies entries newer than its last log id.
 
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
@@ -20,6 +21,8 @@ use matchengine_raft::Transport;
 use matchengine_raft::build_match_engine_node;
 use matchengine_raft::client::MatchEngineClient;
 use matchengine_raft::default_raft_config;
+use matchengine_raft::match_result::MatchEventKind;
+use matchengine_raft::network::api::EventsRequest;
 use matchengine_raft::order_book::Order;
 use matchengine_raft::order_book::OrderSide;
 use matchengine_raft::store::MatchEngineRequest;
@@ -380,6 +383,118 @@ fn restart_recovers_large_snapshot() {
         let client = make_client(addr);
         wait_for_leader(&client).await.unwrap();
         assert_order_state(&client, 2_000, "2000").await.unwrap();
+
+        node.shutdown().await.unwrap();
+    });
+}
+
+/// Snapshot + WAL-tail recovery: load the latest snapshot, then apply the
+/// retained entries whose log index is greater than the snapshot's last log id.
+/// The event window and idempotency map must include both parts.
+#[test]
+fn restart_loads_snapshot_then_replays_newer_wal_events() {
+    C::run(async {
+        let addr = "127.0.0.1:21205";
+        let temp = TempDir::new("snapshot-tail-events");
+        let storage =
+            StorageConfig::new(temp.0.clone()).with_instance_prefix("snapshot-tail-events");
+
+        // Disable automatic snapshots; this test creates one explicitly and
+        // then appends newer entries that must come from the WAL tail.
+        let config = test_config(SnapshotPolicy::LogsSinceLast(1_000_000));
+
+        let node = start(addr, &storage, config.clone()).await.unwrap();
+        let client = make_client(addr);
+        client.init().await.unwrap().unwrap();
+        wait_for_leader(&client).await.unwrap();
+
+        for i in 0..3 {
+            let response = client
+                .write(&MatchEngineRequest::place_with_client_id(
+                    Order::new(OrderSide::Buy, 10.0 - i as f64, 1.0, 0),
+                    format!("pre-snapshot-{i}"),
+                ))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(Some(i), response.data.sequence);
+        }
+
+        node.raft.trigger().snapshot().await.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let snapshot_index = loop {
+            let metrics = client.metrics().await.unwrap();
+            let snapshot = metrics.snapshot.map(|log_id| log_id.index);
+            let purged = metrics.purged.map(|log_id| log_id.index);
+            if let (Some(snapshot), Some(purged)) = (snapshot, purged)
+                && purged >= snapshot
+                && snapshot >= 3
+            {
+                break snapshot;
+            }
+            if Instant::now() > deadline {
+                panic!("snapshot/purge did not happen: snapshot={snapshot:?}, purged={purged:?}");
+            }
+            C::sleep(Duration::from_millis(50)).await;
+        };
+
+        // These two entries are newer than the snapshot and must be replayed
+        // from the WAL after the snapshot is loaded.
+        for i in 0..2 {
+            client
+                .write(&MatchEngineRequest::place(Order::new(
+                    OrderSide::Buy,
+                    5.0 - i as f64,
+                    1.0,
+                    0,
+                )))
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        assert_order_state(&client, 5, "5").await.unwrap();
+
+        node.shutdown().await.unwrap();
+
+        let node = start(addr, &storage, config).await.unwrap();
+        let client = make_client(addr);
+        wait_for_leader(&client).await.unwrap();
+
+        // Snapshot state (3 orders/events) plus WAL tail (2 orders/events).
+        assert_order_state(&client, 5, "5").await.unwrap();
+        let page = client
+            .events(&EventsRequest {
+                after: None,
+                limit: Some(100),
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(5, page.events.len(), "missing snapshot or tail events");
+        let tail: Vec<_> = page
+            .events
+            .iter()
+            .filter(|event| event.event_id.log_index > snapshot_index)
+            .collect();
+        assert_eq!(2, tail.len(), "newer WAL events were not replayed");
+        assert!(
+            tail.iter()
+                .all(|event| event.kind == MatchEventKind::Rested),
+            "unexpected tail events: {tail:?}"
+        );
+
+        // The snapshot's idempotency map is restored too: retrying a
+        // pre-snapshot key must not place another order.
+        let duplicate = client
+            .write(&MatchEngineRequest::place_with_client_id(
+                Order::new(OrderSide::Buy, 99.0, 1.0, 0),
+                "pre-snapshot-0",
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(Some(0), duplicate.data.sequence);
+        assert_order_state(&client, 5, "5").await.unwrap();
 
         node.shutdown().await.unwrap();
     });

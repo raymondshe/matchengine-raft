@@ -654,10 +654,19 @@ impl<C: RaftTypeConfig> StateMachineStore<C> {
 
         if let Some((meta, data)) = read_snapshot_file::<C>(&dir)? {
             let content = decode_content(&data)?;
+            let snapshot_last_log_id = meta.last_log_id.clone();
+            let snapshot_events = content.events.len();
+            let snapshot_orders = content.orders.len();
             inner.install_content(content);
             inner.last_applied_log = meta.last_log_id.clone();
             inner.last_membership = meta.last_membership.clone();
             inner.current_snapshot = Some(StoredSnapshot { meta, data });
+            tracing::info!(
+                snapshot_last_log_id = ?snapshot_last_log_id,
+                snapshot_events,
+                snapshot_orders,
+                "loaded latest snapshot; WAL replay starts after its last log id"
+            );
         }
 
         if market_data.is_some() {
@@ -1223,7 +1232,11 @@ fn decode_content(data: &[u8]) -> io::Result<StateMachineData> {
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("corrupt snapshot: {e}")))
 }
 
-/// Reads and validates the snapshot file, returning metadata plus the encoded content.
+/// Reads and validates the latest snapshot file.
+///
+/// `current.snap` is replaced atomically, so the file present at startup is the
+/// newest complete snapshot; a crash can leave only a `.tmp` file, which is
+/// never selected.
 fn read_snapshot_file<C: RaftTypeConfig>(
     dir: &Path,
 ) -> io::Result<Option<(SnapshotMetaOf<C>, Vec<u8>)>> {
