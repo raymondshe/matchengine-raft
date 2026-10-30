@@ -21,7 +21,7 @@ A practical implementation of a distributed matching engine built upon [OpenRaft
 |---|---|
 | Execution | Deterministic price-time matching; `apply` reads no wall clock |
 | Durability | Segmented WAL + atomic snapshots; snapshot every 100k entries or 30 minutes |
-| Replication | Raft over gRPC by default, HTTP/JSON still supported |
+| Replication | Raft over gRPC; HTTP/JSON Raft transport removed |
 | Symbol model | One symbol per process/cluster, configured and locked through Raft |
 | Numeric model | Exact 18-decimal fixed point through matching, events, snapshots and feeds |
 | Public edge | Bounded request/snapshot limits; loopback or private-network deployment |
@@ -58,7 +58,7 @@ Built for teams that need deterministic execution, durable recovery and a clean 
 - **Atomic snapshots** written by temp file → fsync → rename → directory fsync, with checksum validation before install.
 - **Snapshot policy for real workloads**: every 100,000 applied entries or 30 minutes when newer entries exist, configurable with `--snapshot-interval-ms`.
 - **Snapshot + WAL-tail recovery** that restores the latest snapshot, event window and idempotency map, then replays only newer log entries.
-- **gRPC replication** with bidirectional `stream_append`, chunked snapshot transfer and independent per-peer channels; HTTP/JSON remains selectable.
+- **gRPC replication** with bidirectional `stream_append`, chunked snapshot transfer and independent per-peer channels.
 
 **APIs and data feeds**
 - **Durable match-event feed** at `POST /events` with cursor pagination, retention limits, `client_order_id` idempotency and replay-safe retries.
@@ -69,7 +69,7 @@ Built for teams that need deterministic execution, durable recovery and a clean 
 
 **Built to be trusted**
 - **Bounded public edge**: request-body, read-key, event-page, idempotency-key and snapshot-size limits, with malformed input rejected before Raft.
-- **Explicit deployment contract** for loopback or trusted private networks, plus startup warnings for non-loopback binds.
+- **Explicit internal-service contract**: loopback or trusted private networks, gateway-owned TLS/authentication, plus startup warnings for non-loopback binds.
 - **Fail-fast transport health**: if the gRPC listener dies, `run()` stops the node and returns an error instead of leaving a half-healthy HTTP API serving peers that cannot reach it.
 - **Correctness evidence**: randomized differential tests against a reference model, explicit order-type conformance cases, deterministic replay checks and cluster recovery tests.
 - **One symbol per process/cluster** for isolated resources and failure domains; scale horizontally by running one deployment per symbol.
@@ -111,13 +111,12 @@ This project extends the [example-raft-kv](https://github.com/datafuselabs/openr
                ▼                               ▼                               ▼
     ┌─────────────────────┐         ┌─────────────────────┐         ┌─────────────────────┐
     │     Log + State     │         │     RaftNetwork     │         │      HTTP API       │
-    │  (WAL + Snapshots)  │         │    (gRPC / HTTP)    │         │     (Actix-web)     │
+    │  (WAL + Snapshots)  │         │       (gRPC)        │         │     (Actix-web)     │
     └─────────────────────┘         └─────────────────────┘         └─────────────────────┘
 ```
 
-Peer-to-peer Raft RPCs use gRPC on `port + 1000` by default. The public API and the HTTP Raft
-handlers stay on the `--http-addr` listener, so a node serves both transports regardless of which
-one it dials.
+Peer-to-peer Raft RPCs use gRPC on `port + 1000`. The public application and management API
+stays on the `--http-addr` listener; there is no HTTP/JSON Raft transport.
 
 Market-data egress is node-local and off the consensus path: the tap is a bounded `try_send`, so a
 slow subscriber can never block `apply`. The JSONL sink is for debugging; the same wire-v5 messages
@@ -132,7 +131,6 @@ are what the Aeron adapter (streams 2001–2007) will publish next.
 
 2. **Network Layer** ([`network/`](./src/network/))
    - gRPC Raft RPCs (`src/network/grpc/`) for replication, voting and snapshot streaming
-   - Legacy HTTP/JSON Raft RPCs (`src/network/raft.rs`) selectable at runtime (`src/network/transport.rs`)
    - Separate replication, heartbeat and snapshot channels per peer
    - Management APIs for cluster administration
 
@@ -191,12 +189,7 @@ cargo test
 ```
 
 The integration target runs the cluster scenario through `MatchEngineClient`, exercises the gRPC
-snapshot path, checks the WAL and snapshot formats, and restarts nodes to prove recovery. Run it
-over the legacy transport with:
-
-```shell
-MATCHENGINE_TEST_TRANSPORT=http cargo test --test cluster
-```
+snapshot path, checks the WAL and snapshot formats, and restarts nodes to prove recovery.
 
 See [Testing](#testing) for the individual test files.
 
@@ -217,9 +210,8 @@ Start additional nodes (in separate terminals):
 ./target/debug/matchengine-raft --id 3 --http-addr 127.0.0.1:21003
 ```
 
-Each node listens for gRPC Raft RPCs on `port + 1000` (`22001-22003` here). Use
-`--transport http` to make a node dial peers over HTTP/JSON instead; the HTTP Raft endpoints are
-always mounted, so mixed-transport clusters work during migration.
+Each node listens for gRPC Raft RPCs on `port + 1000` (`22001-22003` here). The HTTP listener is
+reserved for the application and management API.
 
 All state is written to `<data-dir>/<instance-prefix>-<id>/`; see
 [Per-node data directory](#per-node-data-directory).
@@ -308,10 +300,11 @@ The project also includes `scripts/test.sh` for more convenient cluster manageme
 
 ## Security and Deployment Boundary
 
-The HTTP API and the gRPC Raft listener (HTTP port + 1000) have **no TLS, mTLS or authentication**.
-This is an explicit deployment contract: run them only on loopback or a trusted private network,
-and firewall both ports. Do not expose either listener to the public internet until transport
-security and API authentication are implemented.
+The HTTP API and the gRPC Raft listener (HTTP port + 1000) are **plaintext and unauthenticated by
+design**. This is an internal matching engine, not an internet-facing gateway: run it only on
+loopback or a trusted private network, firewall both ports, and terminate TLS plus client
+authentication at the gateway in front of it. TLS/mTLS and API authentication are intentionally
+not implemented in this process, where they would add latency without protecting a public surface.
 
 The node logs a warning when it is bound to a non-loopback address. Request handling is bounded at
 the edge, before Raft proposes anything:
@@ -322,9 +315,8 @@ the edge, before Raft proposes anything:
 | `client_order_id` | 1–128 bytes, ASCII letters/digits plus `. _ - :`; empty rejected |
 | `/read` key | 1–128 printable ASCII bytes |
 | `/events` page size | 1–1000 events |
-| HTTP Raft append body / gRPC message | 64 MiB (`MAX_HTTP_RAFT_BODY_BYTES` / `MAX_MESSAGE_SIZE`) |
-| HTTP snapshot body | 256 MiB (`MAX_SNAPSHOT_BYTES`) |
-| gRPC snapshot stream | 256 MiB total, checked before each chunk is appended |
+| gRPC Raft message | 64 MiB (`MAX_MESSAGE_SIZE`) |
+| gRPC snapshot stream | 256 MiB total (`MAX_SNAPSHOT_BYTES`), checked before each chunk is appended |
 
 Malformed JSON and invalid fields return `400`; oversized bodies return `413`. The replicated
 `client_order_id` dedupe map retains at most 262,144 records, so the key bound also bounds its
@@ -349,14 +341,11 @@ src/
 ├── network/
 │   ├── api.rs               # Application HTTP endpoints
 │   ├── management.rs        # Admin HTTP endpoints
-│   ├── raft.rs              # Raft internal HTTP RPC endpoints
-│   ├── raft_network_impl.rs # HTTP/JSON RaftNetworkV2 implementation
-│   ├── transport.rs         # Runtime transport selection (gRPC or HTTP)
 │   ├── grpc/
 │   │   ├── client.rs        # gRPC RaftNetworkV2 (append, vote, snapshots)
 │   │   ├── server.rs        # gRPC Raft service
 │   │   └── mod.rs           # Protobuf types and message-size limits
-│   └── mod.rs               # Transport enum, Raft port derivation
+│   └── mod.rs               # Raft port derivation and transport limits
 ├── store/
 │   ├── mod.rs               # Storage module
 │   ├── log_store.rs         # Segmented WAL + vote/purge state
@@ -371,7 +360,7 @@ tests/
 └── cluster/
     ├── main.rs              # Single integration test target
     ├── common.rs            # Unique temp data dirs
-    ├── test_cluster.rs      # 3-node cluster, both transports
+    ├── test_cluster.rs      # 3-node gRPC cluster
     ├── test_snapshot.rs     # Snapshot build/purge, learner install + periodic timer
     ├── test_storage.rs      # WAL and snapshot formats
     ├── test_restart.rs      # Restart recovery: log replay, snapshot + WAL tail
@@ -383,7 +372,13 @@ tests/
     ├── test_exactness.rs      # 18-digit values through API, events, feed and snapshot restart
     ├── test_symbols.rs        # One-symbol config, precision rejection and symbol lock
     ├── test_fees.rs           # Maker/taker fees through API, events, feed and restart
-    └── test_fee_assets.rs     # QQQ/USD tick/lot, quote volume and quote fees
+    ├── test_fee_assets.rs     # QQQ/USD tick/lot, quote volume and quote fees
+    └── test_request_limits.rs # Hostile input and request-size limits
+benches/
+├── matchengine.rs           # Order-book microbenchmarks
+├── e2e.rs                   # Submit -> commit -> apply -> response
+├── feed_load.rs             # Market-data feed load test
+└── storage.rs               # WAL append/read/recovery
 ```
 
 ## Storage Implementation
@@ -662,19 +657,18 @@ Adding a node to a cluster involves 3 steps:
 All endpoints speak JSON. Every handler returns a `Result` wrapper, so a successful call looks like
 `{"Ok": ...}` and a forwarded or failed call like `{"Err": ...}`.
 
-### Raft Internal APIs
+### Raft Transport API
 
-Mounted on the public HTTP listener and used by the HTTP/JSON transport:
+Raft peer-to-peer RPCs are served only by gRPC on `--http-addr` port + 1000:
 
-- `POST /append` - Append entries RPC
-- `POST /vote` - Request vote RPC
-- `POST /snapshot` - Install a full snapshot RPC
+- `AppendEntries` and `Vote` (unary)
+- `InstallSnapshot` (client-streaming chunks)
+- `AppendStream` (bidirectional pipelined appends)
 
-The gRPC transport exposes the same operations on `--http-addr` port + 1000
-(`AppendEntries`, `Vote`, `InstallSnapshot`, `AppendStream`); see `proto/raft.proto`.
-Unary append/vote use `RPCOption::soft_ttl`, snapshots stream in 256 KiB chunks, and both message
-directions are capped at 64 MiB. `Unavailable` maps to `RPCError::Unreachable`, timeouts to
-`RPCError::Timeout`, and other statuses to `RPCError::Network`.
+See `proto/raft.proto`. Unary append/vote use `RPCOption::soft_ttl`, snapshots stream in 256 KiB
+chunks, and both message directions are capped at 64 MiB. `Unavailable` maps to
+`RPCError::Unreachable`, timeouts to `RPCError::Timeout`, and other statuses to
+`RPCError::Network`.
 
 ### Admin APIs
 
@@ -811,7 +805,7 @@ placeholder). `sequence` is still required by the deserializer.
 |---|---|
 | `src/order_book/property_tests.rs` | Randomized differential tests against a reference model plus mixed GTC/IOC/FOK/GTD/Day/market/post-only/iceberg/stop orders and positive, zero and rebate fee rates under all fee-asset policies: visible book, fills, priority, no crossed book, volume conservation, sequence/last-trade state and deterministic replay |
 | `src/order_book/conformance_tests.rs` | Explicit market-FOK, no-liquidity market, hidden-iceberg cancel/expiry, parked-stop GTD/Day expiry and fee-reporting cases for market, IOC and stop-child fills |
-| `tests/cluster/test_cluster.rs` | 3-node cluster: init, learner, membership, write/read, linearizable read, leader forwarding, membership shrink; owns and shuts down every node; runs over gRPC by default and HTTP with `MATCHENGINE_TEST_TRANSPORT=http` |
+| `tests/cluster/test_cluster.rs` | 3-node gRPC cluster: init, learner, membership, write/read, linearizable read, leader forwarding, membership shrink; owns and shuts down every node |
 | `tests/cluster/test_snapshot.rs` | Snapshot creation, log purge, a learner installing the purged state over the gRPC snapshot stream, and the periodic snapshot timer with the log-count policy disabled |
 | `tests/cluster/test_storage.rs` | WAL framing, torn-tail truncation, segment rotation, a 20k-record multi-segment reopen, truncate/purge across segments, vote/committed persistence, snapshot build/install/reopen, corrupt-file rejection |
 | `tests/cluster/test_restart.rs` | Full node restart recovering the order book, sequence, event window and idempotency map via WAL replay and via snapshot + newer WAL tail; also 2k-order large-log replay and a multi-chunk (~120 KB) snapshot boot |
@@ -837,6 +831,21 @@ leftover processes
 
 ## Performance and Current Limits
 
+Measured baseline (Apple M4, Rust 1.93.1, release bench profile; full methodology in
+[`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md)):
+
+| Workload | Result |
+|---|---:|
+| Order book: sweep 1k asks / 100 levels | 105.6 µs |
+| End-to-end `/write` p50 / p99 | 3.99 ms / 5.17 ms |
+| Concurrent `/write` throughput (1,000 in flight) | 18,350 writes/s |
+| Market-data feed at 500k fills/s | 495k fills/s, 0 drops at 8,192-frame queue |
+| WAL append / read (20k entries, 100-entry batches) | 26,049 / 2,386,089 entries/s |
+
+The feed also has a deliberate 2M fills/s overload case that drops frames and emits `GAP` rather
+than blocking matching. Reproduce the baseline with `cargo bench --bench matchengine`,
+`cargo bench --bench e2e`, `cargo bench --bench feed_load` and `cargo bench --bench storage`.
+
 Implemented performance choices:
 
 - One `write_all` + one `sync_data` per replicated append batch, so N entries in one AppendEntries
@@ -849,12 +858,12 @@ Implemented performance choices:
   atomically.
 - The event window is bounded by `--max-events` and paged through `/events`; `/read
   orderbook_orders` does not clone it.
+- WAL appends avoid per-entry clones, recovery scans segments sequentially, contiguous log reads share one `pread`, snapshot encoding/writing runs outside the state-machine lock, and snapshot bodies stream to disk through an incremental CRC writer.
 - A gRPC server failure is fatal to `run()`: HTTP is stopped, background tasks are joined and Raft is shut down before the error is returned. HTTP requests are logged once per request.
 
 Current limits and known gaps:
 
-- No transport benchmark harness; numbers in `docs/TRANSPORTS.md` are guidance, not measurements.
-- The gRPC listener has no TLS/mTLS, and the HTTP API has no authentication.
+- TLS/mTLS and API authentication are intentionally gateway responsibilities; this process is an internal service.
 - Snapshot installation needs one contiguous buffer, bounded by 256 MiB per snapshot.
 - One process/cluster trades one symbol; run one deployment per symbol to scale.
 

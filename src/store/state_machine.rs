@@ -88,11 +88,20 @@ pub struct StoredSnapshot<C: RaftTypeConfig> {
 }
 
 /// On-disk snapshot body: metadata plus the encoded state machine content.
-#[derive(Serialize, Deserialize)]
+#[derive(Deserialize)]
 #[serde(bound = "")]
 struct SnapshotPayload<C: RaftTypeConfig> {
     meta: SnapshotMetaOf<C>,
     data: Vec<u8>,
+}
+
+/// Borrowed snapshot body used while writing, so the state-machine bytes are
+/// copied once into the postcard buffer rather than into an intermediate Vec.
+#[derive(Serialize)]
+#[serde(bound = "")]
+struct SnapshotPayloadRef<'a, C: RaftTypeConfig> {
+    meta: &'a SnapshotMetaOf<C>,
+    data: &'a [u8],
 }
 
 /// Default number of match events retained in the state machine.
@@ -834,17 +843,23 @@ where
     /// This is what [`RaftSnapshotBuilder::build_snapshot`] uses; it is also handy in tests that
     /// want a snapshot without waiting for openraft's snapshot policy to trigger.
     pub async fn persist_snapshot(&self) -> io::Result<SnapshotMetaOf<C>> {
-        let inner = self.inner.lock().await;
-        let meta = SnapshotMetaOf::<C> {
-            last_log_id: inner.last_applied_log.clone(),
-            last_membership: inner.last_membership.clone(),
+        // Capture a consistent content image, then release the state-machine
+        // lock before encoding and writing. Applying new entries can continue
+        // while a large snapshot is serialized to disk.
+        let (meta, content) = {
+            let inner = self.inner.lock().await;
+            (
+                SnapshotMetaOf::<C> {
+                    last_log_id: inner.last_applied_log.clone(),
+                    last_membership: inner.last_membership.clone(),
+                },
+                inner.to_content(),
+            )
         };
-        let content = inner.to_content();
         let data = encode_content(&content)?;
         let dir = self.dir.clone();
         let write_meta = meta.clone();
-        let write_data = data.clone();
-        blocking(move || write_snapshot_file::<C>(&dir, &write_meta, &write_data)).await?;
+        blocking(move || write_snapshot_file::<C>(&dir, &write_meta, &data)).await?;
         Ok(meta)
     }
 }
@@ -857,26 +872,36 @@ where
 
     #[tracing::instrument(level = "trace", skip(self))]
     async fn build_snapshot(&mut self) -> Result<SnapshotOf<C, Cursor<Vec<u8>>>, io::Error> {
-        // Hold the lock while encoding/writing: the snapshot must correspond to exactly one
-        // applied log id, and the blocking work runs off the async runtime anyway.
-        let mut inner = self.inner.lock().await;
-
-        let meta = SnapshotMetaOf::<C> {
-            last_log_id: inner.last_applied_log.clone(),
-            last_membership: inner.last_membership.clone(),
+        // Capture a consistent image under the lock, then encode and write it
+        // without blocking apply. The snapshot still corresponds to exactly one
+        // applied log id captured above.
+        let (meta, content) = {
+            let inner = self.inner.lock().await;
+            (
+                SnapshotMetaOf::<C> {
+                    last_log_id: inner.last_applied_log.clone(),
+                    last_membership: inner.last_membership.clone(),
+                },
+                inner.to_content(),
+            )
         };
-        let content = inner.to_content();
         let data = encode_content(&content)?;
 
         let dir = self.dir.clone();
-        let write_data = data.clone();
         let write_meta = meta.clone();
-        blocking(move || write_snapshot_file::<C>(&dir, &write_meta, &write_data)).await?;
+        let data = blocking(move || {
+            write_snapshot_file::<C>(&dir, &write_meta, &data)?;
+            Ok::<_, io::Error>(data)
+        })
+        .await?;
 
-        inner.current_snapshot = Some(StoredSnapshot {
-            meta: meta.clone(),
-            data: data.clone(),
-        });
+        {
+            let mut inner = self.inner.lock().await;
+            inner.current_snapshot = Some(StoredSnapshot {
+                meta: meta.clone(),
+                data: data.clone(),
+            });
+        }
 
         Ok(SnapshotOf::<C, Cursor<Vec<u8>>> {
             meta,
@@ -1185,9 +1210,12 @@ where
         let content = decode_content(&data)?;
 
         let dir = self.dir.clone();
-        let write_data = data.clone();
         let write_meta = meta.clone();
-        blocking(move || write_snapshot_file::<C>(&dir, &write_meta, &write_data)).await?;
+        let data = blocking(move || {
+            write_snapshot_file::<C>(&dir, &write_meta, &data)?;
+            Ok::<_, io::Error>(data)
+        })
+        .await?;
 
         let mut inner = self.inner.lock().await;
         inner.last_applied_log = meta.last_log_id.clone();
@@ -1288,29 +1316,71 @@ fn read_snapshot_file<C: RaftTypeConfig>(
     Ok(Some((payload.meta, payload.data)))
 }
 
+/// A writer that computes a CRC32 over exactly the bytes accepted by the
+/// underlying writer. Used to stream a postcard snapshot body to disk without
+/// first materializing the whole body in memory.
+struct CrcWriter<W> {
+    inner: W,
+    hasher: crc32fast::Hasher,
+}
+
+impl<W: std::io::Write> CrcWriter<W> {
+    fn new(inner: W) -> Self {
+        Self {
+            inner,
+            hasher: crc32fast::Hasher::new(),
+        }
+    }
+
+    fn finish(mut self) -> io::Result<(W, u32)> {
+        use std::io::Write;
+        self.flush()?;
+        let crc = self.hasher.finalize();
+        Ok((self.inner, crc))
+    }
+}
+
+impl<W: std::io::Write> std::io::Write for CrcWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let written = self.inner.write(buf)?;
+        self.hasher.update(&buf[..written]);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 /// Writes a snapshot atomically: temp file, fsync, rename, fsync directory.
+///
+/// The postcard body is streamed through [`CrcWriter`] instead of being built
+/// in a second large `Vec`; only the 4-byte CRC is patched afterwards.
 fn write_snapshot_file<C: RaftTypeConfig>(
     dir: &Path,
     meta: &SnapshotMetaOf<C>,
     data: &[u8],
 ) -> io::Result<()> {
+    use std::io::Seek;
+    use std::io::SeekFrom;
     use std::io::Write;
 
-    let payload = SnapshotPayload::<C> {
-        meta: meta.clone(),
-        data: data.to_vec(),
-    };
-    let body = postcard::to_allocvec(&payload)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-
+    let payload = SnapshotPayloadRef::<C> { meta, data };
     let tmp = dir.join(format!("{SNAPSHOT_FILE}.tmp"));
     let path = dir.join(SNAPSHOT_FILE);
 
     let mut file = std::fs::File::create(&tmp)?;
     file.write_all(SNAPSHOT_MAGIC)?;
     file.write_all(&SNAPSHOT_VERSION.to_le_bytes())?;
-    file.write_all(&crc32fast::hash(&body).to_le_bytes())?;
-    file.write_all(&body)?;
+    file.write_all(&0u32.to_le_bytes())?;
+
+    let mut writer = CrcWriter::new(file);
+    postcard::to_io(&payload, &mut writer)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let (mut file, crc) = writer.finish()?;
+
+    file.seek(SeekFrom::Start((SNAPSHOT_MAGIC.len() + 4) as u64))?;
+    file.write_all(&crc.to_le_bytes())?;
     file.sync_all()?;
     drop(file);
 

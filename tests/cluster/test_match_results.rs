@@ -12,7 +12,6 @@ use std::time::UNIX_EPOCH;
 
 use matchengine_raft::MatchEngineTypeConfig;
 use matchengine_raft::StorageConfig;
-use matchengine_raft::Transport;
 use matchengine_raft::build_match_engine_node;
 use matchengine_raft::client::MatchEngineClient;
 use matchengine_raft::default_raft_config;
@@ -36,15 +35,9 @@ fn file_sink_records_rests_fills_and_cancels() {
             .with_instance_prefix("match-results")
             .with_match_event_log(&event_log);
 
-        let node = build_match_engine_node(
-            1,
-            ADDR.to_string(),
-            Transport::Grpc,
-            default_raft_config(),
-            storage,
-        )
-        .await
-        .unwrap();
+        let node = build_match_engine_node(1, ADDR.to_string(), default_raft_config(), storage)
+            .await
+            .unwrap();
 
         let client = MatchEngineClient::<C>::new(1, ADDR.to_string());
         client.init().await.unwrap().unwrap();
@@ -182,7 +175,6 @@ fn file_sink_records_stop_triggers_and_expiries() {
         let node = build_match_engine_node(
             1,
             "127.0.0.1:21302".to_string(),
-            Transport::Grpc,
             default_raft_config(),
             storage,
         )

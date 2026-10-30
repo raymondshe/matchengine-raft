@@ -7,10 +7,9 @@ cd "$(dirname "$0")/.."
 
 kill() {
     if [ "$(uname)" = "Darwin" ]; then
-        SERVICE='matchengine-raft'
-        if pgrep -xq -- "${SERVICE}"; then
-            pkill -f "${SERVICE}"
-        fi
+        # `pgrep -x` does not match the `./target/.../matchengine-raft` argv
+        # used by these scripts, so let pkill match the full command line.
+        pkill -f 'matchengine-raft' 2>/dev/null || true
     else
         set +e # killall will error if finds no process to kill
         killall matchengine-raft

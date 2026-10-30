@@ -4,7 +4,6 @@ use std::time::Instant;
 
 use matchengine_raft::MatchEngineTypeConfig;
 use matchengine_raft::StorageConfig;
-use matchengine_raft::Transport;
 use matchengine_raft::build_match_engine_node;
 use matchengine_raft::client::MatchEngineClient;
 use matchengine_raft::default_raft_config;
@@ -50,7 +49,6 @@ async fn test_grpc_snapshot_install_inner() -> anyhow::Result<()> {
             let x = rt.block_on(start_match_engine_node_with_storage(
                 1,
                 "127.0.0.1:21101".to_string(),
-                Transport::Grpc,
                 config(),
                 storage,
             ));
@@ -65,7 +63,6 @@ async fn test_grpc_snapshot_install_inner() -> anyhow::Result<()> {
             let x = rt.block_on(start_match_engine_node_with_storage(
                 2,
                 "127.0.0.1:21102".to_string(),
-                Transport::Grpc,
                 config(),
                 storage,
             ));
@@ -173,14 +170,7 @@ async fn test_periodic_snapshot_timer_inner() -> anyhow::Result<()> {
 
     let mut config = default_raft_config();
     config.snapshot_policy = SnapshotPolicy::Never;
-    let node = build_match_engine_node(
-        1,
-        addr.to_string(),
-        Transport::Grpc,
-        config,
-        storage.clone(),
-    )
-    .await?;
+    let node = build_match_engine_node(1, addr.to_string(), config, storage.clone()).await?;
 
     let client = MatchEngineClient::<MatchEngineTypeConfig>::new(1, addr.to_string());
     client.init().await??;

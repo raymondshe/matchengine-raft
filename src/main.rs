@@ -5,7 +5,6 @@ use clap::Parser;
 use env_logger::Env;
 use matchengine_raft::DEFAULT_SNAPSHOT_INTERVAL;
 use matchengine_raft::StorageConfig;
-use matchengine_raft::Transport;
 use matchengine_raft::market_data::MarketDataConfig;
 use matchengine_raft::start_match_engine_node_with_storage;
 use matchengine_raft::store::state_machine::DEFAULT_MAX_EVENTS;
@@ -18,13 +17,6 @@ pub struct Opt {
 
     #[clap(long)]
     pub http_addr: String,
-
-    /// Transport for peer-to-peer Raft RPCs.
-    ///
-    /// The HTTP API and both server endpoints stay available; this only selects
-    /// what this node dials when it talks to peers.
-    #[clap(long, value_enum, default_value_t = Transport::Grpc)]
-    pub transport: Transport,
 
     /// Root directory for durable state. Each node stores its log and snapshot
     /// under `<data-dir>/<instance-prefix>-<id>/`.
@@ -119,7 +111,6 @@ async fn main() -> std::io::Result<()> {
     start_match_engine_node_with_storage(
         options.id,
         options.http_addr,
-        options.transport,
         matchengine_raft::default_raft_config(),
         storage,
     )

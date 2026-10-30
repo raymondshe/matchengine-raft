@@ -18,6 +18,18 @@ readme = "README.md"
 name = "matchengine"
 harness = false
 
+[[bench]]
+name = "e2e"
+harness = false
+
+[[bench]]
+name = "feed_load"
+harness = false
+
+[[bench]]
+name = "storage"
+harness = false
+
 [dependencies]
 actix-web = "4.18.1"
 async-stream = "0.3.6"

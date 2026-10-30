@@ -21,7 +21,7 @@
 |---|---|
 | 执行 | 确定性价格-时间撮合；`apply` 不读墙上时钟 |
 | 持久化 | 分段 WAL + 原子快照；每 100,000 条日志或 30 分钟生成快照 |
-| 复制 | 默认 Raft over gRPC，同时支持 HTTP/JSON |
+| 复制 | Raft over gRPC；HTTP/JSON Raft 传输已移除 |
 | 标的模型 | 一个进程/集群一个标的，经 Raft 配置并在交易开始后锁定 |
 | 数值模型 | 撮合、事件、快照和 feed 全程使用 18 位定点数 |
 | 公共入口 | 请求/快照大小受限；仅支持回环或私有网络部署 |
@@ -58,7 +58,7 @@
 - **原子快照**，通过临时文件 → fsync → rename → 目录 fsync 写入，安装前校验 checksum。
 - **面向真实负载的快照策略**：每 100,000 条已应用日志或每 30 分钟（有新 entry 时）生成快照，可用 `--snapshot-interval-ms` 调整。
 - **快照 + WAL 尾部恢复**：先加载最新快照、事件窗口和幂等表，再只重放更新的日志条目。
-- **gRPC 复制**，支持双向 `stream_append`、分块快照传输和每个对端独立通道；仍可切回 HTTP/JSON。
+- **gRPC 复制**，支持双向 `stream_append`、分块快照传输和每个对端独立通道。
 
 **API 与数据 Feed**
 - **持久化撮合事件 Feed**：`POST /events` 游标分页、保留上限、`client_order_id` 幂等和安全重试。
@@ -69,7 +69,7 @@
 
 **可信赖的工程质量**
 - **受限的公共入口**：请求体、read key、事件分页、幂等键和快照大小均有上限，畸形输入在进入 Raft 前拒绝。
-- **明确的部署契约**：仅支持回环或可信私有网络，并在绑定非回环地址时发出启动警告。
+- **明确的内部服务契约**：仅支持回环或可信私有网络，TLS/认证由网关负责，并在绑定非回环地址时发出启动警告。
 - **传输故障快速失败**：gRPC 监听器失效时，`run()` 会停止节点并返回错误，而不是留下一个对等节点无法访问、却仍在提供 HTTP 的“半健康”节点。
 - **正确性证据**：参考模型随机差分测试、订单类型显式一致性测试、确定性重放检查和集群恢复测试。
 - **一个进程/集群只交易一个标的**，隔离资源与故障域；多标的通过横向部署多个实例扩展。
@@ -111,12 +111,12 @@
                ▼                               ▼                               ▼
     ┌─────────────────────┐         ┌─────────────────────┐         ┌─────────────────────┐
     │     日志 + 状态     │         │     RaftNetwork     │         │      HTTP API       │
-    │    (WAL + 快照)     │         │    (gRPC / HTTP)    │         │     (Actix-web)     │
+    │    (WAL + 快照)     │         │       (gRPC)        │         │     (Actix-web)     │
     └─────────────────────┘         └─────────────────────┘         └─────────────────────┘
 ```
 
-节点间 Raft RPC 默认使用 `端口 + 1000` 上的 gRPC。公共 API 与 HTTP Raft 处理器仍由
-`--http-addr` 监听器提供，因此无论节点主动使用哪种传输，它都会同时服务两种协议。
+节点间 Raft RPC 使用 `端口 + 1000` 上的 gRPC。公共应用/管理 API 仍由 `--http-addr` 监听器提供；
+不再提供 HTTP/JSON Raft 传输。
 
 行情输出是节点本地的，且不参与共识：tap 使用有界 `try_send`，因此慢订阅者永远不会阻塞
 `apply`。JSONL sink 仅用于调试；同样的线格式 v5 消息就是后续 Aeron 适配器（2001–2007 流）
@@ -131,7 +131,6 @@
 
 2. **网络层** ([`network/`](./src/network/))
    - gRPC Raft RPC（`src/network/grpc/`），负责复制、投票和快照流式传输
-   - 可运行时切换的旧版 HTTP/JSON Raft RPC（`src/network/raft.rs`、`src/network/transport.rs`）
    - 每个对端独立的复制、心跳和快照通道
    - 用于集群管理的管理 API
 
@@ -187,13 +186,7 @@ cargo test
 ```
 
 集成测试通过 `MatchEngineClient` 运行集群场景，覆盖 gRPC 快照路径、WAL 与快照文件格式，并重启
-节点验证恢复。也可以用旧版传输运行：
-
-```shell
-MATCHENGINE_TEST_TRANSPORT=http cargo test --test cluster
-```
-
-各测试文件的职责见[测试](#测试)。
+节点验证恢复。各测试文件的职责见[测试](#测试)。
 
 ### 手动设置集群
 
@@ -212,9 +205,8 @@ MATCHENGINE_TEST_TRANSPORT=http cargo test --test cluster
 ./target/debug/matchengine-raft --id 3 --http-addr 127.0.0.1:21003
 ```
 
-每个节点在 `端口 + 1000`（这里是 `22001-22003`）上监听 gRPC Raft RPC。使用
-`--transport http` 可让节点改用 HTTP/JSON 连接对端；HTTP Raft 端点始终挂载，因此迁移期间可以
-混用两种传输。
+每个节点在 `端口 + 1000`（这里是 `22001-22003`）上监听 gRPC Raft RPC；HTTP 监听器只提供应用和
+管理 API。
 
 所有状态写入 `<data-dir>/<instance-prefix>-<id>/`，详见[每节点数据目录](#每节点数据目录)。
 
@@ -302,8 +294,9 @@ curl -X POST -H "Content-Type: application/json" \
 
 ## 安全与部署边界
 
-HTTP API 与 gRPC Raft 监听端口（HTTP 端口 + 1000）**没有 TLS、mTLS 或认证**。这是明确的部署契约：
-只能绑定回环地址或可信私有网络，并对两个端口设置防火墙；在传输安全和 API 认证实现之前，不得暴露到公网。
+HTTP API 与 gRPC Raft 监听端口（HTTP 端口 + 1000）**按设计就是明文且无认证**。这是内部撮合引擎，
+不是面向公网的网关：只能绑定回环地址或可信私有网络，并对两个端口设置防火墙；TLS 和客户端认证
+由前置网关终止。TLS/mTLS 与 API 认证刻意不在本进程中实现——这里没有公网暴露面，额外加解密只会增加延迟。
 
 节点绑定非回环地址时会记录警告。请求在进入 Raft 之前就在边缘层受限：
 
@@ -313,9 +306,8 @@ HTTP API 与 gRPC Raft 监听端口（HTTP 端口 + 1000）**没有 TLS、mTLS �
 | `client_order_id` | 1–128 字节，仅限 ASCII 字母/数字及 `. _ - :`；拒绝空字符串 |
 | `/read` 键 | 1–128 个可打印 ASCII 字节 |
 | `/events` 分页大小 | 1–1000 个事件 |
-| HTTP Raft append 请求体 / gRPC 消息 | 64 MiB（`MAX_HTTP_RAFT_BODY_BYTES` / `MAX_MESSAGE_SIZE`） |
-| HTTP 快照请求体 | 256 MiB（`MAX_SNAPSHOT_BYTES`） |
-| gRPC 快照流 | 总量 256 MiB，在追加每个 chunk 前检查 |
+| gRPC Raft 消息 | 64 MiB（`MAX_MESSAGE_SIZE`） |
+| gRPC 快照流 | 总量 256 MiB（`MAX_SNAPSHOT_BYTES`），在追加每个 chunk 前检查 |
 
 畸形 JSON 和非法字段返回 `400`；超大请求体返回 `413`。复制的 `client_order_id` 去重表最多保留
 262,144 条记录，因此键长度限制也限制了该表的内存占用。
@@ -339,14 +331,11 @@ src/
 ├── network/
 │   ├── api.rs               # 应用 HTTP 端点
 │   ├── management.rs        # 管理 HTTP 端点
-│   ├── raft.rs              # Raft 内部 HTTP RPC 端点
-│   ├── raft_network_impl.rs # HTTP/JSON RaftNetworkV2 实现
-│   ├── transport.rs         # 运行时传输选择（gRPC 或 HTTP）
 │   ├── grpc/
 │   │   ├── client.rs        # gRPC RaftNetworkV2（追加、投票、快照）
 │   │   ├── server.rs        # gRPC Raft 服务
 │   │   └── mod.rs           # Protobuf 类型与消息大小限制
-│   └── mod.rs               # Transport 枚举、Raft 端口推导
+│   └── mod.rs               # Raft 端口推导与传输限制
 ├── store/
 │   ├── mod.rs               # 存储模块
 │   ├── log_store.rs         # 分段 WAL + 投票/purge 状态
@@ -361,7 +350,7 @@ tests/
 └── cluster/
     ├── main.rs              # 单一集成测试目标
     ├── common.rs            # 唯一临时数据目录
-    ├── test_cluster.rs      # 3 节点集群，两种传输
+    ├── test_cluster.rs      # 3 节点 gRPC 集群
     ├── test_snapshot.rs     # 快照生成/purge、学习者安装 + 周期定时器
     ├── test_storage.rs      # WAL 与快照格式
     ├── test_restart.rs      # 重启恢复：日志重放、快照 + WAL 尾部
@@ -373,7 +362,13 @@ tests/
     ├── test_exactness.rs      # 18 位小数经 API、事件、行情和快照重启
     ├── test_symbols.rs        # 单标的配置、精度拒绝和配置锁定
     ├── test_fees.rs           # 撮合/吃单费用经 API、事件、行情和重启
-    └── test_fee_assets.rs     # QQQ/USD tick/lot、quote 数量和 quote 扣费
+    ├── test_fee_assets.rs     # QQQ/USD tick/lot、quote 数量和 quote 扣费
+    └── test_request_limits.rs # 恶意输入和请求大小限制
+benches/
+├── matchengine.rs           # 订单簿微基准
+├── e2e.rs                   # 请求 -> Raft 提交 -> apply -> 响应
+├── feed_load.rs             # 行情 feed 负载测试
+└── storage.rs               # WAL 追加/读取/恢复
 ```
 
 ## 存储实现
@@ -625,19 +620,17 @@ config.max_in_snapshot_log_to_keep = 0; // 清理快照已覆盖的全部日志
 所有端点都使用 JSON。每个处理器返回 `Result` 包装，因此成功调用形如 `{"Ok": ...}`，转发或失败
 调用形如 `{"Err": ...}`。
 
-### Raft 内部 API
+### Raft 传输 API
 
-挂载在公共 HTTP 监听器上，供 HTTP/JSON 传输使用：
+Raft 节点间 RPC 仅由 `--http-addr` 端口 + 1000 上的 gRPC 提供：
 
-- `POST /append` - 追加条目 RPC
-- `POST /vote` - 请求投票 RPC
-- `POST /snapshot` - 安装完整快照 RPC
+- `AppendEntries`、`Vote`（一元）
+- `InstallSnapshot`（客户端流式分块）
+- `AppendStream`（双向流水线追加）
 
-gRPC 传输在 `--http-addr` 端口 + 1000 上暴露相同操作（`AppendEntries`、`Vote`、
-`InstallSnapshot`、`AppendStream`），定义见 `proto/raft.proto`。一元 append/vote 使用
-`RPCOption::soft_ttl`，快照按 256 KiB 分块，双向消息上限均为 64 MiB；`Unavailable` 映射为
-`RPCError::Unreachable`，超时映射为 `RPCError::Timeout`，其他状态映射为
-`RPCError::Network`。
+定义见 `proto/raft.proto`。一元 append/vote 使用 `RPCOption::soft_ttl`，快照按 256 KiB 分块，
+双向消息上限均为 64 MiB；`Unavailable` 映射为 `RPCError::Unreachable`，超时映射为
+`RPCError::Timeout`，其他状态映射为 `RPCError::Network`。
 
 ### 管理 API
 
@@ -753,7 +746,7 @@ pub struct MatchEngineResponse {
 |---|---|
 | `src/order_book/property_tests.rs` | 针对参考模型的随机差分测试，并混合覆盖 GTC/IOC/FOK/GTD/Day、市价、Post-Only、冰山和止损单，以及正费率、零费率和返佣费率下的全部扣费资产策略：可见订单簿、成交、优先级、无交叉盘、数量守恒、序列号/最后成交价状态和确定性重放 |
 | `src/order_book/conformance_tests.rs` | 市价 FOK、无流动性市价单、冰山隐藏量与撤单/过期、挂起止损的 GTD/Day 过期，以及市价/IOC/止损子单成交的费用报告 |
-| `tests/cluster/test_cluster.rs` | 3 节点集群：初始化、学习者、成员变更、读写、线性一致性读、领导者转发、缩容；测试持有并在成功或 panic 时关闭所有节点；默认走 gRPC，设置 `MATCHENGINE_TEST_TRANSPORT=http` 后走 HTTP |
+| `tests/cluster/test_cluster.rs` | 3 节点 gRPC 集群：初始化、学习者、成员变更、读写、线性一致性读、领导者转发、缩容；测试持有并在成功或 panic 时关闭所有节点 |
 | `tests/cluster/test_snapshot.rs` | 快照生成、日志 purge、学习者通过 gRPC 快照流安装已 purge 的状态，以及关闭日志计数策略时的周期快照定时器 |
 | `tests/cluster/test_storage.rs` | WAL 帧格式、撕裂尾部截断、分段轮转、2 万条跨段日志重开、跨段 truncate/purge、vote/committed 持久化、快照构建/安装/重开、损坏文件拒绝 |
 | `tests/cluster/test_restart.rs` | 完整节点重启后通过日志重放恢复，以及通过快照 + 更新的 WAL 尾部恢复订单簿、序列号、事件窗口和幂等表；另含 2000 单大日志重放和多分块（约 120 KB）快照启动 |
@@ -776,6 +769,21 @@ pub struct MatchEngineResponse {
 
 ## 性能与当前限制
 
+实测基线（Apple M4、Rust 1.93.1、release bench profile；完整方法见
+[`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md)）：
+
+| 工作负载 | 结果 |
+|---|---:|
+| 订单簿：1k 卖单 / 100 档全扫 | 105.6 µs |
+| 端到端 `/write` p50 / p99 | 3.99 ms / 5.17 ms |
+| 并发 `/write` 吞吐（1,000 个在途） | 18,350 writes/s |
+| 行情 feed 500k fills/s | 495k fills/s，8,192 队列下 0 丢弃 |
+| WAL 追加 / 读取（20k 条、每批 100 条） | 26,049 / 2,386,089 条/s |
+
+feed 还包含一个刻意的 2M fills/s 过载场景，会丢弃帧并发送 `GAP`，而不是阻塞撮合。可用
+`cargo bench --bench matchengine`、`cargo bench --bench e2e`、`cargo bench --bench feed_load` 和
+`cargo bench --bench storage` 复现实测基线。
+
 已实现的性能设计：
 
 - 每个复制追加批次一次 `write_all` + 一次 `sync_data`，一次 AppendEntries 中的 N 条记录只付一次 fsync。
@@ -784,12 +792,13 @@ pub struct MatchEngineResponse {
 - gRPC 使用双向 `AppendStream` 流水线复制，并为每个对端维护独立的复制、心跳、快照连接。
 - 快照按 256 KiB 分块传输；`log/state` 和 `snapshot/current.snap` 都原子替换。
 - 事件窗口由 `--max-events` 限制并通过 `/events` 分页；`/read orderbook_orders` 不会复制事件窗口。
+- WAL 追加不再逐条 clone entry；恢复时顺序扫描 segment；连续日志读取合并为一次 `pread`；快照编码/写盘在状态机锁之外执行，快照 body 通过增量 CRC writer 直接流式写盘。
 - gRPC 服务故障对 `run()` 是致命的：先停止 HTTP、回收后台任务并关闭 Raft，再返回错误；HTTP 请求只记录一次日志。
 
 当前限制与已知差距：
 
-- 没有传输基准工具，`docs/TRANSPORTS.md` 中的数字只是指导值，不是实测结果。
-- gRPC 监听器尚未配置 TLS/mTLS，HTTP API 也没有认证。
+- 传输测量覆盖 3 节点回环提交；WAN、丢包和大快照传输场景仍未测量。
+- TLS/mTLS 与 API 认证由前置网关负责；本进程是内部服务。
 - 快照安装需要一块连续缓冲区，单个快照上限为 256 MiB。
 - 一个进程/集群只交易一个标的；多标的需要横向部署多个实例。
 

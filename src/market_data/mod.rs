@@ -171,6 +171,12 @@ pub struct MarketDataStats {
     pub gaps: AtomicU64,
     /// Frames dropped on a full queue.
     pub dropped_frames: AtomicU64,
+    /// Frames currently waiting in the bounded queue.
+    pub queued_frames: AtomicU64,
+    /// High-water mark of [`MarketDataStats::queued_frames`].
+    pub queued_peak: AtomicU64,
+    /// Configured queue capacity.
+    pub queue_capacity: AtomicU64,
     /// Snapshots installed.
     pub snapshots: AtomicU64,
     /// `market_seq` of the last processed frame.
@@ -208,6 +214,9 @@ impl MarketDataStats {
             "status": self.status.load(Ordering::Relaxed),
             "gaps": self.gaps.load(Ordering::Relaxed),
             "dropped_frames": self.dropped_frames.load(Ordering::Relaxed),
+            "queued_frames": self.queued_frames.load(Ordering::Relaxed),
+            "queued_peak": self.queued_peak.load(Ordering::Relaxed),
+            "queue_capacity": self.queue_capacity.load(Ordering::Relaxed),
             "snapshots": self.snapshots.load(Ordering::Relaxed),
             "last_market_seq": self.last_market_seq.load(Ordering::Relaxed),
             "last_log_index": self.last_log_index.load(Ordering::Relaxed),
@@ -614,8 +623,12 @@ impl fmt::Debug for MarketDataTap {
 impl MarketDataTap {
     /// Creates a tap and the receiving side of its bounded queue.
     pub fn channel(capacity: usize) -> (Self, TapChannels) {
-        let (sender, receiver) = tokio::sync::mpsc::channel(capacity.max(1));
+        let capacity = capacity.max(1);
+        let (sender, receiver) = tokio::sync::mpsc::channel(capacity);
         let stats = Arc::new(MarketDataStats::default());
+        stats
+            .queue_capacity
+            .store(capacity as u64, Ordering::Relaxed);
         let dropped = Arc::new(AtomicU64::new(0));
         let gap_pending = Arc::new(AtomicBool::new(false));
         let enabled = Arc::new(AtomicBool::new(true));
@@ -648,7 +661,10 @@ impl MarketDataTap {
         }
         self.stats.frames.fetch_add(1, Ordering::Relaxed);
         match self.sender.try_send(Ingest::Frame(frame)) {
-            Ok(()) => {}
+            Ok(()) => {
+                let queued = self.stats.queued_frames.fetch_add(1, Ordering::Relaxed) + 1;
+                self.stats.queued_peak.fetch_max(queued, Ordering::Relaxed);
+            }
             Err(TrySendError::Full(_)) | Err(TrySendError::Closed(_)) => {
                 self.dropped.fetch_add(1, Ordering::Relaxed);
                 self.gap_pending.store(true, Ordering::Relaxed);
@@ -1077,7 +1093,10 @@ impl MarketDataProcessor {
             }
             tokio::select! {
                 message = receiver.recv() => match message {
-                    Some(Ingest::Frame(frame)) => self.ingest(frame),
+                    Some(Ingest::Frame(frame)) => {
+                        self.stats.queued_frames.fetch_sub(1, Ordering::Relaxed);
+                        self.ingest(frame);
+                    }
                     None => break,
                 },
                 _ = wake.notified() => {}

@@ -1,48 +1,17 @@
 pub mod api;
 pub mod grpc;
 pub mod management;
-pub mod raft;
-pub mod raft_network_impl;
-pub mod transport;
 
 /// Ports for the Raft transport are derived from the public HTTP port so that
 /// `BasicNode.addr` keeps one meaning (the API address) for every node.
 pub const RAFT_PORT_OFFSET: u16 = 1000;
 
-/// Maximum HTTP/JSON body accepted by the legacy Raft append RPC.
-///
-/// Matches the gRPC message cap; append batches are the only public Raft body
-/// that routinely grows beyond a single order.
-pub const MAX_HTTP_RAFT_BODY_BYTES: usize = 64 * 1024 * 1024;
-
-/// Maximum snapshot size accepted by either transport.
+/// Maximum snapshot size accepted by the gRPC transport.
 ///
 /// The state machine still installs one contiguous buffer, so the receiver
 /// enforces a hard total before allocating. This is large enough for the
 /// retained event window and order book while bounding a hostile peer.
 pub const MAX_SNAPSHOT_BYTES: usize = 256 * 1024 * 1024;
-
-/// Which transport the node uses for outbound Raft RPCs.
-///
-/// The server always accepts both: the HTTP endpoints remain mounted on the API
-/// listener, and the gRPC service listens on [`RAFT_PORT_OFFSET`] above it.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
-pub enum Transport {
-    /// HTTP/1.1 + JSON, one request per RPC.
-    Http,
-    /// gRPC over HTTP/2, with streaming AppendEntries and snapshots.
-    #[default]
-    Grpc,
-}
-
-impl std::fmt::Display for Transport {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Transport::Http => write!(f, "http"),
-            Transport::Grpc => write!(f, "grpc"),
-        }
-    }
-}
 
 /// Derives the Raft transport address from the public API address.
 ///

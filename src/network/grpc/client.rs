@@ -430,3 +430,27 @@ fn decrement_inflight(inflight: &AtomicUsize) {
         }
     }
 }
+
+/// Factory for the gRPC-only Raft network.
+pub struct GrpcNetworkFactory {
+    local_id: crate::MatchEngineNodeId,
+}
+
+impl GrpcNetworkFactory {
+    /// Creates a factory for connections originating at `local_id`.
+    pub fn new(local_id: crate::MatchEngineNodeId) -> Self {
+        Self { local_id }
+    }
+}
+
+impl openraft::network::RaftNetworkFactory<crate::MatchEngineTypeConfig> for GrpcNetworkFactory {
+    type Network = GrpcNetwork<crate::MatchEngineTypeConfig>;
+
+    async fn new_client(
+        &mut self,
+        target: crate::MatchEngineNodeId,
+        node: &BasicNode,
+    ) -> Self::Network {
+        GrpcNetwork::new(self.local_id, target, &node.addr)
+    }
+}

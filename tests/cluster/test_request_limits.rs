@@ -9,7 +9,6 @@ use std::time::Instant;
 
 use matchengine_raft::MatchEngineTypeConfig;
 use matchengine_raft::StorageConfig;
-use matchengine_raft::Transport;
 use matchengine_raft::build_match_engine_node;
 use matchengine_raft::client::MatchEngineClient;
 use matchengine_raft::default_raft_config;
@@ -34,15 +33,9 @@ fn hostile_requests_are_rejected_before_raft() {
     C::run(async {
         let temp = TempDir::new("request-limits");
         let storage = StorageConfig::new(temp.path()).with_instance_prefix("request-limits");
-        let node = build_match_engine_node(
-            1,
-            ADDR.to_string(),
-            Transport::Grpc,
-            default_raft_config(),
-            storage,
-        )
-        .await
-        .unwrap();
+        let node = build_match_engine_node(1, ADDR.to_string(), default_raft_config(), storage)
+            .await
+            .unwrap();
 
         let client = MatchEngineClient::<C>::new(1, ADDR.to_string());
         client.init().await.unwrap().unwrap();

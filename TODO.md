@@ -18,15 +18,17 @@ important but not blocking; **P3** = later/optional.
 
 ## Top priorities
 
-The P0 public-trust-boundary work, the P1 randomized differential/property tests and the P1
-failure/observability work are complete: edge limits are explicit, the order book is checked
-against a reference model, gRPC failure is fail-fast, requests are logged once, and the cluster
-test owns and shuts down its nodes.
+All top-priority P0/P1 work is complete, including the measured baselines in
+[`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md). The next production-readiness items are the
+remaining P1 entries in their sections: gateway symbol guarding, health/readiness, and the
+fee/session extensions.
 
-1. **P1 — Measure before optimizing.** The post-fee microbenchmark baseline is recorded in §8; add
-   submit → commit → apply → response latency and a 50k–500k fills/s feed load test. Only then
-   consider per-level buckets or a compact resting record. The numbers in `docs/TRANSPORTS.md`
-   are still guidance, not results.
+1. **P1 — Operational readiness.** Add a health/readiness endpoint that reports gRPC listener
+   health, leadership and storage state. TLS and authentication stay at the gateway; this process
+   is internal-only by design.
+2. **P1 — Gateway symbol guard.** Reject a wrong-symbol request before it reaches Raft.
+3. **P2 — Revisit per-level buckets** only if a future 3-node or real-sink measurement justifies
+   the complexity; the current baseline does not.
 
 ## 1. Exact fixed-point end-to-end — done
 
@@ -95,13 +97,14 @@ Remaining:
 - [x] **P0** Cap application JSON bodies at 1 MiB, validate `/read` keys at 1–128 printable ASCII
   bytes, and reject `/events` limits outside 1–1000 with `400`. Malformed JSON and oversized
   bodies fail in the extractor.
-- [x] **P0** Cap HTTP snapshot bodies and gRPC snapshot streams at 256 MiB, checking the gRPC
-  cumulative total before each chunk is appended.
+- [x] **P0** Cap gRPC snapshot streams at 256 MiB, checking the cumulative total before each
+  chunk is appended.
 - [x] **P0** Adopt and document a loopback/trusted-private-network-only deployment contract because
   TLS/mTLS and HTTP authentication are not implemented. The node warns when bound to a
   non-loopback address.
-- [ ] **P1** Implement TLS/mTLS and API authentication before allowing public exposure, then
-  replace the loopback/private-network warning with an enforced policy.
+- [x] **P1** Keep TLS/mTLS and API authentication out of this process by design: the matching
+  engine is an internal service behind a gateway that owns client authentication and TLS
+  termination. The loopback/private-network warning stays as a deployment guard.
 - [ ] **P1** Add a health/readiness endpoint that reports gRPC listener health, Raft leadership
   and storage state.
 - [ ] **P1** Decide whether a died gRPC server task should stop the process (fail fast) or leave
@@ -132,6 +135,9 @@ Persistence is done:
 - [x] Fail-fast gRPC failure: `MatchEngineNode::run()` stops HTTP, joins background tasks and
   shuts Raft down before returning the transport error. A dropped/panicking gRPC task also
   signals failure.
+- [x] Storage-path audit: borrowed WAL encoding (no per-entry clone), sequential segment
+  recovery, coalesced contiguous log reads, snapshot encode/write outside the state-machine lock,
+  and streamed snapshot bodies with incremental CRC (no full body Vec).
 - [x] One request logger; the previous duplicate `Logger` middleware is gone.
 - [x] `test_cluster` owns all three nodes in its runtime and shuts them down on success or panic,
   so fixed ports are released.
@@ -147,11 +153,8 @@ Remaining:
 - [ ] **P2** Consider streaming snapshot bytes into the state machine or a temp file instead of
   buffering the whole snapshot. The current API needs a contiguous buffer, but the receiver's
   total allocation still needs a policy (see §3).
-- [ ] **P2** Add a benchmark harness for the transport comparison: L1 RPC microbenchmark and L2
-  3-node commit latency over HTTP/JSON and gRPC. The current `docs/TRANSPORTS.md` numbers are
-  guidance only.
-- [ ] **P2** Revisit TLS and keep the gRPC listener's failure behavior aligned with the health
-  policy in §3.
+- [x] **P2** Keep TLS at the gateway; do not add per-node TLS to the Raft transport. Keep the
+  gRPC listener's failure behavior aligned with the health policy in §3.
 - [ ] **P3** Aeron remains gated on a measured bottleneck; no adapter is adopted.
 
 ## 5. Matching-engine features and correctness
@@ -213,9 +216,10 @@ Done:
 
 Remaining:
 
-- [ ] **P1** Run a 50k–500k fills/s load test and record feed latency, queue depth and drop/GAP
-  behavior. The bounded tokio `mpsc` queue drops frames rather than blocking matching; operators
-  need to know when that happens.
+- [x] **P1** Run a 50k–500k fills/s load test and record feed latency, queue depth and drop/GAP
+  behavior. At 500k fills/s with an 8,192-frame queue the processor keeps up with no drops; a
+  deliberate 2M fills/s overload drops frames and emits `GAP`. Results:
+  [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md).
 - [ ] **P2** Fill `epoch` (leader generation) and `leader_id` instead of the current zeros; the
   header fields and leader watcher already exist.
 - [ ] **P2** Add a consumer SDK/reference decoder for the wire format; the encoder has golden
@@ -233,7 +237,7 @@ Current coverage:
   including mixed order types and fee-rate styles; `conformance_tests.rs` covers the explicit
   edge cases. `apply` event tests cover market, IOC, FOK, post-only, iceberg, stop-child
   cancellation and automatic GTD expiry.
-- `tests/cluster/test_cluster.rs`: 3 nodes, both transports, init/membership/read/write.
+- `tests/cluster/test_cluster.rs`: 3 nodes over gRPC, init/membership/read/write.
 - `test_snapshot.rs`: snapshot build/purge and learner install over gRPC.
 - `test_storage.rs`: WAL framing, torn-tail truncation, segment rotation, 20k-record multi-segment
   reopen, purge/truncate, vote/committed persistence, snapshot build/install/reopen.
@@ -263,14 +267,12 @@ Remaining:
 - [x] Per-symbol rejection, precision and lock tests are covered by `test_symbols.rs` (see §2).
 - [x] **P0** Hostile-input tests for oversized `client_order_id`, oversized `/write` and `/events`
   payloads, malformed JSON, oversized read keys and oversized snapshots (see §3).
-- [ ] **P1** End-to-end latency benchmark: submit → commit → apply → response, separated from
-  matching and replication costs.
+- [x] **P1** End-to-end latency benchmark: submit → commit → apply → response, separated from
+  matching and replication costs. See [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md).
 - [ ] **P2** Add negative API tests for unknown `/read` keys and malformed `Place` payloads.
   Follower forwarding is already covered.
 - [x] **P2** Make `test_cluster.rs` own and shut down its nodes, including on panic.
 - [ ] **P2** Parameterize the fixed test ports; `test_cluster.rs` still binds 21001–21003.
-- [ ] **P2** Run the cluster suite over the HTTP transport in CI
-  (`MATCHENGINE_TEST_TRANSPORT=http`), not just locally.
 - [ ] **P2** Add an MSRV job for Rust 1.89; CI currently uses stable only.
 - [ ] **P2** Keep `AGENTS.md` and this file in sync after code changes; both are maintained by
   hand.
@@ -280,23 +282,27 @@ Remaining:
 - [x] Order-book micro-benchmarks: `cargo bench --bench matchengine` (wide/deep sweep, rest,
   rest with the market-data journal, partial fill, IOC cancel, iceberg refill, amend, cancel;
   best-of-5 per round).
-- [ ] **P1** Port the current post-fee baseline into `docs/DECIMAL.md`. The 2026-10-29 run
-  measured: sweep 1k/100 levels 84.1µs, 20k/1 level 2.098ms, rest 43.2µs, rest+journal 46.6µs,
-  partial 57.2µs, IOC 110.6µs, iceberg 57.8µs, amend 79.3µs, cancel 91.8µs. Fee calculation adds
-  i256 per-fill work; decide whether a separate no-fee fast path is worth it.
-- [ ] **P1** Add end-to-end latency and throughput benchmarks (submit → commit → apply → response).
-- [ ] **P1** Load-test the market-data feed and record queue/drop behavior (see §6).
-- [ ] **P2** Consider per-level buckets or a compact resting record only if the post-`Fixed`
-  numbers justify the complexity.
+- [x] **P1** Record the post-fee baseline in [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md)
+  (linked from `docs/DECIMAL.md`): sweep 1k/100 levels 105.6µs, 20k/1 level 2.538ms, rest 97.7µs,
+  rest+journal 100.3µs, partial 119.2µs, IOC 201.0µs, iceberg 116.8µs, amend 130.8µs, cancel
+  148.1µs. The journal adds only ~2.6µs per 1k rests; no no-fee fast path is justified yet.
+- [x] **P1** Add end-to-end latency and throughput benchmarks (`cargo bench --bench e2e`):
+  sequential p50 3.99ms / p99 5.17ms, 18,350 writes/s with 1,000 in flight.
+- [x] **P1** Load-test the market-data feed (`cargo bench --bench feed_load`): 495k fills/s with no
+  drops at an 8,192 queue; 2M overload drops frames and emits `GAP`.
+- [x] **P1** Add a storage benchmark (`cargo bench --bench storage`): 20k entries append at
+  26,049/s, read at 2,386,089/s, and reopen/recover in 6.33ms.
+- [ ] **P2** Consider per-level buckets or a compact resting record only if new 3-node or
+  real-sink measurements justify the complexity; the current baseline does not.
 - [ ] **P2** Add a benchmark regression gate (threshold or recorded baseline) to CI.
-- [ ] **P2** Build the transport benchmark harness (see §4).
 
 ## 9. Client library
 
 - [ ] **P2** Harden `src/client.rs` before use outside examples: retry/backoff on transient RPC
   errors, configurable timeouts, and a typed "no known leader" error instead of a bare message.
 - [ ] **P2** Add integration coverage for leader forwarding, failover and retry behavior.
-- [ ] **P2** Support the chosen TLS/authentication configuration (see §3).
+- [x] **P2** Keep the client transport plaintext; gateway authentication/TLS is outside the
+  internal client.
 
 ## 10. Docs, repo hygiene and naming
 
@@ -322,8 +328,7 @@ Remaining:
 - [x] **P3** Rename `src/matchengine/` to `src/order_book/` (2026-10-29); the public module is
   now `order_book`, while the package/binary name `matchengine-raft` is intentionally unchanged.
 - [ ] **P3** Decide whether to rename the remaining mixed-style modules before 1.0
-  (`src/match_result/` → `match_events/`, `src/network/raft.rs` → `http_raft.rs`,
-  `raft_network_impl.rs` → `http_network.rs`). This is import-breaking and offers no functional
+  (`src/match_result/` → `match_events/`). This is import-breaking and offers no functional
   benefit today.
 
 ## 11. Decisions to record
@@ -337,7 +342,8 @@ These choices feed the priorities above; write them down as ADRs or doc notes wh
   reinterpreted.
 - [x] External exposure model: no TLS/mTLS or HTTP authentication; the supported contract is
   loopback or a trusted private network, with edge request/snapshot limits.
-- [ ] TLS/mTLS and HTTP authentication for any future non-private exposure.
+- [x] Authentication and TLS terminate at the gateway; the engine and its Raft transport remain
+  internal-only and plaintext for latency.
 - [ ] gRPC listener failure policy: fail-fast process exit vs degraded health state.
 - [x] Multi-symbol isolation: one process/cluster per symbol, never multiple books in one process.
 - [ ] Event time source for the clearing feed and per-instrument cursor retention.

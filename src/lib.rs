@@ -28,13 +28,11 @@ use crate::match_result::MatchResultSink;
 use crate::match_result::NoopSink;
 use crate::network::api;
 use crate::network::grpc::MAX_MESSAGE_SIZE;
+use crate::network::grpc::client::GrpcNetworkFactory;
 use crate::network::grpc::pb::raft_service_server::RaftServiceServer;
 use crate::network::grpc::server::RaftGrpcService;
 use crate::network::management;
-use crate::network::raft;
-use crate::network::transport::TransportNetworkFactory;
 
-pub use network::Transport;
 pub use store::StorageConfig;
 
 /// Application state module holding the Raft node components.
@@ -167,48 +165,12 @@ impl MatchEngineNode {
     }
 }
 
-/// Starts a complete Raft node with an HTTP server, using the default transport.
+/// Starts a complete Raft node with an HTTP API and a gRPC Raft listener.
 pub async fn start_match_engine_node(
     node_id: MatchEngineNodeId,
     http_addr: String,
 ) -> std::io::Result<()> {
-    start_match_engine_node_with_transport(node_id, http_addr, Transport::default()).await
-}
-
-/// Starts a complete Raft node with an HTTP API server and a gRPC Raft server.
-///
-/// This function sets up and runs a complete Raft node including:
-/// 1. Creating the Raft configuration with snapshot policy
-/// 2. Opening or creating the persistent storage
-/// 3. Restoring any existing state from snapshots and logs
-/// 4. Creating the Raft consensus instance
-/// 5. Starting the Actix-web HTTP server with all endpoints
-/// 6. Starting the tonic gRPC server for peer-to-peer Raft RPCs
-///
-/// The HTTP server provides:
-/// - Raft internal RPC endpoints for cluster communication
-/// - Admin endpoints for cluster management
-/// - Application endpoints for interacting with the state machine
-///
-/// The gRPC server listens on [`network::RAFT_PORT_OFFSET`] above `http_addr`
-/// and carries the transport selected by `transport`.
-///
-/// # Arguments
-///
-/// * `node_id` - The unique ID for this node in the cluster
-/// * `http_addr` - The address (host:port) to listen on for HTTP requests
-/// * `transport` - Which transport to use for outbound Raft RPCs
-///
-/// # Returns
-///
-/// An `io::Result` that resolves when the server shuts down, or an error
-/// if the server fails to start or bind to the address.
-pub async fn start_match_engine_node_with_transport(
-    node_id: MatchEngineNodeId,
-    http_addr: String,
-    transport: Transport,
-) -> std::io::Result<()> {
-    start_match_engine_node_with_config(node_id, http_addr, transport, default_raft_config()).await
+    start_match_engine_node_with_config(node_id, http_addr, default_raft_config()).await
 }
 
 /// Snapshot after this many applied log entries even if the timer has not fired.
@@ -235,28 +197,19 @@ pub fn default_raft_config() -> Config {
 pub async fn start_match_engine_node_with_config(
     node_id: MatchEngineNodeId,
     http_addr: String,
-    transport: Transport,
     config: Config,
 ) -> std::io::Result<()> {
-    start_match_engine_node_with_storage(
-        node_id,
-        http_addr,
-        transport,
-        config,
-        StorageConfig::default(),
-    )
-    .await
+    start_match_engine_node_with_storage(node_id, http_addr, config, StorageConfig::default()).await
 }
 
 /// Starts a node with an explicit Raft configuration and storage layout.
 pub async fn start_match_engine_node_with_storage(
     node_id: MatchEngineNodeId,
     http_addr: String,
-    transport: Transport,
     config: Config,
     storage: StorageConfig,
 ) -> std::io::Result<()> {
-    build_match_engine_node(node_id, http_addr, transport, config, storage)
+    build_match_engine_node(node_id, http_addr, config, storage)
         .await?
         .run()
         .await
@@ -354,7 +307,6 @@ fn warn_if_non_loopback_bind(http_addr: &str) {
 pub async fn build_match_engine_node(
     node_id: MatchEngineNodeId,
     http_addr: String,
-    transport: Transport,
     config: Config,
     storage: StorageConfig,
 ) -> std::io::Result<MatchEngineNode> {
@@ -365,7 +317,7 @@ pub async fn build_match_engine_node(
     let raft_addr = network::raft_addr_from_http(&http_addr)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     let grpc_listener = tokio::net::TcpListener::bind(&raft_addr).await?;
-    tracing::info!(%raft_addr, %transport, "Raft gRPC transport listening");
+    tracing::info!(%raft_addr, "Raft gRPC transport listening");
 
     let config = Arc::new(
         config
@@ -412,7 +364,7 @@ pub async fn build_match_engine_node(
 
     // Create the network layer that will connect and communicate the raft instances and
     // will be used in conjunction with the store created above.
-    let network = TransportNetworkFactory::new(node_id, transport);
+    let network = GrpcNetworkFactory::new(node_id);
 
     // Create a local raft instance.
     let raft = openraft::Raft::new(
@@ -493,14 +445,10 @@ pub async fn build_match_engine_node(
             .wrap(Logger::new("%a \"%r\" %s %b %Dms"))
             .wrap(middleware::Compress::default())
             .app_data(app_data.clone())
-            // Bound request bodies before JSON extraction can allocate or
-            // propose anything. Snapshot and append bodies use explicit caps
-            // in `network::raft`.
+            // Bound application JSON bodies before extraction can allocate or
+            // propose anything. Raft append/snapshot bodies travel over gRPC
+            // and are capped in `network::grpc`.
             .app_data(web::JsonConfig::default().limit(api::MAX_REQUEST_BODY_BYTES))
-            // raft internal RPC
-            .service(raft::append)
-            .service(raft::snapshot)
-            .service(raft::vote)
             // admin API
             .service(management::init)
             .service(management::add_learner)

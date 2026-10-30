@@ -69,6 +69,17 @@ enum WalRecord<C: RaftTypeConfig> {
     Committed(Option<LogIdOf<C>>),
 }
 
+/// Borrowed form used for encoding append batches.
+///
+/// The variant order and payload layout are identical to [`WalRecord`], so the
+/// on-disk format is unchanged while large entries avoid a clone per append.
+#[derive(Serialize)]
+#[serde(bound = "")]
+enum WalRecordRef<'a, C: RaftTypeConfig> {
+    Entry(&'a C::Entry),
+    Committed(&'a Option<LogIdOf<C>>),
+}
+
 /// Vote and purge marker, persisted in the `state` file.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(bound = "")]
@@ -281,7 +292,8 @@ impl<C: RaftTypeConfig> Inner<C> {
 
     /// Appends a commit marker without fsync; the next append batch makes it durable.
     fn save_committed_blocking(&self, committed: Option<LogIdOf<C>>) -> io::Result<()> {
-        let payload = encode_record::<C>(&WalRecord::Committed(committed.clone()))?;
+        let payload = postcard::to_allocvec(&WalRecordRef::<C>::Committed(&committed))
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
         let mut disk = self.disk.write().unwrap();
         if disk.writer_len > SEGMENT_HEADER_LEN
@@ -480,37 +492,53 @@ impl<C: RaftTypeConfig> Inner<C> {
 
     fn read_entries_blocking(&self, locs: &[RecordLoc]) -> io::Result<Vec<C::Entry>> {
         let mut out = Vec::with_capacity(locs.len());
-        let mut current: Option<(u32, Arc<File>)> = None;
-        let mut buf = Vec::new();
+        let mut start = 0usize;
 
-        for loc in locs {
-            if current.as_ref().map(|(seq, _)| *seq) != Some(loc.seq) {
-                current = Some((loc.seq, self.reader(loc.seq)?));
-            }
-            let file = &current.as_ref().unwrap().1;
+        while start < locs.len() {
+            let first = locs[start];
+            let mut end = first.offset + RECORD_HEADER_LEN + first.len as u64;
+            let mut next = start + 1;
 
-            buf.resize(RECORD_HEADER_LEN as usize + loc.len as usize, 0);
-            read_exact_at(file, loc.offset, &mut buf)?;
-
-            let len = u32::from_le_bytes(buf[0..4].try_into().unwrap());
-            let crc = u32::from_le_bytes(buf[4..8].try_into().unwrap());
-            if len != loc.len {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("log record length changed: {len} != {}", loc.len),
-                ));
-            }
-            if crc32fast::hash(&buf[8..]) != crc {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "log record checksum mismatch",
-                ));
+            // Records in one append batch are contiguous unless a commit marker
+            // sits between them. Group the contiguous run into one pread.
+            while next < locs.len() && locs[next].seq == first.seq && locs[next].offset == end {
+                end += RECORD_HEADER_LEN + locs[next].len as u64;
+                next += 1;
             }
 
-            match decode_record::<C>(&buf[8..])? {
-                WalRecord::Entry(entry) => out.push(entry),
-                WalRecord::Committed(_) => {}
+            let file = self.reader(first.seq)?;
+            let mut buf = vec![0u8; (end - first.offset) as usize];
+            read_exact_at(&file, first.offset, &mut buf)?;
+
+            let mut cursor = 0usize;
+            for loc in &locs[start..next] {
+                let header_end = cursor + RECORD_HEADER_LEN as usize;
+                let len = u32::from_le_bytes(buf[cursor..cursor + 4].try_into().unwrap());
+                let crc = u32::from_le_bytes(buf[cursor + 4..header_end].try_into().unwrap());
+                if len != loc.len {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("log record length changed: {len} != {}", loc.len),
+                    ));
+                }
+
+                let payload_end = header_end + len as usize;
+                let payload = &buf[header_end..payload_end];
+                if crc32fast::hash(payload) != crc {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "log record checksum mismatch",
+                    ));
+                }
+
+                match decode_record::<C>(payload)? {
+                    WalRecord::Entry(entry) => out.push(entry),
+                    WalRecord::Committed(_) => {}
+                }
+                cursor = payload_end;
             }
+
+            start = next;
         }
 
         Ok(out)
@@ -778,10 +806,6 @@ fn write_segment_header(path: &Path) -> io::Result<()> {
     file.sync_all()
 }
 
-fn encode_record<C: RaftTypeConfig>(record: &WalRecord<C>) -> io::Result<Vec<u8>> {
-    postcard::to_allocvec(record).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
-}
-
 fn decode_record<C: RaftTypeConfig>(payload: &[u8]) -> io::Result<WalRecord<C>> {
     postcard::from_bytes(payload).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
@@ -798,7 +822,8 @@ where
     let mut locs = Vec::with_capacity(entries.len());
 
     for entry in entries {
-        let payload = encode_record::<C>(&WalRecord::Entry(entry.clone()))?;
+        let payload = postcard::to_allocvec(&WalRecordRef::<C>::Entry(entry))
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let offset = buf.len() as u64;
         buf.extend_from_slice(&Disk::<C>::frame(&payload));
         buf.extend_from_slice(&payload);
@@ -844,7 +869,8 @@ fn recover_segment<C: RaftTypeConfig>(
     state: &mut RuntimeState<C>,
 ) -> io::Result<SegmentMeta> {
     let file = OpenOptions::new().read(true).write(true).open(path)?;
-    let file_len = file.metadata()?.len();
+    let bytes = std::fs::read(path)?;
+    let file_len = bytes.len() as u64;
     let mut meta = SegmentMeta::new(seq, path.to_path_buf());
 
     if file_len < SEGMENT_HEADER_LEN {
@@ -862,8 +888,7 @@ fn recover_segment<C: RaftTypeConfig>(
         return Ok(meta);
     }
 
-    let mut header = [0u8; SEGMENT_HEADER_LEN as usize];
-    read_exact_at(&file, 0, &mut header)?;
+    let header = &bytes[..SEGMENT_HEADER_LEN as usize];
     if &header[0..4] != SEGMENT_MAGIC {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -883,7 +908,6 @@ fn recover_segment<C: RaftTypeConfig>(
 
     let mut pos = SEGMENT_HEADER_LEN;
     let mut valid_tail = pos;
-    let mut buf = Vec::new();
     let mut torn = false;
 
     while pos < file_len {
@@ -892,8 +916,7 @@ fn recover_segment<C: RaftTypeConfig>(
             break;
         }
 
-        let mut frame = [0u8; RECORD_HEADER_LEN as usize];
-        read_exact_at(&file, pos, &mut frame)?;
+        let frame = &bytes[pos as usize..(pos + RECORD_HEADER_LEN) as usize];
         let len = u32::from_le_bytes(frame[0..4].try_into().unwrap());
         let crc = u32::from_le_bytes(frame[4..8].try_into().unwrap());
 
@@ -902,14 +925,15 @@ fn recover_segment<C: RaftTypeConfig>(
             break;
         }
 
-        buf.resize(len as usize, 0);
-        read_exact_at(&file, pos + RECORD_HEADER_LEN, &mut buf)?;
-        if crc32fast::hash(&buf) != crc {
+        let payload_start = (pos + RECORD_HEADER_LEN) as usize;
+        let payload_end = payload_start + len as usize;
+        let payload = &bytes[payload_start..payload_end];
+        if crc32fast::hash(payload) != crc {
             torn = true;
             break;
         }
 
-        let record = match decode_record::<C>(&buf) {
+        let record = match decode_record::<C>(payload) {
             Ok(record) => record,
             Err(_) => {
                 torn = true;

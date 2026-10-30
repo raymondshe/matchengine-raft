@@ -9,7 +9,6 @@ use std::time::Instant;
 
 use matchengine_raft::MatchEngineTypeConfig;
 use matchengine_raft::StorageConfig;
-use matchengine_raft::Transport;
 use matchengine_raft::build_match_engine_node;
 use matchengine_raft::client::MatchEngineClient;
 use matchengine_raft::default_raft_config;
@@ -38,15 +37,10 @@ fn symbol_configuration_validates_orders_and_survives_restart() {
         let temp = TempDir::new("symbols");
         let storage = StorageConfig::new(temp.path()).with_instance_prefix("symbols");
 
-        let node = build_match_engine_node(
-            1,
-            ADDR.to_string(),
-            Transport::Grpc,
-            default_raft_config(),
-            storage.clone(),
-        )
-        .await
-        .unwrap();
+        let node =
+            build_match_engine_node(1, ADDR.to_string(), default_raft_config(), storage.clone())
+                .await
+                .unwrap();
 
         let client = MatchEngineClient::<C>::new(1, ADDR.to_string());
         client.init().await.unwrap().unwrap();
@@ -165,15 +159,9 @@ fn symbol_configuration_validates_orders_and_survives_restart() {
         node.shutdown().await.unwrap();
 
         // The symbol configuration and book survive the snapshot restart.
-        let node = build_match_engine_node(
-            1,
-            ADDR.to_string(),
-            Transport::Grpc,
-            default_raft_config(),
-            storage,
-        )
-        .await
-        .unwrap();
+        let node = build_match_engine_node(1, ADDR.to_string(), default_raft_config(), storage)
+            .await
+            .unwrap();
         let client = MatchEngineClient::<C>::new(1, ADDR.to_string());
         wait_for_leader(&client).await;
 

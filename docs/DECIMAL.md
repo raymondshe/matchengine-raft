@@ -252,6 +252,13 @@ Recommended next steps:
 3. Benchmark the matching loop and feed before/after; keep the "matching must not regress" gate.
 4. Record the wire v5/snapshot v9 compatibility policy in the deployment notes.
 
+## Post-fee performance baseline
+
+The current order-book, end-to-end `/write` and market-data feed measurements are recorded in
+[`PERFORMANCE.md`](./PERFORMANCE.md). They are the baseline for any future per-level bucket or
+compact resting-order change; the matching-path microbenchmarks are still run with
+`cargo bench --bench matchengine`.
+
 ## Decision summary
 
 | Requirement | Best choice |

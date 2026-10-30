@@ -7,12 +7,12 @@ spot/top-of-book, market depth and lifecycle events published to downstream subs
 derivation, encoding and IO decoupled from the matching path, and recommends Aeron there. Both parts record what was verified, what the integration would look like,
 and what should happen before anyone commits to it.
 
-Date: 2026-10-27 · Baseline: `openraft` 0.10.0-alpha.37, gRPC/tonic transport (HTTP/JSON remains
-selectable), segmented WAL + atomic snapshots.
+Date: 2026-10-30 · Baseline: `openraft` 0.10.0-alpha.37, gRPC/tonic-only Raft transport, segmented
+WAL + atomic snapshots.
 
 > **Update after this investigation:** two of the prerequisites below have since landed. Peer-to-peer
 > Raft RPCs now default to gRPC with `stream_append` and chunked snapshots
-> (`src/network/grpc/`, `src/network/transport.rs`), and the log/state machine are durable
+> (`src/network/grpc/`), and the log/state machine are durable
 > (`src/store/log_store.rs`, `src/store/state_machine.rs`). Aeron is still **not** adopted. The
 > remaining gate is a benchmark that shows the transport is the bottleneck.
 
@@ -117,17 +117,15 @@ stack on tuned hardware and are **not** a prediction for this repo.
 
 ### 3.4 Current baseline in this repo
 
-- Transport: gRPC/tonic is the default (`src/network/grpc/`); HTTP/JSON is selectable with
-  `--transport http` (`src/network/raft_network_impl.rs`). Both server sides stay mounted.
-- Pipelining: gRPC implements `stream_append` over the bidirectional `AppendStream`; the HTTP
-  transport still sends one AppendEntries at a time per peer.
-- Codec: `postcard` payloads inside protobuf envelopes on gRPC; `serde_json` on the HTTP transport
-  and the public API.
+- Transport: gRPC/tonic only (`src/network/grpc/`); the HTTP/JSON Raft transport was removed on
+  2026-10-30. The HTTP listener serves only the application and management API.
+- Pipelining: gRPC implements `stream_append` over the bidirectional `AppendStream`.
+- Codec: `postcard` payloads inside protobuf envelopes on gRPC; JSON on the public application API.
 - Snapshot: 256 KiB chunks over a client-streaming `InstallSnapshot`, bounded by the `cancel`
-  future; the HTTP transport sends one JSON body to `POST /snapshot`.
-- Node address: `BasicNode { addr: String }` is used for **two** purposes — the public API /
-  HTTP Raft endpoint and HTTP client forwarding (`MatchEngineClient::send_with_forwarding`,
-  `src/client.rs`). The gRPC address is derived as `addr` port + 1000.
+  future.
+- Node address: `BasicNode { addr: String }` is the public API address used for client
+  forwarding (`MatchEngineClient::send_with_forwarding`, `src/client.rs`). The gRPC address is
+  derived as `addr` port + 1000.
 - Timing: heartbeat 500 ms, election 1500–3000 ms (`src/lib.rs`).
 - Storage: durable segmented WAL + atomic snapshots; restart recovery is covered by
   `tests/cluster/test_restart.rs`.
@@ -304,7 +302,7 @@ A single-message fast path is worth keeping for snapshots smaller than
 | `Closed`, `MaxPositionExceeded` | `RPCError::Network` + recreate publication | Transport is broken; next attempt gets a fresh handle. |
 | no response within `soft_ttl` | `RPCError::Timeout` | Deadline is per request, mirroring `reqwest`'s `.timeout()`. |
 | decode failure | `RPCError::Network` | Same as a malformed HTTP body today. |
-| remote `RaftError` (higher term, etc.) | `RPCError::Network(NetworkError::new(&e))` | Exactly what `src/network/raft_network_impl.rs` does now; `RPCError<C>` has no remote variant. |
+| remote `RaftError` (higher term, etc.) | `RPCError::Network(NetworkError::new(&e))` | Exactly what the gRPC client does now; `RPCError<C>` has no remote variant. |
 
 ### 5.8 Memory sizing (why term lengths matter)
 
@@ -343,10 +341,10 @@ impl<C: RaftTypeConfig<Node = BasicNode>> RaftNetworkV2<C> for Network<C> {
 | File | Change |
 |---|---|
 | `Cargo.toml` | `rusteron-client`, `rusteron-media-driver` (`static` + `precompile`); `postcard`/`crc32fast` are already dependencies |
-| `src/network/grpc/client.rs` | Where the Aeron transport would plug in today; keep the gRPC and HTTP impls selectable |
-| `src/network/raft.rs` | `POST /append` / `/vote` / `/snapshot` stay for dual-transport migration |
+| `src/network/grpc/client.rs` | Where the Aeron transport would plug in today; keep gRPC as the default |
+| `src/network/grpc/client.rs` | Add an Aeron network factory beside `GrpcNetworkFactory` |
 | `src/network/aeron/{mod,agent,rpc,codec,snapshot}.rs` | New module |
-| `src/network/mod.rs` | Add `Transport::Aeron`; media-driver dir and endpoint config |
+| `src/network/mod.rs` | Add media-driver dir and endpoint config |
 | `src/client.rs` | Forwarding still uses `BasicNode.addr` (HTTP) — unchanged |
 | `tests/cluster/test_cluster.rs` | Must start a media driver; fixed ports 21001–21003 plus gRPC 22001–22003 and UDP 23001–23003 |
 
@@ -359,7 +357,7 @@ new HTTP feature flag.
 
 | Option | Latency | Throughput | Complexity | Ops burden | Time to value |
 |---|---|---|---|---|---|
-| **A. HTTP/JSON baseline** (legacy, still selectable) | baseline | baseline | none | none | — |
+| **A. HTTP/JSON baseline** (legacy, removed 2026-10-30) | baseline | baseline | none | none | — |
 | **B. gRPC + postcard + `stream_append` + chunked snapshots** (**implemented**) | large serialization win; pipelined replication | large gain on bursts | medium | none | done |
 | **B′. Raw TCP** — length-prefixed frames, own connection pool | near-B | high, pipelined | medium | low | ~1 week |
 | **D. Aeron for Raft** | marginal vs B/B′ on loopback; better tail under load | high, natural pipelining | **high** | media driver + FFI | ~4 weeks |
@@ -394,7 +392,7 @@ and one more moving part in every failure investigation.
 
 | Risk | Severity | Mitigation |
 |---|---|---|
-| `rusteron` is a thin FFI wrapper, partially documented; the sibling cluster crate warns of "undefined behaviour, segfaults, or data loss" | High | Pin the version, isolate it behind one module, run under ASan in CI, keep the HTTP transport selectable |
+| `rusteron` is a thin FFI wrapper, partially documented; the sibling cluster crate warns of "undefined behaviour, segfaults, or data loss" | High | Pin the version, isolate it behind one module, run under ASan in CI, keep gRPC as the fallback |
 | `!Send + !Sync` forces a thread hop per RPC | Medium | One agent thread per node; measure the channel cost before committing |
 | Backpressure interacts with election timeouts: a stalled follower must not stall votes | High | Separate vote stream; bounded retries; always return `Timeout` rather than block |
 | Snapshot chunking is new, failure-prone code on the recovery path | High | Keep the single-message fast path; property-test reassembly; test with a real 4-node cluster as was done for the current snapshot path |
@@ -413,7 +411,7 @@ and one more moving part in every failure investigation.
 **Phase 0 — measure (1–2 days).** Harness that drives `RaftNetworkV2` directly on 3 nodes,
 loopback and 1 ms RTT, 1 KiB and 64 KiB payloads, 1 and 300 entries per batch, recording p50/p99/p999
 for `append_entries` and `vote`, plus writes/s through `Raft::client_write`. Run it against both the
-gRPC and HTTP transports.
+gRPC transport.
 
 **Phase 1 — optimise the existing transport (done, but unmeasured).** `postcard` payloads,
 `stream_append`, and chunked snapshots now exist over gRPC; the public API stays JSON. The missing
@@ -423,13 +421,13 @@ deliverable is the Phase 0 numbers for this path.
 `offer`/`poll`, correlation map, kill/restart a peer. Re-run the Phase 0 harness through the same
 interface. Decision point: if p99 is not clearly better than Phase 1, stop.
 
-**Phase 3 — integrate (2–3 weeks).** `append_entries`, `vote`, then snapshot chunking. Add
-`Transport::Aeron` and dual-serve both during rollout.
+**Phase 3 — integrate (2–3 weeks).** `append_entries`, `vote`, then snapshot chunking. Add an
+Aeron network factory and keep gRPC as the fallback during rollout.
 
 **Phase 4 — cut over.** Only after a full cluster test that includes a follower joining via
 snapshot, a leader kill, and a driver restart.
 
-**Rollback:** keep the gRPC and HTTP impls compiled and selectable; the flag flips back without a
+**Rollback:** keep gRPC compiled as the fallback; the flag flips back without a
 rebuild.
 
 ---
@@ -484,11 +482,11 @@ Ordered by value per day:
    tests.
 2. ~~**Binary codec for Raft RPCs.**~~ Done: `postcard` inside protobuf envelopes; JSON stays at the
    public API edge.
-3. ~~**`stream_append`.**~~ Done over gRPC (`AppendStream`); the HTTP transport stays sequential.
+3. ~~**`stream_append`.**~~ Done over gRPC (`AppendStream`).
 4. ~~**Snapshot chunking + streaming.**~~ Done: 256 KiB chunks over client-streaming
    `InstallSnapshot`.
 5. **Benchmark harness.** Still missing, and now the only gate in §9.4. Build the L1/L2 harness in
-   `docs/TRANSPORTS.md` §5 and record gRPC vs HTTP/JSON.
+   the gRPC transport design; HTTP/JSON was removed on 2026-10-30.
 6. **TLS/mTLS for the gRPC listener.** Not transport tuning, but the next production blocker.
 7. **Market data.** Independent of the items above and recommended regardless of how §9.4 resolves:
    see Part II for the egress design (Aeron, leader-published, snapshot + deltas).

@@ -10,7 +10,6 @@ use std::time::Instant;
 
 use matchengine_raft::MatchEngineTypeConfig;
 use matchengine_raft::StorageConfig;
-use matchengine_raft::Transport;
 use matchengine_raft::build_match_engine_node;
 use matchengine_raft::client::MatchEngineClient;
 use matchengine_raft::default_raft_config;
@@ -44,15 +43,10 @@ fn exact_18_decimal_values_survive_api_events_feed_and_snapshot_restart() {
             .with_instance_prefix("exactness")
             .with_market_data(market_data);
 
-        let node = build_match_engine_node(
-            1,
-            ADDR.to_string(),
-            Transport::Grpc,
-            default_raft_config(),
-            storage.clone(),
-        )
-        .await
-        .unwrap();
+        let node =
+            build_match_engine_node(1, ADDR.to_string(), default_raft_config(), storage.clone())
+                .await
+                .unwrap();
 
         let client = MatchEngineClient::<C>::new(1, ADDR.to_string());
         client.init().await.unwrap().unwrap();
@@ -174,15 +168,9 @@ fn exact_18_decimal_values_survive_api_events_feed_and_snapshot_restart() {
         node.shutdown().await.unwrap();
 
         // Restart from the same storage and check the exact state again.
-        let node = build_match_engine_node(
-            1,
-            ADDR.to_string(),
-            Transport::Grpc,
-            default_raft_config(),
-            storage,
-        )
-        .await
-        .unwrap();
+        let node = build_match_engine_node(1, ADDR.to_string(), default_raft_config(), storage)
+            .await
+            .unwrap();
         let client = MatchEngineClient::<C>::new(1, ADDR.to_string());
         wait_for_leader(&client).await;
 

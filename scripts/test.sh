@@ -7,10 +7,9 @@ cd "$(dirname "$0")/.."
 
 kill() {
     if [ "$(uname)" = "Darwin" ]; then
-        SERVICE='matchengine-raft'
-        if pgrep -xq -- "${SERVICE}"; then
-            pkill -f "${SERVICE}"
-        fi
+        # `pgrep -x` does not match the `./target/.../matchengine-raft` argv
+        # used by these scripts, so let pkill match the full command line.
+        pkill -f 'matchengine-raft' 2>/dev/null || true
     else
         set +e # killall will error if finds no process to kill
         killall matchengine-raft
@@ -48,21 +47,28 @@ build_cluster() {
     echo
     rpc 2100"$node"/init '[]'
     echo "Node $node initialized"
+    # Give the newly initialized node time to elect itself before adding
+    # learners; openraft rejects add-learner while the membership change is
+    # still in progress.
+    sleep 2
 
     if test "$node" -ne 1
     then
         rpc 2100"$node"/add-learner       '[1, "127.0.0.1:21001"]'
         echo "Node 1 added as learner"
+        sleep 1
     fi
     if test "$node" -ne 2
     then
         rpc 2100"$node"/add-learner       '[2, "127.0.0.1:21002"]'
         echo "Node 2 added as learner"
+        sleep 1
     fi
     if test "$node" -ne 3
     then
         rpc 2100"$node"/add-learner       '[3, "127.0.0.1:21003"]'
         echo "Node 3 added as learner"
+        sleep 1
     fi
 }
 

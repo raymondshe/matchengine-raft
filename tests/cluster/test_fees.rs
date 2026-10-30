@@ -10,7 +10,6 @@ use std::time::Instant;
 
 use matchengine_raft::MatchEngineTypeConfig;
 use matchengine_raft::StorageConfig;
-use matchengine_raft::Transport;
 use matchengine_raft::build_match_engine_node;
 use matchengine_raft::client::MatchEngineClient;
 use matchengine_raft::default_raft_config;
@@ -46,15 +45,10 @@ fn maker_and_taker_fees_survive_events_feed_and_snapshot_restart() {
             .with_match_event_log(&event_log)
             .with_market_data(market_data);
 
-        let node = build_match_engine_node(
-            1,
-            ADDR.to_string(),
-            Transport::Grpc,
-            default_raft_config(),
-            storage.clone(),
-        )
-        .await
-        .unwrap();
+        let node =
+            build_match_engine_node(1, ADDR.to_string(), default_raft_config(), storage.clone())
+                .await
+                .unwrap();
 
         let client = MatchEngineClient::<C>::new(1, ADDR.to_string());
         client.init().await.unwrap().unwrap();
@@ -169,15 +163,9 @@ fn maker_and_taker_fees_survive_events_feed_and_snapshot_restart() {
         node.shutdown().await.unwrap();
 
         // The maker rate survives the snapshot: the next fill still uses 10 bps.
-        let node = build_match_engine_node(
-            1,
-            ADDR.to_string(),
-            Transport::Grpc,
-            default_raft_config(),
-            storage,
-        )
-        .await
-        .unwrap();
+        let node = build_match_engine_node(1, ADDR.to_string(), default_raft_config(), storage)
+            .await
+            .unwrap();
         let client = MatchEngineClient::<C>::new(1, ADDR.to_string());
         wait_for_leader(&client).await;
 

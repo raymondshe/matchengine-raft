@@ -17,7 +17,6 @@ use std::time::UNIX_EPOCH;
 use matchengine_raft::MatchEngineNode;
 use matchengine_raft::MatchEngineTypeConfig;
 use matchengine_raft::StorageConfig;
-use matchengine_raft::Transport;
 use matchengine_raft::build_match_engine_node;
 use matchengine_raft::client::MatchEngineClient;
 use matchengine_raft::default_raft_config;
@@ -89,14 +88,7 @@ async fn start(
     storage: &StorageConfig,
     config: Config,
 ) -> anyhow::Result<MatchEngineNode> {
-    let node = build_match_engine_node(
-        1,
-        addr.to_string(),
-        Transport::Grpc,
-        config,
-        storage.clone(),
-    )
-    .await?;
+    let node = build_match_engine_node(1, addr.to_string(), config, storage.clone()).await?;
     Ok(node)
 }
 

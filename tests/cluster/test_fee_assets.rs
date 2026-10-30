@@ -8,7 +8,6 @@ use std::time::Instant;
 
 use matchengine_raft::MatchEngineTypeConfig;
 use matchengine_raft::StorageConfig;
-use matchengine_raft::Transport;
 use matchengine_raft::build_match_engine_node;
 use matchengine_raft::client::MatchEngineClient;
 use matchengine_raft::default_raft_config;
@@ -42,15 +41,10 @@ fn etf_fiat_quote_volume_and_quote_fee_deduction() {
         let temp = TempDir::new("fee-assets");
         let storage = StorageConfig::new(temp.path()).with_instance_prefix("fee-assets");
 
-        let node = build_match_engine_node(
-            1,
-            ADDR.to_string(),
-            Transport::Grpc,
-            default_raft_config(),
-            storage.clone(),
-        )
-        .await
-        .unwrap();
+        let node =
+            build_match_engine_node(1, ADDR.to_string(), default_raft_config(), storage.clone())
+                .await
+                .unwrap();
         let client = MatchEngineClient::<C>::new(1, ADDR.to_string());
         client.init().await.unwrap().unwrap();
         wait_for_leader(&client).await;

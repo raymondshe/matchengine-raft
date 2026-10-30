@@ -10,7 +10,6 @@ use maplit::btreeset;
 use matchengine_raft::MatchEngineNode;
 use matchengine_raft::MatchEngineTypeConfig;
 use matchengine_raft::StorageConfig;
-use matchengine_raft::Transport;
 use matchengine_raft::build_match_engine_node;
 use matchengine_raft::client::MatchEngineClient;
 use matchengine_raft::default_raft_config;
@@ -84,14 +83,7 @@ async fn test_cluster_inner() -> anyhow::Result<()> {
         Ok(addr)
     };
 
-    // --- Start 3 raft nodes in this test's runtime.
-    //     `MATCHENGINE_TEST_TRANSPORT=http` runs the same suite over the legacy
-    //     HTTP/JSON transport; the default is gRPC.
-
-    let transport = match std::env::var("MATCHENGINE_TEST_TRANSPORT").as_deref() {
-        Ok("http") => Transport::Http,
-        _ => Transport::Grpc,
-    };
+    // --- Start 3 raft nodes in this test's runtime over gRPC.
 
     // A fresh data dir per run: persisted membership would make `init` fail on
     // the second run. Each node gets its own subdirectory below it.
@@ -107,7 +99,7 @@ async fn test_cluster_inner() -> anyhow::Result<()> {
     for id in 1..=3u64 {
         let addr = get_addr(id)?;
         nodes.push(Some(
-            build_match_engine_node(id, addr, transport, config.clone(), storage.clone()).await?,
+            build_match_engine_node(id, addr, config.clone(), storage.clone()).await?,
         ));
     }
 
