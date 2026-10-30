@@ -48,7 +48,7 @@
 **撮合引擎**
 - **价格-时间优先订单簿**，支持 GTC、IOC、FOK、GTD、Day、市价、Post-Only、冰山单、止损市价单和止损限价单。
 - **改单与撤单**遵循确定性优先级：同价减量保留时间优先；改价或增量会以新序列号重新排队。
-- **按资产扣费**，支持 maker/taker 费率、返佣、收到资产/quote/base 扣费策略和精确名义金额计算。
+- **按资产扣费**，支持 maker/taker 费率、返佣和精确名义金额计算；加密货币/FX 默认收到资产扣费，ETF/股票始终以 quote 资产结算。
 - **Base 或 quote 数量**，支持 tick/lot 校验、quote 限价单归一化和 quote 预算市价扫描。
 - **端到端 18 位定点数**，从 API 输入、撮合、事件、快照到行情 feed 全程使用定点数，撮合路径不做 `f64` 运算。
 
@@ -714,7 +714,7 @@ pub struct MatchEngineResponse {
   "price_decimals": 2,
   "price_tick": "0.01",
   "base_lot": "0.0001",
-  "fee_asset_policy": "received"
+  "fee_asset_policy": "quote"
 }}}
 ```
 
@@ -726,8 +726,9 @@ pub struct MatchEngineResponse {
 `fee_overflow` 置位。引擎只记录费用，不维护余额。
 
 法币、稳定币、加密货币、ETF 和股票等标的的 base/quote 数量语义与按资产扣费已实现。
-扣费资产可选择收到资产（默认）、quote 或 base；完整模型和未完成扩展（交易时段、公司行为、
-固定/监管费用、fee token）见 [`docs/FEE_DEDUCTION.md`](./docs/FEE_DEDUCTION.md)。
+ETF/股票 base 的费用始终以 quote 资产结算；加密货币和法币对法币（FX）默认使用收到资产，
+加密货币也可显式选择 quote 或 base。完整模型和未完成扩展（交易时段、公司行为、固定/监管费用、
+fee token）见 [`docs/FEE_DEDUCTION.md`](./docs/FEE_DEDUCTION.md)。
 
 其他订单类型字段（`tif`、`post_only`、`stop_price`、`display_volume`、`hidden_volume`、
 `timestamp`）都是可选的，默认就是普通的 GTC 限价单：

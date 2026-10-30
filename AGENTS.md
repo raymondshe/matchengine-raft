@@ -45,7 +45,9 @@ CI (`.github/workflows/ci.yml`) runs `cargo fmt --all -- --check`, `cargo clippy
   `OrderBook.last_trade_price`, `MatchEvent.price/volume`, depth/BBO records and the market-data
   wire format now use 18-scale `Fixed` integers. Orders carry `volume_unit`, `SymbolConfig` carries
   base/quote `AssetId`/`AssetClass`, tick/lot and `FeeAssetPolicy`, and fills carry
-  `taker_fee`/`maker_fee` plus the fee asset from the order-level user tier. Snapshot **v9** and
+  `taker_fee`/`maker_fee` plus the fee asset from the order-level user tier. ETF/equity bases
+  force `FeeAssetPolicy::Quote`; crypto/spot and fiat-to-fiat pairs default to `Received`.
+  Snapshot **v9** and
   wire **v5** are incompatible with older builds; v9 rejects v8. Wipe the node's `--data-dir`
   when moving an existing example deployment across this change; there is no log-entry migration.
 - Upgraded to `openraft` 0.10.0-alpha.37 from crates.io (git pin and the `openraft-legacy` dependency are gone). Installing it is a normal `cargo fetch`; no git checkout needed.

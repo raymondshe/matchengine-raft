@@ -48,7 +48,7 @@ Built for teams that need deterministic execution, durable recovery and a clean 
 **Matching engine**
 - **Price-time priority order book** with GTC, IOC, FOK, GTD, Day, market, post-only, iceberg, stop-market and stop-limit orders.
 - **Amend and cancel** with deterministic priority rules: same-price reductions keep time priority; price or size increases re-queue under a new sequence.
-- **Asset-aware fee deduction** with maker/taker rates, rebates, received/quote/base fee assets and exact notional accounting.
+- **Asset-aware fee deduction** with maker/taker rates, rebates and exact notional accounting; crypto/FX default to received-asset fees, ETF/equity always settle in quote.
 - **Base or quote volume** with tick/lot enforcement, quote-limit normalization and quote-budget market sweeps.
 - **Exact 18-decimal fixed point** from API input through matching, events, snapshots and the market-data feed — no `f64` arithmetic in the matching path.
 
@@ -767,7 +767,7 @@ Set this process's symbol, assets and accepted precision before trading:
   "price_decimals": 2,
   "price_tick": "0.01",
   "base_lot": "0.0001",
-  "fee_asset_policy": "received"
+  "fee_asset_policy": "quote"
 }}}
 ```
 
@@ -784,9 +784,10 @@ Fees are truncated toward zero at 18 places; `fee_overflow` is set when the noti
 exceeds the supported fixed-point range. The engine records fees but does not move balances.
 
 Base/quote volume semantics and asset-aware fee deduction for fiat, stablecoin, crypto, ETF and
-equity pairs are implemented. The fee asset can be the received asset (default), quote or base;
-the full model and open extensions (sessions, corporate actions, fixed/regulatory fees, fee tokens)
-are in [`docs/FEE_DEDUCTION.md`](./docs/FEE_DEDUCTION.md).
+equity pairs are implemented. ETF/equity bases always settle fees in the quote asset; crypto/spot
+and fiat-to-fiat pairs default to the received asset, and crypto can explicitly select quote or
+base. The full model and open extensions (sessions, corporate actions, fixed/regulatory fees, fee
+tokens) are in [`docs/FEE_DEDUCTION.md`](./docs/FEE_DEDUCTION.md).
 
 Every other order-type field (`tif`, `post_only`, `stop_price`, `display_volume`, `hidden_volume`,
 `timestamp`) is optional and defaults to "plain GTC limit order":

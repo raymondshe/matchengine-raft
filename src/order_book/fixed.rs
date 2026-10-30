@@ -401,6 +401,16 @@ pub enum AssetClass {
     Unknown,
 }
 
+impl AssetClass {
+    /// Whether this base asset uses cash (quote-asset) fees by default.
+    ///
+    /// Brokerage-style ETF/equity fees are charged in the quote currency, not
+    /// in shares. Crypto/spot pairs may use the received asset instead.
+    pub fn is_equity_like(self) -> bool {
+        matches!(self, Self::Equity | Self::Etf)
+    }
+}
+
 /// Identity and settlement precision of one asset.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AssetId {
@@ -455,7 +465,8 @@ pub enum FeeAsset {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum FeeAssetPolicy {
-    /// Buyer fees in base, seller fees in quote.
+    /// Buyer fees in base, seller fees in quote. Suitable for crypto/spot
+    /// pairs; ETF/equity bases are forced to [`Self::Quote`].
     #[default]
     Received,
     /// Both sides in quote.
@@ -567,6 +578,10 @@ impl SymbolConfig {
         if base_asset.decimals > DECIMALS as u8 || quote_asset.decimals > DECIMALS as u8 {
             return Err(ParseFixedError);
         }
+        if base_asset.class.is_equity_like() {
+            // ETF/equity fees are cash fees: both sides settle in quote.
+            self.fee_asset_policy = FeeAssetPolicy::Quote;
+        }
         self.base_asset = base_asset;
         self.quote_asset = quote_asset;
         self.base_lot = decimal_step(self.base_asset.decimals);
@@ -603,6 +618,8 @@ impl SymbolConfig {
             || self.quote_asset.decimals > DECIMALS as u8
             || self.price_tick < Fixed::ZERO
             || self.base_lot < Fixed::ZERO
+            || (self.base_asset.class.is_equity_like()
+                && self.fee_asset_policy != FeeAssetPolicy::Quote)
         {
             return Err(ParseFixedError);
         }
@@ -754,6 +771,45 @@ mod tests {
         assert!(equity.parse_price("100.25").is_ok());
         assert!(equity.parse_price("100.255").is_err());
         assert!(SymbolConfig::new(2, 19, 2).is_err());
+    }
+
+    #[test]
+    fn equity_and_etf_force_quote_fees_while_fx_keeps_received() {
+        let qqq = SymbolConfig::new(0, 2, 4)
+            .unwrap()
+            .with_assets(
+                AssetId::new("QQQ", AssetClass::Etf, 4).unwrap(),
+                AssetId::new("USD", AssetClass::Fiat, 2).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(FeeAssetPolicy::Quote, qqq.fee_asset_policy);
+        assert!(qqq.validate().is_ok());
+
+        let invalid_equity = qqq.clone().with_fee_asset_policy(FeeAssetPolicy::Received);
+        assert!(
+            invalid_equity.validate().is_err(),
+            "ETF/equity fees must settle in quote"
+        );
+
+        let eurusd = SymbolConfig::new(1, 4, 4)
+            .unwrap()
+            .with_assets(
+                AssetId::new("EUR", AssetClass::Fiat, 4).unwrap(),
+                AssetId::new("USD", AssetClass::Fiat, 4).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(FeeAssetPolicy::Received, eurusd.fee_asset_policy);
+        assert!(eurusd.validate().is_ok());
+
+        let btcusdt = SymbolConfig::new(2, 8, 8)
+            .unwrap()
+            .with_assets(
+                AssetId::new("BTC", AssetClass::Crypto, 8).unwrap(),
+                AssetId::new("USDT", AssetClass::Stablecoin, 8).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(FeeAssetPolicy::Received, btcusdt.fee_asset_policy);
+        assert!(btcusdt.validate().is_ok());
     }
 
     #[test]

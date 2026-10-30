@@ -494,7 +494,7 @@ impl<C: RaftTypeConfig> StateMachineStoreInner<C> {
     pub fn configure_symbol(&mut self, config: SymbolConfig) -> Result<(), String> {
         let config = config
             .validate()
-            .map_err(|_| "invalid symbol precision, tick or lot".to_string())?;
+            .map_err(|_| "invalid symbol precision, tick, lot or fee policy".to_string())?;
         if self.symbol_locked {
             return Err("symbol configuration is locked after trading starts".to_string());
         }

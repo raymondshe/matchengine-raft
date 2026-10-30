@@ -90,11 +90,12 @@ Examples:
 
 | Pair | Base | Quote | Tick / lot | Default fee asset |
 |---|---|---|---|---|
-| QQQ/USD | ETF | Fiat | 0.01 USD / 0.0001 share | Received: shares for buyers, USD for sellers |
-| VOO/USD | ETF | Fiat | 0.01 USD / 0.0001 share | Received |
-| GOOGL/USD | Equity | Fiat | 0.01 USD / 0.0001 share | Received |
+| QQQ/USD | ETF | Fiat | 0.01 USD / 0.0001 share | Quote: USD for both sides |
+| VOO/USD | ETF | Fiat | 0.01 USD / 0.0001 share | Quote: USD for both sides |
+| GOOGL/USD | Equity | Fiat | 0.01 USD / 0.0001 share | Quote: USD for both sides |
 | BTC/USDT | Crypto | Stablecoin | 0.01 USDT / 0.00000001 BTC | Received: BTC for buyers, USDT for sellers |
 | BTC/USDC | Crypto | Stablecoin | 0.01 USDC / 0.00000001 BTC | Received |
+| EUR/USD | Fiat | Fiat | 0.0001 USD / 0.0001 EUR | Received: EUR for buyers, USD for sellers |
 
 Quote-volume orders are especially useful for instruments bought by cash amount, such as
 “buy 1,000 USD of QQQ.” Base-volume orders remain natural for “sell 10 shares of QQQ” or
@@ -234,7 +235,7 @@ Add a pair-level policy to `SymbolConfig`:
 
 ```rust
 pub enum FeeAssetPolicy {
-    /// Buyer pays/receives fee in base, seller in quote. Recommended default.
+    /// Buyer pays/receives fee in base, seller in quote. Default for crypto/spot and fiat FX.
     Received,
     /// Both sides pay/receive fees in quote.
     Quote,
@@ -243,6 +244,11 @@ pub enum FeeAssetPolicy {
     // FeeToken(AssetId) is deliberately out of scope for this phase.
 }
 ```
+
+`SymbolConfig::with_assets` automatically selects `Quote` when the base asset is
+`AssetClass::Etf` or `AssetClass::Equity`; `validate` rejects any other policy for those bases.
+Crypto/spot and fiat-to-fiat pairs keep `Received` by default. A broker that wants cash fees for
+crypto can explicitly select `Quote`.
 
 ### 6.1 Gross fee formulas
 
@@ -274,7 +280,7 @@ USDC or another asset. The engine never substitutes a stablecoin for fiat or vic
 
 ### 6.3 Gross and net balances
 
-`Received` (recommended default):
+`Received` (default for crypto/spot and fiat FX):
 
 - Buyer receives `Q - fee_base` base and pays `N` quote.
 - Seller delivers `Q` base and receives `N - fee_quote` quote.
@@ -579,17 +585,19 @@ Implemented choices:
 6. The engine reports exact fees at scale 18; clearing applies the asset's final rounding.
 7. A quote market buy budget is **gross notional**; quote fees are additional debits.
 8. `base_lot` is configurable per symbol and zero disables lot validation.
+9. ETF/equity bases force `FeeAssetPolicy::Quote`; crypto/spot and fiat-to-fiat pairs default to
+   `Received`.
 
 Still open:
 
-9. Which asset classes must be supported at launch: fiat, stablecoin, crypto, equity, ETF, or a
+10. Which asset classes must be supported at launch: fiat, stablecoin, crypto, equity, ETF, or a
    subset? `AssetId`/`AssetClass` exist; production asset issuance/validation is still a deployment
    concern.
-10. Are fixed per-trade fees, per-share commissions, regulatory fees, minimum tickets or taxes in
+11. Are fixed per-trade fees, per-share commissions, regulatory fees, minimum tickets or taxes in
     scope? They are not notional-proportional rates.
-11. Are equity/ETF sessions, holidays, auctions and corporate actions handled entirely by the
+12. Are equity/ETF sessions, holidays, auctions and corporate actions handled entirely by the
     gateway, or does the engine need a symbol lifecycle/halt state?
-12. Can fees be charged in an asset other than base or quote (for example a broker fee in USD on a
+13. Can fees be charged in an asset other than base or quote (for example a broker fee in USD on a
     BTC/USDT trade)? That requires a fee-token price and balance handling.
 
 ## 14. Recommendation
@@ -600,8 +608,8 @@ Adopt the following default contract:
 - Limit quote orders are normalized to base at the limit price before resting.
 - Market buy quote orders are spend-capped; market sell quote orders are proceeds-targeted.
 - Fees are computed on gross notional; volumes are gross.
-- `FeeAssetPolicy::Received` is the default: buyers pay base fees, sellers pay quote fees. This
-  works uniformly for ETF/equity shares and spot crypto.
+- `FeeAssetPolicy::Received` is the default for crypto/spot and fiat FX: buyers pay base fees,
+  sellers pay quote fees. ETF/equity bases force `Quote`, so both sides pay cash fees.
 - `AssetId` must identify fiat, stablecoin, crypto, equity and ETF instruments distinctly; USD and
   USDT are never interchangeable.
 - Price tick and base lot are first-class metadata; decimals alone are not enough for equities or

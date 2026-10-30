@@ -395,8 +395,8 @@ Done:
   the limit price and zero-lot conversions are rejected.
 - [x] Quote-aware market sweeps: buy spends a gross quote budget; sell targets gross quote proceeds
   and rounds the final base lot up, overshooting by at most one lot.
-- [x] Fee asset policies: received asset (default), quote asset and base asset. Events report the
-  actual fee asset per side.
+- [x] Fee asset policies: received asset (crypto/spot and fiat FX default), quote asset
+  (forced for ETF/equity bases) and base asset. Events report the actual fee asset per side.
 - [x] Gross base/quote volume, taker/maker fee assets and fees flow through `MatchResult`,
   `MatchEvent`, `/events`, the file sink and the market-data feed.
 - [x] Tick/lot increments and per-asset precision are enforced on `Place` and `Amend`.
