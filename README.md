@@ -10,8 +10,21 @@
 # Match Engine Raft
 
 [![CI](https://github.com/raymondshe/matchengine-raft/actions/workflows/ci.yml/badge.svg)](https://github.com/raymondshe/matchengine-raft/actions/workflows/ci.yml)
+[![Rust](https://img.shields.io/badge/rust-%E2%89%A5%201.89-orange.svg)](https://www.rust-lang.org)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
+[![Snapshot v9](https://img.shields.io/badge/snapshot-v9-blue.svg)](./docs)
+[![Market-data wire v5](https://img.shields.io/badge/marketdata%20wire-v5-blue.svg)](./docs/MARKET_DATA_PLAN.md)
 
 A practical implementation of a distributed matching engine built upon [OpenRaft](https://github.com/datafuselabs/openraft). Raft logs are persisted in a hand-written segmented write-ahead log and the state machine is made durable with atomic snapshots, so a node recovers all committed state after a restart.
+
+| Area | Today |
+|---|---|
+| Execution | Deterministic price-time matching; `apply` reads no wall clock |
+| Durability | Segmented WAL + atomic snapshots; snapshot every 100k entries or 30 minutes |
+| Replication | Raft over gRPC by default, HTTP/JSON still supported |
+| Symbol model | One symbol per process/cluster, configured and locked through Raft |
+| Numeric model | Exact 18-decimal fixed point through matching, events, snapshots and feeds |
+| Public edge | Bounded request/snapshot limits; loopback or private-network deployment |
 
 ## Table of Contents
 
@@ -30,14 +43,35 @@ A practical implementation of a distributed matching engine built upon [OpenRaft
 
 ## Features
 
-- **Persistent Raft Storage**: A segmented, checksummed write-ahead log with one fsync per replicated batch, plus atomic file snapshots for the state machine
-- **Crash Recovery**: A restarted node loads its snapshot and replays the retained log tail; recovery is covered by integration tests
-- **gRPC Replication**: A [tonic](https://docs.rs/tonic) transport with bidirectional `stream_append`, chunked snapshot transfer and separate per-peer channels; HTTP/JSON remains selectable with `--transport http`
-- **Matching Engine**: Full order-book implementation with price-time priority, GTC/IOC/FOK/GTD/Day, post-only, iceberg and stop orders, amend/cancel, and notional-proportional maker/taker fee deduction with configurable fee assets
-- **HTTP Server**: Built with [Actix-web](https://docs.rs/actix-web) providing both internal Raft APIs and external application APIs
-- **Read Consistency Options**: Local reads, linearizable reads through the leader, and linearizable follower reads
-- **Smart Client**: A Rust client that automatically tracks and redirects requests to the current leader
-- **Durable Match-Event Feed**: A replicated, snapshotted event log served by `POST /events`, with cursor pagination, retention limits and `client_order_id` idempotency
+Built for teams that need deterministic execution, durable recovery and a clean downstream feed — without treating the matching engine as a black box.
+
+**Matching engine**
+- **Price-time priority order book** with GTC, IOC, FOK, GTD, Day, market, post-only, iceberg, stop-market and stop-limit orders.
+- **Amend and cancel** with deterministic priority rules: same-price reductions keep time priority; price or size increases re-queue under a new sequence.
+- **Asset-aware fee deduction** with maker/taker rates, rebates, received/quote/base fee assets and exact notional accounting.
+- **Base or quote volume** with tick/lot enforcement, quote-limit normalization and quote-budget market sweeps.
+- **Exact 18-decimal fixed point** from API input through matching, events, snapshots and the market-data feed — no `f64` arithmetic in the matching path.
+
+**Durability and recovery**
+- **Raft-replicated state machine** with durable membership, log and application state.
+- **Segmented, checksummed WAL** with one fsync per replicated batch and torn-tail recovery.
+- **Atomic snapshots** written by temp file → fsync → rename → directory fsync, with checksum validation before install.
+- **Snapshot policy for real workloads**: every 100,000 applied entries or 30 minutes when newer entries exist, configurable with `--snapshot-interval-ms`.
+- **Snapshot + WAL-tail recovery** that restores the latest snapshot, event window and idempotency map, then replays only newer log entries.
+- **gRPC replication** with bidirectional `stream_append`, chunked snapshot transfer and independent per-peer channels; HTTP/JSON remains selectable.
+
+**APIs and data feeds**
+- **Durable match-event feed** at `POST /events` with cursor pagination, retention limits, `client_order_id` idempotency and replay-safe retries.
+- **Deterministic market-data feed** with leader gating, shadow book, BBO, depth snapshots/deltas, lifecycle events, OHLC bars and a compact binary wire format.
+- **Flexible read consistency**: local reads, linearizable leader reads and linearizable follower reads.
+- **Leader-aware Rust client** that tracks and forwards requests to the current leader.
+- **Operational APIs** for initialization, membership changes, metrics, event status and market-data status.
+
+**Built to be trusted**
+- **Bounded public edge**: request-body, read-key, event-page, idempotency-key and snapshot-size limits, with malformed input rejected before Raft.
+- **Explicit deployment contract** for loopback or trusted private networks, plus startup warnings for non-loopback binds.
+- **Correctness evidence**: randomized differential tests against a reference model, explicit order-type conformance cases, deterministic replay checks and cluster recovery tests.
+- **One symbol per process/cluster** for isolated resources and failure domains; scale horizontally by running one deployment per symbol.
 
 ## Architecture Overview
 
@@ -106,7 +140,7 @@ are what the Aeron adapter (streams 2001–2007) will publish next.
    - Order types: GTC, IOC, FOK, GTD, Day, post-only, iceberg, stop-market and stop-limit
    - Deterministic expiry (`PurgeExpired` carries the timestamps through the log) and stop
      election on the replicated last trade price
-   - Example of a real-world state machine application
+   - The order book is the replicated state machine: deterministic `apply`, no clocks
    - `OrderBook::execute_order` is the full lifecycle; `place_order` is a fills-only wrapper
 
 4. **Market-Data Egress** ([`market_data/`](./src/market_data/))
@@ -815,16 +849,17 @@ Implemented performance choices:
 - The event window is bounded by `--max-events` and paged through `/events`; `/read
   orderbook_orders` does not clone it.
 
-Still missing:
+Current limits and known gaps:
 
 - No transport benchmark harness; numbers in `docs/TRANSPORTS.md` are guidance, not measurements.
-- The gRPC listener has no TLS/mTLS.
-- Snapshot installation still buffers the whole snapshot in memory.
-- `Order` prices/quantities, `last_trade_price`, match events, depth/BBO/spread, the JSONL feed
-  and wire v5 use exact 18-scale fixed-point integers. Snapshot v9 and wire v5 are breaking
-  changes from earlier builds. `SymbolConfig` is replicated and locked for one symbol per
-  process/cluster; multi-symbol deployments run one process per symbol. See
-  [`docs/DECIMAL.md`](./docs/DECIMAL.md).
+- The gRPC listener has no TLS/mTLS, and the HTTP API has no authentication.
+- Snapshot installation needs one contiguous buffer, bounded by 256 MiB per snapshot.
+- One process/cluster trades one symbol; run one deployment per symbol to scale.
+
+Data-format note: `Order` prices/quantities, `last_trade_price`, match events, depth/BBO/spread, the
+JSONL feed and wire v5 use exact 18-scale fixed-point integers. Snapshot **v9** and wire **v5** are
+breaking changes from earlier builds, so recreate data directories when upgrading. See
+[`docs/DECIMAL.md`](./docs/DECIMAL.md).
 
 Known gaps and the roadmap are tracked in [`TODO.md`](./TODO.md).
 

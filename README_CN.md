@@ -10,8 +10,21 @@
 # Match Engine Raft
 
 [![CI](https://github.com/raymondshe/matchengine-raft/actions/workflows/ci.yml/badge.svg)](https://github.com/raymondshe/matchengine-raft/actions/workflows/ci.yml)
+[![Rust](https://img.shields.io/badge/rust-%E2%89%A5%201.89-orange.svg)](https://www.rust-lang.org)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
+[![快照 v9](https://img.shields.io/badge/%E5%BF%AB%E7%85%A7-v9-blue.svg)](./docs)
+[![行情线格式 v5](https://img.shields.io/badge/%E8%A1%8C%E6%83%85%20wire-v5-blue.svg)](./docs/MARKET_DATA_PLAN.md)
 
 这是一个基于 [OpenRaft](https://github.com/datafuselabs/openraft) 构建的分布式撮合引擎的实践实现。Raft 日志持久化在自研的分段预写日志（WAL）中，状态机通过原子快照落盘，因此节点重启后可以恢复全部已提交状态。
+
+| 维度 | 当前状态 |
+|---|---|
+| 执行 | 确定性价格-时间撮合；`apply` 不读墙上时钟 |
+| 持久化 | 分段 WAL + 原子快照；每 100,000 条日志或 30 分钟生成快照 |
+| 复制 | 默认 Raft over gRPC，同时支持 HTTP/JSON |
+| 标的模型 | 一个进程/集群一个标的，经 Raft 配置并在交易开始后锁定 |
+| 数值模型 | 撮合、事件、快照和 feed 全程使用 18 位定点数 |
+| 公共入口 | 请求/快照大小受限；仅支持回环或私有网络部署 |
 
 ## 目录
 
@@ -30,14 +43,35 @@
 
 ## 功能特性
 
-- **持久化 Raft 存储**: 带校验和的分段预写日志，每个复制批次一次 fsync；状态机通过原子文件快照持久化
-- **崩溃恢复**: 重启时加载快照并重放保留的日志尾部，日志重放与快照两条恢复路径均有集成测试覆盖
-- **gRPC 复制**: 基于 [tonic](https://docs.rs/tonic) 的传输层，支持双向 `stream_append`、分块快照传输，并为每个对端维护独立的复制/心跳/快照通道；可用 `--transport http` 切回 HTTP/JSON
-- **撮合引擎**: 完整的订单簿实现，支持价格-时间优先、GTC/IOC/FOK/GTD/Day、Post-Only、冰山单、止损单、改单/撤单，以及按成交名义金额计算 maker/taker 费用并支持可配置扣费资产
-- **HTTP 服务器**: 基于 [Actix-web](https://docs.rs/actix-web) 构建，同时提供内部 Raft API 和外部应用 API
-- **多种读取一致性**: 本地读、经领导者的一致性读，以及线性一致性的 follower read
-- **智能客户端**: Rust 客户端自动跟踪并将请求重定向到当前领导者
-- **持久化撮合事件 Feed**: 复制且随快照持久化的事件日志，通过 `POST /events` 游标分页读取，支持保留上限和 `client_order_id` 幂等重试
+面向需要确定性执行、可靠恢复和清晰下游 feed 的团队，而不是把撮合引擎当成黑盒。
+
+**撮合引擎**
+- **价格-时间优先订单簿**，支持 GTC、IOC、FOK、GTD、Day、市价、Post-Only、冰山单、止损市价单和止损限价单。
+- **改单与撤单**遵循确定性优先级：同价减量保留时间优先；改价或增量会以新序列号重新排队。
+- **按资产扣费**，支持 maker/taker 费率、返佣、收到资产/quote/base 扣费策略和精确名义金额计算。
+- **Base 或 quote 数量**，支持 tick/lot 校验、quote 限价单归一化和 quote 预算市价扫描。
+- **端到端 18 位定点数**，从 API 输入、撮合、事件、快照到行情 feed 全程使用定点数，撮合路径不做 `f64` 运算。
+
+**持久化与恢复**
+- **Raft 复制状态机**，成员、日志和应用状态全部持久化。
+- **分段校验 WAL**，每个复制批次一次 fsync，支持撕裂尾部恢复。
+- **原子快照**，通过临时文件 → fsync → rename → 目录 fsync 写入，安装前校验 checksum。
+- **面向真实负载的快照策略**：每 100,000 条已应用日志或每 30 分钟（有新 entry 时）生成快照，可用 `--snapshot-interval-ms` 调整。
+- **快照 + WAL 尾部恢复**：先加载最新快照、事件窗口和幂等表，再只重放更新的日志条目。
+- **gRPC 复制**，支持双向 `stream_append`、分块快照传输和每个对端独立通道；仍可切回 HTTP/JSON。
+
+**API 与数据 Feed**
+- **持久化撮合事件 Feed**：`POST /events` 游标分页、保留上限、`client_order_id` 幂等和安全重试。
+- **确定性行情 Feed**：领导者门控、影子订单簿、BBO、深度快照/增量、生命周期事件、OHLC K 线和紧凑二进制行情格式。
+- **灵活读取一致性**：本地读、领导者线性一致读和 follower 线性一致读。
+- **领导者感知 Rust 客户端**，自动跟踪并转发到当前领导者。
+- **运维 API**：初始化、成员变更、指标、事件状态和行情状态。
+
+**可信赖的工程质量**
+- **受限的公共入口**：请求体、read key、事件分页、幂等键和快照大小均有上限，畸形输入在进入 Raft 前拒绝。
+- **明确的部署契约**：仅支持回环或可信私有网络，并在绑定非回环地址时发出启动警告。
+- **正确性证据**：参考模型随机差分测试、订单类型显式一致性测试、确定性重放检查和集群恢复测试。
+- **一个进程/集群只交易一个标的**，隔离资源与故障域；多标的通过横向部署多个实例扩展。
 
 ## 架构概述
 
@@ -55,7 +89,7 @@
                                         │                           ▼
                                         │             ┌──────────────────────────────────────┐
                                         │             │       行情任务（按领导者发布）       │
-                                        │             │    影子订单簿 · OHLC · 线格式 v2     │
+                                        │             │    影子订单簿 · OHLC · 线格式 v5     │
                                         │             │      确定性 market_seq/sub_seq       │
                                         │             └──────────────────────────────────────┘
                                         │                                 │ MarketDataSink
@@ -84,7 +118,7 @@
 `--http-addr` 监听器提供，因此无论节点主动使用哪种传输，它都会同时服务两种协议。
 
 行情输出是节点本地的，且不参与共识：tap 使用有界 `try_send`，因此慢订阅者永远不会阻塞
-`apply`。JSONL sink 仅用于调试；同样的线格式 v2 消息就是后续 Aeron 适配器（2001–2007 流）
+`apply`。JSONL sink 仅用于调试；同样的线格式 v5 消息就是后续 Aeron 适配器（2001–2007 流）
 要发布的内容。
 
 ### 核心组件
@@ -104,12 +138,12 @@
    - 价格-时间优先的订单簿（买单与卖单）
    - 订单类型：GTC、IOC、FOK、GTD、Day、Post-Only、冰山单、止损市价单、止损限价单
    - 确定性过期（`PurgeExpired` 通过日志携带时间戳）与基于复制的最后成交价触发止损
-   - 现实世界状态机应用的示例
+   - 订单簿就是被复制的状态机：`apply` 确定性执行，不读时钟
    - `OrderBook::execute_order` 是完整生命周期，`place_order` 是只返回成交的兼容包装
 
 4. **行情数据出口** ([`market_data/`](./src/market_data/))
    - `apply` 将撮合事件和深度日志交给有界 tap（`try_send`，撮合路径永不等待）
-   - 仅领导者发布的任务维护影子订单簿、生成 BBO/OHLC K 线并编码线格式 v2
+   - 仅领导者发布的任务维护影子订单簿、生成 BBO/OHLC K 线并编码线格式 v5
    - 消息键为 `(symbol_id, stream_id, market_seq, sub_seq)`；每个 taker 一条不设上限的 `TRADE`
    - 当前使用 JSONL sink；下一阶段是 Aeron 2001–2007 流
 
@@ -539,7 +573,7 @@ POST /events
   或拖慢。
 
 当前 sink 是用于调试的 JSONL。同样的消息在 `src/market_data/wire.rs` 有二进制编码（64 字节头、
-版本 4、scale-18 `i128`、小端消息体），`MarketDataSink` 就是后续 Aeron 适配器的接入点。每条消息携带
+版本 5、scale-18 `i128`、小端消息体），`MarketDataSink` 就是后续 Aeron 适配器的接入点。每条消息携带
 当前进程配置的 `symbol_id`，便于多个按标的部署共享总线。可调参数：`--market-data-depth`、`--market-data-status-every`、
 `--market-data-bar-intervals-ms`、`--market-data-leader-only`。
 
@@ -750,13 +784,15 @@ pub struct MatchEngineResponse {
 - 快照按 256 KiB 分块传输；`log/state` 和 `snapshot/current.snap` 都原子替换。
 - 事件窗口由 `--max-events` 限制并通过 `/events` 分页；`/read orderbook_orders` 不会复制事件窗口。
 
-仍缺少：
+当前限制与已知差距：
 
 - 没有传输基准工具，`docs/TRANSPORTS.md` 中的数字只是指导值，不是实测结果。
-- gRPC 监听器尚未配置 TLS/mTLS。
-- 快照安装仍整体缓冲在内存中。
-- `Order` 的价格/数量、`last_trade_price`、撮合事件、深度/BBO/spread、JSONL 行情和 wire v5 均使用精确的 18 位定点整数。快照 v9 和 wire v5 是相对旧版本的破坏性变更；每个进程/集群只支持一个标的，`SymbolConfig` 已复制并在交易开始后锁定。多标的通过独立进程/集群隔离。18 位 BTC 分析、微基准和迁移记录见
-  [`docs/DECIMAL.md`](./docs/DECIMAL.md)。
+- gRPC 监听器尚未配置 TLS/mTLS，HTTP API 也没有认证。
+- 快照安装需要一块连续缓冲区，单个快照上限为 256 MiB。
+- 一个进程/集群只交易一个标的；多标的需要横向部署多个实例。
+
+数据格式说明：`Order` 的价格/数量、`last_trade_price`、撮合事件、深度/BBO/spread、JSONL 行情和 wire v5 均使用精确的 18 位定点整数。快照 **v9** 和 wire **v5** 是相对旧版本的破坏性变更，升级时请重建数据目录。每个进程/集群只支持一个标的，`SymbolConfig` 已复制并在交易开始后锁定。18 位 BTC 分析、微基准和迁移记录见
+[`docs/DECIMAL.md`](./docs/DECIMAL.md)。
 
 已知差距与路线图统一记录在 [`TODO.md`](./TODO.md)。
 
