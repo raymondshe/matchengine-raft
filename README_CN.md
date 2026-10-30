@@ -21,7 +21,7 @@
 |---|---|
 | 执行 | 确定性价格-时间撮合；`apply` 不读墙上时钟 |
 | 持久化 | 分段 WAL + 原子快照；每 100,000 条日志或 30 分钟生成快照 |
-| 复制 | Raft over gRPC；HTTP/JSON Raft 传输已移除 |
+| 复制 | Raft 节点间 RPC 使用 gRPC |
 | 标的模型 | 一个进程/集群一个标的，经 Raft 配置并在交易开始后锁定 |
 | 数值模型 | 撮合、事件、快照和 feed 全程使用 18 位定点数 |
 | 公共入口 | 请求/快照大小受限；仅支持回环或私有网络部署 |
@@ -116,7 +116,7 @@
 ```
 
 节点间 Raft RPC 使用 `端口 + 1000` 上的 gRPC。公共应用/管理 API 仍由 `--http-addr` 监听器提供；
-不再提供 HTTP/JSON Raft 传输。
+Raft RPC 不属于 HTTP JSON API。
 
 行情输出是节点本地的，且不参与共识：tap 使用有界 `try_send`，因此慢订阅者永远不会阻塞
 `apply`。JSONL sink 仅用于调试；同样的线格式 v5 消息就是后续 Aeron 适配器（2001–2007 流）
@@ -617,12 +617,13 @@ config.max_in_snapshot_log_to_keep = 0; // 清理快照已覆盖的全部日志
 
 ## API 参考
 
-所有端点都使用 JSON。每个处理器返回 `Result` 包装，因此成功调用形如 `{"Ok": ...}`，转发或失败
-调用形如 `{"Err": ...}`。
+HTTP 应用与管理端点使用 JSON。每个处理器返回 `Result` 包装，因此成功调用形如 `{"Ok": ...}`，
+转发或失败调用形如 `{"Err": ...}`。Raft 节点间 RPC 使用 gRPC，不经过 HTTP JSON API。
 
-### Raft 传输 API
+### Raft gRPC API
 
-Raft 节点间 RPC 仅由 `--http-addr` 端口 + 1000 上的 gRPC 提供：
+Raft 节点间 RPC 仅由 `--http-addr` 端口 + 1000 上的 gRPC 提供；HTTP JSON 监听器上不挂载
+任何 Raft RPC：
 
 - `AppendEntries`、`Vote`（一元）
 - `InstallSnapshot`（客户端流式分块）

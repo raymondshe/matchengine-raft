@@ -21,7 +21,7 @@ A practical implementation of a distributed matching engine built upon [OpenRaft
 |---|---|
 | Execution | Deterministic price-time matching; `apply` reads no wall clock |
 | Durability | Segmented WAL + atomic snapshots; snapshot every 100k entries or 30 minutes |
-| Replication | Raft over gRPC; HTTP/JSON Raft transport removed |
+| Replication | Raft peer RPCs over gRPC |
 | Symbol model | One symbol per process/cluster, configured and locked through Raft |
 | Numeric model | Exact 18-decimal fixed point through matching, events, snapshots and feeds |
 | Public edge | Bounded request/snapshot limits; loopback or private-network deployment |
@@ -116,7 +116,7 @@ This project extends the [example-raft-kv](https://github.com/datafuselabs/openr
 ```
 
 Peer-to-peer Raft RPCs use gRPC on `port + 1000`. The public application and management API
-stays on the `--http-addr` listener; there is no HTTP/JSON Raft transport.
+stays on the `--http-addr` listener. Raft RPCs are not part of the HTTP JSON API.
 
 Market-data egress is node-local and off the consensus path: the tap is a bounded `try_send`, so a
 slow subscriber can never block `apply`. The JSONL sink is for debugging; the same wire-v5 messages
@@ -654,12 +654,14 @@ Adding a node to a cluster involves 3 steps:
 
 ## API Reference
 
-All endpoints speak JSON. Every handler returns a `Result` wrapper, so a successful call looks like
-`{"Ok": ...}` and a forwarded or failed call like `{"Err": ...}`.
+The HTTP application and management endpoints speak JSON. Every handler returns a `Result`
+wrapper, so a successful call looks like `{"Ok": ...}` and a forwarded or failed call like
+`{"Err": ...}`. Raft peer RPCs use gRPC, not the HTTP JSON API.
 
-### Raft Transport API
+### Raft gRPC API
 
-Raft peer-to-peer RPCs are served only by gRPC on `--http-addr` port + 1000:
+Raft peer-to-peer RPCs are served only by gRPC on `--http-addr` port + 1000. No Raft RPC is
+mounted on the HTTP JSON listener:
 
 - `AppendEntries` and `Vote` (unary)
 - `InstallSnapshot` (client-streaming chunks)
