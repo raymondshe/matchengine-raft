@@ -15,6 +15,10 @@
 [![快照 v9](https://img.shields.io/badge/%E5%BF%AB%E7%85%A7-v9-blue.svg)](./docs)
 [![行情线格式 v5](https://img.shields.io/badge/%E8%A1%8C%E6%83%85%20wire-v5-blue.svg)](./docs/MARKET_DATA_PLAN.md)
 
+<p align="center">
+  <img src="MatchEngineRaft.png" alt="Match Engine Raft logo" width="220">
+</p>
+
 这是一个基于 [OpenRaft](https://github.com/datafuselabs/openraft) 构建的分布式撮合引擎的实践实现。Raft 日志持久化在自研的分段预写日志（WAL）中，状态机通过原子快照落盘，因此节点重启后可以恢复全部已提交状态。
 
 | 维度 | 当前状态 |
