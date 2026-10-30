@@ -66,6 +66,7 @@
 - **灵活读取一致性**：本地读、领导者线性一致读和 follower 线性一致读。
 - **领导者感知 Rust 客户端**，自动跟踪并转发到当前领导者。
 - **运维 API**：初始化、成员变更、指标、事件状态和行情状态。
+- **批量写入**：`POST /write_batch` 将多个请求放入一个 Raft entry 和一次 WAL fsync，逐项返回序列号，事件序号在 entry 内连续。
 
 **可信赖的工程质量**
 - **受限的公共入口**：请求体、read key、事件分页、幂等键和快照大小均有上限，畸形输入在进入 Raft 前拒绝。
@@ -306,6 +307,7 @@ HTTP API 与 gRPC Raft 监听端口（HTTP 端口 + 1000）**按设计就是明�
 | `client_order_id` | 1–128 字节，仅限 ASCII 字母/数字及 `. _ - :`；拒绝空字符串 |
 | `/read` 键 | 1–128 个可打印 ASCII 字节 |
 | `/events` 分页大小 | 1–1000 个事件 |
+| `/write_batch` | 1–128 个非嵌套请求，`client_order_id` 不得重复 |
 | gRPC Raft 消息 | 64 MiB（`MAX_MESSAGE_SIZE`） |
 | gRPC 快照流 | 总量 256 MiB（`MAX_SNAPSHOT_BYTES`），在追加每个 chunk 前检查 |
 
@@ -363,7 +365,8 @@ tests/
     ├── test_symbols.rs        # 单标的配置、精度拒绝和配置锁定
     ├── test_fees.rs           # 撮合/吃单费用经 API、事件、行情和重启
     ├── test_fee_assets.rs     # QQQ/USD tick/lot、quote 数量和 quote 扣费
-    └── test_request_limits.rs # 恶意输入和请求大小限制
+    ├── test_request_limits.rs # 恶意输入和请求大小限制
+    └── test_batch_write.rs    # 单 Raft entry 批量写入
 benches/
 ├── matchengine.rs           # 订单簿微基准
 ├── e2e.rs                   # 请求 -> Raft 提交 -> apply -> 响应
@@ -647,7 +650,10 @@ Raft 节点间 RPC 仅由 `--http-addr` 端口 + 1000 上的 gRPC 提供；HTTP 
 - `POST /write` - 通过 Raft 提交 `Place`、`Cancel`、`Amend`、`PurgeExpired` 或 `ConfigureSymbol` 请求。
   订单/变更请求返回分配的 `market_seq`（`Place` 同时是订单序列号），并携带该条目的首批事件（上限 512）。
   `ConfigureSymbol` 返回状态字符串，拒绝时使用 `error` 字段，不消耗市场序列号。`Place` 支持可选的
-  `client_order_id`，用于幂等重试。
+  `client_order_id`，用于幂等重试。`/write` 也接受 `Batch { requests }` 信封；`/write_batch` 则以裸
+  JSON 数组接收同样的请求。
+- `POST /write_batch` - 将 1–128 个非嵌套请求放入一个 Raft entry；响应中的 `batch` 数组逐项返回结果，
+  事件序号在整个 entry 内连续。
 - `POST /read` - 从本地状态机读取（可能读到旧值）
 - `POST /linearizable_read` - 线性一致性读；请求必须到达领导者
 - `POST /follower_read` - 从领导者获取 linearizer 后在本地完成的线性一致性读
@@ -663,6 +669,7 @@ pub enum MatchEngineRequest {
     Amend { order: Order, price: Option<Fixed>, volume: Option<Fixed> },
     PurgeExpired { now_ms: u64, day_close_ms: Option<u64> },
     ConfigureSymbol { config: SymbolConfig },
+    Batch { requests: Vec<MatchEngineRequest> },
 }
 
 pub struct MatchEngineResponse {
@@ -671,6 +678,7 @@ pub struct MatchEngineResponse {
     pub events: Vec<MatchEvent>,      // 本条目的前 512 个事件
     pub events_truncated: bool,       // 还有更多事件时为 true
     pub error: Option<String>,        // 非致命的应用层错误
+    pub batch: Vec<MatchEngineResponse>, // /write_batch 的逐项响应
 }
 ```
 
@@ -680,6 +688,10 @@ pub struct MatchEngineResponse {
 记录也包含相同字段（wire v5）。`client_order_id` 可选，只影响 `Place`：同一 id 重试返回原序列号和
 事件，不会重复下单。长度必须为 1–128 个可打印 ASCII 字节，字符集为 `[A-Za-z0-9._:-]`；空字符串会被拒绝，
 不需要幂等时请省略该字段。
+
+`/write_batch` 在一个 `apply` 调用中按顺序执行子请求，后一项能看到前一项的结果；每项保留自己的
+序列号和事件，所有事件共享该 entry 的日志索引且序号连续。单项被拒绝不会中止整个批次。空批次、
+嵌套批次、超大批次和批次内重复 `client_order_id` 会在进入 Raft 前被拒绝。
 
 `/read`、`/linearizable_read` 和 `/follower_read` 接收 JSON 字符串键，用于读取订单簿的命名视图：
 
@@ -762,11 +774,12 @@ fee token）见 [`docs/FEE_DEDUCTION.md`](./docs/FEE_DEDUCTION.md)。
 | `tests/cluster/test_fees.rs` | 吃单/挂单费率产生精确的成交费用，经 `/write`、`/events`、文件 sink 和行情 feed 输出，并在快照重启后保留 |
 | `tests/cluster/test_fee_assets.rs` | QQQ/USD ETF/法币元数据、tick/lot、quote 数量限价单归一化和 quote 资产扣费 |
 | `tests/cluster/test_request_limits.rs` | 超大 JSON 请求体、畸形输入、非法/超长 `client_order_id`、超长 read key 和越界事件分页在进入 Raft 前以 `400`/`413` 拒绝 |
+| `tests/cluster/test_batch_write.rs` | 多个请求在单个 Raft entry 中应用，逐项序列号、连续事件序号，以及空/嵌套/超大/重复 id 批次校验 |
 
 所有集成测试都使用唯一的临时数据目录。集群测试固定使用端口 `21001-21003`（gRPC
 `22001-22003`），快照测试使用 `21101-21103`，重启测试使用 `21201-21205`，撮合结果测试使用
 `21301`/`21302`、行情数据测试 `21303`、事件日志测试 `21304`、故障切换测试
-`21401-21403`、学习者追赶测试 `21501-21502`、过期节点重入测试 `21601-21603`、精度往返测试 `21701`（gRPC `22701`）、标的配置测试 `21801`（gRPC `22801`）、费用测试 `21901`（gRPC `22901`）、费用资产测试 `21902`（gRPC `22902`）、请求限制测试 `21903`（gRPC `22903`）；重跑前请先停止残留进程
+`21401-21403`、学习者追赶测试 `21501-21502`、过期节点重入测试 `21601-21603`、精度往返测试 `21701`（gRPC `22701`）、标的配置测试 `21801`（gRPC `22801`）、费用测试 `21901`（gRPC `22901`）、费用资产测试 `21902`（gRPC `22902`）、请求限制测试 `21903`（gRPC `22903`）、批量写入测试 `21904`（gRPC `22904`）；重跑前请先停止残留进程
 （`pkill -f matchengine-raft`）。
 
 ## 性能与当前限制
@@ -779,8 +792,13 @@ fee token）见 [`docs/FEE_DEDUCTION.md`](./docs/FEE_DEDUCTION.md)。
 | 订单簿：1k 卖单 / 100 档全扫 | 105.6 µs |
 | 端到端 `/write` p50 / p99 | 3.99 ms / 5.17 ms |
 | 并发 `/write` 吞吐（1,000 个在途） | 18,350 writes/s |
+| 串行 `/write_batch`（每批 128 单） | 25,183 单/s |
+| 并发 `/write_batch`（100 × 32 单） | 157,035 单/s |
 | 行情 feed 500k fills/s | 495k fills/s，8,192 队列下 0 丢弃 |
 | WAL 追加 / 读取（20k 条、每批 100 条） | 26,049 / 2,386,089 条/s |
+
+批量写入把一次 WAL 追加/fsync 摊销到最多 128 个订单：串行 128 单批次达到 25,183 单/s，
+100 个并发 32 单批次达到 157,035 单/s。
 
 feed 还包含一个刻意的 2M fills/s 过载场景，会丢弃帧并发送 `GAP`，而不是阻塞撮合。可用
 `cargo bench --bench matchengine`、`cargo bench --bench e2e`、`cargo bench --bench feed_load` 和

@@ -1,4 +1,5 @@
 mod common;
+mod test_batch_write;
 mod test_cluster;
 mod test_events;
 mod test_exactness;

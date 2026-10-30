@@ -67,6 +67,13 @@ pub enum MatchEngineRequest {
     /// per symbol. The configuration can only change before the first accepted
     /// order and is locked once trading starts.
     ConfigureSymbol { config: SymbolConfig },
+    /// Apply multiple non-batch requests in one Raft entry.
+    ///
+    /// This amortizes one WAL append/fsync across many requests. Sub-requests
+    /// execute in order; their sequences and event ordinals are assigned as if
+    /// they were separate entries, but all events share this entry's log index.
+    /// Nested batches are rejected.
+    Batch { requests: Vec<MatchEngineRequest> },
 }
 
 impl MatchEngineRequest {
@@ -111,6 +118,9 @@ impl fmt::Display for MatchEngineRequest {
             MatchEngineRequest::ConfigureSymbol { config } => {
                 write!(f, "ConfigureSymbol {{ config: {config:?} }}")
             }
+            MatchEngineRequest::Batch { requests } => {
+                write!(f, "Batch {{ requests: {} }}", requests.len())
+            }
         }
     }
 }
@@ -137,6 +147,9 @@ pub struct MatchEngineResponse {
     /// configuration. It is omitted from successful responses.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Per-request responses when the request was a batch.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub batch: Vec<MatchEngineResponse>,
 }
 
 impl MatchEngineResponse {
@@ -159,6 +172,7 @@ impl MatchEngineResponse {
             events: events.iter().take(Self::MAX_EVENTS).copied().collect(),
             events_truncated: truncated,
             error: None,
+            batch: Vec::new(),
         }
     }
 
@@ -171,11 +185,20 @@ impl MatchEngineResponse {
             events,
             events_truncated: truncated,
             error: None,
+            batch: Vec::new(),
         }
     }
 
     pub fn none() -> Self {
         Self::default()
+    }
+
+    /// Wraps per-request responses produced by one batch entry.
+    pub fn batch(responses: Vec<MatchEngineResponse>) -> Self {
+        Self {
+            batch: responses,
+            ..Self::default()
+        }
     }
 
     /// A non-fatal application error (the write itself was committed).

@@ -66,6 +66,7 @@ Built for teams that need deterministic execution, durable recovery and a clean 
 - **Flexible read consistency**: local reads, linearizable leader reads and linearizable follower reads.
 - **Leader-aware Rust client** that tracks and forwards requests to the current leader.
 - **Operational APIs** for initialization, membership changes, metrics, event status and market-data status.
+- **Batch writes** at `POST /write_batch`: multiple requests in one Raft entry and one WAL fsync, with per-request sequences and continuous event ordinals.
 
 **Built to be trusted**
 - **Bounded public edge**: request-body, read-key, event-page, idempotency-key and snapshot-size limits, with malformed input rejected before Raft.
@@ -315,6 +316,7 @@ the edge, before Raft proposes anything:
 | `client_order_id` | 1–128 bytes, ASCII letters/digits plus `. _ - :`; empty rejected |
 | `/read` key | 1–128 printable ASCII bytes |
 | `/events` page size | 1–1000 events |
+| `/write_batch` | 1–128 non-nested requests, unique `client_order_id`s |
 | gRPC Raft message | 64 MiB (`MAX_MESSAGE_SIZE`) |
 | gRPC snapshot stream | 256 MiB total (`MAX_SNAPSHOT_BYTES`), checked before each chunk is appended |
 
@@ -373,7 +375,8 @@ tests/
     ├── test_symbols.rs        # One-symbol config, precision rejection and symbol lock
     ├── test_fees.rs           # Maker/taker fees through API, events, feed and restart
     ├── test_fee_assets.rs     # QQQ/USD tick/lot, quote volume and quote fees
-    └── test_request_limits.rs # Hostile input and request-size limits
+    ├── test_request_limits.rs # Hostile input and request-size limits
+    └── test_batch_write.rs    # Batch writes in one Raft entry
 benches/
 ├── matchengine.rs           # Order-book microbenchmarks
 ├── e2e.rs                   # Submit -> commit -> apply -> response
@@ -687,7 +690,10 @@ chunks, and both message directions are capped at 64 MiB. `Unavailable` maps to
   through Raft. Order/mutation requests return the assigned `market_seq` (for a `Place`, also the
   order sequence) plus the entry's first events (capped at 512). `ConfigureSymbol` returns a status
   string and uses the `error` field on refusal; it does not consume a market sequence. `Place`
-  accepts an optional `client_order_id` for idempotent retries.
+  accepts an optional `client_order_id` for idempotent retries. A `Batch { requests }` envelope is
+  also accepted; `/write_batch` takes the same requests as a bare JSON array.
+- `POST /write_batch` - Submit 1–128 non-nested requests in one Raft entry. The response contains a
+  `batch` array with one response per request; event ordinals are continuous across the entry.
 - `POST /read` - Read from the local state machine (may be stale)
 - `POST /linearizable_read` - Linearizable read; the request must reach the leader
 - `POST /follower_read` - Linearizable read served locally after fetching a linearizer from the leader
@@ -703,6 +709,7 @@ pub enum MatchEngineRequest {
     Amend { order: Order, price: Option<Fixed>, volume: Option<Fixed> },
     PurgeExpired { now_ms: u64, day_close_ms: Option<u64> },
     ConfigureSymbol { config: SymbolConfig },
+    Batch { requests: Vec<MatchEngineRequest> },
 }
 
 pub struct MatchEngineResponse {
@@ -711,6 +718,7 @@ pub struct MatchEngineResponse {
     pub events: Vec<MatchEvent>,      // first 512 events of the entry
     pub events_truncated: bool,       // true when more events exist
     pub error: Option<String>,        // non-fatal application error
+    pub batch: Vec<MatchEngineResponse>, // per-request responses for /write_batch
 }
 ```
 
@@ -722,6 +730,12 @@ the same fields are on market-data `TRADE` and fill `LIFECYCLE` records (wire v5
 `client_order_id` is optional and only affects `Place`: a retry returns the original sequence and
 events instead of placing a second order. It must be 1–128 printable ASCII bytes from
 `[A-Za-z0-9._:-]`; an empty value is rejected, so omit the field to disable idempotency.
+
+`/write_batch` executes sub-requests in order in one `apply` call, so later items see the effects of
+earlier ones. Each item keeps its own sequence and events; all events share the entry's log index
+with continuous ordinals. A rejected sub-request does not abort the rest of the batch. Empty
+batches, nested batches, oversized batches and duplicate `client_order_id`s within one batch are
+rejected before Raft.
 
 `/read`, `/linearizable_read` and `/follower_read` accept a JSON string key naming a view of the
 order book:
@@ -822,13 +836,14 @@ placeholder). `sequence` is still required by the deserializer.
 | `tests/cluster/test_fees.rs` | Maker and taker fee rates produce exact fill fees in `/write`, `/events`, the file sink and the market-data feed, and survive snapshot restart |
 | `tests/cluster/test_fee_assets.rs` | QQQ/USD ETF/fiat metadata, tick/lot enforcement, quote-volume limit normalization and quote-asset fee deduction |
 | `tests/cluster/test_request_limits.rs` | Oversized JSON bodies, malformed input, invalid/oversized `client_order_id`s, oversized read keys and out-of-range event pages are rejected with `400`/`413` before Raft changes the book |
+| `tests/cluster/test_batch_write.rs` | Multiple requests are applied in one Raft entry with per-item sequences, continuous event ordinals, and edge validation for empty, nested, oversized and duplicate-id batches |
 
 Every integration test uses a unique temporary data directory. The cluster test uses fixed ports
 `21001-21003` (gRPC `22001-22003`), the snapshot tests `21101-21103`, the restart tests
 `21201-21205`, the match-result tests `21301`/`21302`, the market-data test `21303`, the event-log test
 `21304`, the failover test `21401-21403`, the learner catch-up test `21501-21502`, the late-join
 test `21601-21603`, the exactness test `21701` (gRPC `22701`), the symbol-config test `21801` (gRPC `22801`), the fee test `21901` (gRPC `22901`), the
-fee-asset test `21902` (gRPC `22902`) and the request-limit test `21903` (gRPC `22903`); stop
+fee-asset test `21902` (gRPC `22902`), the request-limit test `21903` (gRPC `22903`) and the batch-write test `21904` (gRPC `22904`); stop
 leftover processes
 (`pkill -f matchengine-raft`) before rerunning.
 
@@ -842,8 +857,13 @@ Measured baseline (Apple M4, Rust 1.93.1, release bench profile; full methodolog
 | Order book: sweep 1k asks / 100 levels | 105.6 µs |
 | End-to-end `/write` p50 / p99 | 3.99 ms / 5.17 ms |
 | Concurrent `/write` throughput (1,000 in flight) | 18,350 writes/s |
+| Sequential `/write_batch` (128 orders/batch) | 25,183 orders/s |
+| Concurrent `/write_batch` (100 × 32 orders) | 157,035 orders/s |
 | Market-data feed at 500k fills/s | 495k fills/s, 0 drops at 8,192-frame queue |
 | WAL append / read (20k entries, 100-entry batches) | 26,049 / 2,386,089 entries/s |
+
+Batch writes amortize one WAL append/fsync across up to 128 orders: sequential 128-order batches
+reach 25,183 orders/s, and 100 concurrent 32-order batches reach 157,035 orders/s.
 
 The feed also has a deliberate 2M fills/s overload case that drops frames and emits `GAP` rather
 than blocking matching. Reproduce the baseline with `cargo bench --bench matchengine`,

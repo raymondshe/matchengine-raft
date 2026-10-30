@@ -68,6 +68,34 @@ effect: sequential clients pay one WAL fsync per request, while concurrent
 requests share append batches. Matching itself is measured separately above;
 the single-node e2e path is dominated by HTTP plus durable append.
 
+### Batch writes
+
+`POST /write_batch` puts several requests in one Raft entry, so one WAL append
+and `sync_data` covers the whole batch. Measured on the same machine with 200
+sequential batches per size (orders never cross, so this measures commit/apply,
+not matching):
+
+| Batch size | Batches | Orders | Batches/s | Orders/s | Speedup vs size 1 | Batch mean | p50 | p99 |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 200 | 200 | 236 | 236 | 1.00x | 4.23 ms | 4.17 ms | 5.41 ms |
+| 8 | 200 | 1,600 | 229 | 1,829 | 7.73x | 4.37 ms | 4.22 ms | 5.73 ms |
+| 32 | 200 | 6,400 | 230 | 7,345 | 31.06x | 4.35 ms | 4.28 ms | 5.34 ms |
+| 64 | 200 | 12,800 | 218 | 13,929 | 58.90x | 4.59 ms | 4.72 ms | 5.50 ms |
+| 128 | 200 | 25,600 | 197 | 25,183 | 106.48x | 5.08 ms | 5.05 ms | 6.04 ms |
+
+The same run measured 257 single `/write` requests/s. The size-1 `/write_batch`
+path (236 orders/s) pays only the array envelope overhead; by size 128 the
+per-order cost falls by roughly two orders of magnitude because the fsync is
+amortized. Batch latency grows only from 4.23 ms to 5.08 ms as the payload and
+apply work grow, so throughput scales close to the batch size.
+
+With 100 concurrent 32-order batches (3,200 orders in flight), the same node
+reached **157,035 orders/s** (4,907 batches/s), showing that concurrent batches
+also coalesce into Raft append batches. These are single-node loopback numbers;
+a 3-node cluster adds one majority round trip per batch, but the WAL fsync
+amortization is unchanged. Keep batches within the 128-request cap: `apply`
+holds the state-machine lock for the whole batch.
+
 ## Market-data feed load
 
 Real tokio tap, bounded queue and processor; null sink, so this measures the

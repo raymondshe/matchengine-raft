@@ -2,8 +2,9 @@
 //!
 //! Run with `cargo bench --bench e2e`. This is a single-node benchmark, so it
 //! includes HTTP, WAL append/fsync, Raft apply and response serialization but
-//! excludes cross-node replication. The order-book-only costs are measured by
-//! `cargo bench --bench matchengine`.
+//! excludes cross-node replication. It also sweeps `/write_batch` sizes to show
+//! how one WAL fsync per entry amortizes across many orders. The order-book-only
+//! costs are measured by `cargo bench --bench matchengine`.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -28,6 +29,14 @@ type C = MatchEngineTypeConfig;
 const ADDR: &str = "127.0.0.1:24001";
 const SEQUENTIAL_WRITES: usize = 500;
 const CONCURRENT_WRITES: usize = 1_000;
+/// Batch sizes swept by the sequential batch benchmark.
+const BATCH_SIZES: [usize; 5] = [1, 8, 32, 64, 128];
+/// Batches submitted per batch size.
+const BATCHES_PER_SIZE: usize = 200;
+/// In-flight batches in the concurrent batch benchmark.
+const CONCURRENT_BATCHES: usize = 100;
+/// Orders per concurrent batch.
+const CONCURRENT_BATCH_SIZE: usize = 32;
 
 fn temp_dir(label: &str) -> PathBuf {
     let nanos = SystemTime::now()
@@ -111,6 +120,84 @@ async fn sequential_latency(client: &MatchEngineClient<C>) -> anyhow::Result<()>
     Ok(())
 }
 
+async fn batch_throughput(client: &MatchEngineClient<C>) -> anyhow::Result<()> {
+    println!("sequential batches (HTTP /write_batch, one Raft entry each):");
+    println!(
+        "  {:>5}  {:>8}  {:>10}  {:>10}  {:>7}  {:>11}  {:>9}  {:>9}",
+        "size", "orders", "batches/s", "orders/s", "speedup", "batch mean", "p50", "p99"
+    );
+
+    let mut next_order = 0usize;
+    let mut baseline_orders_per_sec = None;
+    for size in BATCH_SIZES {
+        let mut latencies = Vec::with_capacity(BATCHES_PER_SIZE);
+        let started = Instant::now();
+        for _ in 0..BATCHES_PER_SIZE {
+            let requests: Vec<MatchEngineRequest> = (0..size)
+                .map(|offset| write_request(next_order + offset))
+                .collect();
+            next_order += size;
+            let start = Instant::now();
+            client.write_batch(&requests).await??;
+            latencies.push(start.elapsed());
+        }
+        let elapsed = started.elapsed();
+        latencies.sort_unstable();
+
+        let orders = BATCHES_PER_SIZE * size;
+        let batches_per_sec = BATCHES_PER_SIZE as f64 / elapsed.as_secs_f64();
+        let orders_per_sec = orders as f64 / elapsed.as_secs_f64();
+        let baseline = *baseline_orders_per_sec.get_or_insert(orders_per_sec);
+        let mean = latencies.iter().sum::<Duration>() / BATCHES_PER_SIZE as u32;
+
+        println!(
+            "  {:>5}  {:>8}  {:>10.0}  {:>10.0}  {:>6.2}x  {:>11?}  {:>9?}  {:>9?}",
+            size,
+            orders,
+            batches_per_sec,
+            orders_per_sec,
+            orders_per_sec / baseline,
+            mean,
+            percentile(&latencies, 0.50),
+            percentile(&latencies, 0.99),
+        );
+    }
+    Ok(())
+}
+
+async fn concurrent_batch_throughput(client: &MatchEngineClient<C>) -> anyhow::Result<()> {
+    let batches: Vec<Vec<MatchEngineRequest>> = (0..CONCURRENT_BATCHES)
+        .map(|batch| {
+            (0..CONCURRENT_BATCH_SIZE)
+                .map(|offset| write_request(batch * CONCURRENT_BATCH_SIZE + offset))
+                .collect()
+        })
+        .collect();
+    let orders = CONCURRENT_BATCHES * CONCURRENT_BATCH_SIZE;
+
+    let started = Instant::now();
+    let responses = join_all(batches.iter().map(|requests| client.write_batch(requests))).await;
+    let elapsed = started.elapsed();
+    let ok = responses
+        .into_iter()
+        .filter(|response| matches!(response, Ok(Ok(_))))
+        .count();
+
+    println!(
+        "concurrent batches: {CONCURRENT_BATCHES} x {CONCURRENT_BATCH_SIZE} orders ({orders} total)"
+    );
+    println!(
+        "  throughput: {:>10.0} orders/s",
+        orders as f64 / elapsed.as_secs_f64()
+    );
+    println!(
+        "  batches:    {:>10.0} batches/s",
+        CONCURRENT_BATCHES as f64 / elapsed.as_secs_f64()
+    );
+    println!("  completed:  {ok}/{CONCURRENT_BATCHES} batches");
+    Ok(())
+}
+
 async fn concurrent_throughput() -> anyhow::Result<()> {
     let http = reqwest::Client::builder().no_proxy().build()?;
     let url = format!("http://{ADDR}/write");
@@ -148,7 +235,9 @@ async fn main() -> anyhow::Result<()> {
     let (node, client, dir) = start_node().await?;
     println!("end-to-end write benchmark (single node, HTTP + WAL + apply)");
     sequential_latency(&client).await?;
+    batch_throughput(&client).await?;
     concurrent_throughput().await?;
+    concurrent_batch_throughput(&client).await?;
     node.shutdown().await?;
     let _ = std::fs::remove_dir_all(dir);
     Ok(())

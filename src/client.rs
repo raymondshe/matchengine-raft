@@ -76,6 +76,17 @@ where
         self.send_with_forwarding("write", Some(req), 3).await
     }
 
+    /// Submit several requests in one Raft entry.
+    ///
+    /// The whole slice is applied in order in one `apply` call; the response's
+    /// `batch` field holds one response per request.
+    pub async fn write_batch(
+        &self,
+        req: &[C::D],
+    ) -> Result<Result<ClientWriteResponse<C>, ClientWriteError<C>>, RPCError<C>> {
+        self.send_with_forwarding("write_batch", Some(req), 3).await
+    }
+
     /// Read value by key, in an inconsistent mode.
     ///
     /// This method may return stale value because it does not force to read on a legal leader.
@@ -196,7 +207,7 @@ where
         req: Option<&Req>,
     ) -> Result<Result<Resp, Err>, RPCError<C>>
     where
-        Req: Serialize + fmt::Debug + 'static,
+        Req: Serialize + fmt::Debug + ?Sized + 'static,
         Resp: Serialize + DeserializeOwned,
         Err: std::error::Error + Serialize + DeserializeOwned,
     {
@@ -256,7 +267,7 @@ where
         mut retry: usize,
     ) -> Result<Result<Resp, Err>, RPCError<C>>
     where
-        Req: Serialize + fmt::Debug + 'static,
+        Req: Serialize + fmt::Debug + ?Sized + 'static,
         Resp: Serialize + DeserializeOwned,
         Err:
             std::error::Error + Serialize + DeserializeOwned + TryAsRef<ForwardToLeader<C>> + Clone,

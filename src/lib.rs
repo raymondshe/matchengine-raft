@@ -457,6 +457,7 @@ pub async fn build_match_engine_node(
             .service(management::get_linearizer)
             // application API
             .service(api::write)
+            .service(api::write_batch)
             .service(api::read)
             .service(api::linearizable_read)
             .service(api::follower_read)

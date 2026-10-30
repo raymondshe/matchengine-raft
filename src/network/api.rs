@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
@@ -44,6 +45,8 @@ pub const MAX_REQUEST_BODY_BYTES: usize = 1024 * 1024;
 pub const MAX_CLIENT_ORDER_ID_BYTES: usize = 128;
 /// Maximum accepted `/read` key length in bytes.
 pub const MAX_READ_KEY_BYTES: usize = 128;
+/// Maximum number of sub-requests in one `/write_batch` entry.
+pub const MAX_BATCH_REQUESTS: usize = 128;
 
 /// Validates a client idempotency key before it can enter the Raft log.
 ///
@@ -95,6 +98,45 @@ fn validate_events_request(req: &EventsRequest) -> Result<(), String> {
         return Err(format!(
             "events limit must be between 1 and {MAX_EVENTS_PAGE}"
         ));
+    }
+    Ok(())
+}
+
+/// Validates one request, including a one-level batch.
+fn validate_request(request: &MatchEngineRequest) -> Result<(), String> {
+    match request {
+        MatchEngineRequest::Place {
+            client_order_id: Some(id),
+            ..
+        } => validate_client_order_id(id),
+        MatchEngineRequest::Batch { requests } => validate_batch(requests),
+        _ => Ok(()),
+    }
+}
+
+/// Validates a batch before it can enter the Raft log.
+fn validate_batch(requests: &[MatchEngineRequest]) -> Result<(), String> {
+    if requests.is_empty() {
+        return Err("batch must contain at least one request".to_string());
+    }
+    if requests.len() > MAX_BATCH_REQUESTS {
+        return Err(format!("batch exceeds {MAX_BATCH_REQUESTS} requests"));
+    }
+
+    let mut ids = HashSet::new();
+    for request in requests {
+        if matches!(request, MatchEngineRequest::Batch { .. }) {
+            return Err("nested batches are not supported".to_string());
+        }
+        validate_request(request)?;
+        if let MatchEngineRequest::Place {
+            client_order_id: Some(id),
+            ..
+        } = request
+            && !ids.insert(id.as_str())
+        {
+            return Err(format!("duplicate client_order_id in batch: {id}"));
+        }
     }
     Ok(())
 }
@@ -157,18 +199,39 @@ pub async fn write(
     req: Json<MatchEngineRequest>,
 ) -> actix_web::Result<impl Responder> {
     let mut request = req.into_inner();
-    if let MatchEngineRequest::Place {
-        client_order_id: Some(client_order_id),
-        ..
-    } = &request
-    {
-        validate_client_order_id(client_order_id).map_err(actix_web::error::ErrorBadRequest)?;
-    }
+    validate_request(&request).map_err(actix_web::error::ErrorBadRequest)?;
     stamp_intake_time(&mut request);
     let response = match app.raft.client_write(request).await.decompose() {
         Ok(response) => response,
         Err(error) => {
             tracing::error!(%error, "client write failed");
+            return Err(actix_web::error::ErrorInternalServerError(
+                error.to_string(),
+            ));
+        }
+    };
+    Ok(Json(response))
+}
+
+/// Writes multiple requests in one Raft entry.
+///
+/// The body is a JSON array of ordinary requests. They execute in order in one
+/// `apply` call, so one WAL append/fsync covers the whole batch. Each item gets
+/// its own sequence and response under `data.batch`; all events share the
+/// entry's log index.
+#[post("/write_batch")]
+pub async fn write_batch(
+    app: Data<MatchEngineApp>,
+    req: Json<Vec<MatchEngineRequest>>,
+) -> actix_web::Result<impl Responder> {
+    let requests = req.into_inner();
+    validate_batch(&requests).map_err(actix_web::error::ErrorBadRequest)?;
+    let mut request = MatchEngineRequest::Batch { requests };
+    stamp_intake_time(&mut request);
+    let response = match app.raft.client_write(request).await.decompose() {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::error!(%error, "client batch write failed");
             return Err(actix_web::error::ErrorInternalServerError(
                 error.to_string(),
             ));
@@ -188,10 +251,19 @@ fn stamp_intake_time(request: &mut MatchEngineRequest) {
         .map(|elapsed| elapsed.as_millis() as u64)
         .unwrap_or_default();
 
+    stamp_request_at(request, now_ms);
+}
+
+fn stamp_request_at(request: &mut MatchEngineRequest, now_ms: u64) {
     match request {
         MatchEngineRequest::Place { order, .. }
         | MatchEngineRequest::Cancel { order }
         | MatchEngineRequest::Amend { order, .. } => order.timestamp = now_ms,
+        MatchEngineRequest::Batch { requests } => {
+            for request in requests {
+                stamp_request_at(request, now_ms);
+            }
+        }
         MatchEngineRequest::PurgeExpired { .. } | MatchEngineRequest::ConfigureSymbol { .. } => {}
     }
 }
@@ -578,6 +650,36 @@ mod tests {
         assert!(validate_read_key(&"a".repeat(MAX_READ_KEY_BYTES + 1)).is_err());
         assert!(validate_read_key("line\nbreak").is_err());
         assert!(validate_read_key("café").is_err());
+    }
+
+    #[test]
+    fn batch_validation_is_bounded_and_non_nested() {
+        use crate::order_book::Order;
+        use crate::order_book::OrderSide;
+
+        let place = || MatchEngineRequest::place(Order::new(OrderSide::Buy, 100.0, 1.0, 0));
+        assert!(validate_batch(&[place(), place()]).is_ok());
+        assert!(validate_batch(&[]).is_err());
+        assert!(validate_batch(&vec![place(); MAX_BATCH_REQUESTS + 1]).is_err());
+        assert!(
+            validate_batch(&[MatchEngineRequest::Batch {
+                requests: vec![place()],
+            }])
+            .is_err()
+        );
+        assert!(
+            validate_batch(&[
+                MatchEngineRequest::place_with_client_id(
+                    Order::new(OrderSide::Buy, 100.0, 1.0, 0),
+                    "same",
+                ),
+                MatchEngineRequest::place_with_client_id(
+                    Order::new(OrderSide::Buy, 99.0, 1.0, 0),
+                    "same",
+                ),
+            ])
+            .is_err()
+        );
     }
 
     #[test]

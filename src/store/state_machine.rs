@@ -197,6 +197,14 @@ pub struct SubmissionRecord {
     pub log_index: u64,
     /// Number of events the original entry produced.
     pub event_count: u32,
+    /// Ordinal of the submission's first event inside its entry.
+    ///
+    /// Batches share one log index across sub-requests, so the log index alone
+    /// does not identify which events belong to this submission. This offset is
+    /// derived while applying and is not snapshotted; a record restored from a
+    /// snapshot falls back to the whole entry (`None`).
+    #[serde(skip)]
+    pub first_ordinal: Option<u32>,
 }
 
 /// Data contained in the Raft state machine.
@@ -364,6 +372,7 @@ impl<C: RaftTypeConfig> StateMachineStoreInner<C> {
         client_order_id: String,
         order_sequence: u64,
         log_index: u64,
+        first_ordinal: u32,
         event_count: u32,
     ) {
         let record = SubmissionRecord {
@@ -371,6 +380,7 @@ impl<C: RaftTypeConfig> StateMachineStoreInner<C> {
             order_sequence,
             log_index,
             event_count,
+            first_ordinal: Some(first_ordinal),
         };
         self.submissions.insert(client_order_id, record.clone());
         self.submission_order.push_back(record);
@@ -403,11 +413,20 @@ impl<C: RaftTypeConfig> StateMachineStoreInner<C> {
         let mut events = Vec::new();
         let mut total = 0u32;
         for event in &self.events {
-            if event.event_id.log_index == record.log_index {
-                total = total.saturating_add(1);
-                if events.len() < cap {
-                    events.push(*event);
+            if event.event_id.log_index != record.log_index {
+                continue;
+            }
+            // A batch entry holds several submissions' events. When the offset
+            // is known, keep only this submission's ordinal range.
+            if let Some(first) = record.first_ordinal {
+                let end = first.saturating_add(record.event_count);
+                if event.event_id.ordinal < first || event.event_id.ordinal >= end {
+                    continue;
                 }
+            }
+            total = total.saturating_add(1);
+            if events.len() < cap {
+                events.push(*event);
             }
         }
         let truncated = total > cap as u32 || total < record.event_count;
@@ -910,6 +929,261 @@ where
     }
 }
 
+impl<C> StateMachineStore<C>
+where
+    C: RaftTypeConfig<D = MatchEngineRequest, R = MatchEngineResponse>,
+{
+    /// Applies one non-batch request and returns its response plus the number
+    /// of events it produced. Batch callers use the count to keep ordinals
+    /// continuous across sub-requests in the same Raft entry.
+    fn apply_one(
+        &self,
+        inner: &mut StateMachineStoreInner<C>,
+        request: &MatchEngineRequest,
+        log_index: u64,
+        first_ordinal: u32,
+    ) -> (MatchEngineResponse, usize) {
+        match request {
+            MatchEngineRequest::Place {
+                order,
+                client_order_id,
+            } => {
+                if let Some(client_order_id) = client_order_id
+                    && let Some(record) = inner.submissions.get(client_order_id).cloned()
+                {
+                    return (inner.duplicate_response(&record), 0);
+                }
+
+                let mut o = *order;
+                let outcome = match inner.configured_symbol_for(&o) {
+                    Ok(config) => inner.orderbook.execute_order_with_symbol(&mut o, config),
+                    Err(reason) => inner.orderbook.reject_order(&mut o, reason),
+                };
+                if outcome.rejected.is_none() {
+                    // One process serves one symbol: lock the provisioned
+                    // configuration once trading starts.
+                    inner.symbol_locked = true;
+                }
+
+                let mut events = Vec::new();
+                match outcome.rejected {
+                    Some(reason) => {
+                        events.push(MatchEvent::for_rejected(
+                            log_index,
+                            first_ordinal,
+                            &o,
+                            reason,
+                        ));
+                    }
+                    None => {
+                        for expired in &outcome.expired {
+                            events.push(MatchEvent::for_expired(
+                                log_index,
+                                first_ordinal + events.len() as u32,
+                                expired,
+                            ));
+                        }
+                        events.extend(MatchEvent::for_place_at(
+                            log_index,
+                            first_ordinal + events.len() as u32,
+                            &o,
+                            &outcome.fills,
+                            outcome.resting,
+                        ));
+                        if let Some(volume) = outcome.cancelled {
+                            events.push(MatchEvent::for_cancelled_volume(
+                                log_index,
+                                first_ordinal + events.len() as u32,
+                                &o,
+                                volume,
+                            ));
+                        }
+                        for trigger in &outcome.triggers {
+                            events.push(MatchEvent::for_triggered(
+                                log_index,
+                                first_ordinal + events.len() as u32,
+                                &trigger.stop,
+                                trigger.trigger_price,
+                            ));
+                            events.extend(MatchEvent::for_fills(
+                                log_index,
+                                first_ordinal + events.len() as u32,
+                                trigger.stop.side,
+                                trigger.stop.sequence,
+                                &trigger.fills,
+                            ));
+                            if let Some(volume) = trigger.cancelled {
+                                events.push(MatchEvent::for_cancelled_volume(
+                                    log_index,
+                                    first_ordinal + events.len() as u32,
+                                    &trigger.stop,
+                                    volume,
+                                ));
+                            }
+                        }
+                    }
+                }
+                inner.record_events(&events);
+                if let Some(client_order_id) = client_order_id {
+                    inner.record_submission(
+                        client_order_id.clone(),
+                        o.sequence,
+                        log_index,
+                        first_ordinal,
+                        events.len() as u32,
+                    );
+                }
+                self.publish_match_events(&events);
+                self.publish_market_frame(
+                    inner,
+                    log_index,
+                    outcome.market_seq,
+                    o.timestamp,
+                    o.symbol_id,
+                    &events,
+                );
+                let count = events.len();
+                (MatchEngineResponse::applied(o.sequence, &events), count)
+            }
+            MatchEngineRequest::Cancel { order } => {
+                let market_seq = inner.orderbook.next_market_sequence();
+                let mut events = Vec::new();
+                let expired_orders = if inner.orderbook.has_gtd_deadlines() {
+                    inner.orderbook.purge_due_gtd(order.timestamp)
+                } else {
+                    Vec::new()
+                };
+                for expired in expired_orders {
+                    events.push(MatchEvent::for_expired(
+                        log_index,
+                        first_ordinal + events.len() as u32,
+                        &expired,
+                    ));
+                }
+                if inner.configured_symbol_for(order).is_ok() {
+                    if let Some(cancelled) = inner.orderbook.cancel(order) {
+                        events.push(MatchEvent::for_cancel_at(
+                            log_index,
+                            first_ordinal + events.len() as u32,
+                            &cancelled,
+                        ));
+                    }
+                } else {
+                    events.push(MatchEvent::for_rejected(
+                        log_index,
+                        first_ordinal + events.len() as u32,
+                        order,
+                        RejectReason::UnsupportedOrder,
+                    ));
+                }
+                inner.record_events(&events);
+                self.publish_match_events(&events);
+                self.publish_market_frame(
+                    inner,
+                    log_index,
+                    market_seq,
+                    order.timestamp,
+                    order.symbol_id,
+                    &events,
+                );
+                let count = events.len();
+                (MatchEngineResponse::applied(market_seq, &events), count)
+            }
+            MatchEngineRequest::Amend {
+                order,
+                price,
+                volume,
+            } => {
+                let market_seq = inner.orderbook.next_market_sequence();
+                let mut events = Vec::new();
+                let expired_orders = if inner.orderbook.has_gtd_deadlines() {
+                    inner.orderbook.purge_due_gtd(order.timestamp)
+                } else {
+                    Vec::new()
+                };
+                for expired in expired_orders {
+                    events.push(MatchEvent::for_expired(
+                        log_index,
+                        first_ordinal + events.len() as u32,
+                        &expired,
+                    ));
+                }
+                match inner.validate_amend_values(order, *price, *volume) {
+                    Err(reason) => events.push(MatchEvent::for_rejected(
+                        log_index,
+                        first_ordinal + events.len() as u32,
+                        order,
+                        reason,
+                    )),
+                    Ok(_) => match inner
+                        .orderbook
+                        .amend_with_sequence(order, *price, *volume, market_seq)
+                    {
+                        Ok(amendment) => events.push(MatchEvent::for_amended(
+                            log_index,
+                            first_ordinal + events.len() as u32,
+                            &amendment,
+                        )),
+                        Err(err) => events.push(MatchEvent::for_rejected(
+                            log_index,
+                            first_ordinal + events.len() as u32,
+                            order,
+                            err.reason(),
+                        )),
+                    },
+                }
+                inner.record_events(&events);
+                self.publish_match_events(&events);
+                self.publish_market_frame(
+                    inner,
+                    log_index,
+                    market_seq,
+                    order.timestamp,
+                    order.symbol_id,
+                    &events,
+                );
+                let count = events.len();
+                (MatchEngineResponse::applied(market_seq, &events), count)
+            }
+            MatchEngineRequest::PurgeExpired {
+                now_ms,
+                day_close_ms,
+            } => {
+                let market_seq = inner.orderbook.next_market_sequence();
+                let expired = inner.orderbook.purge_expired(*now_ms, *day_close_ms);
+                let events: Vec<MatchEvent> = expired
+                    .iter()
+                    .enumerate()
+                    .map(|(ordinal, order)| {
+                        MatchEvent::for_expired(log_index, first_ordinal + ordinal as u32, order)
+                    })
+                    .collect();
+                inner.record_events(&events);
+                self.publish_match_events(&events);
+                let symbol_id = inner.symbol_config.symbol_id;
+                self.publish_market_frame(
+                    inner, log_index, market_seq, *now_ms, symbol_id, &events,
+                );
+                let count = events.len();
+                (MatchEngineResponse::applied(market_seq, &events), count)
+            }
+            MatchEngineRequest::ConfigureSymbol { config } => {
+                match self.configure_symbol_locked(inner, config.clone()) {
+                    Ok(()) => (
+                        MatchEngineResponse::new(format!("symbol {} configured", config.symbol_id)),
+                        0,
+                    ),
+                    Err(error) => (MatchEngineResponse::error(error), 0),
+                }
+            }
+            MatchEngineRequest::Batch { .. } => (
+                MatchEngineResponse::error("nested batches are not supported"),
+                0,
+            ),
+        }
+    }
+}
+
 impl<C> RaftStateMachine<C> for StateMachineStore<C>
 where
     C: RaftTypeConfig<
@@ -948,241 +1222,21 @@ where
             // propagated) so replicas with different sinks still converge.
             let response = match &entry.payload {
                 EntryPayload::Blank => MatchEngineResponse::none(),
-                EntryPayload::Normal(req) => match req {
-                    MatchEngineRequest::Place {
-                        order,
-                        client_order_id,
-                    } => 'place: {
-                        if let Some(client_order_id) = client_order_id
-                            && let Some(record) = inner.submissions.get(client_order_id).cloned()
-                        {
-                            break 'place inner.duplicate_response(&record);
-                        }
-
-                        let mut o = *order;
-                        let log_index = entry.log_id.index;
-                        let outcome = match inner.configured_symbol_for(&o) {
-                            Ok(config) => inner.orderbook.execute_order_with_symbol(&mut o, config),
-                            Err(reason) => inner.orderbook.reject_order(&mut o, reason),
-                        };
-                        if outcome.rejected.is_none() {
-                            // One process serves one symbol: lock the provisioned
-                            // configuration once trading starts.
-                            inner.symbol_locked = true;
-                        }
-
-                        // Every event of this entry shares its log index and numbers its
-                        // ordinals continuously, so a stop cascade stays one ordered batch.
-                        let mut events = Vec::new();
-                        match outcome.rejected {
-                            Some(reason) => {
-                                events.push(MatchEvent::for_rejected(log_index, 0, &o, reason));
-                            }
-                            None => {
-                                for expired in &outcome.expired {
-                                    events.push(MatchEvent::for_expired(
-                                        log_index,
-                                        events.len() as u32,
-                                        expired,
-                                    ));
-                                }
-                                events.extend(MatchEvent::for_place_at(
-                                    log_index,
-                                    events.len() as u32,
-                                    &o,
-                                    &outcome.fills,
-                                    outcome.resting,
-                                ));
-                                if let Some(volume) = outcome.cancelled {
-                                    events.push(MatchEvent::for_cancelled_volume(
-                                        log_index,
-                                        events.len() as u32,
-                                        &o,
-                                        volume,
-                                    ));
-                                }
-                                for trigger in &outcome.triggers {
-                                    events.push(MatchEvent::for_triggered(
-                                        log_index,
-                                        events.len() as u32,
-                                        &trigger.stop,
-                                        trigger.trigger_price,
-                                    ));
-                                    events.extend(MatchEvent::for_fills(
-                                        log_index,
-                                        events.len() as u32,
-                                        trigger.stop.side,
-                                        trigger.stop.sequence,
-                                        &trigger.fills,
-                                    ));
-                                    if let Some(volume) = trigger.cancelled {
-                                        events.push(MatchEvent::for_cancelled_volume(
-                                            log_index,
-                                            events.len() as u32,
-                                            &trigger.stop,
-                                            volume,
-                                        ));
-                                    }
-                                }
-                            }
-                        }
-                        inner.record_events(&events);
-                        if let Some(client_order_id) = client_order_id {
-                            inner.record_submission(
-                                client_order_id.clone(),
-                                o.sequence,
-                                log_index,
-                                events.len() as u32,
-                            );
-                        }
-                        self.publish_match_events(&events);
-                        self.publish_market_frame(
-                            &mut inner,
-                            log_index,
-                            outcome.market_seq,
-                            o.timestamp,
-                            o.symbol_id,
-                            &events,
-                        );
-
-                        MatchEngineResponse::applied(o.sequence, &events)
+                EntryPayload::Normal(MatchEngineRequest::Batch { requests }) => {
+                    let mut responses = Vec::with_capacity(requests.len());
+                    let mut ordinal = 0u32;
+                    for request in requests {
+                        let (response, event_count) =
+                            self.apply_one(&mut inner, request, entry.log_id.index, ordinal);
+                        ordinal = ordinal.saturating_add(event_count as u32);
+                        responses.push(response);
                     }
-                    MatchEngineRequest::Cancel { order } => {
-                        let log_index = entry.log_id.index;
-                        let market_seq = inner.orderbook.next_market_sequence();
-                        let mut events = Vec::new();
-                        let expired_orders = if inner.orderbook.has_gtd_deadlines() {
-                            inner.orderbook.purge_due_gtd(order.timestamp)
-                        } else {
-                            Vec::new()
-                        };
-                        for expired in expired_orders {
-                            events.push(MatchEvent::for_expired(
-                                log_index,
-                                events.len() as u32,
-                                &expired,
-                            ));
-                        }
-                        if inner.configured_symbol_for(order).is_ok() {
-                            if let Some(cancelled) = inner.orderbook.cancel(order) {
-                                events.push(MatchEvent::for_cancel_at(
-                                    log_index,
-                                    events.len() as u32,
-                                    &cancelled,
-                                ));
-                            }
-                        } else {
-                            events.push(MatchEvent::for_rejected(
-                                log_index,
-                                events.len() as u32,
-                                order,
-                                RejectReason::UnsupportedOrder,
-                            ));
-                        }
-                        inner.record_events(&events);
-                        self.publish_match_events(&events);
-                        self.publish_market_frame(
-                            &mut inner,
-                            log_index,
-                            market_seq,
-                            order.timestamp,
-                            order.symbol_id,
-                            &events,
-                        );
-                        MatchEngineResponse::applied(market_seq, &events)
-                    }
-                    MatchEngineRequest::Amend {
-                        order,
-                        price,
-                        volume,
-                    } => {
-                        let log_index = entry.log_id.index;
-                        let market_seq = inner.orderbook.next_market_sequence();
-                        let mut events = Vec::new();
-                        let expired_orders = if inner.orderbook.has_gtd_deadlines() {
-                            inner.orderbook.purge_due_gtd(order.timestamp)
-                        } else {
-                            Vec::new()
-                        };
-                        for expired in expired_orders {
-                            events.push(MatchEvent::for_expired(
-                                log_index,
-                                events.len() as u32,
-                                &expired,
-                            ));
-                        }
-                        match inner.validate_amend_values(order, *price, *volume) {
-                            Err(reason) => events.push(MatchEvent::for_rejected(
-                                log_index,
-                                events.len() as u32,
-                                order,
-                                reason,
-                            )),
-                            Ok(_) => match inner
-                                .orderbook
-                                .amend_with_sequence(order, *price, *volume, market_seq)
-                            {
-                                Ok(amendment) => events.push(MatchEvent::for_amended(
-                                    log_index,
-                                    events.len() as u32,
-                                    &amendment,
-                                )),
-                                Err(err) => events.push(MatchEvent::for_rejected(
-                                    log_index,
-                                    events.len() as u32,
-                                    order,
-                                    err.reason(),
-                                )),
-                            },
-                        }
-                        inner.record_events(&events);
-                        self.publish_match_events(&events);
-                        self.publish_market_frame(
-                            &mut inner,
-                            log_index,
-                            market_seq,
-                            order.timestamp,
-                            order.symbol_id,
-                            &events,
-                        );
-                        MatchEngineResponse::applied(market_seq, &events)
-                    }
-                    MatchEngineRequest::PurgeExpired {
-                        now_ms,
-                        day_close_ms,
-                    } => {
-                        let market_seq = inner.orderbook.next_market_sequence();
-                        let expired = inner.orderbook.purge_expired(*now_ms, *day_close_ms);
-                        let events: Vec<MatchEvent> = expired
-                            .iter()
-                            .enumerate()
-                            .map(|(ordinal, order)| {
-                                MatchEvent::for_expired(entry.log_id.index, ordinal as u32, order)
-                            })
-                            .collect();
-                        inner.record_events(&events);
-                        self.publish_match_events(&events);
-                        let symbol_id = inner.symbol_config.symbol_id;
-                        self.publish_market_frame(
-                            &mut inner,
-                            entry.log_id.index,
-                            market_seq,
-                            *now_ms,
-                            symbol_id,
-                            &events,
-                        );
-                        MatchEngineResponse::applied(market_seq, &events)
-                    }
-                    MatchEngineRequest::ConfigureSymbol { config } => {
-                        match self.configure_symbol_locked(&mut inner, config.clone()) {
-                            Ok(()) => MatchEngineResponse::new(format!(
-                                "symbol {} configured",
-                                config.symbol_id
-                            )),
-                            Err(error) => MatchEngineResponse::error(error),
-                        }
-                    }
-                },
+                    MatchEngineResponse::batch(responses)
+                }
+                EntryPayload::Normal(req) => {
+                    let (response, _) = self.apply_one(&mut inner, req, entry.log_id.index, 0);
+                    response
+                }
                 EntryPayload::Membership(mem) => {
                     inner.last_membership =
                         StoredMembership::new(Some(entry.log_id.clone()), mem.clone());
@@ -1705,6 +1759,189 @@ mod tests {
         ))]);
         store.apply(entries).await.unwrap();
         assert_eq!(4, sink.len());
+    }
+
+    /// A batch applies every sub-request in one entry, with continuous event
+    /// ordinals and one response per item.
+    #[tokio::test]
+    async fn apply_batch_preserves_sequences_and_event_ordinals() {
+        use crate::match_result::MatchEventKind;
+        use crate::match_result::MemorySink;
+        use crate::order_book::Order;
+        use crate::order_book::OrderSide;
+        use openraft::alias::EntryOf;
+        use openraft::alias::EntryPayloadOf;
+
+        fn entry(
+            index: u64,
+            payload: EntryPayloadOf<MatchEngineTypeConfig>,
+        ) -> EntryOf<MatchEngineTypeConfig> {
+            Entry {
+                log_id: log_id(1, index),
+                payload,
+            }
+        }
+
+        let dir = tempdir();
+        let sink = Arc::new(MemorySink::new());
+        let mut store =
+            StateMachineStore::<MatchEngineTypeConfig>::open_with_sink(dir.path(), sink.clone())
+                .unwrap();
+        let batch = MatchEngineRequest::Batch {
+            requests: vec![
+                MatchEngineRequest::place(Order::new(OrderSide::Buy, 100.0, 1.0, 0)),
+                MatchEngineRequest::place(Order::new(OrderSide::Buy, 99.0, 2.0, 0)),
+            ],
+        };
+        let entries =
+            futures::stream::iter(vec![Ok((entry(1, EntryPayload::Normal(batch)), None))]);
+        store.apply(entries).await.unwrap();
+
+        let events = sink.events();
+        assert_eq!(2, events.len(), "one event per resting order: {events:?}");
+        assert_eq!(MatchEventKind::Rested, events[0].kind);
+        assert_eq!(0, events[0].event_id.ordinal);
+        assert_eq!(MatchEventKind::Rested, events[1].kind);
+        assert_eq!(1, events[1].event_id.ordinal);
+        assert_eq!(events[0].event_id.log_index, events[1].event_id.log_index);
+
+        let content = store.to_content().await;
+        assert_eq!(2, content.orders.len());
+        assert_eq!(2, content.sequence);
+        assert_eq!(2, content.events.len());
+    }
+
+    /// Event ordinals continue across mixed sub-requests in one batch entry.
+    #[tokio::test]
+    async fn batch_ordinals_continue_across_mixed_requests() {
+        use crate::match_result::MatchEventKind;
+        use crate::match_result::MemorySink;
+        use crate::order_book::Order;
+        use crate::order_book::OrderSide;
+        use openraft::alias::EntryOf;
+        use openraft::alias::EntryPayloadOf;
+
+        fn entry(
+            index: u64,
+            payload: EntryPayloadOf<MatchEngineTypeConfig>,
+        ) -> EntryOf<MatchEngineTypeConfig> {
+            Entry {
+                log_id: log_id(1, index),
+                payload,
+            }
+        }
+
+        let dir = tempdir();
+        let sink = Arc::new(MemorySink::new());
+        let mut store =
+            StateMachineStore::<MatchEngineTypeConfig>::open_with_sink(dir.path(), sink.clone())
+                .unwrap();
+        let batch = MatchEngineRequest::Batch {
+            requests: vec![
+                MatchEngineRequest::place(Order::new(OrderSide::Buy, 100.0, 1.0, 0)),
+                MatchEngineRequest::Cancel {
+                    order: Order::new(OrderSide::Buy, 100.0, 1.0, 0),
+                },
+                MatchEngineRequest::Amend {
+                    order: Order::new(OrderSide::Buy, 100.0, 1.0, 99),
+                    price: Some(101.0.into()),
+                    volume: None,
+                },
+            ],
+        };
+        let entries =
+            futures::stream::iter(vec![Ok((entry(1, EntryPayload::Normal(batch)), None))]);
+        store.apply(entries).await.unwrap();
+
+        let events = sink.events();
+        assert_eq!(
+            3,
+            events.len(),
+            "rest, cancel and rejected amend: {events:?}"
+        );
+        assert_eq!(MatchEventKind::Rested, events[0].kind);
+        assert_eq!(0, events[0].event_id.ordinal);
+        assert_eq!(MatchEventKind::Cancelled, events[1].kind);
+        assert_eq!(1, events[1].event_id.ordinal);
+        assert_eq!(MatchEventKind::Rejected, events[2].kind);
+        assert_eq!(2, events[2].event_id.ordinal);
+        assert!(
+            events.iter().all(|event| event.event_id.log_index == 1),
+            "one entry, one log index"
+        );
+
+        let content = store.to_content().await;
+        assert_eq!(3, content.sequence, "place + cancel + amend market seqs");
+        assert!(content.orders.is_empty(), "the cancel removed the order");
+        assert_eq!(3, content.events.len());
+    }
+
+    /// A retried batch item recovers only its own events, even though every
+    /// sub-request in the batch shares one log index.
+    #[tokio::test]
+    async fn batch_duplicate_returns_only_its_own_events() {
+        use crate::match_result::MatchEventKind;
+        use crate::match_result::MemorySink;
+        use crate::order_book::Order;
+        use crate::order_book::OrderSide;
+        use openraft::alias::EntryOf;
+        use openraft::alias::EntryPayloadOf;
+
+        fn entry(
+            index: u64,
+            payload: EntryPayloadOf<MatchEngineTypeConfig>,
+        ) -> EntryOf<MatchEngineTypeConfig> {
+            Entry {
+                log_id: log_id(1, index),
+                payload,
+            }
+        }
+
+        let dir = tempdir();
+        let sink = Arc::new(MemorySink::new());
+        let mut store =
+            StateMachineStore::<MatchEngineTypeConfig>::open_with_sink(dir.path(), sink.clone())
+                .unwrap();
+        let batch = MatchEngineRequest::Batch {
+            requests: vec![
+                MatchEngineRequest::place_with_client_id(
+                    Order::new(OrderSide::Buy, 100.0, 1.0, 0),
+                    "first",
+                ),
+                MatchEngineRequest::place_with_client_id(
+                    Order::new(OrderSide::Buy, 99.0, 1.0, 0),
+                    "second",
+                ),
+            ],
+        };
+        let entries =
+            futures::stream::iter(vec![Ok((entry(1, EntryPayload::Normal(batch)), None))]);
+        store.apply(entries).await.unwrap();
+        assert_eq!(2, sink.events().len());
+        assert_eq!(MatchEventKind::Rested, sink.events()[1].kind);
+
+        let inner = store.inner().lock().await;
+        let second = inner
+            .submissions
+            .get("second")
+            .expect("second submission recorded")
+            .clone();
+        let duplicate = inner.duplicate_response(&second);
+        assert_eq!(Some(1), duplicate.sequence);
+        assert_eq!(1, duplicate.events.len(), "only the second place's event");
+        assert_eq!(1, duplicate.events[0].event_id.ordinal);
+        assert_eq!(1, duplicate.events[0].order_sequence);
+        assert!(!duplicate.events_truncated);
+
+        let first = inner
+            .submissions
+            .get("first")
+            .expect("first submission recorded")
+            .clone();
+        let duplicate = inner.duplicate_response(&first);
+        assert_eq!(Some(0), duplicate.sequence);
+        assert_eq!(1, duplicate.events.len(), "only the first place's event");
+        assert_eq!(0, duplicate.events[0].event_id.ordinal);
     }
 
     /// A failing sink must not fail `apply` or change the resulting state.

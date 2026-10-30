@@ -139,6 +139,9 @@ Persistence is done:
   recovery, coalesced contiguous log reads, snapshot encode/write outside the state-machine lock,
   and streamed snapshot bodies with incremental CRC (no full body Vec).
 - [x] One request logger; the previous duplicate `Logger` middleware is gone.
+- [x] `POST /write_batch` applies 1–128 non-nested requests in one Raft entry, with per-item
+  sequences/events and continuous event ordinals; empty, oversized, nested and duplicate-id
+  batches are rejected at the edge.
 - [x] `test_cluster` owns all three nodes in its runtime and shuts them down on success or panic,
   so fixed ports are released.
 
@@ -255,6 +258,8 @@ Current coverage:
 - `test_symbols.rs`: one-symbol config, over-precision rejection, cross-symbol rejection, the
   post-trade config lock and snapshot restart.
 - `test_fees.rs`: maker/taker fee rates, `/write`/`/events`/file-sink/feed fees and snapshot restart.
+- `test_batch_write.rs`: one Raft entry for multiple requests, per-item sequences and event
+  ordinals, and invalid-batch rejection.
 - `test_fee_assets.rs`: ETF/fiat symbol metadata, tick/lot enforcement, quote-volume limit
   normalization and quote-asset fee deduction.
 - `test_request_limits.rs`: oversized bodies, malformed JSON, invalid/oversized client ids,
