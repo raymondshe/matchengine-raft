@@ -18,16 +18,12 @@ important but not blocking; **P3** = later/optional.
 
 ## Top priorities
 
-The P0 public-trust-boundary work and the P1 randomized differential/property tests are complete:
-ids, request bodies, events pages, read keys and snapshot streams are bounded at the edge, and the
-order book is checked against a reference model for pricing, priority, volume conservation and
-deterministic replay, including mixed order types and fee-rate styles.
+The P0 public-trust-boundary work, the P1 randomized differential/property tests and the P1
+failure/observability work are complete: edge limits are explicit, the order book is checked
+against a reference model, gRPC failure is fail-fast, requests are logged once, and the cluster
+test owns and shuts down its nodes.
 
-1. **P1 — Make failure and observability behavior explicit.** A dead gRPC server task currently
-   leaves the HTTP API serving a node peers cannot reach; two `Logger` middleware log every
-   request twice; `test_cluster` leaks fixed ports and running nodes. Decide fail-fast versus
-   degraded mode, collapse logging, and make the test own and stop its nodes.
-2. **P1 — Measure before optimizing.** The post-fee microbenchmark baseline is recorded in §8; add
+1. **P1 — Measure before optimizing.** The post-fee microbenchmark baseline is recorded in §8; add
    submit → commit → apply → response latency and a 50k–500k fills/s feed load test. Only then
    consider per-level buckets or a compact resting record. The numbers in `docs/TRANSPORTS.md`
    are still guidance, not results.
@@ -110,7 +106,7 @@ Remaining:
   and storage state.
 - [ ] **P1** Decide whether a died gRPC server task should stop the process (fail fast) or leave
   the node in a degraded, clearly reported state. `src/lib.rs` currently only logs it.
-- [ ] **P2** Remove the duplicate `Logger` middleware in `src/lib.rs`; every request is logged
+- [x] **P2** Remove the duplicate `Logger` middleware in `src/lib.rs`; every request is logged
   twice.
 - [ ] **P2** Make `Order::sequence` optional in the public deserializer (`#[serde(default)]`) so
   clients need not send a value that `place_order()` overwrites.
@@ -133,6 +129,12 @@ Persistence is done:
 - [x] Default snapshot policy: `LogsSinceLast(100_000)` plus a 30-minute timer that only fires
   when newer entries exist; `StorageConfig::snapshot_interval` and `--snapshot-interval-ms` tune
   the timer (`0` disables it).
+- [x] Fail-fast gRPC failure: `MatchEngineNode::run()` stops HTTP, joins background tasks and
+  shuts Raft down before returning the transport error. A dropped/panicking gRPC task also
+  signals failure.
+- [x] One request logger; the previous duplicate `Logger` middleware is gone.
+- [x] `test_cluster` owns all three nodes in its runtime and shuts them down on success or panic,
+  so fixed ports are released.
 
 Remaining:
 
@@ -265,8 +267,8 @@ Remaining:
   matching and replication costs.
 - [ ] **P2** Add negative API tests for unknown `/read` keys and malformed `Place` payloads.
   Follower forwarding is already covered.
-- [ ] **P2** Parameterize ports and shut down the nodes in `test_cluster.rs`; it currently binds
-  21001–21003 and leaves them running.
+- [x] **P2** Make `test_cluster.rs` own and shut down its nodes, including on panic.
+- [ ] **P2** Parameterize the fixed test ports; `test_cluster.rs` still binds 21001–21003.
 - [ ] **P2** Run the cluster suite over the HTTP transport in CI
   (`MATCHENGINE_TEST_TRANSPORT=http`), not just locally.
 - [ ] **P2** Add an MSRV job for Rust 1.89; CI currently uses stable only.

@@ -93,6 +93,7 @@ pub struct MatchEngineNode {
     http_task: tokio::task::JoinHandle<()>,
     grpc_shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     grpc_task: tokio::task::JoinHandle<()>,
+    grpc_failure_rx: Option<tokio::sync::oneshot::Receiver<std::io::Error>>,
     market_data: Option<MarketDataHandle>,
     market_data_task: Option<tokio::task::JoinHandle<()>>,
     snapshot_task: Option<tokio::task::JoinHandle<()>>,
@@ -104,11 +105,28 @@ impl MatchEngineNode {
         &self.http_addr
     }
 
-    /// Waits until the HTTP server stops (as the old start functions did).
-    pub async fn run(self) -> std::io::Result<()> {
-        self.http_task
-            .await
-            .map_err(|e| std::io::Error::other(format!("HTTP server task failed: {e}")))
+    /// Waits until the HTTP server stops, or fails fast if the gRPC listener dies.
+    ///
+    /// A node whose peers cannot reach its gRPC port is not allowed to keep
+    /// serving HTTP as if it were healthy: the failure is returned to the caller
+    /// after stopping the remaining tasks, so the process can exit non-zero.
+    pub async fn run(mut self) -> std::io::Result<()> {
+        let grpc_failure = self.grpc_failure_rx.take();
+        let http_result = tokio::select! {
+            result = &mut self.http_task => {
+                result.map_err(|e| std::io::Error::other(format!("HTTP server task failed: {e}")))
+            }
+            failure = wait_for_grpc_failure(grpc_failure) => {
+                tracing::error!(error = %failure, "gRPC Raft server failed; stopping node");
+                self.http_handle.stop(true).await;
+                let _ = (&mut self.http_task).await;
+                self.stop_background().await?;
+                return Err(failure);
+            }
+        };
+
+        self.stop_background().await?;
+        http_result
     }
 
     /// Stops the HTTP server, the gRPC server and the Raft core.
@@ -117,8 +135,12 @@ impl MatchEngineNode {
     /// [`build_match_engine_node`] call.
     pub async fn shutdown(mut self) -> std::io::Result<()> {
         self.http_handle.stop(true).await;
-        let _ = self.http_task.await;
+        let _ = (&mut self.http_task).await;
+        self.stop_background().await
+    }
 
+    /// Stops the non-HTTP tasks and the Raft core.
+    async fn stop_background(mut self) -> std::io::Result<()> {
         if let Some(tx) = self.grpc_shutdown.take() {
             let _ = tx.send(());
         }
@@ -293,6 +315,22 @@ fn spawn_snapshot_timer(
     }))
 }
 
+/// Waits for a fatal gRPC-server signal.
+///
+/// If the task is dropped or panics, the sender disappears and the receiver
+/// resolves with an error instead of leaving the node silently degraded.
+async fn wait_for_grpc_failure(
+    failure: Option<tokio::sync::oneshot::Receiver<std::io::Error>>,
+) -> std::io::Error {
+    match failure {
+        Some(failure) => match failure.await {
+            Ok(error) => error,
+            Err(_) => std::io::Error::other("gRPC Raft server task stopped"),
+        },
+        None => std::future::pending().await,
+    }
+}
+
 /// Warns when the node is bound to a non-loopback address.
 ///
 /// The HTTP API and gRPC Raft listener have no TLS or authentication. The
@@ -414,6 +452,7 @@ pub async fn build_match_engine_node(
     // connect as soon as this node is initialized.
     let grpc_service = RaftGrpcService::new(raft.clone());
     let (grpc_shutdown, grpc_shutdown_rx) = tokio::sync::oneshot::channel();
+    let (grpc_failure_tx, grpc_failure_rx) = tokio::sync::oneshot::channel();
     let grpc_task = tokio::spawn(async move {
         let server = tonic::transport::Server::builder()
             .add_service(
@@ -433,6 +472,9 @@ pub async fn build_match_engine_node(
                 error = %e,
                 "gRPC Raft server stopped; peers can no longer reach this node"
             );
+            let _ = grpc_failure_tx.send(std::io::Error::other(format!(
+                "gRPC Raft server failed: {e}"
+            )));
         }
     });
 
@@ -448,8 +490,7 @@ pub async fn build_match_engine_node(
     // Start the actix-web server.
     let server = HttpServer::new(move || {
         App::new()
-            .wrap(Logger::default())
-            .wrap(Logger::new("%a %{User-Agent}i"))
+            .wrap(Logger::new("%a \"%r\" %s %b %Dms"))
             .wrap(middleware::Compress::default())
             .app_data(app_data.clone())
             // Bound request bodies before JSON extraction can allocate or
@@ -494,6 +535,7 @@ pub async fn build_match_engine_node(
         http_task,
         grpc_shutdown: Some(grpc_shutdown),
         grpc_task,
+        grpc_failure_rx: Some(grpc_failure_rx),
         market_data,
         market_data_task,
         snapshot_task,
@@ -565,5 +607,16 @@ mod tests {
             default_raft_config().snapshot_policy,
             SnapshotPolicy::LogsSinceLast(DEFAULT_SNAPSHOT_LOG_THRESHOLD)
         ));
+    }
+
+    #[tokio::test]
+    async fn lost_grpc_task_is_reported_as_fatal() {
+        let (sender, receiver) = tokio::sync::oneshot::channel::<std::io::Error>();
+        drop(sender);
+        let error = wait_for_grpc_failure(Some(receiver)).await;
+        assert!(
+            error.to_string().contains("gRPC Raft server task stopped"),
+            "unexpected failure: {error}"
+        );
     }
 }

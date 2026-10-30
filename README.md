@@ -70,6 +70,7 @@ Built for teams that need deterministic execution, durable recovery and a clean 
 **Built to be trusted**
 - **Bounded public edge**: request-body, read-key, event-page, idempotency-key and snapshot-size limits, with malformed input rejected before Raft.
 - **Explicit deployment contract** for loopback or trusted private networks, plus startup warnings for non-loopback binds.
+- **Fail-fast transport health**: if the gRPC listener dies, `run()` stops the node and returns an error instead of leaving a half-healthy HTTP API serving peers that cannot reach it.
 - **Correctness evidence**: randomized differential tests against a reference model, explicit order-type conformance cases, deterministic replay checks and cluster recovery tests.
 - **One symbol per process/cluster** for isolated resources and failure domains; scale horizontally by running one deployment per symbol.
 
@@ -810,7 +811,7 @@ placeholder). `sequence` is still required by the deserializer.
 |---|---|
 | `src/order_book/property_tests.rs` | Randomized differential tests against a reference model plus mixed GTC/IOC/FOK/GTD/Day/market/post-only/iceberg/stop orders and positive, zero and rebate fee rates under all fee-asset policies: visible book, fills, priority, no crossed book, volume conservation, sequence/last-trade state and deterministic replay |
 | `src/order_book/conformance_tests.rs` | Explicit market-FOK, no-liquidity market, hidden-iceberg cancel/expiry, parked-stop GTD/Day expiry and fee-reporting cases for market, IOC and stop-child fills |
-| `tests/cluster/test_cluster.rs` | 3-node cluster: init, learner, membership, write/read, linearizable read, leader forwarding, membership shrink; runs over gRPC by default and HTTP with `MATCHENGINE_TEST_TRANSPORT=http` |
+| `tests/cluster/test_cluster.rs` | 3-node cluster: init, learner, membership, write/read, linearizable read, leader forwarding, membership shrink; owns and shuts down every node; runs over gRPC by default and HTTP with `MATCHENGINE_TEST_TRANSPORT=http` |
 | `tests/cluster/test_snapshot.rs` | Snapshot creation, log purge, a learner installing the purged state over the gRPC snapshot stream, and the periodic snapshot timer with the log-count policy disabled |
 | `tests/cluster/test_storage.rs` | WAL framing, torn-tail truncation, segment rotation, a 20k-record multi-segment reopen, truncate/purge across segments, vote/committed persistence, snapshot build/install/reopen, corrupt-file rejection |
 | `tests/cluster/test_restart.rs` | Full node restart recovering the order book, sequence, event window and idempotency map via WAL replay and via snapshot + newer WAL tail; also 2k-order large-log replay and a multi-chunk (~120 KB) snapshot boot |
@@ -848,6 +849,7 @@ Implemented performance choices:
   atomically.
 - The event window is bounded by `--max-events` and paged through `/events`; `/read
   orderbook_orders` does not clone it.
+- A gRPC server failure is fatal to `run()`: HTTP is stopped, background tasks are joined and Raft is shut down before the error is returned. HTTP requests are logged once per request.
 
 Current limits and known gaps:
 

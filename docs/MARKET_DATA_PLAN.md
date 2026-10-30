@@ -201,7 +201,7 @@ leader id, `ts_ms`, `symbol_id`, `sub_seq`, reserved.
 
 | Check | Result |
 |---|---|
-| `cargo test` | **133 unit + 36 integration** tests pass (current; includes exactness, symbol-config, fee, quote-volume, fee-asset and periodic-snapshot tests) |
+| `cargo test` | **134 unit + 36 integration** tests pass (current; includes exactness, symbol-config, fee, quote-volume, fee-asset and periodic-snapshot tests) |
 | `cargo check --all-targets` | **0 warnings** |
 | `cargo test --test cluster test_market_data` | passed; checks `market_seq` anchors for place/amend/cancel and the uncapped trade message |
 | U8 determinism | two processors fed identical frames emit identical messages; a takeover snapshot continues the same keys; wire v5 golden tests (scale-18 `i128`) |

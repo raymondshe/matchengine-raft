@@ -70,6 +70,7 @@
 **可信赖的工程质量**
 - **受限的公共入口**：请求体、read key、事件分页、幂等键和快照大小均有上限，畸形输入在进入 Raft 前拒绝。
 - **明确的部署契约**：仅支持回环或可信私有网络，并在绑定非回环地址时发出启动警告。
+- **传输故障快速失败**：gRPC 监听器失效时，`run()` 会停止节点并返回错误，而不是留下一个对等节点无法访问、却仍在提供 HTTP 的“半健康”节点。
 - **正确性证据**：参考模型随机差分测试、订单类型显式一致性测试、确定性重放检查和集群恢复测试。
 - **一个进程/集群只交易一个标的**，隔离资源与故障域；多标的通过横向部署多个实例扩展。
 
@@ -752,7 +753,7 @@ pub struct MatchEngineResponse {
 |---|---|
 | `src/order_book/property_tests.rs` | 针对参考模型的随机差分测试，并混合覆盖 GTC/IOC/FOK/GTD/Day、市价、Post-Only、冰山和止损单，以及正费率、零费率和返佣费率下的全部扣费资产策略：可见订单簿、成交、优先级、无交叉盘、数量守恒、序列号/最后成交价状态和确定性重放 |
 | `src/order_book/conformance_tests.rs` | 市价 FOK、无流动性市价单、冰山隐藏量与撤单/过期、挂起止损的 GTD/Day 过期，以及市价/IOC/止损子单成交的费用报告 |
-| `tests/cluster/test_cluster.rs` | 3 节点集群：初始化、学习者、成员变更、读写、线性一致性读、领导者转发、缩容；默认走 gRPC，设置 `MATCHENGINE_TEST_TRANSPORT=http` 后走 HTTP |
+| `tests/cluster/test_cluster.rs` | 3 节点集群：初始化、学习者、成员变更、读写、线性一致性读、领导者转发、缩容；测试持有并在成功或 panic 时关闭所有节点；默认走 gRPC，设置 `MATCHENGINE_TEST_TRANSPORT=http` 后走 HTTP |
 | `tests/cluster/test_snapshot.rs` | 快照生成、日志 purge、学习者通过 gRPC 快照流安装已 purge 的状态，以及关闭日志计数策略时的周期快照定时器 |
 | `tests/cluster/test_storage.rs` | WAL 帧格式、撕裂尾部截断、分段轮转、2 万条跨段日志重开、跨段 truncate/purge、vote/committed 持久化、快照构建/安装/重开、损坏文件拒绝 |
 | `tests/cluster/test_restart.rs` | 完整节点重启后通过日志重放恢复，以及通过快照 + 更新的 WAL 尾部恢复订单簿、序列号、事件窗口和幂等表；另含 2000 单大日志重放和多分块（约 120 KB）快照启动 |
@@ -783,6 +784,7 @@ pub struct MatchEngineResponse {
 - gRPC 使用双向 `AppendStream` 流水线复制，并为每个对端维护独立的复制、心跳、快照连接。
 - 快照按 256 KiB 分块传输；`log/state` 和 `snapshot/current.snap` 都原子替换。
 - 事件窗口由 `--max-events` 限制并通过 `/events` 分页；`/read orderbook_orders` 不会复制事件窗口。
+- gRPC 服务故障对 `run()` 是致命的：先停止 HTTP、回收后台任务并关闭 Raft，再返回错误；HTTP 请求只记录一次日志。
 
 当前限制与已知差距：
 
