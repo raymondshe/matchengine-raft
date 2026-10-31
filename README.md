@@ -9,15 +9,15 @@
 
 # Match Engine Raft
 
+<p align="center">
+  <img src="MatchEngineRaft.png" alt="Match Engine Raft logo" width="220">
+</p>
+
 [![CI](https://github.com/raymondshe/matchengine-raft/actions/workflows/ci.yml/badge.svg)](https://github.com/raymondshe/matchengine-raft/actions/workflows/ci.yml)
 [![Rust](https://img.shields.io/badge/rust-%E2%89%A5%201.89-orange.svg)](https://www.rust-lang.org)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
 [![Snapshot v9](https://img.shields.io/badge/snapshot-v9-blue.svg)](./docs)
 [![Market-data wire v5](https://img.shields.io/badge/marketdata%20wire-v5-blue.svg)](./docs/MARKET_DATA_PLAN.md)
-
-<p align="center">
-  <img src="MatchEngineRaft.png" alt="Match Engine Raft logo" width="220">
-</p>
 
 A practical implementation of a distributed matching engine built upon [OpenRaft](https://github.com/datafuselabs/openraft). Raft logs are persisted in a hand-written segmented write-ahead log and the state machine is made durable with atomic snapshots, so a node recovers all committed state after a restart.
 
