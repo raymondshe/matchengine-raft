@@ -379,8 +379,10 @@ impl MatchEvent {
 /// Receives the events produced by the state machine.
 ///
 /// Implementations are chosen when the node is built (see `StorageConfig::match_event_log` for the
-/// built-in file sink) and must be cheap enough not to stall applying: `apply` calls `publish`
-/// while holding the state-machine lock, and a sink must never call back into the state machine.
+/// built-in file sink) and must be cheap enough not to stall applying: `apply` publishes after
+/// releasing the state-machine lock, but a slow sink still delays the apply task and the next
+/// entry. Move heavy I/O to a worker or `spawn_blocking`, and never call back into the state
+/// machine from a sink.
 ///
 /// An error is logged and otherwise ignored. Applying an entry must not depend on whether a sink
 /// is reachable, or replicas would diverge.

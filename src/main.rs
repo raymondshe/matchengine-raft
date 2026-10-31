@@ -82,7 +82,7 @@ pub struct Opt {
     pub market_data_leader_only: bool,
 }
 
-#[actix_web::main]
+#[tokio::main(flavor = "multi_thread")]
 async fn main() -> std::io::Result<()> {
     // Setup the logger
     env_logger::init_from_env(Env::default().default_filter_or("info"));

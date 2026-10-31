@@ -252,9 +252,11 @@ MatchEngineRequest::Place { order, client_order_id } => {
 ```
 
 The real arm is slightly longer because it also anchors automatic-purge events and the
-market-data frame; the window and submission map are updated before the sink call, so a sink
-failure cannot lose them. `Cancel`, `Amend` and `PurgeExpired` use the same
-`record_events`/`MatchEngineResponse::applied` path.
+market-data frame; the window and submission map are updated before publishing, so a sink
+failure cannot lose them. Sink and market-data publishing are collected in `PendingPublish` and
+run after the state-machine lock is released, so a slow sink cannot extend the lock hold time.
+`Cancel`, `Amend` and `PurgeExpired` use the same `record_events`/`MatchEngineResponse::applied`
+path.
 
 `Cancel` publishes a `Cancelled` event only when `cancel()` actually removed an order; `Blank`
 and membership entries publish nothing. `OrderBook::resting_volume` exists precisely so the

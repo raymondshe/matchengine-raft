@@ -410,19 +410,27 @@ impl<C: RaftTypeConfig> StateMachineStoreInner<C> {
     /// response limit. The boolean is true when the response is incomplete.
     fn submission_events(&self, record: &SubmissionRecord) -> (Vec<MatchEvent>, bool) {
         let cap = MatchEngineResponse::MAX_EVENTS;
+        // Events are ordered by (log_index, ordinal), so jump to the entry and
+        // copy only the submission's ordinal range instead of scanning the
+        // whole retained window.
+        let first = record.first_ordinal.unwrap_or(0);
+        let start_id = EventId {
+            log_index: record.log_index,
+            ordinal: first,
+        };
+        let start = self
+            .events
+            .partition_point(|event| event.event_id < start_id);
+        let end = first.saturating_add(record.event_count);
+
         let mut events = Vec::new();
         let mut total = 0u32;
-        for event in &self.events {
+        for event in self.events.range(start..) {
             if event.event_id.log_index != record.log_index {
-                continue;
+                break;
             }
-            // A batch entry holds several submissions' events. When the offset
-            // is known, keep only this submission's ordinal range.
-            if let Some(first) = record.first_ordinal {
-                let end = first.saturating_add(record.event_count);
-                if event.event_id.ordinal < first || event.event_id.ordinal >= end {
-                    continue;
-                }
+            if record.first_ordinal.is_some() && event.event_id.ordinal >= end {
+                break;
             }
             total = total.saturating_add(1);
             if events.len() < cap {
@@ -609,6 +617,15 @@ pub struct StateMachineStore<C: RaftTypeConfig> {
     market_data_control: Arc<OnceLock<(MarketDataControl, usize)>>,
 }
 
+/// A sink/tap publication produced while applying one entry.
+///
+/// It is collected under the state-machine lock and published after the guard
+/// is dropped, so a slow sink cannot extend the lock hold time.
+struct PendingPublish {
+    events: Vec<MatchEvent>,
+    market: Option<(MarketDataTap, TapFrame)>,
+}
+
 impl<C: RaftTypeConfig> Clone for StateMachineStore<C> {
     fn clone(&self) -> Self {
         Self {
@@ -788,12 +805,14 @@ impl<C: RaftTypeConfig> StateMachineStore<C> {
         }
     }
 
-    /// Hands one applied entry's events and depth journal to the market-data tap.
+    /// Builds the market-data frame for one applied entry while the
+    /// state-machine lock is held.
     ///
-    /// This is a bounded `try_send`: it never blocks `apply` and a full queue
-    /// drops the frame (the tap records a gap marker) instead of slowing the
-    /// state machine down.
-    fn publish_market_frame(
+    /// The frame is sent by [`Self::publish_pending`] after the lock is
+    /// released. A closed publishing gate drains the depth journal but skips the
+    /// event clone, so followers and deposed leaders do not pay for a frame the
+    /// tap would drop.
+    fn take_market_frame(
         &self,
         inner: &mut StateMachineStoreInner<C>,
         log_index: u64,
@@ -801,22 +820,37 @@ impl<C: RaftTypeConfig> StateMachineStore<C> {
         ts_ms: u64,
         symbol_id: u32,
         events: &[MatchEvent],
-    ) {
-        let Some(tap) = inner.market_data.clone() else {
-            return;
-        };
+    ) -> Option<(MarketDataTap, TapFrame)> {
+        let tap = inner.market_data.clone()?;
         let depth = inner.orderbook.take_depth_journal();
-        if events.is_empty() && depth.is_empty() {
-            return;
+        if !tap.is_enabled() {
+            return None;
         }
-        tap.publish(TapFrame {
-            log_index,
-            market_seq,
-            ts_ms,
-            symbol_id,
-            events: events.to_vec(),
-            depth,
-        });
+        if events.is_empty() && depth.is_empty() {
+            return None;
+        }
+        Some((
+            tap,
+            TapFrame {
+                log_index,
+                market_seq,
+                ts_ms,
+                symbol_id,
+                events: events.to_vec(),
+                depth,
+            },
+        ))
+    }
+
+    /// Publishes one entry's sink and tap work after the state-machine lock is
+    /// released. Ordering matches the order the entries were applied in.
+    fn publish_pending(&self, pending: Vec<PendingPublish>) {
+        for publish in pending {
+            self.publish_match_events(&publish.events);
+            if let Some((tap, frame)) = publish.market {
+                tap.publish(frame);
+            }
+        }
     }
 }
 
@@ -875,10 +909,13 @@ where
                 inner.to_content(),
             )
         };
-        let data = encode_content(&content)?;
         let dir = self.dir.clone();
         let write_meta = meta.clone();
-        blocking(move || write_snapshot_file::<C>(&dir, &write_meta, &data)).await?;
+        blocking(move || {
+            let data = encode_content(&content)?;
+            write_snapshot_file::<C>(&dir, &write_meta, &data)
+        })
+        .await?;
         Ok(meta)
     }
 }
@@ -904,11 +941,10 @@ where
                 inner.to_content(),
             )
         };
-        let data = encode_content(&content)?;
-
         let dir = self.dir.clone();
         let write_meta = meta.clone();
         let data = blocking(move || {
+            let data = encode_content(&content)?;
             write_snapshot_file::<C>(&dir, &write_meta, &data)?;
             Ok::<_, io::Error>(data)
         })
@@ -942,6 +978,7 @@ where
         request: &MatchEngineRequest,
         log_index: u64,
         first_ordinal: u32,
+        publishes: &mut Vec<PendingPublish>,
     ) -> (MatchEngineResponse, usize) {
         match request {
             MatchEngineRequest::Place {
@@ -1033,8 +1070,7 @@ where
                         events.len() as u32,
                     );
                 }
-                self.publish_match_events(&events);
-                self.publish_market_frame(
+                let market = self.take_market_frame(
                     inner,
                     log_index,
                     outcome.market_seq,
@@ -1043,7 +1079,11 @@ where
                     &events,
                 );
                 let count = events.len();
-                (MatchEngineResponse::applied(o.sequence, &events), count)
+                let response = MatchEngineResponse::applied(o.sequence, &events);
+                if !events.is_empty() || market.is_some() {
+                    publishes.push(PendingPublish { events, market });
+                }
+                (response, count)
             }
             MatchEngineRequest::Cancel { order } => {
                 let market_seq = inner.orderbook.next_market_sequence();
@@ -1077,8 +1117,7 @@ where
                     ));
                 }
                 inner.record_events(&events);
-                self.publish_match_events(&events);
-                self.publish_market_frame(
+                let market = self.take_market_frame(
                     inner,
                     log_index,
                     market_seq,
@@ -1087,7 +1126,11 @@ where
                     &events,
                 );
                 let count = events.len();
-                (MatchEngineResponse::applied(market_seq, &events), count)
+                let response = MatchEngineResponse::applied(market_seq, &events);
+                if !events.is_empty() || market.is_some() {
+                    publishes.push(PendingPublish { events, market });
+                }
+                (response, count)
             }
             MatchEngineRequest::Amend {
                 order,
@@ -1133,8 +1176,7 @@ where
                     },
                 }
                 inner.record_events(&events);
-                self.publish_match_events(&events);
-                self.publish_market_frame(
+                let market = self.take_market_frame(
                     inner,
                     log_index,
                     market_seq,
@@ -1143,7 +1185,11 @@ where
                     &events,
                 );
                 let count = events.len();
-                (MatchEngineResponse::applied(market_seq, &events), count)
+                let response = MatchEngineResponse::applied(market_seq, &events);
+                if !events.is_empty() || market.is_some() {
+                    publishes.push(PendingPublish { events, market });
+                }
+                (response, count)
             }
             MatchEngineRequest::PurgeExpired {
                 now_ms,
@@ -1159,13 +1205,15 @@ where
                     })
                     .collect();
                 inner.record_events(&events);
-                self.publish_match_events(&events);
                 let symbol_id = inner.symbol_config.symbol_id;
-                self.publish_market_frame(
-                    inner, log_index, market_seq, *now_ms, symbol_id, &events,
-                );
+                let market = self
+                    .take_market_frame(inner, log_index, market_seq, *now_ms, symbol_id, &events);
                 let count = events.len();
-                (MatchEngineResponse::applied(market_seq, &events), count)
+                let response = MatchEngineResponse::applied(market_seq, &events);
+                if !events.is_empty() || market.is_some() {
+                    publishes.push(PendingPublish { events, market });
+                }
+                (response, count)
             }
             MatchEngineRequest::ConfigureSymbol { config } => {
                 match self.configure_symbol_locked(inner, config.clone()) {
@@ -1210,39 +1258,53 @@ where
     where
         Strm: Stream<Item = Result<EntryResponder<C>, io::Error>> + Unpin + OptionalSend,
     {
-        let mut inner = self.inner.lock().await;
-
         while let Some((entry, responder)) = entries.try_next().await? {
             tracing::debug!(log_id = %entry.log_id, "replicate to sm");
 
-            inner.last_applied_log = Some(entry.log_id.clone());
+            let mut publishes = Vec::new();
+            let response = {
+                // Lock per entry, not for the whole Apply range: reads and
+                // snapshot capture can interleave between entries, and the log
+                // reader is not called while the lock is held.
+                let mut inner = self.inner.lock().await;
+                inner.last_applied_log = Some(entry.log_id.clone());
 
-            // Application code below stays deterministic: events are derived from the entry
-            // alone, and publishing them is best-effort (a sink failure is logged, never
-            // propagated) so replicas with different sinks still converge.
-            let response = match &entry.payload {
-                EntryPayload::Blank => MatchEngineResponse::none(),
-                EntryPayload::Normal(MatchEngineRequest::Batch { requests }) => {
-                    let mut responses = Vec::with_capacity(requests.len());
-                    let mut ordinal = 0u32;
-                    for request in requests {
-                        let (response, event_count) =
-                            self.apply_one(&mut inner, request, entry.log_id.index, ordinal);
-                        ordinal = ordinal.saturating_add(event_count as u32);
-                        responses.push(response);
+                // Application code below stays deterministic: events are derived from the entry
+                // alone, and publishing them is best-effort (a sink failure is logged, never
+                // propagated) so replicas with different sinks still converge.
+                match &entry.payload {
+                    EntryPayload::Blank => MatchEngineResponse::none(),
+                    EntryPayload::Normal(MatchEngineRequest::Batch { requests }) => {
+                        let mut responses = Vec::with_capacity(requests.len());
+                        let mut ordinal = 0u32;
+                        for request in requests {
+                            let (response, event_count) = self.apply_one(
+                                &mut inner,
+                                request,
+                                entry.log_id.index,
+                                ordinal,
+                                &mut publishes,
+                            );
+                            ordinal = ordinal.saturating_add(event_count as u32);
+                            responses.push(response);
+                        }
+                        MatchEngineResponse::batch(responses)
                     }
-                    MatchEngineResponse::batch(responses)
-                }
-                EntryPayload::Normal(req) => {
-                    let (response, _) = self.apply_one(&mut inner, req, entry.log_id.index, 0);
-                    response
-                }
-                EntryPayload::Membership(mem) => {
-                    inner.last_membership =
-                        StoredMembership::new(Some(entry.log_id.clone()), mem.clone());
-                    MatchEngineResponse::none()
+                    EntryPayload::Normal(req) => {
+                        let (response, _) =
+                            self.apply_one(&mut inner, req, entry.log_id.index, 0, &mut publishes);
+                        response
+                    }
+                    EntryPayload::Membership(mem) => {
+                        inner.last_membership =
+                            StoredMembership::new(Some(entry.log_id.clone()), mem.clone());
+                        MatchEngineResponse::none()
+                    }
                 }
             };
+
+            // Sink and tap work happens outside the state-machine lock.
+            self.publish_pending(publishes);
 
             if let Some(responder) = responder {
                 responder.send(response);
@@ -1260,14 +1322,13 @@ where
         let data = snapshot.into_inner();
         tracing::info!({ snapshot_size = data.len() }, "installing snapshot");
 
-        // Validate before touching the durable copy, so a bad snapshot cannot destroy a good one.
-        let content = decode_content(&data)?;
-
         let dir = self.dir.clone();
         let write_meta = meta.clone();
-        let data = blocking(move || {
+        // Decode and validate on the blocking pool, before touching the durable copy.
+        let (content, data) = blocking(move || {
+            let content = decode_content(&data)?;
             write_snapshot_file::<C>(&dir, &write_meta, &data)?;
-            Ok::<_, io::Error>(data)
+            Ok::<_, io::Error>((content, data))
         })
         .await?;
 
@@ -1942,6 +2003,83 @@ mod tests {
         assert_eq!(Some(0), duplicate.sequence);
         assert_eq!(1, duplicate.events.len(), "only the first place's event");
         assert_eq!(0, duplicate.events[0].event_id.ordinal);
+    }
+
+    /// A retry whose events were evicted still returns the original sequence,
+    /// with an empty, explicitly truncated event list.
+    #[tokio::test]
+    async fn duplicate_response_reports_evicted_events() {
+        use crate::match_result::MemorySink;
+        use crate::order_book::Order;
+        use crate::order_book::OrderSide;
+        use openraft::alias::EntryOf;
+        use openraft::alias::EntryPayloadOf;
+
+        fn entry(
+            index: u64,
+            payload: EntryPayloadOf<MatchEngineTypeConfig>,
+        ) -> EntryOf<MatchEngineTypeConfig> {
+            Entry {
+                log_id: log_id(1, index),
+                payload,
+            }
+        }
+
+        let dir = tempdir();
+        let sink = Arc::new(MemorySink::new());
+        let mut store = StateMachineStore::<MatchEngineTypeConfig>::open_with_limits(
+            dir.path(),
+            sink,
+            None,
+            1,
+            5,
+        )
+        .await
+        .unwrap();
+        let entries = futures::stream::iter(vec![
+            Ok((
+                entry(
+                    1,
+                    EntryPayload::Normal(MatchEngineRequest::place_with_client_id(
+                        Order::new(OrderSide::Buy, 100.0, 1.0, 0),
+                        "a",
+                    )),
+                ),
+                None,
+            )),
+            Ok((
+                entry(
+                    2,
+                    EntryPayload::Normal(MatchEngineRequest::place_with_client_id(
+                        Order::new(OrderSide::Buy, 99.0, 1.0, 0),
+                        "b",
+                    )),
+                ),
+                None,
+            )),
+            Ok((
+                entry(
+                    3,
+                    EntryPayload::Normal(MatchEngineRequest::place_with_client_id(
+                        Order::new(OrderSide::Buy, 98.0, 1.0, 0),
+                        "c",
+                    )),
+                ),
+                None,
+            )),
+        ]);
+        store.apply(entries).await.unwrap();
+
+        let inner = store.inner().lock().await;
+        let record = inner
+            .submissions
+            .get("a")
+            .expect("the submission is still retained")
+            .clone();
+        let duplicate = inner.duplicate_response(&record);
+        assert_eq!(Some(0), duplicate.sequence);
+        assert!(duplicate.events.is_empty(), "the event window dropped it");
+        assert!(duplicate.events_truncated);
     }
 
     /// A failing sink must not fail `apply` or change the resulting state.

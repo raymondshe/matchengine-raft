@@ -650,6 +650,11 @@ impl MarketDataTap {
         )
     }
 
+    /// Whether the publishing gate is open.
+    pub fn is_enabled(&self) -> bool {
+        self.enabled.load(Ordering::Relaxed)
+    }
+
     /// Hands one applied entry to the feed. Never blocks.
     ///
     /// While the gate is closed the frame is dropped at the source: followers

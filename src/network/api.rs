@@ -22,6 +22,7 @@ use crate::app::MatchEngineApp;
 use crate::client::FollowerReadError;
 use crate::match_result::EventId;
 use crate::match_result::MatchEvent;
+use crate::order_book::Order;
 use crate::store::MatchEngineRequest;
 use crate::store::MatchEngineResponse;
 use crate::store::state_machine::StateMachineStoreInner;
@@ -300,9 +301,11 @@ pub async fn read(
 ) -> actix_web::Result<impl Responder> {
     let key = req.into_inner();
     validate_read_key(&key).map_err(actix_web::error::ErrorBadRequest)?;
-    let inner = app.state_machine_store.inner().lock().await;
-    let value = read_state(&inner, &key);
-    let res: Result<String, Infallible> = Ok(value);
+    let value = {
+        let inner = app.state_machine_store.inner().lock().await;
+        read_state_owned(&inner, &key)
+    };
+    let res: Result<String, Infallible> = Ok(value.into_json());
     Ok(Json(res))
 }
 
@@ -346,10 +349,13 @@ pub async fn linearizable_read(
                 ));
             }
 
-            let inner = app.state_machine_store.inner().lock().await;
-            let value = read_state(&inner, &key);
+            let value = {
+                let inner = app.state_machine_store.inner().lock().await;
+                read_state_owned(&inner, &key)
+            };
 
-            let res: Result<String, LinearizableReadError<MatchEngineTypeConfig>> = Ok(value);
+            let res: Result<String, LinearizableReadError<MatchEngineTypeConfig>> =
+                Ok(value.into_json());
             Ok(Json(res))
         }
         Err(e) => {
@@ -520,50 +526,88 @@ pub async fn follower_read(
     }
 
     // 5. Read from local state machine
-    let inner = app.state_machine_store.inner().lock().await;
-    let value = read_state(&inner, &key);
+    let value = {
+        let inner = app.state_machine_store.inner().lock().await;
+        read_state_owned(&inner, &key)
+    };
 
-    Ok(Json(Ok(value)))
+    Ok(Json(Ok(value.into_json())))
+}
+
+/// An owned read result, so JSON serialization can happen after the
+/// state-machine lock is released.
+enum ReadState {
+    Orders(Vec<Order>),
+    Text(String),
+}
+
+impl ReadState {
+    fn into_json(self) -> String {
+        match self {
+            ReadState::Orders(orders) => serde_json::to_string(&orders).unwrap_or_default(),
+            ReadState::Text(text) => text,
+        }
+    }
 }
 
 /// Resolves a `/read` key against the state machine.
 ///
-/// The state machine holds an order book, so reads are named views of it rather than lookups in a
-/// key-value map. Unknown keys return an empty string, which keeps the endpoint total.
-fn read_state<C>(inner: &StateMachineStoreInner<C>, key: &str) -> String
+/// The state machine holds an order book, so reads are named views of it rather
+/// than lookups in a key-value map. Unknown keys return an empty string, which
+/// keeps the endpoint total. Large views are cloned here and serialized by the
+/// caller after the guard is dropped; small scalar views are already strings.
+fn read_state_owned<C>(inner: &StateMachineStoreInner<C>, key: &str) -> ReadState
 where
     C: openraft::RaftTypeConfig<D = MatchEngineRequest, R = MatchEngineResponse>,
 {
     match key {
-        "orderbook_orders" => serde_json::to_string(&inner.orders()).unwrap_or_default(),
-        "orderbook_stops" => serde_json::to_string(&inner.orderbook.stops).unwrap_or_default(),
-        "orderbook_depth" => depth_json(inner, 10),
-        "orderbook_spread" => inner
-            .orderbook
-            .spread()
-            .map_or_else(|| "null".to_string(), |value| value.to_string()),
-        "marketdata_status" => inner
-            .market_data
-            .as_ref()
-            .map(|tap| tap.status_json())
-            .unwrap_or_else(|| "{}".to_string()),
-        "orderbook_last_trade_price" => inner
-            .orderbook
-            .last_trade_price
-            .map_or_else(|| "null".to_string(), |value| value.to_string()),
-        "orderbook_sequence" | "orderbook_sequance" => inner.orderbook.sequence.to_string(),
-        "symbol_config" => serde_json::to_string(&inner.symbol_config()).unwrap_or_default(),
-        "symbol_id" => inner.symbol_config().symbol_id.to_string(),
+        "orderbook_orders" => ReadState::Orders(inner.orders()),
+        "orderbook_stops" => ReadState::Orders(inner.orderbook.stops.clone()),
+        "orderbook_depth" => ReadState::Text(depth_json(inner, 10)),
+        "orderbook_spread" => ReadState::Text(
+            inner
+                .orderbook
+                .spread()
+                .map_or_else(|| "null".to_string(), |value| value.to_string()),
+        ),
+        "marketdata_status" => ReadState::Text(
+            inner
+                .market_data
+                .as_ref()
+                .map(|tap| tap.status_json())
+                .unwrap_or_else(|| "{}".to_string()),
+        ),
+        "orderbook_last_trade_price" => ReadState::Text(
+            inner
+                .orderbook
+                .last_trade_price
+                .map_or_else(|| "null".to_string(), |value| value.to_string()),
+        ),
+        "orderbook_sequence" | "orderbook_sequance" => {
+            ReadState::Text(inner.orderbook.sequence.to_string())
+        }
+        "symbol_config" => {
+            ReadState::Text(serde_json::to_string(&inner.symbol_config()).unwrap_or_default())
+        }
+        "symbol_id" => ReadState::Text(inner.symbol_config().symbol_id.to_string()),
         _ if key.starts_with("orderbook_depth:") => {
             let levels = key
                 .trim_start_matches("orderbook_depth:")
                 .parse::<usize>()
                 .unwrap_or(10)
                 .min(200);
-            depth_json(inner, levels)
+            ReadState::Text(depth_json(inner, levels))
         }
-        _ => String::new(),
+        _ => ReadState::Text(String::new()),
     }
+}
+
+#[cfg(test)]
+fn read_state<C>(inner: &StateMachineStoreInner<C>, key: &str) -> String
+where
+    C: openraft::RaftTypeConfig<D = MatchEngineRequest, R = MatchEngineResponse>,
+{
+    read_state_owned(inner, key).into_json()
 }
 
 /// Renders aggregated depth for both sides as one JSON object.

@@ -3,8 +3,10 @@
 //! Run with `cargo bench --bench e2e`. This is a single-node benchmark, so it
 //! includes HTTP, WAL append/fsync, Raft apply and response serialization but
 //! excludes cross-node replication. It also sweeps `/write_batch` sizes to show
-//! how one WAL fsync per entry amortizes across many orders. The order-book-only
-//! costs are measured by `cargo bench --bench matchengine`.
+//! how one WAL fsync per entry amortizes across many orders. By default the
+//! suite runs on the production multi-thread Tokio runtime; `-- current` and
+//! `-- both` compare the old current-thread flavor. The order-book-only costs
+//! are measured by `cargo bench --bench matchengine`.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -26,7 +28,8 @@ use openraft::type_config::TypeConfigExt;
 
 type C = MatchEngineTypeConfig;
 
-const ADDR: &str = "127.0.0.1:24001";
+const CURRENT_THREAD_ADDR: &str = "127.0.0.1:24001";
+const MULTI_THREAD_ADDR: &str = "127.0.0.1:24002";
 const SEQUENTIAL_WRITES: usize = 500;
 const CONCURRENT_WRITES: usize = 1_000;
 /// Batch sizes swept by the sequential batch benchmark.
@@ -82,19 +85,22 @@ fn write_request(index: usize) -> MatchEngineRequest {
     MatchEngineRequest::place(Order::new(side, price, 1.0, 0))
 }
 
-async fn start_node() -> anyhow::Result<(MatchEngineNode, MatchEngineClient<C>, PathBuf)> {
-    let dir = temp_dir("e2e");
+async fn start_node(
+    addr: &str,
+    runtime: &str,
+) -> anyhow::Result<(MatchEngineNode, MatchEngineClient<C>, PathBuf)> {
+    let dir = temp_dir(runtime);
     let storage = StorageConfig::new(dir.clone())
-        .with_instance_prefix("e2e-bench")
+        .with_instance_prefix(format!("e2e-{runtime}"))
         .with_snapshot_interval(Duration::ZERO);
-    let node = build_match_engine_node(1, ADDR.to_string(), default_raft_config(), storage).await?;
-    let client = MatchEngineClient::<C>::new(1, ADDR.to_string());
+    let node = build_match_engine_node(1, addr.to_string(), default_raft_config(), storage).await?;
+    let client = MatchEngineClient::<C>::new(1, addr.to_string());
     client.init().await??;
     wait_for_leader(&client).await?;
     Ok((node, client, dir))
 }
 
-async fn sequential_latency(client: &MatchEngineClient<C>) -> anyhow::Result<()> {
+async fn sequential_latency(client: &MatchEngineClient<C>, runtime: &str) -> anyhow::Result<()> {
     let mut latencies = Vec::with_capacity(SEQUENTIAL_WRITES);
     let started = Instant::now();
     for index in 0..SEQUENTIAL_WRITES {
@@ -107,7 +113,7 @@ async fn sequential_latency(client: &MatchEngineClient<C>) -> anyhow::Result<()>
     latencies.sort_unstable();
 
     let mean = elapsed / SEQUENTIAL_WRITES as u32;
-    println!("sequential writes: {SEQUENTIAL_WRITES}");
+    println!("sequential writes ({runtime}): {SEQUENTIAL_WRITES}");
     println!(
         "  throughput: {:>10.0} writes/s",
         SEQUENTIAL_WRITES as f64 / elapsed.as_secs_f64()
@@ -120,8 +126,8 @@ async fn sequential_latency(client: &MatchEngineClient<C>) -> anyhow::Result<()>
     Ok(())
 }
 
-async fn batch_throughput(client: &MatchEngineClient<C>) -> anyhow::Result<()> {
-    println!("sequential batches (HTTP /write_batch, one Raft entry each):");
+async fn batch_throughput(client: &MatchEngineClient<C>, runtime: &str) -> anyhow::Result<()> {
+    println!("sequential batches ({runtime}, HTTP /write_batch, one Raft entry each):");
     println!(
         "  {:>5}  {:>8}  {:>10}  {:>10}  {:>7}  {:>11}  {:>9}  {:>9}",
         "size", "orders", "batches/s", "orders/s", "speedup", "batch mean", "p50", "p99"
@@ -165,7 +171,10 @@ async fn batch_throughput(client: &MatchEngineClient<C>) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn concurrent_batch_throughput(client: &MatchEngineClient<C>) -> anyhow::Result<()> {
+async fn concurrent_batch_throughput(
+    client: &MatchEngineClient<C>,
+    runtime: &str,
+) -> anyhow::Result<()> {
     let batches: Vec<Vec<MatchEngineRequest>> = (0..CONCURRENT_BATCHES)
         .map(|batch| {
             (0..CONCURRENT_BATCH_SIZE)
@@ -184,7 +193,7 @@ async fn concurrent_batch_throughput(client: &MatchEngineClient<C>) -> anyhow::R
         .count();
 
     println!(
-        "concurrent batches: {CONCURRENT_BATCHES} x {CONCURRENT_BATCH_SIZE} orders ({orders} total)"
+        "concurrent batches ({runtime}): {CONCURRENT_BATCHES} x {CONCURRENT_BATCH_SIZE} orders ({orders} total)"
     );
     println!(
         "  throughput: {:>10.0} orders/s",
@@ -198,9 +207,9 @@ async fn concurrent_batch_throughput(client: &MatchEngineClient<C>) -> anyhow::R
     Ok(())
 }
 
-async fn concurrent_throughput() -> anyhow::Result<()> {
+async fn concurrent_throughput(addr: &str, runtime: &str) -> anyhow::Result<()> {
     let http = reqwest::Client::builder().no_proxy().build()?;
-    let url = format!("http://{ADDR}/write");
+    let url = format!("http://{addr}/write");
     let body = serde_json::to_vec(&write_request(0))?;
     let started = Instant::now();
     let responses = join_all((0..CONCURRENT_WRITES).map(|_| {
@@ -221,7 +230,7 @@ async fn concurrent_throughput() -> anyhow::Result<()> {
         .into_iter()
         .filter(|response| response.as_ref().is_ok_and(|r| r.status().is_success()))
         .count();
-    println!("concurrent writes: {CONCURRENT_WRITES}");
+    println!("concurrent writes ({runtime}): {CONCURRENT_WRITES}");
     println!(
         "  throughput: {:>10.0} writes/s",
         CONCURRENT_WRITES as f64 / elapsed.as_secs_f64()
@@ -230,15 +239,35 @@ async fn concurrent_throughput() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let (node, client, dir) = start_node().await?;
-    println!("end-to-end write benchmark (single node, HTTP + WAL + apply)");
-    sequential_latency(&client).await?;
-    batch_throughput(&client).await?;
-    concurrent_throughput().await?;
-    concurrent_batch_throughput(&client).await?;
+async fn run_suite(runtime: &str, addr: &str) -> anyhow::Result<()> {
+    println!("\n=== {runtime} runtime ===");
+    let (node, client, dir) = start_node(addr, runtime).await?;
+    sequential_latency(&client, runtime).await?;
+    batch_throughput(&client, runtime).await?;
+    concurrent_throughput(addr, runtime).await?;
+    concurrent_batch_throughput(&client, runtime).await?;
     node.shutdown().await?;
     let _ = std::fs::remove_dir_all(dir);
+    Ok(())
+}
+
+fn main() -> anyhow::Result<()> {
+    println!("end-to-end write benchmark (single node, HTTP + WAL + apply)");
+    let selection = std::env::args().nth(1).unwrap_or_default();
+    let run_current = matches!(selection.as_str(), "current" | "both");
+    let run_multi = selection != "current";
+
+    if run_current {
+        let current = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        current.block_on(run_suite("current_thread", CURRENT_THREAD_ADDR))?;
+    }
+    if run_multi {
+        let multi = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?;
+        multi.block_on(run_suite("multi_thread", MULTI_THREAD_ADDR))?;
+    }
     Ok(())
 }
