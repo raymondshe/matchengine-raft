@@ -351,7 +351,9 @@ src/
 proto/
 └── raft.proto               # gRPC Raft 服务定义
 examples/
-└── sled.rs                  # 游乐场示例（本地 sled 目录，不安装）
+├── sled.rs                  # 游乐场示例（本地 sled 目录，不安装）
+├── dump_wal.rs              # WAL 分段的 JSONL 转储
+└── dump_snapshot.rs         # 当前快照的 JSONL 转储
 tests/
 └── cluster/
     ├── main.rs              # 单一集成测试目标
@@ -611,6 +613,19 @@ config.max_in_snapshot_log_to_keep = 0; // 清理快照已覆盖的全部日志
 
 单节点集群因此可以恢复所有活动订单、序列号、保留事件窗口和幂等去重表，无论恢复路径是纯日志重放
 还是快照 + 更新的 WAL 尾部。两条路径都由 `tests/cluster/test_restart.rs` 覆盖。
+
+### 转储持久化状态
+
+存储示例只读，并校验 WAL/快照 CRC：
+
+```shell
+cargo run --example dump_wal -- <节点目录|log 目录|segment.wal>
+cargo run --example dump_snapshot -- <节点目录|snapshot 目录|current.snap>
+```
+
+`dump_wal` 每条 WAL 记录输出一行 JSON（`entry` 或 `committed`），包含文件和偏移；
+`dump_snapshot` 先输出元数据和状态行，再逐行输出 order、stop、event、submission。两者都以
+JSONL 写到标准输出，便于配合 `jq` 等按行工具。
 
 ## 集群管理
 

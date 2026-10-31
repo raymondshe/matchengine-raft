@@ -15,6 +15,9 @@ use matchengine_raft::order_book::OrderSide;
 use matchengine_raft::order_book::OrderType;
 use matchengine_raft::order_book::TimeInForce;
 use matchengine_raft::store::StateMachineData;
+use matchengine_raft::store::log_store::WalRecord;
+use matchengine_raft::store::log_store::read_wal_file;
+use matchengine_raft::store::state_machine::read_snapshot_file;
 use openraft::Entry;
 use openraft::LogId;
 use openraft::LogState;
@@ -624,4 +627,43 @@ fn state_machine_data_conversion_roundtrips() {
     let back: StateMachineData = postcard::from_bytes(&bytes).unwrap();
     assert_eq!(1, back.orders.len());
     assert_eq!(4, back.sequence);
+}
+
+#[test]
+fn dump_helpers_read_wal_records_and_snapshot_content() {
+    let dir = TempDir::new("dump-helpers");
+
+    block_on(async {
+        let store = Store::open(dir.path()).unwrap();
+        append(&store, vec![blank(0), blank(1)]).await;
+        let mut store = store.clone();
+        store.save_committed(Some(log_id(1, 1))).await.unwrap();
+
+        let sm = Sm::open(dir.path().join("snapshot")).unwrap();
+        sm.persist_snapshot().await.unwrap();
+    });
+
+    let wal = &wal_files(dir.path())[0];
+    let records = read_wal_file::<C>(wal).unwrap();
+    assert!(
+        records.iter().any(|(_, record)| matches!(
+            record,
+            WalRecord::Entry(entry) if entry.log_id().index == 0
+        )),
+        "WAL dump is missing the first entry"
+    );
+    assert!(
+        records.iter().any(|(_, record)| matches!(
+            record,
+            WalRecord::Committed(Some(log_id)) if log_id.index == 1
+        )),
+        "WAL dump is missing the committed marker"
+    );
+
+    let (meta, data) = read_snapshot_file::<C>(&dir.path().join("snapshot"))
+        .unwrap()
+        .expect("snapshot exists");
+    let content: StateMachineData = postcard::from_bytes(&data).unwrap();
+    assert!(meta.last_log_id.is_none());
+    assert!(content.orders.is_empty());
 }

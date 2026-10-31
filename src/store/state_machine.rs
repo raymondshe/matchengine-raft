@@ -1379,8 +1379,9 @@ fn decode_content(data: &[u8]) -> io::Result<StateMachineData> {
 ///
 /// `current.snap` is replaced atomically, so the file present at startup is the
 /// newest complete snapshot; a crash can leave only a `.tmp` file, which is
-/// never selected.
-fn read_snapshot_file<C: RaftTypeConfig>(
+/// never selected. The returned data is the postcard-encoded
+/// [`StateMachineData`] body.
+pub fn read_snapshot_file<C: RaftTypeConfig>(
     dir: &Path,
 ) -> io::Result<Option<(SnapshotMetaOf<C>, Vec<u8>)>> {
     let path = dir.join(SNAPSHOT_FILE);

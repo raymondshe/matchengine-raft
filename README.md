@@ -361,7 +361,9 @@ src/
 proto/
 └── raft.proto               # gRPC Raft service definition
 examples/
-└── sled.rs                  # Playground (local sled dir, not installed)
+├── sled.rs                  # Playground (local sled dir, not installed)
+├── dump_wal.rs              # JSONL dump of WAL segments
+└── dump_snapshot.rs         # JSONL dump of the current snapshot
 tests/
 └── cluster/
     ├── main.rs              # Single integration test target
@@ -648,6 +650,19 @@ On startup the node:
 A single-node cluster therefore comes back with all live orders, the sequence counter, the retained
 event window and the idempotency map, whether recovery is pure log replay or snapshot + newer WAL
 tail. Both paths are covered by `tests/cluster/test_restart.rs`.
+
+### Dumping durable state
+
+The storage examples are read-only and validate the WAL/snapshot CRCs:
+
+```shell
+cargo run --example dump_wal -- <node-dir|log-dir|segment.wal>
+cargo run --example dump_snapshot -- <node-dir|snapshot-dir|current.snap>
+```
+
+`dump_wal` prints one JSON object per WAL record (`entry` or `committed`) with file and offset;
+`dump_snapshot` prints a metadata line, a state line, then one line per order, stop, event or
+submission. Both write JSONL to stdout, so they compose with `jq` and other line-oriented tools.
 
 ## Cluster Management
 

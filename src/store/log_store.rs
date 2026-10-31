@@ -64,8 +64,10 @@ const STATE_FILE: &str = "state";
 /// A record in the WAL. Entries dominate; `Committed` is appended without its own fsync.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(bound = "")]
-enum WalRecord<C: RaftTypeConfig> {
+pub enum WalRecord<C: RaftTypeConfig> {
+    /// One replicated Raft entry.
     Entry(C::Entry),
+    /// The latest committed log id, written without its own fsync.
     Committed(Option<LogIdOf<C>>),
 }
 
@@ -808,6 +810,68 @@ fn write_segment_header(path: &Path) -> io::Result<()> {
 
 fn decode_record<C: RaftTypeConfig>(payload: &[u8]) -> io::Result<WalRecord<C>> {
     postcard::from_bytes(payload).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+/// Reads one WAL segment without modifying it, validating the header and every
+/// record CRC.
+///
+/// Returns `(offset, record)` pairs in file order. A truncated final frame is
+/// ignored, matching the recovery rule that only the last segment may have a
+/// torn tail. A CRC mismatch or an unsupported format returns an error.
+pub fn read_wal_file<C: RaftTypeConfig>(path: &Path) -> io::Result<Vec<(u64, WalRecord<C>)>> {
+    let bytes = std::fs::read(path)?;
+    let file_len = bytes.len() as u64;
+    if file_len < SEGMENT_HEADER_LEN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} has a truncated segment header", path.display()),
+        ));
+    }
+    if &bytes[0..SEGMENT_MAGIC.len()] != SEGMENT_MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} has a bad segment magic", path.display()),
+        ));
+    }
+    let version = u32::from_le_bytes(
+        bytes[SEGMENT_MAGIC.len()..SEGMENT_HEADER_LEN as usize]
+            .try_into()
+            .unwrap(),
+    );
+    if version != SEGMENT_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{} has unsupported segment version {version}",
+                path.display()
+            ),
+        ));
+    }
+
+    let mut records = Vec::new();
+    let mut pos = SEGMENT_HEADER_LEN;
+    while pos < file_len {
+        if pos + RECORD_HEADER_LEN > file_len {
+            break;
+        }
+        let frame = &bytes[pos as usize..(pos + RECORD_HEADER_LEN) as usize];
+        let len = u32::from_le_bytes(frame[0..4].try_into().unwrap());
+        let crc = u32::from_le_bytes(frame[4..8].try_into().unwrap());
+        if len > MAX_RECORD_LEN || pos + RECORD_HEADER_LEN + len as u64 > file_len {
+            break;
+        }
+        let payload_start = (pos + RECORD_HEADER_LEN) as usize;
+        let payload = &bytes[payload_start..payload_start + len as usize];
+        if crc32fast::hash(payload) != crc {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{} has a CRC mismatch at offset {pos}", path.display()),
+            ));
+        }
+        records.push((pos, decode_record::<C>(payload)?));
+        pos += RECORD_HEADER_LEN + len as u64;
+    }
+    Ok(records)
 }
 
 /// `(log index, offset within the batch buffer, payload length)`.

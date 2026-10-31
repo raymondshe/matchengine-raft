@@ -42,6 +42,7 @@ CI (`.github/workflows/ci.yml`) runs `cargo fmt --all -- --check`, `cargo clippy
 - Raft port convention: `BasicNode.addr` stays the HTTP API address, and the gRPC Raft transport lives at `raft_addr_from_http(addr)` = same host, port + `RAFT_PORT_OFFSET` (1000). `src/network/mod.rs` owns the derivation.
 - `/init` takes a JSON array, so a single-node cluster must be initialised with `-d '[]'`. A bare POST or `-d '{}'` fails deserialization ("invalid type: map, expected a sequence"); all scripts now send `'[]'`.
 - `examples/sled.rs` is a playground example (creates a local `my_db` sled dir, gitignored); `sled` is a dev-dependency, so it is not linked into the node binary.
+- `cargo run --example dump_wal -- <node-dir|log-dir|segment.wal>` and `cargo run --example dump_snapshot -- <node-dir|snapshot-dir|current.snap>` print read-only, CRC-validated JSONL dumps of durable state. `read_wal_file` and `read_snapshot_file` are the public helpers behind them.
 
 ## Branch state — read before changing storage or network code
 
