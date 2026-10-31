@@ -1,0 +1,5 @@
+{"Place":{"order":{"live":"Limit","side":"Buy","price":100.0,"volume":1.0,"id":1,"sequence":0}}}
+{"Place":{"order":{"live":"Limit","side":"Buy","price":100.0,"volume":1.0,"id":2,"sequence":0}}}
+{"Place":{"order":{"live":"Limit","side":"Sell","price":100.0,"volume":2.0,"id":3,"sequence":0}}}
+{"Place":{"order":{"live":"Limit","side":"Sell","price":100.0,"volume":1.0,"id":4,"sequence":0}}}
+{"Place":{"order":{"live":"Limit","side":"Buy","price":100.0,"volume":2.0,"id":5,"sequence":0}}}

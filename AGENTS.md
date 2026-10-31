@@ -43,6 +43,7 @@ CI (`.github/workflows/ci.yml`) runs `cargo fmt --all -- --check`, `cargo clippy
 - `/init` takes a JSON array, so a single-node cluster must be initialised with `-d '[]'`. A bare POST or `-d '{}'` fails deserialization ("invalid type: map, expected a sequence"); all scripts now send `'[]'`.
 - `examples/sled.rs` is a playground example (creates a local `my_db` sled dir, gitignored); `sled` is a dev-dependency, so it is not linked into the node binary.
 - `cargo run --example dump_wal -- <node-dir|log-dir|segment.wal>` and `cargo run --example dump_snapshot -- <node-dir|snapshot-dir|current.snap>` print read-only, CRC-validated JSONL dumps of durable state. `read_wal_file` and `read_snapshot_file` are the public helpers behind them.
+- `cargo run --release --example replay_orders -- --orders orders.jsonl [--expected expected.jsonl]` starts an in-process node, replays orders in `/write_batch` batches, and compares the generated match-event JSONL (ignoring `node_id`/`log_index` unless `--strict-log-index`).
 
 ## Branch state — read before changing storage or network code
 

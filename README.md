@@ -363,9 +363,10 @@ proto/
 examples/
 ├── sled.rs                  # Playground (local sled dir, not installed)
 ├── dump_wal.rs              # JSONL dump of WAL segments
-└── dump_snapshot.rs         # JSONL dump of the current snapshot
+├── dump_snapshot.rs         # JSONL dump of the current snapshot
+└── replay_orders.rs         # Replay orders and compare match-result JSONL
 tests/
-└── cluster/
+├── cluster/
     ├── main.rs              # Single integration test target
     ├── common.rs            # Unique temp data dirs
     ├── test_cluster.rs      # 3-node gRPC cluster
@@ -383,11 +384,18 @@ tests/
     ├── test_fee_assets.rs     # QQQ/USD tick/lot, quote volume and quote fees
     ├── test_request_limits.rs # Hostile input and request-size limits
     └── test_batch_write.rs    # Batch writes in one Raft entry
+└── replay/
+    └── limit_orders/
+        ├── orders.jsonl       # Five regular limit orders
+        ├── expected-events.jsonl # Reference match-event JSONL
+        ├── run.sh             # Drive replay_orders and compare
+        └── README.md          # Scenario and regeneration notes
 benches/
 ├── matchengine.rs           # Order-book microbenchmarks
 ├── e2e.rs                   # Submit -> commit -> apply -> response
 ├── feed_load.rs             # Market-data feed load test
-└── storage.rs               # WAL append/read/recovery
+├── storage.rs               # WAL append/read/recovery
+└── p0_bench.rs              # Lock/scan A/B benchmarks
 ```
 
 ## Storage Implementation
@@ -664,6 +672,21 @@ cargo run --example dump_snapshot -- <node-dir|snapshot-dir|current.snap>
 `dump_snapshot` prints a metadata line, a state line, then one line per order, stop, event or
 submission. Both write JSONL to stdout, so they compose with `jq` and other line-oriented tools.
 
+### Replaying orders
+
+`replay_orders` starts an in-process node with `--match-event-log`, replays an orders JSONL file in
+`/write_batch` batches, then compares the generated match events with a reference file:
+
+```shell
+cargo run --release --example replay_orders --   --orders orders.jsonl   --expected expected-events.jsonl
+```
+
+Each orders line is either a `MatchEngineRequest` or a bare `Order` (wrapped as `Place`); blank
+lines and `#` comments are ignored. `Batch` lines are submitted as one entry, and individual
+requests are grouped by `--batch-size` (default 128). The comparison ignores `node_id` and
+`event_id.log_index` by default; pass `--strict-log-index` for an exact event id. Use `--actual` to
+keep the generated JSONL, `--keep` to keep the temporary node data, and `--help` for the rest.
+
 ## Cluster Management
 
 Adding a node to a cluster involves 3 steps:
@@ -856,6 +879,11 @@ placeholder). `sequence` is still required by the deserializer.
 | `tests/cluster/test_fee_assets.rs` | QQQ/USD ETF/fiat metadata, tick/lot enforcement, quote-volume limit normalization and quote-asset fee deduction |
 | `tests/cluster/test_request_limits.rs` | Oversized JSON bodies, malformed input, invalid/oversized `client_order_id`s, oversized read keys and out-of-range event pages are rejected with `400`/`413` before Raft changes the book |
 | `tests/cluster/test_batch_write.rs` | Multiple requests are applied in one Raft entry with per-item sequences, continuous event ordinals, and edge validation for empty, nested, oversized and duplicate-id batches |
+| `tests/replay/limit_orders/run.sh` | Shell-driven replay of five regular limit orders through `replay_orders`; checks price-time priority, multi-fill and partial-rest events against `expected-events.jsonl` |
+
+The replay case is not part of `cargo test`; run it with
+`./tests/replay/limit_orders/run.sh`. It starts an in-process node on `24211` (gRPC `25211`) and
+compares the generated match-event JSONL with the checked-in reference.
 
 Every integration test uses a unique temporary data directory. The cluster test uses fixed ports
 `21001-21003` (gRPC `22001-22003`), the snapshot tests `21101-21103`, the restart tests

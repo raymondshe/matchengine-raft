@@ -353,9 +353,10 @@ proto/
 examples/
 ├── sled.rs                  # 游乐场示例（本地 sled 目录，不安装）
 ├── dump_wal.rs              # WAL 分段的 JSONL 转储
-└── dump_snapshot.rs         # 当前快照的 JSONL 转储
+├── dump_snapshot.rs         # 当前快照的 JSONL 转储
+└── replay_orders.rs         # 回放订单并对比撮合结果 JSONL
 tests/
-└── cluster/
+├── cluster/
     ├── main.rs              # 单一集成测试目标
     ├── common.rs            # 唯一临时数据目录
     ├── test_cluster.rs      # 3 节点 gRPC 集群
@@ -373,11 +374,18 @@ tests/
     ├── test_fee_assets.rs     # QQQ/USD tick/lot、quote 数量和 quote 扣费
     ├── test_request_limits.rs # 恶意输入和请求大小限制
     └── test_batch_write.rs    # 单 Raft entry 批量写入
+└── replay/
+    └── limit_orders/
+        ├── orders.jsonl       # 五条普通限价单
+        ├── expected-events.jsonl # 参考撮合事件 JSONL
+        ├── run.sh             # 驱动 replay_orders 并对比
+        └── README.md          # 场景与重新生成说明
 benches/
 ├── matchengine.rs           # 订单簿微基准
 ├── e2e.rs                   # 请求 -> Raft 提交 -> apply -> 响应
 ├── feed_load.rs             # 行情 feed 负载测试
-└── storage.rs               # WAL 追加/读取/恢复
+├── storage.rs               # WAL 追加/读取/恢复
+└── p0_bench.rs              # 锁/扫描 A/B 基准
 ```
 
 ## 存储实现
@@ -627,6 +635,22 @@ cargo run --example dump_snapshot -- <节点目录|snapshot 目录|current.snap>
 `dump_snapshot` 先输出元数据和状态行，再逐行输出 order、stop、event、submission。两者都以
 JSONL 写到标准输出，便于配合 `jq` 等按行工具。
 
+### 回放订单
+
+`replay_orders` 会启动一个启用 `--match-event-log` 的进程内节点，按 `/write_batch` 批次回放
+订单 JSONL，然后把生成的撮合事件与参考文件对比：
+
+```shell
+cargo run --release --example replay_orders -- \
+  --orders orders.jsonl \
+  --expected expected-events.jsonl
+```
+
+订单文件每行是一个 `MatchEngineRequest` 或裸 `Order`（自动包装为 `Place`）；空行和 `#` 注释会被
+忽略。`Batch` 行作为一个 entry 提交，普通请求按 `--batch-size`（默认 128）分组。默认比较会忽略
+`node_id` 和 `event_id.log_index`；需要精确事件 id 时使用 `--strict-log-index`。`--actual` 可保留
+生成的 JSONL，`--keep` 保留临时节点数据，其余选项见 `--help`。
+
 ## 集群管理
 
 向集群添加节点包含 3 个步骤：
@@ -794,6 +818,10 @@ fee token）见 [`docs/FEE_DEDUCTION.md`](./docs/FEE_DEDUCTION.md)。
 | `tests/cluster/test_fee_assets.rs` | QQQ/USD ETF/法币元数据、tick/lot、quote 数量限价单归一化和 quote 资产扣费 |
 | `tests/cluster/test_request_limits.rs` | 超大 JSON 请求体、畸形输入、非法/超长 `client_order_id`、超长 read key 和越界事件分页在进入 Raft 前以 `400`/`413` 拒绝 |
 | `tests/cluster/test_batch_write.rs` | 多个请求在单个 Raft entry 中应用，逐项序列号、连续事件序号，以及空/嵌套/超大/重复 id 批次校验 |
+| `tests/replay/limit_orders/run.sh` | 通过 `replay_orders` 回放五条普通限价单，校验价格-时间优先、多笔成交和部分挂单事件与 `expected-events.jsonl` 一致 |
+
+回放用例不属于 `cargo test`；用 `./tests/replay/limit_orders/run.sh` 运行。它会启动一个
+进程内节点（HTTP `24211`，gRPC `25211`），并把生成的撮合事件 JSONL 与仓库中的参考文件对比。
 
 所有集成测试都使用唯一的临时数据目录。集群测试固定使用端口 `21001-21003`（gRPC
 `22001-22003`），快照测试使用 `21101-21103`，重启测试使用 `21201-21205`，撮合结果测试使用
