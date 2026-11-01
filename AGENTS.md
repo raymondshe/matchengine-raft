@@ -12,6 +12,7 @@ Single-crate Rust project (edition 2024): a Raft-replicated order-book matching 
 CI (`.github/workflows/ci.yml`) runs `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings` and `cargo test` on push/PR. `Cargo.lock` is tracked (do not add it back to `.gitignore`).
 - `cargo test` runs everything (a single integration target, `cluster`, ~10s once built). Focus it with `cargo test --test cluster`.
   - `cargo bench --bench matchengine` runs the order-book micro-benchmarks (no framework, prints best-of-5 per-round times).
+  - `cargo bench --bench book_replay` exercises `OrderBook` directly with deep sweeps, deep cancels and BBO-advance/query cases; no HTTP, Raft, WAL or feed. Results live in `docs/PERFORMANCE.md`.
   - `cargo bench --bench e2e` starts a single node (127.0.0.1:24001 on the default multi-thread runtime) and measures HTTP submit → Raft commit → apply → response, including a `/write_batch` sweep at 1/8/32/64/128 orders per entry plus concurrent batches; pass `-- current` or `-- both` to compare the old current-thread runtime. `cargo bench --bench feed_load` drives the market-data queue at 50k/500k fills/s and an overload case. Results live in `docs/PERFORMANCE.md`.
   - `cargo bench --bench storage` measures WAL append/read/reopen with real order payloads; results live in `docs/PERFORMANCE.md`.
   - `cargo bench --bench p0_bench -- duplicate|read|snapshot` measures the P0 state-machine optimizations: duplicate retry scan, large reads under write load, and snapshot under write load.
@@ -144,6 +145,7 @@ CI (`.github/workflows/ci.yml`) runs `cargo fmt --all -- --check`, `cargo clippy
 - Trust `src/` over prose. `README.md`, `README_CN.md` and `TODO.md` now match the
   WAL + snapshot + gRPC design; README requires Rust ≥ 1.89 (edition 2024).
 - `docs/PERFORMANCE.md` records the measured order-book, end-to-end, feed-load and storage baselines and how to reproduce them.
+- `docs/THIRD_PARTY_INVESTIGATION.md` consolidates the AsthaMishra/matching-engine, wasif-exe/wire and llc-993/matching-core reviews; `TODO.md` §14 tracks the adopted follow-ups and guardrails.
 - `docs/AERON_SOLUTION.md` is an investigation document. `docs/TRANSPORTS.md` is historical: the
   gRPC/tonic implementation (`src/network/grpc/`) is now the only Raft transport; the HTTP/JSON
   fallback and its comparison were removed on 2026-10-30.

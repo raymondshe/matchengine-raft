@@ -914,7 +914,8 @@ reach 25,183 orders/s, and 100 concurrent 32-order batches reach 157,035 orders/
 
 The feed also has a deliberate 2M fills/s overload case that drops frames and emits `GAP` rather
 than blocking matching. Reproduce the baseline with `cargo bench --bench matchengine`,
-`cargo bench --bench e2e`, `cargo bench --bench feed_load` and `cargo bench --bench storage`.
+`cargo bench --bench book_replay`, `cargo bench --bench e2e`, `cargo bench --bench feed_load` and
+`cargo bench --bench storage`.
 
 Implemented performance choices:
 

@@ -1,6 +1,6 @@
 # TODO
 
-Last reviewed: 2026-10-29. This is the working roadmap; see `AGENTS.md` for commands and the
+Last reviewed: 2026-11-01. This is the working roadmap; see `AGENTS.md` for commands and the
 current branch state.
 
 **Current baseline:** the OpenRaft 0.10 port, durable WAL/snapshot storage and exact scale-18
@@ -10,25 +10,33 @@ single-symbol precision configuration, asset metadata, volume units and maker/ta
 One process/cluster trades exactly one symbol; multi-symbol is isolated by running one process per
 symbol. Base/quote volume and asset-aware fee deduction are done, and the market-data processor
 runs as a tokio task. Edge request/snapshot limits and the loopback/private-network contract are in
-place; the remaining work is stronger correctness evidence, failure behavior, measured performance
-and TLS/authentication for future public exposure.
+place. The remaining work is stronger correctness evidence, failure behavior and measured
+performance; TLS/authentication stays at the gateway and is out of scope for this process.
 
 Priority key: **P0** = correctness/security, do next; **P1** = production readiness; **P2** =
 important but not blocking; **P3** = later/optional.
 
 ## Top priorities
 
-All top-priority P0/P1 work is complete, including the measured baselines in
-[`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md). The next production-readiness items are the
-remaining P1 entries in their sections: gateway symbol guarding, health/readiness, and the
-fee/session extensions.
+The existing P0/P1 work is complete, including the measured baselines in
+[`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md). The third-party review adds new P0/P1 follow-ups
+(see §14). Measurement scope, measured peak RSS and the book-only replay benchmark are now in
+place.
 
-1. **P1 — Operational readiness.** Add a health/readiness endpoint that reports gRPC listener
+1. **P0 — Fuzz targets.** Add `cargo-fuzz` targets for `OrderBook::execute_order` and snapshot/WAL
+   decoding; keep them buildable in a scheduled job.
+2. **P1 — Operational readiness.** Add a health/readiness endpoint that reports gRPC listener
    health, leadership and storage state. TLS and authentication stay at the gateway; this process
    is internal-only by design.
-2. **P1 — Gateway symbol guard.** Reject a wrong-symbol request before it reaches Raft.
-3. **P2 — Revisit per-level buckets** only if a future 3-node or real-sink measurement justifies
-   the complexity; the current baseline does not.
+3. **P1 — Gateway symbol guard.** Reject a wrong-symbol request before it reaches Raft.
+4. **P1 — Per-level bucket prototype.** Prototype `BTreeMap<price, Vec<Order>>` + `head_idx` +
+   sequence index + cached BBO now that the book-only benchmark exists, and benchmark cancel,
+   match, amend and depth before merging. Adoption remains P2.
+5. **P1 — Equity/ETF session and fee scope.** Define gateway responsibilities for sessions,
+   holidays, auctions, T+1/T+2 and corporate actions, and decide whether fixed/regulatory fees,
+   minimum tickets and taxes are in scope.
+6. **P1 — Apply-path allocation reduction.** Measure first; then consider a scratch event buffer,
+   `Arc<[MatchEvent]>` sharing or `SmallVec` for common cases.
 
 ## 1. Exact fixed-point end-to-end — done
 
@@ -107,8 +115,8 @@ Remaining:
   termination. The loopback/private-network warning stays as a deployment guard.
 - [ ] **P1** Add a health/readiness endpoint that reports gRPC listener health, Raft leadership
   and storage state.
-- [ ] **P1** Decide whether a died gRPC server task should stop the process (fail fast) or leave
-  the node in a degraded, clearly reported state. `src/lib.rs` currently only logs it.
+- [x] **P1** Fail fast when the gRPC server task dies: `MatchEngineNode::run()` stops HTTP and
+  background tasks, shuts Raft down and returns the transport error.
 - [x] **P2** Remove the duplicate `Logger` middleware in `src/lib.rs`; every request is logged
   twice.
 - [ ] **P2** Make `Order::sequence` optional in the public deserializer (`#[serde(default)]`) so
@@ -186,10 +194,10 @@ Done:
 
 Remaining:
 
-- [ ] **P1** Evaluate per-price-level buckets (`BTreeMap<price, VecDeque<Order>>` plus a
-  sequence-keyed index) after the post-`Fixed` benchmarks. The current per-order `BTreeMap`
-  descends the tree for every fill; the extended `Order` also grew the map value, which shows up
-  on copy-heavy benches.
+- [ ] **P1** Prototype per-price-level buckets (`BTreeMap<price, Vec<Order>>` plus a
+  sequence-keyed index and cached BBO) after the book-only replay benchmark. The current per-order
+  `BTreeMap` descends the tree for every fill; the extended `Order` also grew the map value, which
+  shows up on copy-heavy benches. Adoption is P2 and requires the prototype to win.
 - [ ] **P2** Amend parked stops (trigger price/volume) and icebergs (tranche semantics); consider
   a sequence → location index for cancel/amend by sequence alone, with index maintenance or
   tombstones.
@@ -264,6 +272,8 @@ Current coverage:
   normalization and quote-asset fee deduction.
 - `test_request_limits.rs`: oversized bodies, malformed JSON, invalid/oversized client ids,
   oversized read keys and out-of-range event pages are rejected before Raft.
+- `tests/replay/limit_orders/run.sh`: shell-driven replay of five regular limit orders through
+  `replay_orders`, comparing the generated match-event JSONL with a checked-in reference.
 
 Remaining:
 
@@ -297,8 +307,14 @@ Remaining:
   drops at an 8,192 queue; 2M overload drops frames and emits `GAP`.
 - [x] **P1** Add a storage benchmark (`cargo bench --bench storage`): 20k entries append at
   26,049/s, read at 2,386,089/s, and reopen/recover in 6.33ms.
-- [ ] **P2** Consider per-level buckets or a compact resting record only if new 3-node or
-  real-sink measurements justify the complexity; the current baseline does not.
+- [x] **P1** Record measured peak RSS for the microbench, e2e, feed, storage and P0 workloads in
+  `docs/PERFORMANCE.md`; the table states that RSS is whole-process, not per-order.
+- [x] **P1** Add a book-only replay benchmark (`cargo bench --bench book_replay`): 1k/100-level
+  sweep 94.7µs (10.56M fills/s), 20k/1-level sweep 2.209ms (9.06M fills/s), 5k deep cancels
+  270.9µs (18.46M cancels/s), 1k-level BBO advance 98.3µs (20.35M advances/s), 1M BBO queries
+  2.335ms (428M queries/s).
+- [ ] **P2** Adopt per-level buckets or a compact resting record only if the P1 prototype and
+  new 3-node or real-sink measurements justify the complexity; the current baseline does not.
 - [ ] **P2** Add a benchmark regression gate (threshold or recorded baseline) to CI.
 
 ## 9. Client library
@@ -319,7 +335,8 @@ Done:
 - [x] `scripts/` holds every shell helper; scripts resolve the repo root themselves and write
   logs under `logs/`, not the repository root.
 - [x] `src/main.rs` is the only binary entry; `examples/sled.rs` is a dev-only playground and
-  `sled` is a dev-dependency.
+  `sled` is a dev-dependency. `examples/dump_wal.rs` and `examples/dump_snapshot.rs` are read-only
+  JSONL dumpers; `examples/replay_orders.rs` is the order-replay/compare harness.
 - [x] The unused `match_engine.png` was removed and `logs/` is gitignored.
 - [x] README/README_CN, AGENTS, TODO, AERON, MATCH_RESULTS, MARKET_DATA_PLAN and FEE_DEDUCTION are
   synced with the WAL + snapshot + gRPC design and snapshot v9 / wire v5.
@@ -349,7 +366,8 @@ These choices feed the priorities above; write them down as ADRs or doc notes wh
   loopback or a trusted private network, with edge request/snapshot limits.
 - [x] Authentication and TLS terminate at the gateway; the engine and its Raft transport remain
   internal-only and plaintext for latency.
-- [ ] gRPC listener failure policy: fail-fast process exit vs degraded health state.
+- [x] gRPC listener failure policy: fail-fast. A dead gRPC server task stops HTTP/background
+  work and returns the transport error; it does not leave a half-healthy node serving.
 - [x] Multi-symbol isolation: one process/cluster per symbol, never multiple books in one process.
 - [ ] Event time source for the clearing feed and per-instrument cursor retention.
 
@@ -426,3 +444,53 @@ Resolved decisions: quote limit sell rounds base quantity down to cap notional; 
 rounds up and permits a bounded overshoot; `volume` is always gross; the fee policy is per symbol;
 quote market-buy budgets are gross notional with quote fees charged additionally; the engine
 reports exact 18-scale fees and clearing applies final asset rounding.
+
+## 14. Third-party investigation takeaways
+
+Source: [`docs/THIRD_PARTY_INVESTIGATION.md`](./docs/THIRD_PARTY_INVESTIGATION.md), covering
+[AsthaMishra/matching-engine](https://github.com/AsthaMishra/matching-engine),
+[wasif-exe/wire](https://github.com/wasif-exe/wire) and
+[llc-993/matching-core](https://github.com/llc-993/matching-core). All are single-node/reference
+projects; our Raft, durability, exactness and deterministic event ids remain non-negotiable.
+
+P0/P1 follow-ups:
+
+- [x] **P0** Add a measurement-scope table to `docs/PERFORMANCE.md` (what each benchmark
+  includes/excludes, closed-loop vs open-loop, timer source and variance), and record measured
+  peak RSS rather than estimated per-order memory. Done: see the scope and memory sections.
+- [x] **P0** Add `benches/book_replay.rs`: book-only replay with deep sweeps, cancel-at-depth and
+  BBO-advance cases, separate from the existing HTTP/Raft `replay_orders` test. Done: results and
+  scope are in `docs/PERFORMANCE.md`.
+- [ ] **P0** Add `cargo-fuzz` targets for `OrderBook::execute_order` and snapshot/WAL decoding;
+  keep the targets buildable and runnable in a scheduled job.
+- [ ] **P1** Prototype a per-price-level `Vec` + `head_idx` + order index + cached BBO; benchmark
+  cancel, match, amend and depth before merging. Keep the sparse `BTreeMap` for our 18-decimal
+  range; do not copy a fixed 65k flat array.
+- [ ] **P1** Measure and reduce apply-path allocations (scratch event buffer, `Arc<[MatchEvent]>`
+  sharing or `SmallVec` for common cases).
+- [ ] **P1** Add a public-API feature matrix test proving every advertised order type reaches the
+  matching engine. llc-993's advanced book exists only in examples; its exchange always uses the
+  Direct book.
+- [ ] **P1** Add an event-lifecycle test proving cancel, expiry, amend and stop handling emit
+  explicit events rather than overloading `Reject`; consumers must reconstruct the full order state.
+- [ ] **P1** Keep TPS, events/s and queries/s distinct in benchmark reports; llc-993 labels event
+  count as QPS and estimates memory at 200 bytes/order.
+- [ ] **P2** Evaluate a binary order-entry path (gRPC/protobuf or compact codec) and feature-gated
+  latency histograms only if a latency target requires them.
+- [ ] **P2** Evaluate real ITCH-style replay data and custom MPMC/SIMD/io_uring work only after a
+  measured bottleneck and a Linux-only deployment decision. `wire-mpmc` is not async-aware: use
+  Tokio `mpsc` for task-to-task communication and keep spin-based queues off Tokio workers.
+
+Guardrails / what not to copy:
+
+- Keep Raft consensus, WAL/snapshot durability, deterministic `(log_index, ordinal)` event ids,
+  exact 18-decimal values, fees/assets and the existing property/conformance/integration suites.
+- Do not copy one-fill matching loops, fixed 65k price arrays, O(n) cancel, global process-local
+  trade ids, SIMD "cancel" that only computes a mask, 192 MiB-per-thread slabs, hard-coded `rdtsc`
+  frequency conversions or io_uring as a default.
+- Verify third-party claims before adopting: AsthaMishra and llc-993 have no license file;
+  AsthaMishra's fuzz target is stale; Wire's v9 matching kernel is single-fill and its LOB has
+  partial-fill/BBO bookkeeping issues; llc-993's advanced order types are not wired into its
+  exchange and its WAL/snapshot is not crash-safe.
+- Do not advertise a feature that exists only in an example, a separate book type, or an
+  unreachable "optimized" implementation.

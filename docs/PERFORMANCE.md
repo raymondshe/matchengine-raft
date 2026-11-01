@@ -1,6 +1,6 @@
 # Performance measurements
 
-Measured on **2026-10-30** (runtime flavor A/B and P0 offloads: **2026-10-31**) on the reference development machine:
+Measured on **2026-10-30** (runtime flavor A/B and P0 offloads: **2026-10-31**; measurement scope and RSS: **2026-11-01**) on the reference development machine:
 
 - Apple M4 (`arm64`)
 - Rust `1.93.1`
@@ -18,7 +18,51 @@ cargo bench --bench e2e           # submit -> commit -> apply -> response (multi
 cargo bench --bench feed_load     # market-data feed at 50k/500k fills/s
 cargo bench --bench storage       # WAL append/read/recovery
 cargo bench --bench p0_bench -- duplicate|read|snapshot  # P0 lock/scan A/B
+cargo bench --bench book_replay   # book-only sweeps, deep cancels and BBO advances
 ```
+
+## Measurement scope
+
+Each number below answers a different question. Do not compare one row to another without checking
+its scope.
+
+| Benchmark | Includes | Excludes | Load model | Timer / sampling | Variance |
+|---|---|---|---|---|---|
+| `matchengine` | Order-book operations: sweep, rest, partial fill, IOC cancel, iceberg refill, amend, cancel; optional depth journal | HTTP, Raft, WAL, snapshots, market-data encoding/sink | Closed-loop, in-process | `Instant`, best-of-5 per round | Best-of-5 only; not a tail study |
+| `book_replay` | `OrderBook` only: 100-level and single-level sweeps, deep cancels, BBO advancement and static BBO queries; book cloned outside the timer | HTTP, Raft, WAL/snapshots, market-data feed, event construction, fees | Closed-loop, in-process; one pristine book per round | `Instant`, best-of-5 per round | Best-of-5 only; 1k/20k cases differ in tree depth, not just order count |
+| `e2e` `/write` | HTTP decode/validation, Raft proposal/commit, WAL append + `sync_data`, apply, response serialization | Cross-node replication, external client network beyond loopback | Sequential is closed-loop; concurrent is a 1,000-request burst | `Instant` per request; p50/p95/p99/max | Medians/percentiles; runtime A/B uses four alternating runs |
+| `e2e` `/write_batch` | Same as `/write`, with 1–128 requests per Raft entry and one WAL fsync per entry | Same as `/write` | 200 sequential batches per size; 100 concurrent 32-order batches | `Instant` per batch | Single run per size; batch latency includes payload/apply growth |
+| `feed_load` | Tokio tap, bounded queue, shadow book, wire encoding and processor drain with a null sink | JSONL/network sink I/O, Raft, HTTP | Offered-load generator at 50k/500k/2M fills/s | `Instant`; queue/drain counters | One run per target; no p99 table |
+| `storage` | WAL append/read/reopen with 20k real order entries and 512 KiB segments | State machine, Raft, HTTP | Closed-loop, 100-entry batches | `Instant` | One run; no tail study |
+| `p0_bench duplicate` | State-machine duplicate-retry lookup over a 262k-event window | HTTP, Raft, WAL | 200 retries after one setup | `Instant`; mean/p50/p99/max | Single run; a single scheduling outlier moves the mean |
+| `p0_bench read` | In-process node `/read orderbook_orders` with 100k orders and 8 concurrent writers | Cross-node replication; client-side parsing beyond bytes received | 2 readers x 10 large reads, writers in flight | `Instant`; read/write p50/p99/max | Single run; allocator/HTTP buffers affect peak RSS |
+| `p0_bench snapshot` | `persist_snapshot` encode/write/fsync for 100k orders while 8 writers run | Raft snapshot shipping; cross-node replication | 8 writers, snapshot on the main benchmark task | `Instant`; writer p50/p99/max and snapshot duration | Single run; encode/fsync dominated |
+
+Timer source is `std::time::Instant` throughout; there is no `rdtsc` or assumed CPU frequency.
+Loopback HTTP and local disk are part of the measured path where stated. Run-to-run variance is
+not a confidence interval; the e2e runtime A/B is the only comparison with four alternating runs.
+
+## Memory footprint (measured peak RSS)
+
+Peak RSS measured with `/usr/bin/time -l` on the release bench binaries on 2026-11-01, running
+the binaries directly so Cargo's own peak is not included. These are **whole-process** peaks,
+including the benchmark driver, runtime, HTTP buffers and allocator retention; they are not
+per-order estimates and should not be compared directly across processes.
+
+| Workload | Peak RSS | What dominates the peak |
+|---|---:|---|
+| `matchengine` microbench | 603 MiB | 20k-order deep book plus per-round clones/allocations |
+| `book_replay` | 604 MiB | 20k-order single-level book, 1k-level BBO book and per-round clones; allocator retention dominates |
+| `e2e` write path | 176 MiB | Node + driver, ~51k resting orders/events, HTTP/JSON buffers |
+| `feed_load` | 7 MiB | Queue and null-sink processor |
+| `storage` | 15 MiB | 20k WAL entries and segment buffers |
+| `p0_bench duplicate` | 163 MiB | 262k retained events and the state-machine book |
+| `p0_bench read` | 1.49 GiB | 100k-order book plus 20 large `orderbook_orders` JSON responses; allocator retention and client buffers dominate |
+| `p0_bench snapshot` | 171 MiB | 100k-order book plus snapshot capture/encode/write buffers |
+
+The `p0_bench read` peak is a warning about large `/read` responses, not a per-order book cost.
+For per-order sizing, use the workload's own measured RSS delta or a dedicated allocation profile;
+do not infer it from these whole-process peaks.
 
 ## Order-book microbenchmarks
 
@@ -39,6 +83,33 @@ noted. These exclude HTTP, Raft, WAL and the feed.
 
 The market-data journal adds about 2.6 µs to 1,000 rests, confirming that the
 matching path does not pay for shadow-book derivation, encoding or sink I/O.
+
+## Book-only replay benchmark
+
+`cargo bench --bench book_replay` exercises `OrderBook` directly: no HTTP, Raft, WAL, snapshot
+or market-data feed. Each case builds a pristine book once, clones it outside the timer, then
+measures only the operation under test; the reported time is best-of-5 per round. This is the
+baseline the per-level bucket prototype must beat.
+
+| Case | Workload per round | Time per round | Throughput |
+|---|---:|---:|---:|
+| Deep sweep, 100 levels | 1,000 asks resting 10 per level; one taker crosses all | 94.7 µs | 10.56M fills/s |
+| Deep sweep, 1 level | 20,000 asks at one price; one taker crosses all | 2.209 ms | 9.06M fills/s |
+| Cancel at depth | 5,000 bids across 50 levels, cancelled deepest-first | 270.9 µs | 18.46M cancels/s |
+| BBO advance | 1,000 levels x 2 sides; cancel the best, then read bid/ask/spread | 98.3 µs | 20.35M advances/s |
+| BBO query | 1,000,000 `spread()` calls against a 1,000-level book | 2.335 ms | 428M queries/s |
+
+The two sweeps both cross every resting ask but differ in tree shape: the 100-level book keeps
+each price subtree small, while the single-level book is one 20,000-entry sequence-ordered
+tree, so per-fill cost rises. Cancels and BBO advancement pay `BTreeMap` removal plus best-level
+lookups; static BBO queries repeatedly call `spread()`, which reads `first_key_value()` on each
+side, so the 428M/s figure shows lookup is cheap relative to mutation. These are whole-round
+times, not per-fill latency percentiles, and the benchmark is closed-loop.
+
+Repeated best-of-5 runs on the same machine produced 83–97 µs for the 100-level sweep, 2.18–2.35 ms
+for the single-level sweep, 271–288 µs for the deep cancels, 98–107 µs for BBO advancement and
+2.10–2.93 ms for the 1M-query loop. The table is one representative run; treat these as
+order-of-magnitude baselines, not exact constants.
 
 ## End-to-end write path
 

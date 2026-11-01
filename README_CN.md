@@ -848,8 +848,8 @@ fee token）见 [`docs/FEE_DEDUCTION.md`](./docs/FEE_DEDUCTION.md)。
 100 个并发 32 单批次达到 157,035 单/s。
 
 feed 还包含一个刻意的 2M fills/s 过载场景，会丢弃帧并发送 `GAP`，而不是阻塞撮合。可用
-`cargo bench --bench matchengine`、`cargo bench --bench e2e`、`cargo bench --bench feed_load` 和
-`cargo bench --bench storage` 复现实测基线。
+`cargo bench --bench matchengine`、`cargo bench --bench book_replay`、`cargo bench --bench e2e`、
+`cargo bench --bench feed_load` 和 `cargo bench --bench storage` 复现实测基线。
 
 已实现的性能设计：
 
