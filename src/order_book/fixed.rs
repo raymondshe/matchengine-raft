@@ -83,6 +83,11 @@ impl Fixed {
         self.0.checked_sub(rhs.0).map(Self)
     }
 
+    /// Adds two values, saturating at the `i128` bounds.
+    pub fn saturating_add(self, rhs: Self) -> Self {
+        Self(self.0.saturating_add(rhs.0))
+    }
+
     /// Subtracts two values, saturating at the `i128` bounds.
     pub fn saturating_sub(self, rhs: Self) -> Self {
         Self(self.0.saturating_sub(rhs.0))

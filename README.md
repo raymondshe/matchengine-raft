@@ -880,10 +880,14 @@ placeholder). `sequence` is still required by the deserializer.
 | `tests/cluster/test_request_limits.rs` | Oversized JSON bodies, malformed input, invalid/oversized `client_order_id`s, oversized read keys and out-of-range event pages are rejected with `400`/`413` before Raft changes the book |
 | `tests/cluster/test_batch_write.rs` | Multiple requests are applied in one Raft entry with per-item sequences, continuous event ordinals, and edge validation for empty, nested, oversized and duplicate-id batches |
 | `tests/replay/limit_orders/run.sh` | Shell-driven replay of five regular limit orders through `replay_orders`; checks price-time priority, multi-fill and partial-rest events against `expected-events.jsonl` |
+| `fuzz/` | `cargo-fuzz` targets for `OrderBook::execute_order`, WAL byte decoding and snapshot byte/content decoding; the nightly scheduled workflow builds all three and runs a smoke pass |
 
 The replay case is not part of `cargo test`; run it with
 `./tests/replay/limit_orders/run.sh`. It starts an in-process node on `24211` (gRPC `25211`) and
 compares the generated match-event JSONL with the checked-in reference.
+
+The fuzz targets are a separate nightly-only crate; see `fuzz/README.md` and
+`.github/workflows/fuzz.yml`.
 
 Every integration test uses a unique temporary data directory. The cluster test uses fixed ports
 `21001-21003` (gRPC `22001-22003`), the snapshot tests `21101-21103`, the restart tests

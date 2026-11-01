@@ -20,22 +20,20 @@ important but not blocking; **P3** = later/optional.
 
 The existing P0/P1 work is complete, including the measured baselines in
 [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md). The third-party review adds new P0/P1 follow-ups
-(see §14). Measurement scope, measured peak RSS and the book-only replay benchmark are now in
-place.
+(see §14). Measurement scope, measured peak RSS, the book-only replay benchmark and the fuzz
+targets are now in place.
 
-1. **P0 — Fuzz targets.** Add `cargo-fuzz` targets for `OrderBook::execute_order` and snapshot/WAL
-   decoding; keep them buildable in a scheduled job.
-2. **P1 — Operational readiness.** Add a health/readiness endpoint that reports gRPC listener
+1. **P1 — Operational readiness.** Add a health/readiness endpoint that reports gRPC listener
    health, leadership and storage state. TLS and authentication stay at the gateway; this process
    is internal-only by design.
-3. **P1 — Gateway symbol guard.** Reject a wrong-symbol request before it reaches Raft.
-4. **P1 — Per-level bucket prototype.** Prototype `BTreeMap<price, Vec<Order>>` + `head_idx` +
+2. **P1 — Gateway symbol guard.** Reject a wrong-symbol request before it reaches Raft.
+3. **P1 — Per-level bucket prototype.** Prototype `BTreeMap<price, Vec<Order>>` + `head_idx` +
    sequence index + cached BBO now that the book-only benchmark exists, and benchmark cancel,
    match, amend and depth before merging. Adoption remains P2.
-5. **P1 — Equity/ETF session and fee scope.** Define gateway responsibilities for sessions,
+4. **P1 — Equity/ETF session and fee scope.** Define gateway responsibilities for sessions,
    holidays, auctions, T+1/T+2 and corporate actions, and decide whether fixed/regulatory fees,
    minimum tickets and taxes are in scope.
-6. **P1 — Apply-path allocation reduction.** Measure first; then consider a scratch event buffer,
+5. **P1 — Apply-path allocation reduction.** Measure first; then consider a scratch event buffer,
    `Arc<[MatchEvent]>` sharing or `SmallVec` for common cases.
 
 ## 1. Exact fixed-point end-to-end — done
@@ -274,6 +272,9 @@ Current coverage:
   oversized read keys and out-of-range event pages are rejected before Raft.
 - `tests/replay/limit_orders/run.sh`: shell-driven replay of five regular limit orders through
   `replay_orders`, comparing the generated match-event JSONL with a checked-in reference.
+- `fuzz/`: `cargo-fuzz` targets for `OrderBook::execute_order` (`order_book`), WAL byte decoding
+  (`wal_decode`) and snapshot byte/content decoding (`snapshot_decode`); the scheduled
+  `.github/workflows/fuzz.yml` job builds them and runs a smoke pass.
 
 Remaining:
 
@@ -461,8 +462,12 @@ P0/P1 follow-ups:
 - [x] **P0** Add `benches/book_replay.rs`: book-only replay with deep sweeps, cancel-at-depth and
   BBO-advance cases, separate from the existing HTTP/Raft `replay_orders` test. Done: results and
   scope are in `docs/PERFORMANCE.md`.
-- [ ] **P0** Add `cargo-fuzz` targets for `OrderBook::execute_order` and snapshot/WAL decoding;
-  keep the targets buildable and runnable in a scheduled job.
+- [x] **P0** Add `cargo-fuzz` targets for `OrderBook::execute_order` and snapshot/WAL decoding;
+  keep the targets buildable and runnable in a scheduled job. Done: `fuzz/` contains the
+  `order_book`, `wal_decode` and `snapshot_decode` targets; `.github/workflows/fuzz.yml` builds
+  them nightly and runs a smoke pass. The order-book target covers the quote-limit
+  zero/overflowing-price and FOK preflight overflow cases, which are now fixed and
+  regression-tested.
 - [ ] **P1** Prototype a per-price-level `Vec` + `head_idx` + order index + cached BBO; benchmark
   cancel, match, amend and depth before merging. Keep the sparse `BTreeMap` for our 18-decimal
   range; do not copy a fixed 65k flat array.

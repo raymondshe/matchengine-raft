@@ -819,9 +819,12 @@ fee token）见 [`docs/FEE_DEDUCTION.md`](./docs/FEE_DEDUCTION.md)。
 | `tests/cluster/test_request_limits.rs` | 超大 JSON 请求体、畸形输入、非法/超长 `client_order_id`、超长 read key 和越界事件分页在进入 Raft 前以 `400`/`413` 拒绝 |
 | `tests/cluster/test_batch_write.rs` | 多个请求在单个 Raft entry 中应用，逐项序列号、连续事件序号，以及空/嵌套/超大/重复 id 批次校验 |
 | `tests/replay/limit_orders/run.sh` | 通过 `replay_orders` 回放五条普通限价单，校验价格-时间优先、多笔成交和部分挂单事件与 `expected-events.jsonl` 一致 |
+| `fuzz/` | `cargo-fuzz` 目标：`OrderBook::execute_order`、WAL 字节解码、快照字节/内容解码；每夜的定时工作流构建三个目标并做一次冒烟运行 |
 
 回放用例不属于 `cargo test`；用 `./tests/replay/limit_orders/run.sh` 运行。它会启动一个
 进程内节点（HTTP `24211`，gRPC `25211`），并把生成的撮合事件 JSONL 与仓库中的参考文件对比。
+
+模糊测试目标是独立的 nightly crate，见 `fuzz/README.md` 和 `.github/workflows/fuzz.yml`。
 
 所有集成测试都使用唯一的临时数据目录。集群测试固定使用端口 `21001-21003`（gRPC
 `22001-22003`），快照测试使用 `21101-21103`，重启测试使用 `21201-21205`，撮合结果测试使用

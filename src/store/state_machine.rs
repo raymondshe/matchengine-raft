@@ -1375,6 +1375,60 @@ fn decode_content(data: &[u8]) -> io::Result<StateMachineData> {
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("corrupt snapshot: {e}")))
 }
 
+/// Decodes one snapshot from memory, validating its magic, version and CRC.
+///
+/// This is the pure decoder behind [`read_snapshot_file`]; it is public so fuzz
+/// targets and diagnostic tools can exercise the framing without touching the
+/// filesystem. The returned data is the postcard-encoded [`StateMachineData`]
+/// body.
+pub fn read_snapshot_bytes<C: RaftTypeConfig>(
+    bytes: &[u8],
+) -> io::Result<(SnapshotMetaOf<C>, Vec<u8>)> {
+    decode_snapshot_bytes::<C>(bytes, "snapshot bytes")
+}
+
+fn decode_snapshot_bytes<C: RaftTypeConfig>(
+    bytes: &[u8],
+    source: &str,
+) -> io::Result<(SnapshotMetaOf<C>, Vec<u8>)> {
+    if bytes.len() < SNAPSHOT_HEADER_LEN || &bytes[0..SNAPSHOT_MAGIC.len()] != SNAPSHOT_MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{source} is not a snapshot file"),
+        ));
+    }
+    let version = u32::from_le_bytes(
+        bytes[SNAPSHOT_MAGIC.len()..SNAPSHOT_MAGIC.len() + 4]
+            .try_into()
+            .unwrap(),
+    );
+    if version != SNAPSHOT_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{source} has unsupported snapshot version {version}"),
+        ));
+    }
+
+    let expected_crc = u32::from_le_bytes(
+        bytes[SNAPSHOT_MAGIC.len() + 4..SNAPSHOT_HEADER_LEN]
+            .try_into()
+            .unwrap(),
+    );
+    if crc32fast::hash(&bytes[SNAPSHOT_HEADER_LEN..]) != expected_crc {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{source} has a snapshot checksum mismatch"),
+        ));
+    }
+
+    let payload: SnapshotPayload<C> =
+        postcard::from_bytes(&bytes[SNAPSHOT_HEADER_LEN..]).map_err(|e| {
+            io::Error::new(io::ErrorKind::InvalidData, format!("corrupt snapshot: {e}"))
+        })?;
+
+    Ok((payload.meta, payload.data))
+}
+
 /// Reads and validates the latest snapshot file.
 ///
 /// `current.snap` is replaced atomically, so the file present at startup is the
@@ -1390,46 +1444,7 @@ pub fn read_snapshot_file<C: RaftTypeConfig>(
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
     };
-
-    if bytes.len() < SNAPSHOT_HEADER_LEN || &bytes[0..SNAPSHOT_MAGIC.len()] != SNAPSHOT_MAGIC {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("{} is not a snapshot file", path.display()),
-        ));
-    }
-    let version = u32::from_le_bytes(
-        bytes[SNAPSHOT_MAGIC.len()..SNAPSHOT_MAGIC.len() + 4]
-            .try_into()
-            .unwrap(),
-    );
-    if version != SNAPSHOT_VERSION {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "{} has unsupported snapshot version {version}",
-                path.display()
-            ),
-        ));
-    }
-
-    let expected_crc = u32::from_le_bytes(
-        bytes[SNAPSHOT_MAGIC.len() + 4..SNAPSHOT_HEADER_LEN]
-            .try_into()
-            .unwrap(),
-    );
-    if crc32fast::hash(&bytes[SNAPSHOT_HEADER_LEN..]) != expected_crc {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("{} has a snapshot checksum mismatch", path.display()),
-        ));
-    }
-
-    let payload: SnapshotPayload<C> =
-        postcard::from_bytes(&bytes[SNAPSHOT_HEADER_LEN..]).map_err(|e| {
-            io::Error::new(io::ErrorKind::InvalidData, format!("corrupt snapshot: {e}"))
-        })?;
-
-    Ok(Some((payload.meta, payload.data)))
+    decode_snapshot_bytes::<C>(&bytes, &path.display().to_string()).map(Some)
 }
 
 /// A writer that computes a CRC32 over exactly the bytes accepted by the

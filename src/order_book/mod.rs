@@ -1059,7 +1059,13 @@ impl OrderBook {
         if order.volume_unit == VolumeUnit::Quote && order.live == OrderType::Limit {
             // A quote limit order becomes a base-denominated resting order at
             // its limit price. The original quote amount stays on the order.
-            let base = (order.volume / order.price).floor_to_multiple(config.base_lot);
+            // `checked_div` rejects a zero price and a result that does not fit
+            // the fixed-point range before any book state changes.
+            let Some(base) = order.volume.checked_div(order.price) else {
+                outcome.rejected = Some(RejectReason::InvalidOrder);
+                return outcome;
+            };
+            let base = base.floor_to_multiple(config.base_lot);
             if base <= Fixed::ZERO {
                 outcome.rejected = Some(RejectReason::InvalidOrder);
                 return outcome;
@@ -1626,13 +1632,13 @@ impl OrderBook {
                 .values()
                 .take_while(|maker| limit.is_none_or(|limit| maker.price <= limit))
                 .map(Order::open_volume)
-                .fold(Fixed::ZERO, |total, volume| total + volume),
+                .fold(Fixed::ZERO, Fixed::saturating_add),
             OrderSide::Sell => self
                 .bids
                 .values()
                 .take_while(|maker| limit.is_none_or(|limit| maker.price >= limit))
                 .map(Order::open_volume)
-                .fold(Fixed::ZERO, |total, volume| total + volume),
+                .fold(Fixed::ZERO, Fixed::saturating_add),
         }
     }
 
@@ -2320,6 +2326,24 @@ mod tests {
     }
 
     #[test]
+    fn fok_preflight_saturates_instead_of_overflowing() {
+        let huge = Fixed::from_raw(i128::MAX / 2);
+        let mut ob = OrderBook::new();
+        let mut a1 = Order::new(OrderSide::Sell, 100, huge, 1);
+        let mut a2 = Order::new(OrderSide::Sell, 100, huge, 2);
+        ob.place_order(&mut a1);
+        ob.place_order(&mut a2);
+
+        let mut fok = Order::new(OrderSide::Buy, 100, 1, 3);
+        fok.tif = TimeInForce::Fok;
+        let outcome = ob.execute_order(&mut fok);
+
+        assert_eq!(None, outcome.rejected);
+        assert_eq!(1, outcome.fills.len());
+        assert_eq!(Fixed::from(1), outcome.fills[0].matches);
+    }
+
+    #[test]
     fn market_order_sweeps_every_level_and_never_rests() {
         let mut ob = OrderBook::new();
         let mut a1 = resting_order(OrderSide::Sell, 100.0, 6.0, 1);
@@ -2648,6 +2672,34 @@ mod tests {
             ob.execute_order_with_symbol(&mut too_small, config)
                 .rejected
         );
+    }
+
+    #[test]
+    fn quote_limit_with_zero_or_overflowing_price_is_rejected() {
+        let mut ob = OrderBook::new();
+
+        // A quote limit normalizes volume / price before shape validation; a
+        // zero price must be rejected, not panic in the division.
+        let mut zero = Order::new(OrderSide::Buy, 0, 100, 1).with_volume_unit(VolumeUnit::Quote);
+        assert_eq!(
+            Some(RejectReason::InvalidOrder),
+            ob.execute_order(&mut zero).rejected
+        );
+        assert!(ob.bids.is_empty());
+
+        // A result that does not fit the scale-18 range is also rejected.
+        let mut overflow = Order::new(
+            OrderSide::Buy,
+            Fixed::from_raw(1),
+            Fixed::from_raw(i128::MAX),
+            2,
+        )
+        .with_volume_unit(VolumeUnit::Quote);
+        assert_eq!(
+            Some(RejectReason::InvalidOrder),
+            ob.execute_order(&mut overflow).rejected
+        );
+        assert!(ob.bids.is_empty());
     }
 
     #[test]

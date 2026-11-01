@@ -1,0 +1,31 @@
+name: Fuzz
+
+on:
+  schedule:
+    # Run nightly so corpus/decoder coverage does not depend on PR traffic.
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Build fuzz targets
+        run: cargo fuzz build
+      - name: Smoke-fuzz order book
+        run: cargo fuzz run order_book -- -runs=2000 -max_total_time=60
+      - name: Smoke-fuzz WAL decoding
+        run: cargo fuzz run wal_decode -- -runs=2000 -max_total_time=60
+      - name: Smoke-fuzz snapshot decoding
+        run: cargo fuzz run snapshot_decode -- -runs=2000 -max_total_time=60

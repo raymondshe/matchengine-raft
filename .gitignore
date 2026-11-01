@@ -2,3 +2,7 @@ target
 *.log
 logs/
 my_db
+fuzz/target
+fuzz/corpus
+fuzz/artifacts
+fuzz/coverage

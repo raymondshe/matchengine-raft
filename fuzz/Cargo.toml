@@ -1,0 +1,45 @@
+[package]
+name = "matchengine-raft-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+arbitrary = { version = "1", features = ["derive"] }
+crc32fast = "1.5.3"
+libfuzzer-sys = "0.4"
+postcard = { version = "1.1.3", features = ["use-std"] }
+
+[dependencies.matchengine-raft]
+path = ".."
+
+# Keep this crate out of the parent package's workspace resolution.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "order_book"
+path = "fuzz_targets/order_book.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wal_decode"
+path = "fuzz_targets/wal_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "snapshot_decode"
+path = "fuzz_targets/snapshot_decode.rs"
+test = false
+doc = false
+bench = false

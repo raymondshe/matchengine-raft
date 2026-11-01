@@ -16,7 +16,9 @@ use matchengine_raft::order_book::OrderType;
 use matchengine_raft::order_book::TimeInForce;
 use matchengine_raft::store::StateMachineData;
 use matchengine_raft::store::log_store::WalRecord;
+use matchengine_raft::store::log_store::read_wal_bytes;
 use matchengine_raft::store::log_store::read_wal_file;
+use matchengine_raft::store::state_machine::read_snapshot_bytes;
 use matchengine_raft::store::state_machine::read_snapshot_file;
 use openraft::Entry;
 use openraft::LogId;
@@ -645,6 +647,19 @@ fn dump_helpers_read_wal_records_and_snapshot_content() {
 
     let wal = &wal_files(dir.path())[0];
     let records = read_wal_file::<C>(wal).unwrap();
+    let wal_bytes = std::fs::read(wal).unwrap();
+    let records_from_bytes = read_wal_bytes::<C>(&wal_bytes).unwrap();
+    assert_eq!(records.len(), records_from_bytes.len());
+    assert_eq!(
+        records
+            .iter()
+            .map(|(offset, _)| *offset)
+            .collect::<Vec<_>>(),
+        records_from_bytes
+            .iter()
+            .map(|(offset, _)| *offset)
+            .collect::<Vec<_>>()
+    );
     assert!(
         records.iter().any(|(_, record)| matches!(
             record,
@@ -660,9 +675,14 @@ fn dump_helpers_read_wal_records_and_snapshot_content() {
         "WAL dump is missing the committed marker"
     );
 
-    let (meta, data) = read_snapshot_file::<C>(&dir.path().join("snapshot"))
+    let snapshot_dir = dir.path().join("snapshot");
+    let (meta, data) = read_snapshot_file::<C>(&snapshot_dir)
         .unwrap()
         .expect("snapshot exists");
+    let snapshot_bytes = std::fs::read(snapshot_dir.join("current.snap")).unwrap();
+    let (meta_from_bytes, data_from_bytes) = read_snapshot_bytes::<C>(&snapshot_bytes).unwrap();
+    assert_eq!(meta.last_log_id, meta_from_bytes.last_log_id);
+    assert_eq!(data, data_from_bytes);
     let content: StateMachineData = postcard::from_bytes(&data).unwrap();
     assert!(meta.last_log_id.is_none());
     assert!(content.orders.is_empty());

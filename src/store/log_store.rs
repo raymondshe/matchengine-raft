@@ -812,25 +812,33 @@ fn decode_record<C: RaftTypeConfig>(payload: &[u8]) -> io::Result<WalRecord<C>> 
     postcard::from_bytes(payload).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
-/// Reads one WAL segment without modifying it, validating the header and every
-/// record CRC.
+/// Reads one WAL segment from memory, validating the header and every record
+/// CRC.
 ///
-/// Returns `(offset, record)` pairs in file order. A truncated final frame is
-/// ignored, matching the recovery rule that only the last segment may have a
-/// torn tail. A CRC mismatch or an unsupported format returns an error.
-pub fn read_wal_file<C: RaftTypeConfig>(path: &Path) -> io::Result<Vec<(u64, WalRecord<C>)>> {
-    let bytes = std::fs::read(path)?;
+/// This is the pure decoder behind [`read_wal_file`]; it is public so fuzz
+/// targets and diagnostic tools can exercise the framing without touching the
+/// filesystem. A truncated final frame is ignored, matching the recovery rule
+/// that only the last segment may have a torn tail. A CRC mismatch or an
+/// unsupported format returns an error.
+pub fn read_wal_bytes<C: RaftTypeConfig>(bytes: &[u8]) -> io::Result<Vec<(u64, WalRecord<C>)>> {
+    decode_wal_bytes::<C>(bytes, "WAL bytes")
+}
+
+fn decode_wal_bytes<C: RaftTypeConfig>(
+    bytes: &[u8],
+    source: &str,
+) -> io::Result<Vec<(u64, WalRecord<C>)>> {
     let file_len = bytes.len() as u64;
     if file_len < SEGMENT_HEADER_LEN {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("{} has a truncated segment header", path.display()),
+            format!("{source} has a truncated segment header"),
         ));
     }
     if &bytes[0..SEGMENT_MAGIC.len()] != SEGMENT_MAGIC {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("{} has a bad segment magic", path.display()),
+            format!("{source} has a bad segment magic"),
         ));
     }
     let version = u32::from_le_bytes(
@@ -841,10 +849,7 @@ pub fn read_wal_file<C: RaftTypeConfig>(path: &Path) -> io::Result<Vec<(u64, Wal
     if version != SEGMENT_VERSION {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!(
-                "{} has unsupported segment version {version}",
-                path.display()
-            ),
+            format!("{source} has unsupported segment version {version}"),
         ));
     }
 
@@ -865,13 +870,24 @@ pub fn read_wal_file<C: RaftTypeConfig>(path: &Path) -> io::Result<Vec<(u64, Wal
         if crc32fast::hash(payload) != crc {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("{} has a CRC mismatch at offset {pos}", path.display()),
+                format!("{source} has a CRC mismatch at offset {pos}"),
             ));
         }
         records.push((pos, decode_record::<C>(payload)?));
         pos += RECORD_HEADER_LEN + len as u64;
     }
     Ok(records)
+}
+
+/// Reads one WAL segment without modifying it, validating the header and every
+/// record CRC.
+///
+/// Returns `(offset, record)` pairs in file order. A truncated final frame is
+/// ignored, matching the recovery rule that only the last segment may have a
+/// torn tail. A CRC mismatch or an unsupported format returns an error.
+pub fn read_wal_file<C: RaftTypeConfig>(path: &Path) -> io::Result<Vec<(u64, WalRecord<C>)>> {
+    let bytes = std::fs::read(path)?;
+    decode_wal_bytes::<C>(&bytes, &path.display().to_string())
 }
 
 /// `(log index, offset within the batch buffer, payload length)`.
