@@ -63,7 +63,7 @@ Built for teams that need deterministic execution, durable recovery and a clean 
 - **Atomic snapshots** written by temp file → fsync → rename → directory fsync, with checksum validation before install.
 - **Snapshot policy for real workloads**: every 100,000 applied entries or 30 minutes when newer entries exist, configurable with `--snapshot-interval-ms`.
 - **Snapshot + WAL-tail recovery** that restores the latest snapshot, event window and idempotency map, then replays only newer log entries.
-- **gRPC replication** with bidirectional `stream_append`, chunked snapshot transfer and independent per-peer channels.
+- **gRPC replication** with bidirectional `stream_append`, chunked snapshot transfer, leadership transfer and independent per-peer channels.
 
 **APIs and data feeds**
 - **Durable match-event feed** at `POST /events` with cursor pagination, retention limits, `client_order_id` idempotency and replay-safe retries.
@@ -72,6 +72,11 @@ Built for teams that need deterministic execution, durable recovery and a clean 
 - **Leader-aware Rust client** that tracks and forwards requests to the current leader.
 - **Operational APIs** for initialization, membership changes, metrics, event status and market-data status.
 - **Batch writes** at `POST /write_batch`: multiple requests in one Raft entry and one WAL fsync, with per-request sequences and continuous event ordinals.
+
+**Operational visibility**
+- **Embedded WebUI console** at `/console/`: cluster health, Raft leadership and replication, storage/event/feed state, a leader-only event viewer and diagnostics — no build step or external assets.
+- **Guarded Raft actions**: graceful leadership transfer over the gRPC `TransferLeader` RPC, a best-effort Pre-Vote election request, and snapshot triggering, with confirmation, action locking and audit logs.
+- **Health and readiness probes**: `/health` reports the gRPC listener, Raft core and WAL/state-machine frontier; `/ready` additionally requires a known leader, making both suitable for orchestrators.
 
 **Built to be trusted**
 - **Bounded public edge**: request-body, read-key, event-page, idempotency-key and snapshot-size limits, with malformed input rejected before Raft.
