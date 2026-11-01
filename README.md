@@ -36,6 +36,7 @@ A practical implementation of a distributed matching engine built upon [OpenRaft
 - [Architecture Overview](#architecture-overview)
 - [Getting Started](#getting-started)
 - [Running the Cluster](#running-the-cluster)
+- [Operational Console](#operational-console)
 - [Security and Deployment Boundary](#security-and-deployment-boundary)
 - [Project Structure](#project-structure)
 - [Storage Implementation](#storage-implementation)
@@ -302,6 +303,16 @@ The project also includes `scripts/test.sh` for more convenient cluster manageme
 
 `scripts/test.sh` keeps all state under `RAFT_DATA_DIR` (default `/tmp/matchengine-raft`), so
 `place-order` results survive `start-node`/`kill` cycles.
+
+## Operational Console
+
+Every node serves an embedded operational console at `/console/`. It shows cluster health, Raft
+leadership and replication, durable storage and event/feed state, and offers guarded leadership
+actions. See [`docs/OPERATIONAL_CONSOLE.md`](./docs/OPERATIONAL_CONSOLE.md) for the design and
+[`docs/OPERATIONAL_CONSOLE_LAYOUT.html`](./docs/OPERATIONAL_CONSOLE_LAYOUT.html) for the layout
+mockup.
+
+![Operational console](./docs/operational-console.jpg)
 
 ## Security and Deployment Boundary
 
@@ -711,6 +722,7 @@ mounted on the HTTP JSON listener:
 - `AppendEntries` and `Vote` (unary)
 - `InstallSnapshot` (client-streaming chunks)
 - `AppendStream` (bidirectional pipelined appends)
+- `TransferLeader` (graceful leadership handoff used by the console)
 
 See `proto/raft.proto`. Unary append/vote use `RPCOption::soft_ttl`, snapshots stream in 256 KiB
 chunks, and both message directions are capped at 64 MiB. `Unavailable` maps to
@@ -725,6 +737,24 @@ chunks, and both message directions are capped at 64 MiB. `Unavailable` maps to
 - `POST /change-membership` - Change the voter set; body is `[1, 2, 3]`
 - `GET /metrics` - Get Raft metrics
 - `POST /get_linearizer` - Fetch a read linearizer from the leader (used by `/follower_read`)
+
+### Operational APIs
+
+- `GET /health` - Liveness: reports the gRPC listener, Raft role/leader, WAL and state-machine
+  frontier. Returns `200` while the listener, Raft core and storage are usable, `503` otherwise.
+- `GET /ready` - Readiness: returns `200` only when the node is healthy and a cluster leader is
+  known; `503` during startup, elections or a partition. A follower with a known leader is ready
+  for reads; writes still go to the leader.
+- `GET /console/` - Embedded operational console (HTML/CSS/JS); no build step or external assets
+- `GET /console/api/node` - Stable node snapshot: health, Raft role, storage frontier, events and feed
+- `GET /console/api/cluster` - Local node plus peer snapshots from the current membership
+- `POST /console/api/actions/transfer-leader` - Graceful leadership transfer (leader-only)
+- `POST /console/api/actions/elect` - Best-effort local Pre-Vote election request
+- `POST /console/api/actions/snapshot` - Trigger a local snapshot
+- `GET /console/api/actions` - Recent in-memory console actions
+
+Console actions require an `X-Console-Action: 1` header and are serialized. The console inherits
+the internal-only HTTP contract; TLS and operator authentication stay at the gateway.
 
 ### Application APIs
 
@@ -878,6 +908,8 @@ placeholder). `sequence` is still required by the deserializer.
 | `tests/cluster/test_fees.rs` | Maker and taker fee rates produce exact fill fees in `/write`, `/events`, the file sink and the market-data feed, and survive snapshot restart |
 | `tests/cluster/test_fee_assets.rs` | QQQ/USD ETF/fiat metadata, tick/lot enforcement, quote-volume limit normalization and quote-asset fee deduction |
 | `tests/cluster/test_request_limits.rs` | Oversized JSON bodies, malformed input, invalid/oversized `client_order_id`s, oversized read keys and out-of-range event pages are rejected with `400`/`413` before Raft changes the book |
+| `tests/cluster/test_health.rs` | `/health` reports the gRPC listener, leadership and WAL/state-machine state; `/ready` is `503` before initialization and `200` after a leader is elected |
+| `tests/cluster/test_console.rs` | Three-node cluster: embedded console assets, node/cluster APIs, unsafe-action rejection and leadership transfer through `/console/api/actions/transfer-leader` |
 | `tests/cluster/test_batch_write.rs` | Multiple requests are applied in one Raft entry with per-item sequences, continuous event ordinals, and edge validation for empty, nested, oversized and duplicate-id batches |
 | `tests/replay/limit_orders/run.sh` | Shell-driven replay of five regular limit orders through `replay_orders`; checks price-time priority, multi-fill and partial-rest events against `expected-events.jsonl` |
 | `fuzz/` | `cargo-fuzz` targets for `OrderBook::execute_order`, WAL byte decoding and snapshot byte/content decoding; the nightly scheduled workflow builds all three and runs a smoke pass |
@@ -894,8 +926,9 @@ Every integration test uses a unique temporary data directory. The cluster test 
 `21201-21205`, the match-result tests `21301`/`21302`, the market-data test `21303`, the event-log test
 `21304`, the failover test `21401-21403`, the learner catch-up test `21501-21502`, the late-join
 test `21601-21603`, the exactness test `21701` (gRPC `22701`), the symbol-config test `21801` (gRPC `22801`), the fee test `21901` (gRPC `22901`), the
-fee-asset test `21902` (gRPC `22902`), the request-limit test `21903` (gRPC `22903`) and the batch-write test `21904` (gRPC `22904`); stop
-leftover processes
+fee-asset test `21902` (gRPC `22902`), the request-limit test `21903` (gRPC `22903`), the batch-write
+test `21904` (gRPC `22904`), the health test `21905` (gRPC `22905`) and the console test
+`21906-21908` (gRPC `22906-22908`); stop leftover processes
 (`pkill -f matchengine-raft`) before rerunning.
 
 ## Performance and Current Limits

@@ -24,6 +24,10 @@ service RaftService {
   // Bidirectional streaming AppendEntries. The server replies once per request in
   // request order.
   rpc AppendStream(stream AppendRequest) returns (stream AppendResponse);
+
+  // Ask a peer to accept a leadership transfer. The payload is a postcard-encoded
+  // openraft `TransferLeaderRequest`.
+  rpc TransferLeader(TransferLeaderCall) returns (TransferLeaderResponse);
 }
 
 message AppendRequest {
@@ -57,5 +61,13 @@ message SnapshotChunk {
 }
 
 message SnapshotResponse {
+  bytes payload = 1;
+}
+
+message TransferLeaderCall {
+  bytes payload = 1;
+}
+
+message TransferLeaderResponse {
   bytes payload = 1;
 }

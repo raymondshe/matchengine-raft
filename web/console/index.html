@@ -1,0 +1,368 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MatchEngine Raft — Operational Console</title>
+<link rel="stylesheet" href="/console/app.css">
+<script src="/console/app.js" defer></script>
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <div class="brand-mark">MR</div>
+    <div class="brand-text">
+      <strong>MatchEngine Raft</strong>
+      <span>Operational console</span>
+    </div>
+  </div>
+  <div class="topbar-status">
+    <span class="chip" id="cluster-chip"><span class="dot"></span> Connecting</span>
+    <span class="chip" id="leader-chip">Leader <strong>—</strong></span>
+    <span class="chip" id="term-chip">Term <strong>—</strong></span>
+    <span class="muted mono" id="updated">not loaded</span>
+    <button class="btn ghost" id="refresh-button" type="button">Refresh</button>
+  </div>
+</header>
+
+<main class="page">
+  <div class="page-head">
+    <div>
+      <div class="eyebrow">Operational console</div>
+      <h1 id="node-title">node-—</h1>
+      <p>One symbol, one Raft group. Switch tabs for cluster, Raft, storage, events, actions and diagnostics.</p>
+    </div>
+    <label class="toggle"><input type="checkbox" id="auto-refresh" checked> Auto-refresh 2s</label>
+  </div>
+
+  <input class="tab-input" type="radio" name="console-tab" id="tab-overview" checked aria-label="Overview">
+  <input class="tab-input" type="radio" name="console-tab" id="tab-raft" aria-label="Raft">
+  <input class="tab-input" type="radio" name="console-tab" id="tab-storage" aria-label="Storage">
+  <input class="tab-input" type="radio" name="console-tab" id="tab-events" aria-label="Events">
+  <input class="tab-input" type="radio" name="console-tab" id="tab-actions" aria-label="Actions">
+  <input class="tab-input" type="radio" name="console-tab" id="tab-diagnostics" aria-label="Diagnostics">
+
+  <nav class="tab-list" aria-label="Console sections">
+    <label class="tab" for="tab-overview"><span class="tab-icon">◈</span> Overview</label>
+    <label class="tab" for="tab-raft"><span class="tab-icon">⌁</span> Raft</label>
+    <label class="tab" for="tab-storage"><span class="tab-icon">▤</span> Storage</label>
+    <label class="tab" for="tab-events"><span class="tab-icon">≡</span> Events</label>
+    <label class="tab" for="tab-actions"><span class="tab-icon">⇄</span> Actions</label>
+    <label class="tab" for="tab-diagnostics"><span class="tab-icon">⌕</span> Diagnostics</label>
+  </nav>
+
+  <div class="tab-panels">
+    <section class="tab-panel" id="panel-overview" aria-label="Overview">
+      <div class="banner" id="warning-banner" hidden>
+        <strong>Cluster warning</strong>
+        <span id="warning-text"></span>
+      </div>
+
+      <section class="stat-grid" aria-label="Cluster summary">
+        <article class="stat">
+          <span class="stat-label">Leader</span>
+          <strong id="stat-leader">—</strong>
+          <span class="stat-foot" id="stat-leader-foot">waiting</span>
+        </article>
+        <article class="stat">
+          <span class="stat-label">Reachable</span>
+          <strong id="stat-reachable">—</strong>
+          <span class="stat-foot" id="stat-reachable-foot">waiting</span>
+        </article>
+        <article class="stat">
+          <span class="stat-label">Max replication lag</span>
+          <strong id="stat-lag">—</strong>
+          <span class="stat-foot" id="stat-lag-foot">waiting</span>
+        </article>
+        <article class="stat">
+          <span class="stat-label">Not ready</span>
+          <strong id="stat-not-ready">—</strong>
+          <span class="stat-foot" id="stat-not-ready-foot">waiting</span>
+        </article>
+        <article class="stat">
+          <span class="stat-label">Committed index</span>
+          <strong id="stat-committed">—</strong>
+          <span class="stat-foot" id="stat-committed-foot">waiting</span>
+        </article>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <div>
+            <h2>Nodes</h2>
+            <p>Membership and local health, as seen from this node.</p>
+          </div>
+          <span class="muted mono" id="member-count">— members</span>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Node</th>
+                <th>Role</th>
+                <th>Raft state</th>
+                <th>Health</th>
+                <th>Leader</th>
+                <th>Last log</th>
+                <th>Applied</th>
+                <th>Lag</th>
+              </tr>
+            </thead>
+            <tbody id="nodes-body"></tbody>
+          </table>
+        </div>
+      </section>
+    </section>
+
+    <section class="tab-panel" id="panel-raft" aria-label="Raft">
+      <div class="grid-2">
+        <section class="panel">
+          <div class="panel-head">
+            <div>
+              <h2>Raft state</h2>
+              <p>Local role, term and log frontier.</p>
+            </div>
+            <span class="badge" id="raft-health">—</span>
+          </div>
+          <div class="kv-grid">
+            <div class="kv"><span>Role</span><span id="raft-role">—</span></div>
+            <div class="kv"><span>Term / vote</span><span id="raft-term-vote">—</span></div>
+            <div class="kv"><span>Last log</span><span id="raft-last-log">—</span></div>
+            <div class="kv"><span>Local committed</span><span id="raft-local-committed">—</span></div>
+            <div class="kv"><span>Cluster committed</span><span id="raft-cluster-committed">—</span></div>
+            <div class="kv"><span>Last applied</span><span id="raft-applied">—</span></div>
+            <div class="kv"><span>Snapshot</span><span id="raft-snapshot">—</span></div>
+            <div class="kv"><span>Purged</span><span id="raft-purged">—</span></div>
+          </div>
+          <div class="panel-body">
+            <span class="badge" id="raft-voters">voters —</span>
+            <span class="badge" id="raft-learners">learners —</span>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <div>
+              <h2>Replication</h2>
+              <p>Leader view; followers show “leader view unavailable”.</p>
+            </div>
+            <span class="badge" id="replication-scope">—</span>
+          </div>
+          <table class="compact">
+            <thead>
+              <tr><th>Node</th><th>Matched</th><th>Lag</th><th>Last ack</th></tr>
+            </thead>
+            <tbody id="replication-body"></tbody>
+          </table>
+        </section>
+      </div>
+    </section>
+
+    <section class="tab-panel" id="panel-storage" aria-label="Storage">
+      <div class="grid-2">
+        <section class="panel">
+          <div class="panel-head">
+            <div>
+              <h2>Durable frontier</h2>
+              <p>WAL, state machine and snapshot state.</p>
+            </div>
+            <span class="badge" id="storage-health">—</span>
+          </div>
+          <div class="kv-grid">
+            <div class="kv"><span>WAL last</span><span id="storage-wal-last">—</span></div>
+            <div class="kv"><span>WAL purged</span><span id="storage-wal-purged">—</span></div>
+            <div class="kv"><span>State machine</span><span id="storage-applied">—</span></div>
+            <div class="kv"><span>Snapshot</span><span id="storage-snapshot">—</span></div>
+            <div class="kv"><span>Order sequence</span><span id="storage-sequence">—</span></div>
+            <div class="kv"><span>Spread</span><span id="storage-spread">—</span></div>
+            <div class="kv"><span>Last trade</span><span id="storage-last-trade">—</span></div>
+            <div class="kv"><span>Book levels</span><span id="storage-levels">—</span></div>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <div>
+              <h2>Event window &amp; feed</h2>
+              <p>Retention and market-data publication.</p>
+            </div>
+            <span class="badge" id="feed-badge">—</span>
+          </div>
+          <div class="meter">
+            <div class="meter-label"><span>Retained events</span><span id="event-label">—</span></div>
+            <progress class="meter-progress" id="event-fill" max="100" value="0"></progress>
+          </div>
+          <div class="kv-grid">
+            <div class="kv"><span>Oldest event</span><span id="event-oldest">—</span></div>
+            <div class="kv"><span>Last event</span><span id="event-last">—</span></div>
+            <div class="kv"><span>Evictions</span><span id="event-evictions">—</span></div>
+            <div class="kv"><span>Last market seq</span><span id="feed-last-seq">—</span></div>
+          </div>
+          <div class="feed-row">
+            <span id="feed-state">—</span>
+            <span class="mono muted" id="feed-queue">—</span>
+          </div>
+        </section>
+      </div>
+    </section>
+
+    <section class="tab-panel" id="panel-events" aria-label="Events">
+      <section class="panel">
+        <div class="panel-head">
+          <div>
+            <h2>Match events</h2>
+            <p>Leader-only event log. Cursor pagination uses (log_index, ordinal).</p>
+          </div>
+          <span class="badge" id="events-badge">—</span>
+        </div>
+        <div class="filter-bar">
+          <label class="filter">Kind
+            <select id="event-kind">
+              <option value="">All kinds</option>
+              <option>fill</option>
+              <option>rested</option>
+              <option>cancelled</option>
+              <option>triggered</option>
+              <option>expired</option>
+              <option>rejected</option>
+              <option>amended</option>
+            </select>
+          </label>
+          <label class="filter">Side
+            <select id="event-side">
+              <option value="">All sides</option>
+              <option>buy</option>
+              <option>sell</option>
+            </select>
+          </label>
+          <label class="filter">Page size
+            <select id="event-limit">
+              <option>100</option>
+              <option selected>500</option>
+              <option>1000</option>
+            </select>
+          </label>
+          <button class="btn ghost" id="events-pause" type="button">Pause</button>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>Event id</th><th>Kind</th><th>Side</th><th>Price</th><th>Volume</th><th>Order seq</th></tr>
+            </thead>
+            <tbody id="events-body"></tbody>
+          </table>
+        </div>
+        <div class="pager">
+          <span id="events-status">—</span>
+          <span class="diag-actions">
+            <button class="btn ghost" id="events-newer" type="button">Newest</button>
+            <button class="btn" id="events-older" type="button">Older</button>
+          </span>
+        </div>
+      </section>
+    </section>
+
+    <section class="tab-panel" id="panel-actions" aria-label="Actions">
+      <div class="grid-2">
+        <section class="panel">
+          <div class="panel-head">
+            <div>
+              <h2>Transfer leadership</h2>
+              <p>Graceful Raft transfer to a caught-up voter.</p>
+            </div>
+            <span class="badge" id="action-leader-badge">—</span>
+          </div>
+          <form class="action-form" id="transfer-form">
+            <label>
+              Target voter
+              <select id="transfer-target"></select>
+            </label>
+            <label class="check">
+              <input type="checkbox" id="transfer-confirm">
+              I understand this changes the Raft leader for the cluster.
+            </label>
+            <button class="btn primary" id="transfer-button" type="submit" disabled>Transfer leadership</button>
+          </form>
+          <p class="hint" id="action-hint">Current leader —. The console polls until a new leader is observed; it does not retry automatically.</p>
+          <p class="hint" id="action-result"></p>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <div>
+              <h2>Maintenance</h2>
+              <p>Lower-risk actions, still confirmed.</p>
+            </div>
+            <span class="badge">guarded</span>
+          </div>
+          <div class="action-card">
+            <strong>Request election on this node</strong>
+            <p>Best-effort Pre-Vote request. A healthy leader may reject it; the term does not climb when the target cannot win.</p>
+            <button class="btn" id="elect-button" type="button">Request election</button>
+          </div>
+          <div class="action-card">
+            <strong>Trigger snapshot</strong>
+            <p>Ask this node to build a snapshot now. The periodic timer and log-count policy remain active.</p>
+            <button class="btn" id="snapshot-button" type="button">Trigger snapshot</button>
+          </div>
+        </section>
+      </div>
+
+      <section class="panel">
+        <div class="panel-head">
+          <div>
+            <h2>Recent actions</h2>
+            <p>In-memory history; durable audit belongs to the gateway/log pipeline.</p>
+          </div>
+          <span class="muted mono" id="action-count">last 0</span>
+        </div>
+        <ul class="timeline" id="action-history"></ul>
+      </section>
+    </section>
+
+    <section class="tab-panel" id="panel-diagnostics" aria-label="Diagnostics">
+      <section class="panel">
+        <div class="panel-head">
+          <div>
+            <h2>Cluster diagnostics</h2>
+            <p>Copy the stable cluster snapshot or inspect the raw health payloads.</p>
+          </div>
+          <span class="badge">schema v1</span>
+        </div>
+        <div class="diag-row">
+          <span class="muted">Useful when escalating an incident or comparing a follower with the leader.</span>
+          <div class="diag-actions">
+            <button class="btn" id="copy-json" type="button">Copy cluster JSON</button>
+            <button class="btn" id="download-json" type="button">Download snapshot</button>
+            <a class="btn ghost" href="/health" target="_blank" rel="noopener">Open raw /health</a>
+          </div>
+        </div>
+        <pre class="code-block" id="diagnostics-json">Loading…</pre>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <div>
+            <h2>Node metadata</h2>
+            <p>Identity and capabilities used by the console.</p>
+          </div>
+        </div>
+        <div class="kv-grid">
+          <div class="kv"><span>Version</span><span id="meta-version">—</span></div>
+          <div class="kv"><span>Started</span><span id="meta-started">—</span></div>
+          <div class="kv"><span>HTTP</span><span id="meta-http">—</span></div>
+          <div class="kv"><span>gRPC</span><span id="meta-grpc">—</span></div>
+          <div class="kv"><span>Capabilities</span><span id="meta-capabilities">—</span></div>
+          <div class="kv"><span>Schema</span><span>v1</span></div>
+        </div>
+      </section>
+    </section>
+  </div>
+
+  <footer class="footer">
+    <span>Operational console · internal use only · TLS and authentication belong to the gateway</span>
+    <span class="mono" id="footer-version">matchengine-raft</span>
+  </footer>
+</main>
+</body>
+</html>

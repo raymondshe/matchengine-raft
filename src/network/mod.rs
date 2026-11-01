@@ -1,5 +1,7 @@
 pub mod api;
+pub mod console;
 pub mod grpc;
+pub mod health;
 pub mod management;
 
 /// Ports for the Raft transport are derived from the public HTTP port so that

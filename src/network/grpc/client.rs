@@ -29,6 +29,8 @@ use openraft::raft::AppendEntriesRequest;
 use openraft::raft::AppendEntriesResponse;
 use openraft::raft::SnapshotResponse;
 use openraft::raft::StreamAppendResult;
+use openraft::raft::TransferLeaderRequest;
+use openraft::raft::TransferLeaderResponse;
 use openraft::raft::VoteRequest;
 use openraft::raft::VoteResponse;
 use tokio::sync::mpsc;
@@ -47,6 +49,7 @@ use crate::network::grpc::encode;
 use crate::network::grpc::pb::AppendRequest;
 use crate::network::grpc::pb::SnapshotChunk;
 use crate::network::grpc::pb::SnapshotResponse as PbSnapshotResponse;
+use crate::network::grpc::pb::TransferLeaderCall;
 use crate::network::grpc::pb::VoteCallRequest;
 use crate::network::grpc::pb::raft_service_client::RaftServiceClient;
 use crate::network::raft_addr_from_http;
@@ -209,6 +212,30 @@ where
             .await?;
 
         let result: Result<VoteResponse<C>, openraft::errors::RaftError<C>> =
+            decode(&resp.payload).map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
+        result.map_err(|e| RPCError::Network(NetworkError::new(&e)))
+    }
+
+    /// Sends a graceful leadership-transfer request to the target peer.
+    #[tracing::instrument(level = "debug", skip_all, err(Debug))]
+    async fn transfer_leader(
+        &mut self,
+        req: TransferLeaderRequest<C>,
+        option: RPCOption,
+    ) -> Result<TransferLeaderResponse<C>, RPCError<C>> {
+        let payload = encode(&req).map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
+        let mut client = self.client()?;
+        let ttl = option.soft_ttl();
+
+        let resp = self
+            .unary(
+                RPCTypes::TransferLeader,
+                ttl,
+                client.transfer_leader(TransferLeaderCall { payload }),
+            )
+            .await?;
+
+        let result: Result<TransferLeaderResponse<C>, openraft::errors::Fatal<C>> =
             decode(&resp.payload).map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
         result.map_err(|e| RPCError::Network(NetworkError::new(&e)))
     }

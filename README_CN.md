@@ -36,6 +36,7 @@
 - [架构概述](#架构概述)
 - [快速开始](#快速开始)
 - [运行集群](#运行集群)
+- [运维控制台](#运维控制台)
 - [安全与部署边界](#安全与部署边界)
 - [项目结构](#项目结构)
 - [存储实现](#存储实现)
@@ -296,6 +297,15 @@ curl -X POST -H "Content-Type: application/json" \
 
 `scripts/test.sh` 把所有状态保存在 `RAFT_DATA_DIR`（默认 `/tmp/matchengine-raft`）下，因此
 `place-order` 的结果在 `start-node`/`kill` 循环后仍然存在。
+
+## 运维控制台
+
+每个节点在 `/console/` 提供内置运维控制台，展示集群健康、Raft 领导与复制、持久化存储、事件窗口和
+行情 feed 状态，并提供受保护的领导者切换、选举请求和快照操作。设计见
+[`docs/OPERATIONAL_CONSOLE.md`](./docs/OPERATIONAL_CONSOLE.md)，布局预览见
+[`docs/OPERATIONAL_CONSOLE_LAYOUT.html`](./docs/OPERATIONAL_CONSOLE_LAYOUT.html)。
+
+![运维控制台](./docs/operational-console.jpg)
 
 ## 安全与部署边界
 
@@ -674,6 +684,7 @@ Raft 节点间 RPC 仅由 `--http-addr` 端口 + 1000 上的 gRPC 提供；HTTP 
 - `AppendEntries`、`Vote`（一元）
 - `InstallSnapshot`（客户端流式分块）
 - `AppendStream`（双向流水线追加）
+- `TransferLeader`（控制台使用的优雅领导者交接）
 
 定义见 `proto/raft.proto`。一元 append/vote 使用 `RPCOption::soft_ttl`，快照按 256 KiB 分块，
 双向消息上限均为 64 MiB；`Unavailable` 映射为 `RPCError::Unreachable`，超时映射为
@@ -687,6 +698,23 @@ Raft 节点间 RPC 仅由 `--http-addr` 端口 + 1000 上的 gRPC 提供；HTTP 
 - `POST /change-membership` - 变更投票成员集合；请求体为 `[1, 2, 3]`
 - `GET /metrics` - 获取 Raft 指标
 - `POST /get_linearizer` - 从领导者获取读 linearizer（供 `/follower_read` 使用）
+
+### 运维 API
+
+- `GET /health` - 存活检查：报告 gRPC 监听器、Raft 角色/领导者、WAL 与状态机前沿。监听器、Raft
+  核心和存储可用时返回 `200`，否则返回 `503`。
+- `GET /ready` - 就绪检查：仅在节点健康且已知集群领导者时返回 `200`；启动、选举或分区期间返回
+  `503`。知道领导者的 follower 可服务读请求，写请求仍需发送给领导者。
+- `GET /console/` - 内置运维控制台（HTML/CSS/JS），无需构建步骤或外部资源
+- `GET /console/api/node` - 稳定的节点快照：健康、Raft 角色、存储前沿、事件和 feed
+- `GET /console/api/cluster` - 当前成员关系中的本节点与对端快照
+- `POST /console/api/actions/transfer-leader` - 优雅领导者切换（仅领导者）
+- `POST /console/api/actions/elect` - 尽力而为的本地 Pre-Vote 选举请求
+- `POST /console/api/actions/snapshot` - 触发本地快照
+- `GET /console/api/actions` - 最近的内存操作记录
+
+控制台操作要求 `X-Console-Action: 1` 请求头，并在进程内串行执行。控制台继承内部 HTTP
+契约；TLS 和运维认证仍由网关负责。
 
 ### 应用 API
 
@@ -817,6 +845,8 @@ fee token）见 [`docs/FEE_DEDUCTION.md`](./docs/FEE_DEDUCTION.md)。
 | `tests/cluster/test_fees.rs` | 吃单/挂单费率产生精确的成交费用，经 `/write`、`/events`、文件 sink 和行情 feed 输出，并在快照重启后保留 |
 | `tests/cluster/test_fee_assets.rs` | QQQ/USD ETF/法币元数据、tick/lot、quote 数量限价单归一化和 quote 资产扣费 |
 | `tests/cluster/test_request_limits.rs` | 超大 JSON 请求体、畸形输入、非法/超长 `client_order_id`、超长 read key 和越界事件分页在进入 Raft 前以 `400`/`413` 拒绝 |
+| `tests/cluster/test_health.rs` | `/health` 报告 gRPC 监听器、领导者和 WAL/状态机状态；`/ready` 在初始化前返回 `503`，选出领导者后返回 `200` |
+| `tests/cluster/test_console.rs` | 三节点集群：内置控制台资源、节点/集群 API、危险操作拒绝，以及通过 `/console/api/actions/transfer-leader` 切换领导者 |
 | `tests/cluster/test_batch_write.rs` | 多个请求在单个 Raft entry 中应用，逐项序列号、连续事件序号，以及空/嵌套/超大/重复 id 批次校验 |
 | `tests/replay/limit_orders/run.sh` | 通过 `replay_orders` 回放五条普通限价单，校验价格-时间优先、多笔成交和部分挂单事件与 `expected-events.jsonl` 一致 |
 | `fuzz/` | `cargo-fuzz` 目标：`OrderBook::execute_order`、WAL 字节解码、快照字节/内容解码；每夜的定时工作流构建三个目标并做一次冒烟运行 |
@@ -829,7 +859,7 @@ fee token）见 [`docs/FEE_DEDUCTION.md`](./docs/FEE_DEDUCTION.md)。
 所有集成测试都使用唯一的临时数据目录。集群测试固定使用端口 `21001-21003`（gRPC
 `22001-22003`），快照测试使用 `21101-21103`，重启测试使用 `21201-21205`，撮合结果测试使用
 `21301`/`21302`、行情数据测试 `21303`、事件日志测试 `21304`、故障切换测试
-`21401-21403`、学习者追赶测试 `21501-21502`、过期节点重入测试 `21601-21603`、精度往返测试 `21701`（gRPC `22701`）、标的配置测试 `21801`（gRPC `22801`）、费用测试 `21901`（gRPC `22901`）、费用资产测试 `21902`（gRPC `22902`）、请求限制测试 `21903`（gRPC `22903`）、批量写入测试 `21904`（gRPC `22904`）；重跑前请先停止残留进程
+`21401-21403`、学习者追赶测试 `21501-21502`、过期节点重入测试 `21601-21603`、精度往返测试 `21701`（gRPC `22701`）、标的配置测试 `21801`（gRPC `22801`）、费用测试 `21901`（gRPC `22901`）、费用资产测试 `21902`（gRPC `22902`）、请求限制测试 `21903`（gRPC `22903`）、批量写入测试 `21904`（gRPC `22904`）、健康检查测试 `21905`（gRPC `22905`）和控制台测试 `21906-21908`（gRPC `22906-22908`）；重跑前请先停止残留进程
 （`pkill -f matchengine-raft`）。
 
 ## 性能与当前限制

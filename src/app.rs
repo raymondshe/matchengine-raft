@@ -1,6 +1,9 @@
+use crate::LogStore;
 use crate::MatchEngineNodeId;
 use crate::MatchEngineRaft;
 use crate::StateMachineStore;
+use crate::network::console::ConsoleState;
+use crate::network::health::GrpcListenerHealth;
 
 /// Application state that holds all core components of a Raft node.
 ///
@@ -33,4 +36,14 @@ pub struct MatchEngineApp {
     ///
     /// This wraps the state machine implementation with our matching engine.
     pub state_machine_store: StateMachineStore,
+
+    /// The durable Raft log, used by the health endpoint to report the WAL
+    /// frontier without going through Raft metrics.
+    pub log_store: LogStore,
+
+    /// Whether the gRPC Raft listener task is still serving.
+    pub grpc_health: GrpcListenerHealth,
+
+    /// Operational-console state: action lock and recent action history.
+    pub console: ConsoleState,
 }

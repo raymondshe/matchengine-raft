@@ -20,20 +20,17 @@ important but not blocking; **P3** = later/optional.
 
 The existing P0/P1 work is complete, including the measured baselines in
 [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md). The third-party review adds new P0/P1 follow-ups
-(see §14). Measurement scope, measured peak RSS, the book-only replay benchmark and the fuzz
-targets are now in place.
+(see §14). Measurement scope, measured peak RSS, the book-only replay benchmark, the fuzz targets,
+the health/readiness endpoints and the operational console are now in place.
 
-1. **P1 — Operational readiness.** Add a health/readiness endpoint that reports gRPC listener
-   health, leadership and storage state. TLS and authentication stay at the gateway; this process
-   is internal-only by design.
-2. **P1 — Gateway symbol guard.** Reject a wrong-symbol request before it reaches Raft.
-3. **P1 — Per-level bucket prototype.** Prototype `BTreeMap<price, Vec<Order>>` + `head_idx` +
+1. **P1 — Gateway symbol guard.** Reject a wrong-symbol request before it reaches Raft.
+2. **P1 — Per-level bucket prototype.** Prototype `BTreeMap<price, Vec<Order>>` + `head_idx` +
    sequence index + cached BBO now that the book-only benchmark exists, and benchmark cancel,
    match, amend and depth before merging. Adoption remains P2.
-4. **P1 — Equity/ETF session and fee scope.** Define gateway responsibilities for sessions,
+3. **P1 — Equity/ETF session and fee scope.** Define gateway responsibilities for sessions,
    holidays, auctions, T+1/T+2 and corporate actions, and decide whether fixed/regulatory fees,
    minimum tickets and taxes are in scope.
-5. **P1 — Apply-path allocation reduction.** Measure first; then consider a scratch event buffer,
+4. **P1 — Apply-path allocation reduction.** Measure first; then consider a scratch event buffer,
    `Arc<[MatchEvent]>` sharing or `SmallVec` for common cases.
 
 ## 1. Exact fixed-point end-to-end — done
@@ -111,8 +108,13 @@ Remaining:
 - [x] **P1** Keep TLS/mTLS and API authentication out of this process by design: the matching
   engine is an internal service behind a gateway that owns client authentication and TLS
   termination. The loopback/private-network warning stays as a deployment guard.
-- [ ] **P1** Add a health/readiness endpoint that reports gRPC listener health, Raft leadership
-  and storage state.
+- [x] **P1** Add `GET /health` (liveness: gRPC listener, Raft running state, WAL and state-machine
+  frontier) and `GET /ready` (healthy plus a known leader). The response reports leadership and
+  durable storage state; both return `503` when a required component is unavailable.
+- [x] **P1** Implement the operational console in
+  [`docs/OPERATIONAL_CONSOLE.md`](./docs/OPERATIONAL_CONSOLE.md): read-only node/Raft/storage/events
+  views, then guarded leadership transfer/election actions. The gRPC `TransferLeader` RPC is
+  implemented; `/console/` and `/console/api/*` are live.
 - [x] **P1** Fail fast when the gRPC server task dies: `MatchEngineNode::run()` stops HTTP and
   background tasks, shuts Raft down and returns the transport error.
 - [x] **P2** Remove the duplicate `Logger` middleware in `src/lib.rs`; every request is logged
@@ -270,6 +272,10 @@ Current coverage:
   normalization and quote-asset fee deduction.
 - `test_request_limits.rs`: oversized bodies, malformed JSON, invalid/oversized client ids,
   oversized read keys and out-of-range event pages are rejected before Raft.
+- `test_health.rs`: `/health` reports the gRPC listener, leadership and WAL/state-machine state;
+  `/ready` is `503` before initialization and `200` after a leader is elected.
+- `test_console.rs`: three-node cluster checks the embedded console assets, node/cluster APIs,
+  unsafe-action rejection and leadership transfer through `/console/api/actions/transfer-leader`.
 - `tests/replay/limit_orders/run.sh`: shell-driven replay of five regular limit orders through
   `replay_orders`, comparing the generated match-event JSONL with a checked-in reference.
 - `fuzz/`: `cargo-fuzz` targets for `OrderBook::execute_order` (`order_book`), WAL byte decoding

@@ -27,10 +27,13 @@ use crate::match_result::FileLogSink;
 use crate::match_result::MatchResultSink;
 use crate::match_result::NoopSink;
 use crate::network::api;
+use crate::network::console;
 use crate::network::grpc::MAX_MESSAGE_SIZE;
 use crate::network::grpc::client::GrpcNetworkFactory;
 use crate::network::grpc::pb::raft_service_server::RaftServiceServer;
 use crate::network::grpc::server::RaftGrpcService;
+use crate::network::health;
+use crate::network::health::GrpcListenerHealth;
 use crate::network::management;
 
 pub use store::StorageConfig;
@@ -317,6 +320,7 @@ pub async fn build_match_engine_node(
     let raft_addr = network::raft_addr_from_http(&http_addr)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     let grpc_listener = tokio::net::TcpListener::bind(&raft_addr).await?;
+    let grpc_health = GrpcListenerHealth::new(raft_addr.to_string());
     tracing::info!(%raft_addr, "Raft gRPC transport listening");
 
     let config = Arc::new(
@@ -405,6 +409,7 @@ pub async fn build_match_engine_node(
     let grpc_service = RaftGrpcService::new(raft.clone());
     let (grpc_shutdown, grpc_shutdown_rx) = tokio::sync::oneshot::channel();
     let (grpc_failure_tx, grpc_failure_rx) = tokio::sync::oneshot::channel();
+    let grpc_health_task = grpc_health.clone();
     let grpc_task = tokio::spawn(async move {
         let server = tonic::transport::Server::builder()
             .add_service(
@@ -419,7 +424,9 @@ pub async fn build_match_engine_node(
                 },
             );
 
-        if let Err(e) = server.await {
+        let result = server.await;
+        grpc_health_task.mark_stopped();
+        if let Err(e) = result {
             tracing::error!(
                 error = %e,
                 "gRPC Raft server stopped; peers can no longer reach this node"
@@ -437,6 +444,9 @@ pub async fn build_match_engine_node(
         addr: http_addr.clone(),
         raft: raft.clone(),
         state_machine_store: state_machine_store.clone(),
+        log_store: log_store.clone(),
+        grpc_health,
+        console: console::ConsoleState::new(),
     });
 
     // Start the actix-web server.
@@ -449,6 +459,19 @@ pub async fn build_match_engine_node(
             // propose anything. Raft append/snapshot bodies travel over gRPC
             // and are capped in `network::grpc`.
             .app_data(web::JsonConfig::default().limit(api::MAX_REQUEST_BODY_BYTES))
+            // operational API
+            .service(health::health)
+            .service(health::ready)
+            .service(console::redirect)
+            .service(console::index)
+            .service(console::css)
+            .service(console::js)
+            .service(console::node)
+            .service(console::cluster)
+            .service(console::actions)
+            .service(console::transfer_leader)
+            .service(console::elect)
+            .service(console::snapshot)
             // admin API
             .service(management::init)
             .service(management::add_learner)

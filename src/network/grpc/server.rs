@@ -18,6 +18,7 @@ use openraft::errors::NetworkError;
 use openraft::errors::StreamingError;
 use openraft::raft::AppendEntriesRequest;
 use openraft::raft::SnapshotResponse;
+use openraft::raft::TransferLeaderRequest;
 use openraft::raft::VoteRequest;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -35,6 +36,8 @@ use crate::network::grpc::encode;
 use crate::network::grpc::pb::AppendRequest;
 use crate::network::grpc::pb::AppendResponse;
 use crate::network::grpc::pb::SnapshotChunk;
+use crate::network::grpc::pb::TransferLeaderCall;
+use crate::network::grpc::pb::TransferLeaderResponse as PbTransferLeaderResponse;
 use crate::network::grpc::pb::VoteCallRequest;
 use crate::network::grpc::pb::VoteCallResponse;
 use crate::network::grpc::pb::raft_service_server::RaftService;
@@ -103,6 +106,21 @@ impl RaftService for RaftGrpcService {
             encode(&result).map_err(|e| Status::internal(format!("encode Vote response: {e}")))?;
 
         Ok(Response::new(VoteCallResponse { payload }))
+    }
+
+    async fn transfer_leader(
+        &self,
+        request: Request<TransferLeaderCall>,
+    ) -> Result<Response<PbTransferLeaderResponse>, Status> {
+        let req: TransferLeaderRequest<MatchEngineTypeConfig> =
+            decode(&request.into_inner().payload)
+                .map_err(|e| Status::invalid_argument(format!("decode TransferLeader: {e}")))?;
+
+        let result = self.raft.handle_transfer_leader(req).await;
+        let payload = encode(&result)
+            .map_err(|e| Status::internal(format!("encode TransferLeader response: {e}")))?;
+
+        Ok(Response::new(PbTransferLeaderResponse { payload }))
     }
 
     async fn install_snapshot(
