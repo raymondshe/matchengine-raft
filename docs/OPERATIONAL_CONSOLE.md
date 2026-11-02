@@ -342,8 +342,8 @@ message TransferLeaderResponse { bytes payload = 1; }
   1. Read `RaftMetrics`.
   2. Reject if `current_leader != Some(self.id)` with `409 Conflict` and the current leader id.
   3. Reject self-target, unknown targets, and learners with `400`/`409`.
-  4. Optionally warn when the target's matched index is behind the leader's last log; OpenRaft
-     will reject with `LogNotFlushed` until the target catches up.
+  4. Reject a target whose leader-known matched index is behind the last log with `409 Conflict`;
+     OpenRaft would otherwise reject it with `LogNotFlushed`.
   5. Call `raft.trigger().transfer_leader(target).await`.
   6. Return `202 Accepted` immediately. The transfer is asynchronous.
 - The UI polls the cluster snapshot for up to ~15 seconds and reports:
@@ -434,8 +434,8 @@ and no JavaScript; it is a visual reference for the implementation, not producti
 
 - Transfer:
   - Target dropdown lists voters only, with current role and lag.
-  - Targets that are unreachable or have nonzero replication lag are disabled by default; the
-    operator can refresh and retry after the target catches up.
+  - Targets that are unreachable or do not report zero replication lag are disabled by default;
+    the operator can refresh and retry after the target catches up.
   - Confirmation dialog shows current leader, target, term and target lag.
   - Require an explicit checkbox ("I understand this changes the Raft leader").
   - After submission, show a pending timeline and the live leader/term; never hide the old leader

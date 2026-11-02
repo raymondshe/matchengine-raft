@@ -34,6 +34,7 @@ use crate::network::grpc::pb::raft_service_server::RaftServiceServer;
 use crate::network::grpc::server::RaftGrpcService;
 use crate::network::health;
 use crate::network::health::GrpcListenerHealth;
+use crate::network::health::GrpcListenerStopGuard;
 use crate::network::management;
 
 pub use store::StorageConfig;
@@ -411,6 +412,7 @@ pub async fn build_match_engine_node(
     let (grpc_failure_tx, grpc_failure_rx) = tokio::sync::oneshot::channel();
     let grpc_health_task = grpc_health.clone();
     let grpc_task = tokio::spawn(async move {
+        let _stop_guard = GrpcListenerStopGuard::new(grpc_health_task);
         let server = tonic::transport::Server::builder()
             .add_service(
                 RaftServiceServer::new(grpc_service)
@@ -425,7 +427,6 @@ pub async fn build_match_engine_node(
             );
 
         let result = server.await;
-        grpc_health_task.mark_stopped();
         if let Err(e) = result {
             tracing::error!(
                 error = %e,

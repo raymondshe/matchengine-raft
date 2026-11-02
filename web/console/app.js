@@ -180,7 +180,11 @@
     text("stat-lag", maxLag === null ? "—" : maxLag);
     text(
       "stat-lag-foot",
-      maxLagNode === null ? "no followers" : `node-${maxLagNode}`,
+      maxLagNode === null
+        ? leader
+          ? "no followers"
+          : "leader view unavailable"
+        : `node-${maxLagNode}`,
     );
     text("stat-not-ready", notReady.length);
     text(
@@ -340,24 +344,42 @@
     );
 
     const target = $("transfer-target");
-    clear(target);
     const leader = leaderSnapshot(cluster);
     const candidates = (node.raft.voters || []).filter((id) => id !== node.node_id);
-    if (candidates.length === 0) {
-      const option = document.createElement("option");
-      option.value = "";
-      option.textContent = "No other voters";
-      option.disabled = true;
-      target.appendChild(option);
-    }
-    for (const id of candidates) {
+    const desired = candidates.map((id) => {
       const member = cluster.nodes.find((entry) => entry.node_id === id);
-      const lag = leader && leader.raft ? leader.raft.replication.find((entry) => entry.node_id === id)?.lag : null;
-      const option = document.createElement("option");
-      option.value = String(id);
-      option.textContent = `node-${id} — ${member && member.reachable ? `lag ${fmt(lag)}` : "unreachable"}`;
-      option.disabled = !member || !member.reachable || (lag !== null && lag > 0);
-      target.appendChild(option);
+      const lag =
+        leader && leader.raft && Array.isArray(leader.raft.replication)
+          ? leader.raft.replication.find((entry) => entry.node_id === id)?.lag
+          : null;
+      const reachable = Boolean(member && member.reachable);
+      return {
+        id: String(id),
+        label: `node-${id} — ${reachable ? `lag ${fmt(lag)}` : "unreachable"}`,
+        disabled: !reachable || lag !== 0,
+      };
+    });
+    if (desired.length === 0) {
+      desired.push({ id: "", label: "No other voters", disabled: true });
+    }
+
+    // Rebuild only when the option set changes; otherwise polling would reset
+    // the operator's selection and focus every two seconds.
+    const signature = JSON.stringify(desired);
+    if (target.dataset.signature !== signature) {
+      const previous = target.value;
+      clear(target);
+      for (const item of desired) {
+        const option = document.createElement("option");
+        option.value = item.id;
+        option.textContent = item.label;
+        option.disabled = item.disabled;
+        target.appendChild(option);
+      }
+      target.dataset.signature = signature;
+      if (previous && desired.some((item) => item.id === previous && !item.disabled)) {
+        target.value = previous;
+      }
     }
 
     const confirm = $("transfer-confirm");
@@ -490,6 +512,7 @@
       if ($("tab-events").checked && !state.eventsPaused) await refreshEvents(true);
     } catch (error) {
       setChip("cluster-chip", `Console unavailable: ${error.message}`, "bad");
+      text("updated", `Stale · ${error.message}`);
     } finally {
       state.loading = false;
     }
@@ -517,13 +540,17 @@
   function schedule() {
     if (state.timer) clearInterval(state.timer);
     state.timer = null;
-    if ($("auto-refresh").checked) {
+    if ($("auto-refresh").checked && !document.hidden) {
       state.timer = setInterval(refresh, 2000);
     }
   }
 
   $("refresh-button").addEventListener("click", refresh);
   $("auto-refresh").addEventListener("change", schedule);
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) refresh();
+    schedule();
+  });
   $("transfer-form").addEventListener("submit", (event) => {
     event.preventDefault();
     const target = Number($("transfer-target").value);

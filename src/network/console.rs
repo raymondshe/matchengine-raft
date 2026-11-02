@@ -96,7 +96,7 @@ impl ConsoleState {
     }
 
     fn record(&self, action: ActionRecord) {
-        let mut records = self.recent_actions.lock().unwrap();
+        let mut records = self.actions_guard();
         records.push_front(action);
         while records.len() > MAX_RECENT_ACTIONS {
             records.pop_back();
@@ -104,12 +104,13 @@ impl ConsoleState {
     }
 
     fn recent(&self) -> Vec<ActionRecord> {
+        self.actions_guard().iter().cloned().collect()
+    }
+
+    fn actions_guard(&self) -> std::sync::MutexGuard<'_, VecDeque<ActionRecord>> {
         self.recent_actions
             .lock()
-            .unwrap()
-            .iter()
-            .cloned()
-            .collect()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 
@@ -475,6 +476,22 @@ pub async fn transfer_leader(
         );
     }
 
+    let target_lag = metrics
+        .replication
+        .as_ref()
+        .and_then(|replication| replication.get(&target))
+        .and_then(|matched| matched.as_ref())
+        .zip(metrics.last_log_index)
+        .map(|(matched, last)| last.saturating_sub(matched.index));
+    if let Some(lag) = target_lag
+        && lag > 0
+    {
+        return action_error(
+            StatusCode::CONFLICT,
+            format!("target node {target} is lagging by {lag} entries"),
+        );
+    }
+
     let guard = match app.console.action_guard().await {
         Ok(guard) => guard,
         Err(()) => {
@@ -698,8 +715,8 @@ async fn collect_node_snapshot(app: &MatchEngineApp) -> NodeSnapshot {
             sequence: inner.orderbook.sequence,
             spread: inner.orderbook.spread(),
             last_trade_price: inner.orderbook.last_trade_price,
-            bid_levels: inner.orderbook.bids.len(),
-            ask_levels: inner.orderbook.asks.len(),
+            bid_levels: count_price_levels(inner.orderbook.bids.keys().map(|key| key.price)),
+            ask_levels: count_price_levels(inner.orderbook.asks.keys().map(|key| key.price)),
             parked_stops: inner.orderbook.stops.len(),
         };
         (events, market_data, orderbook)
@@ -778,6 +795,22 @@ fn now_ms() -> u64 {
         .unwrap_or_default()
 }
 
+/// Counts distinct adjacent prices in an ordered map iterator.
+///
+/// The order book is keyed by `(price, sequence)`, so `bids.len()` counts
+/// resting orders, not price levels.
+fn count_price_levels(prices: impl Iterator<Item = Fixed>) -> usize {
+    let mut count = 0usize;
+    let mut previous = None;
+    for price in prices {
+        if previous != Some(price) {
+            count += 1;
+            previous = Some(price);
+        }
+    }
+    count
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -800,5 +833,18 @@ mod tests {
             (MAX_RECENT_ACTIONS + 4) as u64,
             recent.first().unwrap().at_ms
         );
+    }
+
+    #[test]
+    fn price_levels_are_not_order_count() {
+        let prices = [
+            Fixed::from(100),
+            Fixed::from(100),
+            Fixed::from(100),
+            Fixed::from(99),
+            Fixed::from(98),
+            Fixed::from(98),
+        ];
+        assert_eq!(3, count_price_levels(prices.into_iter()));
     }
 }

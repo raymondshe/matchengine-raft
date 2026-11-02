@@ -62,6 +62,28 @@ impl GrpcListenerHealth {
     }
 }
 
+/// Marks a listener stopped when dropped.
+///
+/// The gRPC task owns one of these so a panic or abort cannot leave the health
+/// endpoint reporting a listener that is no longer serving.
+#[derive(Debug)]
+pub struct GrpcListenerStopGuard {
+    health: GrpcListenerHealth,
+}
+
+impl GrpcListenerStopGuard {
+    /// Wraps a listener health flag.
+    pub fn new(listener: GrpcListenerHealth) -> Self {
+        Self { health: listener }
+    }
+}
+
+impl Drop for GrpcListenerStopGuard {
+    fn drop(&mut self) {
+        self.health.mark_stopped();
+    }
+}
+
 /// One health snapshot returned by `GET /health` and `GET /ready`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthResponse {
@@ -238,5 +260,10 @@ mod tests {
         let clone = listener.clone();
         listener.mark_stopped();
         assert!(!clone.is_listening());
+
+        let guarded = GrpcListenerHealth::new("127.0.0.1:22002".to_string());
+        let guard = GrpcListenerStopGuard::new(guarded.clone());
+        drop(guard);
+        assert!(!guarded.is_listening());
     }
 }
