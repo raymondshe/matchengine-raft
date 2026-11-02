@@ -272,6 +272,9 @@ Current coverage:
   normalization and quote-asset fee deduction.
 - `test_request_limits.rs`: oversized bodies, malformed JSON, invalid/oversized client ids,
   oversized read keys and out-of-range event pages are rejected before Raft.
+- `test_feature_matrix.rs`: every advertised order type reaches the engine through `/write`;
+  rest/amend/fill/cancel, expiry and stop lifecycles emit explicit events; malformed bodies and
+  unknown read keys are covered.
 - `test_health.rs`: `/health` reports the gRPC listener, leadership and WAL/state-machine state;
   `/ready` is `503` before initialization and `200` after a leader is elected.
 - `test_console.rs`: three-node cluster checks the embedded console assets, node/cluster APIs,
@@ -293,8 +296,8 @@ Remaining:
   payloads, malformed JSON, oversized read keys and oversized snapshots (see §3).
 - [x] **P1** End-to-end latency benchmark: submit → commit → apply → response, separated from
   matching and replication costs. See [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md).
-- [ ] **P2** Add negative API tests for unknown `/read` keys and malformed `Place` payloads.
-  Follower forwarding is already covered.
+- [x] **P2** Add negative API tests for unknown `/read` keys and malformed `Place` payloads.
+  Covered by `test_feature_matrix.rs`; follower forwarding is already covered.
 - [x] **P2** Make `test_cluster.rs` own and shut down its nodes, including on panic.
 - [ ] **P2** Parameterize the fixed test ports; `test_cluster.rs` still binds 21001–21003.
 - [ ] **P2** Add an MSRV job for Rust 1.89; CI currently uses stable only.
@@ -495,11 +498,13 @@ P0/P1 follow-ups:
   7.17/6.00/8.00 to 4.17/4.00/5.00 allocs/entry and batch rest from 6.23 to 4.19. Response
   `Vec`/`String` sharing and tap-frame copying remain follow-ups because they change a public type
   or need a tap-enabled workload.
-- [ ] **P1** Add a public-API feature matrix test proving every advertised order type reaches the
-  matching engine. llc-993's advanced book exists only in examples; its exchange always uses the
-  Direct book.
-- [ ] **P1** Add an event-lifecycle test proving cancel, expiry, amend and stop handling emit
+- [x] **P1** Add a public-API feature matrix test proving every advertised order type reaches the
+  matching engine. Done: `tests/cluster/test_feature_matrix.rs` sends every type through `/write`
+  and asserts the event kinds.
+- [x] **P1** Add an event-lifecycle test proving cancel, expiry, amend and stop handling emit
   explicit events rather than overloading `Reject`; consumers must reconstruct the full order state.
+  Done: `test_feature_matrix.rs` covers rest → amend → partial fill → cancel, GTD/Day expiry and
+  stop/stop-limit triggers, including the legitimate `stop_would_trigger` rejection.
 - [ ] **P1** Keep TPS, events/s and queries/s distinct in benchmark reports; llc-993 labels event
   count as QPS and estimates memory at 200 bytes/order.
 - [ ] **P2** Evaluate a binary order-entry path (gRPC/protobuf or compact codec) and feature-gated

@@ -399,7 +399,8 @@ tests/
     ├── test_fees.rs           # Maker/taker fees through API, events, feed and restart
     ├── test_fee_assets.rs     # QQQ/USD tick/lot, quote volume and quote fees
     ├── test_request_limits.rs # Hostile input and request-size limits
-    └── test_batch_write.rs    # Batch writes in one Raft entry
+    ├── test_batch_write.rs    # Batch writes in one Raft entry
+    └── test_feature_matrix.rs # Public-API order-type matrix and lifecycle events
 └── replay/
     ├── README.md              # Scenario matrix, ports and regeneration notes
     ├── run-all.sh             # Run every checked-in replay case
@@ -936,6 +937,7 @@ placeholder). `sequence` is still required by the deserializer.
 | `tests/cluster/test_health.rs` | `/health` reports the gRPC listener, leadership and WAL/state-machine state; `/ready` is `503` before initialization and `200` after a leader is elected |
 | `tests/cluster/test_console.rs` | Three-node cluster: embedded console assets, node/cluster APIs, unsafe-action rejection and leadership transfer through `/console/api/actions/transfer-leader` |
 | `tests/cluster/test_batch_write.rs` | Multiple requests are applied in one Raft entry with per-item sequences, continuous event ordinals, and edge validation for empty, nested, oversized and duplicate-id batches |
+| `tests/cluster/test_feature_matrix.rs` | Sends one order of every advertised type through `/write` and asserts the returned event kinds; follows rest → amend → partial fill → cancel and expiry/stop lifecycles, proving accepted actions emit explicit events rather than rejections; checks malformed bodies and unknown read keys |
 | `tests/replay/*/run.sh` | Shell-driven replay matrix for GTC, IOC, FOK, GTD, Day, market, post-only, iceberg, stop-market, stop-limit, amend, cancel, maker/taker fee, quote-fee and fee-overflow scenarios; each case compares the generated event sequence against its checked-in `expected-events.jsonl` |
 | `fuzz/` | `cargo-fuzz` targets for `OrderBook::execute_order`, WAL byte decoding and snapshot byte/content decoding; the nightly scheduled workflow builds all three and runs a smoke pass |
 
@@ -953,9 +955,9 @@ Every integration test uses a unique temporary data directory. The cluster test 
 `21304`, the failover test `21401-21403`, the learner catch-up test `21501-21502`, the late-join
 test `21601-21603`, the exactness test `21701` (gRPC `22701`), the symbol-config test `21801-21802` (gRPC `22801-22802`), the fee test `21901` (gRPC `22901`), the
 fee-asset test `21902` (gRPC `22902`), the request-limit test `21903` (gRPC `22903`), the batch-write
-test `21904` (gRPC `22904`), the health test `21905` (gRPC `22905`) and the console test
-`21906-21908` (gRPC `22906-22908`); stop leftover processes
-(`pkill -f matchengine-raft`) before rerunning.
+test `21904` (gRPC `22904`), the health test `21905` (gRPC `22905`), the console test
+`21906-21908` (gRPC `22906-22908`) and the feature-matrix/lifecycle tests `21909-21911`
+(gRPC `22909-22911`); stop leftover processes (`pkill -f matchengine-raft`) before rerunning.
 
 ## Performance and Current Limits
 
