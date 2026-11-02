@@ -38,6 +38,7 @@ use openraft::storage::EntryResponder;
 use openraft::storage::RaftStateMachine;
 use serde::Deserialize;
 use serde::Serialize;
+use smallvec::SmallVec;
 
 use crate::market_data::MarketDataControl;
 use crate::market_data::MarketDataTap;
@@ -512,6 +513,11 @@ impl<C: RaftTypeConfig> StateMachineStoreInner<C> {
         self.symbol_config.clone()
     }
 
+    /// The id of the one symbol this process/cluster trades.
+    pub fn symbol_id(&self) -> u32 {
+        self.symbol_config.symbol_id
+    }
+
     /// Adds or updates this process/cluster's symbol and precision configuration.
     ///
     /// A process trades exactly one symbol for its lifetime. The configuration
@@ -622,9 +628,19 @@ pub struct StateMachineStore<C: RaftTypeConfig> {
 /// It is collected under the state-machine lock and published after the guard
 /// is dropped, so a slow sink cannot extend the lock hold time.
 struct PendingPublish {
-    events: Vec<MatchEvent>,
+    events: EventBuffer,
     market: Option<(MarketDataTap, TapFrame)>,
 }
+
+/// Inline event buffer for the common 1–8 event entry.
+///
+/// Most applied entries produce a single rest, cancel or fill event. Keeping
+/// that buffer inline avoids a heap allocation on every request; a large sweep
+/// spills to the heap as usual.
+type EventBuffer = SmallVec<[MatchEvent; 4]>;
+
+/// Inline publish list for the common single-request entry.
+type PendingPublishes = SmallVec<[PendingPublish; 1]>;
 
 impl<C: RaftTypeConfig> Clone for StateMachineStore<C> {
     fn clone(&self) -> Self {
@@ -844,7 +860,7 @@ impl<C: RaftTypeConfig> StateMachineStore<C> {
 
     /// Publishes one entry's sink and tap work after the state-machine lock is
     /// released. Ordering matches the order the entries were applied in.
-    fn publish_pending(&self, pending: Vec<PendingPublish>) {
+    fn publish_pending(&self, pending: impl IntoIterator<Item = PendingPublish>) {
         for publish in pending {
             self.publish_match_events(&publish.events);
             if let Some((tap, frame)) = publish.market {
@@ -862,6 +878,12 @@ where
     pub async fn orderbook_sequence(&self) -> u64 {
         let inner = self.inner.lock().await;
         inner.orderbook.sequence
+    }
+
+    /// The symbol id this process/cluster trades, read from the applied state.
+    pub async fn symbol_id(&self) -> u32 {
+        let inner = self.inner.lock().await;
+        inner.symbol_id()
     }
 
     pub async fn to_content(&self) -> StateMachineData {
@@ -978,7 +1000,7 @@ where
         request: &MatchEngineRequest,
         log_index: u64,
         first_ordinal: u32,
-        publishes: &mut Vec<PendingPublish>,
+        publishes: &mut PendingPublishes,
     ) -> (MatchEngineResponse, usize) {
         match request {
             MatchEngineRequest::Place {
@@ -1002,7 +1024,7 @@ where
                     inner.symbol_locked = true;
                 }
 
-                let mut events = Vec::new();
+                let mut events = EventBuffer::new();
                 match outcome.rejected {
                     Some(reason) => {
                         events.push(MatchEvent::for_rejected(
@@ -1020,13 +1042,14 @@ where
                                 expired,
                             ));
                         }
-                        events.extend(MatchEvent::for_place_at(
+                        MatchEvent::for_place_at_into(
                             log_index,
                             first_ordinal + events.len() as u32,
                             &o,
                             &outcome.fills,
                             outcome.resting,
-                        ));
+                            &mut events,
+                        );
                         if let Some(volume) = outcome.cancelled {
                             events.push(MatchEvent::for_cancelled_volume(
                                 log_index,
@@ -1042,13 +1065,14 @@ where
                                 &trigger.stop,
                                 trigger.trigger_price,
                             ));
-                            events.extend(MatchEvent::for_fills(
+                            MatchEvent::for_fills_into(
                                 log_index,
                                 first_ordinal + events.len() as u32,
                                 trigger.stop.side,
                                 trigger.stop.sequence,
                                 &trigger.fills,
-                            ));
+                                &mut events,
+                            );
                             if let Some(volume) = trigger.cancelled {
                                 events.push(MatchEvent::for_cancelled_volume(
                                     log_index,
@@ -1087,7 +1111,7 @@ where
             }
             MatchEngineRequest::Cancel { order } => {
                 let market_seq = inner.orderbook.next_market_sequence();
-                let mut events = Vec::new();
+                let mut events = EventBuffer::new();
                 let expired_orders = if inner.orderbook.has_gtd_deadlines() {
                     inner.orderbook.purge_due_gtd(order.timestamp)
                 } else {
@@ -1138,7 +1162,7 @@ where
                 volume,
             } => {
                 let market_seq = inner.orderbook.next_market_sequence();
-                let mut events = Vec::new();
+                let mut events = EventBuffer::new();
                 let expired_orders = if inner.orderbook.has_gtd_deadlines() {
                     inner.orderbook.purge_due_gtd(order.timestamp)
                 } else {
@@ -1197,13 +1221,14 @@ where
             } => {
                 let market_seq = inner.orderbook.next_market_sequence();
                 let expired = inner.orderbook.purge_expired(*now_ms, *day_close_ms);
-                let events: Vec<MatchEvent> = expired
-                    .iter()
-                    .enumerate()
-                    .map(|(ordinal, order)| {
-                        MatchEvent::for_expired(log_index, first_ordinal + ordinal as u32, order)
-                    })
-                    .collect();
+                let mut events = EventBuffer::new();
+                for (ordinal, order) in expired.iter().enumerate() {
+                    events.push(MatchEvent::for_expired(
+                        log_index,
+                        first_ordinal + ordinal as u32,
+                        order,
+                    ));
+                }
                 inner.record_events(&events);
                 let symbol_id = inner.symbol_config.symbol_id;
                 let market = self
@@ -1261,7 +1286,23 @@ where
         while let Some((entry, responder)) = entries.try_next().await? {
             tracing::debug!(log_id = %entry.log_id, "replicate to sm");
 
-            let mut publishes = Vec::new();
+            let mut publishes = match &entry.payload {
+                EntryPayload::Normal(MatchEngineRequest::Batch { requests }) => {
+                    // Reserve once when the batch is expected to publish. An
+                    // all-PurgeExpired batch usually produces no events; avoid
+                    // reserving a large publish list for it.
+                    let capacity = if requests
+                        .iter()
+                        .any(|request| !matches!(request, MatchEngineRequest::PurgeExpired { .. }))
+                    {
+                        requests.len()
+                    } else {
+                        0
+                    };
+                    PendingPublishes::with_capacity(capacity)
+                }
+                _ => PendingPublishes::new(),
+            };
             let response = {
                 // Lock per entry, not for the whole Apply range: reads and
                 // snapshot capture can interleave between entries, and the log

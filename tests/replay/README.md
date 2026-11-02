@@ -27,7 +27,7 @@ must match too.
 | `stop_market_orders/` | `24219` | Sell and buy stop election, child fills/cancellations and `stop_would_trigger` rejection |
 | `stop_limit_orders/` | `24220` | Stop-limit children bounded by their limit, partial fill/cancellation and crossed-stop rejection |
 | `amend_orders/` | `24221` | Priority-preserving reductions, re-queuing price/size changes and amend rejection reasons |
-| `cancel_orders/` | `24222` | No-op cancel, cross-symbol rejection, parked-stop cancel and partial-fill cancel |
+| `cancel_orders/` | `24222` | No-op cancel, parked-stop cancel and partial-fill cancel |
 | `fee_orders/` | `24223` | Positive maker/taker fees, maker and taker rebates, both fee assets under `Received`, and a zero-rate fill |
 | `fee_quote_orders/` | `24224` | ETF/fiat quote-fee policy, quote-volume limit normalization and both-side quote fees |
 | `fee_overflow_orders/` | `24225` | Notional overflow zeroes quote volume and quote fees, and sets `fee_overflow` |

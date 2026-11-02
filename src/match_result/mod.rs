@@ -151,31 +151,52 @@ impl MatchEvent {
         taker_sequence: u64,
         matches: &[MatchResult],
     ) -> Vec<MatchEvent> {
-        matches
-            .iter()
-            .enumerate()
-            .map(|(offset, m)| MatchEvent {
-                event_id: EventId {
-                    log_index,
-                    ordinal: first_ordinal + offset as u32,
-                },
-                kind: MatchEventKind::Fill,
-                order_sequence: taker_sequence,
-                side: taker_side,
-                counterparty_sequence: Some(m.maker.sequence),
-                previous_sequence: None,
-                price: m.maker.price,
-                volume: m.matches,
-                quote_volume: m.notional,
-                volume_unit: VolumeUnit::Base,
-                taker_fee_asset: Some(m.taker_fee_asset),
-                maker_fee_asset: Some(m.maker_fee_asset),
-                taker_fee: m.taker_fee,
-                maker_fee: m.maker_fee,
-                fee_overflow: m.fee_overflow,
-                reason: None,
-            })
-            .collect()
+        let mut events = Vec::new();
+        Self::for_fills_into(
+            log_index,
+            first_ordinal,
+            taker_side,
+            taker_sequence,
+            matches,
+            &mut events,
+        );
+        events
+    }
+
+    /// Appends fill events for one sweep to `events`.
+    ///
+    /// This is the allocation-free path used by the state machine; the public
+    /// [`MatchEvent::for_fills`] wrapper collects the same events into a `Vec`
+    /// for callers that need one.
+    pub(crate) fn for_fills_into(
+        log_index: u64,
+        first_ordinal: u32,
+        taker_side: OrderSide,
+        taker_sequence: u64,
+        matches: &[MatchResult],
+        events: &mut impl Extend<MatchEvent>,
+    ) {
+        events.extend(matches.iter().enumerate().map(|(offset, m)| MatchEvent {
+            event_id: EventId {
+                log_index,
+                ordinal: first_ordinal + offset as u32,
+            },
+            kind: MatchEventKind::Fill,
+            order_sequence: taker_sequence,
+            side: taker_side,
+            counterparty_sequence: Some(m.maker.sequence),
+            previous_sequence: None,
+            price: m.maker.price,
+            volume: m.matches,
+            quote_volume: m.notional,
+            volume_unit: VolumeUnit::Base,
+            taker_fee_asset: Some(m.taker_fee_asset),
+            maker_fee_asset: Some(m.maker_fee_asset),
+            taker_fee: m.taker_fee,
+            maker_fee: m.maker_fee,
+            fee_overflow: m.fee_overflow,
+            reason: None,
+        }));
     }
 
     /// Builds the events for a `Place` request.
@@ -201,19 +222,44 @@ impl MatchEvent {
         matches: &[MatchResult],
         resting_volume: Option<Fixed>,
     ) -> Vec<MatchEvent> {
-        let mut events = Self::for_fills(
+        let mut events = Vec::new();
+        Self::for_place_at_into(
+            log_index,
+            first_ordinal,
+            taker,
+            matches,
+            resting_volume,
+            &mut events,
+        );
+        events
+    }
+
+    /// Appends the fills and resting event for a `Place` to `events`.
+    ///
+    /// `first_ordinal` is the ordinal of the first fill; the resting event, if
+    /// any, follows the last fill.
+    pub(crate) fn for_place_at_into(
+        log_index: u64,
+        first_ordinal: u32,
+        taker: &Order,
+        matches: &[MatchResult],
+        resting_volume: Option<Fixed>,
+        events: &mut impl Extend<MatchEvent>,
+    ) {
+        Self::for_fills_into(
             log_index,
             first_ordinal,
             taker.side,
             taker.sequence,
             matches,
+            events,
         );
 
         if let Some(volume) = resting_volume {
-            events.push(MatchEvent {
+            events.extend(std::iter::once(MatchEvent {
                 event_id: EventId {
                     log_index,
-                    ordinal: first_ordinal + events.len() as u32,
+                    ordinal: first_ordinal + matches.len() as u32,
                 },
                 kind: MatchEventKind::Rested,
                 order_sequence: taker.sequence,
@@ -230,10 +276,8 @@ impl MatchEvent {
                 maker_fee: Fixed::ZERO,
                 fee_overflow: false,
                 reason: None,
-            });
+            }));
         }
-
-        events
     }
 
     /// Builds the event for a cancel. `cancelled` is the order as it was stored in the book, so

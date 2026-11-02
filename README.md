@@ -395,7 +395,7 @@ tests/
     ├── test_membership.rs     # Leader failover + learner catch-up from a live log
     ├── test_late_join.rs      # Stale node rejoins and catches up from live members
     ├── test_exactness.rs      # 18-digit values through API, events, feed and snapshot restart
-    ├── test_symbols.rs        # One-symbol config, precision rejection and symbol lock
+    ├── test_symbols.rs        # One-symbol config, gateway symbol guard and symbol lock
     ├── test_fees.rs           # Maker/taker fees through API, events, feed and restart
     ├── test_fee_assets.rs     # QQQ/USD tick/lot, quote volume and quote fees
     ├── test_request_limits.rs # Hostile input and request-size limits
@@ -852,9 +852,11 @@ either decimal strings or legacy numbers; match events, `/read` and the market-d
 decimal strings so 18-decimal values round-trip exactly. A process/cluster trades exactly one
 symbol: `SymbolConfig` is replicated and snapshotted with base/quote `AssetId`/`AssetClass`
 metadata, price tick, base lot and fee-asset policy. Prices/quantities with excess precision or
-wrong increments are rejected, and orders routed to another `symbol_id` are refused. Scaling to
-several symbols means running one process/cluster per symbol, so resources and failures stay
-isolated. Values are normalized to the common 18-decimal scale.
+wrong increments are rejected. On the leader, `/write` and `/write_batch` reject an order whose
+`symbol_id` does not match the configured symbol with `400` before the Raft proposal; the state
+machine still re-checks it as defense in depth. Scaling to several symbols means running one
+process/cluster per symbol, so resources and failures stay isolated. Values are normalized to the
+common 18-decimal scale.
 
 Example order payload accepted by `/write` (note the field name `sequence`):
 
@@ -927,7 +929,7 @@ placeholder). `sequence` is still required by the deserializer.
 | `tests/cluster/test_membership.rs` | Kill the elected leader: a surviving voter takes over with the committed book and accepts new writes. A learner added after the writes catches up through normal log replication, is promoted, and writes through its own node |
 | `tests/cluster/test_late_join.rs` | A node with a stale snapshot/WAL is removed, misses 40 writes while the leader snapshots and purges, then rejoins as a learner and catches up from the live cluster |
 | `tests/cluster/test_exactness.rs` | An 18-fractional-digit price and quantity round-trip through `/write`, `/read`, `/events`, the JSONL market-data feed, snapshot v9 and a restart without passing through `f64` |
-| `tests/cluster/test_symbols.rs` | `ConfigureSymbol` sets the process symbol/precision, rejects over-precision and cross-symbol orders, locks the configuration once trading starts, and survives snapshot restart |
+| `tests/cluster/test_symbols.rs` | The HTTP edge rejects wrong-symbol `Place`/`Cancel`/`Amend` and whole batches with `400` before Raft, including sequence/book checks; a batch that configures a new symbol and places in one entry still works. Also covers precision rejection, the symbol lock and snapshot restart |
 | `tests/cluster/test_fees.rs` | Maker and taker fee rates produce exact fill fees in `/write`, `/events`, the file sink and the market-data feed, and survive snapshot restart |
 | `tests/cluster/test_fee_assets.rs` | QQQ/USD ETF/fiat metadata, tick/lot enforcement, quote-volume limit normalization and quote-asset fee deduction |
 | `tests/cluster/test_request_limits.rs` | Oversized JSON bodies, malformed input, invalid/oversized `client_order_id`s, oversized read keys and out-of-range event pages are rejected with `400`/`413` before Raft changes the book |
@@ -949,7 +951,7 @@ Every integration test uses a unique temporary data directory. The cluster test 
 `21001-21003` (gRPC `22001-22003`), the snapshot tests `21101-21103`, the restart tests
 `21201-21205`, the match-result tests `21301`/`21302`, the market-data test `21303`, the event-log test
 `21304`, the failover test `21401-21403`, the learner catch-up test `21501-21502`, the late-join
-test `21601-21603`, the exactness test `21701` (gRPC `22701`), the symbol-config test `21801` (gRPC `22801`), the fee test `21901` (gRPC `22901`), the
+test `21601-21603`, the exactness test `21701` (gRPC `22701`), the symbol-config test `21801-21802` (gRPC `22801-22802`), the fee test `21901` (gRPC `22901`), the
 fee-asset test `21902` (gRPC `22902`), the request-limit test `21903` (gRPC `22903`), the batch-write
 test `21904` (gRPC `22904`), the health test `21905` (gRPC `22905`) and the console test
 `21906-21908` (gRPC `22906-22908`); stop leftover processes
@@ -975,8 +977,8 @@ reach 25,183 orders/s, and 100 concurrent 32-order batches reach 157,035 orders/
 
 The feed also has a deliberate 2M fills/s overload case that drops frames and emits `GAP` rather
 than blocking matching. Reproduce the baseline with `cargo bench --bench matchengine`,
-`cargo bench --bench book_replay`, `cargo bench --bench e2e`, `cargo bench --bench feed_load` and
-`cargo bench --bench storage`.
+`cargo bench --bench book_replay`, `cargo bench --bench level_book`, `cargo bench --bench apply_path`,
+`cargo bench --bench e2e`, `cargo bench --bench feed_load` and `cargo bench --bench storage`.
 
 Implemented performance choices:
 

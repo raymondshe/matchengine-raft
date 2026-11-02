@@ -23,15 +23,9 @@ The existing P0/P1 work is complete, including the measured baselines in
 (see §14). Measurement scope, measured peak RSS, the book-only replay benchmark, the fuzz targets,
 the health/readiness endpoints and the operational console are now in place.
 
-1. **P1 — Gateway symbol guard.** Reject a wrong-symbol request before it reaches Raft.
-2. **P1 — Per-level bucket prototype.** Prototype `BTreeMap<price, Vec<Order>>` + `head_idx` +
-   sequence index + cached BBO now that the book-only benchmark exists, and benchmark cancel,
-   match, amend and depth before merging. Adoption remains P2.
-3. **P1 — Equity/ETF session and fee scope.** Define gateway responsibilities for sessions,
+1. **P1 — Equity/ETF session and fee scope.** Define gateway responsibilities for sessions,
    holidays, auctions, T+1/T+2 and corporate actions, and decide whether fixed/regulatory fees,
    minimum tickets and taxes are in scope.
-4. **P1 — Apply-path allocation reduction.** Measure first; then consider a scratch event buffer,
-   `Arc<[MatchEvent]>` sharing or `SmallVec` for common cases.
 
 ## 1. Exact fixed-point end-to-end — done
 
@@ -80,17 +74,20 @@ Done:
 - [x] `Place` and `Amend` validate price/quantity decimals, price tick and base lot for that
   symbol; invalid values produce a `rejected` event. `Cancel`, `Amend` and `Place` reject a
   different `symbol_id`.
+- [x] Gateway symbol guard: the leader's `/write` and `/write_batch` reject a wrong-symbol
+  `Place`/`Cancel`/`Amend` with `400` before the Raft proposal, so a misrouted order costs no log
+  entry, sequence or `rejected` event. A batch is guarded up to its first `ConfigureSymbol`; the
+  state machine still re-checks the symbol as defense in depth.
 - [x] `/read symbol_config` and `/read symbol_id` expose the configuration; a publishing
   market-data feed is reset to the new symbol after a successful configuration change.
-- [x] `tests/cluster/test_symbols.rs` covers precision rejection, cross-symbol rejection, the
-  symbol lock and snapshot restart.
+- [x] `tests/cluster/test_symbols.rs` covers the gateway guard (wrong-symbol requests and batches,
+  sequence/book checks, and a configure-and-place batch), precision rejection, the symbol lock and
+  snapshot restart.
 - [x] Documented the deployment contract: one cluster/process group per symbol, separate data
   directories, ports, service-discovery names and market-data streams.
 
 Remaining:
 
-- [ ] **P1** Add a gateway/deployment-level symbol guard so a client cannot send a symbol-1 order to
-  a symbol-0 process (the engine already rejects it; fail earlier and cheaper).
 - [ ] **P2** Add a provisioning helper for `ConfigureSymbol` and a pre-trade readiness check.
 
 ## 3. Public trust boundary and request safety [P1]
@@ -191,13 +188,16 @@ Done:
   policies.
 - [x] Explicit conformance cases for market FOK, empty-book market orders, hidden iceberg
   cancel/expiry, parked-stop GTD/Day expiry and fee reporting on market/IOC/stop-child fills.
+- [x] Prototyped per-price-level buckets (`BTreeMap<price, Vec<Order>>` + `head` cursor +
+  sequence index + cached BBO) in `benches/level_book.rs`; the benchmark verifies the prototype
+  against `OrderBook` before timing. Results are in `docs/PERFORMANCE.md`: match 1.76–2.15x,
+  deep cancel 3.34–3.37x, same-price amend 1.70–1.75x, dense re-queue 2.58–2.62x and BBO query
+  4.5–6.2x faster; sparse one-order-per-level re-queue 0.64–0.65x and BBO advance 0.87–0.90x
+  slower; depth neutral. Full adoption remains P2 and is not justified without a sparse-level
+  fast path.
 
 Remaining:
 
-- [ ] **P1** Prototype per-price-level buckets (`BTreeMap<price, Vec<Order>>` plus a
-  sequence-keyed index and cached BBO) after the book-only replay benchmark. The current per-order
-  `BTreeMap` descends the tree for every fill; the extended `Order` also grew the map value, which
-  shows up on copy-heavy benches. Adoption is P2 and requires the prototype to win.
 - [ ] **P2** Amend parked stops (trigger price/volume) and icebergs (tranche semantics); consider
   a sequence → location index for cancel/amend by sequence alone, with index maintenance or
   tombstones.
@@ -322,8 +322,17 @@ Remaining:
   sweep 94.7µs (10.56M fills/s), 20k/1-level sweep 2.209ms (9.06M fills/s), 5k deep cancels
   270.9µs (18.46M cancels/s), 1k-level BBO advance 98.3µs (20.35M advances/s), 1M BBO queries
   2.335ms (428M queries/s).
+- [x] **P1** Add an apply-path allocation benchmark (`cargo bench --bench apply_path`) and reduce
+  the common event path with inline `SmallVec` buffers: rest 7.17→4.17, cancel 6.00→4.00, fill
+  8.00→5.00 allocs/entry; batch rest 6.23→4.19 allocs/entry. Requested bytes/entry fell from
+  2,323→595 (rest) and 1,308→156 (cancel); fill 3,308→2,012 and batch rest 2,393→1,693. The
+  remaining allocations are the `BTreeMap` node, response `events` `Vec`, legacy `value` `String`
+  and fill `MatchResult` `Vec`.
 - [ ] **P2** Adopt per-level buckets or a compact resting record only if the P1 prototype and
-  new 3-node or real-sink measurements justify the complexity; the current baseline does not.
+  new 3-node or real-sink measurements justify the complexity. The prototype wins populated-level
+  match/cancel/amend and cached-BBO queries but loses sparse one-order-per-level re-queue and
+  BBO advance; full adoption is not justified yet, and a hybrid or sparse-level fast path is the
+  next experiment.
 - [ ] **P2** Add a benchmark regression gate (threshold or recorded baseline) to CI.
 
 ## 9. Client library
@@ -476,11 +485,16 @@ P0/P1 follow-ups:
   them nightly and runs a smoke pass. The order-book target covers the quote-limit
   zero/overflowing-price and FOK preflight overflow cases, which are now fixed and
   regression-tested.
-- [ ] **P1** Prototype a per-price-level `Vec` + `head_idx` + order index + cached BBO; benchmark
-  cancel, match, amend and depth before merging. Keep the sparse `BTreeMap` for our 18-decimal
-  range; do not copy a fixed 65k flat array.
-- [ ] **P1** Measure and reduce apply-path allocations (scratch event buffer, `Arc<[MatchEvent]>`
-  sharing or `SmallVec` for common cases).
+- [x] **P1** Prototype a per-price-level `Vec` + `head_idx` + order index + cached BBO; benchmark
+  cancel, match, amend and depth before merging. Done: `benches/level_book.rs` and the results in
+  `docs/PERFORMANCE.md`; full adoption remains P2 because the sparse one-order-per-level cases
+  still lose. Keep the sparse `BTreeMap` for our 18-decimal range; do not copy a fixed 65k flat
+  array.
+- [x] **P1** Measure and reduce apply-path allocations. Done: `cargo bench --bench apply_path`
+  reports per-entry heap churn; inline `SmallVec` event/publish buffers cut rest/cancel/fill from
+  7.17/6.00/8.00 to 4.17/4.00/5.00 allocs/entry and batch rest from 6.23 to 4.19. Response
+  `Vec`/`String` sharing and tap-frame copying remain follow-ups because they change a public type
+  or need a tap-enabled workload.
 - [ ] **P1** Add a public-API feature matrix test proving every advertised order type reaches the
   matching engine. llc-993's advanced book exists only in examples; its exchange always uses the
   Direct book.

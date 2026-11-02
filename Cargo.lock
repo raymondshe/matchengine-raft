@@ -1812,6 +1812,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sled",
+ "smallvec",
  "tokio",
  "tokio-stream",
  "tonic",

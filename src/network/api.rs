@@ -142,6 +142,65 @@ fn validate_batch(requests: &[MatchEngineRequest]) -> Result<(), String> {
     Ok(())
 }
 
+/// Rejects an order addressed to a symbol this process does not trade.
+///
+/// The state machine remains authoritative and still rejects a wrong symbol
+/// for entries that bypass this edge (for example a replayed log). Running the
+/// same check before the Raft proposal makes a misrouted order cost no log
+/// entry, sequence or `rejected` event.
+fn validate_request_symbol(request: &MatchEngineRequest, configured: u32) -> Result<(), String> {
+    match request {
+        MatchEngineRequest::Place { order, .. }
+        | MatchEngineRequest::Cancel { order }
+        | MatchEngineRequest::Amend { order, .. } => validate_order_symbol(order, configured),
+        MatchEngineRequest::Batch { requests } => {
+            for (index, request) in requests.iter().enumerate() {
+                if matches!(request, MatchEngineRequest::ConfigureSymbol { .. }) {
+                    // A configuration request can change the symbol for the
+                    // rest of the batch. Leave those requests to the state
+                    // machine, which is authoritative about whether the
+                    // configuration is allowed and what it applies to.
+                    break;
+                }
+                validate_request_symbol(request, configured)
+                    .map_err(|error| format!("batch request {index}: {error}"))?;
+            }
+            Ok(())
+        }
+        MatchEngineRequest::PurgeExpired { .. } | MatchEngineRequest::ConfigureSymbol { .. } => {
+            Ok(())
+        }
+    }
+}
+
+/// Checks one order's `symbol_id` against the configured symbol.
+fn validate_order_symbol(order: &Order, configured: u32) -> Result<(), String> {
+    if order.symbol_id != configured {
+        return Err(format!(
+            "order symbol_id {} does not match the configured symbol {configured}",
+            order.symbol_id
+        ));
+    }
+    Ok(())
+}
+
+/// Applies the symbol guard on the leader, before the Raft proposal.
+///
+/// Followers skip the check so their `/write` response still carries the
+/// forwardable Raft error; the leader that receives the forwarded request
+/// performs the guard. A stale leader view cannot make the state machine
+/// accept a wrong symbol: apply re-checks it.
+async fn guard_request_symbol(
+    app: &MatchEngineApp,
+    request: &MatchEngineRequest,
+) -> Result<(), String> {
+    if app.raft.metrics().borrow_watched().current_leader != Some(app.id) {
+        return Ok(());
+    }
+    let configured = app.state_machine_store.symbol_id().await;
+    validate_request_symbol(request, configured)
+}
+
 /// Cursor request for `POST /events`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct EventsRequest {
@@ -190,6 +249,9 @@ pub struct EventsStatus {
 ///   timestamps travel in the request, so the state machine stays deterministic)
 /// - `ConfigureSymbol`: Add or update a symbol's accepted price/quantity precision
 ///
+/// A `Place`, `Cancel` or `Amend` whose `symbol_id` does not match this
+/// node's configured symbol is rejected with `400` before the Raft proposal.
+///
 /// # Returns
 ///
 /// The result of applying the request, or an error if the node is not
@@ -201,6 +263,9 @@ pub async fn write(
 ) -> actix_web::Result<impl Responder> {
     let mut request = req.into_inner();
     validate_request(&request).map_err(actix_web::error::ErrorBadRequest)?;
+    guard_request_symbol(&app, &request)
+        .await
+        .map_err(actix_web::error::ErrorBadRequest)?;
     stamp_intake_time(&mut request);
     let response = match app.raft.client_write(request).await.decompose() {
         Ok(response) => response,
@@ -220,6 +285,11 @@ pub async fn write(
 /// `apply` call, so one WAL append/fsync covers the whole batch. Each item gets
 /// its own sequence and response under `data.batch`; all events share the
 /// entry's log index.
+///
+/// A batch is rejected with `400` before the Raft proposal when an order in it
+/// names a different symbol. Requests after a `ConfigureSymbol` in the same
+/// batch are left to the state machine, since that request may change the
+/// accepted symbol.
 #[post("/write_batch")]
 pub async fn write_batch(
     app: Data<MatchEngineApp>,
@@ -228,6 +298,9 @@ pub async fn write_batch(
     let requests = req.into_inner();
     validate_batch(&requests).map_err(actix_web::error::ErrorBadRequest)?;
     let mut request = MatchEngineRequest::Batch { requests };
+    guard_request_symbol(&app, &request)
+        .await
+        .map_err(actix_web::error::ErrorBadRequest)?;
     stamp_intake_time(&mut request);
     let response = match app.raft.client_write(request).await.decompose() {
         Ok(response) => response,
@@ -724,6 +797,81 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn symbol_guard_rejects_mismatched_orders_before_raft() {
+        let order = |symbol_id| {
+            let mut order = Order::new(OrderSide::Buy, 100.0, 1.0, 0);
+            order.symbol_id = symbol_id;
+            order
+        };
+        let place = |symbol_id| MatchEngineRequest::place(order(symbol_id));
+
+        assert!(validate_request_symbol(&place(0), 0).is_ok());
+        let error = validate_request_symbol(&place(1), 0).unwrap_err();
+        assert!(error.contains("symbol_id 1"), "{error}");
+        assert!(error.contains("configured symbol 0"), "{error}");
+
+        assert!(
+            validate_request_symbol(&MatchEngineRequest::Cancel { order: order(1) }, 0).is_err()
+        );
+        assert!(
+            validate_request_symbol(
+                &MatchEngineRequest::Amend {
+                    order: order(1),
+                    price: None,
+                    volume: None,
+                },
+                0,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_request_symbol(
+                &MatchEngineRequest::PurgeExpired {
+                    now_ms: 0,
+                    day_close_ms: None,
+                },
+                0,
+            )
+            .is_ok()
+        );
+
+        let config = SymbolConfig::new(1, 2, 2).unwrap();
+        assert!(
+            validate_request_symbol(
+                &MatchEngineRequest::ConfigureSymbol {
+                    config: config.clone(),
+                },
+                0,
+            )
+            .is_ok()
+        );
+
+        let batch = MatchEngineRequest::Batch {
+            requests: vec![place(0), place(1)],
+        };
+        let error = validate_request_symbol(&batch, 0).unwrap_err();
+        assert!(error.starts_with("batch request 1:"), "{error}");
+
+        // A configuration request earlier in the batch may change the symbol
+        // for the requests after it, so the guard stops there.
+        let configure_then_place = MatchEngineRequest::Batch {
+            requests: vec![
+                MatchEngineRequest::ConfigureSymbol {
+                    config: config.clone(),
+                },
+                place(1),
+            ],
+        };
+        assert!(validate_request_symbol(&configure_then_place, 0).is_ok());
+
+        // A place before the configuration still uses the old symbol.
+        let place_then_configure = MatchEngineRequest::Batch {
+            requests: vec![place(1), MatchEngineRequest::ConfigureSymbol { config }],
+        };
+        assert!(validate_request_symbol(&place_then_configure, 0).is_err());
     }
 
     #[test]

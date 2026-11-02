@@ -38,6 +38,14 @@ harness = false
 name = "book_replay"
 harness = false
 
+[[bench]]
+name = "level_book"
+harness = false
+
+[[bench]]
+name = "apply_path"
+harness = false
+
 [dependencies]
 actix-web = "4.18.1"
 async-stream = "0.3.6"
@@ -52,6 +60,7 @@ prost = "0.14.4"
 reqwest = { version = "0.13.5", features = ["json"] }
 serde = { version = "1.0.229", features = ["derive", "rc"] }
 serde_json = "1.0.154"
+smallvec = "1.15"
 tokio = { version = "1.54.1", default-features = false, features = ["sync", "net", "io-util", "macros", "rt", "rt-multi-thread", "time", "tracing"] }
 tokio-stream = { version = "0.1.19", features = ["net", "sync"] }
 tonic = "0.14.9"

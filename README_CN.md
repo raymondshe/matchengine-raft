@@ -384,7 +384,7 @@ tests/
     ├── test_membership.rs     # 领导者故障切换 + 学习者从活动日志追赶
     ├── test_late_join.rs      # 过期节点重新加入并从活动成员追赶
     ├── test_exactness.rs      # 18 位小数经 API、事件、行情和快照重启
-    ├── test_symbols.rs        # 单标的配置、精度拒绝和配置锁定
+    ├── test_symbols.rs        # 单标的配置、网关标的守卫和配置锁定
     ├── test_fees.rs           # 撮合/吃单费用经 API、事件、行情和重启
     ├── test_fee_assets.rs     # QQQ/USD tick/lot、quote 数量和 quote 扣费
     ├── test_request_limits.rs # 恶意输入和请求大小限制
@@ -799,7 +799,7 @@ pub struct MatchEngineResponse {
 - `symbol_config` - 当前进程/集群复制的标的与精度配置
 - `symbol_id` - 当前进程/集群唯一支持的标的
 
-价格和数量在内部使用精确的 18 位定点整数。JSON 接受十进制字符串或旧版数字；撮合事件、`/read` 和行情输出十进制字符串，以精确往返 18 位小数。一个进程/集群只交易一个标的：`SymbolConfig` 随 Raft 复制并写入快照，包含 base/quote `AssetId`/`AssetClass`、价格 tick、base lot 和扣费资产策略；超过精度或不符合最小变动单位的订单会被拒绝，`symbol_id` 不匹配的订单也会被拒绝。扩展多标的方式是每个标的运行独立的进程/集群，从而隔离资源与故障；内部统一归一化到 18 位。
+价格和数量在内部使用精确的 18 位定点整数。JSON 接受十进制字符串或旧版数字；撮合事件、`/read` 和行情输出十进制字符串，以精确往返 18 位小数。一个进程/集群只交易一个标的：`SymbolConfig` 随 Raft 复制并写入快照，包含 base/quote `AssetId`/`AssetClass`、价格 tick、base lot 和扣费资产策略；超过精度或不符合最小变动单位的订单会被拒绝。在 leader 上，`/write` 和 `/write_batch` 会在进入 Raft 前以 `400` 拒绝 `symbol_id` 与已配置标的不匹配的订单；状态机仍会再次校验作为纵深防御。扩展多标的方式是每个标的运行独立的进程/集群，从而隔离资源与故障；内部统一归一化到 18 位。
 
 `/write` 接受的订单示例（注意字段名是 `sequence`）：
 
@@ -864,7 +864,7 @@ fee token）见 [`docs/FEE_DEDUCTION.md`](./docs/FEE_DEDUCTION.md)。
 | `tests/cluster/test_membership.rs` | 杀掉当前领导者：存活的投票节点接管已提交订单簿并接受新写入；写入后加入的学习者通过普通日志复制追赶、晋升成员并从自己的节点写入 |
 | `tests/cluster/test_late_join.rs` | 带过期快照/WAL 的节点被移出集群、错过 40 次写入（期间领导者生成快照并 purge），再以学习者身份重新加入并从活动集群追赶 |
 | `tests/cluster/test_exactness.rs` | 18 位小数的价格/数量经 `/write`、`/read`、`/events`、JSONL 行情、快照 v9 和重启后仍然精确，全程不经过 `f64` |
-| `tests/cluster/test_symbols.rs` | `ConfigureSymbol` 设置进程标的/精度，拒绝超精度和跨标的订单，交易开始后锁定配置，并在快照重启后保留配置 |
+| `tests/cluster/test_symbols.rs` | HTTP 入口在进入 Raft 前以 `400` 拒绝错误标的的 `Place`/`Cancel`/`Amend` 和整个批次，并校验序列号/订单簿未变化；同一 entry 中先 `ConfigureSymbol` 再下单的批次仍可工作。另覆盖精度拒绝、配置锁定和快照重启 |
 | `tests/cluster/test_fees.rs` | 吃单/挂单费率产生精确的成交费用，经 `/write`、`/events`、文件 sink 和行情 feed 输出，并在快照重启后保留 |
 | `tests/cluster/test_fee_assets.rs` | QQQ/USD ETF/法币元数据、tick/lot、quote 数量限价单归一化和 quote 资产扣费 |
 | `tests/cluster/test_request_limits.rs` | 超大 JSON 请求体、畸形输入、非法/超长 `client_order_id`、超长 read key 和越界事件分页在进入 Raft 前以 `400`/`413` 拒绝 |
@@ -884,7 +884,7 @@ fee token）见 [`docs/FEE_DEDUCTION.md`](./docs/FEE_DEDUCTION.md)。
 所有集成测试都使用唯一的临时数据目录。集群测试固定使用端口 `21001-21003`（gRPC
 `22001-22003`），快照测试使用 `21101-21103`，重启测试使用 `21201-21205`，撮合结果测试使用
 `21301`/`21302`、行情数据测试 `21303`、事件日志测试 `21304`、故障切换测试
-`21401-21403`、学习者追赶测试 `21501-21502`、过期节点重入测试 `21601-21603`、精度往返测试 `21701`（gRPC `22701`）、标的配置测试 `21801`（gRPC `22801`）、费用测试 `21901`（gRPC `22901`）、费用资产测试 `21902`（gRPC `22902`）、请求限制测试 `21903`（gRPC `22903`）、批量写入测试 `21904`（gRPC `22904`）、健康检查测试 `21905`（gRPC `22905`）和控制台测试 `21906-21908`（gRPC `22906-22908`）；重跑前请先停止残留进程
+`21401-21403`、学习者追赶测试 `21501-21502`、过期节点重入测试 `21601-21603`、精度往返测试 `21701`（gRPC `22701`）、标的配置测试 `21801-21802`（gRPC `22801-22802`）、费用测试 `21901`（gRPC `22901`）、费用资产测试 `21902`（gRPC `22902`）、请求限制测试 `21903`（gRPC `22903`）、批量写入测试 `21904`（gRPC `22904`）、健康检查测试 `21905`（gRPC `22905`）和控制台测试 `21906-21908`（gRPC `22906-22908`）；重跑前请先停止残留进程
 （`pkill -f matchengine-raft`）。
 
 ## 性能与当前限制
@@ -906,7 +906,7 @@ fee token）见 [`docs/FEE_DEDUCTION.md`](./docs/FEE_DEDUCTION.md)。
 100 个并发 32 单批次达到 157,035 单/s。
 
 feed 还包含一个刻意的 2M fills/s 过载场景，会丢弃帧并发送 `GAP`，而不是阻塞撮合。可用
-`cargo bench --bench matchengine`、`cargo bench --bench book_replay`、`cargo bench --bench e2e`、
+`cargo bench --bench matchengine`、`cargo bench --bench book_replay`、`cargo bench --bench level_book`、`cargo bench --bench apply_path`、`cargo bench --bench e2e`、
 `cargo bench --bench feed_load` 和 `cargo bench --bench storage` 复现实测基线。
 
 已实现的性能设计：

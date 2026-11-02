@@ -19,6 +19,8 @@ cargo bench --bench feed_load     # market-data feed at 50k/500k fills/s
 cargo bench --bench storage       # WAL append/read/recovery
 cargo bench --bench p0_bench -- duplicate|read|snapshot  # P0 lock/scan A/B
 cargo bench --bench book_replay   # book-only sweeps, deep cancels and BBO advances
+cargo bench --bench level_book    # per-level bucket prototype vs the current book
+cargo bench --bench apply_path    # apply-path heap allocations per applied entry
 ```
 
 ## Measurement scope
@@ -30,6 +32,8 @@ its scope.
 |---|---|---|---|---|---|
 | `matchengine` | Order-book operations: sweep, rest, partial fill, IOC cancel, iceberg refill, amend, cancel; optional depth journal | HTTP, Raft, WAL, snapshots, market-data encoding/sink | Closed-loop, in-process | `Instant`, best-of-5 per round | Best-of-5 only; not a tail study |
 | `book_replay` | `OrderBook` only: 100-level and single-level sweeps, deep cancels, BBO advancement and static BBO queries; book cloned outside the timer | HTTP, Raft, WAL/snapshots, market-data feed, event construction, fees | Closed-loop, in-process; one pristine book per round | `Instant`, best-of-5 per round | Best-of-5 only; 1k/20k cases differ in tree depth, not just order count |
+| `level_book` | Prototype per-level buckets plus the current `OrderBook`: match sweeps, deep cancels, sparse/dense amends, depth, BBO queries and BBO advancement; plain limit orders only; book cloned outside the timer | Stops, icebergs, GTD expiry, validation, events, depth journal, market-data feed, fees beyond `MatchResult` construction | Closed-loop, in-process; paired current/prototype books | `Instant`, best-of-5 per round | Best-of-5 only; sparse one-order-per-level cases are the prototype's worst case |
+| `apply_path` | `StateMachineStore::apply` only: blank, rest, cancel, fill and 128-request batch workloads; a counting global allocator reports heap calls and requested bytes | HTTP, Raft, WAL, snapshots, market-data tap, event-log reads, response serialization | Closed-loop, direct apply; 50k entries or 1k batches per workload | Counting allocator; per-entry averages | Requested bytes include realloc churn and are not a live-memory high-water mark |
 | `e2e` `/write` | HTTP decode/validation, Raft proposal/commit, WAL append + `sync_data`, apply, response serialization | Cross-node replication, external client network beyond loopback | Sequential is closed-loop; concurrent is a 1,000-request burst | `Instant` per request; p50/p95/p99/max | Medians/percentiles; runtime A/B uses four alternating runs |
 | `e2e` `/write_batch` | Same as `/write`, with 1–128 requests per Raft entry and one WAL fsync per entry | Same as `/write` | 200 sequential batches per size; 100 concurrent 32-order batches | `Instant` per batch | Single run per size; batch latency includes payload/apply growth |
 | `feed_load` | Tokio tap, bounded queue, shadow book, wire encoding and processor drain with a null sink | JSONL/network sink I/O, Raft, HTTP | Offered-load generator at 50k/500k/2M fills/s | `Instant`; queue/drain counters | One run per target; no p99 table |
@@ -61,8 +65,10 @@ per-order estimates and should not be compared directly across processes.
 | `p0_bench snapshot` | 171 MiB | 100k-order book plus snapshot capture/encode/write buffers |
 
 The `p0_bench read` peak is a warning about large `/read` responses, not a per-order book cost.
-For per-order sizing, use the workload's own measured RSS delta or a dedicated allocation profile;
-do not infer it from these whole-process peaks.
+`level_book` runs the current book and the prototype in one process, so its RSS is not a
+per-design A/B; measure each design in a dedicated process before using memory as an adoption
+criterion. For per-order sizing, use the workload's own measured RSS delta or a dedicated
+allocation profile; do not infer it from these whole-process peaks.
 
 ## Order-book microbenchmarks
 
@@ -110,6 +116,81 @@ Repeated best-of-5 runs on the same machine produced 83–97 µs for the 100-lev
 for the single-level sweep, 271–288 µs for the deep cancels, 98–107 µs for BBO advancement and
 2.10–2.93 ms for the 1M-query loop. The table is one representative run; treat these as
 order-of-magnitude baselines, not exact constants.
+
+## Per-level bucket prototype (2026-11-02)
+
+`cargo bench --bench level_book` compares a bench-only prototype with `OrderBook` on the same
+workloads. The prototype keeps one `Vec<Option<Order>>` per price level, a `head` cursor for the
+consumed prefix, a sequence-keyed location index for cancel/amend and cached best bid/ask prices.
+The index uses an identity hasher for the monotonic `u64` sequence keys; the standard SipHash
+variant was also tried and made the sparse cases below slower.
+
+This is a **prototype, not production code**. It covers plain limit orders only and skips stops,
+icebergs, GTD expiry, validation, events, the depth journal and the market-data tap, so the numbers
+isolate the book data structure. Before timing, the benchmark runs a deterministic mixed workload
+that compares BBO, depth, fills, cancels and amendments against `OrderBook`; it prints
+`prototype verification: OK`.
+
+| Case | Current | Prototype | Speedup |
+|---|---:|---:|---:|
+| Match 1k asks / 100 levels | 99.9 µs | 47.8 µs | 2.09x |
+| Match 20k asks / 1 level | 2.305 ms | 1.311 ms | 1.76x |
+| Cancel 5k at depth / 50 levels | 275.3 µs | 81.6 µs | 3.37x |
+| Amend volume 5k (same price) | 229.9 µs | 135.0 µs | 1.70x |
+| Amend price 1k sparse (1 order/level) | 75.6 µs | 117.7 µs | 0.64x |
+| Amend price 5k dense (50 orders/level) | 619.7 µs | 240.1 µs | 2.58x |
+| Depth 10 levels, 100k queries | 6.621 ms | 6.621 ms | 1.00x |
+| BBO query 1k levels, 1M calls | 2.125 ms | 0.472 ms | 4.50x |
+| BBO advance 1k levels x 2 sides | 101.4 µs | 114.1 µs | 0.89x |
+
+The prototype wins where a level is populated: a sweep consumes a contiguous vector and advances
+`head` instead of removing every order from the tree, deep cancels amortize the level lookup, a
+same-price reduction is an in-place update, a dense re-queue leaves the old level alive and cached
+BBO reads are a couple of field loads. The losses are the sparse worst case: with one order per
+level, the sequence lookup, level indirection and level creation/removal cost more than a single
+`BTreeMap` remove/insert. BBO advancement has the same shape because every cancellation removes a
+level. Depth is effectively unchanged.
+
+Full adoption is therefore **not** justified by this prototype; the P2 adoption item remains.
+A follow-up would need a single-order-level fast path (or a hybrid that keeps tree keys for sparse
+levels), a memory A/B in separate processes, and a 3-node or real-sink run. The benchmark is
+closed-loop, best-of-5 per round; repeated mutation runs vary by roughly 5–10%, while the
+current-book BBO-query baseline varied more (about 2.1–2.9 ms across runs), so treat the ratios as
+directional.
+
+## Apply-path allocation benchmark (2026-11-02)
+
+`cargo bench --bench apply_path` drives `StateMachineStore::apply` directly with a counting global
+allocator. It covers blank entries, one-event rest/cancel/fill entries, and 128-request batches;
+the blank and batch-blank cases isolate the harness and response allocations. Counts are heap
+allocation calls per applied entry; bytes are the sum of requested sizes **including realloc
+churn**, not live memory.
+
+Before this change, the per-entry event path allocated a temporary `Vec` for event construction,
+another `Vec` for the request's events, a `Vec` for the response events and a `Vec` for the
+per-entry publish list. The change writes fills/rests directly into an inline
+`SmallVec<[MatchEvent; 4]>` and uses an inline publish list for the common single-request entry.
+The retained event window and the public response still own `Vec`s.
+
+| Workload | Before allocs/entry | After allocs/entry | Before bytes/entry | After bytes/entry |
+|---|---:|---:|---:|---:|
+| Blank | 0.00 | 0.00 | 0.0 | 0.0 |
+| Rest, 1 event | 7.17 | 4.17 | 2,323 | 595 |
+| Cancel, 1 event | 6.00 | 4.00 | 1,308 | 156 |
+| Fill, 1 event | 8.00 | 5.00 | 3,308 | 2,012 |
+| Batch blank, 128 requests | 1.02 | 1.02 | 381 | 381 |
+| Batch rest, 128 x 1 event | 6.23 | 4.19 | 2,393 | 1,693 |
+
+The single-entry rest/cancel/fill times were 0.61/0.30/0.40 µs before and 0.55/0.30/0.38 µs after;
+these are within the benchmark's noise. The batch-rest time was 0.27 µs/entry both before and
+after. The batch bytes also fell because the publish list is reserved once and the per-request
+event buffers stay inline; an all-`PurgeExpired` batch avoids the reserve entirely.
+
+Remaining allocations are the `BTreeMap` node on a rest, the response `events` `Vec`, the legacy
+`value` sequence `String`, and the `MatchResult` `Vec` on a fill. Avoiding the response `Vec` would
+change the public `MatchEngineResponse.events` type; avoiding the `MatchResult` `Vec` would change
+`Outcome.fills`. The market-data tap path still copies events into `TapFrame.events` when the tap is
+enabled, and is not covered by this no-tap benchmark.
 
 ## End-to-end write path
 
@@ -456,8 +537,10 @@ itself is already cheap.
   improves throughput substantially.
 - The feed has ample headroom at 500k fills/s with a null sink. A real sink
   (JSONL or Aeron) must be measured separately because it adds encoding and I/O.
-- No per-level bucket or compact resting-order change is justified by these
-  measurements yet. Revisit after a 3-node e2e run and a real feed sink.
+- The per-level bucket prototype wins match, deep-cancel, dense-amend and
+  BBO-query workloads but loses sparse one-order-per-level re-queue and BBO
+  advance. Full adoption still needs a sparse-level fast path (or a hybrid) and
+  a 3-node/real-sink run; see the prototype section above.
 - The runtime flavor A/B is within noise for the write path: WAL fsync and the
   serialized apply path dominate. P0 items 2-6 are implemented: snapshot
   encode/decode and read serialization are off the lock, apply locks per entry
