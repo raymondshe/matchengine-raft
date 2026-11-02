@@ -24,6 +24,8 @@ use matchengine_raft::default_raft_config;
 use matchengine_raft::order_book::Order;
 use matchengine_raft::order_book::OrderSide;
 use matchengine_raft::store::MatchEngineRequest;
+#[cfg(debug_assertions)]
+use openraft::SnapshotPolicy;
 use openraft::type_config::TypeConfigExt;
 
 use crate::common::TempDir;
@@ -110,7 +112,7 @@ fn sigkill_during_writes_recovers_the_committed_prefix() {
         let base = format!("http://{addr}");
         let data_dir = temp.path().to_path_buf();
 
-        let mut child = ChildGuard(start_node_process(addr, &data_dir));
+        let mut child = ChildGuard(start_node_process(1, addr, &data_dir, "sigkill", &[]));
         wait_for_health(&base).await;
 
         let client = MatchEngineClient::<C>::new(1, addr.to_string());
@@ -140,7 +142,7 @@ fn sigkill_during_writes_recovers_the_committed_prefix() {
 
         // A short pause lets the listener port leave TIME_WAIT before the restart.
         C::sleep(Duration::from_millis(100)).await;
-        let restarted = ChildGuard(start_node_process(addr, &data_dir));
+        let restarted = ChildGuard(start_node_process(1, addr, &data_dir, "sigkill", &[]));
         wait_for_health(&base).await;
 
         let reader = MatchEngineClient::<C>::new(1, addr.to_string());
@@ -157,6 +159,146 @@ fn sigkill_during_writes_recovers_the_committed_prefix() {
         );
 
         drop(restarted);
+    });
+}
+
+/// Kill a learner after it has received a snapshot chunk but before it installs
+/// the snapshot. The receiver buffers the stream in memory, so nothing durable
+/// may exist; the restart must retry and install the complete snapshot.
+#[cfg(debug_assertions)]
+#[test]
+fn sigkill_during_learner_snapshot_install_leaves_no_partial_snapshot() {
+    C::run(async {
+        let leader_temp = TempDir::new("install-leader");
+        let learner_temp = TempDir::new("install-learner");
+        let leader_addr = "127.0.0.1:21922";
+        let learner_addr = "127.0.0.1:21923";
+        let learner_base = format!("http://{learner_addr}");
+
+        let mut config = default_raft_config();
+        config.heartbeat_interval = 200;
+        config.election_timeout_min = 500;
+        config.election_timeout_max = 1_000;
+        config.snapshot_policy = SnapshotPolicy::LogsSinceLast(10);
+        // Purge everything the snapshot covers so the learner must install it.
+        config.max_in_snapshot_log_to_keep = 0;
+
+        let storage = StorageConfig::new(leader_temp.path()).with_instance_prefix("install-leader");
+        let node = build_match_engine_node(1, leader_addr.to_string(), config, storage)
+            .await
+            .unwrap();
+        let leader = MatchEngineClient::<C>::new(1, leader_addr.to_string());
+        leader.init().await.unwrap().unwrap();
+        wait_for_leader(&leader).await;
+
+        for i in 0..30u64 {
+            leader
+                .write(&MatchEngineRequest::place(Order::new(
+                    OrderSide::Buy,
+                    100.0 - i as f64,
+                    1.0,
+                    0,
+                )))
+                .await
+                .unwrap()
+                .unwrap();
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let metrics = leader.metrics().await.unwrap();
+            if let (Some(snapshot), Some(purged)) = (metrics.snapshot, metrics.purged)
+                && purged.index >= snapshot.index
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "snapshot/purge did not happen");
+            C::sleep(Duration::from_millis(50)).await;
+        }
+
+        let marker = learner_temp.path().join("snapshot-install-started");
+        let learner_data = learner_temp.path().to_path_buf();
+        let mut child = ChildGuard(start_node_process(
+            2,
+            learner_addr,
+            &learner_data,
+            "install-learner",
+            &[
+                ("MATCHENGINE_TEST_SNAPSHOT_INSTALL_DELAY_MS", "5000"),
+                (
+                    "MATCHENGINE_TEST_SNAPSHOT_INSTALL_MARKER",
+                    marker.to_str().unwrap(),
+                ),
+            ],
+        ));
+        wait_for_health(&learner_base).await;
+
+        // `add_learner` blocks until the learner catches up; run it in the
+        // background so the test can kill the learner mid-install.
+        let adder = MatchEngineClient::<C>::new(1, leader_addr.to_string());
+        let add =
+            tokio::spawn(async move { adder.add_learner((2, learner_addr.to_string())).await });
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !marker.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "learner never started the snapshot install"
+            );
+            C::sleep(Duration::from_millis(20)).await;
+        }
+
+        child.0.kill().unwrap();
+        child.0.wait().unwrap();
+
+        let snapshot_path = StorageConfig::new(learner_temp.path())
+            .with_instance_prefix("install-learner")
+            .snapshot_dir(2)
+            .join("current.snap");
+        assert!(
+            !snapshot_path.exists(),
+            "a killed snapshot install left a partial current.snap"
+        );
+
+        // Restart without the delay: the leader must resend and complete the install.
+        C::sleep(Duration::from_millis(100)).await;
+        let restarted = ChildGuard(start_node_process(
+            2,
+            learner_addr,
+            &learner_data,
+            "install-learner",
+            &[],
+        ));
+        wait_for_health(&learner_base).await;
+
+        let learner = MatchEngineClient::<C>::new(2, learner_addr.to_string());
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            if let Ok(value) = learner.read(&"orderbook_sequence".to_string()).await
+                && value == "30"
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "learner did not retry the snapshot install"
+            );
+            C::sleep(Duration::from_millis(100)).await;
+        }
+
+        let orders: Vec<Order> =
+            serde_json::from_str(&learner.read(&"orderbook_orders".to_string()).await.unwrap())
+                .unwrap();
+        assert_eq!(30, orders.len());
+        assert!(
+            snapshot_path.exists(),
+            "the restarted learner did not persist the installed snapshot"
+        );
+
+        // The original add-learner request completes once the learner catches up.
+        let _ = tokio::time::timeout(Duration::from_secs(5), add).await;
+        drop(restarted);
+        node.shutdown().await.unwrap();
     });
 }
 
@@ -190,18 +332,26 @@ impl Drop for ChildGuard {
     }
 }
 
-fn start_node_process(addr: &str, data_dir: &Path) -> Child {
+fn start_node_process(
+    id: u64,
+    addr: &str,
+    data_dir: &Path,
+    prefix: &str,
+    envs: &[(&str, &str)],
+) -> Child {
+    let id = id.to_string();
     Command::new(env!("CARGO_BIN_EXE_matchengine-raft"))
         .args([
             "--id",
-            "1",
+            &id,
             "--http-addr",
             addr,
             "--instance-prefix",
-            "sigkill",
+            prefix,
         ])
         .arg("--data-dir")
         .arg(data_dir)
+        .envs(envs.iter().copied())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()

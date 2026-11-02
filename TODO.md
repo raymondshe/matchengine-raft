@@ -25,18 +25,20 @@ the operational console are in place. Equity/ETF sessions, holidays, auctions, T
 corporate actions and fixed/regulatory/minimum/tax fees are owned by the external order system
 (§13).
 
+Failure behavior is complete (§15): the node fail-stops on WAL `ENOSPC`/`EIO`, recovers from
+`SIGKILL` during writes, keeps snapshot writes atomic, and a learner killed mid-snapshot-install
+restarts without a partial snapshot and retries cleanly.
+
 The next work, in order:
 
-1. **Failure behavior (§15).** ENOSPC/EIO fail-stop, SIGKILL during a write stream and snapshot
-   temp-file atomicity are covered; the remaining gap is SIGKILL during a learner snapshot install.
-2. **Pre-Vote (§4).** Implement `RaftNetworkV2::pre_vote` over gRPC and enable it, or record that
+1. **Pre-Vote (§4).** Implement `RaftNetworkV2::pre_vote` over gRPC and enable it, or record that
    Pre-Vote stays disabled. openraft's default `pre_vote` grants unconditionally, so the flag alone
    changes nothing.
-3. **Wire v5 consumer decoder (§6).** Add a reference decoder and encode → decode → re-encode
+2. **Wire v5 consumer decoder (§6).** Add a reference decoder and encode → decode → re-encode
    golden tests; the feed contract has encoder-only coverage today.
-4. **Benchmark regression gate (§8).** Gate CI on `apply_path` allocs/entry (deterministic) plus
+3. **Benchmark regression gate (§8).** Gate CI on `apply_path` allocs/entry (deterministic) plus
    loose time thresholds.
-5. **Event delivery Phase 4 (§5).** Long-poll `wait_ms`, gRPC `StreamEvents` and the optional MQ
+4. **Event delivery Phase 4 (§5).** Long-poll `wait_ms`, gRPC `StreamEvents` and the optional MQ
    bridge; this also settles the event-time/cursor item in §11.
 
 Quick wins that fit alongside any of these: `Order` identity `PartialEq`, `#[serde(default)]` on
@@ -172,13 +174,15 @@ Transport decisions:
 - [x] **P2** Use an explicit gRPC `transfer_leader` transport instead of openraft's default:
   `src/network/grpc/client.rs` sends the RPC and `src/network/grpc/server.rs` calls
   `handle_transfer_leader`; the console transfer action uses it.
+- [x] **P2** Pre-Vote is enabled: `default_raft_config` sets `enable_pre_vote: Some(true)`, the
+  gRPC transport implements `RaftNetworkV2::pre_vote` with a dedicated `PreVote` RPC, and the
+  server calls `Raft::pre_vote`. openraft's default grants unconditionally, so the RPC is what
+  makes the flag effective.
 
 Remaining:
 
 - [ ] **P2** Move off `openraft` 0.10.0-alpha once a stable 0.10 release exists; latest published
   is still `0.10.0-alpha.37`.
-- [ ] **P2** Implement `RaftNetworkV2::pre_vote` over gRPC and
-  `Raft::pre_vote()`, or explicitly document that Pre-Vote is unsupported and keep it disabled.
 - [ ] **P2** Consider streaming snapshot bytes into the state machine or a temp file instead of
   buffering the whole snapshot. The current API needs a contiguous buffer, but the receiver's
   total allocation still needs a policy (see §3).
@@ -420,6 +424,8 @@ These choices feed the priorities above; write them down as ADRs or doc notes wh
 - [x] Equity/ETF sessions, holidays, auctions, T+1/T+2 settlement, corporate actions and
   fixed/regulatory/minimum/tax fees are owned by the external order system; the engine stays
   deterministic and consumes explicit timestamps and notional-proportional maker/taker rates.
+- [x] Pre-Vote uses a dedicated gRPC `PreVote` RPC and is enabled by default; mixed-version
+  clusters are unsupported because an older peer returns `Unimplemented`.
 - [ ] **P2** Decide the event time source for the clearing feed and per-instrument cursor retention
   (Phase 4 in §5).
 
@@ -573,5 +579,6 @@ Guardrails / what not to copy:
   flight and asserts the restarted node's sequence covers every acknowledged batch.
 - [x] **P1** Snapshot atomicity: unit tests prove a leftover `current.snap.tmp` (a crash between
   the temp write and the rename) is ignored and never replaces the committed snapshot.
-- [ ] **P1** SIGKILL during a learner snapshot install: a three-node case must prove the receiver
-  keeps its old state and retries instead of exposing a partially installed snapshot.
+- [x] **P1** SIGKILL during a learner snapshot install: `test_failure.rs` pauses the install after
+  the first chunk with a debug-only delay, kills the learner, asserts no `current.snap` was written,
+  restarts it, and proves the full snapshot is retried and installed.

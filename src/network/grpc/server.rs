@@ -74,6 +74,25 @@ fn append_snapshot_data(
     Ok(())
 }
 
+/// Test-only pause after a snapshot chunk is received.
+///
+/// Debug builds only. `MATCHENGINE_TEST_SNAPSHOT_INSTALL_DELAY_MS` slows a
+/// learner's install so a test can kill it mid-stream; the marker file lets the
+/// test wait until the first chunk has arrived. Release builds compile this out.
+#[cfg(debug_assertions)]
+async fn maybe_delay_snapshot_install() {
+    let Some(millis) = std::env::var("MATCHENGINE_TEST_SNAPSHOT_INSTALL_DELAY_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    else {
+        return;
+    };
+    if let Ok(marker) = std::env::var("MATCHENGINE_TEST_SNAPSHOT_INSTALL_MARKER") {
+        let _ = std::fs::write(marker, b"installing");
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(millis)).await;
+}
+
 #[tonic::async_trait]
 impl RaftService for RaftGrpcService {
     type AppendStreamStream =
@@ -158,6 +177,9 @@ impl RaftService for RaftGrpcService {
             if !chunk.data.is_empty() {
                 append_snapshot_data(&mut data, &mut received, &chunk.data)?;
             }
+
+            #[cfg(debug_assertions)]
+            maybe_delay_snapshot_install().await;
 
             if chunk.done {
                 complete = true;
