@@ -107,19 +107,28 @@ impl MatchEngineNode {
         &self.http_addr
     }
 
-    /// Waits until the HTTP server stops, or fails fast if the gRPC listener dies.
+    /// Waits until the HTTP server stops, or fails fast if a required component dies.
     ///
-    /// A node whose peers cannot reach its gRPC port is not allowed to keep
+    /// A node whose peers cannot reach its gRPC port, or whose Raft core has
+    /// stopped (including on a fatal WAL/snapshot error), is not allowed to keep
     /// serving HTTP as if it were healthy: the failure is returned to the caller
     /// after stopping the remaining tasks, so the process can exit non-zero.
     pub async fn run(mut self) -> std::io::Result<()> {
         let grpc_failure = self.grpc_failure_rx.take();
+        let raft_failure = wait_for_raft_stop(self.raft.clone());
         let http_result = tokio::select! {
             result = &mut self.http_task => {
                 result.map_err(|e| std::io::Error::other(format!("HTTP server task failed: {e}")))
             }
             failure = wait_for_grpc_failure(grpc_failure) => {
                 tracing::error!(error = %failure, "gRPC Raft server failed; stopping node");
+                self.http_handle.stop(true).await;
+                let _ = (&mut self.http_task).await;
+                self.stop_background().await?;
+                return Err(failure);
+            }
+            failure = raft_failure => {
+                tracing::error!(error = %failure, "Raft core stopped; stopping node");
                 self.http_handle.stop(true).await;
                 let _ = (&mut self.http_task).await;
                 self.stop_background().await?;
@@ -285,6 +294,27 @@ async fn wait_for_grpc_failure(
             Err(_) => std::io::Error::other("gRPC Raft server task stopped"),
         },
         None => std::future::pending().await,
+    }
+}
+
+/// Waits for the Raft core to stop.
+///
+/// openraft publishes `Err` in `running_state` when RaftCore exits, including a
+/// fatal WAL or snapshot error, and drops the metrics sender if the task panics.
+/// Either means this node can no longer make progress, so `run()` turns it into
+/// a process failure instead of serving HTTP as a degraded node.
+async fn wait_for_raft_stop(raft: MatchEngineRaft) -> std::io::Error {
+    let mut metrics = raft.metrics();
+    loop {
+        {
+            let current = metrics.borrow_watched();
+            if let Err(fatal) = &current.running_state {
+                return std::io::Error::other(format!("Raft core stopped: {fatal:?}"));
+            }
+        }
+        if metrics.changed().await.is_err() {
+            return std::io::Error::other("Raft core stopped: metrics channel closed");
+        }
     }
 }
 

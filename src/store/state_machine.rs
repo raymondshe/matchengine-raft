@@ -1770,6 +1770,53 @@ mod tests {
         assert_eq!(io::ErrorKind::InvalidData, err.kind());
     }
 
+    #[tokio::test]
+    async fn a_leftover_snapshot_temp_file_is_ignored() {
+        let dir = tempdir();
+        // A crash between writing the temp file and renaming it leaves no visible
+        // snapshot; startup must ignore the partial file instead of failing.
+        std::fs::write(
+            dir.path().join(format!("{SNAPSHOT_FILE}.tmp")),
+            b"partial snapshot",
+        )
+        .unwrap();
+
+        let store = StateMachineStore::<MatchEngineTypeConfig>::open(dir.path()).unwrap();
+        let content = store.to_content().await;
+        assert!(content.orders.is_empty());
+        assert_eq!(0, content.sequence);
+    }
+
+    #[tokio::test]
+    async fn a_partial_snapshot_write_does_not_replace_the_committed_one() {
+        let dir = tempdir();
+        let store = StateMachineStore::<MatchEngineTypeConfig>::open(dir.path()).unwrap();
+        {
+            let mut inner = store.inner().lock().await;
+            inner.orderbook.place_order(&mut Order::new(
+                crate::order_book::OrderSide::Buy,
+                10.0,
+                2.0,
+                0,
+            ));
+            inner.last_applied_log = Some(log_id(1, 3));
+        }
+        store.persist_snapshot().await.unwrap();
+
+        // Simulate a killed process mid-write: the partial file is newer than the
+        // committed snapshot but was never renamed into place.
+        std::fs::write(
+            dir.path().join(format!("{SNAPSHOT_FILE}.tmp")),
+            b"partial snapshot",
+        )
+        .unwrap();
+
+        let reopened = StateMachineStore::<MatchEngineTypeConfig>::open(dir.path()).unwrap();
+        let content = reopened.to_content().await;
+        assert_eq!(1, content.orders.len());
+        assert_eq!(1, content.sequence);
+    }
+
     /// Applies real entries so the sink wiring is covered, not just event construction.
     #[tokio::test]
     async fn apply_publishes_rests_fills_and_cancels_to_the_sink() {

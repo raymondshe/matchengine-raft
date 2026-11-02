@@ -5,6 +5,7 @@ mod test_cluster;
 mod test_console;
 mod test_events;
 mod test_exactness;
+mod test_failure;
 mod test_feature_matrix;
 mod test_fee_assets;
 mod test_fees;

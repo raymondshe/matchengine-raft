@@ -18,15 +18,29 @@ important but not blocking; **P3** = later/optional.
 
 ## Top priorities
 
-The existing P0/P1 work is complete, including the measured baselines in
-[`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md). The remaining third-party follow-ups are P2/P3
-(see §14). Measurement scope, measured peak RSS, the book-only replay benchmark, the fuzz targets,
-the health/readiness endpoints and the operational console are now in place.
+No P0/P1 feature work remains: the measured baselines are in
+[`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md), the third-party follow-ups are P2/P3 (§14), and
+measurement scope, peak RSS, the book-only replay benchmark, the fuzz targets, health/readiness and
+the operational console are in place. Equity/ETF sessions, holidays, auctions, T+1/T+2 settlement,
+corporate actions and fixed/regulatory/minimum/tax fees are owned by the external order system
+(§13).
 
-Equity/ETF sessions, holidays, auctions, T+1/T+2 settlement, corporate actions and
-fixed/regulatory/minimum/tax fees are owned by the external order system (§13). No top-priority
-P0/P1 feature work remains in this roadmap; the remaining items are P2/P3 and are tracked in the
-sections below.
+The next work, in order:
+
+1. **Failure behavior (§15).** ENOSPC/EIO fail-stop, SIGKILL during a write stream and snapshot
+   temp-file atomicity are covered; the remaining gap is SIGKILL during a learner snapshot install.
+2. **Pre-Vote (§4).** Implement `RaftNetworkV2::pre_vote` over gRPC and enable it, or record that
+   Pre-Vote stays disabled. openraft's default `pre_vote` grants unconditionally, so the flag alone
+   changes nothing.
+3. **Wire v5 consumer decoder (§6).** Add a reference decoder and encode → decode → re-encode
+   golden tests; the feed contract has encoder-only coverage today.
+4. **Benchmark regression gate (§8).** Gate CI on `apply_path` allocs/entry (deterministic) plus
+   loose time thresholds.
+5. **Event delivery Phase 4 (§5).** Long-poll `wait_ms`, gRPC `StreamEvents` and the optional MQ
+   bridge; this also settles the event-time/cursor item in §11.
+
+Quick wins that fit alongside any of these: `Order` identity `PartialEq`, `#[serde(default)]` on
+`Order::sequence`, a BTC/USDT quote-volume case, and keeping the completed-item lists below current.
 
 ## 1. Exact fixed-point end-to-end — done
 
@@ -151,19 +165,23 @@ Persistence is done:
 - [x] `test_cluster` owns all three nodes in its runtime and shuts them down on success or panic,
   so fixed ports are released.
 
+Transport decisions:
+
+- [x] **P2** Keep TLS at the gateway; do not add per-node TLS to the Raft transport. Keep the
+  gRPC listener's failure behavior aligned with the health policy in §3.
+- [x] **P2** Use an explicit gRPC `transfer_leader` transport instead of openraft's default:
+  `src/network/grpc/client.rs` sends the RPC and `src/network/grpc/server.rs` calls
+  `handle_transfer_leader`; the console transfer action uses it.
+
 Remaining:
 
 - [ ] **P2** Move off `openraft` 0.10.0-alpha once a stable 0.10 release exists; latest published
   is still `0.10.0-alpha.37`.
 - [ ] **P2** Implement `RaftNetworkV2::pre_vote` over gRPC and
   `Raft::pre_vote()`, or explicitly document that Pre-Vote is unsupported and keep it disabled.
-- [ ] **P2** Decide whether `transfer_leader` should use openraft's default or get an explicit
-  transport implementation; record the decision.
 - [ ] **P2** Consider streaming snapshot bytes into the state machine or a temp file instead of
   buffering the whole snapshot. The current API needs a contiguous buffer, but the receiver's
   total allocation still needs a policy (see §3).
-- [x] **P2** Keep TLS at the gateway; do not add per-node TLS to the Raft transport. Keep the
-  gRPC listener's failure behavior aligned with the health policy in §3.
 - [ ] **P3** Aeron remains gated on a measured bottleneck; no adapter is adopted.
 
 ## 5. Matching-engine features and correctness
@@ -225,16 +243,15 @@ Done:
 - [x] The processor runs as a tokio task over a bounded tokio `mpsc` queue, with `watch`-driven
   shutdown and `Notify`-driven snapshot wakeups; `try_send` keeps the matching path non-blocking.
 - [x] Processor state and shutdown are covered by unit tests and `test_market_data.rs`.
+- [x] **P1** Load-tested the feed at 50k–500k fills/s: at 500k fills/s with an 8,192-frame queue the
+  processor keeps up with no drops; a deliberate 2M fills/s overload drops frames and emits `GAP`.
+  Results: [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md).
+- [x] **P2** `epoch` (leader generation) and `leader_id` carry the current Raft term and known
+  leader: the leader watcher updates both on every metrics change; headers and reset snapshots carry
+  them, covered by the market-data unit test and `test_market_data.rs`.
 
 Remaining:
 
-- [x] **P1** Run a 50k–500k fills/s load test and record feed latency, queue depth and drop/GAP
-  behavior. At 500k fills/s with an 8,192-frame queue the processor keeps up with no drops; a
-  deliberate 2M fills/s overload drops frames and emits `GAP`. Results:
-  [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md).
-- [x] **P2** Fill `epoch` (leader generation) and `leader_id` instead of the current zeros. Done: the
-  leader watcher updates both on every metrics change; headers and reset snapshots carry the current
-  Raft term and known leader, covered by the market-data unit test and `test_market_data.rs`.
 - [ ] **P2** Add a consumer SDK/reference decoder for the wire format; the encoder has golden
   tests, the consumer side has none.
 - [ ] **P2** Archive recording/replay and the snapshot-request stream (2003/2010).
@@ -289,7 +306,7 @@ Current coverage:
   (`wal_decode`) and snapshot byte/content decoding (`snapshot_decode`); the scheduled
   `.github/workflows/fuzz.yml` job builds them and runs a smoke pass.
 
-Remaining:
+Completed follow-ups:
 
 - [x] **P1** Randomized differential/property tests for matching invariants (see §5).
 - [x] Exactness across snapshot/restart/events/feed is covered by `test_exactness.rs`.
@@ -301,9 +318,12 @@ Remaining:
 - [x] **P2** Add negative API tests for unknown `/read` keys and malformed `Place` payloads.
   Covered by `test_feature_matrix.rs`; follower forwarding is already covered.
 - [x] **P2** Make `test_cluster.rs` own and shut down its nodes, including on panic.
-- [ ] **P2** Parameterize the fixed test ports; `test_cluster.rs` still binds 21001–21003.
 - [x] **P2** MSRV job for Rust 1.89: the `msrv` job in `.github/workflows/ci.yml` runs
   `cargo check --all-targets --locked`; the main job uses stable.
+
+Remaining:
+
+- [ ] **P2** Parameterize the fixed test ports; `test_cluster.rs` still binds 21001–21003.
 - [ ] **P2** Keep `AGENTS.md` and this file in sync after code changes; both are maintained by
   hand.
 
@@ -370,13 +390,13 @@ Done:
   synced with the WAL + snapshot + gRPC design and snapshot v9 / wire v5.
 - [x] `docs/DECIMAL.md` records the fixed-point research, BTC 18-decimal range analysis,
   microbenchmarks and the completed end-to-end migration.
+- [x] **P3** Renamed `src/matchengine/` to `src/order_book/` (2026-10-29); the public module is now
+  `order_book`, while the package/binary name `matchengine-raft` is intentionally unchanged.
 
 Remaining:
 
 - [ ] **P2** Keep `AGENTS.md`, READMEs, `docs/DECIMAL.md` and this file in sync after future
   storage/wire changes.
-- [x] **P3** Rename `src/matchengine/` to `src/order_book/` (2026-10-29); the public module is
-  now `order_book`, while the package/binary name `matchengine-raft` is intentionally unchanged.
 - [ ] **P3** Decide whether to rename the remaining mixed-style modules before 1.0
   (`src/match_result/` → `match_events/`). This is import-breaking and offers no functional
   benefit today.
@@ -400,7 +420,8 @@ These choices feed the priorities above; write them down as ADRs or doc notes wh
 - [x] Equity/ETF sessions, holidays, auctions, T+1/T+2 settlement, corporate actions and
   fixed/regulatory/minimum/tax fees are owned by the external order system; the engine stays
   deterministic and consumes explicit timestamps and notional-proportional maker/taker rates.
-- [ ] Event time source for the clearing feed and per-instrument cursor retention.
+- [ ] **P2** Decide the event time source for the clearing feed and per-instrument cursor retention
+  (Phase 4 in §5).
 
 ## 12. Maker and taker fees — done
 
@@ -540,3 +561,17 @@ Guardrails / what not to copy:
   exchange and its WAL/snapshot is not crash-safe.
 - Do not advertise a feature that exists only in an example, a separate book type, or an
   unreachable "optimized" implementation.
+
+## 15. Failure behavior
+
+- [x] **P1** Fail-stop when the Raft core stops: `MatchEngineNode::run()` watches
+  `running_state` and returns an error instead of leaving HTTP and `/health` serving;
+  `tests/cluster/test_failure.rs` covers it.
+- [x] **P1** WAL append failure: a debug-only one-shot `LogStore::inject_append_error` drives
+  `ENOSPC` and `EIO` through a real client write; `test_failure.rs` asserts the node exits.
+- [x] **P1** SIGKILL during a write stream: `test_failure.rs` kills the binary with writes in
+  flight and asserts the restarted node's sequence covers every acknowledged batch.
+- [x] **P1** Snapshot atomicity: unit tests prove a leftover `current.snap.tmp` (a crash between
+  the temp write and the rename) is ignored and never replaces the committed snapshot.
+- [ ] **P1** SIGKILL during a learner snapshot install: a three-node case must prove the receiver
+  keeps its old state and retries instead of exposing a partially installed snapshot.

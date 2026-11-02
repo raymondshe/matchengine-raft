@@ -30,6 +30,10 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::RwLock;
+#[cfg(debug_assertions)]
+use std::sync::atomic::AtomicU8;
+#[cfg(debug_assertions)]
+use std::sync::atomic::Ordering;
 
 use openraft::LogState;
 use openraft::RaftTypeConfig;
@@ -223,9 +227,25 @@ struct Inner<C: RaftTypeConfig> {
     disk: RwLock<Disk<C>>,
     /// Serializes mutations so concurrent appends cannot interleave on disk.
     write_order: tokio::sync::Mutex<()>,
+    /// One-shot fault injection for tests: 0 = off, 1 = ENOSPC, 2 = EIO.
+    #[cfg(debug_assertions)]
+    append_fault: AtomicU8,
 }
 
 impl<C: RaftTypeConfig> Inner<C> {
+    /// Consumes a one-shot injected append failure, if armed.
+    #[cfg(debug_assertions)]
+    fn take_injected_append_error(&self) -> io::Result<()> {
+        match self.append_fault.swap(0, Ordering::SeqCst) {
+            1 => Err(io::Error::new(
+                io::ErrorKind::StorageFull,
+                "injected WAL append failure (ENOSPC)",
+            )),
+            2 => Err(io::Error::other("injected WAL append failure (EIO)")),
+            _ => Ok(()),
+        }
+    }
+
     fn append_blocking(&self, entries: Vec<C::Entry>) -> io::Result<()>
     where
         C::Entry: Clone,
@@ -233,6 +253,9 @@ impl<C: RaftTypeConfig> Inner<C> {
         if entries.is_empty() {
             return Ok(());
         }
+
+        #[cfg(debug_assertions)]
+        self.take_injected_append_error()?;
 
         let last_log_id = entries.last().map(|e| e.log_id().clone());
         let first_index = entries.first().map(|e| e.log_id().index);
@@ -672,6 +695,8 @@ impl<C: RaftTypeConfig> LogStore<C> {
                 _marker: PhantomData,
             }),
             write_order: tokio::sync::Mutex::new(()),
+            #[cfg(debug_assertions)]
+            append_fault: AtomicU8::new(0),
         };
 
         Ok(Self {
@@ -682,6 +707,19 @@ impl<C: RaftTypeConfig> LogStore<C> {
     /// Directory holding this log's segments.
     pub fn dir(&self) -> &Path {
         &self.inner.dir
+    }
+
+    /// Arms a one-shot WAL append failure for fault-injection tests.
+    ///
+    /// Debug builds only: release builds have no hook and no per-append check.
+    /// The error is returned before anything is written, so openraft treats it
+    /// as a fatal storage error and stops the Raft core.
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn inject_append_error(&self, storage_full: bool) {
+        self.inner
+            .append_fault
+            .store(if storage_full { 1 } else { 2 }, Ordering::SeqCst);
     }
 
     async fn append_entries(&self, entries: Vec<C::Entry>) -> io::Result<()>
