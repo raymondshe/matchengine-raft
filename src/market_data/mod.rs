@@ -693,6 +693,8 @@ impl MarketDataTap {
 #[derive(Clone, Debug)]
 pub struct MarketDataControl {
     leader: Arc<AtomicBool>,
+    epoch: Arc<AtomicU64>,
+    leader_id: Arc<AtomicU64>,
     leader_only: bool,
     resetting: Arc<AtomicBool>,
     pending: Arc<Mutex<Option<SnapshotFrame>>>,
@@ -703,6 +705,8 @@ impl MarketDataControl {
     /// Builds a control handle from its parts (used by tests and the node wiring).
     pub(crate) fn new(
         leader: Arc<AtomicBool>,
+        epoch: Arc<AtomicU64>,
+        leader_id: Arc<AtomicU64>,
         leader_only: bool,
         resetting: Arc<AtomicBool>,
         pending: Arc<Mutex<Option<SnapshotFrame>>>,
@@ -710,6 +714,8 @@ impl MarketDataControl {
     ) -> Self {
         Self {
             leader,
+            epoch,
+            leader_id,
             leader_only,
             resetting,
             pending,
@@ -725,6 +731,25 @@ impl MarketDataControl {
     /// Whether this node is currently allowed to publish (leader-only check).
     pub fn is_publishing(&self) -> bool {
         !self.leader_only || self.leader.load(Ordering::Relaxed)
+    }
+
+    /// Updates the Raft term and known leader used in message headers.
+    ///
+    /// The fields are updated on every metrics change so a takeover snapshot
+    /// and all following frames carry the new leader generation.
+    pub fn set_epoch(&self, epoch: u64, leader_id: u64) {
+        self.epoch.store(epoch, Ordering::Relaxed);
+        self.leader_id.store(leader_id, Ordering::Relaxed);
+    }
+
+    /// The current header epoch (Raft term).
+    pub fn epoch(&self) -> u64 {
+        self.epoch.load(Ordering::Relaxed)
+    }
+
+    /// The current header leader id (0 when no leader is known).
+    pub fn leader_id(&self) -> u64 {
+        self.leader_id.load(Ordering::Relaxed)
     }
 
     /// Opens or closes the publish gate (the tap and processor share it).
@@ -766,6 +791,8 @@ impl MarketDataControl {
 pub struct MarketDataHandle {
     tap: MarketDataTap,
     leader: Arc<AtomicBool>,
+    epoch: Arc<AtomicU64>,
+    leader_id: Arc<AtomicU64>,
     leader_only: bool,
     resetting: Arc<AtomicBool>,
     pending: Arc<Mutex<Option<SnapshotFrame>>>,
@@ -794,6 +821,8 @@ impl MarketDataHandle {
         // an all-replica feed starts open but still waits for the startup reset.
         channels.enabled.store(!leader_only, Ordering::Relaxed);
         let leader = channels.enabled.clone();
+        let epoch = Arc::new(AtomicU64::new(0));
+        let leader_id = Arc::new(AtomicU64::new(0));
         let resetting = Arc::new(AtomicBool::new(true));
         let pending = Arc::new(Mutex::new(None));
         let wake = Arc::new(Notify::new());
@@ -804,6 +833,8 @@ impl MarketDataHandle {
             sink,
             channels.stats,
             leader.clone(),
+            epoch.clone(),
+            leader_id.clone(),
             resetting.clone(),
             pending.clone(),
             channels.dropped,
@@ -819,6 +850,8 @@ impl MarketDataHandle {
         Ok(Self {
             tap,
             leader,
+            epoch,
+            leader_id,
             leader_only,
             resetting,
             pending,
@@ -837,6 +870,8 @@ impl MarketDataHandle {
     pub fn control(&self) -> MarketDataControl {
         MarketDataControl::new(
             self.leader.clone(),
+            self.epoch.clone(),
+            self.leader_id.clone(),
             self.leader_only,
             self.resetting.clone(),
             self.pending.clone(),
@@ -847,6 +882,12 @@ impl MarketDataHandle {
     /// Updates the publish gate (driven by `raft.metrics()`).
     pub fn set_leader(&self, leader: bool) {
         self.control().set_leader(leader);
+    }
+
+    /// Updates the Raft term and known leader used in message headers.
+    pub fn set_epoch(&self, epoch: u64, leader_id: u64) {
+        self.epoch.store(epoch, Ordering::Relaxed);
+        self.leader_id.store(leader_id, Ordering::Relaxed);
     }
 
     /// Queues a state capture; the processor emits it before later deltas.
@@ -1030,6 +1071,8 @@ struct MarketDataProcessor {
     sink: Box<dyn MarketDataSink>,
     stats: Arc<MarketDataStats>,
     leader: Arc<AtomicBool>,
+    epoch: Arc<AtomicU64>,
+    leader_id: Arc<AtomicU64>,
     resetting: Arc<AtomicBool>,
     pending: Arc<Mutex<Option<SnapshotFrame>>>,
     shadow: BTreeMap<u32, ShadowBook>,
@@ -1056,6 +1099,8 @@ impl MarketDataProcessor {
         sink: Box<dyn MarketDataSink>,
         stats: Arc<MarketDataStats>,
         leader: Arc<AtomicBool>,
+        epoch: Arc<AtomicU64>,
+        leader_id: Arc<AtomicU64>,
         resetting: Arc<AtomicBool>,
         pending: Arc<Mutex<Option<SnapshotFrame>>>,
         dropped: Arc<AtomicU64>,
@@ -1066,6 +1111,8 @@ impl MarketDataProcessor {
             sink,
             stats,
             leader,
+            epoch,
+            leader_id,
             resetting,
             pending,
             shadow: BTreeMap::new(),
@@ -1610,8 +1657,8 @@ impl MarketDataProcessor {
             sub_seq,
             log_index,
             ordinal,
-            epoch: 0,
-            leader_id: 0,
+            epoch: self.epoch.load(Ordering::Relaxed),
+            leader_id: self.leader_id.load(Ordering::Relaxed),
             ts_ms,
             symbol_id,
             body,
@@ -1649,6 +1696,8 @@ mod tests {
         messages: Arc<Mutex<Vec<MarketMessage>>>,
         stats: Arc<MarketDataStats>,
         leader: Arc<AtomicBool>,
+        epoch: Arc<AtomicU64>,
+        leader_id: Arc<AtomicU64>,
         resetting: Arc<AtomicBool>,
         gap_pending: Arc<AtomicBool>,
         dropped: Arc<AtomicU64>,
@@ -1658,6 +1707,8 @@ mod tests {
         let messages = Arc::new(Mutex::new(Vec::new()));
         let stats = Arc::new(MarketDataStats::default());
         let leader = Arc::new(AtomicBool::new(true));
+        let epoch = Arc::new(AtomicU64::new(0));
+        let leader_id = Arc::new(AtomicU64::new(0));
         let resetting = Arc::new(AtomicBool::new(false));
         let pending = Arc::new(Mutex::new(None));
         let dropped = Arc::new(AtomicU64::new(0));
@@ -1667,6 +1718,8 @@ mod tests {
             Box::new(CollectSink(messages.clone())),
             stats.clone(),
             leader.clone(),
+            epoch.clone(),
+            leader_id.clone(),
             resetting.clone(),
             pending,
             dropped.clone(),
@@ -1677,6 +1730,8 @@ mod tests {
             messages,
             stats,
             leader,
+            epoch,
+            leader_id,
             resetting,
             gap_pending,
             dropped,
@@ -1684,6 +1739,11 @@ mod tests {
     }
 
     impl Harness {
+        fn set_epoch(&self, epoch: u64, leader_id: u64) {
+            self.epoch.store(epoch, Ordering::Relaxed);
+            self.leader_id.store(leader_id, Ordering::Relaxed);
+        }
+
         fn messages(&self) -> Vec<MarketMessage> {
             self.messages.lock().unwrap().clone()
         }
@@ -1785,6 +1845,27 @@ mod tests {
             book_sequence: market_seq + 1,
             pending_stops: 1,
         }
+    }
+
+    #[test]
+    fn messages_carry_the_current_epoch_and_leader() {
+        let mut h = harness(MarketDataConfig::default());
+        h.set_epoch(7, 3);
+        h.processor.ingest(frame(
+            1,
+            1_000,
+            vec![depth(OrderSide::Sell, 100.0, 5.0, 1)],
+            vec![fill_event(1, OrderSide::Buy, 100.0, 1.0, 1, 2)],
+        ));
+
+        let messages = h.messages();
+        assert!(!messages.is_empty());
+        assert!(
+            messages
+                .iter()
+                .all(|message| message.epoch == 7 && message.leader_id == 3),
+            "every header must carry the current epoch/leader: {messages:?}"
+        );
     }
 
     #[test]

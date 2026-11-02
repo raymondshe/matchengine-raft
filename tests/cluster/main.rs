@@ -1,5 +1,6 @@
 mod common;
 mod test_batch_write;
+mod test_client;
 mod test_cluster;
 mod test_console;
 mod test_events;

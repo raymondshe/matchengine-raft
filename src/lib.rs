@@ -533,7 +533,17 @@ fn spawn_market_data_watch(
         let mut leader = false;
         let mut started = false;
         loop {
-            let is_leader = metrics.borrow_and_update().current_leader == Some(node_id);
+            let (is_leader, epoch, leader_id) = {
+                let metrics = metrics.borrow_and_update();
+                (
+                    metrics.current_leader == Some(node_id),
+                    metrics.current_term,
+                    metrics.current_leader.unwrap_or(0),
+                )
+            };
+            // Update the header generation before a takeover snapshot is
+            // queued, so the reset and its following frames carry the new term.
+            control.set_epoch(epoch, leader_id);
             if !leader_only {
                 // Every replica publishes: a startup reset is all consumers need.
                 if !started {

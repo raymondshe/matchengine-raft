@@ -69,7 +69,7 @@
 - **持久化撮合事件 Feed**：`POST /events` 游标分页、保留上限、`client_order_id` 幂等和安全重试。
 - **确定性行情 Feed**：领导者门控、影子订单簿、BBO、深度快照/增量、生命周期事件、OHLC K 线和紧凑二进制行情格式。
 - **灵活读取一致性**：本地读、领导者线性一致读和 follower 线性一致读。
-- **领导者感知 Rust 客户端**，自动跟踪并转发到当前领导者。
+- **领导者感知 Rust 客户端**，自动跟踪并转发到当前领导者，支持可配置超时、瞬时错误重试/退避以及类型化的 API/无领导者错误；重试是至少一次语义，写入重试应使用 `client_order_id` 实现幂等。
 - **运维 API**：初始化、成员变更、指标、事件状态和行情状态。
 - **批量写入**：`POST /write_batch` 将多个请求放入一个 Raft entry 和一次 WAL fsync，逐项返回序列号，事件序号在 entry 内连续。
 
@@ -338,7 +338,7 @@ HTTP API 与 gRPC Raft 监听端口（HTTP 端口 + 1000）**按设计就是明�
 ```
 src/
 ├── main.rs                  # 服务器入口（参数、环境变量、存储配置）
-├── client.rs                # 支持领导者转发的智能客户端
+├── client.rs                # 支持领导者转发、重试和超时的智能客户端
 ├── lib.rs                   # 节点组装、服务与关闭
 ├── app.rs                   # 应用状态
 ├── order_book/
@@ -389,7 +389,8 @@ tests/
     ├── test_fee_assets.rs     # QQQ/USD tick/lot、quote 数量和 quote 扣费
     ├── test_request_limits.rs # 恶意输入和请求大小限制
     ├── test_batch_write.rs    # 单 Raft entry 批量写入
-    └── test_feature_matrix.rs # 公共 API 订单类型矩阵与生命周期事件
+    ├── test_feature_matrix.rs # 公共 API 订单类型矩阵与生命周期事件
+    └── test_client.rs         # 客户端重试、类型化错误与故障切换转发
 └── replay/
     ├── README.md              # 场景矩阵、端口和重新生成说明
     ├── run-all.sh             # 运行全部已检入回放用例
@@ -608,7 +609,7 @@ POST /events
 - 每条消息携带 `(symbol_id, stream_id, market_seq, sub_seq)`。`market_seq` 是复制的变更序列号
   （`Place` 使用 taker 订单序列号；`Cancel`、`Amend`、`PurgeExpired` 各消耗一个），因此该键在
   leader 与 follower、主节点切换和重启后都一致；下游按该四元组去重，`(log_index, ordinal)` 仍是
-  审计位置；
+  审计位置；头部还携带当前 Raft term（`epoch`）和已知 leader id，重置快照标记领导权代次；
 - 默认只有领导者发布（`--market-data-leader-only=false` 时每个副本都发布）；每次获得领导权先发一次
   重置快照（边界为下一个 `market_seq`）。队列满时丢弃帧并发送 `GAP`，`apply` 永远不会被订阅者阻塞
   或拖慢。
@@ -834,8 +835,9 @@ pub struct MatchEngineResponse {
 
 法币、稳定币、加密货币、ETF 和股票等标的的 base/quote 数量语义与按资产扣费已实现。
 ETF/股票 base 的费用始终以 quote 资产结算；加密货币和法币对法币（FX）默认使用收到资产，
-加密货币也可显式选择 quote 或 base。完整模型和未完成扩展（交易时段、公司行为、固定/监管费用、
-fee token）见 [`docs/FEE_DEDUCTION.md`](./docs/FEE_DEDUCTION.md)。
+加密货币也可显式选择 quote 或 base。完整模型和未完成扩展（fee token）见
+[`docs/FEE_DEDUCTION.md`](./docs/FEE_DEDUCTION.md)；交易时段、结算、公司行为以及固定/监管/最低/税费
+由外部订单系统负责。
 
 其他订单类型字段（`tif`、`post_only`、`stop_price`、`display_volume`、`hidden_volume`、
 `timestamp`）都是可选的，默认就是普通的 GTC 限价单：
@@ -873,6 +875,7 @@ fee token）见 [`docs/FEE_DEDUCTION.md`](./docs/FEE_DEDUCTION.md)。
 | `tests/cluster/test_console.rs` | 三节点集群：内置控制台资源、节点/集群 API、危险操作拒绝，以及通过 `/console/api/actions/transfer-leader` 切换领导者 |
 | `tests/cluster/test_batch_write.rs` | 多个请求在单个 Raft entry 中应用，逐项序列号、连续事件序号，以及空/嵌套/超大/重复 id 批次校验 |
 | `tests/cluster/test_feature_matrix.rs` | 通过 `/write` 发送每种已宣传的订单类型并断言返回的事件类型；覆盖挂单 → 改单 → 部分成交 → 撤单以及到期/止损生命周期，证明正常操作使用显式事件而非拒绝；同时校验畸形请求体和未知 read key |
+| `tests/cluster/test_client.rs` | 类型化的无领导者/HTTP 边缘错误、连接被丢弃后的重试/退避，以及领导者故障切换后向新领导者的转发 |
 | `tests/replay/*/run.sh` | Shell 驱动的回放矩阵，覆盖 GTC、IOC、FOK、GTD、Day、市价、Post-Only、冰山单、止损市价单、止损限价单、改单、撤单、撮合/吃单扣费、quote 扣费和费用溢出场景；每个用例对比生成的事件序列与已检入的 `expected-events.jsonl` |
 | `fuzz/` | `cargo-fuzz` 目标：`OrderBook::execute_order`、WAL 字节解码、快照字节/内容解码；每夜的定时工作流构建三个目标并做一次冒烟运行 |
 
@@ -886,7 +889,7 @@ fee token）见 [`docs/FEE_DEDUCTION.md`](./docs/FEE_DEDUCTION.md)。
 所有集成测试都使用唯一的临时数据目录。集群测试固定使用端口 `21001-21003`（gRPC
 `22001-22003`），快照测试使用 `21101-21103`，重启测试使用 `21201-21205`，撮合结果测试使用
 `21301`/`21302`、行情数据测试 `21303`、事件日志测试 `21304`、故障切换测试
-`21401-21403`、学习者追赶测试 `21501-21502`、过期节点重入测试 `21601-21603`、精度往返测试 `21701`（gRPC `22701`）、标的配置测试 `21801-21802`（gRPC `22801-22802`）、费用测试 `21901`（gRPC `22901`）、费用资产测试 `21902`（gRPC `22902`）、请求限制测试 `21903`（gRPC `22903`）、批量写入测试 `21904`（gRPC `22904`）、健康检查测试 `21905`（gRPC `22905`）、控制台测试 `21906-21908`（gRPC `22906-22908`）和功能矩阵/生命周期测试 `21909-21911`（gRPC `22909-22911`）；重跑前请先停止残留进程
+`21401-21403`、学习者追赶测试 `21501-21502`、过期节点重入测试 `21601-21603`、精度往返测试 `21701`（gRPC `22701`）、标的配置测试 `21801-21802`（gRPC `22801-22802`）、费用测试 `21901`（gRPC `22901`）、费用资产测试 `21902`（gRPC `22902`）、请求限制测试 `21903`（gRPC `22903`）、批量写入测试 `21904`（gRPC `22904`）、健康检查测试 `21905`（gRPC `22905`）、控制台测试 `21906-21908`（gRPC `22906-22908`）、功能矩阵/生命周期测试 `21909-21911`（gRPC `22909-22911`）和客户端测试 `21912-21917`（gRPC `22912-22917`）；重跑前请先停止残留进程
 （`pkill -f matchengine-raft`）。
 
 ## 性能与当前限制

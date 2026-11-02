@@ -1,6 +1,6 @@
 # TODO
 
-Last reviewed: 2026-11-01. This is the working roadmap; see `AGENTS.md` for commands and the
+Last reviewed: 2026-11-02. This is the working roadmap; see `AGENTS.md` for commands and the
 current branch state.
 
 **Current baseline:** the OpenRaft 0.10 port, durable WAL/snapshot storage and exact scale-18
@@ -19,13 +19,14 @@ important but not blocking; **P3** = later/optional.
 ## Top priorities
 
 The existing P0/P1 work is complete, including the measured baselines in
-[`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md). The third-party review adds new P0/P1 follow-ups
+[`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md). The remaining third-party follow-ups are P2/P3
 (see §14). Measurement scope, measured peak RSS, the book-only replay benchmark, the fuzz targets,
 the health/readiness endpoints and the operational console are now in place.
 
-1. **P1 — Equity/ETF session and fee scope.** Define gateway responsibilities for sessions,
-   holidays, auctions, T+1/T+2 and corporate actions, and decide whether fixed/regulatory fees,
-   minimum tickets and taxes are in scope.
+Equity/ETF sessions, holidays, auctions, T+1/T+2 settlement, corporate actions and
+fixed/regulatory/minimum/tax fees are owned by the external order system (§13). No top-priority
+P0/P1 feature work remains in this roadmap; the remaining items are P2/P3 and are tracked in the
+sections below.
 
 ## 1. Exact fixed-point end-to-end — done
 
@@ -231,8 +232,9 @@ Remaining:
   behavior. At 500k fills/s with an 8,192-frame queue the processor keeps up with no drops; a
   deliberate 2M fills/s overload drops frames and emits `GAP`. Results:
   [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md).
-- [ ] **P2** Fill `epoch` (leader generation) and `leader_id` instead of the current zeros; the
-  header fields and leader watcher already exist.
+- [x] **P2** Fill `epoch` (leader generation) and `leader_id` instead of the current zeros. Done: the
+  leader watcher updates both on every metrics change; headers and reset snapshots carry the current
+  Raft term and known leader, covered by the market-data unit test and `test_market_data.rs`.
 - [ ] **P2** Add a consumer SDK/reference decoder for the wire format; the encoder has golden
   tests, the consumer side has none.
 - [ ] **P2** Archive recording/replay and the snapshot-request stream (2003/2010).
@@ -340,9 +342,13 @@ Remaining:
 
 ## 9. Client library
 
-- [ ] **P2** Harden `src/client.rs` before use outside examples: retry/backoff on transient RPC
-  errors, configurable timeouts, and a typed "no known leader" error instead of a bare message.
-- [ ] **P2** Add integration coverage for leader forwarding, failover and retry behavior.
+- [x] **P2** Harden `src/client.rs` before use outside examples: retry/backoff on transient RPC
+  errors, configurable timeouts, and a typed "no known leader" error. Done: `ClientConfig` sets
+  timeout/transient/forward retries and exponential backoff; `ClientError` distinguishes `Api`,
+  `NoLeader`, `Timeout`, `Decode` and Raft transport errors.
+- [x] **P2** Add integration coverage for leader forwarding, failover and retry behavior. Done:
+  `tests/cluster/test_client.rs` covers typed no-leader/API errors, retry after a dropped
+  connection and forwarding to the new leader after failover.
 - [x] **P2** Keep the client transport plaintext; gateway authentication/TLS is outside the
   internal client.
 
@@ -390,6 +396,9 @@ These choices feed the priorities above; write them down as ADRs or doc notes wh
 - [x] gRPC listener failure policy: fail-fast. A dead gRPC server task stops HTTP/background
   work and returns the transport error; it does not leave a half-healthy node serving.
 - [x] Multi-symbol isolation: one process/cluster per symbol, never multiple books in one process.
+- [x] Equity/ETF sessions, holidays, auctions, T+1/T+2 settlement, corporate actions and
+  fixed/regulatory/minimum/tax fees are owned by the external order system; the engine stays
+  deterministic and consumes explicit timestamps and notional-proportional maker/taker rates.
 - [ ] Event time source for the clearing feed and per-instrument cursor retention.
 
 ## 12. Maker and taker fees — done
@@ -419,13 +428,13 @@ Done:
   overflow, 18-digit exactness, a taker that later rests, file/event/feed output and snapshot
   restart.
 
-Remaining (outside the matching engine):
+Ownership boundaries (outside the matching engine):
 
-- [ ] **P2** Define fee accounts/balances and settlement ownership in the clearing system. The
-  engine reports exact fees, their assets and the policy; clearing applies final asset rounding and
-  moves funds.
-- [ ] **P2** Decide whether fee tiers can change on a live order. Today a change requires
-  cancel/replace; amendments preserve the original rates.
+- [x] **P2** Fee accounts/balances and settlement ownership live in the external order/clearing
+  system. The engine reports exact fees, their assets and the policy; it does not move funds or
+  apply final asset rounding.
+- [x] **P2** Fee-tier changes on a live order are handled by the order system as cancel/replace;
+  the engine preserves the order's original rates through amendments and resting fills.
 
 ## 13. Base/quote volume and asset-aware fee deduction [done]
 
@@ -452,10 +461,6 @@ Done:
 
 Remaining extensions:
 
-- [ ] **P1** Define gateway responsibilities for equity/ETF sessions, holidays, auctions, T+1/T+2
-  settlement and corporate actions. The deterministic engine must not read a clock.
-- [ ] **P1** Decide whether fixed per-trade fees, per-share commissions, regulatory fees, minimum
-  tickets or taxes are in scope; notional-proportional rates do not cover them.
 - [ ] **P2** Add third-asset fee-token support only if a fee price and balance model are provided.
 - [ ] **P2** Decide whether mixed-unit iceberg/FOK orders should normalize tranches; quote volume
   currently supports plain limit and market orders only.
@@ -464,7 +469,10 @@ Remaining extensions:
 Resolved decisions: quote limit sell rounds base quantity down to cap notional; quote market sell
 rounds up and permits a bounded overshoot; `volume` is always gross; the fee policy is per symbol;
 quote market-buy budgets are gross notional with quote fees charged additionally; the engine
-reports exact 18-scale fees and clearing applies final asset rounding.
+reports exact 18-scale fees and clearing applies final asset rounding. Sessions, holidays,
+auctions, T+1/T+2 settlement, corporate actions and fixed per-trade/per-share, regulatory, minimum
+ticket and tax fees are owned by the external order system; the engine consumes explicit timestamps
+and notional-proportional maker/taker rates only.
 
 ## 14. Third-party investigation takeaways
 
@@ -474,7 +482,7 @@ Source: [`docs/THIRD_PARTY_INVESTIGATION.md`](./docs/THIRD_PARTY_INVESTIGATION.m
 [llc-993/matching-core](https://github.com/llc-993/matching-core). All are single-node/reference
 projects; our Raft, durability, exactness and deterministic event ids remain non-negotiable.
 
-P0/P1 follow-ups:
+P0/P1 follow-ups (all completed):
 
 - [x] **P0** Add a measurement-scope table to `docs/PERFORMANCE.md` (what each benchmark
   includes/excludes, closed-loop vs open-loop, timer source and variance), and record measured
@@ -505,8 +513,13 @@ P0/P1 follow-ups:
   explicit events rather than overloading `Reject`; consumers must reconstruct the full order state.
   Done: `test_feature_matrix.rs` covers rest → amend → partial fill → cancel, GTD/Day expiry and
   stop/stop-limit triggers, including the legitimate `stop_would_trigger` rejection.
-- [ ] **P1** Keep TPS, events/s and queries/s distinct in benchmark reports; llc-993 labels event
-  count as QPS and estimates memory at 200 bytes/order.
+- [x] **P1** Keep TPS, events/s and queries/s distinct in benchmark reports; llc-993 labels event
+  count as QPS and estimates memory at 200 bytes/order. Done: the measurement-scope table and
+  per-benchmark units keep writes/s, orders/s, fills/s, cancels/s, advances/s, queries/s and
+  allocs/entry distinct, and memory is whole-process RSS rather than a per-order estimate.
+
+P2/P3 follow-ups:
+
 - [ ] **P2** Evaluate a binary order-entry path (gRPC/protobuf or compact codec) and feature-gated
   latency histograms only if a latency target requires them.
 - [ ] **P2** Evaluate real ITCH-style replay data and custom MPMC/SIMD/io_uring work only after a

@@ -65,6 +65,11 @@ fn market_data_feed_publishes_trades_bbo_depth_and_bars() {
             }),
             "market data published before the reset snapshot: {events:?}"
         );
+        assert!(
+            events[first_snapshot]["epoch"].as_u64().unwrap_or(0) >= 1,
+            "the reset snapshot must carry the current Raft term"
+        );
+        assert_eq!(1, events[first_snapshot]["leader_id"]);
 
         let place = |order: Order| MatchEngineRequest::place(order);
 
@@ -178,6 +183,11 @@ fn market_data_feed_publishes_trades_bbo_depth_and_bars() {
             .expect("the four-fill trade");
         assert_eq!(sell_seq, first_trade_message["market_seq"]);
         assert_eq!(0, first_trade_message["sub_seq"]);
+        assert!(
+            first_trade_message["epoch"].as_u64().unwrap_or(0) >= 1,
+            "messages carry the Raft term"
+        );
+        assert_eq!(1, first_trade_message["leader_id"]);
         let first_trade = first_trade_message["body"]["trade"]
             .as_array()
             .and_then(|records| records.first())

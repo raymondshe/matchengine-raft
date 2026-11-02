@@ -2,8 +2,9 @@
 
 Status: **core implemented.** The engine now carries base/quote asset metadata, tick/lot rules,
 `VolumeUnit`, quote-aware sweeps and `FeeAssetPolicy`. Snapshot **v9** and wire **v5** encode the
-new fields. Extensions still open are listed in §13 (sessions/lifecycles, fixed/regulatory fees,
-fee tokens, net-volume semantics).
+new fields. Extensions still open are listed in §13 (fee-token support and launch asset-class
+scope). Sessions, settlement, corporate actions and fixed/regulatory/minimum/tax fees are owned by
+the external order system.
 
 ## 1. Goals
 
@@ -104,16 +105,16 @@ Quote-volume orders are especially useful for instruments bought by cash amount,
 ### 3.1 Sessions, settlement and corporate actions
 
 - Crypto pairs can trade continuously; equities/ETFs and fiat FX have sessions, holidays and
-  auctions. The matching engine must not read a clock. The gateway validates the trading session
-  and supplies `Day` close/GTD timestamps through the existing explicit purge path.
+  auctions. The matching engine must not read a clock. The external order system validates the
+  trading session and supplies `Day` close/GTD timestamps through the existing explicit purge path.
 - Equity/ETF settlement may be T+1 or T+2 while stablecoin settlement is on-chain. The engine
-  reports fees and net amounts; the clearing layer owns settlement timing.
+  reports fees and net amounts; the external order/clearing system owns settlement timing.
 - Splits, dividends, symbol changes and other corporate actions can change the base quantity or
-  price basis. Those require a symbol halt and a controlled adjustment/re-listing, not a fee
-  calculation. They are outside the matching engine but must be part of the symbol lifecycle.
+  price basis. They are owned by the external order system; the matching engine has no
+  corporate-action logic and is halted/reconfigured through that system.
 - Notional-proportional maker/taker rates cover the common crypto and brokerage tiers. Fixed
   per-trade fees, per-share commissions, regulatory fees (for example SEC/FINRA fees), minimum
-  tickets and taxes are not modelled by this design; they need a separate fee-rule extension.
+  tickets and taxes are owned by the external order system and are out of scope for this engine.
 - Short selling, margin, lending, dividends and tax withholding are outside this matching-engine
   design.
 
@@ -593,12 +594,17 @@ Still open:
 10. Which asset classes must be supported at launch: fiat, stablecoin, crypto, equity, ETF, or a
    subset? `AssetId`/`AssetClass` exist; production asset issuance/validation is still a deployment
    concern.
-11. Are fixed per-trade fees, per-share commissions, regulatory fees, minimum tickets or taxes in
-    scope? They are not notional-proportional rates.
-12. Are equity/ETF sessions, holidays, auctions and corporate actions handled entirely by the
-    gateway, or does the engine need a symbol lifecycle/halt state?
 13. Can fees be charged in an asset other than base or quote (for example a broker fee in USD on a
     BTC/USDT trade)? That requires a fee-token price and balance handling.
+
+Resolved:
+
+11. Fixed per-trade fees, per-share commissions, regulatory fees, minimum tickets and taxes are
+    owned by the external order system; the engine computes only notional-proportional maker/taker
+    rates.
+12. Equity/ETF sessions, holidays, auctions, T+1/T+2 settlement and corporate actions are owned by
+    the external order system; the engine consumes explicit timestamps and has no clock or
+    corporate-action logic.
 
 ## 14. Recommendation
 
@@ -614,10 +620,11 @@ Adopt the following default contract:
   USDT are never interchangeable.
 - Price tick and base lot are first-class metadata; decimals alone are not enough for equities or
   crypto.
-- The engine reports exact fee amounts and fee assets; clearing owns balances, fiat/chain settlement
-  and final asset precision.
-- Equity/ETF trading sessions, holidays and corporate actions stay upstream of the deterministic
-  matching engine; the gateway supplies session-close/GTD timestamps.
+- The engine reports exact fee amounts and fee assets; the external order/clearing system owns
+  balances, fiat/chain settlement and final asset precision.
+- Equity/ETF sessions, holidays, auctions, T+1/T+2 settlement, corporate actions and
+  fixed/regulatory/minimum/tax fees stay upstream in the external order system; the engine consumes
+  explicit session-close/GTD timestamps and notional-proportional maker/taker rates.
 - Snapshot v9 and wire v5 gate the change.
 
 This keeps the order book’s price-time priority unchanged while extending the execution path with

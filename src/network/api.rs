@@ -20,6 +20,7 @@ use web::Json;
 use crate::MatchEngineTypeConfig;
 use crate::app::MatchEngineApp;
 use crate::client::FollowerReadError;
+use crate::client::FollowerReadErrorKind;
 use crate::match_result::EventId;
 use crate::match_result::MatchEvent;
 use crate::order_book::Order;
@@ -532,9 +533,10 @@ pub async fn follower_read(
     let leader_id = match app.raft.current_leader().await {
         Some(id) => id,
         None => {
-            return Ok(Json(Err(FollowerReadError {
-                message: "No leader available".to_string(),
-            })));
+            return Ok(Json(Err(FollowerReadError::new(
+                FollowerReadErrorKind::NoLeader,
+                "no leader available",
+            ))));
         }
     };
 
@@ -543,9 +545,10 @@ pub async fn follower_read(
     let leader_node = match metrics.membership_config.membership().get_node(&leader_id) {
         Some(node) => node,
         None => {
-            return Ok(Json(Err(FollowerReadError {
-                message: format!("Leader node {} not found in membership", leader_id),
-            })));
+            return Ok(Json(Err(FollowerReadError::new(
+                FollowerReadErrorKind::LeaderNotInMembership,
+                format!("leader node {leader_id} not found in membership"),
+            ))));
         }
     };
     let leader_addr = &leader_node.addr;
@@ -557,9 +560,10 @@ pub async fn follower_read(
     let response = match client.post(&url).send().await {
         Ok(resp) => resp,
         Err(e) => {
-            return Ok(Json(Err(FollowerReadError {
-                message: format!("Failed to contact leader: {}", e),
-            })));
+            return Ok(Json(Err(FollowerReadError::new(
+                FollowerReadErrorKind::LeaderUnreachable,
+                format!("failed to contact leader: {e}"),
+            ))));
         }
     };
 
@@ -569,18 +573,20 @@ pub async fn follower_read(
     > = match response.json().await {
         Ok(result) => result,
         Err(e) => {
-            return Ok(Json(Err(FollowerReadError {
-                message: format!("Failed to parse linearizer data: {}", e),
-            })));
+            return Ok(Json(Err(FollowerReadError::new(
+                FollowerReadErrorKind::LeaderRejected,
+                format!("failed to parse linearizer data: {e}"),
+            ))));
         }
     };
 
     let linearizer_data = match linearizer_data_result {
         Ok(data) => data,
         Err(e) => {
-            return Ok(Json(Err(FollowerReadError {
-                message: format!("Leader returned error: {:?}", e),
-            })));
+            return Ok(Json(Err(FollowerReadError::new(
+                FollowerReadErrorKind::LeaderRejected,
+                format!("leader returned error: {e:?}"),
+            ))));
         }
     };
 
@@ -593,9 +599,10 @@ pub async fn follower_read(
 
     // 4. Wait for local state machine to catch up
     if let Err(e) = linearizer.await_ready(&app.raft).await {
-        return Ok(Json(Err(FollowerReadError {
-            message: format!("Failed to wait for state machine: {:?}", e),
-        })));
+        return Ok(Json(Err(FollowerReadError::new(
+            FollowerReadErrorKind::StateMachine,
+            format!("failed to wait for state machine: {e:?}"),
+        ))));
     }
 
     // 5. Read from local state machine

@@ -1704,6 +1704,8 @@ mod tests {
         let pending = Arc::new(std::sync::Mutex::new(None));
         let control = MarketDataControl::new(
             leader,
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
             true,
             resetting,
             pending,
@@ -2897,6 +2899,8 @@ mod tests {
 
         let control = MarketDataControl::new(
             channels.enabled.clone(),
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
             true,
             Arc::new(std::sync::atomic::AtomicBool::new(true)),
             Arc::new(Mutex::new(None)),

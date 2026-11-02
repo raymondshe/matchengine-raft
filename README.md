@@ -69,7 +69,7 @@ Built for teams that need deterministic execution, durable recovery and a clean 
 - **Durable match-event feed** at `POST /events` with cursor pagination, retention limits, `client_order_id` idempotency and replay-safe retries.
 - **Deterministic market-data feed** with leader gating, shadow book, BBO, depth snapshots/deltas, lifecycle events, OHLC bars and a compact binary wire format.
 - **Flexible read consistency**: local reads, linearizable leader reads and linearizable follower reads.
-- **Leader-aware Rust client** that tracks and forwards requests to the current leader.
+- **Leader-aware Rust client** that tracks and forwards requests to the current leader, with configurable timeouts, transient retry/backoff and typed API/no-leader errors; retries are at-least-once, so use `client_order_id` for idempotent write retries.
 - **Operational APIs** for initialization, membership changes, metrics, event status and market-data status.
 - **Batch writes** at `POST /write_batch`: multiple requests in one Raft entry and one WAL fsync, with per-request sequences and continuous event ordinals.
 
@@ -349,7 +349,7 @@ memory.
 ```
 src/
 ├── main.rs                  # Server entry point (flags, env, storage config)
-├── client.rs                # Smart client with leader forwarding
+├── client.rs                # Smart client with leader forwarding, retries and timeouts
 ├── lib.rs                   # Node composition, servers, shutdown
 ├── app.rs                   # Application state
 ├── order_book/
@@ -400,7 +400,8 @@ tests/
     ├── test_fee_assets.rs     # QQQ/USD tick/lot, quote volume and quote fees
     ├── test_request_limits.rs # Hostile input and request-size limits
     ├── test_batch_write.rs    # Batch writes in one Raft entry
-    └── test_feature_matrix.rs # Public-API order-type matrix and lifecycle events
+    ├── test_feature_matrix.rs # Public-API order-type matrix and lifecycle events
+    └── test_client.rs         # Client retries, typed errors and failover forwarding
 └── replay/
     ├── README.md              # Scenario matrix, ports and regeneration notes
     ├── run-all.sh             # Run every checked-in replay case
@@ -642,7 +643,9 @@ designed in `docs/AERON_SOLUTION.md` Part II and implemented in `src/market_data
 - every message carries `(symbol_id, stream_id, market_seq, sub_seq)`. `market_seq` is the replicated
   mutation sequence (the taker order sequence for `Place`; `Cancel`, `Amend` and `PurgeExpired`
   consume one), so the key is identical on leader and followers, across failover and restart.
-  Downstream deduplicates on that tuple; `(log_index, ordinal)` remains the audit position;
+  Downstream deduplicates on that tuple; `(log_index, ordinal)` remains the audit position. The
+  header also carries the current Raft term as `epoch` and the known leader id; a reset snapshot
+  marks the leadership generation;
 - only the leader publishes by default (`--market-data-leader-only=false` feeds every replica);
   every leadership gain starts with a reset snapshot whose boundary is the next `market_seq`. A full
   queue drops frames and emits a `GAP`; `apply` is never blocked or slowed by a subscriber.
@@ -898,8 +901,9 @@ exceeds the supported fixed-point range. The engine records fees but does not mo
 Base/quote volume semantics and asset-aware fee deduction for fiat, stablecoin, crypto, ETF and
 equity pairs are implemented. ETF/equity bases always settle fees in the quote asset; crypto/spot
 and fiat-to-fiat pairs default to the received asset, and crypto can explicitly select quote or
-base. The full model and open extensions (sessions, corporate actions, fixed/regulatory fees, fee
-tokens) are in [`docs/FEE_DEDUCTION.md`](./docs/FEE_DEDUCTION.md).
+base. The full model and the remaining open extension (fee tokens) are in
+[`docs/FEE_DEDUCTION.md`](./docs/FEE_DEDUCTION.md); sessions, settlement, corporate actions and
+fixed/regulatory/minimum/tax fees are owned by the external order system.
 
 Every other order-type field (`tif`, `post_only`, `stop_price`, `display_volume`, `hidden_volume`,
 `timestamp`) is optional and defaults to "plain GTC limit order":
@@ -938,6 +942,7 @@ placeholder). `sequence` is still required by the deserializer.
 | `tests/cluster/test_console.rs` | Three-node cluster: embedded console assets, node/cluster APIs, unsafe-action rejection and leadership transfer through `/console/api/actions/transfer-leader` |
 | `tests/cluster/test_batch_write.rs` | Multiple requests are applied in one Raft entry with per-item sequences, continuous event ordinals, and edge validation for empty, nested, oversized and duplicate-id batches |
 | `tests/cluster/test_feature_matrix.rs` | Sends one order of every advertised type through `/write` and asserts the returned event kinds; follows rest → amend → partial fill → cancel and expiry/stop lifecycles, proving accepted actions emit explicit events rather than rejections; checks malformed bodies and unknown read keys |
+| `tests/cluster/test_client.rs` | Typed no-leader and HTTP edge errors, retry/backoff after a dropped connection, and forwarding to the new leader after failover |
 | `tests/replay/*/run.sh` | Shell-driven replay matrix for GTC, IOC, FOK, GTD, Day, market, post-only, iceberg, stop-market, stop-limit, amend, cancel, maker/taker fee, quote-fee and fee-overflow scenarios; each case compares the generated event sequence against its checked-in `expected-events.jsonl` |
 | `fuzz/` | `cargo-fuzz` targets for `OrderBook::execute_order`, WAL byte decoding and snapshot byte/content decoding; the nightly scheduled workflow builds all three and runs a smoke pass |
 
@@ -956,8 +961,9 @@ Every integration test uses a unique temporary data directory. The cluster test 
 test `21601-21603`, the exactness test `21701` (gRPC `22701`), the symbol-config test `21801-21802` (gRPC `22801-22802`), the fee test `21901` (gRPC `22901`), the
 fee-asset test `21902` (gRPC `22902`), the request-limit test `21903` (gRPC `22903`), the batch-write
 test `21904` (gRPC `22904`), the health test `21905` (gRPC `22905`), the console test
-`21906-21908` (gRPC `22906-22908`) and the feature-matrix/lifecycle tests `21909-21911`
-(gRPC `22909-22911`); stop leftover processes (`pkill -f matchengine-raft`) before rerunning.
+`21906-21908` (gRPC `22906-22908`), the feature-matrix/lifecycle tests `21909-21911`
+(gRPC `22909-22911`) and the client tests `21912-21917` (gRPC `22912-22917`); stop leftover
+processes (`pkill -f matchengine-raft`) before rerunning.
 
 ## Performance and Current Limits
 

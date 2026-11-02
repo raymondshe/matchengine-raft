@@ -161,8 +161,8 @@ stable across restart and failover: `(symbol_id, stream_id, market_seq, sub_seq)
 | 2007 | `BAR` | trade OHLCV, closed + live (`partial`) |
 
 Header (64 B): magic `AMKT`, version `2`, type, flags (`SNAPSHOT|RESET|GAP|END_OF_BATCH|
-PARTIAL_BAR|BAR_CLOSE`; bit 4 reserved), `market_seq`, `log_index`, `ordinal`, body length, epoch,
-leader id, `ts_ms`, `symbol_id`, `sub_seq`, reserved.
+PARTIAL_BAR|BAR_CLOSE`; bit 4 reserved), `market_seq`, `log_index`, `ordinal`, body length, epoch
+(Raft term), leader id, `ts_ms`, `symbol_id`, `sub_seq`, reserved.
 
 ## Test matrix
 
@@ -247,4 +247,6 @@ Messages are identified by `(symbol_id, stream_id, market_seq, sub_seq)`:
    follower frames never queue ahead of a takeover snapshot.
 
 U1–U6 acceptance criteria are met. U7 (Aeron adapter, Archive replay, multi-symbol deployment) remains
-deferred; `epoch`/`leader_id` are still 0 on the wire until the adapter epoch is wired.
+deferred. The header epoch is the current Raft term and `leader_id` is the known leader (0 when
+none); the leader watcher updates both on every metrics change, so reset snapshots and following
+frames carry the current leadership generation.
