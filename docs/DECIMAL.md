@@ -27,6 +27,32 @@ comparison and benchmarks that led to the integer representation.
 5. **Do not parse money through `f64`.** Parse decimal strings or an integer representation at the
    boundary and reject values with more precision than the instrument allows.
 
+## Decision: keep one compile-time 18-decimal scale
+
+The implemented `Fixed` is a compile-time `i128` at `1e-18` (`DECIMALS = 18`,
+`SCALE = 1_000_000_000_000_000_000`). `SymbolConfig::price_decimals` and the base/quote
+`AssetId` decimals are **business precision** enforced at the API boundary; they are not a
+storage or arithmetic scale.
+
+We considered making the scale follow `SymbolConfig` per symbol and rejected it:
+
+- A runtime scale either enlarges `Fixed` (a scale field pushes it from 16 to 24–32 bytes) or
+  spreads a scale argument through every operation. Both add work to the matching hot path;
+  the compile-time constants fold into immediates.
+- `price × base = quote` with three different scales needs exponent arithmetic and per-fill
+  rounding rules, and would make the canonical representation depend on replicated config.
+- Lowering the constant while keeping `i128` saves no memory. Switching to `i64` saves about
+  72 bytes per `Order` (192 → ~120), but at 18 decimals leaves only ~9.22 whole units of range;
+  at 9–10 decimals it covers BTC/ETH totals but loses 18-decimal precision, and notional still
+  needs `i128`/`i256`.
+- No benchmark shows `Fixed` width as the bottleneck: book-only replay is ~9–10.5M fills/s and
+  the apply path is dominated by `BTreeMap` nodes, event construction and response buffers.
+
+If memory or feed bandwidth becomes a measured problem, use a targeted lever: a compact
+market-data wire (v5 is fixed 16 bytes per value), a compact resting record/snapshot encoding, or
+the measured per-level bucket book. Revisit the scale only with a compile-time prototype and a
+benchmark win, not a runtime per-symbol scale.
+
 ## BTC and 18-decimal values
 
 Native Bitcoin has 8 decimal places (1 satoshi = 1e-8 BTC). An 18-decimal asset is normally a

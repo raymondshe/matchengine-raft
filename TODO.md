@@ -412,6 +412,10 @@ These choices feed the priorities above; write them down as ADRs or doc notes wh
 - [x] Wire v5 representation: scale-18 `i128` prices, quantities, quote volume and fees plus
   volume units and fee assets; older consumers must upgrade and frames are never silently
   reinterpreted.
+- [x] Keep one canonical 18-decimal `Fixed(i128)` scale. `SymbolConfig` decimals are business
+  precision, not a runtime scale; a per-symbol scale would enlarge values or add per-operation
+  scaling, and a smaller `i64` scale trades range and a v10/v6 migration for an unmeasured gain.
+  See [`docs/DECIMAL.md`](./docs/DECIMAL.md#decision-keep-one-compile-time-18-decimal-scale).
 - [x] External exposure model: no TLS/mTLS or HTTP authentication; the supported contract is
   loopback or a trusted private network, with edge request/snapshot limits.
 - [x] Authentication and TLS terminate at the gateway; the engine and its Raft transport remain
