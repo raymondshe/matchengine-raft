@@ -39,8 +39,8 @@ The next work, in order:
 3. **Event delivery Phase 4 (§5).** Long-poll `wait_ms`, gRPC `StreamEvents` and the optional MQ
    bridge; this also settles the event-time/cursor item in §11.
 
-Quick wins that fit alongside any of these: `Order` identity `PartialEq`, `#[serde(default)]` on
-`Order::sequence`, a BTC/USDT quote-volume case, and keeping the completed-item lists below current.
+The quick wins from the last review are complete: `Order` identity `PartialEq`, optional
+`Order::sequence`, and a BTC/USDT quote-volume case.
 
 ## 1. Exact fixed-point end-to-end — done
 
@@ -131,10 +131,10 @@ Remaining:
   background tasks, shuts Raft down and returns the transport error.
 - [x] **P2** Remove the duplicate `Logger` middleware in `src/lib.rs`; every request is logged
   twice.
-- [ ] **P2** Make `Order::sequence` optional in the public deserializer (`#[serde(default)]`) so
-  clients need not send a value that `place_order()` overwrites.
-- [ ] **P2** Make `impl PartialEq for Order` include `id` (and the other identity fields); today
-  two different orders with the same sequence/price/volume compare equal.
+- [x] **P2** `Order::sequence` is optional in the public deserializer (`#[serde(default)]`); it
+  defaults to `0`, and `apply` overwrites it.
+- [x] **P2** `impl PartialEq for Order` compares `id`, `side`, `symbol_id`, `sequence`, `price` and
+  `volume`, so two unrelated orders no longer compare equal.
 
 ## 4. Persistence, Raft and transport
 
@@ -481,16 +481,15 @@ Done:
 - [x] Tick/lot increments and per-asset precision are enforced on `Place` and `Amend`.
 - [x] Snapshot **v9** and market-data wire **v5** are implemented; old data directories must be
   recreated.
-- [x] Tests cover QQQ/USD (ETF/fiat) tick/lot and quote volume in
-  `tests/cluster/test_fee_assets.rs`, plus quote fees, fee overflow, fee policies, the file sink,
-  `/events`, the feed and snapshot restart.
+- [x] Tests cover QQQ/USD (ETF/fiat) and BTC/USDT (crypto/stablecoin) tick/lot, quote volume and
+  fee-asset deduction in `tests/cluster/test_fee_assets.rs`, plus quote fees, fee overflow, fee
+  policies, the file sink, `/events`, the feed and snapshot restart.
 
 Remaining extensions:
 
 - [ ] **P2** Add third-asset fee-token support only if a fee price and balance model are provided.
 - [ ] **P2** Decide whether mixed-unit iceberg/FOK orders should normalize tranches; quote volume
   currently supports plain limit and market orders only.
-- [ ] **P2** Add a BTC/USDT (crypto/stablecoin) quote-volume case alongside the QQQ/USD test.
 
 Resolved decisions: quote limit sell rounds base quantity down to cap notional; quote market sell
 rounds up and permits a bounded overshoot; `volume` is always gross; the fee policy is per symbol;

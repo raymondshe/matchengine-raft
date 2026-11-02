@@ -30,6 +30,7 @@ use crate::common::TempDir;
 type C = MatchEngineTypeConfig;
 
 const ADDR: &str = "127.0.0.1:21902";
+const BTC_ADDR: &str = "127.0.0.1:21924";
 
 fn fixed(value: &str) -> Fixed {
     value.parse().expect("valid exact decimal")
@@ -135,6 +136,118 @@ fn etf_fiat_quote_volume_and_quote_fee_deduction() {
             9,
             u32::from_le_bytes(bytes[7..11].try_into().unwrap()),
             "snapshot must be v9"
+        );
+
+        node.shutdown().await.unwrap();
+    });
+}
+
+#[test]
+fn btc_usdt_quote_volume_and_received_fee_deduction() {
+    C::run(async {
+        let temp = TempDir::new("fee-assets-btc");
+        let storage = StorageConfig::new(temp.path()).with_instance_prefix("fee-assets-btc");
+
+        let node = build_match_engine_node(1, BTC_ADDR.to_string(), default_raft_config(), storage)
+            .await
+            .unwrap();
+        let client = MatchEngineClient::<C>::new(1, BTC_ADDR.to_string());
+        client.init().await.unwrap().unwrap();
+        wait_for_leader(&client).await;
+
+        // Crypto/stablecoin defaults to received-asset fees: the buyer pays in
+        // BTC, the seller in USDT.
+        let config = SymbolConfig::new(0, 2, 8)
+            .unwrap()
+            .with_assets(
+                AssetId::new("BTC", AssetClass::Crypto, 8).unwrap(),
+                AssetId::new("USDT", AssetClass::Stablecoin, 2).unwrap(),
+            )
+            .unwrap()
+            .with_tick_and_lot(fixed("0.01"), fixed("0.00000001"));
+        assert_eq!(FeeAssetPolicy::Received, config.fee_asset_policy);
+        client
+            .write(&MatchEngineRequest::ConfigureSymbol { config })
+            .await
+            .unwrap()
+            .unwrap();
+
+        let view: SymbolConfig =
+            serde_json::from_str(&client.read(&"symbol_config".to_string()).await.unwrap())
+                .unwrap();
+        assert_eq!("BTC", view.base_asset.code);
+        assert_eq!(AssetClass::Crypto, view.base_asset.class);
+        assert_eq!("USDT", view.quote_asset.code);
+        assert_eq!(AssetClass::Stablecoin, view.quote_asset.class);
+
+        // A maker sells 0.5 BTC at 60,000.00 USDT.
+        let maker = Order::new(OrderSide::Sell, fixed("60000.00"), fixed("0.5"), 0)
+            .with_fee_rates(fixed("0.002"), fixed("0"));
+        let rested = client
+            .write(&MatchEngineRequest::place(maker))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(MatchEventKind::Rested, rested.data.events[0].kind);
+
+        // The taker submits 60,000 USDT of quote volume, normalized to 1 BTC.
+        // It fills 0.5 BTC (30,000 notional) and rests the remaining 0.5 BTC.
+        let taker = Order::new(OrderSide::Buy, fixed("60000.00"), fixed("60000"), 0)
+            .with_volume_unit(VolumeUnit::Quote)
+            .with_fee_rates(fixed("0"), fixed("0.001"));
+        let filled = client
+            .write(&MatchEngineRequest::place(taker))
+            .await
+            .unwrap()
+            .unwrap();
+        let fill = &filled.data.events[0];
+        assert_eq!(MatchEventKind::Fill, fill.kind);
+        assert_eq!(fixed("0.5"), fill.volume);
+        assert_eq!(fixed("30000"), fill.quote_volume);
+        // Taker fee: 0.5 BTC x 0.001 charged in the received base asset.
+        assert_eq!(fixed("0.0005"), fill.taker_fee);
+        assert_eq!(Some(FeeAsset::Base), fill.taker_fee_asset);
+        // Maker fee: 30,000 x 0.002 charged in the received quote asset.
+        assert_eq!(fixed("60"), fill.maker_fee);
+        assert_eq!(Some(FeeAsset::Quote), fill.maker_fee_asset);
+
+        let orders: serde_json::Value =
+            serde_json::from_str(&client.read(&"orderbook_orders".to_string()).await.unwrap())
+                .unwrap();
+        assert_eq!("0.5", orders[0]["volume"]);
+        assert_eq!("base", orders[0]["volume_unit"]);
+        assert_eq!("60000", orders[0]["requested_volume"]);
+        assert_eq!("quote", orders[0]["requested_volume_unit"]);
+
+        // Price tick and base lot are enforced through the API.
+        let bad_price = client
+            .write(&MatchEngineRequest::place(Order::new(
+                OrderSide::Buy,
+                fixed("60000.001"),
+                fixed("1"),
+                0,
+            )))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            Some(RejectReason::InvalidOrder),
+            bad_price.data.events[0].reason
+        );
+
+        let bad_lot = client
+            .write(&MatchEngineRequest::place(Order::new(
+                OrderSide::Buy,
+                fixed("60000.00"),
+                fixed("0.000000001"),
+                0,
+            )))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            Some(RejectReason::InvalidOrder),
+            bad_lot.data.events[0].reason
         );
 
         node.shutdown().await.unwrap();

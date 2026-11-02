@@ -193,7 +193,9 @@ pub struct Order {
     /// Sequence number for ordering orders at the same price level.
     ///
     /// This ensures price-time priority - orders with lower sequence
-    /// numbers are matched first at the same price level.
+    /// numbers are matched first at the same price level. Optional on input:
+    /// `apply` assigns the real sequence and clients may omit it.
+    #[serde(default)]
     pub sequence: u64,
 
     /// Time in force ([`TimeInForce`]); defaults to GTC.
@@ -320,10 +322,17 @@ impl Order {
     }
 }
 
-/// Equality comparison for orders based on sequence, price, and volume.
+/// Equality for orders compares the identifying fields and the current size.
+///
+/// `id`, `side`, `symbol_id` and `sequence` distinguish two orders even when
+/// their price and volume happen to match; the price and volume are included
+/// so a partial fill or amendment is observable.
 impl PartialEq for Order {
     fn eq(&self, other: &Self) -> bool {
-        (self.sequence == other.sequence)
+        (self.id == other.id)
+            && (self.side == other.side)
+            && (self.symbol_id == other.symbol_id)
+            && (self.sequence == other.sequence)
             && (self.price == other.price)
             && (self.volume == other.volume)
     }
@@ -2225,6 +2234,31 @@ mod tests {
         let deserialized: OrderBook = serde_json::from_str(&serialized).unwrap();
         println!("deserialized = {:?}", deserialized);
         */
+    }
+
+    #[test]
+    fn order_equality_uses_identity_and_sequence_defaults() {
+        let base = Order::new(OrderSide::Buy, 100.0, 1.0, 7);
+        let same = base;
+        assert_eq!(base, same);
+
+        let mut different_id = base;
+        different_id.id = 1;
+        assert_ne!(base, different_id);
+
+        let mut different_side = base;
+        different_side.side = OrderSide::Sell;
+        assert_ne!(base, different_side);
+
+        let mut different_symbol = base;
+        different_symbol.symbol_id = 2;
+        assert_ne!(base, different_symbol);
+
+        // `sequence` is optional on the wire; apply overwrites it anyway.
+        let mut json = serde_json::to_value(base).unwrap();
+        let _ = json.as_object_mut().unwrap().remove("sequence");
+        let decoded: Order = serde_json::from_value(json).unwrap();
+        assert_eq!(0, decoded.sequence);
     }
 
     // --- Time in force

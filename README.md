@@ -914,7 +914,7 @@ Every other order-type field (`tif`, `post_only`, `stop_price`, `display_volume`
 
 The matching engine overwrites `sequence` when it applies the order, and the receiving leader
 stamps `timestamp` at intake, so both values clients send are ignored (`0` is the conventional
-placeholder). `sequence` is still required by the deserializer.
+placeholder). `sequence` is optional and defaults to `0`.
 
 ## Testing
 
