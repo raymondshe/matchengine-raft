@@ -63,7 +63,7 @@ Built for teams that need deterministic execution, durable recovery and a clean 
 - **Atomic snapshots** written by temp file → fsync → rename → directory fsync, with checksum validation before install.
 - **Snapshot policy for real workloads**: every 100,000 applied entries or 30 minutes when newer entries exist, configurable with `--snapshot-interval-ms`.
 - **Snapshot + WAL-tail recovery** that restores the latest snapshot, event window and idempotency map, then replays only newer log entries.
-- **gRPC replication** with bidirectional `stream_append`, chunked snapshot transfer, leadership transfer and independent per-peer channels.
+- **gRPC replication** with bidirectional `stream_append`, chunked snapshot transfer, Pre-Vote elections, leadership transfer and independent per-peer channels.
 
 **APIs and data feeds**
 - **Durable match-event feed** at `POST /events` with cursor pagination, retention limits, `client_order_id` idempotency and replay-safe retries.

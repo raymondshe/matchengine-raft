@@ -27,18 +27,16 @@ corporate actions and fixed/regulatory/minimum/tax fees are owned by the externa
 
 Failure behavior is complete (§15): the node fail-stops on WAL `ENOSPC`/`EIO`, recovers from
 `SIGKILL` during writes, keeps snapshot writes atomic, and a learner killed mid-snapshot-install
-restarts without a partial snapshot and retries cleanly.
+restarts without a partial snapshot and retries cleanly. Pre-Vote is enabled with a dedicated gRPC
+RPC (§4), so an isolated node asks before campaigning.
 
 The next work, in order:
 
-1. **Pre-Vote (§4).** Implement `RaftNetworkV2::pre_vote` over gRPC and enable it, or record that
-   Pre-Vote stays disabled. openraft's default `pre_vote` grants unconditionally, so the flag alone
-   changes nothing.
-2. **Wire v5 consumer decoder (§6).** Add a reference decoder and encode → decode → re-encode
+1. **Wire v5 consumer decoder (§6).** Add a reference decoder and encode → decode → re-encode
    golden tests; the feed contract has encoder-only coverage today.
-3. **Benchmark regression gate (§8).** Gate CI on `apply_path` allocs/entry (deterministic) plus
+2. **Benchmark regression gate (§8).** Gate CI on `apply_path` allocs/entry (deterministic) plus
    loose time thresholds.
-4. **Event delivery Phase 4 (§5).** Long-poll `wait_ms`, gRPC `StreamEvents` and the optional MQ
+3. **Event delivery Phase 4 (§5).** Long-poll `wait_ms`, gRPC `StreamEvents` and the optional MQ
    bridge; this also settles the event-time/cursor item in §11.
 
 Quick wins that fit alongside any of these: `Order` identity `PartialEq`, `#[serde(default)]` on

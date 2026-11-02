@@ -199,6 +199,11 @@ pub fn default_raft_config() -> Config {
         election_timeout_min: 1500,
         election_timeout_max: 3000,
         snapshot_policy: SnapshotPolicy::LogsSinceLast(DEFAULT_SNAPSHOT_LOG_THRESHOLD),
+        // Ask peers before campaigning so a restarted or partitioned node cannot
+        // inflate the term and depose a healthy leader. The gRPC transport
+        // implements `RaftNetworkV2::pre_vote`; openraft's default grants
+        // unconditionally, so setting this without the RPC would be a no-op.
+        enable_pre_vote: Some(true),
         ..Default::default()
     }
 }
@@ -620,6 +625,11 @@ mod tests {
             default_raft_config().snapshot_policy,
             SnapshotPolicy::LogsSinceLast(DEFAULT_SNAPSHOT_LOG_THRESHOLD)
         ));
+    }
+
+    #[test]
+    fn default_config_enables_pre_vote() {
+        assert_eq!(Some(true), default_raft_config().enable_pre_vote);
     }
 
     #[tokio::test]

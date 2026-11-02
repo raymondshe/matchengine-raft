@@ -127,6 +127,20 @@ impl RaftService for RaftGrpcService {
         Ok(Response::new(VoteCallResponse { payload }))
     }
 
+    async fn pre_vote(
+        &self,
+        request: Request<VoteCallRequest>,
+    ) -> Result<Response<VoteCallResponse>, Status> {
+        let req: VoteRequest<MatchEngineTypeConfig> = decode(&request.into_inner().payload)
+            .map_err(|e| Status::invalid_argument(format!("decode PreVote: {e}")))?;
+
+        let result = self.raft.pre_vote(req).await;
+        let payload = encode(&result)
+            .map_err(|e| Status::internal(format!("encode PreVote response: {e}")))?;
+
+        Ok(Response::new(VoteCallResponse { payload }))
+    }
+
     async fn transfer_leader(
         &self,
         request: Request<TransferLeaderCall>,

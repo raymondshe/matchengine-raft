@@ -63,7 +63,7 @@
 - **原子快照**，通过临时文件 → fsync → rename → 目录 fsync 写入，安装前校验 checksum。
 - **面向真实负载的快照策略**：每 100,000 条已应用日志或每 30 分钟（有新 entry 时）生成快照，可用 `--snapshot-interval-ms` 调整。
 - **快照 + WAL 尾部恢复**：先加载最新快照、事件窗口和幂等表，再只重放更新的日志条目。
-- **gRPC 复制**，支持双向 `stream_append`、分块快照传输、领导权转移和每个对端独立通道。
+- **gRPC 复制**，支持双向 `stream_append`、分块快照传输、Pre-Vote 选举、领导权转移和每个对端独立通道。
 
 **API 与数据 Feed**
 - **持久化撮合事件 Feed**：`POST /events` 游标分页、保留上限、`client_order_id` 幂等和安全重试。

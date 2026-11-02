@@ -13,8 +13,14 @@ service RaftService {
   // pipeline.
   rpc AppendEntries(AppendRequest) returns (AppendResponse);
 
-  // Unary RequestVote / PreVote.
+  // Unary RequestVote.
   rpc Vote(VoteCallRequest) returns (VoteCallResponse);
+
+  // Unary PreVote. Same payload as Vote, but the receiver must not persist a
+  // vote or change its term. A peer that has not heard from a leader for one
+  // election timeout asks before campaigning, so an isolated node cannot
+  // inflate the term and depose a healthy leader.
+  rpc PreVote(VoteCallRequest) returns (VoteCallResponse);
 
   // Streamed full-snapshot install. The first chunk carries `vote` and `meta`;
   // every chunk carries `data`, a monotonically increasing byte `offset`, and the

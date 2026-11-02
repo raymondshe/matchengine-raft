@@ -216,6 +216,31 @@ where
         result.map_err(|e| RPCError::Network(NetworkError::new(&e)))
     }
 
+    /// Sends a PreVote. The payload is the same as [`Self::vote`], but the
+    /// receiver neither persists a vote nor changes its term.
+    #[tracing::instrument(level = "debug", skip_all, err(Debug))]
+    async fn pre_vote(
+        &mut self,
+        req: VoteRequest<C>,
+        option: RPCOption,
+    ) -> Result<VoteResponse<C>, RPCError<C>> {
+        let payload = encode(&req).map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
+        let mut client = self.client()?;
+        let ttl = option.soft_ttl();
+
+        let resp = self
+            .unary(
+                RPCTypes::Vote,
+                ttl,
+                client.pre_vote(VoteCallRequest { payload }),
+            )
+            .await?;
+
+        let result: Result<VoteResponse<C>, openraft::errors::RaftError<C>> =
+            decode(&resp.payload).map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
+        result.map_err(|e| RPCError::Network(NetworkError::new(&e)))
+    }
+
     /// Sends a graceful leadership-transfer request to the target peer.
     #[tracing::instrument(level = "debug", skip_all, err(Debug))]
     async fn transfer_leader(
