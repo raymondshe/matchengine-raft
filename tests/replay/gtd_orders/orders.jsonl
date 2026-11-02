@@ -1,0 +1,5 @@
+{"Place":{"order":{"live":"Limit","side":"Buy","price":100.0,"volume":1.0,"tif":{"GTD":4102444800000},"id":1,"sequence":0}}}
+{"Place":{"order":{"live":"Limit","side":"Sell","price":101.0,"volume":2.0,"tif":{"GTD":4102444800000},"id":2,"sequence":0}}}
+{"Place":{"order":{"live":"Limit","side":"Buy","price":99.0,"volume":1.0,"tif":{"GTD":1},"id":3,"sequence":0}}}
+{"PurgeExpired":{"now_ms":4102444799999,"day_close_ms":null}}
+{"PurgeExpired":{"now_ms":4102444800000,"day_close_ms":null}}

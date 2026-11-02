@@ -1,0 +1,12 @@
+{"Place":{"order":{"live":"Limit","side":"Buy","price":100.0,"volume":5.0,"id":1,"sequence":0}}}
+{"Place":{"order":{"live":"Limit","side":"Sell","price":101.0,"volume":5.0,"id":2,"sequence":0}}}
+{"Amend":{"order":{"live":"Limit","side":"Buy","price":100.0,"volume":5.0,"id":1,"sequence":0},"volume":3.0}}
+{"Amend":{"order":{"live":"Limit","side":"Buy","price":100.0,"volume":3.0,"id":1,"sequence":0},"price":99.0}}
+{"Amend":{"order":{"live":"Limit","side":"Buy","price":99.0,"volume":3.0,"id":1,"sequence":3},"volume":6.0}}
+{"Amend":{"order":{"live":"Limit","side":"Buy","price":99.0,"volume":6.0,"id":1,"sequence":4},"price":102.0}}
+{"Amend":{"order":{"live":"Limit","side":"Buy","price":99.0,"volume":6.0,"id":1,"sequence":99},"volume":1.0}}
+{"Place":{"order":{"live":"Limit","side":"Sell","price":103.0,"volume":4.0,"display_volume":2.0,"id":3,"sequence":0}}}
+{"Amend":{"order":{"live":"Limit","side":"Sell","price":103.0,"volume":4.0,"id":3,"sequence":7},"volume":3.0}}
+{"Cancel":{"order":{"live":"Limit","side":"Buy","price":99.0,"volume":6.0,"id":1,"sequence":4}}}
+{"Cancel":{"order":{"live":"Limit","side":"Sell","price":101.0,"volume":5.0,"id":2,"sequence":1}}}
+{"Cancel":{"order":{"live":"Limit","side":"Sell","price":103.0,"volume":4.0,"id":3,"sequence":7}}}

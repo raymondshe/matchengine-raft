@@ -276,8 +276,10 @@ Current coverage:
   `/ready` is `503` before initialization and `200` after a leader is elected.
 - `test_console.rs`: three-node cluster checks the embedded console assets, node/cluster APIs,
   unsafe-action rejection and leadership transfer through `/console/api/actions/transfer-leader`.
-- `tests/replay/limit_orders/run.sh`: shell-driven replay of five regular limit orders through
-  `replay_orders`, comparing the generated match-event JSONL with a checked-in reference.
+- `tests/replay/`: shell-driven replay matrix for GTC, IOC, FOK, GTD, Day, market, post-only,
+  iceberg, stop-market, stop-limit, amend, cancel, maker/taker fee, quote-fee and fee-overflow
+  scenarios. Each case runs through `replay_orders` and compares the generated event sequence with
+  a checked-in reference; `tests/replay/run-all.sh` runs the whole matrix.
 - `fuzz/`: `cargo-fuzz` targets for `OrderBook::execute_order` (`order_book`), WAL byte decoding
   (`wal_decode`) and snapshot byte/content decoding (`snapshot_decode`); the scheduled
   `.github/workflows/fuzz.yml` job builds them and runs a smoke pass.

@@ -1,0 +1,20 @@
+# Maker earns 10 bps in quote; taker pays 40 bps in base (Received policy).
+{"Place":{"order":{"live":"Limit","side":"Sell","price":100.0,"volume":2.0,"maker_fee_rate":"0.001","taker_fee_rate":"0.002","id":1,"sequence":0}}}
+
+# Maker earns a 5 bps rebate in quote; the taker pays 40 bps in base.
+{"Place":{"order":{"live":"Limit","side":"Sell","price":101.0,"volume":2.0,"maker_fee_rate":"-0.0005","taker_fee_rate":"0.003","id":2,"sequence":0}}}
+
+# Buy 4: 2 fill at 100 and 2 fill at 101.
+{"Place":{"order":{"live":"Limit","side":"Buy","price":101.0,"volume":4.0,"maker_fee_rate":"0.003","taker_fee_rate":"0.004","id":3,"sequence":0}}}
+
+# Bid earns 20 bps in base; the sell taker pays 60 bps in quote.
+{"Place":{"order":{"live":"Limit","side":"Buy","price":99.0,"volume":2.0,"maker_fee_rate":"0.002","taker_fee_rate":"0.005","id":4,"sequence":0}}}
+{"Place":{"order":{"live":"Limit","side":"Sell","price":99.0,"volume":1.0,"maker_fee_rate":"0.001","taker_fee_rate":"0.006","id":5,"sequence":0}}}
+
+# Zero rates produce zero fees.
+{"Place":{"order":{"live":"Limit","side":"Sell","price":102.0,"volume":1.0,"id":6,"sequence":0}}}
+{"Place":{"order":{"live":"Limit","side":"Buy","price":102.0,"volume":1.0,"id":7,"sequence":0}}}
+
+# A negative taker rate is a taker rebate in the received asset.
+{"Place":{"order":{"live":"Limit","side":"Sell","price":103.0,"volume":1.0,"maker_fee_rate":"0.001","taker_fee_rate":"0.002","id":8,"sequence":0}}}
+{"Place":{"order":{"live":"Limit","side":"Buy","price":103.0,"volume":1.0,"maker_fee_rate":"0.001","taker_fee_rate":"-0.001","id":9,"sequence":0}}}

@@ -1,0 +1,12 @@
+# QQQ/USD: the ETF base forces quote fees; 2-decimal tick and 4-decimal lot.
+{"ConfigureSymbol":{"config":{"symbol_id":0,"base_asset":{"code":"QQQ","class":"etf","decimals":4},"quote_asset":{"code":"USD","class":"fiat","decimals":2},"price_decimals":2,"price_tick":"0.01","base_lot":"0.0001","fee_asset_policy":"quote"}}}
+
+# A maker sells one share at 400.10 with a 10 bps quote fee.
+{"Place":{"order":{"live":"Limit","side":"Sell","price":"400.10","volume":"1","maker_fee_rate":"0.001","taker_fee_rate":"0.002","id":1,"sequence":0}}}
+
+# A 1000 USD quote buy normalizes to 2.4993 shares. It fills 1 share at
+# 400.10, leaving 1.4993 shares resting as a base bid.
+{"Place":{"order":{"live":"Limit","side":"Buy","price":"400.10","volume":"1000","volume_unit":"quote","maker_fee_rate":"0.003","taker_fee_rate":"0.004","id":2,"sequence":0}}}
+
+# A sell taker pays 20 bps in quote and the resting bid earns 30 bps in quote.
+{"Place":{"order":{"live":"Limit","side":"Sell","price":"400.10","volume":"1.4993","taker_fee_rate":"0.002","id":3,"sequence":0}}}

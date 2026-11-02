@@ -390,11 +390,23 @@ tests/
     ├── test_request_limits.rs # 恶意输入和请求大小限制
     └── test_batch_write.rs    # 单 Raft entry 批量写入
 └── replay/
-    └── limit_orders/
-        ├── orders.jsonl       # 五条普通限价单
-        ├── expected-events.jsonl # 参考撮合事件 JSONL
-        ├── run.sh             # 驱动 replay_orders 并对比
-        └── README.md          # 场景与重新生成说明
+    ├── README.md              # 场景矩阵、端口和重新生成说明
+    ├── run-all.sh             # 运行全部已检入回放用例
+    ├── limit_orders/          # GTC 价格-时间优先与部分挂单
+    ├── ioc_orders/            # IOC 部分成交与撤销
+    ├── fok_orders/            # FOK 拒绝与全量成交
+    ├── gtd_orders/            # GTD 到期与已过期拒绝
+    ├── day_orders/            # Day 收盘清除与无收盘行为
+    ├── market_orders/         # 市价扫描与剩余撤销
+    ├── post_only_orders/      # Post-Only 挂单与穿价拒绝
+    ├── iceberg_orders/        # 可见档与隐藏储备
+    ├── stop_market_orders/    # 止损市价触发与子单
+    ├── stop_limit_orders/     # 止损限价触发与子单
+    ├── amend_orders/          # 改单优先级规则与拒绝原因
+    ├── cancel_orders/         # 撤单生命周期与停靠止损单
+    ├── fee_orders/            # 撮合/吃单费用、返佣和两种费用资产
+    ├── fee_quote_orders/      # ETF/法币 quote 扣费与 quote 数量归一化
+    └── fee_overflow_orders/   # 名义金额溢出与 fee_overflow 标记
 benches/
 ├── matchengine.rs           # 订单簿微基准
 ├── e2e.rs                   # 请求 -> Raft 提交 -> apply -> 响应
@@ -666,6 +678,12 @@ cargo run --release --example replay_orders -- \
 `node_id` 和 `event_id.log_index`；需要精确事件 id 时使用 `--strict-log-index`。`--actual` 可保留
 生成的 JSONL，`--keep` 保留临时节点数据，其余选项见 `--help`。
 
+仓库在 `tests/replay/` 下为每种订单类型或生命周期操作提供一个用例目录，每个目录包含
+`orders.jsonl`、`expected-events.jsonl`、`run.sh` 和场景 README。矩阵覆盖 GTC、IOC、FOK、
+GTD、Day、市价、Post-Only、冰山单、止损市价单、止损限价单、改单、撤单、撮合/吃单扣费、
+quote 资产扣费和费用溢出。用 `./tests/replay/run-all.sh` 运行全部，或用
+`./tests/replay/<case>/run.sh` 运行单个用例。
+
 ## 集群管理
 
 向集群添加节点包含 3 个步骤：
@@ -853,11 +871,13 @@ fee token）见 [`docs/FEE_DEDUCTION.md`](./docs/FEE_DEDUCTION.md)。
 | `tests/cluster/test_health.rs` | `/health` 报告 gRPC 监听器、领导者和 WAL/状态机状态；`/ready` 在初始化前返回 `503`，选出领导者后返回 `200` |
 | `tests/cluster/test_console.rs` | 三节点集群：内置控制台资源、节点/集群 API、危险操作拒绝，以及通过 `/console/api/actions/transfer-leader` 切换领导者 |
 | `tests/cluster/test_batch_write.rs` | 多个请求在单个 Raft entry 中应用，逐项序列号、连续事件序号，以及空/嵌套/超大/重复 id 批次校验 |
-| `tests/replay/limit_orders/run.sh` | 通过 `replay_orders` 回放五条普通限价单，校验价格-时间优先、多笔成交和部分挂单事件与 `expected-events.jsonl` 一致 |
+| `tests/replay/*/run.sh` | Shell 驱动的回放矩阵，覆盖 GTC、IOC、FOK、GTD、Day、市价、Post-Only、冰山单、止损市价单、止损限价单、改单、撤单、撮合/吃单扣费、quote 扣费和费用溢出场景；每个用例对比生成的事件序列与已检入的 `expected-events.jsonl` |
 | `fuzz/` | `cargo-fuzz` 目标：`OrderBook::execute_order`、WAL 字节解码、快照字节/内容解码；每夜的定时工作流构建三个目标并做一次冒烟运行 |
 
-回放用例不属于 `cargo test`；用 `./tests/replay/limit_orders/run.sh` 运行。它会启动一个
-进程内节点（HTTP `24211`，gRPC `25211`），并把生成的撮合事件 JSONL 与仓库中的参考文件对比。
+回放用例不属于 `cargo test`；用 `./tests/replay/run-all.sh` 运行全部，或用
+`./tests/replay/<case>/run.sh` 运行单个用例。它们使用 HTTP 端口 `24211-24225`（gRPC
+`25211-25225`），每个用例一个端口，并把生成的撮合事件 JSONL 与仓库中的参考文件对比。
+用例矩阵和重新生成步骤见 `tests/replay/README.md`。
 
 模糊测试目标是独立的 nightly crate，见 `fuzz/README.md` 和 `.github/workflows/fuzz.yml`。
 

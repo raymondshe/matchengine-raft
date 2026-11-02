@@ -401,11 +401,23 @@ tests/
     ├── test_request_limits.rs # Hostile input and request-size limits
     └── test_batch_write.rs    # Batch writes in one Raft entry
 └── replay/
-    └── limit_orders/
-        ├── orders.jsonl       # Five regular limit orders
-        ├── expected-events.jsonl # Reference match-event JSONL
-        ├── run.sh             # Drive replay_orders and compare
-        └── README.md          # Scenario and regeneration notes
+    ├── README.md              # Scenario matrix, ports and regeneration notes
+    ├── run-all.sh             # Run every checked-in replay case
+    ├── limit_orders/          # GTC price-time priority and partial rest
+    ├── ioc_orders/            # IOC partial fills and cancellations
+    ├── fok_orders/            # FOK rejection and full fills
+    ├── gtd_orders/            # GTD expiry and already-expired rejection
+    ├── day_orders/            # Day close purge and no-close behaviour
+    ├── market_orders/         # Market sweeps and cancelled remainders
+    ├── post_only_orders/      # Post-only rests and crossing rejections
+    ├── iceberg_orders/        # Visible tranche and hidden reserve
+    ├── stop_market_orders/    # Stop-market election and child orders
+    ├── stop_limit_orders/     # Stop-limit election and child orders
+    ├── amend_orders/          # Amend priority rules and rejections
+    ├── cancel_orders/         # Cancel lifecycle and parked stops
+    ├── fee_orders/            # Maker/taker fees, rebates and both fee assets
+    ├── fee_quote_orders/      # ETF/fiat quote fees and quote-volume normalization
+    └── fee_overflow_orders/   # Notional overflow and fee_overflow reporting
 benches/
 ├── matchengine.rs           # Order-book microbenchmarks
 ├── e2e.rs                   # Submit -> commit -> apply -> response
@@ -703,6 +715,12 @@ requests are grouped by `--batch-size` (default 128). The comparison ignores `no
 `event_id.log_index` by default; pass `--strict-log-index` for an exact event id. Use `--actual` to
 keep the generated JSONL, `--keep` to keep the temporary node data, and `--help` for the rest.
 
+Checked-in cases live under `tests/replay/`: one directory per order type or lifecycle
+operation, each with `orders.jsonl`, `expected-events.jsonl`, `run.sh` and a scenario README. The
+matrix covers GTC, IOC, FOK, GTD, Day, market, post-only, iceberg, stop-market, stop-limit, amend,
+cancel, maker/taker fee deduction, quote-asset fees and fee overflow. Run everything with
+`./tests/replay/run-all.sh`, or one case with `./tests/replay/<case>/run.sh`.
+
 ## Cluster Management
 
 Adding a node to a cluster involves 3 steps:
@@ -916,12 +934,13 @@ placeholder). `sequence` is still required by the deserializer.
 | `tests/cluster/test_health.rs` | `/health` reports the gRPC listener, leadership and WAL/state-machine state; `/ready` is `503` before initialization and `200` after a leader is elected |
 | `tests/cluster/test_console.rs` | Three-node cluster: embedded console assets, node/cluster APIs, unsafe-action rejection and leadership transfer through `/console/api/actions/transfer-leader` |
 | `tests/cluster/test_batch_write.rs` | Multiple requests are applied in one Raft entry with per-item sequences, continuous event ordinals, and edge validation for empty, nested, oversized and duplicate-id batches |
-| `tests/replay/limit_orders/run.sh` | Shell-driven replay of five regular limit orders through `replay_orders`; checks price-time priority, multi-fill and partial-rest events against `expected-events.jsonl` |
+| `tests/replay/*/run.sh` | Shell-driven replay matrix for GTC, IOC, FOK, GTD, Day, market, post-only, iceberg, stop-market, stop-limit, amend, cancel, maker/taker fee, quote-fee and fee-overflow scenarios; each case compares the generated event sequence against its checked-in `expected-events.jsonl` |
 | `fuzz/` | `cargo-fuzz` targets for `OrderBook::execute_order`, WAL byte decoding and snapshot byte/content decoding; the nightly scheduled workflow builds all three and runs a smoke pass |
 
-The replay case is not part of `cargo test`; run it with
-`./tests/replay/limit_orders/run.sh`. It starts an in-process node on `24211` (gRPC `25211`) and
-compares the generated match-event JSONL with the checked-in reference.
+The replay cases are not part of `cargo test`; run the whole matrix with
+`./tests/replay/run-all.sh`, or one case with `./tests/replay/<case>/run.sh`. They use HTTP ports
+`24211-24225` (gRPC `25211-25225`), one per case, and compare the generated match-event JSONL with
+the checked-in reference. See `tests/replay/README.md` for the case matrix and regeneration steps.
 
 The fuzz targets are a separate nightly-only crate; see `fuzz/README.md` and
 `.github/workflows/fuzz.yml`.

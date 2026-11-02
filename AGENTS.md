@@ -50,6 +50,7 @@ CI (`.github/workflows/ci.yml`) runs `cargo fmt --all -- --check` (and the `fuzz
 - `examples/sled.rs` is a playground example (creates a local `my_db` sled dir, gitignored); `sled` is a dev-dependency, so it is not linked into the node binary.
 - `cargo run --example dump_wal -- <node-dir|log-dir|segment.wal>` and `cargo run --example dump_snapshot -- <node-dir|snapshot-dir|current.snap>` print read-only, CRC-validated JSONL dumps of durable state. `read_wal_file` and `read_snapshot_file` are the public helpers behind them; `read_wal_bytes` and `read_snapshot_bytes` are the pure byte decoders the fuzz targets use.
 - `cargo run --release --example replay_orders -- --orders orders.jsonl [--expected expected.jsonl]` starts an in-process node, replays orders in `/write_batch` batches, and compares the generated match-event JSONL (ignoring `node_id`/`log_index` unless `--strict-log-index`).
+- `./tests/replay/run-all.sh` runs the checked-in replay matrix. Each `tests/replay/<case>/` directory has `orders.jsonl`, `expected-events.jsonl`, `run.sh` and a scenario `README.md`; cases cover GTC, IOC, FOK, GTD, Day, market, post-only, iceberg, stop-market, stop-limit, amend, cancel, default-policy maker/taker fees, quote-asset fees and fee overflow. Default HTTP ports are `24211`–`24225` (gRPC port +1000), one per case. Replay cases are manual and not part of `cargo test`.
 
 ## Branch state — read before changing storage or network code
 

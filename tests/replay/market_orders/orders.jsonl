@@ -1,0 +1,10 @@
+{"Place":{"order":{"live":"Limit","side":"Sell","price":100.0,"volume":2.0,"id":1,"sequence":0}}}
+{"Place":{"order":{"live":"Limit","side":"Sell","price":101.0,"volume":3.0,"id":2,"sequence":0}}}
+{"Place":{"order":{"live":"Market","side":"Buy","price":0.0,"volume":4.0,"id":3,"sequence":0}}}
+{"Place":{"order":{"live":"Market","side":"Sell","price":0.0,"volume":5.0,"id":4,"sequence":0}}}
+{"Place":{"order":{"live":"Limit","side":"Buy","price":99.0,"volume":2.0,"id":5,"sequence":0}}}
+{"Place":{"order":{"live":"Limit","side":"Buy","price":98.0,"volume":3.0,"id":6,"sequence":0}}}
+{"Place":{"order":{"live":"Market","side":"Sell","price":0.0,"volume":4.0,"id":7,"sequence":0}}}
+{"Place":{"order":{"live":"Market","side":"Buy","price":0.0,"volume":1.0,"id":8,"sequence":0}}}
+{"Place":{"order":{"live":"Limit","side":"Sell","price":102.0,"volume":1.0,"id":9,"sequence":0}}}
+{"Place":{"order":{"live":"Market","side":"Buy","price":0.0,"volume":3.0,"id":10,"sequence":0}}}

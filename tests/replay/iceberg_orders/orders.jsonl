@@ -1,0 +1,8 @@
+{"Place":{"order":{"live":"Limit","side":"Sell","price":100.0,"volume":10.0,"display_volume":3.0,"id":1,"sequence":0}}}
+{"Place":{"order":{"live":"Limit","side":"Buy","price":100.0,"volume":5.0,"id":2,"sequence":0}}}
+{"Place":{"order":{"live":"Limit","side":"Sell","price":101.0,"volume":4.0,"display_volume":2.0,"id":3,"sequence":0}}}
+{"Place":{"order":{"live":"Limit","side":"Buy","price":101.0,"volume":1.0,"id":4,"sequence":0}}}
+{"Cancel":{"order":{"live":"Limit","side":"Sell","price":100.0,"volume":10.0,"id":1,"sequence":0}}}
+{"Cancel":{"order":{"live":"Limit","side":"Sell","price":101.0,"volume":4.0,"id":3,"sequence":2}}}
+{"Place":{"order":{"live":"Limit","side":"Sell","price":102.0,"volume":6.0,"display_volume":2.0,"tif":{"GTD":4102444800000},"id":5,"sequence":0}}}
+{"PurgeExpired":{"now_ms":4102444800000,"day_close_ms":null}}
