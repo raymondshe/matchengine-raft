@@ -166,13 +166,11 @@ fn report(label: &str, entries: usize, elapsed: Duration, alloc: AllocSnapshot) 
 async fn blank_workload() -> anyhow::Result<()> {
     let (mut store, dir) = open_store("blank")?;
     apply_entry(&mut store, 1, EntryPayload::Blank).await;
-    let mut index = 2u64;
 
     reset_allocations();
     let started = Instant::now();
-    for _ in 0..MEASURED_ENTRIES {
+    for index in 2..2 + MEASURED_ENTRIES as u64 {
         apply_entry(&mut store, index, EntryPayload::Blank).await;
-        index += 1;
     }
     let elapsed = started.elapsed();
     let alloc = allocation_snapshot();
@@ -185,11 +183,11 @@ async fn blank_workload() -> anyhow::Result<()> {
 async fn rest_workload() -> anyhow::Result<()> {
     let (mut store, dir) = open_store("rest")?;
     apply_rests(&mut store, 1, ENTRY_WINDOW).await;
-    let mut index = ENTRY_WINDOW as u64 + 1;
+    let first = ENTRY_WINDOW as u64 + 1;
 
     reset_allocations();
     let started = Instant::now();
-    for _ in 0..MEASURED_ENTRIES {
+    for index in first..first + MEASURED_ENTRIES as u64 {
         apply_entry(
             &mut store,
             index,
@@ -201,7 +199,6 @@ async fn rest_workload() -> anyhow::Result<()> {
             ))),
         )
         .await;
-        index += 1;
     }
     let elapsed = started.elapsed();
     let alloc = allocation_snapshot();
@@ -215,11 +212,11 @@ async fn cancel_workload() -> anyhow::Result<()> {
     let (mut store, dir) = open_store("cancel")?;
     let setup = ENTRY_WINDOW + MEASURED_ENTRIES;
     apply_rests(&mut store, 1, setup).await;
-    let mut index = setup as u64 + 1;
+    let first = setup as u64 + 1;
 
     reset_allocations();
     let started = Instant::now();
-    for offset in 0..MEASURED_ENTRIES {
+    for (offset, index) in (0..MEASURED_ENTRIES).zip(first..) {
         let mut order = Order::new(OrderSide::Buy, 100.0, 1.0, 0);
         order.sequence = offset as u64;
         apply_entry(
@@ -228,7 +225,6 @@ async fn cancel_workload() -> anyhow::Result<()> {
             EntryPayload::Normal(MatchEngineRequest::Cancel { order }),
         )
         .await;
-        index += 1;
     }
     let elapsed = started.elapsed();
     let alloc = allocation_snapshot();
@@ -254,11 +250,11 @@ async fn fill_workload() -> anyhow::Result<()> {
         )
         .await;
     }
-    let mut index = setup as u64 + 1;
+    let first = setup as u64 + 1;
 
     reset_allocations();
     let started = Instant::now();
-    for _ in 0..MEASURED_ENTRIES {
+    for index in first..first + MEASURED_ENTRIES as u64 {
         apply_entry(
             &mut store,
             index,
@@ -270,7 +266,6 @@ async fn fill_workload() -> anyhow::Result<()> {
             ))),
         )
         .await;
-        index += 1;
     }
     let elapsed = started.elapsed();
     let alloc = allocation_snapshot();
@@ -297,21 +292,19 @@ fn batch_requests(size: usize, rest: bool) -> Vec<MatchEngineRequest> {
 
 async fn batch_workload(label: &str, rest: bool) -> anyhow::Result<()> {
     let (mut store, dir) = open_store(label)?;
-    let mut index = 1u64;
     if rest {
         apply_rests(&mut store, 1, ENTRY_WINDOW).await;
-        index = ENTRY_WINDOW as u64 + 1;
     }
+    let first = if rest { ENTRY_WINDOW as u64 + 1 } else { 1 };
     let template = batch_requests(BATCH_SIZE, rest);
 
     reset_allocations();
     let started = Instant::now();
-    for _ in 0..MEASURED_BATCHES {
+    for index in first..first + MEASURED_BATCHES as u64 {
         let batch = MatchEngineRequest::Batch {
             requests: template.clone(),
         };
         apply_entry(&mut store, index, EntryPayload::Normal(batch)).await;
-        index += 1;
     }
     let elapsed = started.elapsed();
     let alloc = allocation_snapshot();

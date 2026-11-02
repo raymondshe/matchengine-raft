@@ -302,7 +302,8 @@ Remaining:
   Covered by `test_feature_matrix.rs`; follower forwarding is already covered.
 - [x] **P2** Make `test_cluster.rs` own and shut down its nodes, including on panic.
 - [ ] **P2** Parameterize the fixed test ports; `test_cluster.rs` still binds 21001–21003.
-- [ ] **P2** Add an MSRV job for Rust 1.89; CI currently uses stable only.
+- [x] **P2** MSRV job for Rust 1.89: the `msrv` job in `.github/workflows/ci.yml` runs
+  `cargo check --all-targets --locked`; the main job uses stable.
 - [ ] **P2** Keep `AGENTS.md` and this file in sync after code changes; both are maintained by
   hand.
 
