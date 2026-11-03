@@ -12,6 +12,17 @@ The comparison ignores `node_id` and `event_id.log_index` (unless
 side, price, volume, fee field and reason. The event ordinals inside an entry
 must match too.
 
+[`examples/replay_orders_events.rs`](../../examples/replay_orders_events.rs) replays the same
+`orders.jsonl` but reads events from the replicated `POST /events` log instead of the node-local
+file sink. Use it to validate what feed consumers actually page through:
+
+```shell
+cargo run --release --example replay_orders_events -- \
+  --orders tests/replay/ioc_orders/orders.jsonl \
+  --expected tests/replay/ioc_orders/expected-events.jsonl \
+  --batch-size 1 --addr 127.0.0.1:24202
+```
+
 ## Cases
 
 | Directory | Default port | Coverage |
@@ -37,11 +48,22 @@ Most cases use `--batch-size 1` so each request is its own Raft entry. The
 
 ## Run
 
-Run every case sequentially:
+Run every case sequentially with the file-sink harness:
 
 ```shell
 ./tests/replay/run-all.sh
 ```
+
+Run the same matrix through `POST /events` (the API-source companion):
+
+```shell
+EVENTS_LIMIT=100 ./tests/replay/run-all.sh events
+```
+
+`EVENTS_REPLAY_ADDR` overrides the shared sequential address (default
+`127.0.0.1:24202`); `EVENTS_LIMIT` sets the `/events` page size. Each case keeps
+its own `--batch-size`, since batching changes event ordinals within a log
+entry.
 
 Run one case:
 

@@ -369,7 +369,8 @@ examples/
 ├── sled.rs                  # 游乐场示例（本地 sled 目录，不安装）
 ├── dump_wal.rs              # WAL 分段的 JSONL 转储
 ├── dump_snapshot.rs         # 当前快照的 JSONL 转储
-└── replay_orders.rs         # 回放订单并对比撮合结果 JSONL
+├── replay_orders.rs         # 回放订单并对比撮合结果 JSONL
+└── replay_orders_events.rs  # 回放订单并从 POST /events 读取事件对比
 tests/
 ├── cluster/
     ├── main.rs              # 单一集成测试目标
@@ -679,6 +680,18 @@ cargo run --release --example replay_orders -- \
 忽略。`Batch` 行作为一个 entry 提交，普通请求按 `--batch-size`（默认 128）分组。默认比较会忽略
 `node_id` 和 `event_id.log_index`；需要精确事件 id 时使用 `--strict-log-index`。`--actual` 可保留
 生成的 JSONL，`--keep` 保留临时节点数据，其余选项见 `--help`。
+
+`replay_orders_events` 是读取 `/events` 的版本：不启用本地事件文件，回放后分页读取复制事件日志
+再与参考文件比较，用于验证下游消费者实际拿到的事件、游标和 id；`--events-limit` 控制每页大小。
+
+```shell
+cargo run --release --example replay_orders_events -- \
+  --orders orders.jsonl \
+  --expected expected-events.jsonl \
+  --events-limit 100
+```
+
+运行全部用例的 `/events` 版本：`./tests/replay/run-all.sh events`。
 
 仓库在 `tests/replay/` 下为每种订单类型或生命周期操作提供一个用例目录，每个目录包含
 `orders.jsonl`、`expected-events.jsonl`、`run.sh` 和场景 README。矩阵覆盖 GTC、IOC、FOK、

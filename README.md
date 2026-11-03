@@ -380,7 +380,8 @@ examples/
 ├── sled.rs                  # Playground (local sled dir, not installed)
 ├── dump_wal.rs              # JSONL dump of WAL segments
 ├── dump_snapshot.rs         # JSONL dump of the current snapshot
-└── replay_orders.rs         # Replay orders and compare match-result JSONL
+├── replay_orders.rs         # Replay orders and compare match-result JSONL
+└── replay_orders_events.rs  # Replay orders and compare events from POST /events
 tests/
 ├── cluster/
     ├── main.rs              # Single integration test target
@@ -718,6 +719,19 @@ lines and `#` comments are ignored. `Batch` lines are submitted as one entry, an
 requests are grouped by `--batch-size` (default 128). The comparison ignores `node_id` and
 `event_id.log_index` by default; pass `--strict-log-index` for an exact event id. Use `--actual` to
 keep the generated JSONL, `--keep` to keep the temporary node data, and `--help` for the rest.
+
+`replay_orders_events` is the API-source companion: it leaves the node-local event sink off,
+replays the same input, then pages the replicated `POST /events` log and compares that. It verifies
+what feed consumers actually read, including retention and event ids:
+
+```shell
+cargo run --release --example replay_orders_events -- \
+  --orders orders.jsonl \
+  --expected expected-events.jsonl \
+  --events-limit 100
+```
+
+Run the whole replay matrix through the API source with `./tests/replay/run-all.sh events`.
 
 Checked-in cases live under `tests/replay/`: one directory per order type or lifecycle
 operation, each with `orders.jsonl`, `expected-events.jsonl`, `run.sh` and a scenario README. The
