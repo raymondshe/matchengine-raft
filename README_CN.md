@@ -325,6 +325,9 @@ cargo run --manifest-path demo/Cargo.toml -- \
 ```
 
 打开 <http://127.0.0.1:24300/demo/>。标签页包含下单、完整订单簿、`/events` 游标事件流和标的自定义。
+
+![演示下单系统](./docs/demo-order-desk.png)
+
 运行流程见 [`demo/README.md`](./demo/README.md)，设计见
 [`docs/DEMO_ORDER_SYSTEM.md`](./docs/DEMO_ORDER_SYSTEM.md)。
 

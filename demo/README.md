@@ -10,6 +10,8 @@ The demo has two pieces:
 - a dependency-free HTML/CSS/JavaScript UI (`demo/web/`) that reuses `web/console/app.css` and adds
   only the trading-desk layout.
 
+![Demo order desk](../docs/demo-order-desk.png)
+
 ## Run
 
 Start and initialize an engine first:

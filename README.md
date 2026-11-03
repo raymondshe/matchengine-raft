@@ -333,8 +333,12 @@ cargo run --manifest-path demo/Cargo.toml -- \
 ```
 
 Open <http://127.0.0.1:24300/demo/>. Tabs cover the order ticket, the full order book, the
-`/events` cursor tape and symbol configuration. See [`demo/README.md`](./demo/README.md) for the
-demo flow and [`docs/DEMO_ORDER_SYSTEM.md`](./docs/DEMO_ORDER_SYSTEM.md) for the design.
+`/events` cursor tape and symbol configuration.
+
+![Demo order desk](./docs/demo-order-desk.png)
+
+See [`demo/README.md`](./demo/README.md) for the demo flow and
+[`docs/DEMO_ORDER_SYSTEM.md`](./docs/DEMO_ORDER_SYSTEM.md) for the design.
 
 ## Security and Deployment Boundary
 
