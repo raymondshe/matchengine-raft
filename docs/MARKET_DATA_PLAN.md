@@ -62,10 +62,11 @@ New module with no new dependencies:
 - **Message model**: `TRADE` (one per taker, all fills), `BBO`, `DEPTH_SNAPSHOT`, `DEPTH_DELTA`
   (post-entry totals), `LIFECYCLE` (one per entry), `STATUS`, `GAP`, `BAR` (closed + partial) — the
   catalogue in §12/§16.
-- **Wire encoder** (`wire.rs`): 64-byte header (magic `AMKT`, version 5, type, flags, `market_seq`,
+- **Wire codec** (`wire.rs`): 64-byte header (magic `AMKT`, version 5, type, flags, `market_seq`,
   log position, epoch, leader, ts, symbol, `sub_seq`) plus bodies, little-endian, matching §16.
   Version 5 encodes every price/quantity/quote volume/fee as a scale-18 `i128` and carries the
-fee asset per side.
+  fee asset per side. `encode` has a strict reference `decode` that rejects malformed frames;
+  golden round-trip tests cover every body type.
 - **Shadow book**: per-side price levels keyed by `Fixed` (scale 18); applies journal deltas,
   tracks order counts, BBO and the last trade.
 - **Processor**: drains frames, updates the shadow, and emits one deterministic batch per entry:
@@ -132,8 +133,9 @@ stable across restart and failover: `(symbol_id, stream_id, market_seq, sub_seq)
   the automatic GTD purge at their intake timestamp; `Day` still needs the explicit close.
 - **Leader-only keys are frame-derived**, so followers do not need to derive for key equality; a
   new leader resets from a snapshot (boundary = next `market_seq`) and continues the same keys.
-- **Wire**: `market_seq` replaces `stream_seq`, `sub_seq` takes two reserved bytes, `version = 2`.
-  `STATUS` is deterministic every `status_every` sequences; `GAP` is diagnostic.
+- **Wire**: `market_seq` replaces `stream_seq`, `sub_seq` takes two reserved bytes, `version = 5`.
+  `STATUS` is deterministic every `status_every` sequences; `GAP` is diagnostic. `wire::decode` is
+  the reference consumer and rejects corrupt/truncated frames.
 - **Acceptance**: two processors fed the same frames emit identical messages; a takeover snapshot
   continues the same keys; one TRADE carries every fill; no `Instant` in the data path; wire golden
   tests and integration assertions cover the keys.
@@ -170,7 +172,7 @@ PARTIAL_BAR|BAR_CLOSE`; bit 4 reserved), `market_seq`, `log_index`, `ordinal`, b
 |---|---|
 | Book | journal per mutation; journal off costs nothing; amend deltas |
 | Events | side on every kind; amended/fill JSON fields |
-| Wire | each message header + body encoding, flags, lengths |
+| Wire | each message header + body encoding, flags, lengths; reference decoder round-trips every body; a pinned v5 golden frame; malformed-frame rejection |
 | Processor | shadow/BBO, per-entry depth totals, bar windows (closed/live), lifecycle shedding, gap, snapshot reset, identical keys across replicas |
 | Apply | tap frame carries events/deltas/timestamp; status counters |
 | End-to-end | JSONL node: trade, BBO, depth, bar, status; leader-only gate |
@@ -194,7 +196,7 @@ PARTIAL_BAR|BAR_CLOSE`; bit 4 reserved), `market_seq`, `log_index`, `ordinal`, b
 | U4 | **done** | `open_with_sinks`, tap frames, `capture_market_data_snapshot`, `marketdata_status`, status assertion |
 | U5 | **done** | `MarketDataConfig` on `StorageConfig`, all CLI flags (incl. `--market-data-leader-only`), leader watcher, source-gated tap, end-to-end test on 21303 |
 | U6 | **done** | README/README_CN/AGENTS/TODO/AERON updates; bench `rest 1k bids + journal` |
-| U8 | **done** | deterministic `(market_seq, sub_seq)` across replicas; all mutations sequenced; auto GTD purge; one TRADE per taker; wire v5 |
+| U8 | **done** | deterministic `(market_seq, sub_seq)` across replicas; all mutations sequenced; auto GTD purge; one TRADE per taker; wire v5 encoder + reference decoder |
 | U7 | deferred | Aeron adapter and Archive replay; multi-symbol is deployment-level (one process per symbol) |
 
 ## Verification (2026-10-28)

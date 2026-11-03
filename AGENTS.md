@@ -11,7 +11,7 @@ Single-crate Rust project (edition 2024): a Raft-replicated order-book matching 
   - `--market-data-log <file>` (env `MARKET_DATA_LOG`) enables the deterministic market-data feed (`src/market_data/`) and appends its messages as JSONL. Leader-only by default; `--market-data-depth`, `--market-data-status-every`, `--market-data-bar-intervals-ms` and `--market-data-leader-only` tune it.
 CI (`.github/workflows/ci.yml`) runs `cargo fmt --all -- --check` (and the `fuzz/` crate's fmt check), `cargo clippy --all-targets -- -D warnings` and `cargo test` on push/PR, plus an `msrv` job that runs `cargo check --all-targets --locked` on Rust 1.89 to enforce `rust-version`. `Cargo.lock` is tracked (do not add it back to `.gitignore`).
 - `cargo test` runs everything (a single integration target, `cluster`, ~10s once built). Focus it with `cargo test --test cluster`.
-  - `cargo +nightly fuzz build` builds the separate `fuzz/` cargo-fuzz crate (`order_book`, `wal_decode`, `snapshot_decode`); `.github/workflows/fuzz.yml` builds it nightly and runs a short smoke pass. The fuzz crate is outside the root workspace so stable `cargo test` and clippy do not compile libFuzzer.
+  - `cargo +nightly fuzz build` builds the separate `fuzz/` cargo-fuzz crate (`order_book`, `wal_decode`, `snapshot_decode`, `wire_decode`); `.github/workflows/fuzz.yml` builds it nightly and runs a short smoke pass. The fuzz crate is outside the root workspace so stable `cargo test` and clippy do not compile libFuzzer.
   - `cargo bench --bench matchengine` runs the order-book micro-benchmarks (no framework, prints best-of-5 per-round times).
   - `cargo bench --bench book_replay` exercises `OrderBook` directly with deep sweeps, deep cancels and BBO-advance/query cases; no HTTP, Raft, WAL or feed. Results live in `docs/PERFORMANCE.md`.
   - `cargo bench --bench level_book` compares the bench-only per-price-level bucket prototype with `OrderBook` on match, cancel, sparse/dense amend, depth and BBO workloads; it verifies both books against each other before timing. Results and the adoption conclusion live in `docs/PERFORMANCE.md`. The prototype is not production code.
@@ -167,8 +167,8 @@ CI (`.github/workflows/ci.yml`) runs `cargo fmt --all -- --check` (and the `fuzz
   fallback and its comparison were removed on 2026-10-30.
 - `docs/MARKET_DATA_PLAN.md` tracks the market-data egress implementation (tap, shadow book,
   deterministic `market_seq`/`sub_seq` sequencing, binary wire format v5 (scale-18 `i128`
-  prices/quantities/fees plus fee assets), JSONL sink, leader gating); the Aeron adapter is still
-  the next phase.
+  prices/quantities/fees plus fee assets) with a strict reference decoder and golden round-trip
+  tests, JSONL sink, leader gating); the Aeron adapter is still the next phase.
 - `docs/FEE_DEDUCTION.md` documents the implemented base/quote volume semantics,
   fiat/stablecoin/equity/ETF asset metadata, tick/lot rules and fee-asset policies. Remaining
   extensions (fee tokens, mixed-unit iceberg/FOK) are listed there; sessions, settlement, corporate

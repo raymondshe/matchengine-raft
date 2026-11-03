@@ -28,15 +28,14 @@ corporate actions and fixed/regulatory/minimum/tax fees are owned by the externa
 Failure behavior is complete (§15): the node fail-stops on WAL `ENOSPC`/`EIO`, recovers from
 `SIGKILL` during writes, keeps snapshot writes atomic, and a learner killed mid-snapshot-install
 restarts without a partial snapshot and retries cleanly. Pre-Vote is enabled with a dedicated gRPC
-RPC (§4), so an isolated node asks before campaigning.
+RPC (§4), so an isolated node asks before campaigning. The wire v5 reference decoder and golden
+tests are complete (§6).
 
 The next work, in order:
 
-1. **Wire v5 consumer decoder (§6).** Add a reference decoder and encode → decode → re-encode
-   golden tests; the feed contract has encoder-only coverage today.
-2. **Benchmark regression gate (§8).** Gate CI on `apply_path` allocs/entry (deterministic) plus
+1. **Benchmark regression gate (§8).** Gate CI on `apply_path` allocs/entry (deterministic) plus
    loose time thresholds.
-3. **Event delivery Phase 4 (§5).** Long-poll `wait_ms`, gRPC `StreamEvents` and the optional MQ
+2. **Event delivery Phase 4 (§5).** Long-poll `wait_ms`, gRPC `StreamEvents` and the optional MQ
    bridge; this also settles the event-time/cursor item in §11.
 
 The quick wins from the last review are complete: `Order` identity `PartialEq`, optional
@@ -251,11 +250,12 @@ Done:
 - [x] **P2** `epoch` (leader generation) and `leader_id` carry the current Raft term and known
   leader: the leader watcher updates both on every metrics change; headers and reset snapshots carry
   them, covered by the market-data unit test and `test_market_data.rs`.
+- [x] **P2** Wire v5 reference decoder (`wire::decode`) with a strict `WireError`: validates the
+  header, body length, enum codes and length prefixes; golden round-trip tests cover every body
+  type, a checked-in golden frame and malformed-frame rejection.
 
 Remaining:
 
-- [ ] **P2** Add a consumer SDK/reference decoder for the wire format; the encoder has golden
-  tests, the consumer side has none.
 - [ ] **P2** Archive recording/replay and the snapshot-request stream (2003/2010).
 - [ ] **P3** Aeron adapter: `MarketDataSink` with `rusteron-client` plus an embedded driver in
   tests, feature-gated (`market-data-aeron`); see AERON_SOLUTION §20/§23.
@@ -268,7 +268,8 @@ Current coverage:
   framing. `src/order_book/property_tests.rs` runs randomized traces against a reference model,
   including mixed order types and fee-rate styles; `conformance_tests.rs` covers the explicit
   edge cases. `apply` event tests cover market, IOC, FOK, post-only, iceberg, stop-child
-  cancellation and automatic GTD expiry.
+  cancellation and automatic GTD expiry. `src/market_data/wire.rs` tests the encoder and
+  reference decoder, pins a v5 golden frame and rejects malformed frames.
 - `tests/cluster/test_cluster.rs`: 3 nodes over gRPC, init/membership/read/write.
 - `test_snapshot.rs`: snapshot build/purge and learner install over gRPC.
 - `test_storage.rs`: WAL framing, torn-tail truncation, segment rotation, 20k-record multi-segment
@@ -305,8 +306,8 @@ Current coverage:
   scenarios. Each case runs through `replay_orders` and compares the generated event sequence with
   a checked-in reference; `tests/replay/run-all.sh` runs the whole matrix.
 - `fuzz/`: `cargo-fuzz` targets for `OrderBook::execute_order` (`order_book`), WAL byte decoding
-  (`wal_decode`) and snapshot byte/content decoding (`snapshot_decode`); the scheduled
-  `.github/workflows/fuzz.yml` job builds them and runs a smoke pass.
+  (`wal_decode`), snapshot byte/content decoding (`snapshot_decode`) and market-data wire decoding
+  (`wire_decode`); the scheduled `.github/workflows/fuzz.yml` job builds them and runs a smoke pass.
 
 Completed follow-ups:
 

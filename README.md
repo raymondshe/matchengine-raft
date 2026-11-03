@@ -67,7 +67,7 @@ Built for teams that need deterministic execution, durable recovery and a clean 
 
 **APIs and data feeds**
 - **Durable match-event feed** at `POST /events` with cursor pagination, retention limits, `client_order_id` idempotency and replay-safe retries.
-- **Deterministic market-data feed** with leader gating, shadow book, BBO, depth snapshots/deltas, lifecycle events, OHLC bars and a compact binary wire format.
+- **Deterministic market-data feed** with leader gating, shadow book, BBO, depth snapshots/deltas, lifecycle events, OHLC bars and a compact binary wire format with a reference decoder.
 - **Flexible read consistency**: local reads, linearizable leader reads and linearizable follower reads.
 - **Leader-aware Rust client** that tracks and forwards requests to the current leader, with configurable timeouts, transient retry/backoff and typed API/no-leader errors; retries are at-least-once, so use `client_order_id` for idempotent write retries.
 - **Operational APIs** for initialization, membership changes, metrics, event status and market-data status.

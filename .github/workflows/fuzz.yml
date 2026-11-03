@@ -29,3 +29,5 @@ jobs:
         run: cargo fuzz run wal_decode -- -runs=2000 -max_total_time=60
       - name: Smoke-fuzz snapshot decoding
         run: cargo fuzz run snapshot_decode -- -runs=2000 -max_total_time=60
+      - name: Smoke-fuzz market-data wire decoding
+        run: cargo fuzz run wire_decode -- -runs=2000 -max_total_time=30

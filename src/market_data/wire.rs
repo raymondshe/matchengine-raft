@@ -12,15 +12,32 @@
 //! so no financial value crosses the wire as `f64`, and carries the volume unit
 //! and fee asset per record. A version bump is required for any change other
 //! than adding a field at the end of `STATUS`.
+//!
+//! [`encode`] produces frames and [`decode`] is the reference consumer. The
+//! decoder is strict and returns [`WireError`] instead of panicking on a
+//! truncated, corrupt or unknown frame.
+
+use std::fmt;
 
 use super::BarRecord;
+use super::BboRecord;
 use super::DepthSnapshotRecord;
+use super::GapRecord;
+use super::LevelUpdate;
 use super::LifecycleRecord;
 use super::MarketMessage;
 use super::MessageBody;
+use super::STREAM_BAR;
+use super::STREAM_BBO;
+use super::STREAM_DEPTH_DELTA;
+use super::STREAM_DEPTH_SNAPSHOT;
+use super::STREAM_LIFECYCLE;
+use super::STREAM_STATUS;
+use super::STREAM_TRADE;
 use super::StatusRecord;
 use super::TradeRecord;
 use crate::match_result::MatchEventKind;
+use crate::order_book::DepthLevel;
 use crate::order_book::FeeAsset;
 use crate::order_book::Fixed;
 use crate::order_book::OrderSide;
@@ -68,6 +85,35 @@ impl MessageBody {
             MessageBody::Status(_) => MessageType::Status,
             MessageBody::Gap(_) => MessageType::Gap,
             MessageBody::Bar(_) => MessageType::Bar,
+        }
+    }
+}
+
+impl MessageType {
+    fn from_code(code: u8) -> Result<Self, WireError> {
+        match code {
+            1 => Ok(Self::Trade),
+            2 => Ok(Self::Bbo),
+            3 => Ok(Self::DepthSnapshot),
+            4 => Ok(Self::DepthDelta),
+            5 => Ok(Self::Lifecycle),
+            6 => Ok(Self::Status),
+            7 => Ok(Self::Gap),
+            8 => Ok(Self::Bar),
+            _ => Err(WireError::UnknownMessageType(code)),
+        }
+    }
+
+    /// Stream a body travels on. `GAP` is emitted on the status stream.
+    fn stream(self) -> u16 {
+        match self {
+            Self::Trade => STREAM_TRADE,
+            Self::Bbo => STREAM_BBO,
+            Self::DepthSnapshot => STREAM_DEPTH_SNAPSHOT,
+            Self::DepthDelta => STREAM_DEPTH_DELTA,
+            Self::Lifecycle => STREAM_LIFECYCLE,
+            Self::Status | Self::Gap => STREAM_STATUS,
+            Self::Bar => STREAM_BAR,
         }
     }
 }
@@ -297,6 +343,484 @@ fn reason_code(reason: Option<RejectReason>) -> u8 {
     }
 }
 
+/// Error returned by [`decode`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WireError {
+    /// The frame is shorter than the fixed header.
+    TooShort { len: usize, need: usize },
+    /// The magic bytes are not `AMKT`.
+    BadMagic([u8; 4]),
+    /// The frame uses a schema version this decoder does not know.
+    UnsupportedVersion(u8),
+    /// The type code in the header is not defined.
+    UnknownMessageType(u8),
+    /// The header's body length does not match the bytes that follow it.
+    BodyLengthMismatch { declared: u32, actual: usize },
+    /// The body decoder finished before the declared body length.
+    TrailingBytes { count: usize },
+    /// A field ran past the end of the frame.
+    Truncated { field: &'static str },
+    /// An enum code has no defined value.
+    InvalidCode { field: &'static str, code: u8 },
+    /// A length prefix cannot fit in the remaining body; rejected before allocation.
+    CountTooLarge {
+        field: &'static str,
+        count: usize,
+        remaining: usize,
+    },
+}
+
+impl fmt::Display for WireError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TooShort { len, need } => {
+                write!(f, "frame is {len} bytes, need at least {need}")
+            }
+            Self::BadMagic(found) => write!(f, "bad magic: {found:02x?}"),
+            Self::UnsupportedVersion(version) => {
+                write!(f, "unsupported wire version {version}")
+            }
+            Self::UnknownMessageType(code) => write!(f, "unknown message type {code}"),
+            Self::BodyLengthMismatch { declared, actual } => {
+                write!(
+                    f,
+                    "declared body length {declared} does not match {actual} bytes"
+                )
+            }
+            Self::TrailingBytes { count } => write!(f, "{count} trailing body bytes"),
+            Self::Truncated { field } => write!(f, "truncated while reading {field}"),
+            Self::InvalidCode { field, code } => write!(f, "invalid {field} code {code}"),
+            Self::CountTooLarge {
+                field,
+                count,
+                remaining,
+            } => write!(
+                f,
+                "{field} count {count} cannot fit in {remaining} remaining bytes"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for WireError {}
+
+/// Fixed-size records, used to reject impossible length prefixes before allocation.
+const TRADE_RECORD_LEN: usize = 120;
+const LIFECYCLE_RECORD_LEN: usize = 123;
+const DEPTH_LEVEL_LEN: usize = 37;
+
+struct Decoder<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> Decoder<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, offset: 0 }
+    }
+
+    fn remaining(&self) -> usize {
+        self.bytes.len().saturating_sub(self.offset)
+    }
+
+    fn take(&mut self, len: usize, field: &'static str) -> Result<&'a [u8], WireError> {
+        let end = self
+            .offset
+            .checked_add(len)
+            .ok_or(WireError::Truncated { field })?;
+        let slice = self
+            .bytes
+            .get(self.offset..end)
+            .ok_or(WireError::Truncated { field })?;
+        self.offset = end;
+        Ok(slice)
+    }
+
+    fn u8(&mut self, field: &'static str) -> Result<u8, WireError> {
+        Ok(self.take(1, field)?[0])
+    }
+
+    fn u16(&mut self, field: &'static str) -> Result<u16, WireError> {
+        let mut bytes = [0u8; 2];
+        bytes.copy_from_slice(self.take(2, field)?);
+        Ok(u16::from_le_bytes(bytes))
+    }
+
+    fn u32(&mut self, field: &'static str) -> Result<u32, WireError> {
+        let mut bytes = [0u8; 4];
+        bytes.copy_from_slice(self.take(4, field)?);
+        Ok(u32::from_le_bytes(bytes))
+    }
+
+    fn u64(&mut self, field: &'static str) -> Result<u64, WireError> {
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(self.take(8, field)?);
+        Ok(u64::from_le_bytes(bytes))
+    }
+
+    fn i128(&mut self, field: &'static str) -> Result<i128, WireError> {
+        let mut bytes = [0u8; 16];
+        bytes.copy_from_slice(self.take(16, field)?);
+        Ok(i128::from_le_bytes(bytes))
+    }
+
+    fn fixed(&mut self, field: &'static str) -> Result<Fixed, WireError> {
+        Ok(Fixed::from_raw(self.i128(field)?))
+    }
+
+    fn boolean(&mut self, field: &'static str) -> Result<bool, WireError> {
+        match self.u8(field)? {
+            0 => Ok(false),
+            1 => Ok(true),
+            code => Err(WireError::InvalidCode { field, code }),
+        }
+    }
+
+    fn count(&mut self, field: &'static str, record_len: usize) -> Result<usize, WireError> {
+        let count = self.u32(field)? as usize;
+        let remaining = self.remaining();
+        if count > remaining / record_len {
+            return Err(WireError::CountTooLarge {
+                field,
+                count,
+                remaining,
+            });
+        }
+        Ok(count)
+    }
+}
+
+/// Decodes one frame produced by [`encode`].
+///
+/// The decoder is strict: it rejects a wrong magic, version or message type, a
+/// body length that does not match the frame, trailing body bytes, invalid enum
+/// codes and length prefixes that cannot fit the remaining body. It never
+/// panics on malformed input, so consumers and fuzz targets can call it
+/// directly.
+///
+/// `MarketMessage::stream` is not carried on the wire; it is derived from the
+/// body type (`GAP` uses the `STATUS` stream).
+///
+/// Version 5 encodes `counterparty_sequence = 0` for "no counterparty", so a
+/// real maker sequence `0` decodes as `None`. Sequence `0` is valid for the
+/// first order in an empty book; this is a known v5 limitation.
+pub fn decode(bytes: &[u8]) -> Result<MarketMessage, WireError> {
+    if bytes.len() < HEADER_LEN {
+        return Err(WireError::TooShort {
+            len: bytes.len(),
+            need: HEADER_LEN,
+        });
+    }
+
+    let mut decoder = Decoder::new(bytes);
+    let mut magic = [0u8; 4];
+    magic.copy_from_slice(decoder.take(4, "magic")?);
+    if magic != MAGIC {
+        return Err(WireError::BadMagic(magic));
+    }
+
+    let version = decoder.u8("version")?;
+    if version != VERSION {
+        return Err(WireError::UnsupportedVersion(version));
+    }
+    let message_type = MessageType::from_code(decoder.u8("message type")?)?;
+    let flags = decoder.u16("flags")?;
+    let market_seq = decoder.u64("market_seq")?;
+    let log_index = decoder.u64("log_index")?;
+    let ordinal = decoder.u32("ordinal")?;
+    let body_len = decoder.u32("body length")?;
+    let epoch = decoder.u64("epoch")?;
+    let leader_id = decoder.u64("leader_id")?;
+    let ts_ms = decoder.u64("ts_ms")?;
+    let symbol_id = decoder.u32("symbol_id")?;
+    let sub_seq = decoder.u16("sub_seq")?;
+    let _reserved = decoder.u16("reserved")?;
+
+    let actual = bytes.len() - HEADER_LEN;
+    if body_len as usize != actual {
+        return Err(WireError::BodyLengthMismatch {
+            declared: body_len,
+            actual,
+        });
+    }
+
+    let body = decode_body(message_type, &mut decoder)?;
+    let trailing = decoder.remaining();
+    if trailing != 0 {
+        return Err(WireError::TrailingBytes { count: trailing });
+    }
+
+    Ok(MarketMessage {
+        stream: message_type.stream(),
+        flags,
+        market_seq,
+        sub_seq,
+        log_index,
+        ordinal,
+        epoch,
+        leader_id,
+        ts_ms,
+        symbol_id,
+        body,
+    })
+}
+
+fn decode_body(kind: MessageType, decoder: &mut Decoder<'_>) -> Result<MessageBody, WireError> {
+    match kind {
+        MessageType::Trade => {
+            let count = decoder.count("trade count", TRADE_RECORD_LEN)?;
+            let mut records = Vec::with_capacity(count);
+            for _ in 0..count {
+                records.push(decode_trade(decoder)?);
+            }
+            Ok(MessageBody::Trade(records))
+        }
+        MessageType::Bbo => Ok(MessageBody::Bbo(BboRecord {
+            last_trade: decode_option_fixed(decoder, "bbo.last_trade")?,
+            bid: decoder.fixed("bbo.bid")?,
+            bid_volume: decoder.fixed("bbo.bid_volume")?,
+            ask: decoder.fixed("bbo.ask")?,
+            ask_volume: decoder.fixed("bbo.ask_volume")?,
+            mid: decode_option_fixed(decoder, "bbo.mid")?,
+            spread: decode_option_fixed(decoder, "bbo.spread")?,
+        })),
+        MessageType::DepthSnapshot => {
+            Ok(MessageBody::DepthSnapshot(decode_depth_snapshot(decoder)?))
+        }
+        MessageType::DepthDelta => {
+            let count = decoder.count("depth delta count", DEPTH_LEVEL_LEN)?;
+            let mut updates = Vec::with_capacity(count);
+            for _ in 0..count {
+                let (side, level) = decode_level(decoder, "depth delta")?;
+                updates.push(LevelUpdate { side, level });
+            }
+            Ok(MessageBody::DepthDelta(updates))
+        }
+        MessageType::Lifecycle => {
+            let count = decoder.count("lifecycle count", LIFECYCLE_RECORD_LEN)?;
+            let mut records = Vec::with_capacity(count);
+            for _ in 0..count {
+                records.push(decode_lifecycle(decoder)?);
+            }
+            Ok(MessageBody::Lifecycle(records))
+        }
+        MessageType::Status => Ok(MessageBody::Status(StatusRecord {
+            last_market_seq: decoder.u64("status.last_market_seq")?,
+            last_sub_seq: decoder.u16("status.last_sub_seq")?,
+            last_log_index: decoder.u64("status.last_log_index")?,
+            last_ordinal: decoder.u32("status.last_ordinal")?,
+            applied_index: decoder.u64("status.applied_index")?,
+            book_sequence: decoder.u64("status.book_sequence")?,
+            pending_stops: decoder.u32("status.pending_stops")?,
+        })),
+        MessageType::Gap => Ok(MessageBody::Gap(GapRecord {
+            last_good_log_index: decoder.u64("gap.last_good_log_index")?,
+            last_good_ordinal: decoder.u32("gap.last_good_ordinal")?,
+            dropped: decoder.u32("gap.dropped")?,
+        })),
+        MessageType::Bar => Ok(MessageBody::Bar(BarRecord {
+            interval_ms: u64::from(decoder.u32("bar.interval_ms")?),
+            window_start_ms: decoder.u64("bar.window_start_ms")?,
+            last_ts_ms: decoder.u64("bar.last_ts_ms")?,
+            open: decoder.fixed("bar.open")?,
+            high: decoder.fixed("bar.high")?,
+            low: decoder.fixed("bar.low")?,
+            close: decoder.fixed("bar.close")?,
+            volume: decoder.fixed("bar.volume")?,
+            trade_count: decoder.u32("bar.trade_count")?,
+            bar_seq: decoder.u64("bar.bar_seq")?,
+        })),
+    }
+}
+
+fn decode_trade(decoder: &mut Decoder<'_>) -> Result<TradeRecord, WireError> {
+    Ok(TradeRecord {
+        log_index: decoder.u64("trade.log_index")?,
+        ordinal: decoder.u32("trade.ordinal")?,
+        ts_ms: decoder.u64("trade.ts_ms")?,
+        price: decoder.fixed("trade.price")?,
+        volume: decoder.fixed("trade.volume")?,
+        quote_volume: decoder.fixed("trade.quote_volume")?,
+        taker_fee: decoder.fixed("trade.taker_fee")?,
+        taker_fee_asset: decode_fee_asset(
+            decoder.u8("trade.taker_fee_asset")?,
+            "trade.taker_fee_asset",
+        )?,
+        maker_fee: decoder.fixed("trade.maker_fee")?,
+        maker_fee_asset: decode_fee_asset(
+            decoder.u8("trade.maker_fee_asset")?,
+            "trade.maker_fee_asset",
+        )?,
+        fee_overflow: decoder.boolean("trade.fee_overflow")?,
+        taker_side: decode_side(decoder.u8("trade.taker_side")?, "trade.taker_side")?,
+        taker_sequence: decoder.u64("trade.taker_sequence")?,
+        maker_sequence: decoder.u64("trade.maker_sequence")?,
+    })
+}
+
+fn decode_depth_snapshot(decoder: &mut Decoder<'_>) -> Result<DepthSnapshotRecord, WireError> {
+    let bids = decoder.u32("depth.bids")? as usize;
+    let asks = decoder.u32("depth.asks")? as usize;
+    let total = bids.checked_add(asks).ok_or(WireError::CountTooLarge {
+        field: "depth levels",
+        count: usize::MAX,
+        remaining: decoder.remaining(),
+    })?;
+    let remaining = decoder.remaining();
+    if total > remaining / DEPTH_LEVEL_LEN {
+        return Err(WireError::CountTooLarge {
+            field: "depth levels",
+            count: total,
+            remaining,
+        });
+    }
+
+    let mut bid_levels = Vec::with_capacity(bids);
+    for _ in 0..bids {
+        let (_, level) = decode_level(decoder, "depth.bid")?;
+        bid_levels.push(level);
+    }
+    let mut ask_levels = Vec::with_capacity(asks);
+    for _ in 0..asks {
+        let (_, level) = decode_level(decoder, "depth.ask")?;
+        ask_levels.push(level);
+    }
+    Ok(DepthSnapshotRecord {
+        bids: bid_levels,
+        asks: ask_levels,
+    })
+}
+
+fn decode_level(
+    decoder: &mut Decoder<'_>,
+    field: &'static str,
+) -> Result<(OrderSide, DepthLevel), WireError> {
+    let side = decode_side(decoder.u8(field)?, field)?;
+    let price = decoder.fixed(field)?;
+    let volume = decoder.fixed(field)?;
+    let orders = decoder.u32(field)?;
+    Ok((
+        side,
+        DepthLevel {
+            price,
+            volume,
+            orders,
+        },
+    ))
+}
+
+fn decode_lifecycle(decoder: &mut Decoder<'_>) -> Result<LifecycleRecord, WireError> {
+    let log_index = decoder.u64("lifecycle.log_index")?;
+    let ordinal = decoder.u32("lifecycle.ordinal")?;
+    let ts_ms = decoder.u64("lifecycle.ts_ms")?;
+    let kind = decode_kind(decoder.u8("lifecycle.kind")?)?;
+    let order_sequence = decoder.u64("lifecycle.order_sequence")?;
+    let side = decode_side(decoder.u8("lifecycle.side")?, "lifecycle.side")?;
+    let counterparty = decoder.u64("lifecycle.counterparty_sequence")?;
+    Ok(LifecycleRecord {
+        log_index,
+        ordinal,
+        ts_ms,
+        kind,
+        order_sequence,
+        side,
+        counterparty_sequence: (counterparty != 0).then_some(counterparty),
+        price: decoder.fixed("lifecycle.price")?,
+        volume: decoder.fixed("lifecycle.volume")?,
+        quote_volume: decoder.fixed("lifecycle.quote_volume")?,
+        volume_unit: decode_volume_unit(
+            decoder.u8("lifecycle.volume_unit")?,
+            "lifecycle.volume_unit",
+        )?,
+        taker_fee: decoder.fixed("lifecycle.taker_fee")?,
+        taker_fee_asset: decode_fee_asset(
+            decoder.u8("lifecycle.taker_fee_asset")?,
+            "lifecycle.taker_fee_asset",
+        )?,
+        maker_fee: decoder.fixed("lifecycle.maker_fee")?,
+        maker_fee_asset: decode_fee_asset(
+            decoder.u8("lifecycle.maker_fee_asset")?,
+            "lifecycle.maker_fee_asset",
+        )?,
+        fee_overflow: decoder.boolean("lifecycle.fee_overflow")?,
+        reason: decode_reason(decoder.u8("lifecycle.reason")?)?,
+    })
+}
+
+fn decode_option_fixed(
+    decoder: &mut Decoder<'_>,
+    field: &'static str,
+) -> Result<Option<Fixed>, WireError> {
+    match decoder.u8(field)? {
+        0 => {
+            // The encoder writes a zero placeholder after the absence byte.
+            decoder.take(16, field)?;
+            Ok(None)
+        }
+        1 => Ok(Some(decoder.fixed(field)?)),
+        code => Err(WireError::InvalidCode { field, code }),
+    }
+}
+
+fn decode_fee_asset(code: u8, field: &'static str) -> Result<Option<FeeAsset>, WireError> {
+    match code {
+        0 => Ok(None),
+        1 => Ok(Some(FeeAsset::Base)),
+        2 => Ok(Some(FeeAsset::Quote)),
+        _ => Err(WireError::InvalidCode { field, code }),
+    }
+}
+
+fn decode_volume_unit(code: u8, field: &'static str) -> Result<VolumeUnit, WireError> {
+    match code {
+        0 => Ok(VolumeUnit::Base),
+        1 => Ok(VolumeUnit::Quote),
+        _ => Err(WireError::InvalidCode { field, code }),
+    }
+}
+
+fn decode_side(code: u8, field: &'static str) -> Result<OrderSide, WireError> {
+    match code {
+        0 => Ok(OrderSide::Buy),
+        1 => Ok(OrderSide::Sell),
+        _ => Err(WireError::InvalidCode { field, code }),
+    }
+}
+
+fn decode_kind(code: u8) -> Result<MatchEventKind, WireError> {
+    match code {
+        1 => Ok(MatchEventKind::Rested),
+        2 => Ok(MatchEventKind::Fill),
+        3 => Ok(MatchEventKind::Cancelled),
+        4 => Ok(MatchEventKind::Triggered),
+        5 => Ok(MatchEventKind::Expired),
+        6 => Ok(MatchEventKind::Rejected),
+        7 => Ok(MatchEventKind::Amended),
+        _ => Err(WireError::InvalidCode {
+            field: "lifecycle.kind",
+            code,
+        }),
+    }
+}
+
+fn decode_reason(code: u8) -> Result<Option<RejectReason>, WireError> {
+    match code {
+        0 => Ok(None),
+        1 => Ok(Some(RejectReason::FokUnfillable)),
+        2 => Ok(Some(RejectReason::PostOnlyWouldCross)),
+        3 => Ok(Some(RejectReason::StopWouldTrigger)),
+        4 => Ok(Some(RejectReason::GtdAlreadyExpired)),
+        5 => Ok(Some(RejectReason::OrderNotFound)),
+        6 => Ok(Some(RejectReason::UnsupportedOrder)),
+        7 => Ok(Some(RejectReason::AmendWouldCross)),
+        8 => Ok(Some(RejectReason::InvalidOrder)),
+        _ => Err(WireError::InvalidCode {
+            field: "lifecycle.reason",
+            code,
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -361,8 +885,9 @@ mod tests {
     }
 
     fn message(body: MessageBody) -> MarketMessage {
+        let stream = body.message_type().stream();
         MarketMessage {
-            stream: 0,
+            stream,
             flags: flags::END_OF_BATCH,
             market_seq: 7,
             sub_seq: 3,
@@ -677,5 +1202,265 @@ mod tests {
             dropped: 0,
         })));
         assert_eq!(5, bytes[4]);
+    }
+
+    fn sample_trade() -> TradeRecord {
+        TradeRecord {
+            log_index: 10,
+            ordinal: 0,
+            ts_ms: 1_000,
+            price: fixed("100.5"),
+            volume: fixed("2"),
+            quote_volume: fixed("201"),
+            taker_fee: fixed("0.4"),
+            taker_fee_asset: Some(FeeAsset::Base),
+            maker_fee: fixed("0.2"),
+            maker_fee_asset: Some(FeeAsset::Quote),
+            fee_overflow: false,
+            taker_side: OrderSide::Buy,
+            taker_sequence: 4,
+            maker_sequence: 2,
+        }
+    }
+
+    fn sample_lifecycle() -> LifecycleRecord {
+        LifecycleRecord {
+            log_index: 5,
+            ordinal: 2,
+            ts_ms: 1_000,
+            kind: MatchEventKind::Fill,
+            order_sequence: 8,
+            side: OrderSide::Buy,
+            counterparty_sequence: Some(3),
+            price: fixed("100"),
+            volume: fixed("2"),
+            quote_volume: fixed("200"),
+            volume_unit: VolumeUnit::Base,
+            taker_fee: fixed("0.4"),
+            taker_fee_asset: Some(FeeAsset::Base),
+            maker_fee: fixed("0.2"),
+            maker_fee_asset: Some(FeeAsset::Quote),
+            fee_overflow: false,
+            reason: None,
+        }
+    }
+
+    fn sample_bar() -> BarRecord {
+        BarRecord {
+            interval_ms: 1_000,
+            window_start_ms: 1_000,
+            last_ts_ms: 1_800,
+            open: fixed("100"),
+            high: fixed("101"),
+            low: fixed("99"),
+            close: fixed("100.5"),
+            volume: fixed("7"),
+            trade_count: 3,
+            bar_seq: 4,
+        }
+    }
+
+    fn assert_round_trip(body: MessageBody) {
+        let original = message(body);
+        let bytes = encode(&original);
+        let decoded = decode(&bytes).expect("valid frame decodes");
+        assert_eq!(original, decoded);
+        assert_eq!(bytes, encode(&decoded));
+    }
+
+    #[test]
+    fn decode_round_trips_every_body_type() {
+        assert_round_trip(MessageBody::Trade(vec![sample_trade()]));
+        assert_round_trip(MessageBody::Bbo(BboRecord {
+            last_trade: Some(fixed("100")),
+            bid: fixed("99.5"),
+            bid_volume: fixed("3"),
+            ask: fixed("100.5"),
+            ask_volume: fixed("4"),
+            mid: Some(fixed("100")),
+            spread: Some(fixed("1")),
+        }));
+        assert_round_trip(MessageBody::Bbo(BboRecord {
+            last_trade: None,
+            bid: Fixed::ZERO,
+            bid_volume: Fixed::ZERO,
+            ask: Fixed::ZERO,
+            ask_volume: Fixed::ZERO,
+            mid: None,
+            spread: None,
+        }));
+        assert_round_trip(MessageBody::DepthSnapshot(DepthSnapshotRecord {
+            bids: vec![DepthLevel {
+                price: fixed("100"),
+                volume: fixed("5"),
+                orders: 2,
+            }],
+            asks: vec![DepthLevel {
+                price: fixed("101"),
+                volume: fixed("1.5"),
+                orders: 1,
+            }],
+        }));
+        assert_round_trip(MessageBody::DepthDelta(vec![LevelUpdate {
+            side: OrderSide::Sell,
+            level: DepthLevel {
+                price: fixed("99"),
+                volume: fixed("4"),
+                orders: 1,
+            },
+        }]));
+        assert_round_trip(MessageBody::Lifecycle(vec![sample_lifecycle()]));
+        assert_round_trip(MessageBody::Status(StatusRecord {
+            last_market_seq: 12,
+            last_sub_seq: 1,
+            last_log_index: 9,
+            last_ordinal: 1,
+            applied_index: 10,
+            book_sequence: 4,
+            pending_stops: 2,
+        }));
+        assert_round_trip(MessageBody::Gap(GapRecord {
+            last_good_log_index: 41,
+            last_good_ordinal: 2,
+            dropped: 1,
+        }));
+        assert_round_trip(MessageBody::Bar(sample_bar()));
+    }
+
+    const GOLDEN_GAP_HEX: &str = "414d4b5405070c0007000000000000002a000000000000000300000010000000090000000000000001000000000000000068e5cf8b010000000000000300000029000000000000000200000001000000";
+
+    fn hex_bytes(hex: &str) -> Vec<u8> {
+        assert_eq!(0, hex.len() % 2, "hex must have complete bytes");
+        (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("valid hex"))
+            .collect()
+    }
+
+    #[test]
+    fn golden_gap_frame_is_stable() {
+        let bytes = hex_bytes(GOLDEN_GAP_HEX);
+        assert_eq!(80, bytes.len());
+
+        let decoded = decode(&bytes).expect("golden frame decodes");
+        assert_eq!(STREAM_STATUS, decoded.stream);
+        assert_eq!(flags::GAP | flags::END_OF_BATCH, decoded.flags);
+        assert_eq!(7, decoded.market_seq);
+        assert_eq!(42, decoded.log_index);
+        assert_eq!(3, decoded.ordinal);
+        assert_eq!(9, decoded.epoch);
+        assert_eq!(1, decoded.leader_id);
+        assert_eq!(1_700_000_000_000, decoded.ts_ms);
+        assert_eq!(0, decoded.symbol_id);
+        assert_eq!(3, decoded.sub_seq);
+        assert_eq!(
+            MessageBody::Gap(GapRecord {
+                last_good_log_index: 41,
+                last_good_ordinal: 2,
+                dropped: 1,
+            }),
+            decoded.body
+        );
+        assert_eq!(bytes, encode(&decoded));
+    }
+
+    #[test]
+    fn decode_rejects_malformed_frames() {
+        let golden = hex_bytes(GOLDEN_GAP_HEX);
+
+        assert!(matches!(
+            decode(&[]),
+            Err(WireError::TooShort {
+                len: 0,
+                need: HEADER_LEN
+            })
+        ));
+
+        let mut bad = golden.clone();
+        bad[0] = 0;
+        assert!(matches!(decode(&bad), Err(WireError::BadMagic(_))));
+
+        let mut bad = golden.clone();
+        bad[4] = 4;
+        assert!(matches!(
+            decode(&bad),
+            Err(WireError::UnsupportedVersion(4))
+        ));
+
+        let mut bad = golden.clone();
+        bad[5] = 99;
+        assert!(matches!(
+            decode(&bad),
+            Err(WireError::UnknownMessageType(99))
+        ));
+
+        let mut bad = golden.clone();
+        bad[28..32].copy_from_slice(&15u32.to_le_bytes());
+        assert!(matches!(
+            decode(&bad),
+            Err(WireError::BodyLengthMismatch {
+                declared: 15,
+                actual: 16
+            })
+        ));
+
+        let mut trailing = golden.clone();
+        trailing.push(0);
+        trailing[28..32].copy_from_slice(&17u32.to_le_bytes());
+        assert!(matches!(
+            decode(&trailing),
+            Err(WireError::TrailingBytes { count: 1 })
+        ));
+
+        let mut truncated = encode(&message(MessageBody::Status(StatusRecord {
+            last_market_seq: 12,
+            last_sub_seq: 1,
+            last_log_index: 9,
+            last_ordinal: 1,
+            applied_index: 10,
+            book_sequence: 4,
+            pending_stops: 2,
+        })));
+        truncated.pop();
+        truncated[28..32].copy_from_slice(&41u32.to_le_bytes());
+        assert!(matches!(
+            decode(&truncated),
+            Err(WireError::Truncated { .. })
+        ));
+
+        let mut bad_side = encode(&message(MessageBody::Trade(vec![sample_trade()])));
+        bad_side[HEADER_LEN + 107] = 9;
+        assert!(matches!(
+            decode(&bad_side),
+            Err(WireError::InvalidCode {
+                field: "trade.taker_side",
+                code: 9
+            })
+        ));
+
+        let mut huge_count = encode(&message(MessageBody::Trade(vec![sample_trade()])));
+        huge_count[HEADER_LEN..HEADER_LEN + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(matches!(
+            decode(&huge_count),
+            Err(WireError::CountTooLarge { .. })
+        ));
+
+        let mut bad_option = encode(&message(MessageBody::Bbo(BboRecord {
+            last_trade: None,
+            bid: Fixed::ZERO,
+            bid_volume: Fixed::ZERO,
+            ask: Fixed::ZERO,
+            ask_volume: Fixed::ZERO,
+            mid: None,
+            spread: None,
+        })));
+        bad_option[HEADER_LEN] = 2;
+        assert!(matches!(
+            decode(&bad_option),
+            Err(WireError::InvalidCode {
+                field: "bbo.last_trade",
+                code: 2
+            })
+        ));
     }
 }
