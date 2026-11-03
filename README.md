@@ -984,7 +984,7 @@ placeholder). `sequence` is optional and defaults to `0`.
 
 The replay cases are not part of `cargo test`; run the whole matrix with
 `./tests/replay/run-all.sh`, or one case with `./tests/replay/<case>/run.sh`. They use HTTP ports
-`24211-24225` (gRPC `25211-25225`), one per case, and compare the generated match-event JSONL with
+`24211-24226` (gRPC `25211-25226`), one per case, and compare the generated match-event JSONL with
 the checked-in reference. See `tests/replay/README.md` for the case matrix and regeneration steps.
 
 The fuzz targets are a separate nightly-only crate; see `fuzz/README.md` and

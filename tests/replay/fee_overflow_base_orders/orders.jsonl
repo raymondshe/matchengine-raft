@@ -1,0 +1,5 @@
+# Received policy on the default BTC/USDT symbol: a seller maker is paid in
+# quote, a buyer taker pays in base. The quote notional overflows, so only the
+# quote maker fee is unavailable; the base taker fee stays exact.
+{"Place":{"order":{"live":"Limit","side":"Sell","price":"100000000000","volume":"10000000000","maker_fee_rate":"0.001","taker_fee_rate":"0.002","id":1,"sequence":0}}}
+{"Place":{"order":{"live":"Limit","side":"Buy","price":"100000000000","volume":"10000000000","maker_fee_rate":"0.001","taker_fee_rate":"0.002","id":2,"sequence":0}}}

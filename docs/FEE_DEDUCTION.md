@@ -519,6 +519,10 @@ Examples:
 - The same fill under a Base/Base policy: `quote_volume` is `0` and `error` contains
   `notional_overflow`, but the base-denominated maker and taker fees remain exact (`0.001` and
   `0.002` of the matched volume).
+- Under the default `Received` policy the buyer taker pays in base and the seller maker in quote.
+  The same overflowing fill reports `error = ["notional_overflow", "maker_fee_overflow"]` with an
+  exact `taker_fee` and an unavailable `maker_fee`. `tests/replay/fee_overflow_base_orders/` pins
+  this shape.
 
 `MatchErrors` is a copyable bitmask internally and a JSON string array externally. New non-fatal
 fill conditions can add a code without changing the event shape. The current numeric fields remain
@@ -757,6 +761,8 @@ Migration order used:
 - Iceberg refills and stop children with both volume units.
 - Amendments preserve unit/rates and normalize new quote volume.
 - 18-digit exactness, snapshot restart and wire round-trip.
+- Replay fixtures for quote-policy overflow (`fee_overflow_orders`) and a `Received` fill where
+  only the quote maker fee is unavailable (`fee_overflow_base_orders`).
 - Determinism across replicas and failover.
 - No negative/over-budget remainders; no crossed book.
 - Derivatives extension: linear USDT-margined fees in quote, inverse fees in base, third-asset

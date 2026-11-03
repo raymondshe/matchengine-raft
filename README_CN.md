@@ -912,8 +912,8 @@ ETF/股票 base 的费用始终以 quote 资产结算；加密货币和法币对
 | `fuzz/` | `cargo-fuzz` 目标：`OrderBook::execute_order`、WAL 字节解码、快照字节/内容解码；每夜的定时工作流构建三个目标并做一次冒烟运行 |
 
 回放用例不属于 `cargo test`；用 `./tests/replay/run-all.sh` 运行全部，或用
-`./tests/replay/<case>/run.sh` 运行单个用例。它们使用 HTTP 端口 `24211-24225`（gRPC
-`25211-25225`），每个用例一个端口，并把生成的撮合事件 JSONL 与仓库中的参考文件对比。
+`./tests/replay/<case>/run.sh` 运行单个用例。它们使用 HTTP 端口 `24211-24226`（gRPC
+`25211-25226`），每个用例一个端口，并把生成的撮合事件 JSONL 与仓库中的参考文件对比。
 用例矩阵和重新生成步骤见 `tests/replay/README.md`。
 
 模糊测试目标是独立的 nightly crate，见 `fuzz/README.md` 和 `.github/workflows/fuzz.yml`。
