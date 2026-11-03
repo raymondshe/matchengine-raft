@@ -21,6 +21,12 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: Test
         run: cargo test
+      - name: Demo format
+        run: cargo fmt --manifest-path demo/Cargo.toml -- --check
+      - name: Demo clippy
+        run: cargo clippy --manifest-path demo/Cargo.toml --all-targets -- -D warnings
+      - name: Demo test
+        run: cargo test --manifest-path demo/Cargo.toml --locked
 
   msrv:
     runs-on: ubuntu-latest

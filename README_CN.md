@@ -37,6 +37,7 @@
 - [快速开始](#快速开始)
 - [运行集群](#运行集群)
 - [运维控制台](#运维控制台)
+- [演示下单系统](#演示下单系统)
 - [安全与部署边界](#安全与部署边界)
 - [项目结构](#项目结构)
 - [存储实现](#存储实现)
@@ -76,6 +77,7 @@
 **运维可见性**
 - **内置 WebUI 控制台** `/console/`：集群健康、Raft 领导与复制、存储/事件/行情状态、仅领导者可见的事件查看器和诊断信息，无需构建步骤或外部资源。
 - **受保护的 Raft 操作**：通过 gRPC `TransferLeader` 进行优雅领导者切换、尽力而为的 Pre-Vote 选举请求和快照触发，带确认、操作锁和审计日志。
+- **独立演示下单系统** `demo/`：独立进程与 crate，可提交真实订单，展示完整订单簿、标的自定义和游标跟随的 `/events` 事件流，并复用控制台主题。
 - **健康与就绪探针**：`/health` 报告 gRPC 监听器、Raft 核心和 WAL/状态机前沿；`/ready` 还要求已知领导者，适合编排系统使用。
 
 **可信赖的工程质量**
@@ -311,6 +313,20 @@ curl -X POST -H "Content-Type: application/json" \
 [`docs/OPERATIONAL_CONSOLE_LAYOUT.html`](./docs/OPERATIONAL_CONSOLE_LAYOUT.html)。
 
 ![运维控制台](./docs/operational-console.jpg)
+
+## 演示下单系统
+
+`demo/` 是面向运行中节点的独立下单 WebUI。它是单独的 crate 和进程，不修改引擎二进制及其路由；
+通过 leader-aware 客户端调用公共 HTTP API，并复用控制台主题。先启动并初始化引擎，再运行：
+
+```shell
+cargo run --manifest-path demo/Cargo.toml -- \
+  --addr 127.0.0.1:24300 --engine 127.0.0.1:24301 --engine-id 1
+```
+
+打开 <http://127.0.0.1:24300/demo/>。标签页包含下单、完整订单簿、`/events` 游标事件流和标的自定义。
+运行流程见 [`demo/README.md`](./demo/README.md)，设计见
+[`docs/DEMO_ORDER_SYSTEM.md`](./docs/DEMO_ORDER_SYSTEM.md)。
 
 ## 安全与部署边界
 

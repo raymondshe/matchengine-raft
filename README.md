@@ -37,6 +37,7 @@ A practical implementation of a distributed matching engine built upon [OpenRaft
 - [Getting Started](#getting-started)
 - [Running the Cluster](#running-the-cluster)
 - [Operational Console](#operational-console)
+- [Demo Order Desk](#demo-order-desk)
 - [Security and Deployment Boundary](#security-and-deployment-boundary)
 - [Project Structure](#project-structure)
 - [Storage Implementation](#storage-implementation)
@@ -76,6 +77,7 @@ Built for teams that need deterministic execution, durable recovery and a clean 
 **Operational visibility**
 - **Embedded WebUI console** at `/console/`: cluster health, Raft leadership and replication, storage/event/feed state, a leader-only event viewer and diagnostics — no build step or external assets.
 - **Guarded Raft actions**: graceful leadership transfer over the gRPC `TransferLeader` RPC, a best-effort Pre-Vote election request, and snapshot triggering, with confirmation, action locking and audit logs.
+- **Standalone demo order desk** at `demo/`: a separate process and crate that places real orders and shows the full book, symbol configuration and a cursor-following `/events` tape, reusing the console theme.
 - **Health and readiness probes**: `/health` reports the gRPC listener, Raft core and WAL/state-machine frontier; `/ready` additionally requires a known leader, making both suitable for orchestrators.
 
 **Built to be trusted**
@@ -318,6 +320,21 @@ actions. See [`docs/OPERATIONAL_CONSOLE.md`](./docs/OPERATIONAL_CONSOLE.md) for 
 mockup.
 
 ![Operational console](./docs/operational-console.jpg)
+
+## Demo Order Desk
+
+`demo/` is a standalone order-entry WebUI for a running node. It is a separate crate and process;
+the engine binary and its routes are unchanged. It calls the public HTTP API through the
+leader-aware client and reuses the console theme. Start an initialized engine, then run:
+
+```shell
+cargo run --manifest-path demo/Cargo.toml -- \
+  --addr 127.0.0.1:24300 --engine 127.0.0.1:24301 --engine-id 1
+```
+
+Open <http://127.0.0.1:24300/demo/>. Tabs cover the order ticket, the full order book, the
+`/events` cursor tape and symbol configuration. See [`demo/README.md`](./demo/README.md) for the
+demo flow and [`docs/DEMO_ORDER_SYSTEM.md`](./docs/DEMO_ORDER_SYSTEM.md) for the design.
 
 ## Security and Deployment Boundary
 

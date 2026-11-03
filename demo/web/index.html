@@ -1,0 +1,410 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MatchEngine Raft — Demo order desk</title>
+<link rel="stylesheet" href="/demo/app.css">
+<script src="/demo/app.js" defer></script>
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <div class="brand-mark">OD</div>
+    <div class="brand-text">
+      <strong>MatchEngine Raft</strong>
+      <span>Demo order desk</span>
+    </div>
+  </div>
+  <div class="topbar-status">
+    <span class="chip" id="node-chip"><span class="dot"></span> connecting</span>
+    <span class="chip" id="leader-chip">Leader <strong>—</strong></span>
+    <span class="chip" id="term-chip">Term <strong>—</strong></span>
+    <span class="chip" id="ready-chip">Ready <strong>—</strong></span>
+    <span class="chip" id="symbol-chip">Symbol —</span>
+    <span class="muted mono" id="updated">not loaded</span>
+    <button class="btn ghost" id="refresh-button" type="button">Refresh</button>
+  </div>
+</header>
+
+<main class="page">
+  <div class="page-head">
+    <div>
+      <div class="eyebrow">Demo order desk</div>
+      <h1 id="desk-title">Order desk</h1>
+      <p>Place orders, watch the visible book and follow the replicated match-event log.</p>
+    </div>
+    <div class="page-actions">
+      <label class="toggle"><input type="checkbox" id="auto-refresh" checked> Auto-refresh 1s</label>
+      <button class="btn" id="manual-refresh" type="button">Refresh</button>
+    </div>
+  </div>
+
+  <div class="banner demo-banner">
+    <strong>Demo</strong>
+    <span>Orders are real replicated writes. Fees are reported; the engine does not hold balances or settle funds.</span>
+  </div>
+  <div class="banner" id="warning-banner" hidden>
+    <strong id="warning-title">Warning</strong>
+    <span id="warning-text"></span>
+  </div>
+
+  <input class="tab-input" type="radio" name="desk-tabs" id="tab-overview" checked aria-label="Trade">
+  <input class="tab-input" type="radio" name="desk-tabs" id="tab-storage" aria-label="Full book">
+  <input class="tab-input" type="radio" name="desk-tabs" id="tab-events" aria-label="Events">
+  <input class="tab-input" type="radio" name="desk-tabs" id="tab-raft" aria-label="Symbol">
+
+  <nav class="tab-list" aria-label="Order desk sections">
+    <label class="tab" for="tab-overview"><span class="tab-icon">◈</span> Trade</label>
+    <label class="tab" for="tab-storage"><span class="tab-icon">▤</span> Full book</label>
+    <label class="tab" for="tab-events"><span class="tab-icon">≡</span> Events</label>
+    <label class="tab" for="tab-raft"><span class="tab-icon">⚙</span> Symbol</label>
+  </nav>
+
+  <div class="tab-panels">
+    <section class="tab-panel" id="panel-overview" aria-label="Trade">
+      <div class="desk-grid">
+        <section class="panel" aria-label="Instrument and order book">
+          <div class="panel-head">
+            <div>
+              <h2>Instrument</h2>
+              <p id="instrument-subtitle">—</p>
+            </div>
+            <span class="badge leader" id="instrument-role">—</span>
+          </div>
+
+          <div class="instrument-grid">
+            <div><span>Best bid</span><strong class="good" id="best-bid">—</strong><span class="sub" id="best-bid-foot">—</span></div>
+            <div><span>Best ask</span><strong class="bad" id="best-ask">—</strong><span class="sub" id="best-ask-foot">—</span></div>
+            <div><span>Spread</span><strong id="spread">—</strong><span class="sub">ask − bid</span></div>
+            <div><span>Last trade</span><strong id="last-trade">—</strong><span class="sub" id="last-trade-foot">—</span></div>
+            <div><span>Book sequence</span><strong id="book-sequence">—</strong><span class="sub">replicated market seq</span></div>
+            <div><span>Tick / lot</span><strong id="tick-lot">—</strong><span class="sub">price / base</span></div>
+          </div>
+
+          <div class="subhead">Depth · top 20</div>
+          <div class="table-wrap">
+            <table class="ladder compact">
+              <thead><tr><th>Side</th><th class="num">Price</th><th class="num">Volume</th><th class="num">Orders</th></tr></thead>
+              <tbody id="depth-body"></tbody>
+            </table>
+          </div>
+
+          <div class="subhead">Open orders <span class="badge neutral" id="orders-count">0</span></div>
+          <div class="table-wrap">
+            <table class="orders-table compact">
+              <thead><tr><th>Seq</th><th>Side</th><th>Price</th><th>Remaining</th><th>Type</th><th></th></tr></thead>
+              <tbody id="orders-body"></tbody>
+            </table>
+          </div>
+
+          <div class="subhead">Parked stops <span class="badge warn" id="stops-count">0</span></div>
+          <div class="table-wrap">
+            <table class="orders-table compact">
+              <thead><tr><th>Seq</th><th>Side</th><th>Stop</th><th>Volume</th><th>Child</th><th></th></tr></thead>
+              <tbody id="stops-body"></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="panel" aria-label="Order ticket">
+          <div class="panel-head">
+            <div>
+              <h2>Order ticket</h2>
+              <p id="ticket-subtitle">Limit · GTC</p>
+            </div>
+            <span class="badge neutral" id="ticket-type-badge">Limit</span>
+          </div>
+
+          <div class="segmented" role="group" aria-label="Side">
+            <button class="buy active" id="side-buy" type="button">Buy</button>
+            <button class="sell" id="side-sell" type="button">Sell</button>
+          </div>
+
+          <form class="ticket-form" id="ticket-form">
+            <div class="ticket-row">
+              <label class="field"><span>Type</span>
+                <select id="ticket-type"><option>Limit</option><option>Market</option></select>
+              </label>
+              <label class="field"><span>Time in force</span>
+                <select id="ticket-tif"><option>GTC</option><option>IOC</option><option>FOK</option><option>GTD</option><option>Day</option></select>
+              </label>
+            </div>
+
+            <label class="field" id="expiry-field" hidden><span>GTD expiry</span><input id="ticket-expiry" type="datetime-local"></label>
+
+            <label class="field"><span>Price</span>
+              <div class="input-unit"><input id="ticket-price" type="text" inputmode="decimal" placeholder="0.00"><span class="unit" id="price-unit">—</span></div>
+            </label>
+
+            <label class="field"><span>Volume</span>
+              <div class="input-unit">
+                <input id="ticket-volume" type="text" inputmode="decimal" placeholder="0.00000000">
+                <select class="unit-select" id="ticket-unit"><option value="base">Base</option><option value="quote">Quote</option></select>
+              </div>
+            </label>
+
+            <div class="checks">
+              <label class="check"><input id="ticket-post-only" type="checkbox"> Post-only</label>
+              <label class="check"><input id="ticket-iceberg" type="checkbox"> Iceberg</label>
+            </div>
+
+            <details class="advanced">
+              <summary>Advanced · fees, stop, display, client order id</summary>
+              <div class="ticket-row">
+                <label class="field"><span>Maker fee rate</span><input id="ticket-maker" type="text" value="0" placeholder="0.001 = 10 bps"></label>
+                <label class="field"><span>Taker fee rate</span><input id="ticket-taker" type="text" value="0" placeholder="0.002 = 20 bps"></label>
+              </div>
+              <div class="ticket-hint">Fee rates are fractions of notional, not bps: 0.001 = 10 bps = 0.1%.</div>
+              <div class="ticket-row">
+                <label class="field"><span>Stop price</span><div class="input-unit"><input id="ticket-stop" type="text" placeholder="0.00"><span class="unit">—</span></div></label>
+                <label class="field"><span>Display volume</span><div class="input-unit"><input id="ticket-display" type="text" placeholder="iceberg tranche"><span class="unit">base</span></div></label>
+              </div>
+              <label class="field"><span>Client order id</span><input id="ticket-client-id" type="text"></label>
+            </details>
+
+            <button class="btn primary" id="ticket-submit" type="submit">Place buy order</button>
+            <div class="ticket-hint" id="ticket-hint">The engine validates precision, tick and lot.</div>
+          </form>
+
+          <div class="result-banner" id="ticket-result" hidden>
+            <strong id="result-title">—</strong>
+            <span id="result-text"></span>
+          </div>
+
+          <div class="subhead">Order result events</div>
+          <div class="table-wrap">
+            <table class="tape compact">
+              <thead><tr><th>Event</th><th>Kind</th><th>Side</th><th class="num">Price</th><th class="num">Volume</th><th class="num">Order</th></tr></thead>
+              <tbody id="result-events-body"></tbody>
+            </table>
+          </div>
+        </section>
+      </div>
+
+      <section class="panel recent-events" aria-label="Recent events">
+        <div class="panel-head">
+          <div>
+            <h2>Recent events</h2>
+            <p>Last events from <span class="mono">/events</span>; the full cursor tape is on the Events tab.</p>
+          </div>
+          <span class="badge good" id="recent-badge">Following</span>
+        </div>
+        <div class="table-wrap">
+          <table class="tape compact">
+            <thead><tr><th>Event id</th><th>Kind</th><th>Side</th><th class="num">Price</th><th class="num">Volume</th><th class="num">Order</th></tr></thead>
+            <tbody id="recent-events-body"></tbody>
+          </table>
+        </div>
+        <div class="pager">
+          <span id="recent-status">—</span>
+          <label class="btn" for="tab-events">Open Events tab</label>
+        </div>
+      </section>
+    </section>
+
+    <section class="tab-panel" id="panel-storage" aria-label="Full book">
+      <section class="panel full-book" aria-label="Full order book debug view">
+        <div class="panel-head">
+          <div>
+            <h2>Full book <span class="badge warn debug-note">debug</span></h2>
+            <p>Every resting order and every price level. Loaded on demand; never part of the 1 s state poll.</p>
+          </div>
+          <span class="badge neutral" id="book-meta">not loaded</span>
+        </div>
+
+        <div class="full-book-toolbar">
+          <span class="badge neutral" id="book-snapshot">—</span>
+          <span class="muted mono" id="book-loaded">manual refresh</span>
+          <span class="grow"></span>
+          <span class="diag-actions">
+            <button class="btn ghost" id="book-copy" type="button">Copy JSON</button>
+            <button class="btn" id="book-refresh" type="button">Refresh full book</button>
+          </span>
+        </div>
+
+        <div class="full-book-grid">
+          <div class="book-side">
+            <div class="subhead">Bids · order level <span class="badge neutral" id="book-bids-count">0</span></div>
+            <div class="table-wrap">
+              <table class="full-table compact">
+                <thead><tr><th>Seq</th><th class="num">Price</th><th class="num">Volume</th><th class="num">Hidden</th><th class="num">Display</th><th>Type</th><th>TIF</th><th>Flags</th></tr></thead>
+                <tbody id="book-bids-body"></tbody>
+              </table>
+            </div>
+            <div class="pager"><span id="book-page">—</span><span class="diag-actions"><button class="btn ghost" id="book-prev" type="button">Previous</button><button class="btn" id="book-next" type="button">Next</button></span></div>
+          </div>
+
+          <div class="book-side">
+            <div class="subhead">Asks · order level <span class="badge neutral" id="book-asks-count">0</span></div>
+            <div class="table-wrap">
+              <table class="full-table compact">
+                <thead><tr><th>Seq</th><th class="num">Price</th><th class="num">Volume</th><th class="num">Hidden</th><th class="num">Display</th><th>Type</th><th>TIF</th><th>Flags</th></tr></thead>
+                <tbody id="book-asks-body"></tbody>
+              </table>
+            </div>
+            <div class="pager"><span id="book-page-asks">—</span><span class="diag-actions"><button class="btn ghost" id="book-prev-asks" type="button">Previous</button><button class="btn" id="book-next-asks" type="button">Next</button></span></div>
+          </div>
+        </div>
+
+        <div class="subhead">Aggregated levels · all <span class="badge neutral" id="book-levels-count">0</span></div>
+        <div class="table-wrap">
+          <table class="full-levels compact">
+            <thead><tr><th>Side</th><th class="num">Price</th><th class="num">Visible volume</th><th class="num">Orders</th></tr></thead>
+            <tbody id="book-levels-body"></tbody>
+          </table>
+        </div>
+
+        <div class="subhead">Parked stops · all <span class="badge warn" id="book-stops-count">0</span></div>
+        <div class="table-wrap">
+          <table class="full-table compact">
+            <thead><tr><th>Seq</th><th>Side</th><th class="num">Stop price</th><th class="num">Volume</th><th>Type</th><th>TIF</th><th class="num">Hidden</th><th class="num">Display</th></tr></thead>
+            <tbody id="book-stops-body"></tbody>
+          </table>
+        </div>
+        <div class="pager">
+          <span class="debug-note">Debug view: full data, client-side paging. Large books can make this response and render slow.</span>
+        </div>
+      </section>
+    </section>
+
+    <section class="tab-panel" id="panel-events" aria-label="Events">
+      <div class="events-layout">
+        <section class="panel" aria-label="Full event tape">
+          <div class="panel-head">
+            <div>
+              <h2>Match events</h2>
+              <p>Replicated <span class="mono">POST /events</span> cursor feed · retained window</p>
+            </div>
+            <span class="badge good" id="events-badge">Following</span>
+          </div>
+
+          <div class="filter-bar">
+            <label class="filter">Kind
+              <select id="event-kind"><option value="">All kinds</option><option>fill</option><option>rested</option><option>cancelled</option><option>triggered</option><option>expired</option><option>rejected</option><option>amended</option></select>
+            </label>
+            <label class="filter">Side
+              <select id="event-side"><option value="">All sides</option><option>Buy</option><option>Sell</option></select>
+            </label>
+            <label class="filter">Order
+              <select id="event-order"><option value="">All orders</option></select>
+            </label>
+            <label class="filter">Page
+              <select id="event-limit"><option>100</option><option selected>500</option><option>1000</option></select>
+            </label>
+            <button class="btn ghost" id="events-pause" type="button">Pause</button>
+          </div>
+
+          <div class="table-wrap">
+            <table class="events-table compact">
+              <thead><tr><th>Event id</th><th>Kind</th><th>Side</th><th class="num">Order</th><th class="num">Counter</th><th class="num">Price</th><th class="num">Volume</th><th class="num">Quote</th><th>Fees</th><th>Reason</th></tr></thead>
+              <tbody id="events-body"></tbody>
+            </table>
+          </div>
+
+          <div class="pager">
+            <span id="events-status">—</span>
+            <span class="diag-actions">
+              <button class="btn ghost" id="events-reset" type="button">Reset cursor</button>
+            </span>
+          </div>
+          <div class="fee-note">Click a row to inspect the event. The cursor is persisted per node + symbol in sessionStorage.</div>
+        </section>
+
+        <section class="panel event-detail" aria-label="Selected event detail">
+          <div class="panel-head">
+            <div>
+              <h2 id="event-detail-title">Select an event</h2>
+              <p id="event-detail-sub">Click a row in the tape.</p>
+            </div>
+            <span class="badge neutral" id="event-detail-badge">—</span>
+          </div>
+          <div class="kv-grid" id="event-detail-body"></div>
+          <pre class="event-json" id="event-json">{}</pre>
+        </section>
+      </div>
+    </section>
+
+    <section class="tab-panel" id="panel-raft" aria-label="Symbol">
+      <div class="grid-2 symbol-grid">
+        <section class="panel" aria-label="Symbol configuration">
+          <div class="panel-head">
+            <div>
+              <h2>Symbol configuration</h2>
+              <p>One process/cluster trades exactly one symbol.</p>
+            </div>
+            <span class="badge neutral" id="symbol-lock">—</span>
+          </div>
+          <div class="symbol-banner" id="symbol-banner">
+            <strong id="symbol-banner-title">—</strong>
+            <span id="symbol-banner-text">—</span>
+          </div>
+          <div class="kv-grid">
+            <div class="kv"><span>Symbol id</span><span id="config-symbol-id">—</span></div>
+            <div class="kv"><span>Base asset</span><span id="config-base">—</span></div>
+            <div class="kv"><span>Quote asset</span><span id="config-quote">—</span></div>
+            <div class="kv"><span>Price decimals</span><span id="config-price-decimals">—</span></div>
+            <div class="kv"><span>Price tick</span><span id="config-tick">—</span></div>
+            <div class="kv"><span>Base lot</span><span id="config-lot">—</span></div>
+            <div class="kv"><span>Fee asset policy</span><span id="config-fee-policy">—</span></div>
+            <div class="kv"><span>Book sequence</span><span id="config-book-seq">—</span></div>
+          </div>
+
+          <form class="symbol-form" id="symbol-form">
+            <div class="ticket-row">
+              <label class="field"><span>Base code</span><input id="symbol-base-code" type="text"></label>
+              <label class="field"><span>Base class</span><select id="symbol-base-class"><option value="crypto">crypto</option><option value="stablecoin">stablecoin</option><option value="fiat">fiat</option><option value="equity">equity</option><option value="etf">etf</option></select></label>
+              <label class="field"><span>Base decimals</span><input id="symbol-base-decimals" type="text"></label>
+            </div>
+            <div class="ticket-row">
+              <label class="field"><span>Quote code</span><input id="symbol-quote-code" type="text"></label>
+              <label class="field"><span>Quote class</span><select id="symbol-quote-class"><option value="stablecoin">stablecoin</option><option value="crypto">crypto</option><option value="fiat">fiat</option><option value="equity">equity</option><option value="etf">etf</option></select></label>
+              <label class="field"><span>Quote decimals</span><input id="symbol-quote-decimals" type="text"></label>
+            </div>
+            <div class="ticket-row">
+              <label class="field"><span>Price decimals</span><input id="symbol-price-decimals" type="text"></label>
+              <label class="field"><span>Price tick</span><input id="symbol-tick" type="text"></label>
+              <label class="field"><span>Base lot</span><input id="symbol-lot" type="text"></label>
+            </div>
+            <label class="field"><span>Fee asset policy</span><select id="symbol-policy"><option value="received">received</option><option value="quote">quote</option><option value="base">base</option></select></label>
+            <button class="btn" id="symbol-submit" type="submit">Configure symbol</button>
+          </form>
+          <div class="reset-note">Reset a demo by restarting the engine with a fresh <span class="mono">--data-dir</span>; there is no destructive reset endpoint.</div>
+        </section>
+
+        <section class="panel" aria-label="Node and event window">
+          <div class="panel-head">
+            <div>
+              <h2>Node &amp; event window</h2>
+              <p>The state behind the desk.</p>
+            </div>
+            <span class="badge good" id="node-ready-badge">—</span>
+          </div>
+          <div class="kv-grid">
+            <div class="kv"><span>Engine</span><span id="node-engine">—</span></div>
+            <div class="kv"><span>Leader / term</span><span id="node-leader-term">—</span></div>
+            <div class="kv"><span>Raft state</span><span id="node-raft-state">—</span></div>
+            <div class="kv"><span>Book sequence</span><span id="node-book-seq">—</span></div>
+            <div class="kv"><span>Oldest event</span><span id="node-oldest-event">—</span></div>
+            <div class="kv"><span>Last event</span><span id="node-last-event">—</span></div>
+            <div class="kv"><span>Retained events</span><span id="node-retained">—</span></div>
+            <div class="kv"><span>Market-data feed</span><span id="node-market-data">—</span></div>
+          </div>
+          <div class="panel-body">
+            <span class="badge neutral">POST /events cursor</span>
+            <span class="badge neutral">state poll 1 s</span>
+            <span class="badge neutral">event poll 700 ms</span>
+          </div>
+        </section>
+      </div>
+    </section>
+  </div>
+
+  <footer class="desk-footer">
+    <span id="footer-book">book — · last trade — · spread —</span>
+    <span class="mono" id="footer-events">events —</span>
+    <span>demo · separate process · state poll 1 s · event poll 700 ms</span>
+  </footer>
+</main>
+</body>
+</html>
