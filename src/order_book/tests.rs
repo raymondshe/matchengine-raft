@@ -721,7 +721,7 @@ fn fill_fees_use_taker_and_maker_rates() {
         "the maker sells, so its fee is in quote"
     );
     assert_eq!(FeeAsset::Quote, fill.maker_fee_asset);
-    assert!(!fill.fee_overflow);
+    assert!(fill.error.is_empty());
 
     let remaining = ob.best_ask().expect("the maker still has volume");
     assert_eq!(rate("0.001"), remaining.maker_fee_rate);
@@ -914,15 +914,61 @@ fn fee_asset_policies_charge_the_expected_asset() {
 }
 
 #[test]
-fn fee_overflow_is_reported_explicitly() {
+fn notional_overflow_is_reported_explicitly() {
     let huge = Fixed::from_units(10_000_000_000_000_000_000);
     let maker = Order::new(OrderSide::Sell, huge, 1, 1);
     let taker = Order::new(OrderSide::Buy, huge, 1, 2);
     let fill = MatchResult::new(&taker, &maker, huge);
-    assert!(fill.fee_overflow);
+    assert!(fill.error.contains(MatchErrorCode::NotionalOverflow));
+    assert!(fill.error.contains(MatchErrorCode::MakerFeeOverflow));
+    assert!(!fill.error.contains(MatchErrorCode::TakerFeeOverflow));
     assert_eq!(Fixed::ZERO, fill.notional);
     assert_eq!(Fixed::ZERO, fill.taker_fee);
     assert_eq!(Fixed::ZERO, fill.maker_fee);
+}
+
+#[test]
+fn notional_overflow_keeps_base_fees_that_fit() {
+    let rate = |value: &str| value.parse::<Fixed>().unwrap();
+    let price = Fixed::from_units(100_000_000_000);
+    let volume = Fixed::from_units(10_000_000_000);
+    let maker =
+        Order::new(OrderSide::Sell, price, volume, 1).with_fee_rates(rate("0.001"), Fixed::ZERO);
+    let taker =
+        Order::new(OrderSide::Buy, price, volume, 2).with_fee_rates(Fixed::ZERO, rate("0.002"));
+    let fill = MatchResult::new_with_policy(&taker, &maker, volume, FeeAssetPolicy::Base);
+
+    // The quote notional overflows, but base fees depend only on volume.
+    assert_eq!(MatchErrors::NOTIONAL_OVERFLOW, fill.error);
+    assert_eq!(Fixed::ZERO, fill.notional);
+    assert_eq!(Fixed::from_units(10_000_000), fill.maker_fee);
+    assert_eq!(Fixed::from_units(20_000_000), fill.taker_fee);
+    assert_eq!(FeeAsset::Base, fill.maker_fee_asset);
+    assert_eq!(FeeAsset::Base, fill.taker_fee_asset);
+}
+
+#[test]
+fn match_errors_serialize_as_named_codes() {
+    let mut errors = MatchErrors::NONE;
+    errors.insert(MatchErrorCode::NotionalOverflow);
+    errors.insert(MatchErrorCode::MakerFeeOverflow);
+    assert_eq!(
+        r#"["notional_overflow","maker_fee_overflow"]"#,
+        serde_json::to_string(&errors).unwrap()
+    );
+    assert_eq!(
+        MatchErrors::NOTIONAL_OVERFLOW,
+        serde_json::from_str::<MatchErrors>("\"notional_overflow\"").unwrap()
+    );
+    assert_eq!(
+        MatchErrors::TAKER_FEE_OVERFLOW,
+        serde_json::from_str::<MatchErrors>(r#"["taker_fee_overflow"]"#).unwrap()
+    );
+    assert_eq!(
+        MatchErrors::NONE,
+        serde_json::from_str::<MatchErrors>("[]").unwrap()
+    );
+    assert!(MatchErrors::from_bits(0b1000).is_none());
 }
 
 #[test]

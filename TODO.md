@@ -5,7 +5,7 @@ current branch state.
 
 **Current baseline:** the OpenRaft 0.10 port, durable WAL/snapshot storage and exact scale-18
 `Fixed` migration are done. Order prices/quantities, last trade, match events, depth/BBO, `/read`,
-the market-data feed and wire v5 are exact; snapshot v9 stores fixed-point orders/events, the
+the market-data feed and wire v6 are exact; snapshot v10 stores fixed-point orders/events, the
 single-symbol precision configuration, asset metadata, volume units and maker/taker fee assets.
 One process/cluster trades exactly one symbol; multi-symbol is isolated by running one process per
 symbol. Base/quote volume and asset-aware fee deduction are done, and the market-data processor
@@ -28,7 +28,7 @@ corporate actions and fixed/regulatory/minimum/tax fees are owned by the externa
 Failure behavior is complete (§15): the node fail-stops on WAL `ENOSPC`/`EIO`, recovers from
 `SIGKILL` during writes, keeps snapshot writes atomic, and a learner killed mid-snapshot-install
 restarts without a partial snapshot and retries cleanly. Pre-Vote is enabled with a dedicated gRPC
-RPC (§4), so an isolated node asks before campaigning. The wire v5 reference decoder and golden
+RPC (§4), so an isolated node asks before campaigning. The wire v6 reference decoder and golden
 tests are complete (§6).
 
 The next work, in order:
@@ -55,21 +55,21 @@ Completed:
 - [x] `DepthLevel`, `DepthChange`, `spread`, `mid_price`, `/read` depth/BBO/spread/last-trade and
   the shadow book are exact. The shadow book is keyed by `Fixed`.
 - [x] Market-data `TradeRecord`, `BboRecord`, depth records, lifecycle and `BarRecord` are `Fixed`.
-  Wire **v5** encodes prices, quantities, quote volume and fees as little-endian scale-18 `i128`.
-- [x] Snapshot **v9** stores the last trade, match events, asset metadata, tick/lot rules, fee
+  Wire **v6** encodes prices, quantities, quote volume and fees as little-endian scale-18 `i128`.
+- [x] Snapshot **v10** stores the last trade, match events, asset metadata, tick/lot rules, fee
   assets and fill fees as `Fixed`, plus the single-symbol precision configuration; older snapshots
   are rejected.
 - [x] `Fixed::notional` multiplies through an `i256` intermediate and truncates toward zero at 18
   places; unit tests cover an intermediate that overflows `i128`.
 - [x] Fill fees use the taker order's taker rate and the maker order's maker rate; `MatchResult`
-  carries notional/fees/`fee_overflow`, events and the JSONL feed carry both fees, and snapshot v9
-  preserves the order rates and event fees.
+  carries notional/fees and an ordered `error` set, events and the JSONL feed carry both fees, and
+  snapshot v10 preserves the order rates and event fees.
 - [x] `tests/cluster/test_exactness.rs` round-trips 18 fractional digits through `/write`,
-  `/read`, `/events`, the JSONL feed, snapshot v9 and a restart.
-- [x] README/README_CN, AGENTS, DECIMAL, MATCH_RESULTS, MARKET_DATA_PLAN and AERON record wire v5,
-  snapshot v9 and the new decimal/fee JSON output.
+  `/read`, `/events`, the JSONL feed, snapshot v10 and a restart.
+- [x] README/README_CN, AGENTS, DECIMAL, MATCH_RESULTS, MARKET_DATA_PLAN and AERON record wire v6,
+  snapshot v10 and the new decimal/fee JSON output.
 
-Note: wire v5 and snapshot v9 are breaking changes; existing data directories must be recreated
+Note: wire v6 and snapshot v10 are breaking changes; existing data directories must be recreated
 and older feed consumers must implement the scale-18 integer layout, volume units and fee assets.
 
 ## 2. One process, one symbol [done]
@@ -80,7 +80,7 @@ routes two books or switches symbols after trading starts.
 
 Done:
 
-- [x] Replicated `StateMachineData.symbol_config` + `symbol_locked` in snapshot v9.
+- [x] Replicated `StateMachineData.symbol_config` + `symbol_locked` in snapshot v10.
   `MatchEngineRequest::ConfigureSymbol` sets the one symbol and its precision through Raft before
   trading.
 - [x] The configuration is locked after the first accepted order; changing symbol or precision
@@ -238,7 +238,7 @@ Done:
 
 - [x] Deterministic feed core: depth journal, `MatchEvent.side`, leader-stamped intake
   timestamps, shadow book, one TRADE per taker, BBO, depth snapshots/deltas, lifecycle, OHLC bars,
-  status cadence, gap marker, leader gating with reset snapshots, JSONL sink and wire encoder v5.
+  status cadence, gap marker, leader gating with reset snapshots, JSONL sink and wire encoder v6.
 - [x] Deterministic `market_seq`/`sub_seq`: identical keys across replicas, failover and restart.
 - [x] `marketdata_status` read key.
 - [x] The processor runs as a tokio task over a bounded tokio `mpsc` queue, with `watch`-driven
@@ -250,7 +250,7 @@ Done:
 - [x] **P2** `epoch` (leader generation) and `leader_id` carry the current Raft term and known
   leader: the leader watcher updates both on every metrics change; headers and reset snapshots carry
   them, covered by the market-data unit test and `test_market_data.rs`.
-- [x] **P2** Wire v5 reference decoder (`wire::decode`) with a strict `WireError`: validates the
+- [x] **P2** Wire v6 reference decoder (`wire::decode`) with a strict `WireError`: validates the
   header, body length, enum codes and length prefixes; golden round-trip tests cover every body
   type, a checked-in golden frame and malformed-frame rejection.
 
@@ -269,7 +269,7 @@ Current coverage:
   including mixed order types and fee-rate styles; `conformance_tests.rs` covers the explicit
   edge cases. `apply` event tests cover market, IOC, FOK, post-only, iceberg, stop-child
   cancellation and automatic GTD expiry. `src/market_data/wire.rs` tests the encoder and
-  reference decoder, pins a v5 golden frame and rejects malformed frames.
+  reference decoder, pins a v6 golden frame and rejects malformed frames.
 - `tests/cluster/test_cluster.rs`: 3 nodes over gRPC, init/membership/read/write.
 - `test_snapshot.rs`: snapshot build/purge and learner install over gRPC.
 - `test_storage.rs`: WAL framing, torn-tail truncation, segment rotation, 20k-record multi-segment
@@ -284,7 +284,7 @@ Current coverage:
   catches up from a live leader.
 - `test_late_join.rs`: a stale snapshot/WAL is superseded after a late rejoin.
 - `test_exactness.rs`: 18-fractional-digit values survive `/write`, `/read`, `/events`, the JSONL
-  feed, snapshot v9 and a restart.
+  feed, snapshot v10 and a restart.
 - `test_symbols.rs`: one-symbol config, over-precision rejection, cross-symbol rejection, the
   post-trade config lock and snapshot restart.
 - `test_fees.rs`: maker/taker fee rates, `/write`/`/events`/file-sink/feed fees and snapshot restart.
@@ -390,7 +390,7 @@ Done:
   JSONL dumpers; `examples/replay_orders.rs` is the order-replay/compare harness.
 - [x] The unused `match_engine.png` was removed and `logs/` is gitignored.
 - [x] README/README_CN, AGENTS, TODO, AERON, MATCH_RESULTS, MARKET_DATA_PLAN and FEE_DEDUCTION are
-  synced with the WAL + snapshot + gRPC design and snapshot v9 / wire v5.
+  synced with the WAL + snapshot + gRPC design and snapshot v10 / wire v6.
 - [x] `docs/DECIMAL.md` records the fixed-point research, BTC 18-decimal range analysis,
   microbenchmarks and the completed end-to-end migration.
 - [x] **P3** Renamed `src/matchengine/` to `src/order_book/` (2026-10-29); the public module is now
@@ -410,7 +410,7 @@ These choices feed the priorities above; write them down as ADRs or doc notes wh
 
 - [x] `SymbolConfig` lives in replicated state as the single process/cluster symbol and locks
   after the first accepted order; precision changes are versioned by the Raft log/snapshot.
-- [x] Wire v5 representation: scale-18 `i128` prices, quantities, quote volume and fees plus
+- [x] Wire v6 representation: scale-18 `i128` prices, quantities, quote volume and fees plus
   volume units and fee assets; older consumers must upgrade and frames are never silently
   reinterpreted.
 - [x] Keep one canonical 18-decimal `Fixed(i128)` scale. `SymbolConfig` decimals are business
@@ -450,11 +450,11 @@ Done:
   zero at 18 places. Positive = charge, negative = rebate.
 - [x] A taker that later rests uses its maker rate on future fills. Amendments, iceberg refills and
   stop children preserve the original order's rates.
-- [x] `MatchResult` carries `notional`, `taker_fee`, `maker_fee` and `fee_overflow`.
-  `MatchEvent`/`StoredMatchEvent` carry both fees and the flag.
+- [x] `MatchResult` carries `notional`, `taker_fee`, `maker_fee` and `MatchErrors`.
+  `MatchEvent`/`StoredMatchEvent` carry both fees and the error set.
 - [x] `/write` events, `/events`, the JSONL file sink and market-data `TRADE`/fill `LIFECYCLE`
-  records expose the fees and their assets. Wire is **v5**.
-- [x] Snapshot **v9** persists order rates, fee assets and event fees.
+  records expose the fees and their assets. Wire is **v6**.
+- [x] Snapshot **v10** persists order rates, fee assets and event fees.
 - [x] Tests cover simultaneous maker/taker rates, negative maker rebates, rate validation, fee
   overflow, 18-digit exactness, a taker that later rests, file/event/feed output and snapshot
   restart.
@@ -484,7 +484,7 @@ Done:
 - [x] Gross base/quote volume, taker/maker fee assets and fees flow through `MatchResult`,
   `MatchEvent`, `/events`, the file sink and the market-data feed.
 - [x] Tick/lot increments and per-asset precision are enforced on `Place` and `Amend`.
-- [x] Snapshot **v9** and market-data wire **v5** are implemented; old data directories must be
+- [x] Snapshot **v10** and market-data wire **v6** are implemented; old data directories must be
   recreated.
 - [x] Tests cover QQQ/USD (ETF/fiat) and BTC/USDT (crypto/stablecoin) tick/lot, quote volume and
   fee-asset deduction in `tests/cluster/test_fee_assets.rs`, plus quote fees, fee overflow, fee

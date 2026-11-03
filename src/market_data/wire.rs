@@ -7,7 +7,7 @@
 //!
 //! Layout is packed (no implicit padding): fields are written in the order
 //! listed, and variable arrays start with a `u32` count, so a single taker's
-//! uncapped fill list cannot be truncated. Version 5 encodes every price,
+//! uncapped fill list cannot be truncated. Version 6 encodes every price,
 //! quantity, quote volume and fee as a scale-18 `i128` (16 bytes, little-endian),
 //! so no financial value crosses the wire as `f64`, and carries the volume unit
 //! and fee asset per record. A version bump is required for any change other
@@ -40,6 +40,7 @@ use crate::match_result::MatchEventKind;
 use crate::order_book::DepthLevel;
 use crate::order_book::FeeAsset;
 use crate::order_book::Fixed;
+use crate::order_book::MatchErrors;
 use crate::order_book::OrderSide;
 use crate::order_book::RejectReason;
 use crate::order_book::VolumeUnit;
@@ -47,7 +48,7 @@ use crate::order_book::VolumeUnit;
 /// Magic bytes at the start of every message.
 pub const MAGIC: [u8; 4] = *b"AMKT";
 /// Current schema version.
-pub const VERSION: u8 = 5;
+pub const VERSION: u8 = 6;
 /// Header length in bytes.
 pub const HEADER_LEN: usize = 64;
 
@@ -205,7 +206,7 @@ fn encode_trade(record: &TradeRecord, out: &mut Vec<u8>) {
     out.push(fee_asset_code(record.taker_fee_asset));
     put_fixed(record.maker_fee, out);
     out.push(fee_asset_code(record.maker_fee_asset));
-    out.push(u8::from(record.fee_overflow));
+    out.push(record.error.bits());
     out.push(side_code(record.taker_side));
     out.extend_from_slice(&record.taker_sequence.to_le_bytes());
     out.extend_from_slice(&record.maker_sequence.to_le_bytes());
@@ -251,7 +252,7 @@ fn encode_lifecycle(record: &LifecycleRecord, out: &mut Vec<u8>) {
     out.push(fee_asset_code(record.taker_fee_asset));
     put_fixed(record.maker_fee, out);
     out.push(fee_asset_code(record.maker_fee_asset));
-    out.push(u8::from(record.fee_overflow));
+    out.push(record.error.bits());
     out.push(reason_code(record.reason));
 }
 
@@ -468,14 +469,6 @@ impl<'a> Decoder<'a> {
         Ok(Fixed::from_raw(self.i128(field)?))
     }
 
-    fn boolean(&mut self, field: &'static str) -> Result<bool, WireError> {
-        match self.u8(field)? {
-            0 => Ok(false),
-            1 => Ok(true),
-            code => Err(WireError::InvalidCode { field, code }),
-        }
-    }
-
     fn count(&mut self, field: &'static str, record_len: usize) -> Result<usize, WireError> {
         let count = self.u32(field)? as usize;
         let remaining = self.remaining();
@@ -501,9 +494,9 @@ impl<'a> Decoder<'a> {
 /// `MarketMessage::stream` is not carried on the wire; it is derived from the
 /// body type (`GAP` uses the `STATUS` stream).
 ///
-/// Version 5 encodes `counterparty_sequence = 0` for "no counterparty", so a
-/// real maker sequence `0` decodes as `None`. Sequence `0` is valid for the
-/// first order in an empty book; this is a known v5 limitation.
+/// The wire format encodes `counterparty_sequence = 0` for "no counterparty",
+/// so a real maker sequence `0` decodes as `None`. Sequence `0` is valid for
+/// the first order in an empty book; this is a known limitation.
 pub fn decode(bytes: &[u8]) -> Result<MarketMessage, WireError> {
     if bytes.len() < HEADER_LEN {
         return Err(WireError::TooShort {
@@ -651,7 +644,13 @@ fn decode_trade(decoder: &mut Decoder<'_>) -> Result<TradeRecord, WireError> {
             decoder.u8("trade.maker_fee_asset")?,
             "trade.maker_fee_asset",
         )?,
-        fee_overflow: decoder.boolean("trade.fee_overflow")?,
+        error: {
+            let bits = decoder.u8("trade.error")?;
+            MatchErrors::from_bits(bits).ok_or(WireError::InvalidCode {
+                field: "trade.error",
+                code: bits,
+            })?
+        },
         taker_side: decode_side(decoder.u8("trade.taker_side")?, "trade.taker_side")?,
         taker_sequence: decoder.u64("trade.taker_sequence")?,
         maker_sequence: decoder.u64("trade.maker_sequence")?,
@@ -742,7 +741,13 @@ fn decode_lifecycle(decoder: &mut Decoder<'_>) -> Result<LifecycleRecord, WireEr
             decoder.u8("lifecycle.maker_fee_asset")?,
             "lifecycle.maker_fee_asset",
         )?,
-        fee_overflow: decoder.boolean("lifecycle.fee_overflow")?,
+        error: {
+            let bits = decoder.u8("lifecycle.error")?;
+            MatchErrors::from_bits(bits).ok_or(WireError::InvalidCode {
+                field: "lifecycle.error",
+                code: bits,
+            })?
+        },
         reason: decode_reason(decoder.u8("lifecycle.reason")?)?,
     })
 }
@@ -947,7 +952,7 @@ mod tests {
                 taker_fee_asset: Some(FeeAsset::Base),
                 maker_fee: fixed("0.2"),
                 maker_fee_asset: Some(FeeAsset::Quote),
-                fee_overflow: false,
+                error: MatchErrors::NONE,
                 taker_side: OrderSide::Buy,
                 taker_sequence: 4,
                 maker_sequence: 2,
@@ -963,7 +968,7 @@ mod tests {
                 taker_fee_asset: Some(FeeAsset::Quote),
                 maker_fee: fixed("0.05"),
                 maker_fee_asset: Some(FeeAsset::Base),
-                fee_overflow: false,
+                error: MatchErrors::NONE,
                 taker_side: OrderSide::Sell,
                 taker_sequence: 5,
                 maker_sequence: 3,
@@ -1113,7 +1118,7 @@ mod tests {
             taker_fee_asset: Some(FeeAsset::Base),
             maker_fee: fixed("0.2"),
             maker_fee_asset: Some(FeeAsset::Quote),
-            fee_overflow: false,
+            error: MatchErrors::NONE,
             reason: None,
         }]);
         let bytes = encode(&message(lifecycle));
@@ -1177,7 +1182,7 @@ mod tests {
                 taker_fee_asset: Some(FeeAsset::Base),
                 maker_fee: Fixed::ZERO,
                 maker_fee_asset: Some(FeeAsset::Quote),
-                fee_overflow: false,
+                error: MatchErrors::NONE,
                 taker_side: OrderSide::Buy,
                 taker_sequence: 1,
                 maker_sequence: i,
@@ -1194,14 +1199,14 @@ mod tests {
     }
 
     #[test]
-    fn wire_version_is_v5() {
-        assert_eq!(5, VERSION);
+    fn wire_version_is_v6() {
+        assert_eq!(6, VERSION);
         let bytes = encode(&message(MessageBody::Gap(GapRecord {
             last_good_log_index: 0,
             last_good_ordinal: 0,
             dropped: 0,
         })));
-        assert_eq!(5, bytes[4]);
+        assert_eq!(6, bytes[4]);
     }
 
     fn sample_trade() -> TradeRecord {
@@ -1216,7 +1221,7 @@ mod tests {
             taker_fee_asset: Some(FeeAsset::Base),
             maker_fee: fixed("0.2"),
             maker_fee_asset: Some(FeeAsset::Quote),
-            fee_overflow: false,
+            error: MatchErrors::NOTIONAL_OVERFLOW | MatchErrors::MAKER_FEE_OVERFLOW,
             taker_side: OrderSide::Buy,
             taker_sequence: 4,
             maker_sequence: 2,
@@ -1240,7 +1245,7 @@ mod tests {
             taker_fee_asset: Some(FeeAsset::Base),
             maker_fee: fixed("0.2"),
             maker_fee_asset: Some(FeeAsset::Quote),
-            fee_overflow: false,
+            error: MatchErrors::TAKER_FEE_OVERFLOW,
             reason: None,
         }
     }
@@ -1327,7 +1332,7 @@ mod tests {
         assert_round_trip(MessageBody::Bar(sample_bar()));
     }
 
-    const GOLDEN_GAP_HEX: &str = "414d4b5405070c0007000000000000002a000000000000000300000010000000090000000000000001000000000000000068e5cf8b010000000000000300000029000000000000000200000001000000";
+    const GOLDEN_GAP_HEX: &str = "414d4b5406070c0007000000000000002a000000000000000300000010000000090000000000000001000000000000000068e5cf8b010000000000000300000029000000000000000200000001000000";
 
     fn hex_bytes(hex: &str) -> Vec<u8> {
         assert_eq!(0, hex.len() % 2, "hex must have complete bytes");

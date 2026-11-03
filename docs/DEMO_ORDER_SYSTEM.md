@@ -469,7 +469,7 @@ validated/typed requests and remain behind the write header; it is useful for de
       "taker_fee_asset": "base",
       "maker_fee": "0.0603",
       "maker_fee_asset": "quote",
-      "fee_overflow": false
+      "error": []
     }
   ],
   "next_after": {"log_index": 40, "ordinal": 0},

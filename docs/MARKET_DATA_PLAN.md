@@ -62,7 +62,7 @@ New module with no new dependencies:
 - **Message model**: `TRADE` (one per taker, all fills), `BBO`, `DEPTH_SNAPSHOT`, `DEPTH_DELTA`
   (post-entry totals), `LIFECYCLE` (one per entry), `STATUS`, `GAP`, `BAR` (closed + partial) — the
   catalogue in §12/§16.
-- **Wire codec** (`wire.rs`): 64-byte header (magic `AMKT`, version 5, type, flags, `market_seq`,
+- **Wire codec** (`wire.rs`): 64-byte header (magic `AMKT`, version 6, type, flags, `market_seq`,
   log position, epoch, leader, ts, symbol, `sub_seq`) plus bodies, little-endian, matching §16.
   Version 5 encodes every price/quantity/quote volume/fee as a scale-18 `i128` and carries the
   fee asset per side. `encode` has a strict reference `decode` that rejects malformed frames;
@@ -172,7 +172,7 @@ PARTIAL_BAR|BAR_CLOSE`; bit 4 reserved), `market_seq`, `log_index`, `ordinal`, b
 |---|---|
 | Book | journal per mutation; journal off costs nothing; amend deltas |
 | Events | side on every kind; amended/fill JSON fields |
-| Wire | each message header + body encoding, flags, lengths; reference decoder round-trips every body; a pinned v5 golden frame; malformed-frame rejection |
+| Wire | each message header + body encoding, flags, lengths; reference decoder round-trips every body; a pinned v6 golden frame; malformed-frame rejection |
 | Processor | shadow/BBO, per-entry depth totals, bar windows (closed/live), lifecycle shedding, gap, snapshot reset, identical keys across replicas |
 | Apply | tap frame carries events/deltas/timestamp; status counters |
 | End-to-end | JSONL node: trade, BBO, depth, bar, status; leader-only gate |
@@ -183,7 +183,7 @@ PARTIAL_BAR|BAR_CLOSE`; bit 4 reserved), `market_seq`, `log_index`, `ordinal`, b
 - U1–U6 added no crates. The later exactness work added `i256` for price × quantity; the Aeron
   adapter is the only other planned dependency.
 - The feed state (journal, shadow book, bars) is transient and absent from snapshots. U1–U6 kept
-  `SNAPSHOT_VERSION` 3; later exactness/symbol/fee work bumped it to 9 for the replicated
+  `SNAPSHOT_VERSION` 3; later exactness/symbol/fee work bumped it to 10 for the replicated
   order/event fields, single-symbol precision configuration and fee data, not for feed state.
 
 ## Progress
@@ -196,7 +196,7 @@ PARTIAL_BAR|BAR_CLOSE`; bit 4 reserved), `market_seq`, `log_index`, `ordinal`, b
 | U4 | **done** | `open_with_sinks`, tap frames, `capture_market_data_snapshot`, `marketdata_status`, status assertion |
 | U5 | **done** | `MarketDataConfig` on `StorageConfig`, all CLI flags (incl. `--market-data-leader-only`), leader watcher, source-gated tap, end-to-end test on 21303 |
 | U6 | **done** | README/README_CN/AGENTS/TODO/AERON updates; bench `rest 1k bids + journal` |
-| U8 | **done** | deterministic `(market_seq, sub_seq)` across replicas; all mutations sequenced; auto GTD purge; one TRADE per taker; wire v5 encoder + reference decoder |
+| U8 | **done** | deterministic `(market_seq, sub_seq)` across replicas; all mutations sequenced; auto GTD purge; one TRADE per taker; wire v6 encoder + reference decoder |
 | U7 | deferred | Aeron adapter and Archive replay; multi-symbol is deployment-level (one process per symbol) |
 
 ## Verification (2026-10-28)
@@ -206,10 +206,10 @@ PARTIAL_BAR|BAR_CLOSE`; bit 4 reserved), `market_seq`, `log_index`, `ordinal`, b
 | `cargo test` | **133 unit + 36 integration** tests pass (current; includes exactness, symbol-config, fee, quote-volume, fee-asset and periodic-snapshot tests) |
 | `cargo check --all-targets` | **0 warnings** |
 | `cargo test --test cluster test_market_data` | passed; checks `market_seq` anchors for place/amend/cancel and the uncapped trade message |
-| U8 determinism | two processors fed identical frames emit identical messages; a takeover snapshot continues the same keys; wire v5 golden tests (scale-18 `i128`) |
+| U8 determinism | two processors fed identical frames emit identical messages; a takeover snapshot continues the same keys; wire v6 golden tests (scale-18 `i128`) |
 | automatic purge | `Place`/`Cancel`/`Amend` purge due GTD at intake time; `Day` only via `PurgeExpired`; guarded by the earliest-expiry index (no scan without GTD) |
 | `matchengine-raft --help` | all feed flags present, including `--market-data-status-every` and `--market-data-leader-only` |
-| Snapshot/log formats | U8 itself kept `SNAPSHOT_VERSION` 3; later work bumped it to 4 (event window + dedupe map), 5 (fixed-point order prices/quantities), 6 (last trade + match events fixed-point), 7 (single-symbol precision configuration), 8 (maker/taker fee rates and fill fees) and 9 (asset metadata, tick/lot, volume units and fee assets). `market_seq` lives in the existing `OrderBook::sequence` |
+| Snapshot/log formats | U8 itself kept `SNAPSHOT_VERSION` 3; later work bumped it to 4 (event window + dedupe map), 5 (fixed-point order prices/quantities), 6 (last trade + match events fixed-point), 7 (single-symbol precision configuration), 8 (maker/taker fee rates and fill fees), 9 (asset metadata, tick/lot, volume units and fee assets) and 10 (`MatchErrors` replacing the boolean fee-overflow flag). `market_seq` lives in the existing `OrderBook::sequence` |
 | Dependencies | `i256 0.2.5` added for exact notional multiplication; no other dependencies |
 
 Bench (best-of-5 per round, after the earliest-expiry guard): rest 1k bids **40.1 µs**, rest 1k +
@@ -231,7 +231,7 @@ Messages are identified by `(symbol_id, stream_id, market_seq, sub_seq)`:
   reserved `sub_seq = u16::MAX`.
 - The takeover snapshot is an exclusive boundary at the next sequence; its reset BBO uses
   `sub_seq = 1` so the first post-snapshot frame's BBO at `sub_seq = 0` is not deduplicated away.
-- Tests compare two processors fed the same frames and a snapshot takeover; the wire is version 5.
+- Tests compare two processors fed the same frames and a snapshot takeover; the wire is version 6.
 
 
 ### Gaps found during verification (fixed)

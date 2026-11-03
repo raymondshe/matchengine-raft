@@ -20,11 +20,12 @@ representation. The engine reports the fill normally, but:
 - `quote_volume` is `0`;
 - `taker_fee` and `maker_fee` are `0`;
 - `taker_fee_asset` and `maker_fee_asset` are still `quote`;
-- `fee_overflow` is `true`.
+- `error` is
+  `["notional_overflow","taker_fee_overflow","maker_fee_overflow"]`.
 
 The quote policy makes both fees depend on the overflowing notional, so both
-are zeroed together. A fill marked `fee_overflow` must not be treated as having
-real zero fees; the flag says the fee fields are unreliable.
+are zeroed together. A fill carrying these error codes must not be treated as
+having real zero notional or fees; the codes name the unavailable fields.
 
 ## Expected events
 

@@ -22,7 +22,7 @@ CI (`.github/workflows/ci.yml`) runs `cargo fmt --all -- --check` (and the `fuzz
   - `tests/cluster/test_snapshot.rs` forces a snapshot, purges the log, and checks that a joining learner installs the snapshot over gRPC; a second case disables the log-count policy and proves the 30-minute timer path writes `snapshot/current.snap`.
   - `tests/cluster/test_storage.rs` covers the WAL and snapshot formats directly, including a 20k-record multi-segment reopen; `tests/cluster/test_restart.rs` boots a node, stops it, and proves recovery via log replay and via snapshot + newer WAL tail (including events and dedupe), plus 2k-order large-log replay and a multi-chunk (~120 KB) snapshot boot. `tests/cluster/test_membership.rs` kills the elected leader and proves a remaining voter keeps the committed book and accepts writes, and adds a learner after writes to prove it catches up from the live log before promotion. `tests/cluster/test_late_join.rs` gives a node a stale snapshot/WAL, removes it, advances the cluster while the leader purges the log, then re-adds it as a learner and verifies it catches up from live members.
   - `tests/cluster/test_match_results.rs` boots a node with the file sink and checks rest/fill/cancel events in log order (port 21301, gRPC 22301); a second test on 21302 exercises a stop trigger, GTD expiry and the new `/read` keys.
-  - `tests/cluster/test_exactness.rs` proves 18-fractional-digit prices/quantities survive `/write`, `/read`, `/events`, the JSONL market-data feed, snapshot v9 and a restart (port 21701, gRPC 22701).
+  - `tests/cluster/test_exactness.rs` proves 18-fractional-digit prices/quantities survive `/write`, `/read`, `/events`, the JSONL market-data feed, snapshot v10 and a restart (port 21701, gRPC 22701).
   - `tests/cluster/test_symbols.rs` runs the leader-side gateway guard (wrong-symbol `Place`/`Cancel`/`Amend` and batches return `400` before Raft with no sequence/book change, while a configure-and-place batch still works), configures the process symbol/precision, rejects over-precision orders, locks the configuration once trading starts, and proves it survives snapshot restart (ports 21801-21802, gRPC 22801-22802).
   - `tests/cluster/test_feature_matrix.rs` sends one order of every advertised type through `/write` and asserts the event kinds, follows rest → amend → partial fill → cancel plus expiry/stop lifecycles, and checks malformed bodies/unknown read keys (ports 21909-21911, gRPC 22909-22911).
   - `tests/cluster/test_client.rs` covers typed no-leader/HTTP edge errors, retry/backoff after a dropped connection, and forwarding to the new leader after failover (ports 21912-21917, gRPC 22912-22917).
@@ -69,8 +69,8 @@ CI (`.github/workflows/ci.yml`) runs `cargo fmt --all -- --check` (and the `fuzz
   base/quote `AssetId`/`AssetClass`, tick/lot and `FeeAssetPolicy`, and fills carry
   `taker_fee`/`maker_fee` plus the fee asset from the order-level user tier. ETF/equity bases
   force `FeeAssetPolicy::Quote`; crypto/spot and fiat-to-fiat pairs default to `Received`.
-  Snapshot **v9** and
-  wire **v5** are incompatible with older builds; v9 rejects v8. Wipe the node's `--data-dir`
+  Snapshot **v10** and
+  wire **v6** are incompatible with older builds; v10 rejects v9. Wipe the node's `--data-dir`
   when moving an existing example deployment across this change; there is no log-entry migration.
 - Upgraded to `openraft` 0.10.0-alpha.37 from crates.io (git pin and the `openraft-legacy` dependency are gone). Installing it is a normal `cargo fetch`; no git checkout needed.
 - The node runs **gRPC (tonic) only** for peer-to-peer Raft RPCs; the HTTP/JSON transport was removed.
@@ -86,7 +86,7 @@ CI (`.github/workflows/ci.yml`) runs `cargo fmt --all -- --check` (and the `fuzz
 - Default snapshots are `LogsSinceLast(100_000)` plus a 30-minute timer; `StorageConfig::snapshot_interval` / `--snapshot-interval-ms` tunes it and `0` disables only the timer.
 - Storage hot paths: WAL append uses a borrowed encoder, recovery scans segments sequentially, contiguous reads share one `pread`, snapshot encode/write happens outside the state-machine lock, and snapshot bodies stream through an incremental CRC writer. `docs/PERFORMANCE.md` records the baseline.
 - A failed or dropped gRPC server task is fail-fast: `MatchEngineNode::run()` stops HTTP and background tasks, shuts Raft down, and returns the error. HTTP requests use one `Logger` middleware.
-- `src/store/state_machine.rs` keeps the order book + sequence + event window in memory and persists `snapshot/current.snap` (magic `MRFSNAP` + version + postcard meta + postcard content) via temp file → fsync → rename → dir fsync. Snapshot version is 9 (v3 added the extended `Order`, parked stops and last trade price; v4 added the retained `MatchEvent` window and client-order-id dedupe map; v5 stored prices/quantities as 18-scale `Fixed` integers; v6 stored the last trade price and match events as `Fixed`; v7 added the replicated single-symbol precision configuration; v8 added maker/taker fee rates to orders and fee fields to match events; v9 added base/quote asset metadata, tick/lot rules, volume units and fee assets). Older files are rejected on open. `install_snapshot` validates before replacing the durable copy. Restart = open snapshot, then openraft replays the retained log tail.
+- `src/store/state_machine.rs` keeps the order book + sequence + event window in memory and persists `snapshot/current.snap` (magic `MRFSNAP` + version + postcard meta + postcard content) via temp file → fsync → rename → dir fsync. Snapshot version is 10 (v10 replaces the boolean fee-overflow flag with `MatchErrors`; v3 added the extended `Order`, parked stops and last trade price; v4 added the retained `MatchEvent` window and client-order-id dedupe map; v5 stored prices/quantities as 18-scale `Fixed` integers; v6 stored the last trade price and match events as `Fixed`; v7 added the replicated single-symbol precision configuration; v8 added maker/taker fee rates to orders and fee fields to match events; v9 added base/quote asset metadata, tick/lot rules, volume units and fee assets). Older files are rejected on open. `install_snapshot` validates before replacing the durable copy. Restart = open snapshot, then openraft replays the retained log tail.
 - `src/store/config.rs` owns `StorageConfig` (`data_dir`, `instance_prefix`, `node_dir`/`log_dir`/`snapshot_dir`). The old sled-backed `src/store/store.rs` and the `walkdir` dependency are gone; `sled` remains only for the `examples/sled.rs` playground.
 
 ## Test gotchas
@@ -145,11 +145,11 @@ CI (`.github/workflows/ci.yml`) runs `cargo fmt --all -- --check` (and the `fuzz
 - `Order` deserializes `sequence` with a default of `0`; the scripts still send it, and
   `place_order()` overwrites it. `Order` equality compares `id`, `side`, `symbol_id`, `sequence`,
   `price` and `volume`.
-- Fills compute maker/taker fees from the two orders' user-level `maker_fee_rate`/`taker_fee_rate` (signed fractions of notional). `MatchResult` carries `notional`, both fees and `fee_overflow`; `MatchEvent` carries the fees and flag, and market-data `TRADE`/fill `LIFECYCLE` mirror them. The engine records fees but does not maintain balances.
+- Fills compute maker/taker fees from the two orders' user-level `maker_fee_rate`/`taker_fee_rate` (signed fractions of notional). `MatchResult` carries `notional`, both fees and `error` (an ordered `MatchErrors` set); `MatchEvent` carries the fees and error set, and market-data `TRADE`/fill `LIFECYCLE` mirror them. The engine records fees but does not maintain balances.
 - Match results leave `apply` as `MatchEvent`s through a `MatchResultSink`. `EventId` is
   `(log_index, ordinal)`, so no event counter is stored in snapshots; `OrderBook::resting_volume`
   is the authoritative source for a `Rested` event's volume (do not derive it by subtraction).
-- A process/cluster trades exactly one symbol. Replicated `StateMachineData.symbol_config` + `symbol_locked` (snapshot v9) hold its precision; `MatchEngineRequest::ConfigureSymbol` updates it through Raft before trading, locks it after the first accepted order, and queues a market-data reset snapshot when the node is publishing. `apply` rejects `Place`/`Amend` values with more decimals than configured and rejects orders with a different `symbol_id`; on the leader, `/write` and `/write_batch` reject a wrong-symbol request earlier, with `400` before the Raft proposal. `/read symbol_config` and `/read symbol_id` expose it. Multi-symbol means one process/cluster per symbol, not multiple books in one process.
+- A process/cluster trades exactly one symbol. Replicated `StateMachineData.symbol_config` + `symbol_locked` (snapshot v10) hold its precision; `MatchEngineRequest::ConfigureSymbol` updates it through Raft before trading, locks it after the first accepted order, and queues a market-data reset snapshot when the node is publishing. `apply` rejects `Place`/`Amend` values with more decimals than configured and rejects orders with a different `symbol_id`; on the leader, `/write` and `/write_batch` reject a wrong-symbol request earlier, with `400` before the Raft proposal. `/read symbol_config` and `/read symbol_id` expose it. Multi-symbol means one process/cluster per symbol, not multiple books in one process.
 - `/read` keys are resolved by `read_state` in `src/network/api.rs`: `orderbook_orders`,
   `orderbook_stops`, `orderbook_last_trade_price`, `orderbook_depth` (`orderbook_depth:N` for N
   levels, capped at 200), `orderbook_spread`, `marketdata_status`, and `orderbook_sequence`
@@ -168,7 +168,7 @@ CI (`.github/workflows/ci.yml`) runs `cargo fmt --all -- --check` (and the `fuzz
   gRPC/tonic implementation (`src/network/grpc/`) is now the only Raft transport; the HTTP/JSON
   fallback and its comparison were removed on 2026-10-30.
 - `docs/MARKET_DATA_PLAN.md` tracks the market-data egress implementation (tap, shadow book,
-  deterministic `market_seq`/`sub_seq` sequencing, binary wire format v5 (scale-18 `i128`
+  deterministic `market_seq`/`sub_seq` sequencing, binary wire format v6 (scale-18 `i128`
   prices/quantities/fees plus fee assets) with a strict reference decoder and golden round-trip
   tests, JSONL sink, leader gating); the Aeron adapter is still the next phase.
 - `docs/FEE_DEDUCTION.md` documents the implemented base/quote volume semantics,
@@ -178,9 +178,9 @@ CI (`.github/workflows/ci.yml`) runs `cargo fmt --all -- --check` (and the `fuzz
 - `docs/DECIMAL.md` compares integer ticks, `rust_decimal`, `fastnum`, `bigdecimal`, `decimal`
   and `fixed`, with microbenchmarks, an 18-decimal BTC range analysis and a migration plan. `Order`
   now uses 18-scale `Fixed` integers end-to-end (`last_trade_price`, events, depth/BBO, market data,
-  wire v5, snapshot v9). `SymbolConfig` is replicated and enforced for the one symbol a
+  wire v6, snapshot v10). `SymbolConfig` is replicated and enforced for the one symbol a
   process/cluster trades; multi-symbol isolation is deployment-level (one process per symbol).
 - `docs/MATCH_RESULTS.md` describes match-result delivery. Phases 1a–3 are implemented: events in
-  `/write`, a replicated bounded event log in snapshots (v9), `POST /events` +
+  `/write`, a replicated bounded event log in snapshots (v10), `POST /events` +
   `GET /events/status`, and `client_order_id` submission dedupe. `--match-event-log` remains a
   node-local debugging sink. Phase 4 (long-poll, gRPC streaming, MQ bridge) is still a proposal.

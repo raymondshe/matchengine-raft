@@ -35,6 +35,7 @@ use serde::Serialize;
 use crate::order_book::Amendment;
 use crate::order_book::FeeAsset;
 use crate::order_book::Fixed;
+use crate::order_book::MatchErrors;
 use crate::order_book::MatchResult;
 use crate::order_book::Order;
 use crate::order_book::OrderSide;
@@ -122,17 +123,20 @@ pub struct MatchEvent {
     #[serde(default)]
     pub maker_fee_asset: Option<FeeAsset>,
     /// Taker fee for a fill: positive = charge, negative = rebate. Zero for
-    /// non-fill events and when `fee_overflow` is true.
+    /// non-fill events and when this fee overflowed. A fill with
+    /// `error = ["taker_fee_overflow"]` can still carry a valid maker fee.
     #[serde(default)]
     pub taker_fee: Fixed,
     /// Maker fee for a fill: positive = charge, negative = rebate. Zero for
-    /// non-fill events and when `fee_overflow` is true.
+    /// non-fill events and when this fee overflowed. A fill with
+    /// `error = ["maker_fee_overflow"]` can still carry a valid taker fee.
     #[serde(default)]
     pub maker_fee: Fixed,
-    /// True when the fill's notional or fee overflowed the scale-18 `i128`
-    /// range; the fee fields are then zero but must not be treated as real.
+    /// Non-fatal fill errors, for example `["notional_overflow"]`. Empty means
+    /// every price-derived field is exact. Only the fields named by the codes
+    /// are unavailable; other fees may remain exact.
     #[serde(default)]
-    pub fee_overflow: bool,
+    pub error: MatchErrors,
     /// The policy reason behind a rejection or expiry. Absent (and omitted from the JSON lines)
     /// for every other kind.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -194,7 +198,7 @@ impl MatchEvent {
             maker_fee_asset: Some(m.maker_fee_asset),
             taker_fee: m.taker_fee,
             maker_fee: m.maker_fee,
-            fee_overflow: m.fee_overflow,
+            error: m.error,
             reason: None,
         }));
     }
@@ -274,7 +278,7 @@ impl MatchEvent {
                 maker_fee_asset: None,
                 taker_fee: Fixed::ZERO,
                 maker_fee: Fixed::ZERO,
-                fee_overflow: false,
+                error: MatchErrors::NONE,
                 reason: None,
             }));
         }
@@ -314,7 +318,7 @@ impl MatchEvent {
             maker_fee_asset: None,
             taker_fee: Fixed::ZERO,
             maker_fee: Fixed::ZERO,
-            fee_overflow: false,
+            error: MatchErrors::NONE,
             reason: None,
         }
     }
@@ -342,7 +346,7 @@ impl MatchEvent {
             maker_fee_asset: None,
             taker_fee: Fixed::ZERO,
             maker_fee: Fixed::ZERO,
-            fee_overflow: false,
+            error: MatchErrors::NONE,
             reason: None,
         }
     }
@@ -364,7 +368,7 @@ impl MatchEvent {
             maker_fee_asset: None,
             taker_fee: Fixed::ZERO,
             maker_fee: Fixed::ZERO,
-            fee_overflow: false,
+            error: MatchErrors::NONE,
             reason: None,
         }
     }
@@ -391,7 +395,7 @@ impl MatchEvent {
             maker_fee_asset: None,
             taker_fee: Fixed::ZERO,
             maker_fee: Fixed::ZERO,
-            fee_overflow: false,
+            error: MatchErrors::NONE,
             reason: Some(reason),
         }
     }
@@ -414,7 +418,7 @@ impl MatchEvent {
             maker_fee_asset: None,
             taker_fee: Fixed::ZERO,
             maker_fee: Fixed::ZERO,
-            fee_overflow: false,
+            error: MatchErrors::NONE,
             reason: None,
         }
     }

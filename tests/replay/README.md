@@ -41,7 +41,7 @@ cargo run --release --example replay_orders_events -- \
 | `cancel_orders/` | `24222` | No-op cancel, parked-stop cancel and partial-fill cancel |
 | `fee_orders/` | `24223` | Positive maker/taker fees, maker and taker rebates, both fee assets under `Received`, and a zero-rate fill |
 | `fee_quote_orders/` | `24224` | ETF/fiat quote-fee policy, quote-volume limit normalization and both-side quote fees |
-| `fee_overflow_orders/` | `24225` | Notional overflow zeroes quote volume and quote fees, and sets `fee_overflow` |
+| `fee_overflow_orders/` | `24225` | Notional overflow zeroes quote volume and quote fees, and sets the overflow error codes |
 
 Most cases use `--batch-size 1` so each request is its own Raft entry. The
 `limit_orders` case keeps `--batch-size 2` to exercise batching as well.

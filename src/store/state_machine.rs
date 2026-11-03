@@ -73,9 +73,10 @@ const SNAPSHOT_MAGIC: &[u8; 7] = b"MRFSNAP";
 /// last trade price and match events as fixed-point values. Version 7 adds the replicated
 /// single-symbol precision configuration; version 8 adds maker/taker fee rates to orders and fee
 /// fields to stored match events; version 9 adds base/quote asset metadata, tick/lot rules, volume
-/// units, fee assets and gross quote notional. Postcard is not self-describing, so an older file is
-/// rejected with an explicit error instead of being decoded into a different shape.
-const SNAPSHOT_VERSION: u32 = 9;
+/// units, fee assets and gross quote notional; version 10 replaces the boolean fee-overflow flag
+/// with the `MatchErrors` bit set. Postcard is not self-describing, so an older file is rejected
+/// with an explicit error instead of being decoded into a different shape.
+const SNAPSHOT_VERSION: u32 = 10;
 /// `magic + version + crc32 of the body`.
 const SNAPSHOT_HEADER_LEN: usize = SNAPSHOT_MAGIC.len() + 4 + 4;
 
@@ -137,7 +138,7 @@ pub struct StoredMatchEvent {
     pub taker_fee_asset: Option<crate::order_book::FeeAsset>,
     pub maker_fee: Fixed,
     pub maker_fee_asset: Option<crate::order_book::FeeAsset>,
-    pub fee_overflow: bool,
+    pub error: crate::order_book::MatchErrors,
     pub reason: Option<RejectReason>,
 }
 
@@ -158,7 +159,7 @@ impl From<MatchEvent> for StoredMatchEvent {
             taker_fee_asset: event.taker_fee_asset,
             maker_fee: event.maker_fee,
             maker_fee_asset: event.maker_fee_asset,
-            fee_overflow: event.fee_overflow,
+            error: event.error,
             reason: event.reason,
         }
     }
@@ -181,7 +182,7 @@ impl From<StoredMatchEvent> for MatchEvent {
             taker_fee_asset: event.taker_fee_asset,
             maker_fee: event.maker_fee,
             maker_fee_asset: event.maker_fee_asset,
-            fee_overflow: event.fee_overflow,
+            error: event.error,
             reason: event.reason,
         }
     }

@@ -52,6 +52,7 @@ use crate::order_book::DepthChange;
 use crate::order_book::DepthLevel;
 use crate::order_book::FeeAsset;
 use crate::order_book::Fixed;
+use crate::order_book::MatchErrors;
 use crate::order_book::OrderSide;
 use crate::order_book::RejectReason;
 use crate::order_book::VolumeUnit;
@@ -253,8 +254,8 @@ pub struct TradeRecord {
     pub maker_fee: Fixed,
     /// Asset of `maker_fee`.
     pub maker_fee_asset: Option<FeeAsset>,
-    /// True when the fee calculation overflowed the supported range.
-    pub fee_overflow: bool,
+    /// Non-fatal fill reporting errors, for example `["notional_overflow"]`.
+    pub error: MatchErrors,
     /// Taker side (the maker's side is the opposite).
     pub taker_side: OrderSide,
     /// Taker order sequence.
@@ -333,8 +334,8 @@ pub struct LifecycleRecord {
     pub maker_fee: Fixed,
     /// Asset of `maker_fee`, when applicable.
     pub maker_fee_asset: Option<FeeAsset>,
-    /// True when a fill's fee calculation overflowed.
-    pub fee_overflow: bool,
+    /// Non-fatal fill reporting errors, empty for non-fill events.
+    pub error: MatchErrors,
     /// Rejection/expiry reason when present.
     pub reason: Option<RejectReason>,
 }
@@ -1330,7 +1331,7 @@ impl MarketDataProcessor {
                 taker_fee_asset: event.taker_fee_asset,
                 maker_fee: event.maker_fee,
                 maker_fee_asset: event.maker_fee_asset,
-                fee_overflow: event.fee_overflow,
+                error: event.error,
             });
         }
 
@@ -1420,7 +1421,7 @@ impl MarketDataProcessor {
                     taker_fee_asset: event.taker_fee_asset,
                     maker_fee: event.maker_fee,
                     maker_fee_asset: event.maker_fee_asset,
-                    fee_overflow: event.fee_overflow,
+                    error: event.error,
                     reason: event.reason,
                 })
                 .collect();

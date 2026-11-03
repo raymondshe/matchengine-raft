@@ -491,7 +491,7 @@ function renderEventDetail(event) {
     ["Quote", event.quote_volume],
     ["Taker fee", `${event.taker_fee} ${event.taker_fee_asset ?? ""}`],
     ["Maker fee", `${event.maker_fee} ${event.maker_fee_asset ?? ""}`],
-    ["Fee overflow", event.fee_overflow],
+    ["Errors", (event.error || []).join(", ") || "—"],
     ["Reason", event.reason ?? "—"],
   ];
   for (const [label, value] of rows) {

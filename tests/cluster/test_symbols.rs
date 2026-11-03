@@ -235,9 +235,9 @@ fn symbol_configuration_validates_orders_and_survives_restart() {
         assert!(snapshot.last_log_id.is_some());
         let bytes = std::fs::read(storage.snapshot_dir(1).join("current.snap")).unwrap();
         assert_eq!(
-            9,
+            10,
             u32::from_le_bytes(bytes[7..11].try_into().unwrap()),
-            "snapshot must be v9"
+            "snapshot must be v10"
         );
 
         node.shutdown().await.unwrap();

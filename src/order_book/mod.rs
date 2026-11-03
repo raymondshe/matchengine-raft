@@ -1,3 +1,4 @@
+use serde::ser::SerializeSeq;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
@@ -524,6 +525,189 @@ pub struct OrderBook {
     gtd_scan_dirty: bool,
 }
 
+/// A non-fatal fill reporting problem. These are not matching failures: the
+/// fill is committed, but the named derived value is unavailable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MatchErrorCode {
+    /// The quote notional (`price * quantity`) did not fit scale-18 `i128`.
+    NotionalOverflow,
+    /// The taker fee did not fit scale-18 `i128`.
+    TakerFeeOverflow,
+    /// The maker fee did not fit scale-18 `i128`.
+    MakerFeeOverflow,
+}
+
+impl MatchErrorCode {
+    /// Stable wire/JSON name.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotionalOverflow => "notional_overflow",
+            Self::TakerFeeOverflow => "taker_fee_overflow",
+            Self::MakerFeeOverflow => "maker_fee_overflow",
+        }
+    }
+
+    /// Inverse of [`Self::as_str`].
+    pub fn from_name(value: &str) -> Option<Self> {
+        match value {
+            "notional_overflow" => Some(Self::NotionalOverflow),
+            "taker_fee_overflow" => Some(Self::TakerFeeOverflow),
+            "maker_fee_overflow" => Some(Self::MakerFeeOverflow),
+            _ => None,
+        }
+    }
+
+    const fn bit(self) -> u8 {
+        match self {
+            Self::NotionalOverflow => 1 << 0,
+            Self::TakerFeeOverflow => 1 << 1,
+            Self::MakerFeeOverflow => 1 << 2,
+        }
+    }
+
+    const ALL: [Self; 3] = [
+        Self::NotionalOverflow,
+        Self::TakerFeeOverflow,
+        Self::MakerFeeOverflow,
+    ];
+}
+
+/// A set of non-fatal fill errors. Empty means every reported field is exact.
+///
+/// This is a copyable bitmask internally and a string array in JSON, for
+/// example `["notional_overflow", "taker_fee_overflow"]`. An empty set is
+/// serialized as `[]`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct MatchErrors(u8);
+
+impl MatchErrors {
+    /// No errors.
+    pub const NONE: Self = Self(0);
+    /// Quote notional overflowed.
+    pub const NOTIONAL_OVERFLOW: Self = Self(MatchErrorCode::NotionalOverflow.bit());
+    /// Taker fee overflowed.
+    pub const TAKER_FEE_OVERFLOW: Self = Self(MatchErrorCode::TakerFeeOverflow.bit());
+    /// Maker fee overflowed.
+    pub const MAKER_FEE_OVERFLOW: Self = Self(MatchErrorCode::MakerFeeOverflow.bit());
+    const KNOWN_BITS: u8 =
+        Self::NOTIONAL_OVERFLOW.0 | Self::TAKER_FEE_OVERFLOW.0 | Self::MAKER_FEE_OVERFLOW.0;
+
+    /// Raw bitmask for the binary wire format.
+    pub const fn bits(self) -> u8 {
+        self.0
+    }
+
+    /// Rebuilds a set from wire bits. Unknown bits are rejected.
+    pub const fn from_bits(bits: u8) -> Option<Self> {
+        if bits & !Self::KNOWN_BITS == 0 {
+            Some(Self(bits))
+        } else {
+            None
+        }
+    }
+
+    /// Whether no error is set.
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    /// Adds a code to the set.
+    pub fn insert(&mut self, code: MatchErrorCode) {
+        self.0 |= code.bit();
+    }
+
+    /// Whether `code` is present.
+    pub const fn contains(self, code: MatchErrorCode) -> bool {
+        self.0 & code.bit() != 0
+    }
+
+    /// Iterates the set in stable code order.
+    pub fn codes(self) -> impl Iterator<Item = MatchErrorCode> {
+        MatchErrorCode::ALL
+            .into_iter()
+            .filter(move |code| self.contains(*code))
+    }
+}
+
+impl std::ops::BitOr for MatchErrors {
+    type Output = Self;
+
+    fn bitor(self, rhs: Self) -> Self::Output {
+        Self(self.0 | rhs.0)
+    }
+}
+
+impl std::ops::BitOrAssign for MatchErrors {
+    fn bitor_assign(&mut self, rhs: Self) {
+        self.0 |= rhs.0;
+    }
+}
+
+impl Serialize for MatchErrors {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        if !serializer.is_human_readable() {
+            return serializer.serialize_u8(self.0);
+        }
+        let mut seq = serializer.serialize_seq(Some(self.codes().count()))?;
+        for code in self.codes() {
+            seq.serialize_element(&code)?;
+        }
+        seq.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for MatchErrors {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        if !deserializer.is_human_readable() {
+            let bits = u8::deserialize(deserializer)?;
+            return Self::from_bits(bits)
+                .ok_or_else(|| serde::de::Error::custom("unknown match error bits"));
+        }
+        deserializer.deserialize_any(MatchErrorsVisitor)
+    }
+}
+
+struct MatchErrorsVisitor;
+
+impl<'de> serde::de::Visitor<'de> for MatchErrorsVisitor {
+    type Value = MatchErrors;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("an error code or an array of error codes")
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        MatchErrorCode::from_name(value)
+            .map(|code| {
+                let mut errors = MatchErrors::NONE;
+                errors.insert(code);
+                errors
+            })
+            .ok_or_else(|| E::custom(format!("unknown match error code: {value}")))
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+    where
+        A: serde::de::SeqAccess<'de>,
+    {
+        let mut errors = MatchErrors::NONE;
+        while let Some(code) = seq.next_element::<MatchErrorCode>()? {
+            errors.insert(code);
+        }
+        Ok(errors)
+    }
+}
+
 /// Represents the result of a successful order match.
 ///
 /// A MatchResult is created when a taker order crosses the spread and
@@ -540,19 +724,20 @@ pub struct MatchResult {
     /// the notional does not fit the fixed-point range.
     pub notional: Fixed,
     /// Taker fee: positive = charge, negative = rebate. Zero when the fee
-    /// cannot be represented exactly; see `fee_overflow`.
+    /// cannot be represented exactly; see `error`.
     pub taker_fee: Fixed,
     /// Asset in which the taker fee is charged or rebated.
     pub taker_fee_asset: FeeAsset,
     /// Maker fee: positive = charge, negative = rebate. Zero when the fee
-    /// cannot be represented exactly; see `fee_overflow`.
+    /// cannot be represented exactly; see `error`.
     pub maker_fee: Fixed,
     /// Asset in which the maker fee is charged or rebated.
     pub maker_fee_asset: FeeAsset,
-    /// True when the notional or either fee overflowed the scale-18 `i128`
-    /// range. The fill itself is still valid; downstream must not assume the
-    /// zero fee amounts are real.
-    pub fee_overflow: bool,
+    /// Non-fatal reporting errors for this fill. Empty means every dependent
+    /// field is exact. Only the affected values are zero: a base fee can remain
+    /// exact when the quote notional overflowed. Downstream must not treat a
+    /// zero value named by an error code as a real zero.
+    pub error: MatchErrors,
 }
 
 /// Equality comparison for match results.
@@ -566,7 +751,7 @@ impl PartialEq for MatchResult {
             && (self.taker_fee_asset == other.taker_fee_asset)
             && (self.maker_fee == other.maker_fee)
             && (self.maker_fee_asset == other.maker_fee_asset)
-            && (self.fee_overflow == other.fee_overflow)
+            && (self.error == other.error)
     }
 }
 
@@ -599,6 +784,16 @@ impl MatchResult {
         };
         let taker_fee = fee(taker_fee_asset, taker.taker_fee_rate);
         let maker_fee = fee(maker_fee_asset, maker.maker_fee_rate);
+        let mut error = MatchErrors::NONE;
+        if notional.is_none() {
+            error |= MatchErrors::NOTIONAL_OVERFLOW;
+        }
+        if taker_fee.is_none() {
+            error |= MatchErrors::TAKER_FEE_OVERFLOW;
+        }
+        if maker_fee.is_none() {
+            error |= MatchErrors::MAKER_FEE_OVERFLOW;
+        }
         Self {
             taker: *taker,
             maker: *maker,
@@ -608,7 +803,7 @@ impl MatchResult {
             taker_fee_asset,
             maker_fee: maker_fee.unwrap_or(Fixed::ZERO),
             maker_fee_asset,
-            fee_overflow: notional.is_none() || taker_fee.is_none() || maker_fee.is_none(),
+            error,
         }
     }
 }

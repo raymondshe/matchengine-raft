@@ -694,7 +694,11 @@ fn assert_fill_fees(fill: &MatchResult, policy: FeeAssetPolicy, context: &str) {
     assert_eq!(fill.maker_fee_asset, maker_asset, "{context}: maker asset");
     assert_eq!(fill.taker_fee, taker_fee, "{context}: taker fee");
     assert_eq!(fill.maker_fee, maker_fee, "{context}: maker fee");
-    assert!(!fill.fee_overflow, "{context}: unexpected fee overflow");
+    assert!(
+        fill.error.is_empty(),
+        "{context}: unexpected fill errors {:?}",
+        fill.error
+    );
 }
 
 /// Applies one mixed operation, validates every fill's fee and returns the

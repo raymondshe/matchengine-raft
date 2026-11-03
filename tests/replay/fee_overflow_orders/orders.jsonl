@@ -1,5 +1,6 @@
 # QQQ/USD quote-fee policy: an overflowing notional zeroes quote_volume and
-# both quote-asset fees, and sets fee_overflow. The fill itself is still valid.
+# both quote-asset fees, and sets the three overflow error codes. The fill
+# itself is still valid.
 {"ConfigureSymbol":{"config":{"symbol_id":0,"base_asset":{"code":"QQQ","class":"etf","decimals":4},"quote_asset":{"code":"USD","class":"fiat","decimals":2},"price_decimals":2,"price_tick":"0.01","base_lot":"0.0001","fee_asset_policy":"quote"}}}
 {"Place":{"order":{"live":"Limit","side":"Sell","price":"100000000000","volume":"10000000000","maker_fee_rate":"0.001","taker_fee_rate":"0.002","id":1,"sequence":0}}}
 {"Place":{"order":{"live":"Limit","side":"Buy","price":"100000000000","volume":"10000000000","maker_fee_rate":"0.001","taker_fee_rate":"0.002","id":2,"sequence":0}}}

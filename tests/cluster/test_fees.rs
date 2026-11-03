@@ -80,7 +80,7 @@ fn maker_and_taker_fees_survive_events_feed_and_snapshot_restart() {
         assert_eq!(MatchEventKind::Fill, filled.data.events[0].kind);
         assert_eq!(fixed("0.004"), filled.data.events[0].taker_fee);
         assert_eq!(fixed("0.1"), filled.data.events[0].maker_fee);
-        assert!(!filled.data.events[0].fee_overflow);
+        assert!(filled.data.events[0].error.is_empty());
 
         let page = client
             .events(&EventsRequest {
@@ -97,7 +97,7 @@ fn maker_and_taker_fees_survive_events_feed_and_snapshot_restart() {
             .expect("the fill is retained");
         assert_eq!(fixed("0.004"), fill.taker_fee);
         assert_eq!(fixed("0.1"), fill.maker_fee);
-        assert!(!fill.fee_overflow);
+        assert!(fill.error.is_empty());
 
         // The order keeps its rates for the next maker fill.
         let orders: serde_json::Value =
@@ -155,9 +155,9 @@ fn maker_and_taker_fees_survive_events_feed_and_snapshot_restart() {
         assert!(snapshot.last_log_id.is_some());
         let bytes = std::fs::read(storage.snapshot_dir(1).join("current.snap")).unwrap();
         assert_eq!(
-            9,
+            10,
             u32::from_le_bytes(bytes[7..11].try_into().unwrap()),
-            "snapshot must be v9"
+            "snapshot must be v10"
         );
 
         node.shutdown().await.unwrap();

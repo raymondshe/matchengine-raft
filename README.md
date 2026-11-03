@@ -16,8 +16,8 @@
 [![CI](https://github.com/raymondshe/matchengine-raft/actions/workflows/ci.yml/badge.svg)](https://github.com/raymondshe/matchengine-raft/actions/workflows/ci.yml)
 [![Rust](https://img.shields.io/badge/rust-%E2%89%A5%201.89-orange.svg)](https://www.rust-lang.org)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
-[![Snapshot v9](https://img.shields.io/badge/snapshot-v9-blue.svg)](./docs)
-[![Market-data wire v5](https://img.shields.io/badge/marketdata%20wire-v5-blue.svg)](./docs/MARKET_DATA_PLAN.md)
+[![Snapshot v10](https://img.shields.io/badge/snapshot-v10-blue.svg)](./docs)
+[![Market-data wire v6](https://img.shields.io/badge/marketdata%20wire-v6-blue.svg)](./docs/MARKET_DATA_PLAN.md)
 
 A practical implementation of a distributed matching engine built upon [OpenRaft](https://github.com/datafuselabs/openraft). Raft logs are persisted in a hand-written segmented write-ahead log and the state machine is made durable with atomic snapshots, so a node recovers all committed state after a restart.
 
@@ -103,7 +103,7 @@ This project extends the [example-raft-kv](https://github.com/datafuselabs/openr
                                         │                           ▼
                                         │             ┌──────────────────────────────────────┐
                                         │             │  Market-data task (leader-gated)   │
-                                        │             │     shadow book · OHLC · wire v5     │
+                                        │             │     shadow book · OHLC · wire v6     │
                                         │             │   deterministic market_seq/sub_seq   │
                                         │             └──────────────────────────────────────┘
                                         │                                 │ MarketDataSink
@@ -132,7 +132,7 @@ Peer-to-peer Raft RPCs use gRPC on `port + 1000`. The public application and man
 stays on the `--http-addr` listener. Raft RPCs are not part of the HTTP JSON API.
 
 Market-data egress is node-local and off the consensus path: the tap is a bounded `try_send`, so a
-slow subscriber can never block `apply`. The JSONL sink is for debugging; the same wire-v5 messages
+slow subscriber can never block `apply`. The JSONL sink is for debugging; the same wire-v6 messages
 are what the Aeron adapter (streams 2001–2007) will publish next.
 
 ### Key Components
@@ -157,7 +157,7 @@ are what the Aeron adapter (streams 2001–2007) will publish next.
 
 4. **Market-Data Egress** ([`market_data/`](./src/market_data/))
    - `apply` hands match events and a depth journal to a bounded tap (`try_send`; matching never waits)
-   - A leader-gated tokio task keeps a shadow book, derives BBO/OHLC bars and encodes wire v5
+   - A leader-gated tokio task keeps a shadow book, derives BBO/OHLC bars and encodes wire v6
    - Keys are `(symbol_id, stream_id, market_seq, sub_seq)`; one uncapped `TRADE` per taker
    - JSONL sink today; Aeron streams 2001–2007 are the next phase
 
@@ -441,7 +441,7 @@ tests/
     ├── cancel_orders/         # Cancel lifecycle and parked stops
     ├── fee_orders/            # Maker/taker fees, rebates and both fee assets
     ├── fee_quote_orders/      # ETF/fiat quote fees and quote-volume normalization
-    └── fee_overflow_orders/   # Notional overflow and fee_overflow reporting
+    └── fee_overflow_orders/   # Notional overflow and structured error reporting
 benches/
 ├── matchengine.rs           # Order-book microbenchmarks
 ├── e2e.rs                   # Submit -> commit -> apply -> response
@@ -477,7 +477,7 @@ avoiding a second fsync per batch.
 ### Snapshots (`src/store/state_machine.rs`)
 
 The state machine (order book + sequence counter + retained match-event window + submission dedupe
-map) stays in memory so applying entries is fast. Snapshot v9 is written as
+map) stays in memory so applying entries is fast. Snapshot v10 is written as
 `snapshot/current.snap` using the same atomic temp-file/rename protocol; `install_snapshot`
 validates the incoming bytes before replacing the durable copy, so a bad snapshot cannot destroy a
 good one.
@@ -609,7 +609,7 @@ POST /write { Place | Cancel | Amend | PurgeExpired }
 `Place` accepts an optional `client_order_id`; retrying it returns the original sequence and
 events instead of placing a second order. The event window is bounded by `--max-events` (env
 `MAX_EVENTS`, default 262144); the submission map has a separate fixed 262144-record cap so retry
-resolution never depends on a node-local flag. Both are included in snapshot v9. `GET /events/status` reports the
+resolution never depends on a node-local flag. Both are included in snapshot v10. `GET /events/status` reports the
 oldest/last retained id and eviction counters; consumers resume from `next_after` and dedupe on
 `event_id`.
 
@@ -673,7 +673,7 @@ designed in `docs/AERON_SOLUTION.md` Part II and implemented in `src/market_data
   queue drops frames and emits a `GAP`; `apply` is never blocked or slowed by a subscriber.
 
 The shipped sink is JSONL for debugging. The same messages have a binary encoding in
-`src/market_data/wire.rs` (64-byte header, version 5, scale-18 `i128` bodies), and `MarketDataSink`
+`src/market_data/wire.rs` (64-byte header, version 6, scale-18 `i128` bodies), and `MarketDataSink`
 is the seam the Aeron adapter will implement (next phase). Every message carries the configured
 process `symbol_id`, so separate per-symbol deployments can share a bus. Tuning: `--market-data-depth`, `--market-data-status-every`,
 `--market-data-bar-intervals-ms`, `--market-data-leader-only`.
@@ -860,7 +860,7 @@ Every order/mutation request consumes one `market_seq`; `Place` also uses it as 
 sequence, while `ConfigureSymbol` does not consume one. The response carries at most 512 events;
 the full batch is available from `/events`. Fill events carry
 `quote_volume`, `volume_unit`, `taker_fee`/`taker_fee_asset` and `maker_fee`/`maker_fee_asset`;
-the same fields are on market-data `TRADE` and fill `LIFECYCLE` records (wire v5).
+the same fields are on market-data `TRADE` and fill `LIFECYCLE` records (wire v6).
 `client_order_id` is optional and only affects `Place`: a retry returns the original sequence and
 events instead of placing a second order. It must be 1–128 printable ASCII bytes from
 `[A-Za-z0-9._:-]`; an empty value is rejected, so omit the field to disable idempotency.
@@ -930,8 +930,9 @@ Fee rates (`maker_fee_rate`, `taker_fee_rate`) are signed `Fixed` fractions supp
 gateway from the user level. `"0.001"` means 10 bps and negative values are rebates. They are
 optional and default to zero. The engine computes each fill's notional from the maker price and
 matched quantity, then charges the taker order's taker rate and the maker order's maker rate.
-Fees are truncated toward zero at 18 places; `fee_overflow` is set when the notional or a fee
-exceeds the supported fixed-point range. The engine records fees but does not move balances.
+Fees are truncated toward zero at 18 places; a fill carries an ordered `error` set
+(`notional_overflow`, `taker_fee_overflow`, `maker_fee_overflow`) when a dependent value exceeds
+the supported fixed-point range. The engine records fees but does not move balances.
 
 Base/quote volume semantics and asset-aware fee deduction for fiat, stablecoin, crypto, ETF and
 equity pairs are implemented. ETF/equity bases always settle fees in the quote asset; crypto/spot
@@ -968,7 +969,7 @@ placeholder). `sequence` is optional and defaults to `0`.
 | `tests/cluster/test_events.rs` | `/write` returns events, `/events` pages by cursor, `client_order_id` retries do not duplicate an order, and `--max-events` eviction is visible in `/events/status` |
 | `tests/cluster/test_membership.rs` | Kill the elected leader: a surviving voter takes over with the committed book and accepts new writes. A learner added after the writes catches up through normal log replication, is promoted, and writes through its own node |
 | `tests/cluster/test_late_join.rs` | A node with a stale snapshot/WAL is removed, misses 40 writes while the leader snapshots and purges, then rejoins as a learner and catches up from the live cluster |
-| `tests/cluster/test_exactness.rs` | An 18-fractional-digit price and quantity round-trip through `/write`, `/read`, `/events`, the JSONL market-data feed, snapshot v9 and a restart without passing through `f64` |
+| `tests/cluster/test_exactness.rs` | An 18-fractional-digit price and quantity round-trip through `/write`, `/read`, `/events`, the JSONL market-data feed, snapshot v10 and a restart without passing through `f64` |
 | `tests/cluster/test_symbols.rs` | The HTTP edge rejects wrong-symbol `Place`/`Cancel`/`Amend` and whole batches with `400` before Raft, including sequence/book checks; a batch that configures a new symbol and places in one entry still works. Also covers precision rejection, the symbol lock and snapshot restart |
 | `tests/cluster/test_fees.rs` | Maker and taker fee rates produce exact fill fees in `/write`, `/events`, the file sink and the market-data feed, and survive snapshot restart |
 | `tests/cluster/test_fee_assets.rs` | QQQ/USD ETF/fiat metadata, tick/lot enforcement, quote-volume limit normalization and quote-asset fee deduction |
@@ -1045,7 +1046,7 @@ Current limits and known gaps:
 - One process/cluster trades one symbol; run one deployment per symbol to scale.
 
 Data-format note: `Order` prices/quantities, `last_trade_price`, match events, depth/BBO/spread, the
-JSONL feed and wire v5 use exact 18-scale fixed-point integers. Snapshot **v9** and wire **v5** are
+JSONL feed and wire v6 use exact 18-scale fixed-point integers. Snapshot **v10** and wire **v6** are
 breaking changes from earlier builds, so recreate data directories when upgrading. See
 [`docs/DECIMAL.md`](./docs/DECIMAL.md).
 

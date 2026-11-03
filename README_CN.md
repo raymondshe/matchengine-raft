@@ -16,8 +16,8 @@
 [![CI](https://github.com/raymondshe/matchengine-raft/actions/workflows/ci.yml/badge.svg)](https://github.com/raymondshe/matchengine-raft/actions/workflows/ci.yml)
 [![Rust](https://img.shields.io/badge/rust-%E2%89%A5%201.89-orange.svg)](https://www.rust-lang.org)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
-[![快照 v9](https://img.shields.io/badge/%E5%BF%AB%E7%85%A7-v9-blue.svg)](./docs)
-[![行情线格式 v5](https://img.shields.io/badge/%E8%A1%8C%E6%83%85%20wire-v5-blue.svg)](./docs/MARKET_DATA_PLAN.md)
+[![快照 v10](https://img.shields.io/badge/%E5%BF%AB%E7%85%A7-v10-blue.svg)](./docs)
+[![行情线格式 v6](https://img.shields.io/badge/%E8%A1%8C%E6%83%85%20wire-v6-blue.svg)](./docs/MARKET_DATA_PLAN.md)
 
 这是一个基于 [OpenRaft](https://github.com/datafuselabs/openraft) 构建的分布式撮合引擎的实践实现。Raft 日志持久化在自研的分段预写日志（WAL）中，状态机通过原子快照落盘，因此节点重启后可以恢复全部已提交状态。
 
@@ -103,7 +103,7 @@
                                         │                           ▼
                                         │             ┌──────────────────────────────────────┐
                                         │             │       行情任务（按领导者发布）       │
-                                        │             │    影子订单簿 · OHLC · 线格式 v5     │
+                                        │             │    影子订单簿 · OHLC · 线格式 v6     │
                                         │             │      确定性 market_seq/sub_seq       │
                                         │             └──────────────────────────────────────┘
                                         │                                 │ MarketDataSink
@@ -132,7 +132,7 @@
 Raft RPC 不属于 HTTP JSON API。
 
 行情输出是节点本地的，且不参与共识：tap 使用有界 `try_send`，因此慢订阅者永远不会阻塞
-`apply`。JSONL sink 仅用于调试；同样的线格式 v5 消息就是后续 Aeron 适配器（2001–2007 流）
+`apply`。JSONL sink 仅用于调试；同样的线格式 v6 消息就是后续 Aeron 适配器（2001–2007 流）
 要发布的内容。
 
 ### 核心组件
@@ -156,7 +156,7 @@ Raft RPC 不属于 HTTP JSON API。
 
 4. **行情数据出口** ([`market_data/`](./src/market_data/))
    - `apply` 将撮合事件和深度日志交给有界 tap（`try_send`，撮合路径永不等待）
-   - 仅领导者发布的任务维护影子订单簿、生成 BBO/OHLC K 线并编码线格式 v5
+   - 仅领导者发布的任务维护影子订单簿、生成 BBO/OHLC K 线并编码线格式 v6
    - 消息键为 `(symbol_id, stream_id, market_seq, sub_seq)`；每个 taker 一条不设上限的 `TRADE`
    - 当前使用 JSONL sink；下一阶段是 Aeron 2001–2007 流
 
@@ -428,7 +428,7 @@ tests/
     ├── cancel_orders/         # 撤单生命周期与停靠止损单
     ├── fee_orders/            # 撮合/吃单费用、返佣和两种费用资产
     ├── fee_quote_orders/      # ETF/法币 quote 扣费与 quote 数量归一化
-    └── fee_overflow_orders/   # 名义金额溢出与 fee_overflow 标记
+    └── fee_overflow_orders/   # 名义金额溢出与结构化错误码
 benches/
 ├── matchengine.rs           # 订单簿微基准
 ├── e2e.rs                   # 请求 -> Raft 提交 -> apply -> 响应
@@ -456,7 +456,7 @@ Raft 日志追加写入 `log/NNNNNNNNNN.wal` 分段文件：
 
 ### 快照（`src/store/state_machine.rs`）
 
-状态机（订单簿 + 序列号 + 保留的撮合事件窗口 + 提交去重表）常驻内存以保证 apply 速度。快照 v9 写入 `snapshot/current.snap`，通过临时文件 → fsync → rename → 目录 fsync 原子替换；`install_snapshot` 会先校验收到的数据再替换磁盘副本，坏快照不会破坏已有的好快照。
+状态机（订单簿 + 序列号 + 保留的撮合事件窗口 + 提交去重表）常驻内存以保证 apply 速度。快照 v10 写入 `snapshot/current.snap`，通过临时文件 → fsync → rename → 目录 fsync 原子替换；`install_snapshot` 会先校验收到的数据再替换磁盘副本，坏快照不会破坏已有的好快照。
 
 快照负载是 postcard 编码的 `StateMachineData`：
 
@@ -576,7 +576,7 @@ POST /write { Place | Cancel | Amend | PurgeExpired | ConfigureSymbol }
 
 `Place` 支持可选的 `client_order_id`；用同一个 id 重试会返回原序列号和事件，而不会重复下单。
 事件窗口由 `--max-events`（环境变量 `MAX_EVENTS`，默认 262144）限制；提交去重表另有固定的
-262144 条上限，避免重试结果依赖节点本地参数。两者都包含在快照 v9 中。
+262144 条上限，避免重试结果依赖节点本地参数。两者都包含在快照 v10 中。
 `GET /events/status` 报告最旧/最新保留 id 和淘汰计数；消费者从 `next_after` 继续，并按 `event_id`
 去重。
 
@@ -635,7 +635,7 @@ POST /events
   或拖慢。
 
 当前 sink 是用于调试的 JSONL。同样的消息在 `src/market_data/wire.rs` 有二进制编码（64 字节头、
-版本 5、scale-18 `i128`、小端消息体），`MarketDataSink` 就是后续 Aeron 适配器的接入点。每条消息携带
+版本 6、scale-18 `i128`、小端消息体），`MarketDataSink` 就是后续 Aeron 适配器的接入点。每条消息携带
 当前进程配置的 `symbol_id`，便于多个按标的部署共享总线。可调参数：`--market-data-depth`、`--market-data-status-every`、
 `--market-data-bar-intervals-ms`、`--market-data-leader-only`。
 
@@ -813,7 +813,7 @@ pub struct MatchEngineResponse {
 每个订单/变更请求消耗一个 `market_seq`；`Place` 同时把它作为订单序列号，`ConfigureSymbol` 不消耗。
 响应最多携带 512 个事件，完整批次从 `/events` 读取。成交事件携带 `quote_volume`、`volume_unit`、
 `taker_fee`/`taker_fee_asset` 和 `maker_fee`/`maker_fee_asset`；行情 `TRADE` 与成交 `LIFECYCLE`
-记录也包含相同字段（wire v5）。`client_order_id` 可选，只影响 `Place`：同一 id 重试返回原序列号和
+记录也包含相同字段（wire v6）。`client_order_id` 可选，只影响 `Place`：同一 id 重试返回原序列号和
 事件，不会重复下单。长度必须为 1–128 个可打印 ASCII 字节，字符集为 `[A-Za-z0-9._:-]`；空字符串会被拒绝，
 不需要幂等时请省略该字段。
 
@@ -863,7 +863,7 @@ pub struct MatchEngineResponse {
 费率字段（`maker_fee_rate`、`taker_fee_rate`）是网关按用户等级带入的有符号 `Fixed` 小数：
 `"0.001"` 表示 10 bps，负值表示返佣，缺省为零。每笔成交的名义金额由 maker 价格 × 成交数量计算，
 吃单方按吃单费率收费，挂单方按挂单费率收费；费用按 18 位小数向零截断。名义金额或费用超出支持的定点范围时
-`fee_overflow` 置位。引擎只记录费用，不维护余额。
+会通过 `error` 返回 `notional_overflow`、`taker_fee_overflow`、`maker_fee_overflow` 等错误码。引擎只记录费用，不维护余额。
 
 法币、稳定币、加密货币、ETF 和股票等标的的 base/quote 数量语义与按资产扣费已实现。
 ETF/股票 base 的费用始终以 quote 资产结算；加密货币和法币对法币（FX）默认使用收到资产，
@@ -898,7 +898,7 @@ ETF/股票 base 的费用始终以 quote 资产结算；加密货币和法币对
 | `tests/cluster/test_events.rs` | `/write` 返回事件、`/events` 游标分页、`client_order_id` 重试不重复下单、`--max-events` 淘汰与 `/events/status` 计数 |
 | `tests/cluster/test_membership.rs` | 杀掉当前领导者：存活的投票节点接管已提交订单簿并接受新写入；写入后加入的学习者通过普通日志复制追赶、晋升成员并从自己的节点写入 |
 | `tests/cluster/test_late_join.rs` | 带过期快照/WAL 的节点被移出集群、错过 40 次写入（期间领导者生成快照并 purge），再以学习者身份重新加入并从活动集群追赶 |
-| `tests/cluster/test_exactness.rs` | 18 位小数的价格/数量经 `/write`、`/read`、`/events`、JSONL 行情、快照 v9 和重启后仍然精确，全程不经过 `f64` |
+| `tests/cluster/test_exactness.rs` | 18 位小数的价格/数量经 `/write`、`/read`、`/events`、JSONL 行情、快照 v10 和重启后仍然精确，全程不经过 `f64` |
 | `tests/cluster/test_symbols.rs` | HTTP 入口在进入 Raft 前以 `400` 拒绝错误标的的 `Place`/`Cancel`/`Amend` 和整个批次，并校验序列号/订单簿未变化；同一 entry 中先 `ConfigureSymbol` 再下单的批次仍可工作。另覆盖精度拒绝、配置锁定和快照重启 |
 | `tests/cluster/test_fees.rs` | 吃单/挂单费率产生精确的成交费用，经 `/write`、`/events`、文件 sink 和行情 feed 输出，并在快照重启后保留 |
 | `tests/cluster/test_fee_assets.rs` | QQQ/USD ETF/法币元数据、tick/lot、quote 数量限价单归一化和 quote 资产扣费 |
@@ -964,7 +964,7 @@ feed 还包含一个刻意的 2M fills/s 过载场景，会丢弃帧并发送 `G
 - 快照安装需要一块连续缓冲区，单个快照上限为 256 MiB。
 - 一个进程/集群只交易一个标的；多标的需要横向部署多个实例。
 
-数据格式说明：`Order` 的价格/数量、`last_trade_price`、撮合事件、深度/BBO/spread、JSONL 行情和 wire v5 均使用精确的 18 位定点整数。快照 **v9** 和 wire **v5** 是相对旧版本的破坏性变更，升级时请重建数据目录。每个进程/集群只支持一个标的，`SymbolConfig` 已复制并在交易开始后锁定。18 位 BTC 分析、微基准和迁移记录见
+数据格式说明：`Order` 的价格/数量、`last_trade_price`、撮合事件、深度/BBO/spread、JSONL 行情和 wire v6 均使用精确的 18 位定点整数。快照 **v10** 和 wire **v6** 是相对旧版本的破坏性变更，升级时请重建数据目录。每个进程/集群只支持一个标的，`SymbolConfig` 已复制并在交易开始后锁定。18 位 BTC 分析、微基准和迁移记录见
 [`docs/DECIMAL.md`](./docs/DECIMAL.md)。
 
 已知差距与路线图统一记录在 [`TODO.md`](./TODO.md)。

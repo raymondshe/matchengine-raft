@@ -601,7 +601,7 @@ stops are not depth either; they appear only as `LIFECYCLE` events (`triggered`)
    task captures the
    real book only at startup, on leadership gain and (optionally) for reconciliation. The per-price
    bucket index in `TODO.md` §9 stays a matching-side optimization; the feed does not depend on it.
-6. **Prices, quantities and fees are scale-18 integers.** Wire v5 encodes every financial value as a
+6. **Prices, quantities and fees are scale-18 integers.** Wire v6 encodes every financial value as a
    little-endian `i128` at 18 fractional digits; no public financial output crosses `f64`.
 7. **One process/cluster per symbol.** A process trades exactly one symbol; multi-symbol means
    running a separate process/cluster per symbol so CPU, memory, logs, snapshots and failures stay
@@ -753,11 +753,11 @@ Bodies:
 
 | Type | Fields |
 |---|---|
-| `TRADE` | `count u32`, then per fill: `log_index u64`, `ordinal u32`, `ts_ms u64`, `price i128`, `volume i128`, `taker_fee i128`, `maker_fee i128`, `fee_overflow u8`, `taker_side u8` (0 = buy aggressor, 1 = sell), `taker_seq u64`, `maker_seq u64` |
+| `TRADE` | `count u32`, then per fill: `log_index u64`, `ordinal u32`, `ts_ms u64`, `price i128`, `volume i128`, `taker_fee i128`, `maker_fee i128`, `error u8` (bit set: 1 notional, 2 taker, 4 maker), `taker_side u8` (0 = buy aggressor, 1 = sell), `taker_seq u64`, `maker_seq u64` |
 | `BBO` | `present u8` + `last_trade i128`, `bid i128`, `bid_volume i128`, `ask i128`, `ask_volume i128`, `present u8` + `mid i128`, `present u8` + `spread i128` |
 | `DEPTH_DELTA` | `count u32`, then `[side u8, price i128, total_visible i128, orders u32]` per touched level |
 | `DEPTH_SNAPSHOT` | `bid_levels u32`, `ask_levels u32`, then level records, best first |
-| `LIFECYCLE` | `count u32`, then per event: `log_index u64`, `ordinal u32`, `ts_ms u64`, `kind u8`, `order_sequence u64`, `counterparty u64` (0 = none), `price i128`, `volume i128`, `taker_fee i128`, `maker_fee i128`, `fee_overflow u8`, `reason u8` |
+| `LIFECYCLE` | `count u32`, then per event: `log_index u64`, `ordinal u32`, `ts_ms u64`, `kind u8`, `order_sequence u64`, `counterparty u64` (0 = none), `price i128`, `volume i128`, `taker_fee i128`, `maker_fee i128`, `error u8` (bit set: 1 notional, 2 taker, 4 maker), `reason u8` |
 | `STATUS` | `last_market_seq u64`, `last_sub_seq u16`, `last_log_index u64`, `last_ordinal u32`, `applied_index u64`, `book_sequence u64`, `pending_stops u32` |
 | `GAP` | `last_good_log_index u64`, `last_good_ordinal u32`, `dropped u32`, `product u8` |
 | `BAR` | `interval_ms u32`, `window_start_ms u64`, `last_ts_ms u64`, `open i128`, `high i128`, `low i128`, `close i128`, `volume i128`, `trade_count u32`, `bar_seq u64` |
@@ -863,8 +863,9 @@ independent of the feed.
   those are committed, so they are not wrong — consumers dedupe on
   `(symbol_id, stream_id, market_seq, sub_seq)` (§16.1) and honour the `RESET`/snapshot ordering
   rule. The keys are replicated-state derived, so the handover does not reset the sequence space.
-- **Leader restart.** State is restored from the v9 snapshot plus log replay (v9 adds asset
-  metadata, tick/lot rules, volume units and fee assets; v8 adds fee rates and fill fees; v7 adds
+- **Leader restart.** State is restored from the v10 snapshot plus log replay (v10 replaces the
+  boolean fee-overflow flag with `MatchErrors`; v9 adds asset metadata, tick/lot rules, volume units
+  and fee assets; v8 adds fee rates and fill fees; v7 adds
   the single-symbol precision configuration; v6 stores the last trade and match events as
   fixed-point; v5 stored order prices/quantities; v4 carries the match-event window and submission
   dedupe map; v3 added stops and `last_trade_price`); the seeder
@@ -1110,7 +1111,7 @@ book.
   but survive duplication and simplify recovery.
 - Archive deployment: every node, or only the current leader? Retention and disk budget?
 - Are lifecycle events and order sequences public? If not, split streams and networks.
-- ~~Price encoding~~ Resolved: wire v5 carries scale-18 `i128` prices, quantities and fees; old v2/v3
+- ~~Price encoding~~ Resolved: wire v6 carries scale-18 `i128` prices, quantities and fees; old v2/v3
   frames are not silently reinterpreted.
 - Journal vs event-only reconstruction: the journal is exact (iceberg refills, hidden volume) but
   touches the book module; events alone would leave the tap fully outside `order_book/` but need

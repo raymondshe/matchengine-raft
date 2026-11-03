@@ -1,10 +1,10 @@
 # Fee Deduction Design: Base vs Quote Volume
 
-Status: **core implemented.** The engine now carries base/quote asset metadata, tick/lot rules,
-`VolumeUnit`, quote-aware sweeps and `FeeAssetPolicy`. Snapshot **v9** and wire **v5** encode the
-new fields. Extensions still open are listed in §13 (fee-token support and launch asset-class
-scope). Sessions, settlement, corporate actions and fixed/regulatory/minimum/tax fees are owned by
-the external order system.
+Status: **core implemented for cash/spot.** The engine now carries base/quote asset metadata,
+tick/lot rules, `VolumeUnit`, quote-aware sweeps and `FeeAssetPolicy`. Snapshot **v10** and wire
+**v6** encode the new fields. Derivatives and margin-asset settlement are a documented extension,
+not implemented; the required model is in §3.2 and the open items are in §13. Sessions, settlement,
+corporate actions and fixed/regulatory/minimum/tax fees are owned by the external order system.
 
 ## 1. Goals
 
@@ -115,8 +115,89 @@ Quote-volume orders are especially useful for instruments bought by cash amount,
 - Notional-proportional maker/taker rates cover the common crypto and brokerage tiers. Fixed
   per-trade fees, per-share commissions, regulatory fees (for example SEC/FINRA fees), minimum
   tickets and taxes are owned by the external order system and are out of scope for this engine.
-- Short selling, margin, lending, dividends and tax withholding are outside this matching-engine
-  design.
+- Spot short selling, margin lending, dividends and tax withholding are outside this
+  matching-engine design. Derivatives margin and third-asset settlement are discussed in §3.2; they
+  require an explicit extension and are not part of the implemented `FeeAssetPolicy`.
+
+### 3.2 Derivatives and margin assets (not implemented)
+
+The implemented engine is cash/spot: the base asset is delivered, the quote asset is paid, and a
+fee can only be denominated in one of those two assets. A derivative introduces a third role — the
+**settlement or margin asset** — and a different notional formula. The common shapes do not all fit
+the current `FeeAssetPolicy`:
+
+| Instrument | Price and quantity | Margin / fee asset | Fit with the current model |
+|---|---|---|---|
+| Linear USDT-margined perpetual or future (BTC/USDT) | USDⓈ per BTC; quantity in BTC or contracts | USDT (`quote`) | Fee asset can be `Quote`, but instrument kind and any contract multiplier are missing |
+| Inverse coin-margined perpetual or future (BTC/USD) | USD per BTC; quantity in contracts with a fixed USD value | BTC (`base`) | Fee is `(contracts × contract_value / price) × rate`, not `base_quantity × rate` for raw contract quantity |
+| Third-asset margin, for example USDC-collateralised BTC/USD | USD per BTC | USDC, neither base nor quote | No `FeeAsset` variant and no settlement-asset field |
+| Quanto or multi-collateral contract | Underlying price and settlement currency differ | A settlement asset or portfolio currency | No FX/conversion metadata; cannot infer the asset |
+
+The engine must not infer a margin asset from `quote_asset` or treat `FeeAssetPolicy::Quote` as a
+synonym for “margin”. The USDT-margined linear case happens to have `margin == quote`, so it can be
+reported with `Quote` once the instrument metadata exists. Inverse and third-asset contracts need an
+explicit settlement asset and their own fee formula.
+
+Recommended metadata extension:
+
+```rust
+pub enum InstrumentKind {
+    Spot,
+    LinearPerpetual,
+    LinearFuture,
+    InversePerpetual,
+    InverseFuture,
+    Option,
+}
+
+pub struct SymbolConfig {
+    // existing fields...
+    pub instrument_kind: InstrumentKind,
+    // Linear: base units per contract. Inverse: quote value per contract. Zero/one for spot.
+    pub contract_multiplier: Fixed,
+    pub settlement_asset: AssetId, // margin, PnL and default fee asset
+}
+
+pub enum FeeAsset {
+    Base,
+    Quote,
+    Settlement, // resolves to SymbolConfig::settlement_asset
+}
+```
+
+Define `Order.volume` explicitly as either underlying quantity or contracts. If it is contracts,
+`base_lot` is a contract lot and `contract_multiplier` converts contracts to base-equivalent
+quantity for fees and risk. For linear contracts:
+
+```text
+N = price * contracts * contract_multiplier
+fee_settlement = N * rate
+fee_base       = contracts * contract_multiplier * rate
+```
+
+For inverse contracts the quote notional is fixed per contract:
+
+```text
+N_quote = contracts * contract_multiplier   // multiplier is quote value per contract
+Q_base  = N_quote / price
+fee_base = Q_base * rate
+```
+
+A third-asset fee also needs an explicit conversion from the contract's quote currency to the
+settlement asset, or a fee schedule denominated directly in settlement units. The matching engine
+must not invent that conversion.
+
+Derivatives add cash flows and risk state that this engine does not implement:
+
+- funding payments for perpetuals;
+- liquidation, insurance-fund and auto-deleveraging cash flows;
+- initial and maintenance margin, leverage limits and portfolio netting;
+- premium, settlement and option exercise/expiry;
+- realised and unrealised PnL in the settlement asset.
+
+Those belong to the gateway, risk and clearing layers. The matching engine can still own
+price-time matching and report gross fills and fees, but it must not claim to settle margin or
+calculate liquidation prices.
 
 ## 4. Baseline this design replaced
 
@@ -318,6 +399,27 @@ fees. A quote-market buy budget is a **gross notional** cap; when the fee asset 
 an additional quote debit unless the gateway defines the budget as fee-inclusive. That choice is
 listed in the open decisions.
 
+### 6.5 Derivatives and margin-asset fees
+
+For derivatives, the relevant fee asset is normally the **settlement/margin asset**, not the
+“received” spot asset:
+
+- Linear USDT-margined contracts: margin, PnL and fees are in USDT. If the symbol's quote is USDT,
+  `FeeAssetPolicy::Quote` already names the right asset; the notional must still include the
+  contract multiplier.
+- Inverse coin-margined contracts: margin, PnL and fees are in the base coin, but the fee is derived
+  from a fixed quote value per contract and the current price. `FeeAssetPolicy::Base` names the
+  right asset, but `fee = Q * rate` is only correct when `Q` is the base-equivalent fill quantity,
+  not the raw contract count.
+- Third-asset or multi-collateral margin: the settlement asset is neither the symbol's base nor
+  quote. Add `FeeAsset::Settlement` (resolved through `SymbolConfig::settlement_asset`) or an
+  explicit asset id; do not misuse `Quote` or `Base`.
+- `Received` is a spot-delivery policy (buyer receives base, seller receives quote). It is not the
+  default for a derivative; a derivative has no base/quote delivery on the fill.
+
+The engine should keep reporting `taker_fee_asset` and `maker_fee_asset` explicitly, even when the
+fee amount is zero because of overflow. Risk and clearing must know which asset the zero refers to.
+
 ## 7. Rounding and precision
 
 `SymbolConfig` should describe the pair, its two assets and its tradable increments:
@@ -355,6 +457,80 @@ Recommended rounding rules:
 Decision: the engine reports exact scale-18 fees plus the explicit fee asset; the clearing layer
 applies the final asset precision. This keeps matching deterministic and avoids a node-local
 rounding policy.
+
+### 7.1 Overflow and `error`
+
+Every price, quantity, notional and fee is a scale-18 `Fixed` stored in an `i128`. The largest
+representable value is `i128::MAX / 10^18`, about `1.7014e20` units. `Fixed::checked_mul`
+multiplies through a 256-bit intermediate and truncates toward zero; it returns `None` only when
+the scaled result cannot fit `i128`.
+
+One fill computes three dependent values independently:
+
+```text
+N          = maker_price * matched_volume
+taker_fee  = (taker_fee_asset  == Base ? matched_volume : N) * taker.taker_fee_rate
+maker_fee  = (maker_fee_asset  == Base ? matched_volume : N) * maker.maker_fee_rate
+```
+
+A failure in any one computation sets an error code on the fill:
+
+| Code | Value that is unavailable |
+|---|---|
+| `notional_overflow` | `quote_volume` (the gross quote notional `N`) |
+| `taker_fee_overflow` | `taker_fee` |
+| `maker_fee_overflow` | `maker_fee` |
+
+The fill carries `error`, an ordered set of these codes. An empty set (`[]` in JSON) means every
+dependent value is exact. Multiple codes can be present and are emitted in the fixed order above.
+
+- If `N` overflows, `quote_volume` is `0`; if a fee calculation overflows, that fee is `0`.
+- The fill itself is still valid: price, volume, matched gross quantity, order identities and fee
+  assets remain exact. Matching never saturates or wraps, and overflow never changes book state.
+- `error` is **fill-scoped and non-fatal**. It is not `MatchEngineResponse.error`, which rejects a
+  write; a fill carrying codes has already been accepted and committed.
+- Quote-asset fees depend on `N`, so a notional overflow normally zeroes both quote fees.
+- Base-asset fees depend only on matched volume. If `N` overflows but a base fee still fits, the
+  base fee remains nonzero and exact while `error` contains `notional_overflow`.
+- A flagged fill can therefore mix valid and unavailable values. Because zero is also a valid fee,
+  consumers must use the codes: a zero is exact only when its code is absent. If exact settlement
+  is required, quarantine or recompute the flagged fill.
+- Fee assets are not affected by overflow: `taker_fee_asset` and `maker_fee_asset` are still
+  reported from the symbol policy and order sides. Signed rebates use the same checked path; an
+  overflowing rebate becomes `0` with `maker_fee_overflow` or `taker_fee_overflow` set rather than
+  being clamped.
+
+JSON example:
+
+```json
+{
+  "quote_volume": "0",
+  "taker_fee": "0",
+  "maker_fee": "0.001",
+  "error": ["notional_overflow"]
+}
+```
+
+Examples:
+
+- QQQ/USD under the ETF quote policy: price `100,000,000,000`, volume `10,000,000,000` gives
+  `N = 10^21`, above the scale-18 range. Both quote fees are `0`, assets remain `quote`, and
+  `error` is `["notional_overflow", "taker_fee_overflow", "maker_fee_overflow"]`.
+- The same fill under a Base/Base policy: `quote_volume` is `0` and `error` contains
+  `notional_overflow`, but the base-denominated maker and taker fees remain exact (`0.001` and
+  `0.002` of the matched volume).
+
+`MatchErrors` is a copyable bitmask internally and a JSON string array externally. New non-fatal
+fill conditions can add a code without changing the event shape. The current numeric fields remain
+zero when unavailable; a future version may make them nullable, which would remove the need to
+cross-check the code before using a zero.
+
+Derivatives make overflow easier to reach because notional includes the contract multiplier and the
+settlement asset may require a conversion. A fill with an overflow code must not be fed into margin,
+PnL or liquidation calculations as if its zero fields were real.
+
+This is a breaking event/wire/snapshot change: snapshot **v10** and wire **v6** carry `MatchErrors`.
+The v9/v5 boolean `fee_overflow` is legacy and is not decoded into the new shape.
 
 ## 8. Impact on order-book execution
 
@@ -448,6 +624,11 @@ If the implementation prefers not to extend `Order`, introduce an internal `Rest
 with `base_remaining` and the original metadata. The book should not compare quote amounts as if
 they were base quantities.
 
+The derivatives extension in §3.2 also requires `VolumeUnit::Contract`, the instrument kind,
+contract multiplier and settlement asset in `SymbolConfig`, and `FeeAsset::Settlement`. These are
+wire and snapshot changes: snapshot v10 and wire v6 cannot carry them without another version and
+migration.
+
 ### 9.2 `MatchResult`
 
 Replace the current unitless fee fields with explicit asset-aware fields:
@@ -461,7 +642,7 @@ pub struct MatchResult {
     pub taker_fee_asset: FeeAsset,
     pub maker_fee: Fixed,
     pub maker_fee_asset: FeeAsset,
-    pub fee_overflow: bool,
+    pub error: MatchErrors, // ordered set of overflow codes
     // existing taker/maker order identity
 }
 ```
@@ -469,6 +650,10 @@ pub struct MatchResult {
 `FeeAsset` names the side of the pair (`Base`/`Quote`); the actual `AssetId` comes from
 `SymbolConfig`. A future fee-token extension can replace it with an explicit `AssetId` and a
 fee-price model without changing the matching arithmetic.
+
+`error` is a fill-scoped set of codes, not proof that both fees are zero; see §7.1. A base fee can
+remain exact when only the quote notional overflows. Downstream consumers must not treat a zeroed
+dependent field as real when its code is present.
 
 ### 9.3 Events and feed
 
@@ -478,7 +663,7 @@ Each fill event should expose:
 - gross quote notional;
 - taker fee and fee asset;
 - maker fee and fee asset;
-- `fee_overflow`;
+- `error` under the fill-level rules in §7.1;
 - requested volume unit (for audit);
 - any quote remainder or quote overshoot.
 
@@ -539,9 +724,10 @@ This was implemented as a breaking storage/wire change:
 
 - `Order` gained `volume_unit` and normalized/requested volume metadata.
 - `SymbolConfig` gained base/quote asset metadata and the fee policy.
-- `MatchEvent`/`MatchResult` gained quote notional and fee-asset fields.
-- Snapshot version is **v9**.
-- Market-data wire format is **v5**.
+- `MatchEvent`/`MatchResult` gained quote notional and fee-asset fields; the boolean
+  `fee_overflow` was replaced by the ordered `error`/`MatchErrors` code set.
+- Snapshot version is **v10**.
+- Market-data wire format is **v6**.
 - Existing snapshots cannot be decoded into the new shape; data directories must be recreated or
   a versioned decoder must be added.
 - `volume_unit` defaults to `Base` and fee policy to `Received` for JSON compatibility, but old
@@ -573,6 +759,9 @@ Migration order used:
 - 18-digit exactness, snapshot restart and wire round-trip.
 - Determinism across replicas and failover.
 - No negative/over-budget remainders; no crossed book.
+- Derivatives extension: linear USDT-margined fees in quote, inverse fees in base, third-asset
+  settlement, contract-multiplier notional, maker rebates and overflow quarantine; margin/PnL and
+  funding stay outside the engine.
 
 ## 13. Decisions and remaining questions
 
@@ -592,19 +781,29 @@ Implemented choices:
 Still open:
 
 10. Which asset classes must be supported at launch: fiat, stablecoin, crypto, equity, ETF, or a
-   subset? `AssetId`/`AssetClass` exist; production asset issuance/validation is still a deployment
-   concern.
-13. Can fees be charged in an asset other than base or quote (for example a broker fee in USD on a
+    subset? `AssetId`/`AssetClass` exist; production asset issuance/validation is still a deployment
+    concern.
+11. Can fees be charged in an asset other than base or quote (for example a broker fee in USD on a
     BTC/USDT trade)? That requires a fee-token price and balance handling.
+12. Derivatives support requires an instrument kind, contract multiplier, settlement/margin asset,
+    `VolumeUnit::Contract` and `FeeAsset::Settlement`; the fee formula depends on whether the
+    contract is linear, inverse, quanto or third-asset margined. This is a snapshot/wire-version
+    change, not an incremental `FeeAssetPolicy` value.
+13. For third-asset margin, decide whether fees are charged directly in settlement units or
+    converted from the contract's quote currency at an explicit, versioned rate. The engine must not
+    infer an FX rate.
 
 Resolved:
 
-11. Fixed per-trade fees, per-share commissions, regulatory fees, minimum tickets and taxes are
+14. Fixed per-trade fees, per-share commissions, regulatory fees, minimum tickets and taxes are
     owned by the external order system; the engine computes only notional-proportional maker/taker
     rates.
-12. Equity/ETF sessions, holidays, auctions, T+1/T+2 settlement and corporate actions are owned by
+15. Equity/ETF sessions, holidays, auctions, T+1/T+2 settlement and corporate actions are owned by
     the external order system; the engine consumes explicit timestamps and has no clock or
     corporate-action logic.
+16. Funding, liquidation, insurance funds, auto-deleveraging, initial/maintenance margin, leverage
+    limits, portfolio netting, option exercise and realised/unrealised PnL are owned by the
+    risk/clearing layer. The matching engine reports fills and fees only.
 
 ## 14. Recommendation
 
@@ -625,7 +824,14 @@ Adopt the following default contract:
 - Equity/ETF sessions, holidays, auctions, T+1/T+2 settlement, corporate actions and
   fixed/regulatory/minimum/tax fees stay upstream in the external order system; the engine consumes
   explicit session-close/GTD timestamps and notional-proportional maker/taker rates.
-- Snapshot v9 and wire v5 gate the change.
+- Keep the implemented cash/spot contract as-is. Before derivatives, add instrument kind, contract
+  multiplier, settlement/margin asset, `VolumeUnit::Contract` and `FeeAsset::Settlement`; do not
+  reinterpret `Quote` as “margin”.
+- Derivatives funding, liquidation, margin and PnL stay upstream; the engine matches orders and
+  reports gross fills, fees and fee assets. A fill with an overflow error code must be quarantined
+  rather than treated as zero fee/notional by the risk layer.
+- Snapshot v10 and wire v6 gate the cash/spot change; a derivatives extension needs a new
+  snapshot/wire version.
 
 This keeps the order book’s price-time priority unchanged while extending the execution path with
 one explicit quote-aware sweep mode and asset-aware fee reporting.
