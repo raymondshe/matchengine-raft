@@ -32,23 +32,27 @@ restarts without a partial snapshot and retries cleanly. Pre-Vote is enabled wit
 RPC (§4), so an isolated node asks before campaigning. The wire v6 reference decoder and golden
 tests are complete (§6).
 
-The next work, in order (re-prioritised 2026-11-04 after the external optimization-notes
-re-review, whose verdicts are in [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md)):
+The next work, in order (re-prioritised 2026-11-04 after the benchmark-measurement pass and the
+external optimization-notes re-review, whose verdicts are in
+[`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md)):
 
-1. **Benchmark measurement discipline (§8, P1).** Add p50/p99 to `book_replay` and `level_book`,
-   label cache warmth per row, and run one pinned-core `e2e` pass. Best-of-5 whole-round times hide
-   the tails that a regression gate needs; this is the prerequisite for item 2.
-2. **Benchmark regression gate (§8, P2).** Gate CI on `apply_path` allocs/entry (deterministic) plus
-   loose percentile thresholds from item 1.
-3. **Event delivery Phase 4 (§5).** Long-poll `wait_ms`, gRPC `StreamEvents` and the optional MQ
+1. **Benchmark regression gate (§8, P2).** Gate CI on `apply_path` allocs/entry (deterministic) plus
+   loose percentile thresholds now that `book_replay` and `level_book` report warm p50/p99.
+2. **Event delivery Phase 4 (§5).** Long-poll `wait_ms`, gRPC `StreamEvents` and the optional MQ
    bridge; this also settles the event-time/cursor item in §11.
-4. **Realistic-mix replay benchmark (§8, P2).** Replay a large fixture with a real
+3. **Realistic-mix replay benchmark (§8, P2).** Replay a large fixture with a real
    add/cancel/amend mix (stops, icebergs, fees) and report percentiles - the load analogue of
    `tests/replay` and the closest equivalent to the ITCH-style replay the external notes treat as
    the only production-like signal.
+4. **Linux pinned-core `e2e` pass (§8, P2).** `--pin <cpu>` is implemented (Linux
+   `sched_setaffinity`) and fails loudly on macOS; run
+   `cargo bench --bench e2e -- --pin 0` once on a Linux host to record the true single-core number.
 
-The quick wins from the last review are complete: `Order` identity `PartialEq`, optional
-`Order::sequence`, a BTC/USDT quote-volume case, and the `fee_overflow_base_orders` replay case.
+The measurement work from the re-review is done: `book_replay` and `level_book` now report warm
+p50/p99 plus an interleaved cold pass with setup/drop outside the timer, and this macOS host's
+closest pinned approximation (current-thread runtime) showed no change. The quick wins from the
+last review are also complete: `Order` identity `PartialEq`, optional `Order::sequence`, a BTC/USDT
+quote-volume case, and the `fee_overflow_base_orders` replay case.
 
 ## 1. Exact fixed-point end-to-end — done
 
@@ -359,29 +363,33 @@ Remaining:
 - [x] **P1** Record measured peak RSS for the microbench, e2e, feed, storage and P0 workloads in
   `docs/PERFORMANCE.md`; the table states that RSS is whole-process, not per-order.
 - [x] **P1** Add a book-only replay benchmark (`cargo bench --bench book_replay`): 1k/100-level
-  sweep 94.7µs (10.56M fills/s), 20k/1-level sweep 2.209ms (9.06M fills/s), 5k deep cancels
-  270.9µs (18.46M cancels/s), 1k-level BBO advance 98.3µs (20.35M advances/s), 1M BBO queries
-  2.335ms (428M queries/s).
+  sweep 85.7µs warm p50 (11.66M fills/s), 20k/1-level sweep 2.319ms (8.86M fills/s), 5k deep
+  cancels 256.7µs (19.63M cancels/s), 1k-level BBO advance 97.5µs (20.37M advances/s), 1M BBO
+  queries 2.492ms (434M queries/s).
 - [x] **P1** Add an apply-path allocation benchmark (`cargo bench --bench apply_path`) and reduce
   the common event path with inline `SmallVec` buffers: rest 7.17→4.17, cancel 6.00→4.00, fill
   8.00→5.00 allocs/entry; batch rest 6.23→4.19 allocs/entry. Requested bytes/entry fell from
   2,323→595 (rest) and 1,308→156 (cancel); fill 3,308→2,012 and batch rest 2,393→1,693. The
   remaining allocations are the `BTreeMap` node, response `events` `Vec`, legacy `value` `String`
   and fill `MatchResult` `Vec`.
-- [ ] **P1** Report percentiles, not only best-of-5: add p50/p99 to `book_replay` and `level_book`
-  rounds and label cache warmth per row. Only `e2e` reports percentiles today, and the external
-  optimization-notes review (2026-11-04) showed best-of-5 hides exactly the tails a gate needs.
+- [x] **P1** Report percentiles, not only best-of-5, and label cache warmth. Done:
+  `benches/bench_support` clones before the timer and drops after it, reports warm p50/p99 plus
+  best-of-5, and interleaves a cold pass with a 64 MiB eviction sweep. `book_replay` now shows the
+  1k-ask sweep at 85.7µs p50 / 171.8µs p99; `level_book` keeps best-of-5 for continuity and uses
+  p50 as the headline.
 - [ ] **P1** Add one realistic-mix replay benchmark: replay a large fixture (add/cancel/amend with
   stops, icebergs and fees) and report p50/p99. `tests/replay` is correctness-only; this is its
   load analogue.
 - [ ] **P2** Adopt per-level buckets or a compact resting record only if the P1 prototype and
-  new 3-node or real-sink measurements justify the complexity. The prototype wins populated-level
-  match/cancel/amend and cached-BBO queries but loses sparse one-order-per-level re-queue and
-  BBO advance; full adoption is not justified yet, and a hybrid or sparse-level fast path is the
-  next experiment.
+  new 3-node or real-sink measurements justify the complexity. The 2026-11-04 run wins 1.84x
+  match, 3.31x cancel, 1.75x/2.59x amend and 4.90x BBO query, but loses 0.75x sparse amend, 0.87x
+  BBO advance and 0.96x depth; full adoption is not justified yet, and a hybrid or sparse-level
+  fast path is the next experiment.
 - [ ] **P2** Add a benchmark regression gate (threshold or recorded baseline) to CI.
-- [ ] **P2** Run `cargo bench --bench e2e` pinned to one core (`taskset -c <n>`) once, to separate
-  scheduler noise from the fsync cost that dominates the current p99.
+- [ ] **P2** Run `cargo bench --bench e2e -- --pin <cpu>` on a Linux host once, to separate
+  scheduler noise from the fsync cost that dominates the current p99. The flag is implemented; this
+  macOS host has no core-pinning API, so the recorded 2026-11-04 approximation is the
+  current-thread runtime (p50 3.95ms / p99 5.22ms vs 3.93ms / 5.10ms multi-thread, i.e. no change).
 - [ ] **P2** Reserve the known lengths for the remaining apply-path allocations (response `events`
   `Vec`, fill `MatchResult` `Vec`) where the shape is fixed; they are the `apply_path` leftovers.
 
@@ -592,8 +600,11 @@ P0/P1 follow-ups (all completed):
 
 Open follow-ups:
 
-- [ ] **P1** Add percentiles and cache-warmth labels to the book benchmarks, add a realistic-mix
-  replay, and run one pinned-core `e2e` pass (tracked in §8, from the same re-review).
+- [x] **P1** Add percentiles and cache-warmth labels to the book benchmarks. Done: shared
+  `benches/bench_support` with warm/cold, setup/drop exclusion and p50/p99 (tracked in §8).
+- [ ] **P1** Add the realistic-mix replay benchmark (tracked in §8, from the same re-review).
+- [ ] **P2** Run the Linux pinned-core `e2e` pass; the `--pin` flag exists and this macOS host
+  cannot pin (tracked in §8).
 - [ ] **P2** Evaluate a binary order-entry path (gRPC/protobuf or compact codec) and feature-gated
   latency histograms only if a latency target requires them.
 - [ ] **P2** Evaluate real ITCH-style replay data and custom MPMC/SIMD/io_uring work only after a

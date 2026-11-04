@@ -70,6 +70,7 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 [dev-dependencies]
 anyhow = "1.0.104"
+libc = "0.2.191"
 maplit = "1.0.2"
 sled = "0.34.7"
 

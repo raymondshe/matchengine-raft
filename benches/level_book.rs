@@ -9,14 +9,22 @@
 //! expiry, validation, events, the depth journal and the market-data tap, so the
 //! numbers isolate the book data structure. It is compared side-by-side with
 //! `OrderBook` on the same workloads; adoption remains a P2 decision.
+//!
+//! Timing follows `benches/bench_support`: the state is cloned outside the
+//! timer, and each case reports the historical best-of-5 mean-of-rounds plus
+//! warm p50/p99 over all per-round samples, then a cold pass that evicts the
+//! caches (64 MiB read-modify-write sweep) between the clone and the timed op.
+//! The headline comparison is the p50 speedup; best-of-5 is kept for continuity
+//! with the recorded baselines.
+
+#[path = "bench_support/mod.rs"]
+mod bench_support;
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::hash::BuildHasherDefault;
 use std::hash::Hasher;
 use std::hint::black_box;
-use std::time::Duration;
-use std::time::Instant;
 
 use matchengine_raft::order_book::Amendment;
 use matchengine_raft::order_book::DepthLevel;
@@ -487,57 +495,65 @@ fn prototype_amend_book(levels: u32, per_level: u32) -> (LevelBook, Vec<(u64, Fi
     (book, entries)
 }
 
-#[derive(Clone, Copy)]
-struct Measurement {
-    duration: Duration,
-    units: usize,
-}
-
-/// Clones `base` outside the timer, runs `op` and keeps the best of five
-/// per-round averages. This mirrors `book_replay`.
+/// Clones `base` outside the timer, runs `op` and keeps the historical
+/// best-of-5 mean-of-rounds plus warm p50/p99 and a cold eviction pass.
 fn measure<T>(
     rounds: u32,
     base: &T,
-    clone: impl Fn(&T) -> T,
-    mut op: impl FnMut(T) -> usize,
-) -> Measurement {
-    let mut best = Duration::MAX;
-    let mut best_units = 0;
-
-    for _ in 0..5 {
-        let mut elapsed = Duration::ZERO;
-        let mut units = 0usize;
-        for _ in 0..rounds {
-            let state = clone(base);
-            let start = Instant::now();
-            units += op(state);
-            elapsed += start.elapsed();
-        }
-        let per_round = elapsed / rounds;
-        if per_round < best {
-            best = per_round;
-            best_units = units / rounds as usize;
-        }
-    }
-
-    Measurement {
-        duration: best,
-        units: best_units,
-    }
+    clone: impl FnMut(&T) -> T,
+    op: impl FnMut(&mut T) -> usize,
+) -> bench_support::Samples {
+    bench_support::run(bench_support::Config::default(), rounds, base, clone, op)
 }
 
-fn report(name: &str, current: Measurement, prototype: Measurement, unit: &str) {
-    let current_rate = current.units as f64 / current.duration.as_secs_f64();
-    let prototype_rate = prototype.units as f64 / prototype.duration.as_secs_f64();
-    let speedup = if current_rate > 0.0 {
+fn speedup(
+    current: &bench_support::Samples,
+    prototype: &bench_support::Samples,
+    pick: impl Fn(&bench_support::Samples) -> std::time::Duration,
+) -> f64 {
+    let current_rate = current.units_per_second(pick(current));
+    let prototype_rate = prototype.units_per_second(pick(prototype));
+    if current_rate > 0.0 {
         prototype_rate / current_rate
     } else {
         f64::INFINITY
-    };
+    }
+}
+
+/// Prints the side-by-side comparison: the headline speedup at p50 (the metric
+/// the docs quote), the historical best-of-5 speedup for continuity, and both
+/// books' warm best/p50/p99 and cold p50/p99.
+fn report(
+    name: &str,
+    rounds: u32,
+    current: bench_support::Samples,
+    prototype: bench_support::Samples,
+    unit: &str,
+) {
+    let p50 = speedup(&current, &prototype, bench_support::Samples::warm_p50);
+    let best = speedup(&current, &prototype, |samples| samples.warm_best(rounds));
+    let current_rate = current.units_per_second(current.warm_p50());
+    let prototype_rate = prototype.units_per_second(prototype.warm_p50());
     println!(
-        "{name:46} current {current:>10?} ({current_rate:>12.0} {unit}/s)  prototype {prototype:>10?} ({prototype_rate:>12.0} {unit}/s)  {speedup:>5.2}x",
-        current = current.duration,
-        prototype = prototype.duration,
+        "{name}: prototype {p50:.2}x at p50 ({current_rate:.0} -> {prototype_rate:.0} {unit}/s), {best:.2}x at best-of-5"
+    );
+    println!(
+        "  warm  current best {:>10?} p50 {:>10?} p99 {:>10?}   prototype best {:>10?} p50 {:>10?} p99 {:>10?}",
+        current.warm_best(rounds),
+        current.warm_p50(),
+        current.warm_p99(),
+        prototype.warm_best(rounds),
+        prototype.warm_p50(),
+        prototype.warm_p99(),
+    );
+    println!(
+        "  cold  current p50 {:>10?} p99 {:>10?} (n={})   prototype p50 {:>10?} p99 {:>10?} (n={})",
+        current.cold_p50(),
+        current.cold_p99(),
+        current.cold.len(),
+        prototype.cold_p50(),
+        prototype.cold_p99(),
+        prototype.cold.len(),
     );
 }
 
@@ -696,8 +712,10 @@ fn verify() {
 fn main() {
     verify();
     println!("prototype verification: OK");
-    println!("per-level bucket prototype vs current OrderBook (book-only, best-of-5)");
-    println!("scope: plain limit orders; no stops, icebergs, GTD, events, feed or journal\n");
+    println!("per-level bucket prototype vs current OrderBook (book-only)");
+    println!("scope: plain limit orders; no stops, icebergs, GTD, events, feed or journal");
+    println!("warm = clone immediately before the timed op; cold = 64 MiB eviction sweep first");
+    println!("best = best mean-of-rounds over 5 repeats; p50/p99 = nearest-rank per round\n");
 
     let (current_book, current_taker) = current_sweep_book(100, 10);
     let (prototype_book, prototype_taker) = prototype_sweep_book(100, 10);
@@ -705,8 +723,8 @@ fn main() {
         100,
         &(current_book, current_taker),
         |(book, taker)| (book.clone(), *taker),
-        |(mut book, mut taker)| {
-            let fills = book.place_order(&mut taker);
+        |(book, taker)| {
+            let fills = book.place_order(taker);
             assert_eq!(1_000, fills.len());
             assert!(book.asks.is_empty());
             fills.len()
@@ -716,15 +734,21 @@ fn main() {
         100,
         &(prototype_book, prototype_taker),
         |(book, taker)| (book.clone(), *taker),
-        |(mut book, mut taker)| {
+        |(book, taker)| {
             let limit = taker.price;
-            let fills = book.match_taker(&mut taker, Some(limit));
+            let fills = book.match_taker(taker, Some(limit));
             assert_eq!(1_000, fills.len());
             assert!(book.asks.is_empty());
             fills.len()
         },
     );
-    report("match 1k asks / 100 levels", current, prototype, "fills");
+    report(
+        "match 1k asks / 100 levels",
+        100,
+        current,
+        prototype,
+        "fills",
+    );
 
     let (current_book, current_taker) = current_sweep_book(1, 20_000);
     let (prototype_book, prototype_taker) = prototype_sweep_book(1, 20_000);
@@ -732,8 +756,8 @@ fn main() {
         20,
         &(current_book, current_taker),
         |(book, taker)| (book.clone(), *taker),
-        |(mut book, mut taker)| {
-            let fills = book.place_order(&mut taker);
+        |(book, taker)| {
+            let fills = book.place_order(taker);
             assert_eq!(20_000, fills.len());
             assert!(book.asks.is_empty());
             fills.len()
@@ -743,15 +767,15 @@ fn main() {
         20,
         &(prototype_book, prototype_taker),
         |(book, taker)| (book.clone(), *taker),
-        |(mut book, mut taker)| {
+        |(book, taker)| {
             let limit = taker.price;
-            let fills = book.match_taker(&mut taker, Some(limit));
+            let fills = book.match_taker(taker, Some(limit));
             assert_eq!(20_000, fills.len());
             assert!(book.asks.is_empty());
             fills.len()
         },
     );
-    report("match 20k asks / 1 level", current, prototype, "fills");
+    report("match 20k asks / 1 level", 20, current, prototype, "fills");
 
     let (current_book, current_orders) = current_cancel_book(100, 100);
     let (prototype_book, prototype_sequences) = prototype_cancel_book(100, 100);
@@ -759,7 +783,7 @@ fn main() {
         50,
         &(current_book, current_orders),
         |(book, orders)| (book.clone(), orders.clone()),
-        |(mut book, orders)| {
+        |(book, orders)| {
             let mut cancelled = 0usize;
             for order in orders.iter().rev() {
                 if book.cancel(order).is_some() {
@@ -774,7 +798,7 @@ fn main() {
         50,
         &(prototype_book, prototype_sequences),
         |(book, sequences)| (book.clone(), sequences.clone()),
-        |(mut book, sequences)| {
+        |(book, sequences)| {
             let mut cancelled = 0usize;
             for &sequence in sequences.iter().rev() {
                 if book.cancel(sequence).is_some() {
@@ -787,6 +811,7 @@ fn main() {
     );
     report(
         "cancel 5k at depth / 50 levels",
+        50,
         current,
         prototype,
         "cancels",
@@ -799,9 +824,9 @@ fn main() {
         50,
         &(current_book, current_orders),
         |(book, orders)| (book.clone(), orders.clone()),
-        |(mut book, orders)| {
+        |(book, orders)| {
             let mut amended = 0usize;
-            for order in &orders {
+            for order in orders.iter() {
                 if book.amend(order, None, Some(reduced_volume)).is_ok() {
                     amended += 1;
                 }
@@ -814,9 +839,9 @@ fn main() {
         50,
         &(prototype_book, prototype_entries),
         |(book, entries)| (book.clone(), entries.clone()),
-        |(mut book, entries)| {
+        |(book, entries)| {
             let mut amended = 0usize;
-            for &(sequence, _) in &entries {
+            for &(sequence, _) in entries.iter() {
                 if book.amend(sequence, None, Some(reduced_volume)).is_some() {
                     amended += 1;
                 }
@@ -825,7 +850,13 @@ fn main() {
             amended
         },
     );
-    report("amend volume 5k (same price)", current, prototype, "amends");
+    report(
+        "amend volume 5k (same price)",
+        50,
+        current,
+        prototype,
+        "amends",
+    );
 
     let (current_book, current_orders) = current_amend_book(1_000, 1);
     let (prototype_book, prototype_entries) = prototype_amend_book(1_000, 1);
@@ -834,9 +865,9 @@ fn main() {
         50,
         &(current_book, current_orders),
         |(book, orders)| (book.clone(), orders.clone()),
-        |(mut book, orders)| {
+        |(book, orders)| {
             let mut amended = 0usize;
-            for order in &orders {
+            for order in orders.iter() {
                 let new_price = order.price.checked_sub(price_step).expect("price fits");
                 if book.amend(order, Some(new_price), None).is_ok() {
                     amended += 1;
@@ -850,9 +881,9 @@ fn main() {
         50,
         &(prototype_book, prototype_entries),
         |(book, entries)| (book.clone(), entries.clone()),
-        |(mut book, entries)| {
+        |(book, entries)| {
             let mut amended = 0usize;
-            for &(sequence, price) in &entries {
+            for &(sequence, price) in entries.iter() {
                 let new_price = price.checked_sub(price_step).expect("price fits");
                 if book.amend(sequence, Some(new_price), None).is_some() {
                     amended += 1;
@@ -862,7 +893,13 @@ fn main() {
             amended
         },
     );
-    report("amend price 1k (re-queue)", current, prototype, "amends");
+    report(
+        "amend price 1k (re-queue)",
+        50,
+        current,
+        prototype,
+        "amends",
+    );
 
     let (current_book, current_orders) = current_amend_book(100, 50);
     let (prototype_book, prototype_entries) = prototype_amend_book(100, 50);
@@ -870,9 +907,9 @@ fn main() {
         20,
         &(current_book, current_orders),
         |(book, orders)| (book.clone(), orders.clone()),
-        |(mut book, orders)| {
+        |(book, orders)| {
             let mut amended = 0usize;
-            for order in &orders {
+            for order in orders.iter() {
                 let new_price = order.price.checked_sub(price_step).expect("price fits");
                 if book.amend(order, Some(new_price), None).is_ok() {
                     amended += 1;
@@ -886,9 +923,9 @@ fn main() {
         20,
         &(prototype_book, prototype_entries),
         |(book, entries)| (book.clone(), entries.clone()),
-        |(mut book, entries)| {
+        |(book, entries)| {
             let mut amended = 0usize;
-            for &(sequence, price) in &entries {
+            for &(sequence, price) in entries.iter() {
                 let new_price = price.checked_sub(price_step).expect("price fits");
                 if book.amend(sequence, Some(new_price), None).is_some() {
                     amended += 1;
@@ -900,6 +937,7 @@ fn main() {
     );
     report(
         "amend price 5k dense (re-queue)",
+        20,
         current,
         prototype,
         "amends",
@@ -908,7 +946,7 @@ fn main() {
     let (current_book, _, _) = current_bbo_book(1_000);
     let (prototype_book, _, _) = prototype_bbo_book(1_000);
     let current = measure(
-        1,
+        20,
         &current_book,
         |book| book.clone(),
         |book| {
@@ -922,7 +960,7 @@ fn main() {
         },
     );
     let prototype = measure(
-        1,
+        20,
         &prototype_book,
         |book| book.clone(),
         |book| {
@@ -936,14 +974,15 @@ fn main() {
         },
     );
     report(
-        "depth 10 levels (100k queries)",
+        "depth 10 levels (100k queries/round)",
+        20,
         current,
         prototype,
         "levels",
     );
 
     let current = measure(
-        1,
+        20,
         &current_book,
         |book| book.clone(),
         |book| {
@@ -954,7 +993,7 @@ fn main() {
         },
     );
     let prototype = measure(
-        1,
+        20,
         &prototype_book,
         |book| book.clone(),
         |book| {
@@ -965,7 +1004,8 @@ fn main() {
         },
     );
     report(
-        "BBO query 1k levels (1M calls)",
+        "BBO query 1k levels (1M calls/round)",
+        20,
         current,
         prototype,
         "queries",
@@ -977,7 +1017,7 @@ fn main() {
         50,
         &(current_book, current_bids, current_asks),
         |(book, bids, asks)| (book.clone(), bids.clone(), asks.clone()),
-        |(mut book, bids, asks)| {
+        |(book, bids, asks)| {
             let mut advances = 0usize;
             for (bid, ask) in bids.iter().zip(asks.iter()) {
                 assert!(book.cancel(bid).is_some());
@@ -996,7 +1036,7 @@ fn main() {
         50,
         &(prototype_book, prototype_bids, prototype_asks),
         |(book, bids, asks)| (book.clone(), bids.clone(), asks.clone()),
-        |(mut book, bids, asks)| {
+        |(book, bids, asks)| {
             let mut advances = 0usize;
             for (&bid, &ask) in bids.iter().zip(asks.iter()) {
                 assert!(book.cancel(bid).is_some());
@@ -1013,6 +1053,7 @@ fn main() {
     );
     report(
         "BBO advance 1k levels x 2 sides",
+        50,
         current,
         prototype,
         "advances",

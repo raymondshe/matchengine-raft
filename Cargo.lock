@@ -1803,6 +1803,7 @@ dependencies = [
  "env_logger",
  "futures",
  "i256",
+ "libc",
  "maplit",
  "openraft",
  "postcard",

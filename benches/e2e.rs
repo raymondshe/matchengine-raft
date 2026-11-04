@@ -5,8 +5,9 @@
 //! excludes cross-node replication. It also sweeps `/write_batch` sizes to show
 //! how one WAL fsync per entry amortizes across many orders. By default the
 //! suite runs on the production multi-thread Tokio runtime; `-- current` and
-//! `-- both` compare the old current-thread flavor. The order-book-only costs
-//! are measured by `cargo bench --bench matchengine`.
+//! `-- both` compare the old current-thread flavor, and `--pin <cpu>` pins the
+//! process on Linux (`sched_setaffinity`) to remove scheduler noise. The
+//! order-book-only costs are measured by `cargo bench --bench matchengine`.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -57,6 +58,36 @@ fn temp_dir(label: &str) -> PathBuf {
 fn percentile(sorted: &[Duration], percentile: f64) -> Duration {
     let index = ((sorted.len() - 1) as f64 * percentile).round() as usize;
     sorted[index]
+}
+
+/// Pins the process to one CPU before the runtimes start. Threads created
+/// afterwards inherit the affinity mask, so this reproduces
+/// `taskset -c <cpu> cargo bench --bench e2e` on Linux.
+#[cfg(target_os = "linux")]
+fn pin_to_cpu(cpu: usize) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
+    let mut set = unsafe { std::mem::zeroed::<libc::cpu_set_t>() };
+    if cpu >= 8 * std::mem::size_of::<libc::cpu_set_t>() {
+        anyhow::bail!("CPU {cpu} does not fit the affinity mask");
+    }
+    unsafe { libc::CPU_SET(cpu, &mut set) };
+    let rc = unsafe { libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error()).context(format!("pin process to CPU {cpu}"));
+    }
+    Ok(())
+}
+
+/// macOS and the BSDs expose no process core-pinning API; fail loudly instead
+/// of silently running unpinned.
+#[cfg(not(target_os = "linux"))]
+fn pin_to_cpu(cpu: usize) -> anyhow::Result<()> {
+    anyhow::bail!(
+        "--pin {cpu} needs Linux sched_setaffinity; this host has no process core-pinning API. \
+         Run `cargo bench --bench e2e -- current` for a single-threaded runtime approximation, \
+         or run the pinned pass on Linux."
+    )
 }
 
 async fn wait_for_leader(client: &MatchEngineClient<C>) -> anyhow::Result<()> {
@@ -252,8 +283,33 @@ async fn run_suite(runtime: &str, addr: &str) -> anyhow::Result<()> {
 }
 
 fn main() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
     println!("end-to-end write benchmark (single node, HTTP + WAL + apply)");
-    let selection = std::env::args().nth(1).unwrap_or_default();
+    let mut selection = String::new();
+    let mut pin = None;
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            // Cargo passes `--bench` to harness-less bench binaries.
+            "--bench" => {}
+            "current" | "both" => selection = arg,
+            "--pin" => {
+                let cpu = args.next().context("--pin needs a CPU number")?;
+                pin = Some(cpu.parse::<usize>()?);
+            }
+            other if other.starts_with("--pin=") => {
+                pin = Some(other["--pin=".len()..].parse::<usize>()?);
+            }
+            other => {
+                anyhow::bail!("unknown argument {other:?}; expected current|both|--pin <cpu>")
+            }
+        }
+    }
+    if let Some(cpu) = pin {
+        pin_to_cpu(cpu)?;
+        println!("process pinned to CPU {cpu}");
+    }
     let run_current = matches!(selection.as_str(), "current" | "both");
     let run_multi = selection != "current";
 

@@ -3,11 +3,15 @@
 //! Run with `cargo bench --bench book_replay`. This exercises `OrderBook` directly:
 //! no HTTP, Raft, WAL, snapshots or market-data feed. Each case builds a pristine
 //! book once, clones it outside the timer and measures only the operation under
-//! test, best-of-5 per round.
+//! test. Every case reports the historical best-of-5 mean-of-rounds plus warm
+//! p50/p99 over all per-round samples, and a cold pass that evicts the caches
+//! (64 MiB read-modify-write sweep) between the clone and the timed op, so warm
+//! and cold behaviour are reported separately. See `benches/bench_support`.
+
+#[path = "bench_support/mod.rs"]
+mod bench_support;
 
 use std::hint::black_box;
-use std::time::Duration;
-use std::time::Instant;
 
 use matchengine_raft::order_book::Order;
 use matchengine_raft::order_book::OrderBook;
@@ -71,41 +75,39 @@ fn bbo_book(levels: u32) -> (OrderBook, Vec<Order>, Vec<Order>) {
     (book, bids, asks)
 }
 
-/// Clones `base` outside the timer, runs `op` and reports the best per-round
-/// average across five repetitions.
+/// Clones `base` outside the timer, runs `op` and reports the best-of-5
+/// mean-of-rounds, warm p50/p99 over all per-round samples, and a cold pass
+/// with the caches evicted between clone and timed op.
 fn bench_clone<T>(
     name: &str,
     rounds: u32,
     base: &T,
-    mut clone: impl FnMut(&T) -> T,
-    mut op: impl FnMut(T) -> usize,
+    clone: impl FnMut(&T) -> T,
+    op: impl FnMut(&mut T) -> usize,
     unit: &str,
 ) {
-    let mut best = Duration::MAX;
-    let mut best_units = 0usize;
-
-    for _ in 0..5 {
-        let mut elapsed = Duration::ZERO;
-        let mut units = 0usize;
-        for _ in 0..rounds {
-            let state = clone(base);
-            let start = Instant::now();
-            units += op(state);
-            elapsed += start.elapsed();
-        }
-        let per_round = elapsed / rounds;
-        if per_round < best {
-            best = per_round;
-            best_units = units / rounds as usize;
-        }
-    }
-
-    let throughput = best_units as f64 / best.as_secs_f64();
-    println!("{name:44} best-of-5 {best:>10?}  {throughput:>12.0} {unit}/s");
+    let samples = bench_support::run(bench_support::Config::default(), rounds, base, clone, op);
+    let best = samples.warm_best(rounds);
+    let rate = samples.units_per_second(best);
+    println!(
+        "{name:38} warm  best {best:>10?} p50 {:>10?} p99 {:>10?} n={:>4} {rate:>12.0} {unit}/s",
+        samples.warm_p50(),
+        samples.warm_p99(),
+        samples.warm.len(),
+    );
+    println!(
+        "{:38} cold  p50 {:>10?} p99 {:>10?} n={}",
+        "",
+        samples.cold_p50(),
+        samples.cold_p99(),
+        samples.cold.len(),
+    );
 }
 
 fn main() {
     println!("book-only replay benchmark (no HTTP, Raft, WAL or feed)");
+    println!("warm = clone immediately before the timed op; cold = 64 MiB eviction sweep first");
+    println!("best = best mean-of-rounds over 5 repeats; p50/p99 = nearest-rank per round\n");
 
     let (wide, wide_taker) = sweep_book(100, 10);
     bench_clone(
@@ -113,8 +115,8 @@ fn main() {
         100,
         &(wide, wide_taker),
         |(book, taker)| (book.clone(), *taker),
-        |(mut book, mut taker)| {
-            let fills = book.place_order(&mut taker).len();
+        |(book, taker)| {
+            let fills = book.place_order(taker).len();
             assert_eq!(1_000, fills);
             assert!(book.asks.is_empty());
             fills
@@ -128,8 +130,8 @@ fn main() {
         20,
         &(deep, deep_taker),
         |(book, taker)| (book.clone(), *taker),
-        |(mut book, mut taker)| {
-            let fills = book.place_order(&mut taker).len();
+        |(book, taker)| {
+            let fills = book.place_order(taker).len();
             assert_eq!(20_000, fills);
             assert!(book.asks.is_empty());
             fills
@@ -143,7 +145,7 @@ fn main() {
         50,
         &(cancelled_book, deep_orders),
         |(book, orders)| (book.clone(), orders.clone()),
-        |(mut book, orders)| {
+        |(book, orders)| {
             let mut cancelled = 0usize;
             for order in orders.iter().rev() {
                 if book.cancel(order).is_some() {
@@ -162,7 +164,7 @@ fn main() {
         50,
         &(advancing_book, bids, asks),
         |(book, bids, asks)| (book.clone(), bids.clone(), asks.clone()),
-        |(mut book, bids, asks)| {
+        |(book, bids, asks)| {
             let mut advances = 0usize;
             for (bid, ask) in bids.iter().zip(asks.iter()) {
                 assert!(book.cancel(bid).is_some());
@@ -181,8 +183,8 @@ fn main() {
 
     let (static_book, _, _) = bbo_book(1_000);
     bench_clone(
-        "BBO query 1k levels (1M calls)",
-        1,
+        "BBO query 1k levels (1M calls/round)",
+        20,
         &static_book,
         |book| book.clone(),
         |book| {

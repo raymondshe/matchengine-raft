@@ -31,8 +31,8 @@ its scope.
 | Benchmark | Includes | Excludes | Load model | Timer / sampling | Variance |
 |---|---|---|---|---|---|
 | `matchengine` | Order-book operations: sweep, rest, partial fill, IOC cancel, iceberg refill, amend, cancel; optional depth journal | HTTP, Raft, WAL, snapshots, market-data encoding/sink | Closed-loop, in-process | `Instant`, best-of-5 per round | Best-of-5 only; not a tail study |
-| `book_replay` | `OrderBook` only: 100-level and single-level sweeps, deep cancels, BBO advancement and static BBO queries; book cloned outside the timer | HTTP, Raft, WAL/snapshots, market-data feed, event construction, fees | Closed-loop, in-process; one pristine book per round | `Instant`, best-of-5 per round | Best-of-5 only; 1k/20k cases differ in tree depth, not just order count |
-| `level_book` | Prototype per-level buckets plus the current `OrderBook`: match sweeps, deep cancels, sparse/dense amends, depth, BBO queries and BBO advancement; plain limit orders only; book cloned outside the timer | Stops, icebergs, GTD expiry, validation, events, depth journal, market-data feed, fees beyond `MatchResult` construction | Closed-loop, in-process; paired current/prototype books | `Instant`, best-of-5 per round | Best-of-5 only; sparse one-order-per-level cases are the prototype's worst case |
+| `book_replay` | `OrderBook` only: 100-level and single-level sweeps, deep cancels, BBO advancement and static BBO queries; clone/eviction outside the timed window | HTTP, Raft, WAL/snapshots, market-data feed, event construction, fees | Closed-loop, in-process; one pristine book per round | `Instant` per round; best-of-5 repeats, warm p50/p99, interleaved cold p50/p99 after a 64 MiB eviction sweep | 5-14% run-to-run; cold adds ~8-22%; 1k/20k cases differ in tree depth, not just order count |
+| `level_book` | Prototype per-level buckets plus the current `OrderBook`: match sweeps, deep cancels, sparse/dense amends, depth, BBO queries and BBO advancement; plain limit orders only; clone/eviction outside the timed window | Stops, icebergs, GTD expiry, validation, events, depth journal, market-data feed, fees beyond `MatchResult` construction | Closed-loop, in-process; paired current/prototype books | `Instant` per round; best-of-5 repeats, warm p50/p99, interleaved cold p50/p99 after a 64 MiB eviction sweep | 5-10% run-to-run, BBO-query ratio 4.9-5.6x; sparse one-order-per-level cases are the prototype's worst case |
 | `apply_path` | `StateMachineStore::apply` only: blank, rest, cancel, fill and 128-request batch workloads; a counting global allocator reports heap calls and requested bytes | HTTP, Raft, WAL, snapshots, market-data tap, event-log reads, response serialization | Closed-loop, direct apply; 50k entries or 1k batches per workload | Counting allocator; per-entry averages | Requested bytes include realloc churn and are not a live-memory high-water mark |
 | `e2e` `/write` | HTTP decode/validation, Raft proposal/commit, WAL append + `sync_data`, apply, response serialization | Cross-node replication, external client network beyond loopback | Sequential is closed-loop; concurrent is a 1,000-request burst | `Instant` per request; p50/p95/p99/max | Medians/percentiles; runtime A/B uses four alternating runs |
 | `e2e` `/write_batch` | Same as `/write`, with 1–128 requests per Raft entry and one WAL fsync per entry | Same as `/write` | 200 sequential batches per size; 100 concurrent 32-order batches | `Instant` per batch | Single run per size; batch latency includes payload/apply growth |
@@ -45,6 +45,14 @@ its scope.
 Timer source is `std::time::Instant` throughout; there is no `rdtsc` or assumed CPU frequency.
 Loopback HTTP and local disk are part of the measured path where stated. Run-to-run variance is
 not a confidence interval; the e2e runtime A/B is the only comparison with four alternating runs.
+
+The two book benches share `benches/bench_support`: each round clones the state before
+`Instant::now()` and drops the mutated state after the duration is recorded, so setup and teardown
+are outside the timer. "Warm" means the clone immediately precedes the timed operation; "cold"
+means a 64 MiB read-modify-write sweep runs between the clone and the timed operation. Warm and
+cold rounds are interleaved in one time window: running all warm rounds first biased the warm pass
+(early samples carried clock ramp-up and the cold pass inherited a boosted clock), which showed up
+as cold p50 beating warm p50 on this host.
 
 ## Memory footprint (measured peak RSS)
 
@@ -93,31 +101,39 @@ matching path does not pay for shadow-book derivation, encoding or sink I/O.
 ## Book-only replay benchmark
 
 `cargo bench --bench book_replay` exercises `OrderBook` directly: no HTTP, Raft, WAL, snapshot
-or market-data feed. Each case builds a pristine book once, clones it outside the timer, then
-measures only the operation under test; the reported time is best-of-5 per round. This is the
-baseline the per-level bucket prototype must beat.
+or market-data feed. Each case builds a pristine book once, clones it outside the timer, and
+reports three views of one run: the historical best-of-5 mean-of-rounds, warm p50/p99 over all
+per-round samples, and a cold p50/p99 with the caches evicted between clone and operation.
 
-| Case | Workload per round | Time per round | Throughput |
-|---|---:|---:|---:|
-| Deep sweep, 100 levels | 1,000 asks resting 10 per level; one taker crosses all | 94.7 µs | 10.56M fills/s |
-| Deep sweep, 1 level | 20,000 asks at one price; one taker crosses all | 2.209 ms | 9.06M fills/s |
-| Cancel at depth | 5,000 bids across 50 levels, cancelled deepest-first | 270.9 µs | 18.46M cancels/s |
-| BBO advance | 1,000 levels x 2 sides; cancel the best, then read bid/ask/spread | 98.3 µs | 20.35M advances/s |
-| BBO query | 1,000,000 `spread()` calls against a 1,000-level book | 2.335 ms | 428M queries/s |
+| Case | Workload per round | Warm best | Warm p50 | Warm p99 | Cold p50 | Best-case throughput |
+|---|---|---:|---:|---:|---:|---:|
+| Deep sweep, 100 levels | 1,000 asks resting 10 per level; one taker crosses all | 85.8 µs | 85.7 µs | 171.8 µs | 104.4 µs | 11.66M fills/s |
+| Deep sweep, 1 level | 20,000 asks at one price; one taker crosses all | 2.258 ms | 2.319 ms | 2.856 ms | 2.512 ms | 8.86M fills/s |
+| Cancel at depth | 5,000 bids across 50 levels, cancelled deepest-first | 254.7 µs | 256.7 µs | 322.6 µs | 311.8 µs | 19.63M cancels/s |
+| BBO advance | 1,000 levels x 2 sides; cancel the best, then read bid/ask/spread | 98.2 µs | 97.5 µs | 153.9 µs | 114.7 µs | 20.37M advances/s |
+| BBO query | 1,000,000 `spread()` calls against a 1,000-level book | 2.301 ms | 2.492 ms | 2.820 ms | 2.542 ms | 434.5M queries/s |
+
+Warm p50 tracks best-of-5 within 9%, so the historical number is a fair summary of the typical
+round; the p99 column is where the tail shows. The 1k-ask sweep has the widest tail (p99 2.0x p50)
+because a 100-level tree is small enough that one preemption is a large fraction of the round; the
+20k single-level sweep spreads the same work over 2.3 ms and its p99 is 1.2x p50. Cold p50 is
+8-22% above warm for the destructive cases and ~2% above warm for the static BBO query, whose
+working set is the tree edge rather than every node.
 
 The two sweeps both cross every resting ask but differ in tree shape: the 100-level book keeps
 each price subtree small, while the single-level book is one 20,000-entry sequence-ordered
 tree, so per-fill cost rises. Cancels and BBO advancement pay `BTreeMap` removal plus best-level
 lookups; static BBO queries repeatedly call `spread()`, which reads `first_key_value()` on each
-side, so the 428M/s figure shows lookup is cheap relative to mutation. These are whole-round
+side, so the 434M/s figure shows lookup is cheap relative to mutation. These are whole-round
 times, not per-fill latency percentiles, and the benchmark is closed-loop.
 
-Repeated best-of-5 runs on the same machine produced 83–97 µs for the 100-level sweep, 2.18–2.35 ms
-for the single-level sweep, 271–288 µs for the deep cancels, 98–107 µs for BBO advancement and
-2.10–2.93 ms for the 1M-query loop. The table is one representative run; treat these as
-order-of-magnitude baselines, not exact constants.
+Two consecutive runs on the same machine produced 84.7-85.8 µs best / 85.7-89.2 µs warm p50 for
+the 100-level sweep, 2.26-2.50 ms / 2.32-2.49 ms for the single-level sweep, 255-267 µs /
+257-271 µs for the deep cancels, 98-108 µs / 98-107 µs for BBO advancement and 2.30-2.59 ms /
+2.49-2.85 ms for the 1M-query loop. Treat these as order-of-magnitude baselines, not exact
+constants.
 
-## Per-level bucket prototype (2026-11-02)
+## Per-level bucket prototype (2026-11-04)
 
 `cargo bench --bench level_book` compares a bench-only prototype with `OrderBook` on the same
 workloads. The prototype keeps one `Vec<Option<Order>>` per price level, a `head` cursor for the
@@ -131,17 +147,17 @@ isolate the book data structure. Before timing, the benchmark runs a determinist
 that compares BBO, depth, fills, cancels and amendments against `OrderBook`; it prints
 `prototype verification: OK`.
 
-| Case | Current | Prototype | Speedup |
-|---|---:|---:|---:|
-| Match 1k asks / 100 levels | 99.9 µs | 47.8 µs | 2.09x |
-| Match 20k asks / 1 level | 2.305 ms | 1.311 ms | 1.76x |
-| Cancel 5k at depth / 50 levels | 275.3 µs | 81.6 µs | 3.37x |
-| Amend volume 5k (same price) | 229.9 µs | 135.0 µs | 1.70x |
-| Amend price 1k sparse (1 order/level) | 75.6 µs | 117.7 µs | 0.64x |
-| Amend price 5k dense (50 orders/level) | 619.7 µs | 240.1 µs | 2.58x |
-| Depth 10 levels, 100k queries | 6.621 ms | 6.621 ms | 1.00x |
-| BBO query 1k levels, 1M calls | 2.125 ms | 0.472 ms | 4.50x |
-| BBO advance 1k levels x 2 sides | 101.4 µs | 114.1 µs | 0.89x |
+| Case | Current warm p50 | Prototype warm p50 | Speedup (p50) | Speedup (best-of-5) |
+|---|---:|---:|---:|---:|
+| Match 1k asks / 100 levels | 84.8 µs | 46.1 µs | 1.84x | 1.82x |
+| Match 20k asks / 1 level | 2.316 ms | 1.830 ms | 1.27x | 1.27x |
+| Cancel 5k at depth / 50 levels | 262.4 µs | 79.3 µs | 3.31x | 3.21x |
+| Amend volume 5k (same price) | 182.7 µs | 104.5 µs | 1.75x | 1.72x |
+| Amend price 1k sparse (1 order/level) | 72.3 µs | 96.0 µs | 0.75x | 0.75x |
+| Amend price 5k dense (50 orders/level) | 634.1 µs | 244.8 µs | 2.59x | 2.58x |
+| Depth 10 levels, 100k queries | 6.408 ms | 6.660 ms | 0.96x | 0.96x |
+| BBO query 1k levels, 1M calls | 2.233 ms | 0.456 ms | 4.90x | 5.18x |
+| BBO advance 1k levels x 2 sides | 103.0 µs | 118.4 µs | 0.87x | 0.88x |
 
 The prototype wins where a level is populated: a sweep consumes a contiguous vector and advances
 `head` instead of removing every order from the tree, deep cancels amortize the level lookup, a
@@ -151,12 +167,19 @@ level, the sequence lookup, level indirection and level creation/removal cost mo
 `BTreeMap` remove/insert. BBO advancement has the same shape because every cancellation removes a
 level. Depth is effectively unchanged.
 
+The cold pass does not change the ranking: cancel is 303.4 µs cold for the current book vs 86.4 µs
+for the prototype, sparse amend is 84.9 µs vs 128.5 µs, and BBO query is 2.808 ms vs 0.453 ms.
+One case moves: BBO advancement is a warm loss (0.87x) but cold parity (115.2 µs vs 117.5 µs), so
+the cached best index pays off mainly while the book is cache-resident. The layout conclusion is
+therefore not an artifact of warm caches.
+
 Full adoption is therefore **not** justified by this prototype; the P2 adoption item remains.
 A follow-up would need a single-order-level fast path (or a hybrid that keeps tree keys for sparse
 levels), a memory A/B in separate processes, and a 3-node or real-sink run. The benchmark is
-closed-loop, best-of-5 per round; repeated mutation runs vary by roughly 5–10%, while the
-current-book BBO-query baseline varied more (about 2.1–2.9 ms across runs), so treat the ratios as
-directional.
+closed-loop; repeated mutation runs vary by roughly 5-10%, while the BBO-query ratio moved between
+4.90x and 5.57x across runs and the 1k match between 1.84x and 1.99x, so treat the ratios as
+directional. The 2026-11-02 table quoted best-of-5 only; the numbers above are the same workloads
+with warm p50 as the headline and best-of-5 kept for continuity.
 
 ## Apply-path allocation benchmark (2026-11-02)
 
@@ -253,8 +276,8 @@ holds the state-machine lock for the whole batch.
 
 The node binary now uses a multi-threaded Tokio runtime; the previous
 `#[actix_web::main]` setup used actix-rt's current-thread runtime. To measure the
-runtime flavor alone, `cargo bench --bench e2e` was run with `-- current` and
-`-- multi` in alternating fresh processes (four runs each, medians). The HTTP
+runtime flavor alone, `cargo bench --bench e2e` was run with `-- current` and with
+the default multi-thread mode in alternating fresh processes (four runs each, medians). The HTTP
 workers are separate threads in both cases; only the runtime hosting RaftCore,
 apply, gRPC, the snapshot timer and the feed changes.
 
@@ -278,6 +301,30 @@ The medians are within run-to-run noise. These workloads are dominated by WAL
 scheduling, so the runtime switch alone does not improve them. It remains the
 enabler for isolating gRPC, snapshot and feed work; the next gains require the
 snapshot, lock-scope and sink/read offloads below.
+
+### Pinned-core pass (2026-11-04)
+
+The external optimization notes (below) reduce scheduler noise by pinning the benchmark to one
+core. The e2e bench now accepts `--pin <cpu>`: on Linux it calls `sched_setaffinity` before the
+runtimes start, so threads created afterwards inherit the mask (equivalent to
+`taskset -c <cpu> cargo bench --bench e2e`). On macOS and the BSDs it fails loudly, because those
+hosts expose no process core-pinning API.
+
+This host is macOS, so the recorded pass uses the closest available approximation,
+`cargo bench --bench e2e -- current`: one Tokio worker hosts RaftCore, apply, gRPC and the snapshot
+timer, while Actix keeps its separate HTTP worker threads.
+
+| Workload | Multi-thread (unpinned) | Current-thread (approximation) |
+|---|---:|---:|
+| Sequential `/write` | 256 writes/s | 258 writes/s |
+| Sequential `/write` p50 / p99 | 3.93 ms / 5.10 ms | 3.95 ms / 5.22 ms |
+| Concurrent `/write` (1,000 in flight) | 19,651 writes/s | 18,186 writes/s |
+| Concurrent batches (100 x 32) | 156,034 orders/s | 140,068 orders/s |
+
+The two runs are within the 5-10% run-to-run noise, so removing Tokio's multi-thread scheduler did
+not move the tail: p99 stays ~1.3x p50 and the p50 stays at the WAL `sync_data` cost. A true
+pinned single-core run remains a Linux-only measurement; run
+`cargo bench --bench e2e -- --pin 0` there when a Linux host is available.
 
 ### P0 optimization A/B (2026-10-31)
 
@@ -548,41 +595,38 @@ already covered by design, two are traps, and the measurement discipline transfe
 
 | Their optimization | Their measurement | Our status | Verdict |
 |---|---|---|---|
-| Flat array + bitmap instead of `BTreeMap` | 7.8x-318x at depth 100-1000 | Already prototyped as per-level buckets (`level_book`): 2.09x sweep, 3.37x deep cancel, 1.70x/2.58x amend, but 0.64x sparse amend and 0.89x BBO advance | Keep as the P2 hybrid with a sparse-level fast path; do not adopt wholesale (it needs a bounded cent price range) |
-| Cached best-bid/ask index | `bbo` 354 ns -> 0.88 ns | BBO already reads the tree edges: 428M queries/s, ~2.3 ns per call; the prototype's cached BBO is only 4.5x against that and loses on advance (0.89x) | Skip |
+| Flat array + bitmap instead of `BTreeMap` | 7.8x-318x at depth 100-1000 | Already prototyped as per-level buckets (`level_book`): 1.84x sweep, 3.31x deep cancel, 1.75x/2.59x amend, but 0.75x sparse amend and 0.87x BBO advance | Keep as the P2 hybrid with a sparse-level fast path; do not adopt wholesale (it needs a bounded cent price range) |
+| Cached best-bid/ask index | `bbo` 354 ns -> 0.88 ns | BBO already reads the tree edges: 434M queries/s, ~2.3 ns per call; the prototype's cached BBO is 4.9x against that and loses on advance (0.87x) | Skip |
 | `Vec` order index keyed by per-book sequential ids | 1.7-1.8x after removing SipHash | No secondary index exists here: a resting order is identified by `(side, price, sequence)`, which is also its tree key, and the sequence is dense and per book by construction | Already better; no action |
 | Store the index-in-level so cancel needs no intra-level scan | Their stated next win | No intra-level `Vec` to scan; cancel is one tree remove | Already better; a prerequisite only if the bucket layout lands |
-| `active` flag + `head_idx` instead of `retain()`/`pop_front()` | Qualitative | A partially filled maker is updated in place, so only fully consumed makers are removed; the prototype's `head` cursor is the analogue (2.09x sweep) | Part of the layout item; nothing to do today |
-| Bitmap `top_n_levels` (`trailing_zeros`/`leading_zeros`) | 53 µs -> 794 ns | The depth walk already visits active levels only and is capped at 200; prototype depth was 1.00x | Skip - empty slots are never visited |
+| `active` flag + `head_idx` instead of `retain()`/`pop_front()` | Qualitative | A partially filled maker is updated in place, so only fully consumed makers are removed; the prototype's `head` cursor is the analogue (1.84x sweep) | Part of the layout item; nothing to do today |
+| Bitmap `top_n_levels` (`trailing_zeros`/`leading_zeros`) | 53 µs -> 794 ns | The depth walk already visits active levels only and is capped at 200; prototype depth was 0.96x | Skip - empty slots are never visited |
 | Arena allocator (`bumpalo`) | **Regression**: single-operation latency 79-88% worse; removed again in their Optimization 9 | Inline buffers are the adopted approach (`apply_path`: 4-5 allocs/entry after the `SmallVec` change) | Do not adopt; it would also complicate `to_content` and snapshot serialization |
 | Pre-allocated collections (`with_capacity`, `next_power_of_two`) | Small, qualitative | Event window, per-entry event buffer and publish list are preallocated/inline; the response `events` `Vec`, the legacy `value` `String` and the fill `MatchResult` `Vec` still allocate | P2 micro: reserve the known lengths where the shape is fixed |
-| Response slot pool replacing `oneshot::channel()` | Removes one allocation per request | One `/write` costs ~4 ms and is fsync-bound; their pool (256 slots) also caps in-flight requests, which conflicts with the 18,350 concurrent writes already sustained here | Skip; not the bottleneck |
+| Response slot pool replacing `oneshot::channel()` | Removes one allocation per request | One `/write` costs ~4 ms and is fsync-bound; their pool (256 slots) also caps in-flight requests, which conflicts with the ~19k concurrent writes already sustained here | Skip; not the bottleneck |
 | N-thread sharding, one owner per symbol | Their 132M/s is multi-threaded (~33M/s per thread); remaining single-thread gap ~3x | One symbol per process is deliberate and apply must be serial for determinism; parallelism already exists across processes and across HTTP workers plus the blocking pool | Skip; keep the multi-thread caveat in mind when comparing numbers |
 | SIMD slot scan, `mmap` | They judged SIMD marginal over the bitmap and mmap inapplicable | Agreed | Skip |
 
-### Measurement discipline to adopt
+### Measurement discipline adopted (2026-11-04)
 
-These transfer regardless of layout and are the cheapest wins on the list:
+The measurement rules transferred regardless of layout and are now implemented:
 
-- **Report warm and cold separately, and exclude setup and drop from the timed window.** Their
-  `iter_custom` lesson: dropping a 100,000-slot book inside the timer produced ~960 µs uniformly
-  across all depths. Our `book_replay` and `level_book` already clone outside the timer, but the
-  tables do not say which numbers are warm-cache, and repeated runs vary 5-10% (up to ~35% for the
-  current-book BBO baseline). Label cache warmth per row.
-- **Prefer percentiles to best-of-5 for anything with a tail.** They report p50/p99/p99.9 from a
-  1.94M-op NASDAQ ITCH replay (100 ns / 1.8 µs / 14.9 µs). Our book benchmarks are whole-round
-  best-of-5 times; only `e2e` has p50/p95/p99. Adding p50/p99 to `book_replay` and `level_book`
-  would make regressions visible that a best-of-5 hides.
-- **Add one realistic-mix replay.** They treat ITCH replay as the only production-like signal
-  because it carries a real add/cancel/modify mix. Our `tests/replay` fixtures are correctness-only;
-  replaying a large fixture with a realistic mix and reporting percentiles is the closest analogue,
-  and it exercises stops, icebergs, fees and events, which their single-book replay does not.
-- **Quantify scheduler noise before optimizing further.** Their pinned `SCHED_FIFO` run collapsed
-  the tail, and they attributed outliers to preemption windows. Re-running `cargo bench --bench e2e`
-  pinned to one core (`taskset -c <n>`) would separate scheduler contribution from the fsync cost
-  that dominates the current p99.
+- **Warm and cold are separate, and setup/drop are outside the timed window.** Their `iter_custom`
+  lesson - dropping a 100,000-slot book inside the timer produced ~960 µs uniformly at every depth -
+  is enforced by `benches/bench_support`: clone before `Instant::now()`, drop after the duration is
+  recorded, and a 64 MiB eviction sweep between clone and op for the cold rows. The tables label
+  warm and cold separately.
+- **Percentiles, not just best-of-5.** `book_replay` and `level_book` report warm p50/p99 over every
+  per-round sample and keep best-of-5 for continuity. The 1k-ask sweep's p99 is 2.0x its p50 while
+  best-of-5 sits on the p50, which is exactly the tail a regression gate needs to see.
+- **A realistic-mix replay is still open.** They treat ITCH replay as the only production-like
+  signal because it carries a real add/cancel/modify mix. Our `tests/replay` fixtures are
+  correctness-only; a large realistic replay with percentiles remains a TODO.md §8 item.
+- **Scheduler noise is now measurable.** `cargo bench --bench e2e -- --pin <cpu>` pins the process on
+  Linux; on this macOS host the current-thread run was the closest approximation and showed no
+  change (see "Pinned-core pass"). A true pinned Linux run is still pending.
 - **Compare like with like.** Their throughput is single-threaded book management with no
-  durability; the concurrent 157,035 orders/s measured here includes Raft commit, WAL `sync_data`,
+  durability; the concurrent ~156k orders/s measured here includes Raft commit, WAL `sync_data`,
   apply, events and JSON. Never quote the two side by side.
 
 ### Not applicable here
