@@ -319,7 +319,7 @@ actions. See [`docs/OPERATIONAL_CONSOLE.md`](./docs/OPERATIONAL_CONSOLE.md) for 
 [`docs/OPERATIONAL_CONSOLE_LAYOUT.html`](./docs/OPERATIONAL_CONSOLE_LAYOUT.html) for the layout
 mockup.
 
-![Operational console](./docs/operational-console.jpg)
+![Operational console](./docs/operational-console.png)
 
 ## Demo Order Desk
 

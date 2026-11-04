@@ -312,7 +312,7 @@ curl -X POST -H "Content-Type: application/json" \
 [`docs/OPERATIONAL_CONSOLE.md`](./docs/OPERATIONAL_CONSOLE.md)，布局预览见
 [`docs/OPERATIONAL_CONSOLE_LAYOUT.html`](./docs/OPERATIONAL_CONSOLE_LAYOUT.html)。
 
-![运维控制台](./docs/operational-console.jpg)
+![运维控制台](./docs/operational-console.png)
 
 ## 演示下单系统
 
