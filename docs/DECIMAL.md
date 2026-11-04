@@ -271,12 +271,19 @@ Remaining exactness work:
 - Notional settlement and fee rounding policies still need product decisions; the arithmetic
   primitive is in place.
 
-Recommended next steps:
+Completed follow-ups:
 
-1. Document the one-process-per-symbol deployment contract and add gateway routing/isolation.
-2. Define the notional/settlement rounding policy and use `Fixed::notional` or `i256` directly.
-3. Benchmark the matching loop and feed before/after; keep the "matching must not regress" gate.
-4. Record the wire v6/snapshot v10 compatibility policy in the deployment notes.
+1. The one-process-per-symbol deployment contract is documented in `AGENTS.md` and the READMEs;
+   gateway routing and isolation remain deployment-level and outside this process.
+2. Matching-loop, feed and end-to-end baselines are recorded in
+   [`PERFORMANCE.md`](./PERFORMANCE.md).
+3. The wire v6/snapshot v10 compatibility policy is documented: older wire and snapshot versions
+   are rejected, so existing data directories must be recreated when crossing this change.
+
+Remaining next steps:
+
+1. Define the notional/settlement rounding policy and use `Fixed::notional` or `i256` directly.
+2. Add the CI benchmark regression gate described in [`TODO.md`](../TODO.md) §8.
 
 ## Post-fee performance baseline
 

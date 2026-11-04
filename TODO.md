@@ -119,7 +119,7 @@ Remaining:
 
 ## 3. Public trust boundary and request safety [P1]
 
-- [x] **P0** Bound `client_order_id` to 1–128 printable ASCII bytes from `[A-Za-z0-9._:-]`;
+- [x] **P0** Bound `client_order_id` to 1–128 bytes from `[A-Za-z0-9._:-]`;
   empty strings are rejected and invalid ids return `400` before the Raft proposal.
 - [x] **P0** Cap application JSON bodies at 1 MiB, validate `/read` keys at 1–128 printable ASCII
   bytes, and reject `/events` limits outside 1–1000 with `400`. Malformed JSON and oversized
@@ -418,8 +418,9 @@ Done:
   `sled` is a dev-dependency. `examples/dump_wal.rs` and `examples/dump_snapshot.rs` are read-only
   JSONL dumpers; `examples/replay_orders.rs` is the order-replay/compare harness.
 - [x] The unused `match_engine.png` was removed and `logs/` is gitignored.
-- [x] README/README_CN, AGENTS, TODO, AERON, MATCH_RESULTS, MARKET_DATA_PLAN and FEE_DEDUCTION are
-  synced with the WAL + snapshot + gRPC design and snapshot v10 / wire v6.
+- [x] README/README_CN, AGENTS, TODO, PERFORMANCE, AERON, MATCH_RESULTS, MARKET_DATA_PLAN,
+  FEE_DEDUCTION, DECIMAL and DEMO_ORDER_SYSTEM are synced with the WAL + snapshot + gRPC design,
+  snapshot v10 / wire v6 and the implemented demo crate.
 - [x] `docs/DECIMAL.md` records the fixed-point research, BTC 18-decimal range analysis,
   microbenchmarks and the completed end-to-end migration.
 - [x] **P3** Renamed `src/matchengine/` to `src/order_book/` (2026-10-29); the public module is now
@@ -503,6 +504,16 @@ Ownership boundaries (outside the matching engine):
 - [x] **P2** Fee accounts/balances and settlement ownership live in the external order/clearing
   system. The engine reports exact fees, their assets and the policy; it does not move funds or
   apply final asset rounding.
+- [x] **P2** Asset freezing and fee funding are order-system/clearing responsibilities: the order
+  system reserves the trading asset using the policy in `docs/FEE_DEDUCTION.md` §6.6, and clearing
+  deducts each fill's fee from the freeze or the settlement leg. The engine holds no freeze state.
+  The standalone demo desk renders a labelled estimate of the cash/spot freeze and settlement legs
+  for demonstration (`demo/src/freeze.rs`); it does not enforce or persist a freeze. It also offers a
+  demo-only linear quote-margined perpetual toggle with leverage, estimating notional, initial margin
+  and fee without engine product/leverage fields or margin state.
+- [ ] **P3** Engine-level derivative support (instrument kind, leverage/margin fields, contract
+  multiplier, funding/PnL/liquidation) is out of scope for the cash/spot matching engine. The demo
+  perpetual overlay is a UI/economics estimate only and must not be treated as an engine contract.
 - [x] **P2** Fee-tier changes on a live order are handled by the order system as cancel/replace;
   the engine preserves the order's original rates through amendments and resting fills.
 

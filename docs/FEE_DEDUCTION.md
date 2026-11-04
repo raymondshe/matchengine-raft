@@ -1,19 +1,26 @@
 # Fee Deduction Design: Base vs Quote Volume
 
-Status: **core implemented for cash/spot.** The engine carries base/quote asset metadata, tick/lot
-rules, `VolumeUnit`, quote-aware sweeps and `FeeAssetPolicy`. Snapshot **v9** and wire **v5**
-introduced those fields; snapshot **v10** and wire **v6** replace the boolean fee-overflow flag with
-the ordered `error`/`MatchErrors` code set. Derivatives and margin-asset settlement are a documented
-extension, not implemented; the model is in §3.2 and the open items are §13 items 11-16. Sessions,
-settlement, corporate actions and fixed/regulatory/minimum/tax fees are owned by the external order
-system.
+Status: **core implemented for cash/spot; equity/ETF and fiat-to-fiat (FX) pairs are covered by the
+same model, while derivatives and margin-asset settlement remain a documented extension.** The
+engine carries base/quote asset metadata, tick/lot rules, `VolumeUnit`, quote-aware sweeps and
+`FeeAssetPolicy`. Snapshot **v9** and wire **v5** introduced those fields; snapshot **v10** and wire
+**v6** replace the boolean fee-overflow flag with the ordered `error`/`MatchErrors` code set.
+Derivatives and margin-asset settlement are a documented extension, not implemented; the model is in
+§3.2, the freeze policy is in §6.6.3 and the open items are §13 items 11-16. Sessions, settlement,
+corporate actions and fixed/regulatory/minimum/tax fees are owned by the external order system.
+Asset freezing and fee funding are also order-system responsibilities: the order system reserves the
+trading asset before submission and clearing deducts fees when it processes match results. The engine
+never holds balances or enforces a freeze; §6.6 defines the policy.
 
 Restricted or missing today:
 
 - Quote volume supports plain limit and market orders only; quote icebergs and quote FOK are
   rejected at admission (§5.1).
 - One process/cluster trades exactly one symbol; multi-symbol is deployment-level isolation.
-- Derivatives, third-asset/margin fees, funding, liquidation and PnL are out of scope (§3.2, §6.5).
+- Derivatives, third-asset/margin fees, funding, liquidation and PnL are out of scope for the
+  implemented engine; the extension model and freeze sizing are in §3.2 and §6.6.3.
+- The engine does not hold balances, freezes or margin. The order system must size the freeze and
+  clearing must deduct fees before crediting proceeds (§6.6).
 - Fee rates outside ±100% are rejected; a zero tick or lot disables only that increment check.
 
 ## 1. Goals
@@ -23,6 +30,8 @@ Restricted or missing today:
 - Allow an order to specify its gross size in either **base** or **quote** units.
 - Charge maker and taker fees at user-level rates supplied with the order.
 - Make the fee asset explicit and deterministic.
+- Define the order-system freeze and clearing fee-funding policy for cash/spot, FX, equity/ETF and
+  derivatives.
 - Keep the matching engine independent of user accounts, balances and fee tiers.
 - Preserve exact fixed-point arithmetic and deterministic replay.
 - Define the changes required in `OrderBook::execute_order`, events, snapshots and the feed.
@@ -40,6 +49,10 @@ Restricted or missing today:
 | Gross | Amount before fees. |
 | Net | Amount after fees. |
 | Fee asset | Asset in which a side pays or receives the fee. |
+| Freeze `F` | Amount the order system reserves in a freeze asset before submitting an order. |
+| Freeze asset `A_f` | Asset reserved by the order system; it is not necessarily the fee asset. |
+| Margin | Collateral reserved for a leveraged derivative, normally `notional / leverage`. |
+| Clearing | The external layer that consumes match results, deducts fees and settles frozen assets. |
 | Maker | The resting order. |
 | Taker | The incoming order that crosses the spread. |
 
@@ -351,6 +364,9 @@ pub enum FeeAssetPolicy {
 Crypto/spot and fiat-to-fiat pairs keep `Received` by default. A broker that wants cash fees for
 crypto can explicitly select `Quote`.
 
+The policy also determines the default order-system freeze asset for cash/spot orders. §6.6 defines
+the freeze table, base-volume estimation under `Base`, and the margin-plus-fee rule for derivatives.
+
 ### 6.1 Gross fee formulas
 
 For one side of a fill:
@@ -377,6 +393,9 @@ Positive amounts are charges; negative amounts are rebates.
 The buyer's rate is the taker rate when the buy order is the taker and the maker rate when it is
 the maker. The same role rule applies to the seller.
 
+The table names only the **fee** asset. The asset the order system freezes and the settlement leg
+used to fund the fee are defined in §6.6.
+
 “Quote” in this table means the symbol's configured quote asset, whether that is USD, GBP, USDT,
 USDC or another asset. The engine never substitutes a stablecoin for fiat or vice versa.
 
@@ -402,6 +421,12 @@ A negative fee reverses the direction: the side receives the rebate instead of p
 The engine only **reports** these amounts. It does not hold or debit balances. The gateway/clearing
 system must reserve the required assets and apply the final settlement precision.
 
+These net legs are funded from the order-system freeze described in §6.6. A positive fee is
+withheld from the asset being delivered or credited (or from a pre-funded fee reserve) before any
+proceeds are credited, so clearing never creates an unfunded negative balance. For `Received`, the
+frozen principal is quote for the buyer and base for the seller; the fee is taken from the other
+leg.
+
 ### 6.4 Interaction with volume unit
 
 The fee formula is always based on the gross fill (`Q` and `N`); the volume unit only changes how
@@ -417,7 +442,9 @@ the order is sized and how the remainder is tracked:
 Maker fees use the maker order's maker rate and the maker's received asset, exactly like taker
 fees. A quote-market buy budget is a **gross notional** cap: when the fee asset is quote, the fee is
 an additional quote debit on top of the cap, which is the implemented choice recorded in §13 item 7.
-A fee-inclusive budget remains a gateway convention, not an engine option.
+A fee-inclusive budget remains a gateway convention, not an engine option. The order-system freeze
+must cover the cap plus any quote fee; under `Base` it also carries a quote-equivalent reserve for
+the base fee (§6.6).
 
 ### 6.5 Derivatives and margin-asset fees
 
@@ -439,6 +466,179 @@ For derivatives, the relevant fee asset is normally the **settlement/margin asse
 
 The engine should keep reporting `taker_fee_asset` and `maker_fee_asset` explicitly, even when the
 fee amount is zero because of overflow. Risk and clearing must know which asset the zero refers to.
+Freeze sizing for derivatives is in §6.6.3: the order system reserves the settlement/margin asset,
+adds the estimated fee and applies the leverage set by risk; the engine does not compute margin,
+leverage or liquidation.
+
+### 6.6 Asset freezing and fee funding
+
+The matching engine is balance-agnostic: it does not hold accounts, reserve assets or inspect a
+freeze. The **order system** freezes the required asset before submitting an order, and the
+**clearing/settlement** layer consumes that freeze when it processes match results. This section
+defines the order-system contract; it does not add balance state to `OrderBook`.
+
+#### 6.6.1 Cash/spot freeze by policy
+
+For a cash/spot order, the freeze follows the policy below and the fee is funded from the frozen
+asset or the settlement leg:
+
+| Policy | Side | Frozen principal | Fee asset | Fee funding at clearing |
+|---|---|---|---|---|
+| `Received` | Buy | Quote: maximum gross notional `N_max` | Base | Withhold `fee_base` from the base delivery (`Q - fee_base`) |
+| `Received` | Sell | Base: gross quantity `Q` | Quote | Withhold `fee_quote` from the quote proceeds (`N - fee_quote`) |
+| `Quote` | Buy | Quote: `N_max + fee_quote_max` | Quote | Deduct from the frozen quote |
+| `Quote` | Sell | Base: `Q` | Quote | Withhold `fee_quote` from the quote proceeds |
+| `Base` | Buy | Quote: `N_max + fee_quote_reserve + buffer` | Base | Withhold `fee_base` from the base delivery; release the matching quote reserve |
+| `Base` | Sell | Quote: `N_max + fee_quote_reserve + buffer` | Base | Withhold or acquire `fee_base` from the quote collateral; release the matching quote reserve |
+
+`N_max` is the maximum gross notional the order can execute: `Q * price` for a limit order, or
+`Q * protection_price` for a market order. For a `Base` sell it is the worst-case quote cost of
+covering or delivering the base (a short-collateral model), not the expected proceeds. Under
+`Base`, `fee_quote_reserve` is the base fee converted to quote at a conservative conversion price.
+The reserve is not a second fee; it is released when clearing withholds the base fee from the base
+leg.
+
+`Received` is the standard spot-delivery policy: the buyer freezes quote to pay the seller, and the
+seller freezes base to deliver. Fees are taken from the asset the side receives, so no second freeze
+is needed. This is the default for crypto/spot and fiat FX.
+
+`Quote` buys need a quote freeze that covers both notional and the quote fee. `Quote` sells deliver
+base and the quote fee is withheld from proceeds; because the fee rate is at most 100%, each fill's
+proceeds cover its own fee.
+
+`Base` is a **quote-collateral** policy: the order system freezes quote for both sides even though
+the fee is charged in base. It is intended for quote-collateralised instruments such as margin,
+short/derivative and quote-settled setups. A spot seller using `Base` must have an independent base
+inventory or locate; the quote freeze covers the economic obligation, not physical delivery.
+
+#### 6.6.2 Base policy: estimating the quote freeze from base volume
+
+When a `Base`-policy order is submitted with `volume_unit = base`, the engine matches the gross base
+quantity `Q`; it never converts the order to quote and never spends a quote balance. The order system
+must translate `Q` into a quote freeze using a conservative risk price and then cap the submitted
+base quantity so every possible fill plus fee is covered.
+
+Inputs:
+
+- `Q`: requested gross base volume;
+- `P_ref`: conservative risk price. For a buy, use the limit price or a protection price at or above
+  expected execution. For a sell, use the price at which quote collateral can buy back or deliver
+  the base, including a risk buffer;
+- `fee_quote_per_base`: the side's positive fee per base unit, expressed in quote. For `Base` this is
+  `max(rate, 0) * P_fee`, where `P_fee` is a conservative conversion price; for `Quote` it is
+  `P_ref * max(rate, 0)`;
+- `buffer`: a quote buffer for slippage and settlement rounding;
+- `leverage`: the risk-set leverage for a derivative; absent for cash.
+
+For a cash order:
+
+```text
+cost_per_base = P_ref + fee_quote_per_base
+F_quote       = ceil_to_quote_lot(Q * cost_per_base + buffer)
+```
+
+For a derivative:
+
+```text
+cost_per_base = P_ref / leverage + fee_quote_per_base
+F_quote       = ceil_to_quote_lot(Q * cost_per_base + buffer)
+```
+
+If the client supplies a quote freeze `F_quote`, invert the same formula:
+
+```text
+Q_max = floor_to_base_lot((F_quote - buffer) / cost_per_base)
+```
+
+The order system submits `Q <= Q_max`. If the client requests a larger base quantity, reject it with
+an insufficient-funds error (or resize only with explicit client consent). Do **not** submit the full
+`Q` and rely on the engine to stop at the freeze: the engine does not see `F_quote`. If the market
+moves beyond `P_ref` or the fee exceeds the estimate, the order system must top up, cancel the
+remainder, or let clearing reject the excess; a fill that breaches the freeze is an order-system risk
+event, not a matching-engine rejection.
+
+Size `P_ref`, `fee_quote_per_base` and `buffer` so the highest price the order can execute at
+(including market protection and slippage) plus the maximum fee still fits `F_quote`. If that cannot
+be guaranteed, the order system must not submit the full base quantity; the engine will still match
+it because it has no freeze to stop at.
+
+For a quote-volume order under `Base`, normalize it to base at admission and apply the same `N_max`
+formula. The requested quote amount alone is not sufficient: it excludes the fee reserve and, for a
+sell, can understate the conservative buy-back price. A freeze that does not exceed `buffer` funds
+no base quantity and must be rejected.
+
+A hard engine-side guarantee that no fill exceeds the freeze is not available today. It would need
+an explicit versioned limit such as `max_quote_spend` on the order (§9.1); the engine must not infer
+it from a balance or a node-local account lookup.
+
+For a sell under `Base`, the quote collateral covers buy-back/delivery of the base and the base fee.
+For a buy, the quote collateral covers the notional and a quote-equivalent reserve for the base fee;
+clearing withholds the fee from the base delivery.
+
+#### 6.6.3 Derivatives: margin plus fee
+
+For derivatives the freeze asset is the contract's settlement/margin asset: quote for a linear
+USDT-margined contract, base for an inverse coin-margined contract, or an explicit third asset for
+third-asset margin. When volume is expressed in contracts, first convert it to base-equivalent units
+with `contract_multiplier` (§3.2). The order system determines leverage `L` and reserves:
+
+```text
+linear:   margin = price * contracts * contract_multiplier / L
+inverse:  margin = contracts * contract_multiplier / (price * L)   // in base
+fee_est  = fee formula from §3.2/§6.5, in the settlement asset
+F        = ceil_to_freeze_lot(margin + fee_est + maintenance_buffer)
+```
+
+- Leverage, initial/maintenance margin rates and liquidation are risk-layer inputs; the engine does
+  not calculate them.
+- A linear contract with quote margin/fee freezes quote; an inverse contract freezes base; a
+  third-asset contract freezes its configured settlement asset.
+- If the fee asset differs from the freeze asset, reserve the quote/base equivalent explicitly.
+  The engine reports the fee asset and amount; it does not convert assets.
+- The fee is deducted from the frozen margin when clearing processes each fill. Remaining margin is
+  updated by PnL, funding and settlement outside the engine.
+- A fill carrying an overflow error code must not be used as a zero fee or zero notional in margin or
+  liquidation calculations (§7.1).
+
+#### 6.6.4 Match-result handling and release
+
+For each match result, clearing should:
+
+1. Resolve the fee asset from the policy and side, using the explicit `taker_fee_asset` and
+   `maker_fee_asset` on the fill.
+2. Consume the frozen principal for the filled quantity.
+3. Deduct a positive fee from the frozen asset when it is the fee asset; otherwise withhold it from
+   the asset being delivered or credited (Received buy: base delivery; Received sell: quote
+   proceeds; Base: base leg) or from a pre-funded fee reserve.
+4. Credit the net amount; credit a rebate in the fee asset.
+5. Release the unused freeze on cancellation, expiry or terminal fill.
+
+This is per fill and repeated across partial fills. A fee must never create an unfunded negative
+balance. If the fee asset differs from the frozen asset and the settlement leg is insufficient, the
+order system must reject or top up before submission, or clearing must quarantine the fill for
+manual handling.
+
+Example freeze requirements (ignoring buffers and rounding):
+
+| Order | Policy | Freeze |
+|---|---|---|
+| Buy 1 BTC at 50,000 USDT | `Received` | 50,000 USDT; base fee withheld from BTC delivery |
+| Sell 1 BTC at 50,000 USDT | `Received` | 1 BTC; quote fee withheld from USDT proceeds |
+| Buy 10 QQQ at 400 USD | `Quote` | 4,000 USD + quote fee |
+| Sell 10 QQQ at 400 USD | `Quote` | 10 QQQ; quote fee from USD proceeds |
+| Buy 10 QQQ at 400 USD, 0.1% base fee | `Base` | 4,000 USD + 4 USD fee reserve |
+| Linear perp, 1 BTC at 50,000 USDT, 10x | `Quote` | 5,000 USDT margin + fee + buffer |
+| Inverse perp, fee in BTC, 10x | `Base` | BTC margin + BTC fee + buffer |
+
+The standalone demo order desk (`demo/src/freeze.rs`) implements a labelled **demo estimate** of the
+cash/spot rows above and of the **linear quote-margined perpetual** row: it derives the freeze,
+maker/taker settlement legs and, for a perpetual ticket, the leverage, position side, notional,
+initial margin and quote fee from the replicated `SymbolConfig`, the order fields and the fee rates.
+The perpetual overlay is demo-only — the engine still matches the configured cash symbol and has no
+instrument-kind, leverage or margin field. The demo requires `fee_asset_policy = quote` for perpetual
+orders, models no contract multiplier, funding, PnL, liquidation or maintenance margin, and treats a
+zero `buffer`. It holds no account state, never enforces the freeze, and does not estimate inverse or
+third-asset contracts. The engine remains authoritative for the fill's fee fields only.
 
 ## 7. Rounding and precision
 
@@ -473,6 +673,9 @@ Recommended rounding rules:
 - Fiat fees settle in the fiat ledger's minor units; stablecoin fees in the chain's smallest unit;
   fractional-share fees in the base asset's share precision.
 - If a fee rounds to zero at the asset's minimum unit, no minimum fee is applied in this phase.
+- Order-system freeze amounts round **up** to the freeze asset's settlement precision/lot, never
+  down. An order whose freeze cannot cover the maximum obligation is rejected or topped up before
+  submission; the engine does not resize it.
 - All rounding is deterministic and independent of node-local configuration.
 
 Decision: the engine reports exact scale-18 fees plus the explicit fee asset; the clearing layer
@@ -636,6 +839,9 @@ Quote market orders never rest. This keeps `BidKey`/`AskKey` and the book compar
 - All base quantities are whole base lots after normalization.
 - Fees never change the matched gross quantity.
 - Gross notional and both fees are deterministic from the fill and order rates.
+- The engine matches only the submitted base quantity; it does not read, hold or mutate order-system
+  balances or freezes. The order system must admit an order whose base quantity fits its freeze; the
+  engine has no per-order balance cap (§6.6).
 - A rejected order never mutates the book or fee state.
 - The book remains uncrossed after every successful execution.
 
@@ -670,6 +876,11 @@ The derivatives extension in §3.2 also requires `VolumeUnit::Contract`, the ins
 contract multiplier and settlement asset in `SymbolConfig`, and `FeeAsset::Settlement`. These are
 wire and snapshot changes: snapshot v10 and wire v6 cannot carry them without another version and
 migration.
+
+Freeze metadata is not part of `Order`: balances, reservations and accounts stay in the order
+system, and the engine receives only the base quantity it should match. If a deployment later wants
+an in-engine spend cap (for example a `max_quote_spend` field), that must be an explicit order field
+with its own wire/snapshot version and matching invariant, not an implicit balance lookup.
 
 ### 9.2 `MatchResult`
 
@@ -821,6 +1032,27 @@ Still to cover if the extensions in §3.2 and §13 items 11-16 are built:
   contract-multiplier notional, maker rebates and overflow quarantine; margin/PnL and funding stay
   outside the engine.
 
+Order-system freeze and clearing cases (outside this repository, not part of `cargo test`):
+
+- `Received` buy: quote principal is frozen, the base fee is withheld from the base delivery and the
+  unused quote is released. `Received` sell: base principal is frozen, the quote fee is withheld
+  from proceeds and the unused base is released.
+- `Quote` buy: the freeze covers `N_max` plus the quote fee; a partial fill and a cancel release the
+  remainder exactly once. `Quote` sell: base principal is frozen and the quote fee is deducted from
+  proceeds per fill.
+- `Base` with base volume: the estimator produces `Q_max`; an order for `Q > Q_max` is rejected or
+  explicitly resized before submission; an accepted `Q` matches in full even when the realized
+  notional plus fee would exceed the quote freeze, which must raise an order-system risk event.
+- `Base` buy and sell: the quote collateral reserve for the base fee is released once clearing has
+  funded or withheld the base fee, and no fee is charged twice.
+- Partial fills, amendments, cancellation, GTD/Day expiry and a stopped child: each terminal state
+  releases only the unused freeze, and a fee is deducted once per fill.
+- A fill with `notional_overflow`, `maker_fee_overflow` or `taker_fee_overflow` is quarantined by
+  clearing rather than settled from a zero amount.
+- Derivatives: margin plus fee plus buffer is frozen in the settlement asset at risk-set leverage;
+  the fee is deducted from the freeze on every fill; PnL, funding and liquidation adjust the
+  remaining margin outside the engine.
+
 ## 13. Decisions and remaining questions
 
 Implemented choices:
@@ -868,6 +1100,24 @@ Resolved:
 19. Funding, liquidation, insurance funds, auto-deleveraging, initial/maintenance margin, leverage
     limits, portfolio netting, option exercise and realised/unrealised PnL are owned by the
     risk/clearing layer. The matching engine reports fills and fees only.
+20. Balance checks, asset freezes and freeze release are order-system state. The engine never holds
+    balances or enforces a per-order spend cap; it matches the base quantity it receives (§6.6).
+21. Under `Received`, the order system freezes quote for a buy and base for a sell; the fee is taken
+    from the received asset. Under `Quote`, both sides settle the fee in quote; a sell still freezes
+    the base principal. Under `Base`, the order system freezes quote collateral for both sides and
+    the fee is charged in base (§6.6.1).
+22. Base-volume orders under `Base` use the conservative estimate
+    `F_quote = ceil_to_quote_lot(Q * (P_ref + fee_quote_per_base) + buffer)`, with `P_ref` replaced
+    by `P_ref / leverage` for a derivative. The order system accepts `Q <= Q_max` and rejects or
+    explicitly resizes the rest; the engine matches the submitted base volume and has no visibility
+    of `F_quote` (§6.6.2).
+23. Derivative freezes are `margin + fee_est + maintenance_buffer` at the risk-set leverage, in the
+    contract's settlement/margin asset. Leverage, margin rates and liquidation remain risk-layer
+    inputs (§6.6.3).
+24. Clearing deducts each fill's positive fee from the frozen asset or the settlement leg before
+    crediting proceeds, and releases the unused freeze on cancel, expiry or terminal fill. A fill
+    must never create an unfunded negative balance; if it would, clearing rejects or quarantines it
+    (§6.6.4).
 
 ## 14. Recommendation
 
@@ -885,6 +1135,20 @@ Adopt the following default contract:
   crypto.
 - The engine reports exact fee amounts and fee assets; the external order/clearing system owns
   balances, fiat/chain settlement and final asset precision.
+- The order system freezes the trading asset before submission and clearing deducts fees from that
+  freeze or the settlement leg, then releases the unused amount. `Received` freezes quote for buys
+  and base for sells; `Quote` freezes the quote fee and, on sells, the base principal; `Base`
+  freezes quote collateral for both sides.
+- A base-volume order under `Base` is converted by the order system with a conservative price, fee
+  reserve and buffer, rounded up, and the submitted base quantity is capped at the resulting
+  `Q_max`. The engine matches that base quantity exactly and must not be assumed to stop at the
+  freeze, because it does not see balances.
+- A derivative freeze covers risk-set initial margin, the estimated fee and a maintenance buffer in
+  the settlement/margin asset. The engine reports the fee asset and amount but computes neither
+  margin nor leverage.
+- The engine stores no freeze or balance state. If in-engine spend enforcement is ever required,
+  add an explicit versioned order field (for example `max_quote_spend`) rather than an implicit
+  balance lookup.
 - Equity/ETF sessions, holidays, auctions, T+1/T+2 settlement, corporate actions and
   fixed/regulatory/minimum/tax fees stay upstream in the external order system; the engine consumes
   explicit session-close/GTD timestamps and notional-proportional maker/taker rates.

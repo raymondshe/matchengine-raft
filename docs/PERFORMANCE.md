@@ -1,6 +1,6 @@
 # Performance measurements
 
-Measured on **2026-10-30** (runtime flavor A/B and P0 offloads: **2026-10-31**; measurement scope and RSS: **2026-11-01**) on the reference development machine:
+Measured on **2026-10-30** (runtime flavor A/B and P0 offloads: **2026-10-31**; measurement scope and RSS: **2026-11-01**; book p50/p99 and the pinned-core approximation: **2026-11-04**) on the reference development machine:
 
 - Apple M4 (`arm64`)
 - Rust `1.93.1`
@@ -14,7 +14,7 @@ on the deployment hardware before using the numbers for sizing.
 
 ```shell
 cargo bench --bench matchengine   # order-book microbenchmarks
-cargo bench --bench e2e           # submit -> commit -> apply -> response (multi-thread; -- current|both for A/B)
+cargo bench --bench e2e           # submit -> commit -> apply -> response (multi-thread; -- current|both for A/B, --pin <cpu> on Linux)
 cargo bench --bench feed_load     # market-data feed at 50k/500k fills/s
 cargo bench --bench storage       # WAL append/read/recovery
 cargo bench --bench p0_bench -- duplicate|read|snapshot  # P0 lock/scan A/B

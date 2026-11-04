@@ -22,6 +22,7 @@
     <span class="chip" id="term-chip">Term <strong>—</strong></span>
     <span class="chip" id="ready-chip">Ready <strong>—</strong></span>
     <span class="chip" id="symbol-chip">Symbol —</span>
+    <span class="chip" id="backend-chip">Backend —</span>
     <span class="muted mono" id="updated">not loaded</span>
     <button class="btn ghost" id="refresh-button" type="button">Refresh</button>
   </div>
@@ -31,8 +32,11 @@
   <div class="page-head">
     <div>
       <div class="eyebrow">Demo order desk</div>
-      <h1 id="desk-title">Order desk</h1>
-      <p>Place orders, watch the visible book and follow the replicated match-event log.</p>
+      <label class="pair-picker" for="pair-select">
+        <span>Trading pair</span>
+        <select id="pair-select" aria-label="Trading pair"></select>
+      </label>
+      <p id="pair-hint">Each pair uses its own engine and orderbook.</p>
     </div>
     <div class="page-actions">
       <label class="toggle"><input type="checkbox" id="auto-refresh" checked> Auto-refresh 1s</label>
@@ -82,6 +86,14 @@
             <div><span>Tick / lot</span><strong id="tick-lot">—</strong><span class="sub">price / base</span></div>
           </div>
 
+          <div class="freeze-strip">
+            <div class="freeze-strip-head">
+              <span>Estimated freeze</span>
+              <span class="freeze-hint" id="freeze-note">demo estimate · engine holds no balances</span>
+            </div>
+            <div class="freeze-chips" id="freeze-chips">—</div>
+          </div>
+
           <div class="subhead">Depth · top 20</div>
           <div class="table-wrap">
             <table class="ladder compact">
@@ -93,7 +105,7 @@
           <div class="subhead">Open orders <span class="badge neutral" id="orders-count">0</span></div>
           <div class="table-wrap">
             <table class="orders-table compact">
-              <thead><tr><th>Seq</th><th>Side</th><th>Price</th><th>Remaining</th><th>Type</th><th></th></tr></thead>
+              <thead><tr><th>Seq</th><th>Side</th><th>Price</th><th>Remaining</th><th>Freeze</th><th>Type</th><th></th></tr></thead>
               <tbody id="orders-body"></tbody>
             </table>
           </div>
@@ -101,7 +113,7 @@
           <div class="subhead">Parked stops <span class="badge warn" id="stops-count">0</span></div>
           <div class="table-wrap">
             <table class="orders-table compact">
-              <thead><tr><th>Seq</th><th>Side</th><th>Stop</th><th>Volume</th><th>Child</th><th></th></tr></thead>
+              <thead><tr><th>Seq</th><th>Side</th><th>Stop</th><th>Volume</th><th>Freeze</th><th>Child</th><th></th></tr></thead>
               <tbody id="stops-body"></tbody>
             </table>
           </div>
@@ -133,6 +145,24 @@
 
             <label class="field" id="expiry-field" hidden><span>GTD expiry</span><input id="ticket-expiry" type="datetime-local"></label>
 
+            <div class="ticket-row" id="leverage-row" hidden>
+              <label class="field"><span>Leverage</span>
+                <select id="ticket-leverage">
+                  <option value="1">1x</option>
+                  <option value="2">2x</option>
+                  <option value="3">3x</option>
+                  <option value="5">5x</option>
+                  <option value="10" selected>10x</option>
+                  <option value="20">20x</option>
+                  <option value="25">25x</option>
+                  <option value="50">50x</option>
+                  <option value="100">100x</option>
+                </select>
+              </label>
+              <div class="field"><span>Margin asset</span><span class="static-value" id="leverage-margin-asset">—</span></div>
+            </div>
+            <div class="ticket-hint" id="leverage-hint" hidden></div>
+
             <label class="field"><span>Price</span>
               <div class="input-unit"><input id="ticket-price" type="text" inputmode="decimal" placeholder="0.00"><span class="unit" id="price-unit">—</span></div>
             </label>
@@ -163,6 +193,15 @@
               <label class="field"><span>Client order id</span><input id="ticket-client-id" type="text"></label>
             </details>
 
+            <div class="ticket-freeze" id="ticket-freeze">
+              <div class="ticket-freeze-head">
+                <span>Estimated freeze</span>
+                <span class="badge neutral" id="ticket-freeze-role">—</span>
+              </div>
+              <strong id="ticket-freeze-value">—</strong>
+              <span id="ticket-freeze-detail">Fill the ticket to preview the order-system freeze.</span>
+            </div>
+
             <button class="btn primary" id="ticket-submit" type="submit">Place buy order</button>
             <div class="ticket-hint" id="ticket-hint">The engine validates precision, tick and lot.</div>
           </form>
@@ -181,6 +220,48 @@
           </div>
         </section>
       </div>
+
+      <section class="panel economics-panel" id="economics-panel" aria-label="Order economics">
+        <div class="panel-head">
+          <div>
+            <h2 id="economics-title">Order economics</h2>
+            <p id="economics-sub">Select an open order, a parked stop or a full-book row.</p>
+          </div>
+          <span class="diag-actions">
+            <span class="badge neutral" id="economics-badge">estimate</span>
+            <button class="btn ghost" id="economics-clear" type="button" hidden>Clear</button>
+          </span>
+        </div>
+        <div class="economics-empty" id="economics-empty">
+          Click a row to inspect its estimated freeze and the assets each side of a fill delivers, receives and pays in fees.
+        </div>
+        <div class="economics-detail" id="economics-detail" hidden>
+          <div class="economics-freeze">
+            <div><span>Freeze</span><strong id="economics-freeze-value">—</strong></div>
+            <div><span>Basis</span><strong id="economics-freeze-basis">—</strong></div>
+            <div><span>Fee rate</span><strong id="economics-freeze-rate">—</strong></div>
+            <div><span>Reference price</span><strong id="economics-reference">—</strong></div>
+          </div>
+          <div class="perp-terms" id="perp-terms" hidden>
+            <div><span>Product</span><strong id="perp-product">—</strong></div>
+            <div><span>Leverage</span><strong id="perp-leverage">—</strong></div>
+            <div><span>Position</span><strong id="perp-position">—</strong></div>
+            <div><span>Notional</span><strong id="perp-notional">—</strong></div>
+            <div><span>Initial margin</span><strong id="perp-margin">—</strong></div>
+            <div><span>Fee</span><strong id="perp-fee">—</strong></div>
+            <div><span>Buffer</span><strong id="perp-buffer">—</strong></div>
+            <div><span>Margin asset</span><strong id="perp-margin-asset">—</strong></div>
+            <div><span>Fee rate</span><strong id="perp-rate">—</strong></div>
+          </div>
+          <div class="table-wrap" id="settlement-wrap">
+            <table class="settlement-table compact">
+              <thead><tr><th>Leg</th><th>Delivers</th><th>Receives</th><th class="num">Fee</th><th class="num">Rate</th></tr></thead>
+              <tbody id="settlement-body"></tbody>
+            </table>
+          </div>
+          <div class="fee-note" id="economics-note"></div>
+        </div>
+      </section>
 
       <section class="panel recent-events" aria-label="Recent events">
         <div class="panel-head">
@@ -215,6 +296,7 @@
 
         <div class="full-book-toolbar">
           <span class="badge neutral" id="book-snapshot">—</span>
+          <span class="badge neutral" id="book-freeze">freeze —</span>
           <span class="muted mono" id="book-loaded">manual refresh</span>
           <span class="grow"></span>
           <span class="diag-actions">
@@ -228,7 +310,7 @@
             <div class="subhead">Bids · order level <span class="badge neutral" id="book-bids-count">0</span></div>
             <div class="table-wrap">
               <table class="full-table compact">
-                <thead><tr><th>Seq</th><th class="num">Price</th><th class="num">Volume</th><th class="num">Hidden</th><th class="num">Display</th><th>Type</th><th>TIF</th><th>Flags</th></tr></thead>
+                <thead><tr><th>Seq</th><th class="num">Price</th><th class="num">Volume</th><th class="num">Hidden</th><th class="num">Display</th><th class="num">Freeze</th><th>Type</th><th>TIF</th><th>Flags</th></tr></thead>
                 <tbody id="book-bids-body"></tbody>
               </table>
             </div>
@@ -239,7 +321,7 @@
             <div class="subhead">Asks · order level <span class="badge neutral" id="book-asks-count">0</span></div>
             <div class="table-wrap">
               <table class="full-table compact">
-                <thead><tr><th>Seq</th><th class="num">Price</th><th class="num">Volume</th><th class="num">Hidden</th><th class="num">Display</th><th>Type</th><th>TIF</th><th>Flags</th></tr></thead>
+                <thead><tr><th>Seq</th><th class="num">Price</th><th class="num">Volume</th><th class="num">Hidden</th><th class="num">Display</th><th class="num">Freeze</th><th>Type</th><th>TIF</th><th>Flags</th></tr></thead>
                 <tbody id="book-asks-body"></tbody>
               </table>
             </div>
@@ -258,7 +340,7 @@
         <div class="subhead">Parked stops · all <span class="badge warn" id="book-stops-count">0</span></div>
         <div class="table-wrap">
           <table class="full-table compact">
-            <thead><tr><th>Seq</th><th>Side</th><th class="num">Stop price</th><th class="num">Volume</th><th>Type</th><th>TIF</th><th class="num">Hidden</th><th class="num">Display</th></tr></thead>
+            <thead><tr><th>Seq</th><th>Side</th><th class="num">Stop price</th><th class="num">Volume</th><th class="num">Freeze</th><th>Type</th><th>TIF</th><th class="num">Hidden</th><th class="num">Display</th></tr></thead>
             <tbody id="book-stops-body"></tbody>
           </table>
         </div>
@@ -381,7 +463,10 @@
             <span class="badge good" id="node-ready-badge">—</span>
           </div>
           <div class="kv-grid">
-            <div class="kv"><span>Engine</span><span id="node-engine">—</span></div>
+            <div class="kv"><span>Active product</span><span id="node-product">—</span></div>
+            <div class="kv"><span>Active engine</span><span id="node-engine">—</span></div>
+            <div class="kv"><span>Spot engine</span><span id="node-spot-engine">—</span></div>
+            <div class="kv"><span>Perpetual engine</span><span id="node-perp-engine">—</span></div>
             <div class="kv"><span>Leader / term</span><span id="node-leader-term">—</span></div>
             <div class="kv"><span>Raft state</span><span id="node-raft-state">—</span></div>
             <div class="kv"><span>Book sequence</span><span id="node-book-seq">—</span></div>

@@ -387,6 +387,40 @@
   .orders-table th, .orders-table td { padding: 7px 10px; font-size: 11px; }
   .orders-table .actions { display: flex; gap: 5px; justify-content: flex-end; }
   .orders-table .btn { min-height: 24px; padding: 2px 7px; font-size: 10px; }
+  .orders-table tr.selected { background: rgba(99, 169, 255, .12); }
+  .freeze-strip {
+    display: grid;
+    gap: 6px;
+    padding: 10px 16px;
+    border-bottom: 1px solid var(--border);
+    background: rgba(23, 34, 58, .45);
+  }
+  .freeze-strip-head {
+    display: flex;
+    justify-content: space-between;
+    gap: 10px;
+    flex-wrap: wrap;
+    color: var(--muted);
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: .06em;
+  }
+  .freeze-hint { color: var(--faint); font-size: 10px; text-transform: none; letter-spacing: 0; }
+  .freeze-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+  .freeze-chip {
+    display: inline-flex;
+    align-items: baseline;
+    gap: 5px;
+    padding: 4px 9px;
+    border: 1px solid var(--border-strong);
+    border-radius: 999px;
+    background: var(--surface-3);
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 11px;
+  }
+  .freeze-chip strong { color: var(--text); font-size: 12px; }
+  .freeze-chip span { color: var(--muted); font-size: 10px; }
+  .freeze-cell { color: var(--muted); font-size: 10.5px; }
   .flash-row { background: rgba(66, 211, 146, .08); }
   .side-buy { color: var(--good); font-weight: 650; }
   .side-sell { color: var(--bad); font-weight: 650; }
@@ -409,6 +443,14 @@
   }
   .segmented button.buy.active { border-color: #245744; background: var(--good-soft); color: var(--good); }
   .segmented button.sell.active { border-color: #5c272c; background: var(--bad-soft); color: var(--bad); }
+  .segmented.product { padding-top: 12px; }
+  .segmented.product button.active { border-color: rgba(96, 165, 250, .55); background: rgba(37, 99, 235, .16); color: #bfdbfe; }
+  .static-value {
+    display: flex; align-items: center; min-height: 34px; padding: 5px 9px;
+    border: 1px solid var(--border-strong); border-radius: 8px;
+    background: var(--surface-2); color: var(--text); font-size: 12px;
+    font-variant-numeric: tabular-nums;
+  }
 
   .ticket-form { display: grid; gap: 12px; padding: 14px 16px; }
   .ticket-row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
@@ -449,10 +491,66 @@
   .ticket-form .checks { display: flex; gap: 16px; flex-wrap: wrap; }
   .ticket-form .check { padding: 0; }
   .ticket-form .btn.primary { width: 100%; min-height: 38px; font-weight: 700; }
-  .ticket-hint { color: var(--faint); font-size: 11px; }
+  .ticket-hint { color: var(--faint); font-size: 11px; line-height: 1.45; }
+  .ticket-hint.warn { color: #f4c97a; }
   .advanced { border-top: 1px solid var(--border); padding-top: 10px; }
   .advanced summary { color: var(--muted); font-size: 11px; cursor: pointer; }
   .advanced[open] summary { margin-bottom: 10px; }
+
+  .ticket-freeze {
+    display: grid;
+    gap: 4px;
+    padding: 10px 12px;
+    border: 1px solid var(--border-strong);
+    border-radius: 10px;
+    background: rgba(29, 61, 102, .35);
+  }
+  .ticket-freeze-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 8px;
+    color: var(--muted);
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: .06em;
+  }
+  .ticket-freeze strong { font-size: 18px; font-variant-numeric: tabular-nums; }
+  .ticket-freeze > span { color: var(--faint); font-size: 10.5px; }
+
+  .economics-panel { margin-top: 16px; }
+  .economics-empty { padding: 14px 16px; color: var(--faint); font-size: 12px; }
+  .economics-detail { display: grid; gap: 0; }
+  .economics-freeze {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    border-bottom: 1px solid var(--border);
+  }
+  .economics-freeze > div {
+    display: grid;
+    gap: 3px;
+    padding: 12px 16px;
+    border-right: 1px solid var(--border);
+  }
+  .economics-freeze > div:last-child { border-right: 0; }
+  .economics-freeze span { color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: .06em; }
+  .economics-freeze strong { font-size: 14px; font-variant-numeric: tabular-nums; }
+  .perp-terms {
+    display: grid; grid-template-columns: repeat(6, minmax(0, 1fr));
+    border-bottom: 1px solid rgba(39, 54, 80, .6);
+  }
+  .perp-terms > div {
+    display: grid; gap: 2px; padding: 10px 16px;
+    border-right: 1px solid rgba(39, 54, 80, .55);
+    border-bottom: 1px solid rgba(39, 54, 80, .55);
+  }
+  .perp-terms > div:nth-child(6n) { border-right: 0; }
+  .perp-terms > div:nth-last-child(-n+3) { border-bottom: 0; }
+  .perp-terms span { color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: .06em; }
+  .perp-terms strong { font-size: 13px; font-variant-numeric: tabular-nums; }
+  .settlement-table th, .settlement-table td { padding: 8px 12px; font-size: 11px; }
+  .settlement-table .rebate { color: var(--warn); }
+  .economics-panel .fee-note { padding: 10px 16px 14px; color: var(--faint); font-size: 10.5px; border-top: 1px solid rgba(39, 54, 80, .6); }
 
   .result-banner {
     display: grid;
@@ -659,6 +757,17 @@
         <div><span>Tick / lot</span><strong>0.01 / 1e-8</strong><span class="sub">price / base</span></div>
       </div>
 
+      <div class="freeze-strip">
+        <div class="freeze-strip-head">
+          <span>Estimated freeze</span>
+          <span class="freeze-hint">8 priced · demo estimate · engine holds no balances</span>
+        </div>
+        <div class="freeze-chips">
+          <span class="freeze-chip" title="3 orders"><strong>1</strong><span>BTC</span></span>
+          <span class="freeze-chip" title="5 orders"><strong>208,302.95</strong><span>USDT</span></span>
+        </div>
+      </div>
+
       <div class="subhead">Depth · top 20</div>
       <div class="table-wrap">
         <table class="ladder compact">
@@ -681,14 +790,14 @@
       <div class="subhead">Open orders <span class="badge neutral">6</span></div>
       <div class="table-wrap">
         <table class="orders-table compact">
-          <thead><tr><th>Seq</th><th>Side</th><th>Price</th><th>Remaining</th><th>Type</th><th></th></tr></thead>
+          <thead><tr><th>Seq</th><th>Side</th><th>Price</th><th>Remaining</th><th>Freeze</th><th>Type</th><th></th></tr></thead>
           <tbody>
-            <tr class="flash-row"><td class="mono">44</td><td class="side-buy">Buy</td><td class="mono">60,000.01</td><td class="mono">0.20000000</td><td>Limit · GTC</td><td class="actions"><button class="btn ghost" type="button">Cancel</button><button class="btn" type="button">Amend</button></td></tr>
-            <tr><td class="mono">43</td><td class="side-sell">Sell</td><td class="mono">60,000.02</td><td class="mono">0.10000000</td><td>Limit · GTC</td><td class="actions"><button class="btn ghost" type="button">Cancel</button><button class="btn" type="button">Amend</button></td></tr>
-            <tr><td class="mono">41</td><td class="side-buy">Buy</td><td class="mono">60,000.00</td><td class="mono">0.42130000</td><td>Limit · GTC</td><td class="actions"><button class="btn ghost" type="button">Cancel</button><button class="btn" type="button">Amend</button></td></tr>
-            <tr><td class="mono">39</td><td class="side-buy">Buy</td><td class="mono">59,999.99</td><td class="mono">0.50000000</td><td>Limit · GTC · post-only</td><td class="actions"><button class="btn ghost" type="button">Cancel</button><button class="btn" type="button">Amend</button></td></tr>
-            <tr><td class="mono">37</td><td class="side-sell">Sell</td><td class="mono">60,000.03</td><td class="mono">0.40000000</td><td>Iceberg · display 0.10</td><td class="actions"><button class="btn ghost" type="button">Cancel</button></td></tr>
-            <tr><td class="mono">34</td><td class="side-buy">Buy</td><td class="mono">59,999.97</td><td class="mono">2.10000000</td><td>Limit · GTC</td><td class="actions"><button class="btn ghost" type="button">Cancel</button><button class="btn" type="button">Amend</button></td></tr>
+            <tr class="flash-row selected"><td class="mono">44</td><td class="side-buy">Buy</td><td class="mono">60,000.01</td><td class="mono">0.20000000</td><td class="freeze-cell mono">1,206.01 USDT</td><td>Perp 10x · Limit · GTC</td><td class="actions"><button class="btn ghost" type="button">Cancel</button><button class="btn" type="button">Amend</button></td></tr>
+            <tr><td class="mono">43</td><td class="side-sell">Sell</td><td class="mono">60,000.02</td><td class="mono">0.10000000</td><td class="freeze-cell mono">0.10000000 BTC</td><td>Limit · GTC</td><td class="actions"><button class="btn ghost" type="button">Cancel</button><button class="btn" type="button">Amend</button></td></tr>
+            <tr><td class="mono">41</td><td class="side-buy">Buy</td><td class="mono">60,000.00</td><td class="mono">0.42130000</td><td class="freeze-cell mono">25,278.00 USDT</td><td>Limit · GTC</td><td class="actions"><button class="btn ghost" type="button">Cancel</button><button class="btn" type="button">Amend</button></td></tr>
+            <tr><td class="mono">39</td><td class="side-buy">Buy</td><td class="mono">59,999.99</td><td class="mono">0.50000000</td><td class="freeze-cell mono">30,000.00 USDT</td><td>Limit · GTC · post-only</td><td class="actions"><button class="btn ghost" type="button">Cancel</button><button class="btn" type="button">Amend</button></td></tr>
+            <tr><td class="mono">37</td><td class="side-sell">Sell</td><td class="mono">60,000.03</td><td class="mono">0.40000000</td><td class="freeze-cell mono">0.40000000 BTC</td><td>Iceberg · display 0.10</td><td class="actions"><button class="btn ghost" type="button">Cancel</button></td></tr>
+            <tr><td class="mono">34</td><td class="side-buy">Buy</td><td class="mono">59,999.97</td><td class="mono">2.10000000</td><td class="freeze-cell mono">125,999.94 USDT</td><td>Limit · GTC</td><td class="actions"><button class="btn ghost" type="button">Cancel</button><button class="btn" type="button">Amend</button></td></tr>
           </tbody>
         </table>
       </div>
@@ -696,10 +805,10 @@
       <div class="subhead">Parked stops <span class="badge warn">2</span></div>
       <div class="table-wrap">
         <table class="orders-table compact">
-          <thead><tr><th>Seq</th><th>Side</th><th>Stop</th><th>Volume</th><th>Child</th><th></th></tr></thead>
+          <thead><tr><th>Seq</th><th>Side</th><th>Stop</th><th>Volume</th><th>Freeze</th><th>Child</th><th></th></tr></thead>
           <tbody>
-            <tr><td class="mono">36</td><td class="side-buy">Buy</td><td class="mono">60,100.00</td><td class="mono">0.25000000</td><td>Market</td><td class="actions"><button class="btn ghost" type="button">Cancel</button></td></tr>
-            <tr><td class="mono">35</td><td class="side-sell">Sell</td><td class="mono">59,900.00</td><td class="mono">0.50000000</td><td>Limit 59,850.00</td><td class="actions"><button class="btn ghost" type="button">Cancel</button></td></tr>
+            <tr><td class="mono">36</td><td class="side-buy">Buy</td><td class="mono">60,100.00</td><td class="mono">0.25000000</td><td class="freeze-cell mono">15,025.00 USDT</td><td>Market</td><td class="actions"><button class="btn ghost" type="button">Cancel</button></td></tr>
+            <tr><td class="mono">35</td><td class="side-sell">Sell</td><td class="mono">59,900.00</td><td class="mono">0.50000000</td><td class="freeze-cell mono">0.50000000 BTC</td><td>Limit 59,850.00</td><td class="actions"><button class="btn ghost" type="button">Cancel</button></td></tr>
           </tbody>
         </table>
       </div>
@@ -712,7 +821,12 @@
           <h2>Order ticket</h2>
           <p>Limit order · BTC / USDT</p>
         </div>
-        <span class="badge neutral">GTC</span>
+        <span class="badge neutral">Perp Limit · GTC</span>
+      </div>
+
+      <div class="segmented product" role="group" aria-label="Product">
+        <button type="button">Spot</button>
+        <button class="active" type="button">Perpetual</button>
       </div>
 
       <div class="segmented" role="group" aria-label="Side">
@@ -729,6 +843,14 @@
             <select><option>GTC</option><option>IOC</option><option>FOK</option><option>GTD</option><option>Day</option></select>
           </label>
         </div>
+
+        <div class="ticket-row">
+          <label class="field"><span>Leverage</span>
+            <select><option>1x</option><option>2x</option><option>3x</option><option>5x</option><option selected>10x</option><option>20x</option><option>25x</option><option>50x</option><option>100x</option></select>
+          </label>
+          <div class="field"><span>Margin asset</span><span class="static-value">USDT</span></div>
+        </div>
+        <div class="ticket-hint">Linear quote-margined perpetual overlay. Buy opens a long, sell opens a short; the engine matches the fills but does not hold margin or fund the position.</div>
 
         <label class="field"><span>Price</span>
           <div class="input-unit"><input type="text" value="60000.01" inputmode="decimal"><span class="unit">USDT</span></div>
@@ -747,19 +869,29 @@
         </div>
 
         <details class="advanced">
-          <summary>Advanced · fees, stop, client order id</summary>
+          <summary>Advanced · fees, stop, display, client order id</summary>
           <div class="ticket-row">
-            <label class="field"><span>Maker fee (bps)</span><input type="text" value="0"></label>
-            <label class="field"><span>Taker fee (bps)</span><input type="text" value="0"></label>
+            <label class="field"><span>Maker fee rate</span><input type="text" value="0.0005" placeholder="0.001 = 10 bps"></label>
+            <label class="field"><span>Taker fee rate</span><input type="text" value="0.001" placeholder="0.002 = 20 bps"></label>
           </div>
+          <div class="ticket-hint">Fee rates are fractions of notional, not bps: 0.001 = 10 bps = 0.1%.</div>
           <div class="ticket-row">
             <label class="field"><span>Stop price</span><div class="input-unit"><input type="text" placeholder="0.00"><span class="unit">USDT</span></div></label>
-            <label class="field"><span>Display volume</span><div class="input-unit"><input type="text" placeholder="iceberg"><span class="unit">BTC</span></div></label>
+            <label class="field"><span>Display volume</span><div class="input-unit"><input type="text" placeholder="iceberg tranche"><span class="unit">BTC</span></div></label>
           </div>
           <label class="field"><span>Client order id</span><input type="text" value="demo-7c1b6f5e-4a90-4d8a-9d2a-1e0b3c4d5e6f"></label>
         </details>
 
-        <button class="btn primary" type="button">Place buy order</button>
+        <div class="ticket-freeze">
+          <div class="ticket-freeze-head">
+            <span>Estimated freeze</span>
+            <span class="badge leader">taker rate</span>
+          </div>
+          <strong>3,030.01 USDT</strong>
+          <span>10x long · margin 3000.0005 USDT + fee 30.000005 USDT · notional 30000.005 USDT · 0.1% · reference 60000.01</span>
+        </div>
+
+        <button class="btn primary" type="button">Buy / long · 10x</button>
         <div class="ticket-hint">Tick 0.01 · base lot 0.00000001 · the engine validates precision, tick and lot.</div>
       </form>
 
@@ -782,6 +914,39 @@
     </section>
 
       </div>
+
+      <section class="panel economics-panel" aria-label="Order economics">
+        <div class="panel-head">
+          <div>
+            <h2>Perp 10x Buy 0.5 BTC @ 60,000.01</h2>
+            <p>Sequence 44 · Perp Limit · Buy 0.50000000 BTC</p>
+          </div>
+          <span class="diag-actions">
+            <span class="badge leader">demo estimate</span>
+            <button class="btn ghost" type="button">Clear</button>
+          </span>
+        </div>
+        <div class="economics-detail">
+          <div class="economics-freeze">
+            <div><span>Freeze</span><strong>3,015.01 USDT</strong></div>
+            <div><span>Basis</span><strong>Maker · perpetual margin + quote fee</strong></div>
+            <div><span>Fee rate</span><strong>0.05%</strong></div>
+            <div><span>Reference price</span><strong>60000.01</strong></div>
+          </div>
+          <div class="perp-terms">
+            <div><span>Product</span><strong>Perpetual · linear</strong></div>
+            <div><span>Leverage</span><strong>10x</strong></div>
+            <div><span>Position</span><strong>Long</strong></div>
+            <div><span>Notional</span><strong>30000.005 USDT</strong></div>
+            <div><span>Initial margin</span><strong>3000.0005 USDT</strong></div>
+            <div><span>Fee</span><strong>15.0000025 USDT</strong></div>
+            <div><span>Buffer</span><strong>0 USDT</strong></div>
+            <div><span>Margin asset</span><strong>USDT</strong></div>
+            <div><span>Fee rate</span><strong>0.05%</strong></div>
+          </div>
+          <div class="fee-note">Linear USDT-margined perpetual demo overlay. Quote fee is deducted from the frozen perpetual margin. The engine matches and reports the fills; it does not hold margin, fund, compute PnL or liquidate. Demo estimate only.</div>
+        </div>
+      </section>
 
       <section class="panel recent-events" aria-label="Recent events">
         <div class="panel-head">
@@ -820,6 +985,7 @@
 
     <div class="full-book-toolbar">
       <span class="badge good">snapshot 119:1</span>
+      <span class="badge neutral">freeze 578.20 BTC · 15,408,000.00 USDT</span>
       <span class="muted mono">loaded 140 ms ago · complete</span>
       <span class="grow"></span>
       <span class="diag-actions">
@@ -833,16 +999,16 @@
         <div class="subhead">Bids · order level <span class="badge neutral">642</span></div>
         <div class="table-wrap">
           <table class="full-table compact">
-            <thead><tr><th>Seq</th><th class="num">Price</th><th class="num">Volume</th><th class="num">Hidden</th><th class="num">Display</th><th>Type</th><th>TIF</th><th>Flags</th></tr></thead>
+            <thead><tr><th>Seq</th><th class="num">Price</th><th class="num">Volume</th><th class="num">Hidden</th><th class="num">Display</th><th class="num">Freeze</th><th>Type</th><th>TIF</th><th>Flags</th></tr></thead>
             <tbody>
-              <tr class="flash-row"><td class="mono">44</td><td class="num mono">60,000.01</td><td class="num mono">0.20000000</td><td class="num mono">0</td><td class="num mono">0</td><td>Limit</td><td>GTC</td><td class="flags">—</td></tr>
-              <tr><td class="mono">41</td><td class="num mono">60,000.00</td><td class="num mono">0.42130000</td><td class="num mono">0</td><td class="num mono">0</td><td>Limit</td><td>GTC</td><td class="flags">—</td></tr>
-              <tr><td class="mono">39</td><td class="num mono">59,999.99</td><td class="num mono">0.50000000</td><td class="num mono">0</td><td class="num mono">0</td><td>Limit</td><td>GTC</td><td class="flags">post-only</td></tr>
-              <tr><td class="mono">34</td><td class="num mono">59,999.97</td><td class="num mono">2.10000000</td><td class="num mono">0</td><td class="num mono">0</td><td>Limit</td><td>GTC</td><td class="flags">—</td></tr>
-              <tr><td class="mono">33</td><td class="num mono">59,999.96</td><td class="num mono">0.90000000</td><td class="num mono">0</td><td class="num mono">0</td><td>Limit</td><td>GTC</td><td class="flags">—</td></tr>
-              <tr><td class="mono">32</td><td class="num mono">59,999.95</td><td class="num mono">1.25000000</td><td class="num mono">0</td><td class="num mono">0</td><td>Limit</td><td>GTC</td><td class="flags">—</td></tr>
-              <tr><td class="mono">31</td><td class="num mono">59,999.94</td><td class="num mono">0.30000000</td><td class="num mono">0</td><td class="num mono">0</td><td>Limit</td><td>GTD</td><td class="flags">expires 10:42</td></tr>
-              <tr><td class="mono">30</td><td class="num mono">59,999.90</td><td class="num mono">4.00000000</td><td class="num mono">0</td><td class="num mono">0</td><td>Limit</td><td>GTC</td><td class="flags">—</td></tr>
+              <tr class="flash-row selected"><td class="mono">44</td><td class="num mono">60,000.01</td><td class="num mono">0.20000000</td><td class="num mono">0</td><td class="num mono">0</td><td class="num freeze-cell mono">12,000.01 USDT</td><td>Limit</td><td>GTC</td><td class="flags">—</td></tr>
+              <tr><td class="mono">41</td><td class="num mono">60,000.00</td><td class="num mono">0.42130000</td><td class="num mono">0</td><td class="num mono">0</td><td class="num freeze-cell mono">25,278.00 USDT</td><td>Limit</td><td>GTC</td><td class="flags">—</td></tr>
+              <tr><td class="mono">39</td><td class="num mono">59,999.99</td><td class="num mono">0.50000000</td><td class="num mono">0</td><td class="num mono">0</td><td class="num freeze-cell mono">30,000.00 USDT</td><td>Limit</td><td>GTC</td><td class="flags">post-only</td></tr>
+              <tr><td class="mono">34</td><td class="num mono">59,999.97</td><td class="num mono">2.10000000</td><td class="num mono">0</td><td class="num mono">0</td><td class="num freeze-cell mono">125,999.94 USDT</td><td>Limit</td><td>GTC</td><td class="flags">—</td></tr>
+              <tr><td class="mono">33</td><td class="num mono">59,999.96</td><td class="num mono">0.90000000</td><td class="num mono">0</td><td class="num mono">0</td><td class="num freeze-cell mono">53,999.97 USDT</td><td>Limit</td><td>GTC</td><td class="flags">—</td></tr>
+              <tr><td class="mono">32</td><td class="num mono">59,999.95</td><td class="num mono">1.25000000</td><td class="num mono">0</td><td class="num mono">0</td><td class="num freeze-cell mono">74,999.94 USDT</td><td>Limit</td><td>GTC</td><td class="flags">—</td></tr>
+              <tr><td class="mono">31</td><td class="num mono">59,999.94</td><td class="num mono">0.30000000</td><td class="num mono">0</td><td class="num mono">0</td><td class="num freeze-cell mono">17,999.99 USDT</td><td>Limit</td><td>GTD</td><td class="flags">expires 10:42</td></tr>
+              <tr><td class="mono">30</td><td class="num mono">59,999.90</td><td class="num mono">4.00000000</td><td class="num mono">0</td><td class="num mono">0</td><td class="num freeze-cell mono">239,999.60 USDT</td><td>Limit</td><td>GTC</td><td class="flags">—</td></tr>
             </tbody>
           </table>
         </div>
@@ -853,16 +1019,16 @@
         <div class="subhead">Asks · order level <span class="badge neutral">642</span></div>
         <div class="table-wrap">
           <table class="full-table compact">
-            <thead><tr><th>Seq</th><th class="num">Price</th><th class="num">Volume</th><th class="num">Hidden</th><th class="num">Display</th><th>Type</th><th>TIF</th><th>Flags</th></tr></thead>
+            <thead><tr><th>Seq</th><th class="num">Price</th><th class="num">Volume</th><th class="num">Hidden</th><th class="num">Display</th><th class="num">Freeze</th><th>Type</th><th>TIF</th><th>Flags</th></tr></thead>
             <tbody>
-              <tr><td class="mono">43</td><td class="num mono">60,000.02</td><td class="num mono">0.10000000</td><td class="num mono">0</td><td class="num mono">0</td><td>Limit</td><td>GTC</td><td class="flags">—</td></tr>
-              <tr><td class="mono">37</td><td class="num mono">60,000.03</td><td class="num mono">0.10000000</td><td class="num mono">0.30000000</td><td class="num mono">0.10000000</td><td>Iceberg</td><td>GTC</td><td class="flags">hidden 0.30</td></tr>
-              <tr><td class="mono">29</td><td class="num mono">60,000.04</td><td class="num mono">0.85000000</td><td class="num mono">0</td><td class="num mono">0</td><td>Limit</td><td>GTC</td><td class="flags">—</td></tr>
-              <tr><td class="mono">28</td><td class="num mono">60,000.05</td><td class="num mono">1.20000000</td><td class="num mono">0</td><td class="num mono">0</td><td>Limit</td><td>GTC</td><td class="flags">—</td></tr>
-              <tr><td class="mono">27</td><td class="num mono">60,000.06</td><td class="num mono">0.50000000</td><td class="num mono">0</td><td class="num mono">0</td><td>Limit</td><td>GTC</td><td class="flags">—</td></tr>
-              <tr><td class="mono">26</td><td class="num mono">60,000.08</td><td class="num mono">2.00000000</td><td class="num mono">0</td><td class="num mono">0</td><td>Limit</td><td>GTC</td><td class="flags">—</td></tr>
-              <tr><td class="mono">25</td><td class="num mono">60,000.10</td><td class="num mono">0.75000000</td><td class="num mono">0</td><td class="num mono">0</td><td>Limit</td><td>GTC</td><td class="flags">—</td></tr>
-              <tr><td class="mono">24</td><td class="num mono">60,000.20</td><td class="num mono">3.25000000</td><td class="num mono">0</td><td class="num mono">0</td><td>Limit</td><td>GTC</td><td class="flags">—</td></tr>
+              <tr><td class="mono">43</td><td class="num mono">60,000.02</td><td class="num mono">0.10000000</td><td class="num mono">0</td><td class="num mono">0</td><td class="num freeze-cell mono">0.10000000 BTC</td><td>Limit</td><td>GTC</td><td class="flags">—</td></tr>
+              <tr><td class="mono">37</td><td class="num mono">60,000.03</td><td class="num mono">0.10000000</td><td class="num mono">0.30000000</td><td class="num mono">0.10000000</td><td class="num freeze-cell mono">0.40000000 BTC</td><td>Iceberg</td><td>GTC</td><td class="flags">hidden 0.30</td></tr>
+              <tr><td class="mono">29</td><td class="num mono">60,000.04</td><td class="num mono">0.85000000</td><td class="num mono">0</td><td class="num mono">0</td><td class="num freeze-cell mono">0.85000000 BTC</td><td>Limit</td><td>GTC</td><td class="flags">—</td></tr>
+              <tr><td class="mono">28</td><td class="num mono">60,000.05</td><td class="num mono">1.20000000</td><td class="num mono">0</td><td class="num mono">0</td><td class="num freeze-cell mono">1.20000000 BTC</td><td>Limit</td><td>GTC</td><td class="flags">—</td></tr>
+              <tr><td class="mono">27</td><td class="num mono">60,000.06</td><td class="num mono">0.50000000</td><td class="num mono">0</td><td class="num mono">0</td><td class="num freeze-cell mono">0.50000000 BTC</td><td>Limit</td><td>GTC</td><td class="flags">—</td></tr>
+              <tr><td class="mono">26</td><td class="num mono">60,000.08</td><td class="num mono">2.00000000</td><td class="num mono">0</td><td class="num mono">0</td><td class="num freeze-cell mono">2.00000000 BTC</td><td>Limit</td><td>GTC</td><td class="flags">—</td></tr>
+              <tr><td class="mono">25</td><td class="num mono">60,000.10</td><td class="num mono">0.75000000</td><td class="num mono">0</td><td class="num mono">0</td><td class="num freeze-cell mono">0.75000000 BTC</td><td>Limit</td><td>GTC</td><td class="flags">—</td></tr>
+              <tr><td class="mono">24</td><td class="num mono">60,000.20</td><td class="num mono">3.25000000</td><td class="num mono">0</td><td class="num mono">0</td><td class="num freeze-cell mono">3.25000000 BTC</td><td>Limit</td><td>GTC</td><td class="flags">—</td></tr>
             </tbody>
           </table>
         </div>
@@ -886,6 +1052,17 @@
         </tbody>
       </table>
     </div>
+    <div class="subhead">Parked stops · all <span class="badge warn">2</span></div>
+    <div class="table-wrap">
+      <table class="full-table compact">
+        <thead><tr><th>Seq</th><th>Side</th><th class="num">Stop price</th><th class="num">Volume</th><th class="num">Freeze</th><th>Type</th><th>TIF</th><th class="num">Hidden</th><th class="num">Display</th></tr></thead>
+        <tbody>
+          <tr><td class="mono">36</td><td class="side-buy">Buy</td><td class="num mono">60,100.00</td><td class="num mono">0.25000000</td><td class="num freeze-cell mono">15,025.00 USDT</td><td>Market</td><td>GTC</td><td class="num mono">0</td><td class="num mono">0</td></tr>
+          <tr><td class="mono">35</td><td class="side-sell">Sell</td><td class="num mono">59,900.00</td><td class="num mono">0.50000000</td><td class="num freeze-cell mono">0.50000000 BTC</td><td>Limit</td><td>GTC</td><td class="num mono">0</td><td class="num mono">0</td></tr>
+        </tbody>
+      </table>
+    </div>
+
     <div class="pager">
       <span class="debug-note">Debug view: full data, client-side paging. Large books can make this response and render slow.</span>
       <span class="diag-actions"><button class="btn ghost" type="button">Previous levels</button><button class="btn" type="button">Next levels</button></span>

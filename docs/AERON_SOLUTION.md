@@ -1,13 +1,16 @@
 # Aeron in matchengine-raft — Raft transport assessment and market-data egress design
 
-Status: **investigation and design only.** No Aeron code exists in this repo, nothing was
-benchmarked, and no dependency was added. Part I (sections 1–10) assesses Aeron as the Raft
-transport and says not yet. Part II (sections 11–26) designs the market-data egress path — trades,
-spot/top-of-book, market depth and lifecycle events published to downstream subscribers — with all
-derivation, encoding and IO decoupled from the matching path, and recommends Aeron there. Both parts record what was verified, what the integration would look like,
+Status: **investigation and design for Aeron; the non-Aeron core of Part II is implemented.** No
+Aeron code exists in this repo, nothing was benchmarked, and no dependency was added. Part I
+(sections 1–10) assesses Aeron as the Raft transport and says not yet. Part II (sections 11–26)
+designs the market-data egress path — trades, spot/top-of-book, market depth and lifecycle events
+published to downstream subscribers — with all derivation, encoding and IO decoupled from the
+matching path, and recommends Aeron there. The tap, shadow book, wire encoder, leader gating and
+JSONL sink are implemented in `src/market_data/`; the Aeron adapter and Archive replay are pending.
+Both parts record what was verified, what the integration would look like,
 and what should happen before anyone commits to it.
 
-Date: 2026-10-30 · Baseline: `openraft` 0.10.0-alpha.37, gRPC/tonic-only Raft transport, segmented
+Date: 2026-10-30 · Reviewed 2026-11-04 · Baseline: `openraft` 0.10.0-alpha.37, gRPC/tonic-only Raft transport, segmented
 WAL + atomic snapshots.
 
 > **Update after this investigation:** two of the prerequisites below have since landed. Peer-to-peer
@@ -905,6 +908,10 @@ multicast is unavailable.
 
 ## 20. Repo integration
 
+The non-Aeron rows below are now implemented; the "new" markers record the original plan. The
+Aeron publisher, embedded-driver resync/failover tests and the market-data benchmark remain
+pending.
+
 | File | Change |
 |---|---|
 | `Cargo.toml` | optional `rusteron-client` + `rusteron-media-driver` behind a `market-data-aeron` feature (default off, so the default build stays pure Rust and `cargo test` needs no driver) |
@@ -1055,6 +1062,11 @@ loopback UDP, plus offers/s at saturation. The JSONL sink is the baseline. **No 
 until measured** — same rule as Part I.
 
 ## 23. Staged plan and effort
+
+Status: most of the phase 1/3/4 functionality that does not require Aeron is implemented
+(journal, tap, shadow book, deterministic sequencing, OHLC, snapshots, leader gating and status);
+the benchmark gate and a real multi-node failover test remain pending. Phases 2 and 5 (the Aeron
+transport and Archive replay) remain pending.
 
 | Phase | Deliverable | Exit criterion | Days |
 |---|---|---|---|

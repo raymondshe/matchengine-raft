@@ -11,6 +11,7 @@ use matchengine_raft::match_result::EventId;
 use matchengine_raft::network::api::MAX_EVENTS_PAGE;
 use matchengine_raft::order_book::SymbolConfig;
 
+use crate::freeze::Product;
 use crate::state::AmendTicket;
 use crate::state::ApiError;
 use crate::state::CancelTicket;
@@ -60,13 +61,31 @@ pub async fn css() -> HttpResponse {
 }
 
 #[derive(Deserialize, Default)]
+pub struct ProductQuery {
+    pub product: Option<Product>,
+}
+
+impl ProductQuery {
+    fn product(&self) -> Product {
+        self.product.unwrap_or_default()
+    }
+}
+
+#[derive(Deserialize, Default)]
 pub struct StateQuery {
+    pub product: Option<Product>,
     pub depth: Option<usize>,
+}
+
+#[get("/demo/api/backends")]
+pub async fn backends(app: Data<DemoApp>) -> HttpResponse {
+    HttpResponse::Ok().json(app.backends())
 }
 
 #[get("/demo/api/state")]
 pub async fn state(app: Data<DemoApp>, query: Query<StateQuery>) -> HttpResponse {
-    match app.state(query.depth.unwrap_or(20)).await {
+    let product = query.product.unwrap_or_default();
+    match app.state(product, query.depth.unwrap_or(20)).await {
         Ok(state) => HttpResponse::Ok().json(state),
         Err(error) => api_error(error),
     }
@@ -74,6 +93,7 @@ pub async fn state(app: Data<DemoApp>, query: Query<StateQuery>) -> HttpResponse
 
 #[derive(Deserialize, Default)]
 pub struct BookQuery {
+    pub product: Option<Product>,
     pub limit: Option<usize>,
 }
 
@@ -83,7 +103,7 @@ pub async fn book(app: Data<DemoApp>, query: Query<BookQuery>) -> HttpResponse {
     if limit == 0 {
         return api_error(ApiError::bad_request("limit must be at least 1"));
     }
-    match app.book(limit).await {
+    match app.book(query.product.unwrap_or_default(), limit).await {
         Ok(book) => HttpResponse::Ok().json(book),
         Err(error) => api_error(error),
     }
@@ -91,6 +111,7 @@ pub async fn book(app: Data<DemoApp>, query: Query<BookQuery>) -> HttpResponse {
 
 #[derive(Deserialize)]
 pub struct EventsQuery {
+    pub product: Option<Product>,
     pub after_log_index: Option<u64>,
     pub after_ordinal: Option<u32>,
     pub limit: Option<usize>,
@@ -113,7 +134,10 @@ pub async fn events(app: Data<DemoApp>, query: Query<EventsQuery>) -> HttpRespon
             "limit must be 1..={MAX_EVENTS_PAGE}"
         )));
     }
-    match app.events(after, limit).await {
+    match app
+        .events(query.product.unwrap_or_default(), after, limit)
+        .await
+    {
         Ok(page) => HttpResponse::Ok().json(page),
         Err(error) => api_error(error),
     }
@@ -132,6 +156,23 @@ pub async fn place(
     }
     match app.place(body.into_inner()).await {
         Ok(result) => HttpResponse::Ok().json(result),
+        Err(error) => api_error(error),
+    }
+}
+
+#[post("/demo/api/freeze")]
+pub async fn freeze_preview(
+    app: Data<DemoApp>,
+    request: HttpRequest,
+    body: Json<PlaceTicket>,
+) -> HttpResponse {
+    if !action_headers_ok(&request) {
+        return api_error(ApiError::bad_request(
+            "missing X-Demo-Action header or cross-origin request",
+        ));
+    }
+    match app.preview_freeze(body.into_inner()).await {
+        Ok(preview) => HttpResponse::Ok().json(preview),
         Err(error) => api_error(error),
     }
 }
@@ -174,6 +215,7 @@ pub async fn amend(
 pub async fn configure_symbol(
     app: Data<DemoApp>,
     request: HttpRequest,
+    query: Query<ProductQuery>,
     body: Json<SymbolConfig>,
 ) -> HttpResponse {
     if !action_headers_ok(&request) {
@@ -181,7 +223,10 @@ pub async fn configure_symbol(
             "missing X-Demo-Action header or cross-origin request",
         ));
     }
-    match app.configure_symbol(body.into_inner()).await {
+    match app
+        .configure_symbol(query.product(), body.into_inner())
+        .await
+    {
         Ok(result) => HttpResponse::Ok().json(result),
         Err(error) => api_error(error),
     }

@@ -1,4 +1,6 @@
+use std::collections::HashMap;
 use std::fmt;
+use std::sync::Mutex;
 
 use actix_web::http::StatusCode;
 use openraft::errors::ClientWriteError;
@@ -26,28 +28,114 @@ use matchengine_raft::order_book::TimeInForce;
 use matchengine_raft::order_book::VolumeUnit;
 use matchengine_raft::store::MatchEngineRequest;
 
+use crate::freeze::AssetFreeze;
+use crate::freeze::FreezeEstimate;
+use crate::freeze::OrderEconomics;
+use crate::freeze::Product;
+use crate::freeze::estimate_order_economics;
+use crate::freeze::estimate_ticket_economics;
+use crate::freeze::perpetual_supported;
+use crate::freeze::summarize_freezes;
+use crate::freeze::validate_leverage;
+
 type C = MatchEngineTypeConfig;
 pub const MAX_STATE_ORDERS: usize = 200;
 pub const DEFAULT_EVENTS_LIMIT: usize = 500;
+pub const SCHEMA_VERSION: u8 = 2;
+const PERPETUAL_POLICY_HINT: &str =
+    "linear perpetual requires fee_asset_policy=quote; configure the symbol before trading";
+const PERPETUAL_BACKEND_HINT: &str =
+    "perpetual backend is not configured; start the demo with --perp-engine <addr>";
 
-/// The demo server's connection to one running engine node.
-pub struct DemoApp {
+/// One demo backend: a connection to a running engine node and the product
+/// whose own orderbook that engine serves. Spot and Perpetual are separate
+/// processes/clusters, so an order sequence is only unique within a backend.
+pub struct EngineBackend {
+    pub product: Product,
     pub engine_id: u64,
-    pub engine_addr: String,
+    pub http_addr: String,
     client: MatchEngineClient<C>,
+    /// Leverage chosen when the demo submitted a perpetual order, keyed by
+    /// that backend's sequence. The engine has no leverage field.
+    leverages: Mutex<HashMap<u64, u32>>,
 }
 
-impl DemoApp {
-    pub fn new(engine_id: u64, engine_addr: String) -> Self {
-        let client = MatchEngineClient::new(engine_id, engine_addr.clone());
+impl EngineBackend {
+    fn new(product: Product, engine_id: u64, http_addr: String) -> Self {
+        let client = MatchEngineClient::new(engine_id, http_addr.clone());
         Self {
+            product,
             engine_id,
-            engine_addr,
+            http_addr,
             client,
+            leverages: Mutex::new(HashMap::new()),
         }
     }
 
-    pub async fn state(&self, depth: usize) -> Result<StateResponse, ApiError> {
+    pub fn info(&self) -> BackendInfo {
+        BackendInfo {
+            product: self.product,
+            engine_id: self.engine_id,
+            http_addr: self.http_addr.clone(),
+        }
+    }
+
+    fn remember_leverage(&self, sequence: Option<u64>, leverage: u32) {
+        if self.product != Product::Perpetual {
+            return;
+        }
+        if let Some(sequence) = sequence {
+            self.leverages
+                .lock()
+                .expect("leverage metadata lock")
+                .insert(sequence, leverage);
+        }
+    }
+
+    fn take_leverage(&self, sequence: u64) -> Option<u32> {
+        self.leverages
+            .lock()
+            .expect("leverage metadata lock")
+            .remove(&sequence)
+    }
+
+    fn restore_leverage(&self, sequence: u64, leverage: u32) {
+        self.leverages
+            .lock()
+            .expect("leverage metadata lock")
+            .insert(sequence, leverage);
+    }
+
+    /// A resting or parked order plus its demo-side product/leverage tag and
+    /// freeze estimate. A perpetual order placed before a demo restart has no
+    /// remembered leverage, so it stays unestimated until it is cancelled.
+    fn desk_orders(&self, orders: &[Order], symbol: &SymbolConfig) -> Vec<DeskOrder> {
+        let leverages = self.leverages.lock().expect("leverage metadata lock");
+        orders
+            .iter()
+            .map(|order| {
+                let leverage = if self.product == Product::Perpetual {
+                    leverages.get(&order.sequence).copied()
+                } else {
+                    None
+                };
+                let economics = match (self.product, leverage) {
+                    (Product::Perpetual, None) => None,
+                    _ => {
+                        estimate_order_economics(order, symbol, self.product, leverage.unwrap_or(1))
+                    }
+                };
+                DeskOrder {
+                    order: *order,
+                    product: self.product,
+                    leverage,
+                    economics,
+                }
+            })
+            .collect()
+    }
+
+    async fn state(&self, depth: usize) -> Result<EngineState, ApiError> {
         let depth = depth.clamp(1, 200);
         let symbol: SymbolConfig = self.read_json("symbol_config").await?;
         let orders: Vec<Order> = self.read_json("orderbook_orders").await?;
@@ -74,21 +162,23 @@ impl DemoApp {
             .and_then(|id| metrics.membership_config.membership().get_node(&id))
             .map(|node| node.addr.clone());
 
-        let mut visible_orders = orders.clone();
-        visible_orders.sort_by_key(|order| order.sequence);
-        let orders_total = visible_orders.len();
+        let mut all_orders = self.desk_orders(&orders, &symbol);
+        let all_stops = self.desk_orders(&stops, &symbol);
+        let freeze = freeze_state(&all_orders, &all_stops);
+
+        all_orders.sort_by_key(|entry| entry.order.sequence);
+        let orders_total = all_orders.len();
         let orders_truncated = orders_total > MAX_STATE_ORDERS;
-        visible_orders.truncate(MAX_STATE_ORDERS);
+        all_orders.truncate(MAX_STATE_ORDERS);
 
-        let stops_total = stops.len();
+        let stops_total = all_stops.len();
         let stops_truncated = stops_total > MAX_STATE_ORDERS;
-        let stops: Vec<Order> = stops.into_iter().take(MAX_STATE_ORDERS).collect();
+        let stops: Vec<DeskOrder> = all_stops.into_iter().take(MAX_STATE_ORDERS).collect();
 
-        Ok(StateResponse {
-            schema_version: 1,
+        Ok(EngineState {
             node: NodeState {
                 id: self.engine_id,
-                http_addr: self.engine_addr.clone(),
+                http_addr: self.http_addr.clone(),
                 is_leader: metrics.current_leader == Some(self.engine_id),
                 leader_id,
                 leader_addr,
@@ -115,13 +205,14 @@ impl DemoApp {
             orders: OrdersState {
                 total: orders_total,
                 truncated: orders_truncated,
-                items: visible_orders,
+                items: all_orders,
             },
             stops: OrdersState {
                 total: stops_total,
                 truncated: stops_truncated,
                 items: stops,
             },
+            freeze,
             events: EventsState {
                 oldest_event_id: events.oldest_event_id,
                 last_event_id: events.last_event_id,
@@ -145,27 +236,43 @@ impl DemoApp {
             .parse()
             .map_err(|error| ApiError::decode(format!("orderbook_sequence: {error}")))?;
 
-        let mut bids: Vec<Order> = orders
+        let symbol: SymbolConfig = self.read_json("symbol_config").await?;
+        let all_orders = self.desk_orders(&orders, &symbol);
+        let all_stops = self.desk_orders(&stops, &symbol);
+        let freeze = freeze_state(&all_orders, &all_stops);
+
+        let mut bids: Vec<DeskOrder> = all_orders
             .iter()
-            .filter(|order| order.side == OrderSide::Buy)
-            .copied()
+            .filter(|entry| entry.order.side == OrderSide::Buy)
+            .cloned()
             .collect();
-        let mut asks: Vec<Order> = orders
+        let mut asks: Vec<DeskOrder> = all_orders
             .iter()
-            .filter(|order| order.side == OrderSide::Sell)
-            .copied()
+            .filter(|entry| entry.order.side == OrderSide::Sell)
+            .cloned()
             .collect();
-        bids.sort_by(|a, b| b.price.cmp(&a.price).then(a.sequence.cmp(&b.sequence)));
-        asks.sort_by(|a, b| a.price.cmp(&b.price).then(a.sequence.cmp(&b.sequence)));
+        bids.sort_by(|a, b| {
+            b.order
+                .price
+                .cmp(&a.order.price)
+                .then(a.order.sequence.cmp(&b.order.sequence))
+        });
+        asks.sort_by(|a, b| {
+            a.order
+                .price
+                .cmp(&b.order.price)
+                .then(a.order.sequence.cmp(&b.order.sequence))
+        });
         let bids_total = bids.len();
         let asks_total = asks.len();
-        let stops_total = stops.len();
+        let stops_total = all_stops.len();
         bids.truncate(limit);
         asks.truncate(limit);
-        let stops: Vec<Order> = stops.into_iter().take(limit).collect();
+        let stops: Vec<DeskOrder> = all_stops.into_iter().take(limit).collect();
 
         Ok(FullBookResponse {
-            schema_version: 1,
+            schema_version: SCHEMA_VERSION,
+            product: self.product,
             market_seq: sequence,
             counts: BookCounts {
                 bids: bids_total,
@@ -179,6 +286,7 @@ impl DemoApp {
                 bids: depth_from_orders(&orders, OrderSide::Buy, usize::MAX),
                 asks: depth_from_orders(&orders, OrderSide::Sell, usize::MAX),
             },
+            freeze,
             truncated: limit != usize::MAX
                 && (limit < bids_total || limit < asks_total || limit < stops_total),
         })
@@ -200,7 +308,8 @@ impl DemoApp {
             .map_err(client_error)?
             .map_err(|error| ApiError::unavailable(error.to_string()))?;
         Ok(EventsPage {
-            schema_version: 1,
+            schema_version: SCHEMA_VERSION,
+            product: self.product,
             events: page.events,
             next_after: page.next_after,
             oldest_event_id: page.oldest_event_id,
@@ -210,49 +319,90 @@ impl DemoApp {
     }
 
     pub async fn place(&self, ticket: PlaceTicket) -> Result<OrderResult, ApiError> {
-        let symbol_id = self.symbol_id().await?;
-        let tif = parse_tif(&ticket.tif, ticket.expiry_ms)?;
-        let maker_fee_rate = validate_fee_rate(ticket.maker_fee_rate, "maker_fee_rate")?;
-        let taker_fee_rate = validate_fee_rate(ticket.taker_fee_rate, "taker_fee_rate")?;
+        let product = self.product;
+        let leverage = ticket.leverage.unwrap_or(1);
+        let symbol: SymbolConfig = self.read_json("symbol_config").await?;
+        validate_product(&symbol, product, leverage)?;
+        let order = ticket.build_order(symbol.symbol_id)?;
+        let result = self
+            .write(MatchEngineRequest::Place {
+                order,
+                client_order_id: ticket.client_order_id,
+            })
+            .await?;
+        if result.error.is_none() {
+            self.remember_leverage(result.sequence, leverage);
+        }
+        Ok(result)
+    }
 
-        let mut order = Order::new(
-            ticket.side,
-            ticket.price.unwrap_or(Fixed::ZERO),
-            ticket.volume,
-            0,
-        );
-        order.live = ticket.order_type;
-        order.symbol_id = symbol_id;
-        order.volume_unit = ticket.volume_unit;
-        order.tif = tif;
-        order.post_only = ticket.post_only;
-        order.stop_price = ticket.stop_price.unwrap_or(Fixed::ZERO);
-        order.display_volume = ticket.display_volume.unwrap_or(Fixed::ZERO);
-        order.maker_fee_rate = maker_fee_rate;
-        order.taker_fee_rate = taker_fee_rate;
-
-        self.write(MatchEngineRequest::Place {
-            order,
-            client_order_id: ticket.client_order_id,
+    /// Previews the order-system freeze and settlement legs for an order
+    /// ticket without submitting it. Nothing here is engine state: the demo
+    /// derives the estimate from the replicated symbol configuration, the
+    /// order fields and the entered fee rates.
+    pub async fn preview_freeze(&self, ticket: PlaceTicket) -> Result<FreezePreview, ApiError> {
+        let product = self.product;
+        let leverage = ticket.leverage.unwrap_or(1);
+        if product == Product::Perpetual {
+            validate_leverage(leverage).map_err(ApiError::bad_request)?;
+        }
+        let symbol: SymbolConfig = self.read_json("symbol_config").await?;
+        let order = ticket.build_order(symbol.symbol_id)?;
+        let fallback_price = self
+            .read_optional_fixed("orderbook_last_trade_price")
+            .await?;
+        let economics =
+            estimate_ticket_economics(&order, &symbol, fallback_price, product, leverage);
+        let reason = economics.is_none().then(|| {
+            if product == Product::Perpetual && !perpetual_supported(&symbol) {
+                PERPETUAL_POLICY_HINT.to_string()
+            } else {
+                match order.live {
+                    OrderType::Market => {
+                        "no reference price: enter a stop price or trade first".to_string()
+                    }
+                    _ => "no reference price: enter a limit price".to_string(),
+                }
+            }
+        });
+        Ok(FreezePreview {
+            schema_version: SCHEMA_VERSION,
+            product,
+            economics,
+            reason,
         })
-        .await
     }
 
     pub async fn cancel(&self, request: CancelTicket) -> Result<OrderResult, ApiError> {
-        let mut order = Order::new(request.side, request.price, Fixed::ZERO, request.sequence);
+        let sequence = request.sequence;
+        let mut order = Order::new(request.side, request.price, Fixed::ZERO, sequence);
         order.symbol_id = self.symbol_id().await?;
-        self.write(MatchEngineRequest::Cancel { order }).await
+        let result = self.write(MatchEngineRequest::Cancel { order }).await?;
+        if result.error.is_none() {
+            self.take_leverage(sequence);
+        }
+        Ok(result)
     }
 
     pub async fn amend(&self, request: AmendTicket) -> Result<OrderResult, ApiError> {
-        let mut order = Order::new(request.side, request.price, Fixed::ZERO, request.sequence);
+        let old_sequence = request.sequence;
+        let leverage = self.take_leverage(old_sequence);
+        let mut order = Order::new(request.side, request.price, Fixed::ZERO, old_sequence);
         order.symbol_id = self.symbol_id().await?;
-        self.write(MatchEngineRequest::Amend {
-            order,
-            price: request.new_price,
-            volume: request.new_volume,
-        })
-        .await
+        let result = self
+            .write(MatchEngineRequest::Amend {
+                order,
+                price: request.new_price,
+                volume: request.new_volume,
+            })
+            .await?;
+        if let Some(leverage) = leverage {
+            match (result.error.as_ref(), result.sequence) {
+                (None, Some(new_sequence)) => self.restore_leverage(new_sequence, leverage),
+                _ => self.restore_leverage(old_sequence, leverage),
+            }
+        }
+        Ok(result)
     }
 
     pub async fn configure_symbol(&self, config: SymbolConfig) -> Result<OrderResult, ApiError> {
@@ -271,7 +421,7 @@ impl DemoApp {
 
     async fn write(&self, request: MatchEngineRequest) -> Result<OrderResult, ApiError> {
         match self.client.write(&request).await {
-            Ok(Ok(response)) => Ok(order_result(response)),
+            Ok(Ok(response)) => Ok(order_result(response, self.product)),
             Ok(Err(error)) => Err(write_error(error)),
             Err(error) => Err(client_error(error)),
         }
@@ -315,6 +465,133 @@ impl DemoApp {
     }
 }
 
+/// The demo server's two independent engine backends. Spot is required;
+/// Perpetual is optional so a single-engine spot-only demo still works.
+pub struct DemoApp {
+    spot: EngineBackend,
+    perpetual: Option<EngineBackend>,
+}
+
+impl DemoApp {
+    pub fn new(engine_id: u64, engine_addr: String, perpetual: Option<(u64, String)>) -> Self {
+        Self {
+            spot: EngineBackend::new(Product::Spot, engine_id, engine_addr),
+            perpetual: perpetual
+                .map(|(engine_id, addr)| EngineBackend::new(Product::Perpetual, engine_id, addr)),
+        }
+    }
+
+    pub fn backends(&self) -> BackendsState {
+        BackendsState {
+            spot: self.spot.info(),
+            perpetual: self.perpetual.as_ref().map(EngineBackend::info),
+        }
+    }
+
+    fn backend(&self, product: Product) -> Result<&EngineBackend, ApiError> {
+        match product {
+            Product::Spot => Ok(&self.spot),
+            Product::Perpetual => self
+                .perpetual
+                .as_ref()
+                .ok_or_else(|| ApiError::not_configured(PERPETUAL_BACKEND_HINT)),
+        }
+    }
+
+    pub async fn state(&self, product: Product, depth: usize) -> Result<StateResponse, ApiError> {
+        let backend = self.backend(product)?;
+        let state = backend.state(depth).await?;
+        Ok(StateResponse {
+            schema_version: SCHEMA_VERSION,
+            product,
+            backend: backend.info(),
+            backends: self.backends(),
+            node: state.node,
+            symbol: state.symbol,
+            book: state.book,
+            orders: state.orders,
+            stops: state.stops,
+            freeze: state.freeze,
+            events: state.events,
+            market_data: state.market_data,
+        })
+    }
+
+    pub async fn book(&self, product: Product, limit: usize) -> Result<FullBookResponse, ApiError> {
+        self.backend(product)?.book(limit).await
+    }
+
+    pub async fn events(
+        &self,
+        product: Product,
+        after: Option<EventId>,
+        limit: usize,
+    ) -> Result<EventsPage, ApiError> {
+        self.backend(product)?.events(after, limit).await
+    }
+
+    pub async fn place(&self, ticket: PlaceTicket) -> Result<OrderResult, ApiError> {
+        self.backend(ticket.product)?.place(ticket).await
+    }
+
+    pub async fn preview_freeze(&self, ticket: PlaceTicket) -> Result<FreezePreview, ApiError> {
+        self.backend(ticket.product)?.preview_freeze(ticket).await
+    }
+
+    pub async fn cancel(&self, request: CancelTicket) -> Result<OrderResult, ApiError> {
+        self.backend(request.product)?.cancel(request).await
+    }
+
+    pub async fn amend(&self, request: AmendTicket) -> Result<OrderResult, ApiError> {
+        self.backend(request.product)?.amend(request).await
+    }
+
+    pub async fn configure_symbol(
+        &self,
+        product: Product,
+        config: SymbolConfig,
+    ) -> Result<OrderResult, ApiError> {
+        self.backend(product)?.configure_symbol(config).await
+    }
+}
+
+fn validate_product(
+    symbol: &SymbolConfig,
+    product: Product,
+    leverage: u32,
+) -> Result<(), ApiError> {
+    if product != Product::Perpetual {
+        return Ok(());
+    }
+    validate_leverage(leverage).map_err(ApiError::bad_request)?;
+    if !perpetual_supported(symbol) {
+        return Err(ApiError::bad_request(PERPETUAL_POLICY_HINT));
+    }
+    Ok(())
+}
+
+fn estimated_freezes(items: &[DeskOrder]) -> impl Iterator<Item = &FreezeEstimate> {
+    items
+        .iter()
+        .filter_map(|entry| entry.economics.as_ref().map(|economics| &economics.freeze))
+}
+
+fn freeze_state(orders: &[DeskOrder], stops: &[DeskOrder]) -> FreezeState {
+    let total_orders = orders.len() + stops.len();
+    let estimated = orders
+        .iter()
+        .chain(stops.iter())
+        .filter(|entry| entry.economics.is_some())
+        .count();
+    FreezeState {
+        orders: summarize_freezes(estimated_freezes(orders)),
+        stops: summarize_freezes(estimated_freezes(stops)),
+        total: summarize_freezes(estimated_freezes(orders).chain(estimated_freezes(stops))),
+        estimated,
+        unestimated: total_orders - estimated,
+    }
+}
+
 fn depth_from_orders(orders: &[Order], side: OrderSide, levels: usize) -> Vec<DepthLevel> {
     if levels == 0 {
         return Vec::new();
@@ -350,9 +627,10 @@ fn depth_from_orders(orders: &[Order], side: OrderSide, levels: usize) -> Vec<De
     depth
 }
 
-fn order_result(response: ClientWriteResponse<C>) -> OrderResult {
+fn order_result(response: ClientWriteResponse<C>, product: Product) -> OrderResult {
     OrderResult {
-        schema_version: 1,
+        schema_version: SCHEMA_VERSION,
+        product,
         sequence: response.data.sequence,
         log_index: response.log_id.index,
         events: response.data.events,
@@ -382,6 +660,10 @@ impl ApiError {
 
     pub fn unavailable(message: impl Into<String>) -> Self {
         Self::new(StatusCode::SERVICE_UNAVAILABLE, "unavailable", message)
+    }
+
+    pub fn not_configured(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::BAD_REQUEST, "not_configured", message)
     }
 
     pub fn decode(message: impl Into<String>) -> Self {
@@ -470,16 +752,49 @@ fn validate_fee_rate(rate: Fixed, field: &str) -> Result<Fixed, ApiError> {
     Ok(rate)
 }
 
+/// Engine-owned portion of one product's state; `DemoApp` adds the backend
+/// metadata shared by both products.
+struct EngineState {
+    node: NodeState,
+    symbol: SymbolState,
+    book: BookState,
+    orders: OrdersState,
+    stops: OrdersState,
+    freeze: FreezeState,
+    events: EventsState,
+    market_data: MarketDataState,
+}
+
 #[derive(Serialize)]
 pub struct StateResponse {
     pub schema_version: u8,
+    pub product: Product,
+    pub backend: BackendInfo,
+    pub backends: BackendsState,
     pub node: NodeState,
     pub symbol: SymbolState,
     pub book: BookState,
     pub orders: OrdersState,
     pub stops: OrdersState,
+    pub freeze: FreezeState,
     pub events: EventsState,
     pub market_data: MarketDataState,
+}
+
+/// One configured engine backend and the product whose orderbook it serves.
+#[derive(Serialize, Clone)]
+pub struct BackendInfo {
+    pub product: Product,
+    pub engine_id: u64,
+    pub http_addr: String,
+}
+
+/// Both demo backends. `perpetual` is `null` when the demo was started without
+/// `--perp-engine`, in which case the UI disables the Perpetual product.
+#[derive(Serialize)]
+pub struct BackendsState {
+    pub spot: BackendInfo,
+    pub perpetual: Option<BackendInfo>,
 }
 
 #[derive(Serialize)]
@@ -515,11 +830,31 @@ pub struct DepthState {
     pub asks: Vec<DepthLevel>,
 }
 
+/// A resting or parked order plus its demo-side freeze/settlement estimate.
+#[derive(Serialize, Clone)]
+pub struct DeskOrder {
+    pub order: Order,
+    pub product: Product,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub leverage: Option<u32>,
+    pub economics: Option<OrderEconomics>,
+}
+
 #[derive(Serialize)]
 pub struct OrdersState {
     pub total: usize,
     pub truncated: bool,
-    pub items: Vec<Order>,
+    pub items: Vec<DeskOrder>,
+}
+
+/// Aggregate estimated freezes for every order the demo can price.
+#[derive(Serialize)]
+pub struct FreezeState {
+    pub orders: Vec<AssetFreeze>,
+    pub stops: Vec<AssetFreeze>,
+    pub total: Vec<AssetFreeze>,
+    pub estimated: usize,
+    pub unestimated: usize,
 }
 
 #[derive(Serialize)]
@@ -540,12 +875,14 @@ pub struct MarketDataState {
 #[derive(Serialize)]
 pub struct FullBookResponse {
     pub schema_version: u8,
+    pub product: Product,
     pub market_seq: u64,
     pub counts: BookCounts,
-    pub bids: Vec<Order>,
-    pub asks: Vec<Order>,
-    pub stops: Vec<Order>,
+    pub bids: Vec<DeskOrder>,
+    pub asks: Vec<DeskOrder>,
+    pub stops: Vec<DeskOrder>,
     pub depth: DepthState,
+    pub freeze: FreezeState,
     pub truncated: bool,
 }
 
@@ -559,6 +896,7 @@ pub struct BookCounts {
 #[derive(Serialize)]
 pub struct EventsPage {
     pub schema_version: u8,
+    pub product: Product,
     pub events: Vec<MatchEvent>,
     pub next_after: Option<EventId>,
     pub oldest_event_id: Option<EventId>,
@@ -569,6 +907,7 @@ pub struct EventsPage {
 #[derive(Serialize)]
 pub struct OrderResult {
     pub schema_version: u8,
+    pub product: Product,
     pub sequence: Option<u64>,
     pub log_index: u64,
     pub events: Vec<MatchEvent>,
@@ -576,9 +915,22 @@ pub struct OrderResult {
     pub error: Option<String>,
 }
 
+/// Demo-side estimate for a ticket that has not been submitted.
+#[derive(Serialize)]
+pub struct FreezePreview {
+    pub schema_version: u8,
+    pub product: Product,
+    pub economics: Option<OrderEconomics>,
+    pub reason: Option<String>,
+}
+
 #[derive(Deserialize)]
 pub struct PlaceTicket {
     pub side: OrderSide,
+    #[serde(default)]
+    pub product: Product,
+    #[serde(default)]
+    pub leverage: Option<u32>,
     #[serde(rename = "type")]
     pub order_type: OrderType,
     #[serde(default)]
@@ -604,8 +956,30 @@ pub struct PlaceTicket {
     pub client_order_id: Option<String>,
 }
 
+impl PlaceTicket {
+    fn build_order(&self, symbol_id: u32) -> Result<Order, ApiError> {
+        let tif = parse_tif(&self.tif, self.expiry_ms)?;
+        let maker_fee_rate = validate_fee_rate(self.maker_fee_rate, "maker_fee_rate")?;
+        let taker_fee_rate = validate_fee_rate(self.taker_fee_rate, "taker_fee_rate")?;
+
+        let mut order = Order::new(self.side, self.price.unwrap_or(Fixed::ZERO), self.volume, 0);
+        order.live = self.order_type;
+        order.symbol_id = symbol_id;
+        order.volume_unit = self.volume_unit;
+        order.tif = tif;
+        order.post_only = self.post_only;
+        order.stop_price = self.stop_price.unwrap_or(Fixed::ZERO);
+        order.display_volume = self.display_volume.unwrap_or(Fixed::ZERO);
+        order.maker_fee_rate = maker_fee_rate;
+        order.taker_fee_rate = taker_fee_rate;
+        Ok(order)
+    }
+}
+
 #[derive(Deserialize)]
 pub struct CancelTicket {
+    #[serde(default)]
+    pub product: Product,
     pub side: OrderSide,
     pub price: Fixed,
     pub sequence: u64,
@@ -613,6 +987,8 @@ pub struct CancelTicket {
 
 #[derive(Deserialize)]
 pub struct AmendTicket {
+    #[serde(default)]
+    pub product: Product,
     pub side: OrderSide,
     pub price: Fixed,
     pub sequence: u64,
@@ -626,6 +1002,8 @@ pub struct AmendTicket {
 mod tests {
     use super::*;
 
+    use matchengine_raft::order_book::FeeAssetPolicy;
+
     fn order(side: OrderSide, price: i128, volume: i128, sequence: u64) -> Order {
         Order::new(
             side,
@@ -633,6 +1011,10 @@ mod tests {
             Fixed::from_units(volume),
             sequence,
         )
+    }
+
+    fn spot_economics(order: &Order, symbol: &SymbolConfig) -> Option<OrderEconomics> {
+        estimate_order_economics(order, symbol, Product::Spot, 1)
     }
 
     #[test]
@@ -664,6 +1046,244 @@ mod tests {
         assert!(validate_fee_rate("1.000000000000000001".parse().unwrap(), "x").is_err());
         assert!(validate_fee_rate("-1.1".parse().unwrap(), "x").is_err());
         assert_eq!(0, validate_fee_rate(Fixed::ZERO, "x").unwrap().raw());
+    }
+
+    #[test]
+    fn desk_order_serializes_economics_alongside_order_fields() {
+        let symbol = SymbolConfig::default();
+        let order = order(OrderSide::Buy, 100, 1, 7);
+        let entry = DeskOrder {
+            order,
+            product: Product::Spot,
+            leverage: None,
+            economics: spot_economics(&order, &symbol),
+        };
+        let value = serde_json::to_value(&entry).unwrap();
+        assert_eq!(7, value["order"]["sequence"]);
+        assert_eq!("100", value["order"]["price"]);
+        assert_eq!("spot", value["product"]);
+        assert!(value.get("leverage").is_none());
+        assert_eq!("USDT", value["economics"]["freeze"]["asset"]);
+        assert_eq!("100", value["economics"]["freeze"]["amount"]);
+        assert_eq!("BTC", value["economics"]["taker"]["fee"]["asset"]);
+    }
+
+    #[test]
+    fn perpetual_desk_order_serializes_margin_terms() {
+        let symbol = SymbolConfig::default().with_fee_asset_policy(FeeAssetPolicy::Quote);
+        let mut order = order(OrderSide::Buy, 100, 1, 8);
+        order.maker_fee_rate = "0.002".parse().unwrap();
+        order.taker_fee_rate = "0.002".parse().unwrap();
+        let entry = DeskOrder {
+            order,
+            product: Product::Perpetual,
+            leverage: Some(10),
+            economics: estimate_order_economics(&order, &symbol, Product::Perpetual, 10),
+        };
+        let value = serde_json::to_value(&entry).unwrap();
+        assert_eq!("perpetual", value["product"]);
+        assert_eq!(10, value["leverage"]);
+        assert_eq!("USDT", value["economics"]["freeze"]["asset"]);
+        assert_eq!("10.2", value["economics"]["freeze"]["amount"]);
+        assert_eq!(
+            "perpetual_margin_plus_fee",
+            value["economics"]["freeze"]["basis"]
+        );
+        assert!(value["economics"]["taker"].is_null());
+        assert_eq!(10, value["economics"]["perpetual"]["leverage"]);
+        assert_eq!("10", value["economics"]["perpetual"]["initial_margin"]);
+        assert_eq!("0.2", value["economics"]["perpetual"]["fee"]["amount"]);
+    }
+
+    #[test]
+    fn ticket_product_defaults_to_spot_and_accepts_perpetual_leverage() {
+        let spot: PlaceTicket =
+            serde_json::from_str(r#"{"side":"Buy","type":"Limit","volume":"1","price":"100"}"#)
+                .unwrap();
+        assert_eq!(Product::Spot, spot.product);
+        assert_eq!(None, spot.leverage);
+
+        let perpetual: PlaceTicket = serde_json::from_str(
+            r#"{"side":"Sell","product":"perpetual","leverage":10,"type":"Limit","volume":"1","price":"100"}"#,
+        )
+        .unwrap();
+        assert_eq!(Product::Perpetual, perpetual.product);
+        assert_eq!(Some(10), perpetual.leverage);
+    }
+
+    #[test]
+    fn cancel_and_amend_tickets_default_to_spot() {
+        let cancel: CancelTicket =
+            serde_json::from_str(r#"{"side":"Buy","price":"100","sequence":7}"#).unwrap();
+        assert_eq!(Product::Spot, cancel.product);
+        assert_eq!(7, cancel.sequence);
+
+        let amend: AmendTicket = serde_json::from_str(
+            r#"{"product":"perpetual","side":"Sell","price":"100","sequence":8,"new_price":"101"}"#,
+        )
+        .unwrap();
+        assert_eq!(Product::Perpetual, amend.product);
+        assert_eq!(Some(Fixed::from_units(101)), amend.new_price);
+    }
+
+    #[test]
+    fn demo_app_reports_the_optional_perpetual_backend() {
+        let spot_only = DemoApp::new(1, "127.0.0.1:24401".to_string(), None);
+        let backends = spot_only.backends();
+        assert_eq!(Product::Spot, backends.spot.product);
+        assert_eq!("127.0.0.1:24401", backends.spot.http_addr);
+        assert!(backends.perpetual.is_none());
+        let error = match spot_only.backend(Product::Perpetual) {
+            Ok(_) => panic!("perpetual backend unexpectedly configured"),
+            Err(error) => error,
+        };
+        assert_eq!("not_configured", error.kind);
+
+        let pair = DemoApp::new(
+            1,
+            "127.0.0.1:24401".to_string(),
+            Some((2, "127.0.0.1:24402".to_string())),
+        );
+        let backends = pair.backends();
+        let perpetual = backends.perpetual.expect("perpetual backend");
+        assert_eq!(Product::Perpetual, perpetual.product);
+        assert_eq!(2, perpetual.engine_id);
+        assert_eq!("127.0.0.1:24402", perpetual.http_addr);
+    }
+
+    #[test]
+    fn each_backend_labels_its_orders_and_remembers_leverage() {
+        let spot = EngineBackend::new(Product::Spot, 1, "127.0.0.1:24401".to_string());
+        let perpetual = EngineBackend::new(Product::Perpetual, 1, "127.0.0.1:24402".to_string());
+        let symbol = SymbolConfig::default();
+        let mut resting = order(OrderSide::Buy, 100, 1, 7);
+        resting.maker_fee_rate = "0.002".parse().unwrap();
+        resting.taker_fee_rate = "0.002".parse().unwrap();
+
+        let spot_entries = spot.desk_orders(std::slice::from_ref(&resting), &symbol);
+        assert_eq!(Product::Spot, spot_entries[0].product);
+        assert_eq!(None, spot_entries[0].leverage);
+        assert!(spot_entries[0].economics.is_some());
+
+        perpetual.remember_leverage(Some(7), 10);
+        let perp_symbol = SymbolConfig::default().with_fee_asset_policy(FeeAssetPolicy::Quote);
+        let perp_entries = perpetual.desk_orders(std::slice::from_ref(&resting), &perp_symbol);
+        assert_eq!(Product::Perpetual, perp_entries[0].product);
+        assert_eq!(Some(10), perp_entries[0].leverage);
+        assert_eq!(
+            "10.2",
+            perp_entries[0]
+                .economics
+                .as_ref()
+                .unwrap()
+                .freeze
+                .amount
+                .to_string()
+        );
+
+        // A sequence placed before a demo restart has no remembered leverage.
+        let unknown = order(OrderSide::Buy, 100, 1, 8);
+        let entries = perpetual.desk_orders(std::slice::from_ref(&unknown), &perp_symbol);
+        assert_eq!(None, entries[0].leverage);
+        assert!(entries[0].economics.is_none());
+    }
+
+    #[test]
+    fn validate_product_guards_perpetual_leverage_and_policy() {
+        let quote_symbol = SymbolConfig::default().with_fee_asset_policy(FeeAssetPolicy::Quote);
+        let cash_symbol = SymbolConfig::default().with_fee_asset_policy(FeeAssetPolicy::Received);
+
+        // Spot ignores the leverage and the fee policy entirely.
+        assert!(validate_product(&cash_symbol, Product::Spot, 0).is_ok());
+        assert!(validate_product(&cash_symbol, Product::Spot, 999).is_ok());
+
+        assert!(validate_product(&quote_symbol, Product::Perpetual, 1).is_ok());
+        assert!(validate_product(&quote_symbol, Product::Perpetual, 100).is_ok());
+        assert_eq!(
+            "leverage must be between 1 and 100",
+            validate_product(&quote_symbol, Product::Perpetual, 0)
+                .unwrap_err()
+                .message
+        );
+        assert_eq!(
+            PERPETUAL_POLICY_HINT,
+            validate_product(&cash_symbol, Product::Perpetual, 10)
+                .unwrap_err()
+                .message
+        );
+    }
+
+    #[test]
+    fn leverage_metadata_moves_with_an_amend_and_ignores_spot() {
+        // The spot backend never records leverage, even if a client sends it.
+        let spot = EngineBackend::new(Product::Spot, 1, "127.0.0.1:24401".to_string());
+        spot.remember_leverage(Some(7), 25);
+        assert_eq!(None, spot.take_leverage(7));
+
+        // The perpetual backend keys leverage by sequence: `take` removes it
+        // (the amend path), and `restore` re-inserts it under the sequence the
+        // engine assigned, so the tag survives a priority-losing amendment.
+        let perpetual = EngineBackend::new(Product::Perpetual, 1, "127.0.0.1:24402".to_string());
+        perpetual.remember_leverage(Some(7), 25);
+        let moved = perpetual.take_leverage(7);
+        assert_eq!(Some(25), moved);
+        assert_eq!(None, perpetual.take_leverage(7));
+        perpetual.restore_leverage(9, moved.unwrap());
+        assert_eq!(Some(25), perpetual.take_leverage(9));
+    }
+
+    #[test]
+    fn perpetual_ticket_leverage_is_optional_and_must_be_an_integer() {
+        let optional: PlaceTicket = serde_json::from_str(
+            r#"{"side":"Buy","product":"perpetual","type":"Limit","volume":"1","price":"100"}"#,
+        )
+        .unwrap();
+        assert_eq!(Product::Perpetual, optional.product);
+        assert_eq!(None, optional.leverage);
+
+        // An out-of-range integer still deserializes; `validate_product`
+        // rejects it before any write is proposed.
+        let zero: PlaceTicket = serde_json::from_str(
+            r#"{"side":"Buy","product":"perpetual","leverage":0,"type":"Limit","volume":"1","price":"100"}"#,
+        )
+        .unwrap();
+        assert_eq!(Some(0), zero.leverage);
+
+        // A fractional leverage is a malformed ticket, not a rounded one.
+        assert!(serde_json::from_str::<PlaceTicket>(
+            r#"{"side":"Buy","product":"perpetual","leverage":10.5,"type":"Limit","volume":"1","price":"100"}"#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn freeze_state_aggregates_orders_and_stops_by_asset() {
+        let symbol = SymbolConfig::default();
+        let buy = order(OrderSide::Buy, 100, 2, 1);
+        let sell = order(OrderSide::Sell, 100, 1, 2);
+        let orders = vec![DeskOrder {
+            order: buy,
+            product: Product::Spot,
+            leverage: None,
+            economics: spot_economics(&buy, &symbol),
+        }];
+        let stops = vec![DeskOrder {
+            order: sell,
+            product: Product::Spot,
+            leverage: None,
+            economics: spot_economics(&sell, &symbol),
+        }];
+        let freeze = freeze_state(&orders, &stops);
+        assert_eq!(2, freeze.estimated);
+        assert_eq!(0, freeze.unestimated);
+        assert_eq!(1, freeze.orders.len());
+        assert_eq!("USDT", freeze.orders[0].asset);
+        assert_eq!("200", freeze.orders[0].amount.to_string());
+        assert_eq!(1, freeze.stops.len());
+        assert_eq!("BTC", freeze.stops[0].asset);
+        assert_eq!(2, freeze.total.len());
+        assert_eq!("BTC", freeze.total[0].asset);
+        assert_eq!("USDT", freeze.total[1].asset);
     }
 
     #[test]

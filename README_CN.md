@@ -77,7 +77,7 @@
 **运维可见性**
 - **内置 WebUI 控制台** `/console/`：集群健康、Raft 领导与复制、存储/事件/行情状态、仅领导者可见的事件查看器和诊断信息，无需构建步骤或外部资源。
 - **受保护的 Raft 操作**：通过 gRPC `TransferLeader` 进行优雅领导者切换、尽力而为的 Pre-Vote 选举请求和快照触发，带确认、操作锁和审计日志。
-- **独立演示下单系统** `demo/`：独立进程与 crate，可提交真实订单，展示完整订单簿、标的自定义和游标跟随的 `/events` 事件流，并复用控制台主题。
+- **独立演示下单系统** `demo/`：独立进程与 crate，可提交真实订单，展示完整订单簿、标的自定义、游标跟随的 `/events` 事件流，以及带“演示估算”标注的订单系统冻结额与 maker/taker 费用结算预览，并复用控制台主题。
 - **健康与就绪探针**：`/health` 报告 gRPC 监听器、Raft 核心和 WAL/状态机前沿；`/ready` 还要求已知领导者，适合编排系统使用。
 
 **可信赖的工程质量**
@@ -325,6 +325,11 @@ cargo run --manifest-path demo/Cargo.toml -- \
 ```
 
 打开 <http://127.0.0.1:24300/demo/>。标签页包含下单、完整订单簿、`/events` 游标事件流和标的自定义。
+下单前会预览订单系统预计冻结的资产；点击订单可查看估算冻结额，以及 maker/taker 各自交付/收取的资产、
+费用和资金扣减方式。下单面板还提供仅用于演示的 **永续** 产品与 `1..=100` 倍杠杆选择：这是一个线性
+quote 保证金叠加层，会估算名义价值、初始保证金和费用，要求 `fee_asset_policy=quote`，但发给引擎的仍是
+普通订单，产品/杠杆标签仅保存在 demo 进程内存中。引擎不持有余额、保证金或冻结状态，这些数字仅为演示
+估算，规则见 [`docs/FEE_DEDUCTION.md`](./docs/FEE_DEDUCTION.md) §6.6。
 
 ![演示下单系统](./docs/demo-order-desk.png)
 
@@ -371,6 +376,8 @@ src/
 ├── network/
 │   ├── api.rs               # 应用 HTTP 端点
 │   ├── management.rs        # 管理 HTTP 端点
+│   ├── health.rs            # /health 与 /ready 探针
+│   ├── console.rs           # 内置控制台与受保护操作
 │   ├── grpc/
 │   │   ├── client.rs        # gRPC RaftNetworkV2（追加、投票、快照）
 │   │   ├── server.rs        # gRPC Raft 服务
@@ -406,11 +413,14 @@ tests/
     ├── test_exactness.rs      # 18 位小数经 API、事件、行情和快照重启
     ├── test_symbols.rs        # 单标的配置、网关标的守卫和配置锁定
     ├── test_fees.rs           # 撮合/吃单费用经 API、事件、行情和重启
-    ├── test_fee_assets.rs     # QQQ/USD tick/lot、quote 数量和 quote 扣费
+    ├── test_fee_assets.rs     # QQQ/USD 与 BTC/USDT tick/lot、quote 数量和扣费
     ├── test_request_limits.rs # 恶意输入和请求大小限制
     ├── test_batch_write.rs    # 单 Raft entry 批量写入
+    ├── test_health.rs         # /health 与 /ready 探针
+    ├── test_console.rs        # 内置控制台与受保护的领导者操作
     ├── test_feature_matrix.rs # 公共 API 订单类型矩阵与生命周期事件
-    └── test_client.rs         # 客户端重试、类型化错误与故障切换转发
+    ├── test_client.rs         # 客户端重试、类型化错误与故障切换转发
+    └── test_failure.rs        # Raft/WAL 错误 fail-stop 与 SIGKILL 恢复
 └── replay/
     ├── README.md              # 场景矩阵、端口和重新生成说明
     ├── run-all.sh             # 运行全部已检入回放用例
@@ -428,13 +438,18 @@ tests/
     ├── cancel_orders/         # 撤单生命周期与停靠止损单
     ├── fee_orders/            # 撮合/吃单费用、返佣和两种费用资产
     ├── fee_quote_orders/      # ETF/法币 quote 扣费与 quote 数量归一化
-    └── fee_overflow_orders/   # 名义金额溢出与结构化错误码
+    ├── fee_overflow_orders/   # 名义金额溢出与结构化错误码
+    └── fee_overflow_base_orders/ # 溢出发送时基础费用仍精确
 benches/
 ├── matchengine.rs           # 订单簿微基准
+├── book_replay.rs           # 纯订单簿扫描/撤单/BBO 与 p50/p99
+├── level_book.rs            # 按价格档桶原型对比
+├── apply_path.rs            # 每条 apply 记录的堆分配
 ├── e2e.rs                   # 请求 -> Raft 提交 -> apply -> 响应
 ├── feed_load.rs             # 行情 feed 负载测试
 ├── storage.rs               # WAL 追加/读取/恢复
-└── p0_bench.rs              # 锁/扫描 A/B 基准
+├── p0_bench.rs              # 锁/扫描 A/B 基准
+└── bench_support/           # 共享 warm/cold p50/p99 计时工具
 ```
 
 ## 存储实现
@@ -814,7 +829,7 @@ pub struct MatchEngineResponse {
 响应最多携带 512 个事件，完整批次从 `/events` 读取。成交事件携带 `quote_volume`、`volume_unit`、
 `taker_fee`/`taker_fee_asset` 和 `maker_fee`/`maker_fee_asset`；行情 `TRADE` 与成交 `LIFECYCLE`
 记录也包含相同字段（wire v6）。`client_order_id` 可选，只影响 `Place`：同一 id 重试返回原序列号和
-事件，不会重复下单。长度必须为 1–128 个可打印 ASCII 字节，字符集为 `[A-Za-z0-9._:-]`；空字符串会被拒绝，
+事件，不会重复下单。长度必须为 1–128 字节，字符集为 `[A-Za-z0-9._:-]`；空字符串会被拒绝，
 不需要幂等时请省略该字段。
 
 `/write_batch` 在一个 `apply` 调用中按顺序执行子请求，后一项能看到前一项的结果；每项保留自己的
@@ -863,7 +878,7 @@ pub struct MatchEngineResponse {
 费率字段（`maker_fee_rate`、`taker_fee_rate`）是网关按用户等级带入的有符号 `Fixed` 小数：
 `"0.001"` 表示 10 bps，负值表示返佣，缺省为零。每笔成交的名义金额由 maker 价格 × 成交数量计算，
 吃单方按吃单费率收费，挂单方按挂单费率收费；费用按 18 位小数向零截断。名义金额或费用超出支持的定点范围时
-会通过 `error` 返回 `notional_overflow`、`taker_fee_overflow`、`maker_fee_overflow` 等错误码。引擎只记录费用，不维护余额。
+会通过 `error` 返回 `notional_overflow`、`taker_fee_overflow`、`maker_fee_overflow` 等错误码。引擎只记录费用，不维护余额：订单系统冻结交易资产，清算系统从冻结资产中扣费。
 
 法币、稳定币、加密货币、ETF 和股票等标的的 base/quote 数量语义与按资产扣费已实现。
 ETF/股票 base 的费用始终以 quote 资产结算；加密货币和法币对法币（FX）默认使用收到资产，
@@ -901,15 +916,16 @@ ETF/股票 base 的费用始终以 quote 资产结算；加密货币和法币对
 | `tests/cluster/test_exactness.rs` | 18 位小数的价格/数量经 `/write`、`/read`、`/events`、JSONL 行情、快照 v10 和重启后仍然精确，全程不经过 `f64` |
 | `tests/cluster/test_symbols.rs` | HTTP 入口在进入 Raft 前以 `400` 拒绝错误标的的 `Place`/`Cancel`/`Amend` 和整个批次，并校验序列号/订单簿未变化；同一 entry 中先 `ConfigureSymbol` 再下单的批次仍可工作。另覆盖精度拒绝、配置锁定和快照重启 |
 | `tests/cluster/test_fees.rs` | 吃单/挂单费率产生精确的成交费用，经 `/write`、`/events`、文件 sink 和行情 feed 输出，并在快照重启后保留 |
-| `tests/cluster/test_fee_assets.rs` | QQQ/USD ETF/法币元数据、tick/lot、quote 数量限价单归一化和 quote 资产扣费 |
+| `tests/cluster/test_fee_assets.rs` | QQQ/USD ETF/法币与 BTC/USDT 加密/稳定币元数据、tick/lot、quote 数量限价单归一化，以及 quote 资产和 received 资产扣费 |
 | `tests/cluster/test_request_limits.rs` | 超大 JSON 请求体、畸形输入、非法/超长 `client_order_id`、超长 read key 和越界事件分页在进入 Raft 前以 `400`/`413` 拒绝 |
 | `tests/cluster/test_health.rs` | `/health` 报告 gRPC 监听器、领导者和 WAL/状态机状态；`/ready` 在初始化前返回 `503`，选出领导者后返回 `200` |
 | `tests/cluster/test_console.rs` | 三节点集群：内置控制台资源、节点/集群 API、危险操作拒绝，以及通过 `/console/api/actions/transfer-leader` 切换领导者 |
 | `tests/cluster/test_batch_write.rs` | 多个请求在单个 Raft entry 中应用，逐项序列号、连续事件序号，以及空/嵌套/超大/重复 id 批次校验 |
 | `tests/cluster/test_feature_matrix.rs` | 通过 `/write` 发送每种已宣传的订单类型并断言返回的事件类型；覆盖挂单 → 改单 → 部分成交 → 撤单以及到期/止损生命周期，证明正常操作使用显式事件而非拒绝；同时校验畸形请求体和未知 read key |
 | `tests/cluster/test_client.rs` | 类型化的无领导者/HTTP 边缘错误、连接被丢弃后的重试/退避，以及领导者故障切换后向新领导者的转发 |
+| `tests/cluster/test_failure.rs` | Raft 核心停止、注入的 WAL `ENOSPC`/`EIO`、写流期间 SIGKILL 和学习者快照安装期间 SIGKILL 时 fail-stop；两个 SIGKILL 用例启动真实二进制 |
 | `tests/replay/*/run.sh` | Shell 驱动的回放矩阵，覆盖 GTC、IOC、FOK、GTD、Day、市价、Post-Only、冰山单、止损市价单、止损限价单、改单、撤单、撮合/吃单扣费、quote 扣费和费用溢出场景；每个用例对比生成的事件序列与已检入的 `expected-events.jsonl` |
-| `fuzz/` | `cargo-fuzz` 目标：`OrderBook::execute_order`、WAL 字节解码、快照字节/内容解码；每夜的定时工作流构建三个目标并做一次冒烟运行 |
+| `fuzz/` | `cargo-fuzz` 目标：`OrderBook::execute_order`、WAL 字节解码、快照字节/内容解码和行情 wire 解码；每夜的定时工作流构建四个目标并做一次冒烟运行 |
 
 回放用例不属于 `cargo test`；用 `./tests/replay/run-all.sh` 运行全部，或用
 `./tests/replay/<case>/run.sh` 运行单个用例。它们使用 HTTP 端口 `24211-24226`（gRPC
@@ -921,7 +937,7 @@ ETF/股票 base 的费用始终以 quote 资产结算；加密货币和法币对
 所有集成测试都使用唯一的临时数据目录。集群测试固定使用端口 `21001-21003`（gRPC
 `22001-22003`），快照测试使用 `21101-21103`，重启测试使用 `21201-21205`，撮合结果测试使用
 `21301`/`21302`、行情数据测试 `21303`、事件日志测试 `21304`、故障切换测试
-`21401-21403`、学习者追赶测试 `21501-21502`、过期节点重入测试 `21601-21603`、精度往返测试 `21701`（gRPC `22701`）、标的配置测试 `21801-21802`（gRPC `22801-22802`）、费用测试 `21901`（gRPC `22901`）、费用资产测试 `21902`（gRPC `22902`）、请求限制测试 `21903`（gRPC `22903`）、批量写入测试 `21904`（gRPC `22904`）、健康检查测试 `21905`（gRPC `22905`）、控制台测试 `21906-21908`（gRPC `22906-22908`）、功能矩阵/生命周期测试 `21909-21911`（gRPC `22909-22911`）和客户端测试 `21912-21917`（gRPC `22912-22917`）；重跑前请先停止残留进程
+`21401-21403`、学习者追赶测试 `21501-21502`、过期节点重入测试 `21601-21603`、精度往返测试 `21701`（gRPC `22701`）、标的配置测试 `21801-21802`（gRPC `22801-22802`）、费用测试 `21901`（gRPC `22901`）、费用资产测试 `21902` 和 `21924`（gRPC `22902`/`22924`）、请求限制测试 `21903`（gRPC `22903`）、批量写入测试 `21904`（gRPC `22904`）、健康检查测试 `21905`（gRPC `22905`）、控制台测试 `21906-21908`（gRPC `22906-22908`）、功能矩阵/生命周期测试 `21909-21911`（gRPC `22909-22911`）、客户端测试 `21912-21917`（gRPC `22912-22917`）和故障测试 `21918-21923`（gRPC `22918-22923`）；重跑前请先停止残留进程
 （`pkill -f matchengine-raft`）。
 
 ## 性能与当前限制
@@ -938,6 +954,10 @@ ETF/股票 base 的费用始终以 quote 资产结算；加密货币和法币对
 | 并发 `/write_batch`（100 × 32 单） | 157,035 单/s |
 | 行情 feed 500k fills/s | 495k fills/s，8,192 队列下 0 丢弃 |
 | WAL 追加 / 读取（20k 条、每批 100 条） | 26,049 / 2,386,089 条/s |
+
+订单簿一行来自 `matchengine` best-of-5 微基准。`book_replay` 直接运行相同的 1k/100 档扫描，
+并给出 warm p50/p99（85.7 µs / 171.8 µs）以及交错的 cold pass；完整表格和方法见
+[`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md)。
 
 批量写入把一次 WAL 追加/fsync 摊销到最多 128 个订单：串行 128 单批次达到 25,183 单/s，
 100 个并发 32 单批次达到 157,035 单/s。
@@ -959,7 +979,6 @@ feed 还包含一个刻意的 2M fills/s 过载场景，会丢弃帧并发送 `G
 
 当前限制与已知差距：
 
-- 传输测量覆盖 3 节点回环提交；WAN、丢包和大快照传输场景仍未测量。
 - TLS/mTLS 与 API 认证由前置网关负责；本进程是内部服务。
 - 快照安装需要一块连续缓冲区，单个快照上限为 256 MiB。
 - 一个进程/集群只交易一个标的；多标的需要横向部署多个实例。

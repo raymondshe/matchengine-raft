@@ -77,7 +77,7 @@ Built for teams that need deterministic execution, durable recovery and a clean 
 **Operational visibility**
 - **Embedded WebUI console** at `/console/`: cluster health, Raft leadership and replication, storage/event/feed state, a leader-only event viewer and diagnostics — no build step or external assets.
 - **Guarded Raft actions**: graceful leadership transfer over the gRPC `TransferLeader` RPC, a best-effort Pre-Vote election request, and snapshot triggering, with confirmation, action locking and audit logs.
-- **Standalone demo order desk** at `demo/`: a separate process and crate that places real orders and shows the full book, symbol configuration and a cursor-following `/events` tape, reusing the console theme.
+- **Standalone demo order desk** at `demo/`: a separate process and crate that places real orders and shows the full book, symbol configuration, a cursor-following `/events` tape and labelled demo estimates of the order-system freeze plus maker/taker fee settlement, with a demo-only linear perpetual/leverage overlay; reuses the console theme.
 - **Health and readiness probes**: `/health` reports the gRPC listener, Raft core and WAL/state-machine frontier; `/ready` additionally requires a known leader, making both suitable for orchestrators.
 
 **Built to be trusted**
@@ -384,6 +384,8 @@ src/
 ├── network/
 │   ├── api.rs               # Application HTTP endpoints
 │   ├── management.rs        # Admin HTTP endpoints
+│   ├── health.rs            # /health and /ready probes
+│   ├── console.rs           # Embedded console and guarded actions
 │   ├── grpc/
 │   │   ├── client.rs        # gRPC RaftNetworkV2 (append, vote, snapshots)
 │   │   ├── server.rs        # gRPC Raft service
@@ -419,11 +421,14 @@ tests/
     ├── test_exactness.rs      # 18-digit values through API, events, feed and snapshot restart
     ├── test_symbols.rs        # One-symbol config, gateway symbol guard and symbol lock
     ├── test_fees.rs           # Maker/taker fees through API, events, feed and restart
-    ├── test_fee_assets.rs     # QQQ/USD tick/lot, quote volume and quote fees
+    ├── test_fee_assets.rs     # QQQ/USD and BTC/USDT tick/lot, quote volume and fees
     ├── test_request_limits.rs # Hostile input and request-size limits
     ├── test_batch_write.rs    # Batch writes in one Raft entry
+    ├── test_health.rs         # /health and /ready probes
+    ├── test_console.rs        # Embedded console and guarded leadership actions
     ├── test_feature_matrix.rs # Public-API order-type matrix and lifecycle events
-    └── test_client.rs         # Client retries, typed errors and failover forwarding
+    ├── test_client.rs         # Client retries, typed errors and failover forwarding
+    └── test_failure.rs        # Fail-stop on Raft/WAL errors and SIGKILL recovery
 └── replay/
     ├── README.md              # Scenario matrix, ports and regeneration notes
     ├── run-all.sh             # Run every checked-in replay case
@@ -441,13 +446,18 @@ tests/
     ├── cancel_orders/         # Cancel lifecycle and parked stops
     ├── fee_orders/            # Maker/taker fees, rebates and both fee assets
     ├── fee_quote_orders/      # ETF/fiat quote fees and quote-volume normalization
-    └── fee_overflow_orders/   # Notional overflow and structured error reporting
+    ├── fee_overflow_orders/   # Notional overflow and structured error reporting
+    └── fee_overflow_base_orders/ # Overflow with an exact base fee
 benches/
 ├── matchengine.rs           # Order-book microbenchmarks
+├── book_replay.rs           # Book-only sweeps, cancels and BBO with p50/p99
+├── level_book.rs            # Per-level bucket prototype comparison
+├── apply_path.rs            # Apply-path heap allocations per entry
 ├── e2e.rs                   # Submit -> commit -> apply -> response
 ├── feed_load.rs             # Market-data feed load test
 ├── storage.rs               # WAL append/read/recovery
-└── p0_bench.rs              # Lock/scan A/B benchmarks
+├── p0_bench.rs              # Lock/scan A/B benchmarks
+└── bench_support/           # Shared warm/cold p50/p99 timing harness
 ```
 
 ## Storage Implementation
@@ -862,7 +872,7 @@ the full batch is available from `/events`. Fill events carry
 `quote_volume`, `volume_unit`, `taker_fee`/`taker_fee_asset` and `maker_fee`/`maker_fee_asset`;
 the same fields are on market-data `TRADE` and fill `LIFECYCLE` records (wire v6).
 `client_order_id` is optional and only affects `Place`: a retry returns the original sequence and
-events instead of placing a second order. It must be 1–128 printable ASCII bytes from
+events instead of placing a second order. It must be 1–128 bytes from
 `[A-Za-z0-9._:-]`; an empty value is rejected, so omit the field to disable idempotency.
 
 `/write_batch` executes sub-requests in order in one `apply` call, so later items see the effects of
@@ -932,7 +942,8 @@ optional and default to zero. The engine computes each fill's notional from the 
 matched quantity, then charges the taker order's taker rate and the maker order's maker rate.
 Fees are truncated toward zero at 18 places; a fill carries an ordered `error` set
 (`notional_overflow`, `taker_fee_overflow`, `maker_fee_overflow`) when a dependent value exceeds
-the supported fixed-point range. The engine records fees but does not move balances.
+the supported fixed-point range. The engine records fees but does not move balances: the order
+system freezes the trading asset and clearing deducts fees from that freeze.
 
 Base/quote volume semantics and asset-aware fee deduction for fiat, stablecoin, crypto, ETF and
 equity pairs are implemented. ETF/equity bases always settle fees in the quote asset; crypto/spot
@@ -972,15 +983,16 @@ placeholder). `sequence` is optional and defaults to `0`.
 | `tests/cluster/test_exactness.rs` | An 18-fractional-digit price and quantity round-trip through `/write`, `/read`, `/events`, the JSONL market-data feed, snapshot v10 and a restart without passing through `f64` |
 | `tests/cluster/test_symbols.rs` | The HTTP edge rejects wrong-symbol `Place`/`Cancel`/`Amend` and whole batches with `400` before Raft, including sequence/book checks; a batch that configures a new symbol and places in one entry still works. Also covers precision rejection, the symbol lock and snapshot restart |
 | `tests/cluster/test_fees.rs` | Maker and taker fee rates produce exact fill fees in `/write`, `/events`, the file sink and the market-data feed, and survive snapshot restart |
-| `tests/cluster/test_fee_assets.rs` | QQQ/USD ETF/fiat metadata, tick/lot enforcement, quote-volume limit normalization and quote-asset fee deduction |
+| `tests/cluster/test_fee_assets.rs` | QQQ/USD ETF/fiat and BTC/USDT crypto/stablecoin metadata, tick/lot enforcement, quote-volume limit normalization, and quote-asset plus received-asset fee deduction |
 | `tests/cluster/test_request_limits.rs` | Oversized JSON bodies, malformed input, invalid/oversized `client_order_id`s, oversized read keys and out-of-range event pages are rejected with `400`/`413` before Raft changes the book |
 | `tests/cluster/test_health.rs` | `/health` reports the gRPC listener, leadership and WAL/state-machine state; `/ready` is `503` before initialization and `200` after a leader is elected |
 | `tests/cluster/test_console.rs` | Three-node cluster: embedded console assets, node/cluster APIs, unsafe-action rejection and leadership transfer through `/console/api/actions/transfer-leader` |
 | `tests/cluster/test_batch_write.rs` | Multiple requests are applied in one Raft entry with per-item sequences, continuous event ordinals, and edge validation for empty, nested, oversized and duplicate-id batches |
 | `tests/cluster/test_feature_matrix.rs` | Sends one order of every advertised type through `/write` and asserts the returned event kinds; follows rest → amend → partial fill → cancel and expiry/stop lifecycles, proving accepted actions emit explicit events rather than rejections; checks malformed bodies and unknown read keys |
 | `tests/cluster/test_client.rs` | Typed no-leader and HTTP edge errors, retry/backoff after a dropped connection, and forwarding to the new leader after failover |
+| `tests/cluster/test_failure.rs` | Fail-stop when the Raft core stops, injected WAL `ENOSPC`/`EIO`, SIGKILL during a write stream and SIGKILL during a learner snapshot install; the SIGKILL cases spawn the real binary |
 | `tests/replay/*/run.sh` | Shell-driven replay matrix for GTC, IOC, FOK, GTD, Day, market, post-only, iceberg, stop-market, stop-limit, amend, cancel, maker/taker fee, quote-fee and fee-overflow scenarios; each case compares the generated event sequence against its checked-in `expected-events.jsonl` |
-| `fuzz/` | `cargo-fuzz` targets for `OrderBook::execute_order`, WAL byte decoding and snapshot byte/content decoding; the nightly scheduled workflow builds all three and runs a smoke pass |
+| `fuzz/` | `cargo-fuzz` targets for `OrderBook::execute_order`, WAL byte decoding, snapshot byte/content decoding and market-data wire decoding; the nightly scheduled workflow builds all four and runs a smoke pass |
 
 The replay cases are not part of `cargo test`; run the whole matrix with
 `./tests/replay/run-all.sh`, or one case with `./tests/replay/<case>/run.sh`. They use HTTP ports
@@ -995,11 +1007,12 @@ Every integration test uses a unique temporary data directory. The cluster test 
 `21201-21205`, the match-result tests `21301`/`21302`, the market-data test `21303`, the event-log test
 `21304`, the failover test `21401-21403`, the learner catch-up test `21501-21502`, the late-join
 test `21601-21603`, the exactness test `21701` (gRPC `22701`), the symbol-config test `21801-21802` (gRPC `22801-22802`), the fee test `21901` (gRPC `22901`), the
-fee-asset test `21902` (gRPC `22902`), the request-limit test `21903` (gRPC `22903`), the batch-write
-test `21904` (gRPC `22904`), the health test `21905` (gRPC `22905`), the console test
-`21906-21908` (gRPC `22906-22908`), the feature-matrix/lifecycle tests `21909-21911`
-(gRPC `22909-22911`) and the client tests `21912-21917` (gRPC `22912-22917`); stop leftover
-processes (`pkill -f matchengine-raft`) before rerunning.
+fee-asset tests `21902` and `21924` (gRPC `22902`/`22924`), the request-limit test `21903` (gRPC
+`22903`), the batch-write test `21904` (gRPC `22904`), the health test `21905` (gRPC `22905`), the
+console test `21906-21908` (gRPC `22906-22908`), the feature-matrix/lifecycle tests `21909-21911`
+(gRPC `22909-22911`), the client tests `21912-21917` (gRPC `22912-22917`) and the failure tests
+`21918-21923` (gRPC `22918-22923`); stop leftover processes (`pkill -f matchengine-raft`) before
+rerunning.
 
 ## Performance and Current Limits
 
@@ -1015,6 +1028,11 @@ Measured baseline (Apple M4, Rust 1.93.1, release bench profile; full methodolog
 | Concurrent `/write_batch` (100 × 32 orders) | 157,035 orders/s |
 | Market-data feed at 500k fills/s | 495k fills/s, 0 drops at 8,192-frame queue |
 | WAL append / read (20k entries, 100-entry batches) | 26,049 / 2,386,089 entries/s |
+
+The order-book row is the `matchengine` best-of-5 microbench. `book_replay` exercises the same
+1k-asks/100-level sweep directly and now reports warm p50/p99 (85.7 µs / 171.8 µs) plus an
+interleaved cold pass; the full table and methodology are in
+[`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md).
 
 Batch writes amortize one WAL append/fsync across up to 128 orders: sequential 128-order batches
 reach 25,183 orders/s, and 100 concurrent 32-order batches reach 157,035 orders/s.
