@@ -160,10 +160,10 @@ CI (`.github/workflows/ci.yml`) runs `cargo fmt --all -- --check` (and the `fuzz
 
 - Trust `src/` over prose. `README.md`, `README_CN.md` and `TODO.md` now match the
   WAL + snapshot + gRPC design; README requires Rust ≥ 1.89 (edition 2024).
-- `docs/PERFORMANCE.md` records the measured order-book, end-to-end, feed-load and storage baselines and how to reproduce them.
+- `docs/PERFORMANCE.md` records the measured order-book, end-to-end, feed-load and storage baselines and how to reproduce them, plus a 2026-11-04 review of AsthaMishra's `optimization_notes.md` stating which of their optimizations transfer here, which are already covered and which are measured traps (arena allocator).
 - `docs/OPERATIONAL_CONSOLE.md` documents the Actix-served operational console: embedded `/console/` UI, node/cluster APIs, guarded leadership transfer and a best-effort election request. The layout mockup is `docs/OPERATIONAL_CONSOLE_LAYOUT.html`.
 - `docs/DEMO_ORDER_SYSTEM.md` documents the standalone `demo/` order desk (a separate crate and process, not an engine route): order ticket, full book, cancel/amend and `/events` cursor-follow. Run it with `cargo run --manifest-path demo/Cargo.toml -- --addr 127.0.0.1:24300 --engine 127.0.0.1:24301 --engine-id 1`; the layout mockup is `docs/DEMO_ORDER_LAYOUT.html`.
-- `docs/THIRD_PARTY_INVESTIGATION.md` consolidates the AsthaMishra/matching-engine, wasif-exe/wire and llc-993/matching-core reviews; `TODO.md` §14 tracks the adopted follow-ups and guardrails.
+- `docs/THIRD_PARTY_INVESTIGATION.md` consolidates the AsthaMishra/matching-engine, wasif-exe/wire and llc-993/matching-core reviews (re-reviewed 2026-11-04 with AsthaMishra's `optimization_notes.md`); `TODO.md` §14 tracks the adopted follow-ups and guardrails.
 - `docs/AERON_SOLUTION.md` is an investigation document. `docs/TRANSPORTS.md` is historical: the
   gRPC/tonic implementation (`src/network/grpc/`) is now the only Raft transport; the HTTP/JSON
   fallback and its comparison were removed on 2026-10-30.

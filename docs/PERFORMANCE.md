@@ -510,6 +510,11 @@ itself is already cheap.
   is worse.
 - Do not add a second fsync or a synchronous sink to the apply path. The WAL's
   one-append/one-fsync batch is the reason the batch-write path scales.
+- Do not swap in an arena allocator (`bumpalo` or similar) expecting a win. The external
+  optimization notes measured it 79-88% worse for single-operation latency and removed it again; see
+  the external review section above.
+- Do not compare this engine's replicated, fsync-bound write throughput against a single-node book
+  microbenchmark from another project. Compare book-to-book or e2e-to-e2e.
 
 ### Validation plan
 
@@ -530,6 +535,63 @@ itself is already cheap.
 - During snapshot install, watch Raft metrics for heartbeat/leader changes; a
   healthy result is no election and no write-timeout spike.
 
+## External optimization notes: what transfers here (2026-11-04)
+
+Re-read AsthaMishra/matching-engine's `matching-core/optimization_notes.md` (last updated
+26-05-2026) against this engine. It documents nine book-layout and runtime optimizations with
+before/after numbers, measured on a single-node, cent-tick, `$0.01-$999.99` book of 100,000 price
+slots. This engine is Raft-replicated, one symbol per process, 18-decimal `Fixed`, and its
+end-to-end write path is fsync-dominated (~4 ms), while book-only work runs at ~10M fills/s
+(`book_replay` above). Most of their wins target a bottleneck this engine does not currently have.
+The value in the document is selective: one layout idea is already prototyped here, several are
+already covered by design, two are traps, and the measurement discipline transfers wholesale.
+
+| Their optimization | Their measurement | Our status | Verdict |
+|---|---|---|---|
+| Flat array + bitmap instead of `BTreeMap` | 7.8x-318x at depth 100-1000 | Already prototyped as per-level buckets (`level_book`): 2.09x sweep, 3.37x deep cancel, 1.70x/2.58x amend, but 0.64x sparse amend and 0.89x BBO advance | Keep as the P2 hybrid with a sparse-level fast path; do not adopt wholesale (it needs a bounded cent price range) |
+| Cached best-bid/ask index | `bbo` 354 ns -> 0.88 ns | BBO already reads the tree edges: 428M queries/s, ~2.3 ns per call; the prototype's cached BBO is only 4.5x against that and loses on advance (0.89x) | Skip |
+| `Vec` order index keyed by per-book sequential ids | 1.7-1.8x after removing SipHash | No secondary index exists here: a resting order is identified by `(side, price, sequence)`, which is also its tree key, and the sequence is dense and per book by construction | Already better; no action |
+| Store the index-in-level so cancel needs no intra-level scan | Their stated next win | No intra-level `Vec` to scan; cancel is one tree remove | Already better; a prerequisite only if the bucket layout lands |
+| `active` flag + `head_idx` instead of `retain()`/`pop_front()` | Qualitative | A partially filled maker is updated in place, so only fully consumed makers are removed; the prototype's `head` cursor is the analogue (2.09x sweep) | Part of the layout item; nothing to do today |
+| Bitmap `top_n_levels` (`trailing_zeros`/`leading_zeros`) | 53 µs -> 794 ns | The depth walk already visits active levels only and is capped at 200; prototype depth was 1.00x | Skip - empty slots are never visited |
+| Arena allocator (`bumpalo`) | **Regression**: single-operation latency 79-88% worse; removed again in their Optimization 9 | Inline buffers are the adopted approach (`apply_path`: 4-5 allocs/entry after the `SmallVec` change) | Do not adopt; it would also complicate `to_content` and snapshot serialization |
+| Pre-allocated collections (`with_capacity`, `next_power_of_two`) | Small, qualitative | Event window, per-entry event buffer and publish list are preallocated/inline; the response `events` `Vec`, the legacy `value` `String` and the fill `MatchResult` `Vec` still allocate | P2 micro: reserve the known lengths where the shape is fixed |
+| Response slot pool replacing `oneshot::channel()` | Removes one allocation per request | One `/write` costs ~4 ms and is fsync-bound; their pool (256 slots) also caps in-flight requests, which conflicts with the 18,350 concurrent writes already sustained here | Skip; not the bottleneck |
+| N-thread sharding, one owner per symbol | Their 132M/s is multi-threaded (~33M/s per thread); remaining single-thread gap ~3x | One symbol per process is deliberate and apply must be serial for determinism; parallelism already exists across processes and across HTTP workers plus the blocking pool | Skip; keep the multi-thread caveat in mind when comparing numbers |
+| SIMD slot scan, `mmap` | They judged SIMD marginal over the bitmap and mmap inapplicable | Agreed | Skip |
+
+### Measurement discipline to adopt
+
+These transfer regardless of layout and are the cheapest wins on the list:
+
+- **Report warm and cold separately, and exclude setup and drop from the timed window.** Their
+  `iter_custom` lesson: dropping a 100,000-slot book inside the timer produced ~960 µs uniformly
+  across all depths. Our `book_replay` and `level_book` already clone outside the timer, but the
+  tables do not say which numbers are warm-cache, and repeated runs vary 5-10% (up to ~35% for the
+  current-book BBO baseline). Label cache warmth per row.
+- **Prefer percentiles to best-of-5 for anything with a tail.** They report p50/p99/p99.9 from a
+  1.94M-op NASDAQ ITCH replay (100 ns / 1.8 µs / 14.9 µs). Our book benchmarks are whole-round
+  best-of-5 times; only `e2e` has p50/p95/p99. Adding p50/p99 to `book_replay` and `level_book`
+  would make regressions visible that a best-of-5 hides.
+- **Add one realistic-mix replay.** They treat ITCH replay as the only production-like signal
+  because it carries a real add/cancel/modify mix. Our `tests/replay` fixtures are correctness-only;
+  replaying a large fixture with a realistic mix and reporting percentiles is the closest analogue,
+  and it exercises stops, icebergs, fees and events, which their single-book replay does not.
+- **Quantify scheduler noise before optimizing further.** Their pinned `SCHED_FIFO` run collapsed
+  the tail, and they attributed outliers to preemption windows. Re-running `cargo bench --bench e2e`
+  pinned to one core (`taskset -c <n>`) would separate scheduler contribution from the fsync cost
+  that dominates the current p99.
+- **Compare like with like.** Their throughput is single-threaded book management with no
+  durability; the concurrent 157,035 orders/s measured here includes Raft commit, WAL `sync_data`,
+  apply, events and JSON. Never quote the two side by side.
+
+### Not applicable here
+
+- Fixed tick and bounded price range (`MAX_PRICE / TICK_SIZE` slots): incompatible with 18-decimal
+  `Fixed` and configurable `price_tick`/`base_lot`.
+- Per-process symbol sharding: contradictory to one symbol per process/cluster.
+- Removing durability for latency: `sync_data`, snapshots and replication are the product.
+
 ## Interpretation
 
 - Matching and feed derivation are not the current bottleneck.
@@ -541,6 +603,10 @@ itself is already cheap.
   BBO-query workloads but loses sparse one-order-per-level re-queue and BBO
   advance. Full adoption still needs a sparse-level fast path (or a hybrid) and
   a 3-node/real-sink run; see the prototype section above.
+- The external optimization-notes review (2026-11-04) transfers measurement discipline, not
+  layout: the per-level bucket prototype already covers the one applicable layout idea, the
+  secondary-order-index and cached-BBO wins are already covered by the `(side, price, sequence)`
+  tree key, and the arena/response-pool ideas are measured regressions or non-bottlenecks here.
 - The runtime flavor A/B is within noise for the write path: WAL fsync and the
   serialized apply path dominate. P0 items 2-6 are implemented: snapshot
   encode/decode and read serialization are off the lock, apply locks per entry

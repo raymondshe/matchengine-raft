@@ -1,17 +1,18 @@
 # TODO
 
-Last reviewed: 2026-11-02. This is the working roadmap; see `AGENTS.md` for commands and the
+Last reviewed: 2026-11-04. This is the working roadmap; see `AGENTS.md` for commands and the
 current branch state.
 
 **Current baseline:** the OpenRaft 0.10 port, durable WAL/snapshot storage and exact scale-18
 `Fixed` migration are done. Order prices/quantities, last trade, match events, depth/BBO, `/read`,
 the market-data feed and wire v6 are exact; snapshot v10 stores fixed-point orders/events, the
-single-symbol precision configuration, asset metadata, volume units and maker/taker fee assets.
+single-symbol precision configuration, asset metadata, volume units, maker/taker fee assets and the
+fill-level `error` code set.
 One process/cluster trades exactly one symbol; multi-symbol is isolated by running one process per
 symbol. Base/quote volume and asset-aware fee deduction are done, and the market-data processor
 runs as a tokio task. Edge request/snapshot limits and the loopback/private-network contract are in
-place. The remaining work is stronger correctness evidence, failure behavior and measured
-performance; TLS/authentication stays at the gateway and is out of scope for this process.
+place. The remaining work is measured performance evidence and event delivery; TLS/authentication
+stays at the gateway and is out of scope for this process.
 
 Priority key: **P0** = correctness/security, do next; **P1** = production readiness; **P2** =
 important but not blocking; **P3** = later/optional.
@@ -31,15 +32,23 @@ restarts without a partial snapshot and retries cleanly. Pre-Vote is enabled wit
 RPC (§4), so an isolated node asks before campaigning. The wire v6 reference decoder and golden
 tests are complete (§6).
 
-The next work, in order:
+The next work, in order (re-prioritised 2026-11-04 after the external optimization-notes
+re-review, whose verdicts are in [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md)):
 
-1. **Benchmark regression gate (§8).** Gate CI on `apply_path` allocs/entry (deterministic) plus
-   loose time thresholds.
-2. **Event delivery Phase 4 (§5).** Long-poll `wait_ms`, gRPC `StreamEvents` and the optional MQ
+1. **Benchmark measurement discipline (§8, P1).** Add p50/p99 to `book_replay` and `level_book`,
+   label cache warmth per row, and run one pinned-core `e2e` pass. Best-of-5 whole-round times hide
+   the tails that a regression gate needs; this is the prerequisite for item 2.
+2. **Benchmark regression gate (§8, P2).** Gate CI on `apply_path` allocs/entry (deterministic) plus
+   loose percentile thresholds from item 1.
+3. **Event delivery Phase 4 (§5).** Long-poll `wait_ms`, gRPC `StreamEvents` and the optional MQ
    bridge; this also settles the event-time/cursor item in §11.
+4. **Realistic-mix replay benchmark (§8, P2).** Replay a large fixture with a real
+   add/cancel/amend mix (stops, icebergs, fees) and report percentiles - the load analogue of
+   `tests/replay` and the closest equivalent to the ITCH-style replay the external notes treat as
+   the only production-like signal.
 
 The quick wins from the last review are complete: `Order` identity `PartialEq`, optional
-`Order::sequence`, and a BTC/USDT quote-volume case.
+`Order::sequence`, a BTC/USDT quote-volume case, and the `fee_overflow_base_orders` replay case.
 
 ## 1. Exact fixed-point end-to-end — done
 
@@ -302,9 +311,11 @@ Current coverage:
 - `test_console.rs`: three-node cluster checks the embedded console assets, node/cluster APIs,
   unsafe-action rejection and leadership transfer through `/console/api/actions/transfer-leader`.
 - `tests/replay/`: shell-driven replay matrix for GTC, IOC, FOK, GTD, Day, market, post-only,
-  iceberg, stop-market, stop-limit, amend, cancel, maker/taker fee, quote-fee and fee-overflow
-  scenarios. Each case runs through `replay_orders` and compares the generated event sequence with
-  a checked-in reference; `tests/replay/run-all.sh` runs the whole matrix.
+  iceberg, stop-market, stop-limit, amend, cancel, default-policy maker/taker fees, quote-asset fees
+  and two fee-overflow scenarios (quote policy, and a `Received` fill that keeps an exact base fee).
+  Each case runs through `replay_orders` and compares the generated event sequence with a checked-in
+  reference; `tests/replay/run-all.sh` runs the whole matrix and `run-all.sh events` replays the same
+  cases through `POST /events`.
 - `fuzz/`: `cargo-fuzz` targets for `OrderBook::execute_order` (`order_book`), WAL byte decoding
   (`wal_decode`), snapshot byte/content decoding (`snapshot_decode`) and market-data wire decoding
   (`wire_decode`); the scheduled `.github/workflows/fuzz.yml` job builds them and runs a smoke pass.
@@ -357,12 +368,22 @@ Remaining:
   2,323→595 (rest) and 1,308→156 (cancel); fill 3,308→2,012 and batch rest 2,393→1,693. The
   remaining allocations are the `BTreeMap` node, response `events` `Vec`, legacy `value` `String`
   and fill `MatchResult` `Vec`.
+- [ ] **P1** Report percentiles, not only best-of-5: add p50/p99 to `book_replay` and `level_book`
+  rounds and label cache warmth per row. Only `e2e` reports percentiles today, and the external
+  optimization-notes review (2026-11-04) showed best-of-5 hides exactly the tails a gate needs.
+- [ ] **P1** Add one realistic-mix replay benchmark: replay a large fixture (add/cancel/amend with
+  stops, icebergs and fees) and report p50/p99. `tests/replay` is correctness-only; this is its
+  load analogue.
 - [ ] **P2** Adopt per-level buckets or a compact resting record only if the P1 prototype and
   new 3-node or real-sink measurements justify the complexity. The prototype wins populated-level
   match/cancel/amend and cached-BBO queries but loses sparse one-order-per-level re-queue and
   BBO advance; full adoption is not justified yet, and a hybrid or sparse-level fast path is the
   next experiment.
 - [ ] **P2** Add a benchmark regression gate (threshold or recorded baseline) to CI.
+- [ ] **P2** Run `cargo bench --bench e2e` pinned to one core (`taskset -c <n>`) once, to separate
+  scheduler noise from the fsync cost that dominates the current p99.
+- [ ] **P2** Reserve the known lengths for the remaining apply-path allocations (response `events`
+  `Vec`, fill `MatchResult` `Vec`) where the shape is fixed; they are the `apply_path` leftovers.
 
 ## 9. Client library
 
@@ -429,6 +450,10 @@ These choices feed the priorities above; write them down as ADRs or doc notes wh
   deterministic and consumes explicit timestamps and notional-proportional maker/taker rates.
 - [x] Pre-Vote uses a dedicated gRPC `PreVote` RPC and is enabled by default; mixed-version
   clusters are unsupported because an older peer returns `Unimplemented`.
+- [x] No arena allocator on the apply path. The external optimization notes measured `bumpalo`
+  79-88% *worse* for single-operation latency and removed it again (their Optimization 7 -> 9);
+  inline `SmallVec` buffers are the adopted approach. See
+  [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md).
 - [ ] **P2** Decide the event time source for the clearing feed and per-instrument cursor retention
   (Phase 4 in §5).
 
@@ -445,19 +470,25 @@ Done:
   to `-1..=1`.
 - [x] The gateway supplies both rates at placement; they travel in the Raft log, snapshot and
   resting/amended/stop/iceberg order state.
-- [x] Per fill, notional = maker price × matched quantity through the `i256` path; taker fee =
-  notional × taker's taker rate; maker fee = notional × maker's maker rate. Fees truncate toward
-  zero at 18 places. Positive = charge, negative = rebate.
+- [x] Per fill, notional = maker price × matched quantity through the `i256` path. A quote fee is
+  notional × that side's rate; a base fee is matched quantity × that side's rate; the pair's fee
+  policy decides which asset each side uses. Fees truncate toward zero at 18 places. Positive =
+  charge, negative = rebate.
 - [x] A taker that later rests uses its maker rate on future fills. Amendments, iceberg refills and
   stop children preserve the original order's rates.
-- [x] `MatchResult` carries `notional`, `taker_fee`, `maker_fee` and `MatchErrors`.
+- [x] `MatchResult` carries `notional`, `taker_fee`, `maker_fee` and `MatchErrors` (the `error`
+  set): `notional_overflow`, `taker_fee_overflow` and `maker_fee_overflow`, empty when every
+  dependent value is exact. A flagged fill can still carry exact values — a base fee survives a
+  quote-notional overflow — so a zero is real only when its code is absent.
   `MatchEvent`/`StoredMatchEvent` carry both fees and the error set.
 - [x] `/write` events, `/events`, the JSONL file sink and market-data `TRADE`/fill `LIFECYCLE`
   records expose the fees and their assets. Wire is **v6**.
 - [x] Snapshot **v10** persists order rates, fee assets and event fees.
-- [x] Tests cover simultaneous maker/taker rates, negative maker rebates, rate validation, fee
-  overflow, 18-digit exactness, a taker that later rests, file/event/feed output and snapshot
-  restart.
+- [x] Tests cover simultaneous maker/taker rates, negative maker rebates, rate validation, overflow
+  error codes, 18-digit exactness, a taker that later rests, file/event/feed output and snapshot
+  restart. The replay matrix adds two overflow cases: `fee_overflow_orders` (quote policy: the
+  notional and both quote fees are unavailable) and `fee_overflow_base_orders` (`Received`: the base
+  taker fee stays exact while the quote maker fee is unavailable).
 
 Ownership boundaries (outside the matching engine):
 
@@ -483,7 +514,9 @@ Done:
   (forced for ETF/equity bases) and base asset. Events report the actual fee asset per side.
 - [x] Gross base/quote volume, taker/maker fee assets and fees flow through `MatchResult`,
   `MatchEvent`, `/events`, the file sink and the market-data feed.
-- [x] Tick/lot increments and per-asset precision are enforced on `Place` and `Amend`.
+- [x] An amendment carries no unit: its volume is always base, even for an order placed in quote
+  volume, and the client's requested amount stays in `requested_volume`/`requested_volume_unit`.
+  Tick/lot increments and per-asset precision are enforced on `Place` and `Amend`.
 - [x] Snapshot **v10** and market-data wire **v6** are implemented; old data directories must be
   recreated.
 - [x] Tests cover QQQ/USD (ETF/fiat) and BTC/USDT (crypto/stablecoin) tick/lot, quote volume and
@@ -494,7 +527,11 @@ Remaining extensions:
 
 - [ ] **P2** Add third-asset fee-token support only if a fee price and balance model are provided.
 - [ ] **P2** Decide whether mixed-unit iceberg/FOK orders should normalize tranches; quote volume
-  currently supports plain limit and market orders only.
+  currently supports plain limit and market orders only, and those combinations are rejected at
+  admission (`docs/FEE_DEDUCTION.md` §5.1, §13 item 16).
+- [ ] **P2** Decide whether the numeric fields named by an error code should become `Option<Fixed>`
+  (JSON `null`) instead of zero, so a real zero and an unavailable value cannot be confused
+  (`docs/FEE_DEDUCTION.md` §13 item 15).
 
 Resolved decisions: quote limit sell rounds base quantity down to cap notional; quote market sell
 rounds up and permits a bounded overshoot; `volume` is always gross; the fee policy is per symbol;
@@ -547,9 +584,16 @@ P0/P1 follow-ups (all completed):
   count as QPS and estimates memory at 200 bytes/order. Done: the measurement-scope table and
   per-benchmark units keep writes/s, orders/s, fills/s, cancels/s, advances/s, queries/s and
   allocs/entry distinct, and memory is whole-process RSS rather than a per-order estimate.
+- [x] **P1** Re-read AsthaMishra's `matching-core/optimization_notes.md` (2026-11-04) and record
+  what transfers. Done: only the measurement discipline plus the already-prototyped per-level
+  buckets apply; the arena was a measured regression there, and the response-slot pool,
+  cached-BBO index and symbol sharding are already covered or inapplicable. Verdicts are in the
+  "External optimization notes" section of [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md).
 
-P2/P3 follow-ups:
+Open follow-ups:
 
+- [ ] **P1** Add percentiles and cache-warmth labels to the book benchmarks, add a realistic-mix
+  replay, and run one pinned-core `e2e` pass (tracked in §8, from the same re-review).
 - [ ] **P2** Evaluate a binary order-entry path (gRPC/protobuf or compact codec) and feature-gated
   latency histograms only if a latency target requires them.
 - [ ] **P2** Evaluate real ITCH-style replay data and custom MPMC/SIMD/io_uring work only after a
@@ -563,6 +607,9 @@ Guardrails / what not to copy:
 - Do not copy one-fill matching loops, fixed 65k price arrays, O(n) cancel, global process-local
   trade ids, SIMD "cancel" that only computes a mask, 192 MiB-per-thread slabs, hard-coded `rdtsc`
   frequency conversions or io_uring as a default.
+- Do not put an arena allocator on the apply path (measured 79-88% worse single-operation latency in
+  the AsthaMishra notes, later removed by them), and never compare a single-node book
+  microbenchmark with this engine's replicated, fsync-bound end-to-end numbers.
 - Verify third-party claims before adopting: AsthaMishra and llc-993 have no license file;
   AsthaMishra's fuzz target is stale; Wire's v9 matching kernel is single-fill and its LOB has
   partial-fill/BBO bookkeeping issues; llc-993's advanced order types are not wired into its

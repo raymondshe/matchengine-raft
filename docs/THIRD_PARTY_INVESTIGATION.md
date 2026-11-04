@@ -9,9 +9,12 @@ failure modes. This document consolidates the separate reports into one referenc
 | [wasif-exe/wire](https://github.com/wasif-exe/wire) | `abd2bf2` (2026-10-19) | MIT | Low-level layout/allocator/MPMC ideas and a cautionary benchmark case |
 | [llc-993/matching-core](https://github.com/llc-993/matching-core) | `2cb21c0` (2026-01-03) | No license file exposed | Feature breadth, WAL/snapshot attempt, integration/benchmark caution |
 
-Review date: 2026-11-01. The review used the public READMEs, `PLAN.md` and the key source files
-listed in the references. Tests were not executed here. No code was copied; all three projects are
-reference material only.
+Review date: 2026-11-01, re-reviewed 2026-11-04. The review used the public READMEs, `PLAN.md`
+and the key source files listed in the references; the 2026-11-04 pass added AsthaMishra's
+`matching-core/optimization_notes.md` to Part I. Tests were not executed here. No code was copied;
+all three projects are reference material only. The performance-specific verdicts (what transfers to
+matchengine-raft and what does not) live in
+[`docs/PERFORMANCE.md`](./PERFORMANCE.md) ("External optimization notes").
 
 ## Part I - AsthaMishra/matching-engine
 
@@ -82,6 +85,19 @@ The benchmark documentation is notably honest:
 `PLAN.md` also says the fuzz target is currently stale and does not build, despite the README's
 historical fuzz claim. Treat that claim as unverified until the target is fixed.
 
+`matching-core/optimization_notes.md` (re-reviewed 2026-11-04) records nine dated optimization
+steps with before/after numbers: the flat array + bitmap (7.8x-318x at depth 100-1000 over their
+BTreeMap baseline, with `bbo`/`top_n` regressions they then fixed through cached best indices and
+bitmap-word iteration), a `Vec` order index keyed by per-book sequential ids after dropping SipHash
+(1.7-1.8x), an `active`-flag + `head_idx` cancel/match path, a `bumpalo` arena that was added and
+then **removed** after measuring 79-88% worse single-operation latency, a pre-allocated
+response-slot pool replacing `oneshot::channel()`, N-thread symbol sharding, and a NASDAQ ITCH
+replay as the only production-like signal (AAPL, 1.94M ops: p50 100 ns, p99 1.8 us, p99.9 14.9 us;
+100 symbols, 108M sequential ops at ~4.1M ops/s). The notes are unusually honest about benchmark
+mechanics: `iter_batched` timed the book's O(MAX_PRICE) drop and produced ~960 us uniformly until
+they moved it outside the timer with `iter_custom`, and they separate warm-cache throughput from
+cold-cache per-operation numbers.
+
 ### 5. Findings and risks
 
 - **Self-trade prevention without an event.** In the reviewed matching code, a self-trade-prevented
@@ -94,6 +110,10 @@ historical fuzz claim. Treat that claim as unverified until the target is fixed.
   path is now a single-threaded io_uring loop; the fuzz target is stale. Verify code before trusting
   prose.
 - **No license file.** The GitHub API reports no license. Do not copy code from this repository.
+- **Optimizations are provisional until re-measured.** Optimization 7 added a `bumpalo` arena and
+  Optimization 9 removed it after it regressed single-operation latency 79-88%; the 132M/s headline
+  turned out to be multi-threaded (~33M/s per thread). Treat each technique in that document as a
+  hypothesis with its own A/B, and require the same evidence of ourselves before adopting one.
 - **No durability/consensus.** This is a single-node in-memory engine; our Raft/WAL/snapshot story
   is a separate, non-negotiable strength.
 
@@ -433,6 +453,8 @@ measure a separate `AdvancedOrderBook`, not the product pipeline.
 - SIMD "cancel" that only computes a mask and never updates state.
 - Hard-coded `rdtsc` frequency conversion; report TSC ticks or measure wall time.
 - A 192 MiB-per-thread slab allocator for variable-sized, long-lived orders/events.
+- An arena allocator on a per-entry apply path: the AsthaMishra notes measured `bumpalo` 79-88%
+  worse for single-operation latency and removed it (their Optimization 7 -> 9).
 - Global process-local trade ids; our deterministic `(log_index, ordinal)` ids are required for
   replication and replay.
 - Copying a project's code or claims without a license/buildable test evidence. AsthaMishra and
@@ -474,6 +496,7 @@ exact 18-decimal values, fees/assets and the existing property/conformance/integ
 - <https://github.com/AsthaMishra/matching-engine/blob/stable/PLAN.md>
 - <https://github.com/AsthaMishra/matching-engine/blob/stable/matching-core/src/order_book.rs>
 - <https://github.com/AsthaMishra/matching-engine/blob/stable/matching-core/src/matching.rs>
+- <https://github.com/AsthaMishra/matching-engine/blob/stable/matching-core/optimization_notes.md>
 
 ### llc-993/matching-core
 
