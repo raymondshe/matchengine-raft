@@ -1,13 +1,18 @@
 # Market-data egress — implementation plan
 
-Status: **implemented for U1–U6 and U8; U7 deferred.** Design rationale lives in
+Status: **implemented for U1–U6 and U8; U7 deferred; U9–U15 planned.** Design rationale lives in
 [`AERON_SOLUTION.md`](./AERON_SOLUTION.md) Part II (§11–26). This file turns that design into
-ordered, testable units of work.
+ordered, testable units of work. The consumer side of U7 — a **separate market-data system** that
+subscribes to the Aeron multicast feed and serves Binance-style WebSocket streams — is designed in
+[`MARKET_DATA_WEBSOCKET.md`](./MARKET_DATA_WEBSOCKET.md), and its implementation is planned below
+as **U9–U15**.
 
 Scope of this implementation: the deterministic **feed pipeline** — tap, depth journal, shadow
 book, message model, deterministic publisher, JSONL sink, leader gating, snapshots, `/read`
-status and an end-to-end test. The **Aeron transport** is deliberately the next phase: it is an adapter over
-the message bytes this plan produces, and adding a media driver is a separate operational decision.
+status and an end-to-end test. The **Aeron transport** is deliberately a later phase: it is an
+adapter over the message bytes this plan produces, and adding a media driver is a separate
+operational decision. That phase and the **separate market-data system** that consumes it are now
+planned as U9–U15 below, from [`MARKET_DATA_WEBSOCKET.md`](./MARKET_DATA_WEBSOCKET.md).
 
 ## Decisions already fixed (from AERON_SOLUTION Part II)
 
@@ -143,12 +148,199 @@ stable across restart and failover: `(symbol_id, stream_id, market_seq, sub_seq)
 
 ### U7 — Deferred (documented, not in this change)
 
-- **Aeron adapter**: a `MarketDataSink` that encodes via `wire.rs` and offers to streams 2001+;
-  `rusteron-client` + an embedded driver in tests, feature-gated (`market-data-aeron`).
+- **Aeron adapter**: now planned as **U10** below, per
+  [`MARKET_DATA_WEBSOCKET.md`](./MARKET_DATA_WEBSOCKET.md) §4.2 (feature `market-data-aeron`,
+  one exclusive publication per stream, embedded driver in tests).
 - **Archive** recording/replay and the snapshot-request stream.
 - **Multi-symbol deployment**: one process/cluster per symbol; the message schema already carries
   `symbol_id` for routing and dedupe across deployments.
 - **Aeron Cluster / Raft transport**: untouched by this work (Part I gate).
+
+## Work units — the market-data system over Aeron + WebSocket (U9–U15)
+
+These units realize [`MARKET_DATA_WEBSOCKET.md`](./MARKET_DATA_WEBSOCKET.md): the engine publishes
+the feed to Aeron multicast (U9–U10) and a separate `marketdata/` crate consumes it and serves
+Binance-style WebSocket streams (U11–U15). Function-point IDs (FP-…) are the agreed breakdown for
+planning; each unit lists the points it delivers.
+
+| Unit | Scope | Function points |
+|---|---|---|
+| U9 | engine feed prerequisites | FP-E1, FP-E2, FP-E3 |
+| U10 | Aeron publication adapter (feature `market-data-aeron`) | FP-E4–E8, FP-T1 |
+| U11 | service crate, ingestion, assembly | FP-S1–S5 |
+| U12 | WS hub: streams, conflation, snapshot-on-subscribe | FP-H1–H4, FP-P4 |
+| U13 | client protocol and session lifecycle | FP-P1–P3, FP-P5–P7 |
+| U14 | resilience, ops, scale-out | FP-R1–R4, FP-O1–O3, FP-X1 |
+| U15 | end-to-end integration, benchmarks, docs | FP-T3, FP-T4 |
+
+Order and parallelism: **U9 first** (small, unblocks both sides). After U9, **U10** (engine) and
+**U11–U13** (service, driven by a channel source with no media driver) can proceed in parallel;
+U14 builds on U11–U13; only **U15** needs U10 and U14 together. Deferred P2/P3 work is listed
+after the units.
+
+### U9 — Engine feed prerequisites for distribution (P0)
+
+Make the feed consumable by Binance-style clients without touching matching.
+
+- **Per-entry depth contiguity (FP-E1):** the processor emits one `DEPTH_DELTA` per mutating
+  entry, with an empty level list when no visible depth changed (rejections, parked-stop
+  activity, a `Day` purge of stops). The catalogue table below becomes "one message per entry,
+  possibly empty". Golden and processor tests cover the empty case.
+- **Custom sink seam (FP-E2):** `MarketDataHandle::start_with_sink(config, sink)`; `log_path`
+  keeps selecting `JsonlSink`, and a caller may install a custom sink (Aeron in U10, test sinks
+  in tests) alongside it.
+- **Bar quote volume (FP-E3):** `BarRecord` gains summed quote notional for the kline `q` field.
+  This is a wire body change, so the wire version bumps v6 → v7 with updated golden frames and a
+  strict decoder that rejects v6; the JSONL serde output gains the field additively.
+
+**Done when:** every mutating entry yields exactly one depth message (empty allowed, rejections
+and parked stops included); two processors fed identical frames still emit identical messages;
+`start_with_sink` installs a test sink; bar goldens carry `q`; wire v7 rejects v6; no
+matching-path change (`cargo bench --bench matchengine` gate).
+
+### U10 — Aeron publication adapter (P1a, feature `market-data-aeron`)
+
+The engine side of the market-data system: publish the deterministic feed to Aeron multicast.
+
+- Feature `market-data-aeron`: optional `rusteron-client` + `rusteron-media-driver` dependencies,
+  default off — the default build and `cargo test` still need no driver.
+- `src/market_data/aeron.rs`: `AeronSink` implementing `MarketDataSink` — `wire::encode` each
+  message, one **exclusive publication per stream** (2001–2007) so a depth snapshot cannot
+  head-of-line-block a trade, publications created lazily on leadership gain and closed on loss.
+- A dedicated publication thread owns the `!Send` handles, fed by the processor task through a
+  bounded handoff; `try_offer` with retry under backpressure; gap counters. A stalled publication
+  slows the processor and degrades the feed to `GAP` — never an `apply` stall (AERON §17).
+- **Periodic snapshot re-broadcast (FP-E6):** re-publish the reset `DEPTH_SNAPSHOT` every
+  `--market-data-aeron-snapshot-every-ms` (default 30 000, 0 off) so consumers can (re)join
+  without waiting for an election.
+- **Idle heartbeat (FP-E7):** a diagnostic `STATUS` with a reserved `sub_seq` every
+  `--market-data-aeron-heartbeat-ms` (default 1000) when nothing was applied, carrying
+  epoch/leader/watermark.
+- CLI flags (FP-E8): `--market-data-aeron-channel`, `--market-data-aeron-stream-base` (2001),
+  `--market-data-aeron-port-base` (`http_port + 3000`), plus the two timers above.
+- Tests (FP-T1): embedded driver publish/receive per stream (golden bytes round-trip);
+  backpressure → `GAP` and no `apply` stall; leadership gain/loss opens/closes publications;
+  periodic snapshot and heartbeat cadence.
+
+**Done when:** a subscriber decodes every golden frame byte-for-byte; the cluster suite passes
+with the feature off; `cargo bench --bench matchengine` shows no regression with it on.
+
+### U11 — Market-data service: crate, ingestion, assembly (P1b-1)
+
+The consumer side begins: a new crate that turns Aeron frames into assembled state.
+
+- New crate `marketdata/` (sibling of `demo/`, own `Cargo.toml`), binary
+  `matchengine-marketdata`, CLI per `MARKET_DATA_WEBSOCKET.md` §13.2, CI fmt/Clippy/test jobs like
+  `demo/` has (FP-S1).
+- `FrameSource` trait (`Sourced::{Message, Loss}`) with a channel-backed source for driverless
+  tests and `AeronSource`: one subscription per stream id, fragment reassembly, `wire::decode`, a
+  dedicated subscriber thread owning the `!Send` handles, a bounded handoff queue whose overflow
+  becomes a gap (FP-S2).
+- Assembler: dedupe by `(symbol_id, stream_id, market_seq, sub_seq)`; apply
+  snapshot/delta/BBO/bar/status; continuity watermark; gap policy — invalidate depth, keep
+  latest-value streams, re-sync on the next periodic snapshot (FP-S3, FP-S4).
+- Caches as `watch<Arc<…>>`: depth map, top-N, BBO, current bars, watermark (FP-S5).
+
+**Done when:** channel-driven unit tests cover dedupe (duplicate frames, two Aeron sessions),
+snapshot reset, delta totals, watermark and gap→re-sync; an embedded-driver test receives engine
+frames through `AeronSource`; the crate's CI jobs are green.
+
+### U12 — Market-data service: WS hub and streams (P1b-2)
+
+Turn assembled state into Binance-shaped stream content.
+
+- Serialize-once fan-out: per stream key (name + speed) a `broadcast<Bytes>` channel, lazily
+  created and pruned; a registry behind one `std::sync::Mutex` never held across `.await`
+  (FP-H1).
+- Conflation: `@depth@100ms`/`@1000ms` windows from `tokio::time::interval`, merged `U..u`
+  ranges with last-write-wins levels, empty window emits nothing; partial-depth caches refreshed
+  per window (FP-H2).
+- Realtime streams published per entry: `@trade`, `@sweep`, `@bookTicker`, `@kline_<interval>`,
+  `@status`, `@lifecycle` (FP-H4).
+- Payload encoders with golden JSON fixtures: `Fixed` decimal strings, fee fields, extension
+  fields (`L`, `S`, `ts`, `ms`, `qv`) (FP-P4).
+- Snapshot-on-subscribe: `depthSnapshot`, top-N, `bookTicker`, current kline pushed from the
+  caches at subscribe (FP-H3).
+
+**Done when:** every stream's golden payload matches its fixture; conflation and
+snapshot-on-subscribe unit tests pass; a channel-driven instance serves every P1 stream.
+
+### U13 — Market-data service: client protocol and sessions (P1b-3)
+
+The Binance-parity client surface.
+
+- Endpoints `GET /ws`, `/ws/<stream>`, `/stream?streams=…` and the combined-stream envelope
+  wrapped around shared bytes (FP-P1, FP-P5).
+- Stream-name parser: catalogue, speeds, kline intervals, `depth5/10/20`; `--pair`/`--symbol-id`
+  validated against every frame (FP-P2).
+- Control protocol: `SUBSCRIBE`/`UNSUBSCRIBE`/`LIST_SUBSCRIPTIONS` with id echo, error codes 0–4,
+  10 inbound messages/s, 64-stream cap, 4 KiB frame cap, `SET_PROPERTY` refused (FP-P3).
+- Sessions spawned onto the main runtime via a captured `Handle` (never on actix worker threads);
+  ping every 180 s, pong timeout 600 s, 24 h rotation, close codes 1000/1008/1011/1013 (FP-P6).
+- Backpressure classes: `LatestValue` drain-to-latest vs `Sequenced` FIFO (1024 entries);
+  `Lagged` → resync (depth) or close 1013 (FP-P7).
+
+**Done when:** the protocol/limit tests of `MARKET_DATA_WEBSOCKET.md` §14 pass; a
+`tokio-tungstenite` client maintains a correct local book through place/fill/amend/cancel using
+Binance rules 3–6 against a channel-driven instance.
+
+### U14 — Market-data service: resilience, ops, scale-out (P1b-4)
+
+Survive every failure the design lists, and be operable.
+
+- Engine failover: epoch change + `RESET` snapshot → rebuild caches, push `resync` +
+  `depthSnapshot`, **keep client connections**; dedupe deposed-leader stragglers (FP-R1).
+- Service restart: state rebuilt from the periodic snapshot + deltas; `/ready` gates load
+  balancer routing (FP-R2).
+- Graceful shutdown: stop watch → sessions close 1001 → assembler drains → Aeron thread
+  releases → HTTP stops (FP-R3).
+- Slow-instance recovery: Aeron loss or handoff overflow → gap → self re-sync; Max multicast
+  flow control assumed, Min documented as forbidden (FP-R4).
+- `/health`, `/ready` (snapshot current + heartbeat fresh), metrics (connections, messages sent,
+  slow-consumer closes, resyncs, assembler gaps, watermark lag), config validation
+  (pair vs frames, bar intervals vs engine, channel/stream-base match) (FP-O1–O3).
+- Two instances behind one load balancer serve identical stream content (FP-X1).
+
+**Done when:** the §14 resilience rows pass; a leadership change keeps a client's connection up
+with a correct book after re-sync; two instances produce identical payloads for the same frames.
+
+### U15 — End-to-end integration, benchmarks, documentation (P1b-5)
+
+Prove the whole path and record the numbers.
+
+- End-to-end test (FP-T3): embedded Aeron driver, one engine node publishing (U10), one service
+  instance, a `tokio-tungstenite` client asserting trade/bookTicker/depth/kline frames in order
+  through place/fill/amend/cancel, a forced gap, and a leadership change — the client's
+  connection stays up across the failover.
+- Benchmarks (FP-T4): engine tap/publication cost with the feed on/off (the
+  "matching must not regress" gate) and the service `ws_fanout` bench (N connections ×
+  `bookTicker`/`depth@100ms`, serialize-once reuse, per-connection send cost, assembler memory).
+  Results recorded in [`PERFORMANCE.md`](./PERFORMANCE.md).
+- Docs: README/README_CN/AGENTS/TODO updated for the new crate, flags and runbook (media driver,
+  channel, flow-control strategy, retention sizing).
+
+**Done when:** the end-to-end test and both benches land; the docs describe actual behaviour;
+CI is green including the new crate.
+
+### Deferred (P2/P3, from MARKET_DATA_WEBSOCKET.md §16)
+
+- `@aggTrade` price-grouped sweeps; `@miniTicker`/`@ticker` 24 h rolling window (service-local).
+- `GET /marketdata/depth` REST snapshot endpoint (REST+WS sync parity).
+- Per-IP connection throttling in-process (option); fleet autoscaling runbook.
+- Multi-symbol routing by `symbol_id`; per-DC relays; the Kafka/NATS bridge variant.
+- From U7: Archive recording/replay and the snapshot-request stream 2010.
+
+### Test matrix additions (U9–U15)
+
+| Layer | Tests |
+|---|---|
+| Engine processor (U9) | per-entry depth contiguity incl. empty deltas; identical output across two processors; bar `q` goldens; wire v7 golden + v6 rejection |
+| Engine Aeron adapter (U10) | golden bytes per stream; embedded driver round-trip; backpressure → `GAP`, no `apply` stall; leadership lifecycle; snapshot/heartbeat cadence |
+| Service ingestion (U11) | `FrameSource` channel driver; dedupe (duplicates, two sessions); snapshot reset; delta totals; watermark; gap→re-sync; heartbeat timeout |
+| Service hub (U12) | conflation windows; serialize-once; snapshot-on-subscribe; golden payloads per stream |
+| Service protocol (U13) | stream-name parsing; control protocol and error codes; limits (ping/pong, 24 h, caps); backpressure classes; Binance rules 3–6 as literal cases |
+| Service resilience (U14) | failover keeps connections; restart rebuild; graceful shutdown; two instances identical content |
+| End-to-end (U15) | engine + service + WS client through trades, gap and leadership change |
 
 ## Message catalogue and streams (reference)
 
@@ -180,8 +372,10 @@ PARTIAL_BAR|BAR_CLOSE`; bit 4 reserved), `market_seq`, `log_index`, `ordinal`, b
 ## Working rules
 
 - Each unit lands with its tests and a doc touch where behaviour is user-visible.
-- U1–U6 added no crates. The later exactness work added `i256` for price × quantity; the Aeron
-  adapter is the only other planned dependency.
+- U1–U6 added no crates. The later exactness work added `i256` for price × quantity. U10 adds the
+  feature-gated `rusteron-client`/`rusteron-media-driver` pair on the engine (default off); U11
+  adds the separate `marketdata/` crate (`rusteron-client`, `actix-ws`, with `tokio-tungstenite`
+  as a dev-dependency), which never touches the engine binary.
 - The feed state (journal, shadow book, bars) is transient and absent from snapshots. U1–U6 kept
   `SNAPSHOT_VERSION` 3; later exactness/symbol/fee work bumped it to 10 for the replicated
   order/event fields, single-symbol precision configuration and fee data, not for feed state.
@@ -192,18 +386,25 @@ PARTIAL_BAR|BAR_CLOSE`; bit 4 reserved), `market_seq`, `log_index`, `ordinal`, b
 |---|---|---|
 | U1 | **done** | `OrderBook::depth_journal`, `DepthChange`, opt-in recording, tests per mutation |
 | U2 | **done** | `MatchEvent.side`; leader stamps `Order.timestamp` at intake; GTD test made clock-relative |
-| U3 | **done** | `src/market_data/{mod,wire}.rs`: shadow book, processor, sinks, tap, deterministic message keys, 20 module unit tests |
+| U3 | **done** | `src/market_data/{mod,wire}.rs`: shadow book, processor, sinks, tap, deterministic message keys, 26 module unit tests |
 | U4 | **done** | `open_with_sinks`, tap frames, `capture_market_data_snapshot`, `marketdata_status`, status assertion |
 | U5 | **done** | `MarketDataConfig` on `StorageConfig`, all CLI flags (incl. `--market-data-leader-only`), leader watcher, source-gated tap, end-to-end test on 21303 |
 | U6 | **done** | README/README_CN/AGENTS/TODO/AERON updates; bench `rest 1k bids + journal` |
 | U8 | **done** | deterministic `(market_seq, sub_seq)` across replicas; all mutations sequenced; auto GTD purge; one TRADE per taker; wire v6 encoder + reference decoder |
-| U7 | deferred | Aeron adapter and Archive replay; multi-symbol is deployment-level (one process per symbol) |
+| U9 | **planned** | engine prerequisites: per-entry depth contiguity, `start_with_sink` seam, bar quote volume (wire v7) |
+| U10 | **planned** | Aeron publication adapter behind `market-data-aeron`: per-stream publications, backpressure, periodic snapshot, heartbeat |
+| U11 | **planned** | `marketdata/` crate, `FrameSource`/`AeronSource`, assembler with dedupe and gap policy |
+| U12 | **planned** | WS hub: serialize-once fan-out, conflation, snapshot-on-subscribe, stream payloads |
+| U13 | **planned** | Binance client protocol: endpoints, control messages, limits, session lifecycle |
+| U14 | **planned** | resilience, health/readiness, metrics, two-instance parity |
+| U15 | **planned** | end-to-end integration, benchmarks, docs |
+| U7 | deferred | Archive replay and the snapshot-request stream; multi-symbol is deployment-level. The Aeron adapter moved to U10 |
 
 ## Verification (2026-10-28)
 
 | Check | Result |
 |---|---|
-| `cargo test` | **133 unit + 36 integration** tests pass (current; includes exactness, symbol-config, fee, quote-volume, fee-asset and periodic-snapshot tests) |
+| `cargo test` | **155 unit + 52 integration** tests pass (2026-11-04; includes exactness, symbol-config, fee, quote-volume, fee-asset and periodic-snapshot tests) |
 | `cargo check --all-targets` | **0 warnings** |
 | `cargo test --test cluster test_market_data` | passed; checks `market_seq` anchors for place/amend/cancel and the uncapped trade message |
 | U8 determinism | two processors fed identical frames emit identical messages; a takeover snapshot continues the same keys; wire v6 golden tests (scale-18 `i128`) |
