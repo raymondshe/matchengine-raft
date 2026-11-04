@@ -1,10 +1,20 @@
 # Fee Deduction Design: Base vs Quote Volume
 
-Status: **core implemented for cash/spot.** The engine now carries base/quote asset metadata,
-tick/lot rules, `VolumeUnit`, quote-aware sweeps and `FeeAssetPolicy`. Snapshot **v10** and wire
-**v6** encode the new fields. Derivatives and margin-asset settlement are a documented extension,
-not implemented; the required model is in §3.2 and the open items are in §13. Sessions, settlement,
-corporate actions and fixed/regulatory/minimum/tax fees are owned by the external order system.
+Status: **core implemented for cash/spot.** The engine carries base/quote asset metadata, tick/lot
+rules, `VolumeUnit`, quote-aware sweeps and `FeeAssetPolicy`. Snapshot **v9** and wire **v5**
+introduced those fields; snapshot **v10** and wire **v6** replace the boolean fee-overflow flag with
+the ordered `error`/`MatchErrors` code set. Derivatives and margin-asset settlement are a documented
+extension, not implemented; the model is in §3.2 and the open items are §13 items 11-16. Sessions,
+settlement, corporate actions and fixed/regulatory/minimum/tax fees are owned by the external order
+system.
+
+Restricted or missing today:
+
+- Quote volume supports plain limit and market orders only; quote icebergs and quote FOK are
+  rejected at admission (§5.1).
+- One process/cluster trades exactly one symbol; multi-symbol is deployment-level isolation.
+- Derivatives, third-asset/margin fees, funding, liquidation and PnL are out of scope (§3.2, §6.5).
+- Fee rates outside ±100% are rejected; a zero tick or lot disables only that increment check.
 
 ## 1. Goals
 
@@ -26,7 +36,7 @@ corporate actions and fixed/regulatory/minimum/tax fees are owned by the externa
 | Price `P` | Quote units per one base unit. |
 | Base quantity `Q` | Gross amount of the base asset traded. |
 | Notional `N` | Gross quote value of a fill: `N = P * Q`. |
-| Fee rate `r` | Signed fraction of notional. Positive = charge, negative = rebate. |
+| Fee rate `r` | Signed fraction of the fee basis: notional for a quote fee, base quantity for a base fee. Positive = charge, negative = rebate. |
 | Gross | Amount before fees. |
 | Net | Amount after fees. |
 | Fee asset | Asset in which a side pays or receives the fee. |
@@ -153,7 +163,7 @@ pub enum InstrumentKind {
 pub struct SymbolConfig {
     // existing fields...
     pub instrument_kind: InstrumentKind,
-    // Linear: base units per contract. Inverse: quote value per contract. Zero/one for spot.
+    // Linear: base units per contract. Inverse: quote value per contract. 1 for spot.
     pub contract_multiplier: Fixed,
     pub settlement_asset: AssetId, // margin, PnL and default fee asset
 }
@@ -208,8 +218,8 @@ Before this design was implemented, the engine behaved as follows:
 - A fill computes `taker_fee` and `maker_fee` but does not say whether the amounts are base or
   quote.
 - The order book assumes `volume` can be compared directly with maker base volume.
-- There is no distinction between a buy spending 1,000 USD/USDT and a buy buying 1,000 USD/USDT
-  worth of base at an unknown execution price.
+- There is no distinction between spending 1,000 USD/USDT and buying 1,000 USD/USDT of base at an
+  unknown execution price.
 - Stop, iceberg and amendment paths inherit the same base-quantity assumption.
 
 Consequences:
@@ -285,8 +295,10 @@ A market order has no limit price to normalize against, so it remains in quote m
   remaining_quote -= P * Q_fill
   ```
 
-  Stop when no positive base lot fits or liquidity is exhausted. Any quote remainder below one base
-  lot is cancelled and reported as a remainder.
+  Stop when no positive base lot fits or liquidity is exhausted. The leftover quote is cancelled and
+  reported as a `Cancelled` event whose `volume` is the quote amount and whose `volume_unit` is
+  `quote`. The leftover is bounded by the quote cost of one base lot (`price * base_lot`), unless the
+  sweep stopped because the implied notional cannot be represented (§7.1).
 
 - **Market sell:** `volume` is a gross quote **proceeds target**. At each maker price `P`:
 
@@ -296,19 +308,26 @@ A market order has no limit price to normalize against, so it remains in quote m
   ```
 
   The final fill may overshoot the target by at most one base lot. Stop once proceeds reach the
-  target or liquidity is exhausted. If exact/no-overshoot semantics are required, use floor and
-  accept a small shortfall instead; that is an open decision.
+  target or liquidity is exhausted; accepting that overshoot instead of a shortfall is the
+  implemented choice recorded in §13 item 2.
 
 Quote market orders never rest. A stop-market child uses quote mode when elected; a stop-limit
 child converts at its limit price when placed.
 
+Only plain limit and market orders may use quote volume. Combining quote volume with iceberg fields
+(`display_volume`/`hidden_volume`) or with `FOK` is rejected as `invalid_order` at admission: those
+shapes need a base-normalization rule that does not exist yet (§13 item 16). A quote amount must
+also carry no more than `quote_asset.decimals` fractional digits.
+
 #### Icebergs, stops and amendments
 
-- `display_volume` and `hidden_volume` use the same unit as the order's volume.
-- For quote limit orders, convert all three to base quantities at admission; the visible/hidden
-  split must remain consistent.
-- For quote stop-market orders, keep quote mode until the stop is elected.
-- Amendments cannot change `volume_unit`; the new volume is interpreted in the existing unit.
+- `display_volume` and `hidden_volume` use the same unit as `volume`, but icebergs must be placed
+  with base volume; the quote combinations are rejected (§5.1).
+- A quote stop-market order keeps quote mode until the stop is elected; a quote stop-limit child is
+  normalized at its limit price before it is parked.
+- An amendment carries no unit: its `volume` is always a base quantity, even for an order placed in
+  quote volume, because quote limit orders are normalized at admission. The client's original amount
+  stays on the order as `requested_volume`/`requested_volume_unit`.
 - Fee rates are preserved across amendments, refills and stop children.
 
 ## 6. Fee asset policies
@@ -341,8 +360,9 @@ fee_quote = N * r
 fee_base  = Q * r
 ```
 
-where `r` is that side's maker or taker rate. The two formulas are economically equivalent before
-rounding; the chosen fee asset determines which one is used.
+where `r` is that side's maker or taker rate. They are different numbers: `fee_quote` is worth
+`price * fee_base` at the fill price. Either is a valid representation of the same value before
+rounding, and the chosen fee asset decides which one is used.
 
 ### 6.2 Deduction table
 
@@ -395,9 +415,9 @@ the order is sized and how the remainder is tracked:
 | Quote market sell | Quote proceeds target | Taker sell: `N * r` quote | Taker sell: `N * r` deducted from proceeds | Taker sell: `Q * r` additional/debited base |
 
 Maker fees use the maker order's maker rate and the maker's received asset, exactly like taker
-fees. A quote-market buy budget is a **gross notional** cap; when the fee asset is quote, the fee is
-an additional quote debit unless the gateway defines the budget as fee-inclusive. That choice is
-listed in the open decisions.
+fees. A quote-market buy budget is a **gross notional** cap: when the fee asset is quote, the fee is
+an additional quote debit on top of the cap, which is the implemented choice recorded in §13 item 7.
+A fee-inclusive budget remains a gateway convention, not an engine option.
 
 ### 6.5 Derivatives and margin-asset fees
 
@@ -437,18 +457,19 @@ pub struct SymbolConfig {
 }
 ```
 
-The current `quantity_decimals` cannot represent both base and quote volume; asset decimals belong
-to `AssetId`, and the symbol adds tick/lot increments. Validation must reject prices that are not a
-multiple of `price_tick` and quantities that are not a multiple of `base_lot`, not merely values
-with too many decimal places.
+The earlier single `quantity_decimals` setting could not represent both base and quote volume;
+decimals now live on each `AssetId`, and the symbol adds tick/lot increments. Validation rejects
+prices that are not a multiple of `price_tick` and quantities that are not a multiple of `base_lot`,
+not merely values with too many decimal places; a zero increment disables that check.
 
 Recommended rounding rules:
 
 - Base quantity: floor/ceil to `base_lot` according to the volume-unit rule above.
 - Quote notional: compute exactly at scale 18; settlement quantizes to `quote_asset.decimals`.
 - Fee amounts: report at scale 18 with the fee asset; clearing rounds to that asset's precision.
-- Positive fees round **up** and rebates round **down** at settlement, so the venue never
-  under-collects or over-pays.
+- At settlement, positive fees round **up** and rebates round **toward zero** (never more
+  negative), so the venue never under-collects or over-pays. The engine itself truncates toward zero
+  inside `checked_mul`; this rule only quantizes the reported amount.
 - Fiat fees settle in the fiat ledger's minor units; stablecoin fees in the chain's smallest unit;
   fractional-share fees in the base asset's share precision.
 - If a fee rounds to zero at the asset's minimum unit, no minimum fee is applied in this phase.
@@ -461,9 +482,10 @@ rounding policy.
 ### 7.1 Overflow and `error`
 
 Every price, quantity, notional and fee is a scale-18 `Fixed` stored in an `i128`. The largest
-representable value is `i128::MAX / 10^18`, about `1.7014e20` units. `Fixed::checked_mul`
-multiplies through a 256-bit intermediate and truncates toward zero; it returns `None` only when
-the scaled result cannot fit `i128`.
+representable value is `i128::MAX / 10^18`, about `1.7014e20` units. `Fixed::checked_mul` multiplies
+in `i128` when the unscaled product fits and falls back to a 256-bit intermediate otherwise; it
+divides the unscaled product by the scale, truncating toward zero, and returns `None` only when the
+scaled result cannot fit `i128`. `Fixed::notional` is the same path applied to `price * quantity`.
 
 One fill computes three dependent values independently:
 
@@ -483,6 +505,8 @@ A failure in any one computation sets an error code on the fill:
 
 The fill carries `error`, an ordered set of these codes. An empty set (`[]` in JSON) means every
 dependent value is exact. Multiple codes can be present and are emitted in the fixed order above.
+Non-fill events also carry `[]` together with `null` fee assets; for them the empty set means "no
+fill values to report", not "fees computed exactly".
 
 - If `N` overflows, `quote_volume` is `0`; if a fee calculation overflows, that fee is `0`.
 - The fill itself is still valid: price, volume, matched gross quantity, order identities and fee
@@ -499,17 +523,24 @@ dependent value is exact. Multiple codes can be present and are emitted in the f
   reported from the symbol policy and order sides. Signed rebates use the same checked path; an
   overflowing rebate becomes `0` with `maker_fee_overflow` or `taker_fee_overflow` set rather than
   being clamped.
+- A quote-market taker stops sweeping when the remaining budget and the maker price imply a notional
+  that cannot be represented; the leftover quote is cancelled rather than matched further.
 
 JSON example:
 
 ```json
 {
   "quote_volume": "0",
-  "taker_fee": "0",
-  "maker_fee": "0.001",
-  "error": ["notional_overflow"]
+  "taker_fee": "20000000",
+  "taker_fee_asset": "base",
+  "maker_fee": "0",
+  "maker_fee_asset": "quote",
+  "error": ["notional_overflow", "maker_fee_overflow"]
 }
 ```
+
+The base taker fee stays exact; only the quote maker fee and the notional are unavailable. Both fee
+assets are still named, so a consumer knows which asset each zero refers to.
 
 Examples:
 
@@ -524,10 +555,10 @@ Examples:
   exact `taker_fee` and an unavailable `maker_fee`. `tests/replay/fee_overflow_base_orders/` pins
   this shape.
 
-`MatchErrors` is a copyable bitmask internally and a JSON string array externally. New non-fatal
-fill conditions can add a code without changing the event shape. The current numeric fields remain
-zero when unavailable; a future version may make them nullable, which would remove the need to
-cross-check the code before using a zero.
+`MatchErrors` is a copyable bitmask internally, one `u8` in the snapshot and on the wire, and a
+JSON string array externally. New non-fatal fill conditions can add a code without changing the event
+shape. The affected numeric fields stay `0` today, so a consumer must cross-check the codes before
+using a zero; making those fields nullable instead is §13 item 15.
 
 Derivatives make overflow easier to reach because notional includes the contract multiplier and the
 settlement asset may require a conversion. A fill with an overflow code must not be fed into margin,
@@ -540,28 +571,30 @@ The v9/v5 boolean `fee_overflow` is legacy and is not decoded into the new shape
 
 ### 8.1 Admission
 
-`OrderBook::execute_order` currently consumes `order.volume` as base. It needs an order
-normalization step before validation/matching:
+`OrderBook::execute_order` normalizes before validation and matching, which is why every later step
+sees base quantities:
 
 ```text
 Base volume        -> Q = volume
-Quote limit        -> Q = floor_to_base_lot(volume / limit_price)
-Quote market buy   -> matching mode BuyQuote(volume)
-Quote market sell  -> matching mode SellQuote(volume)
+Quote limit        -> Q = floor_to_base_lot(volume / limit_price); stored as volume_unit = Base
+Quote market buy   -> SweepMode::BuyQuote(volume)
+Quote market sell  -> SweepMode::SellQuote(volume)
 ```
 
-Reject zero normalized quantity, invalid unit combinations, unsupported market/stop combinations,
-and precision violations at admission.
+Admission rejects a zero normalized quantity, quote volume combined with iceberg fields or `FOK`, a
+quote amount with more than `quote_asset.decimals` fractional digits, fee rates outside ±100%, and
+every tick/lot/decimal violation. A rejected order consumes no book or fee state.
 
 ### 8.2 Sweep loop
 
-Introduce a remaining-size state instead of a single `Fixed` base remainder:
+The sweep keeps one `Fixed` remainder together with the mode that remainder is in, so the same loop
+tracks either a base quantity or a quote budget:
 
 ```rust
-enum Remaining {
-    Base(Fixed),
-    BuyQuote(Fixed),   // gross quote spend cap
-    SellQuote(Fixed),  // gross quote proceeds target
+enum SweepMode {
+    Base,      // remainder is a base quantity
+    BuyQuote,  // remainder is a gross quote spend cap
+    SellQuote, // remainder is a gross quote proceeds target
 }
 ```
 
@@ -575,7 +608,7 @@ SellQuote:  Q = min(maker.remaining, ceil_to_base_lot(remaining_quote / price))
 
 After the gross fill is chosen:
 
-- decrement the maker and remaining base/quote amounts;
+- decrement the maker and the remainder: `Base` by `Q`, either quote mode by `N` (saturating);
 - compute `N = price * Q`;
 - compute taker and maker fees from gross `N`/`Q` and their role rates;
 - append the fill with base, quote, fees and fee assets;
@@ -590,9 +623,9 @@ Quote market orders never rest. This keeps `BidKey`/`AskKey` and the book compar
 
 - A quote limit stop converts at its limit price before parking.
 - A quote market stop keeps quote mode until elected.
-- An iceberg's visible and hidden quantities are normalized consistently; a tranche cannot produce
-  a zero base lot.
-- The stop cascade uses the same `Remaining` logic as ordinary orders.
+- Icebergs are base-volume only: a quote order carrying `display_volume`/`hidden_volume` is
+  rejected, so no tranche normalization exists.
+- The stop cascade uses the same `SweepMode` logic as ordinary orders.
 - Fee reporting follows every fill, including stop children and iceberg refills.
 
 ### 8.5 Invariants
@@ -610,13 +643,18 @@ Quote market orders never rest. This keeps `BidKey`/`AskKey` and the book compar
 
 ### 9.1 `Order`
 
-Add:
+Implemented:
 
 ```rust
-pub volume_unit: VolumeUnit, // default Base
-pub maker_fee_rate: Fixed,   // already present
-pub taker_fee_rate: Fixed,   // already present
+pub volume_unit: VolumeUnit,           // default Base
+pub requested_volume: Fixed,           // client's gross amount; zero means it was `volume`
+pub requested_volume_unit: VolumeUnit, // unit of `requested_volume`
+pub maker_fee_rate: Fixed,
+pub taker_fee_rate: Fixed,
 ```
+
+Both rates are validated against `MIN_FEE_RATE..=MAX_FEE_RATE` (±100%); anything outside is
+`invalid_order`.
 
 For a quote limit order, the book needs the normalized base quantity. Recommended representation:
 
@@ -635,19 +673,20 @@ migration.
 
 ### 9.2 `MatchResult`
 
-Replace the current unitless fee fields with explicit asset-aware fields:
+`MatchResult` is asset-aware: it keeps both order identities, the gross base quantity and quote
+notional, both fees with their assets, and the error set.
 
 ```rust
 pub struct MatchResult {
-    pub price: Fixed,
-    pub base_quantity: Fixed,   // gross
-    pub quote_notional: Fixed,  // gross
-    pub taker_fee: Fixed,
+    pub taker: Order,        // the incoming order that crossed
+    pub maker: Order,        // the resting order it matched
+    pub matches: Fixed,      // gross base quantity of this fill
+    pub notional: Fixed,     // gross quote notional N; zero when it overflowed
+    pub taker_fee: Fixed,    // signed: positive charge, negative rebate
     pub taker_fee_asset: FeeAsset,
     pub maker_fee: Fixed,
     pub maker_fee_asset: FeeAsset,
-    pub error: MatchErrors, // ordered set of overflow codes
-    // existing taker/maker order identity
+    pub error: MatchErrors,  // ordered set of non-fatal codes (overflow codes today)
 }
 ```
 
@@ -661,29 +700,33 @@ dependent field as real when its code is present.
 
 ### 9.3 Events and feed
 
-Each fill event should expose:
+Each fill event exposes:
 
-- gross base quantity;
-- gross quote notional;
-- taker fee and fee asset;
-- maker fee and fee asset;
-- `error` under the fill-level rules in §7.1;
-- requested volume unit (for audit);
-- any quote remainder or quote overshoot.
+- `volume`: gross base quantity, always with `volume_unit = base`;
+- `quote_volume`: gross quote notional;
+- `taker_fee` with `taker_fee_asset`, and `maker_fee` with `maker_fee_asset`;
+- `error` under the fill-level rules in §7.1.
 
-The current `volume` field can remain the gross base quantity for compatibility, with new explicit
-`quote_volume` and fee-asset fields. The feed's `TRADE` and fill `LIFECYCLE` records need the same
-fields.
+`volume_unit` describes the unit of that event's own `volume`: rests and fills are base, while a
+quote-market `Cancelled` event reports the leftover quote with `volume_unit = quote`. The client's
+requested unit is not part of an event - it stays on the stored order
+(`requested_volume`/`requested_volume_unit`) and is visible through `/read orderbook_orders`. No
+event reports a quote overshoot. The feed's `TRADE` and fill `LIFECYCLE` records carry the same
+fields, `error` included.
 
 ## 10. API examples
+
+Units are lower-case (`base`/`quote`), `live` and `id` and `price` have no serde defaults, so even a
+market order must carry `"price": "0"`.
 
 ### Base volume
 
 ```json
 {"Place": {"order": {
+  "live": "Limit", "id": 1, "sequence": 0,
   "symbol_id": 0,
   "side": "Buy",
-  "volume_unit": "Base",
+  "volume_unit": "base",
   "price": "100.25",
   "volume": "4.4",
   "maker_fee_rate": "0.001",
@@ -695,9 +738,10 @@ fields.
 
 ```json
 {"Place": {"order": {
+  "live": "Limit", "id": 2, "sequence": 0,
   "symbol_id": 0,
   "side": "Buy",
-  "volume_unit": "Quote",
+  "volume_unit": "quote",
   "price": "100.25",
   "volume": "1000",
   "maker_fee_rate": "0.001",
@@ -705,22 +749,27 @@ fields.
 }}}
 ```
 
-This normalizes to `floor_to_base_lot(1000 / 100.25)` base units at admission.
+This normalizes to `floor_to_base_lot(1000 / 100.25)` base units at admission; the order rests with
+`volume_unit` `base`, and keeps the requested quote amount in `requested_volume`/
+`requested_volume_unit`.
 
 ### Quote volume, market buy
 
 ```json
 {"Place": {"order": {
+  "live": "Market", "id": 3, "sequence": 0,
   "symbol_id": 0,
   "side": "Buy",
-  "volume_unit": "Quote",
-  "live": "Market",
+  "volume_unit": "quote",
+  "price": "0",
   "volume": "500",
   "taker_fee_rate": "0.002"
 }}}
 ```
 
-This spends at most 500 quote units while sweeping; any remainder below one base lot is cancelled.
+This spends at most 500 quote units while sweeping. The budget is gross: a quote-asset fee is
+debited on top of it. The leftover, bounded by the quote cost of one base lot, is cancelled as a
+`Cancelled` event whose `volume` is the quote amount and whose `volume_unit` is `quote`.
 
 ## 11. Versioning and migration
 
@@ -749,25 +798,28 @@ Migration order used:
 
 ## 12. Test matrix
 
-- Base buy/sell with fee in received asset.
-- Base buy/sell with fee in quote.
-- Base buy/sell with fee in base.
+Covered today by unit tests, the cluster tests and the replay matrix:
+
+- Base buy/sell with fee in the received asset, in quote and in base.
 - Maker rebate in each fee asset.
 - Quote limit buy/sell normalization, zero-lot rejection and base-lot rounding.
-- Quote market buy spend cap, leftover dust and fee in base vs quote.
+- Quote market buy spend cap, leftover quote dust and fee in base vs quote.
 - Quote market sell proceeds target and final-lot overshoot policy.
-- Partial fills and multiple makers.
-- A taker that later rests, then fills as maker.
-- Iceberg refills and stop children with both volume units.
-- Amendments preserve unit/rates and normalize new quote volume.
+- Partial fills and multiple makers; a taker that later rests, then fills as maker.
+- Iceberg refills and stop children in base volume (quote icebergs and quote FOK are rejected).
+- Amendments preserve rates; the amended volume is always base.
 - 18-digit exactness, snapshot restart and wire round-trip.
 - Replay fixtures for quote-policy overflow (`fee_overflow_orders`) and a `Received` fill where
   only the quote maker fee is unavailable (`fee_overflow_base_orders`).
 - Determinism across replicas and failover.
 - No negative/over-budget remainders; no crossed book.
-- Derivatives extension: linear USDT-margined fees in quote, inverse fees in base, third-asset
-  settlement, contract-multiplier notional, maker rebates and overflow quarantine; margin/PnL and
-  funding stay outside the engine.
+- Fee rates outside ±100%, and quote amounts with too many decimals, are rejected.
+
+Still to cover if the extensions in §3.2 and §13 items 11-16 are built:
+
+- Derivatives: linear USDT-margined fees in quote, inverse fees in base, third-asset settlement,
+  contract-multiplier notional, maker rebates and overflow quarantine; margin/PnL and funding stay
+  outside the engine.
 
 ## 13. Decisions and remaining questions
 
@@ -783,31 +835,37 @@ Implemented choices:
 8. `base_lot` is configurable per symbol and zero disables lot validation.
 9. ETF/equity bases force `FeeAssetPolicy::Quote`; crypto/spot and fiat-to-fiat pairs default to
    `Received`.
+10. Fee rates must be within ±100% (`MIN_FEE_RATE..=MAX_FEE_RATE`); anything farther is
+   `invalid_order`.
 
 Still open:
 
-10. Which asset classes must be supported at launch: fiat, stablecoin, crypto, equity, ETF, or a
-    subset? `AssetId`/`AssetClass` exist; production asset issuance/validation is still a deployment
+11. Which asset classes a deployment must enable: fiat, stablecoin, crypto, equity, ETF or a
+    subset? `AssetId`/`AssetClass` cover all five; asset issuance and validation are a deployment
     concern.
-11. Can fees be charged in an asset other than base or quote (for example a broker fee in USD on a
+12. Can fees be charged in an asset other than base or quote (for example a broker fee in USD on a
     BTC/USDT trade)? That requires a fee-token price and balance handling.
-12. Derivatives support requires an instrument kind, contract multiplier, settlement/margin asset,
+13. Derivatives support requires an instrument kind, contract multiplier, settlement/margin asset,
     `VolumeUnit::Contract` and `FeeAsset::Settlement`; the fee formula depends on whether the
     contract is linear, inverse, quanto or third-asset margined. This is a snapshot/wire-version
     change, not an incremental `FeeAssetPolicy` value.
-13. For third-asset margin, decide whether fees are charged directly in settlement units or
+14. For third-asset margin, decide whether fees are charged directly in settlement units or
     converted from the contract's quote currency at an explicit, versioned rate. The engine must not
     infer an FX rate.
+15. Should the numeric fields named by an error code become `Option<Fixed>` (JSON `null`) instead of
+    zero, so a real zero and an unavailable value cannot be confused?
+16. Quote volume for icebergs and FOK: today both are rejected at admission because they need a
+    base-normalization rule that does not exist.
 
 Resolved:
 
-14. Fixed per-trade fees, per-share commissions, regulatory fees, minimum tickets and taxes are
+17. Fixed per-trade fees, per-share commissions, regulatory fees, minimum tickets and taxes are
     owned by the external order system; the engine computes only notional-proportional maker/taker
     rates.
-15. Equity/ETF sessions, holidays, auctions, T+1/T+2 settlement and corporate actions are owned by
+18. Equity/ETF sessions, holidays, auctions, T+1/T+2 settlement and corporate actions are owned by
     the external order system; the engine consumes explicit timestamps and has no clock or
     corporate-action logic.
-16. Funding, liquidation, insurance funds, auto-deleveraging, initial/maintenance margin, leverage
+19. Funding, liquidation, insurance funds, auto-deleveraging, initial/maintenance margin, leverage
     limits, portfolio netting, option exercise and realised/unrealised PnL are owned by the
     risk/clearing layer. The matching engine reports fills and fees only.
 
@@ -840,4 +898,5 @@ Adopt the following default contract:
   snapshot/wire version.
 
 This keeps the order book’s price-time priority unchanged while extending the execution path with
-one explicit quote-aware sweep mode and asset-aware fee reporting.
+two explicit quote-aware sweep modes (spend-capped buys, proceeds-targeted sells) and asset-aware
+fee reporting.
