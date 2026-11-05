@@ -41,7 +41,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # rusteron is pinned to 0.2.13 and uses precompiled Aeron C libraries
-      # (`static`, `precompile-rustls`); no Java or cmake is required.
+      # (`static`, `precompile-rustls`); no Java or cmake is required, but the
+      # static Linux link needs the uuid and bsd development libraries.
+      - name: Install Aeron system libraries
+        run: sudo apt-get update && sudo apt-get install -y libbsd-dev uuid-dev
       - name: Engine Aeron sink test
         run: cargo test --features market-data-aeron --lib market_data::aeron --locked
       - name: Market-data Aeron end-to-end test

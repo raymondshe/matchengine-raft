@@ -231,4 +231,5 @@ behind `--features market-data-aeron`.
 > **Dependency pin:** rusteron is pinned to `0.2.13`. Versions from `0.2.14`
 > call `std::hint::cold_path`, which is not available on the project's stable
 > toolchain. The feature uses `static` + `precompile-rustls`, so the first build
-> downloads precompiled Aeron C libraries (no cmake/Java needed).
+> downloads precompiled Aeron C libraries (no cmake/Java needed). On Linux the
+> static link also needs `libbsd-dev` and `uuid-dev`; CI installs them.

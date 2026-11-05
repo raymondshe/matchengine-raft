@@ -4,6 +4,7 @@
 //! conflates depth deltas at 100 ms and 1000 ms, serializes each stream payload
 //! once and broadcasts it to the per-stream `tokio::sync::broadcast` channels.
 
+use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
@@ -97,8 +98,8 @@ impl DepthBook {
             .map(|price| (*price, self.total(side, *price)))
             .collect();
         match side {
-            OrderSide::Buy => levels.sort_by(|a, b| b.0.cmp(&a.0)),
-            OrderSide::Sell => levels.sort_by(|a, b| a.0.cmp(&b.0)),
+            OrderSide::Buy => levels.sort_by_key(|level| Reverse(level.0)),
+            OrderSide::Sell => levels.sort_by_key(|level| level.0),
         }
         levels
     }
