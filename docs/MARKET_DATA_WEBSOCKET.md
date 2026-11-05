@@ -1,11 +1,11 @@
 # Market-data system — Aeron multicast egress and Binance-style WebSocket distribution
 
-Status: **design, not implemented.** Two systems are specified here:
+Status: **implemented as a reference service.** Two systems are specified here:
 
 1. the **matchengine** gains only the Aeron publication adapter (U7 of
    [`MARKET_DATA_PLAN.md`](./MARKET_DATA_PLAN.md)) and broadcasts its existing deterministic feed
    on Aeron **multicast**;
-2. a **separate market-data system** (its own crate and process, like `demo/`) subscribes to those
+2. a **separate market-data system** (its own crate and process, like `demos/order_system/`) subscribes to those
    Aeron streams, rebuilds the derived state and serves **Binance-style WebSocket streams** to
    browsers and other clients.
 
@@ -19,7 +19,10 @@ side stays on its existing multi-thread runtime with one dedicated publication t
 market-data system is a new binary built on Tokio + `actix-web`/`actix-ws`, with Aeron handles
 isolated on their own thread.
 
-Last updated: 2026-11-04.
+Last updated: 2026-11-05.
+
+Reference implementation: `demos/market_data_system/` (Aeron ingestion via rusteron 0.2.13 plus a
+JSONL fallback; Binance-style WebSocket service; multi-symbol per instance with one shared hub).
 
 Related documents: [`MARKET_DATA_PLAN.md`](./MARKET_DATA_PLAN.md) (the implemented feed),
 [`AERON_SOLUTION.md`](./AERON_SOLUTION.md) Part II §11–26 (the Aeron egress design this builds
@@ -148,8 +151,8 @@ Binance's documented procedure for maintaining a local book from the diff stream
 | Integer trade id `t` | `(L, t)` = (Raft log index, ordinal) | fills are identified by `EventId`; there is no separate replicated trade counter |
 | `aggTrade` id `a` | `@sweep` stream (one message per taker, all fills) in P1; price-grouped `@aggTrade` in P2 | one taker may sweep several price levels, which does not fit Binance's single-price aggregate shape |
 | REST snapshot required for depth sync | snapshot is pushed **on the WS at subscribe time**; an HTTP snapshot endpoint is optional parity | removes the REST round-trip and the snapshot/stream race for our clients; Binance rules still hold |
-| 1024 streams per connection | 64 (configurable) | one symbol per deployment: the catalogue is small, the cap only guards abuse |
-| Edge serves thousands of symbols | one symbol per engine deployment/cluster | engine contract: multi-symbol is deployment-level (P3 routes several deployments) |
+| 1024 streams per connection | 1024 (configurable) | Binance parity; one connection can hold several symbols' streams |
+| Edge serves thousands of symbols | one symbol per engine deployment/cluster; one service instance aggregates several engines | engine contract stays one symbol per cluster; the service has one feed/state per configured symbol behind a shared hub |
 | `E`/`T` event times from the exchange | intake timestamps replicated in the log | the feed's rule: never a publish-time clock (§13 of the Aeron design) |
 | JSON only | JSON first; binary (wire v6 / an SBE-like format) is a later option | Binance itself now offers SBE streams; our wire v6 already exists on the Aeron edge |
 
@@ -187,8 +190,8 @@ Binance's documented procedure for maintaining a local book from the diff stream
   Aeron channel is trusted-network-only, exactly like the engine's HTTP/gRPC edge (§11).
 - Durable replay/retention on the market-data path (Aeron is not store-and-forward; the Raft log
   and the replicated event window remain the record — see `MATCH_RESULTS.md`).
-- Multi-symbol service from one engine; the wire carries `symbol_id` and a P3 instance may route
-  several engine deployments, but one engine serves one symbol.
+- Multiple books in one engine process; the wire carries `symbol_id`, and one service instance
+  consumes several single-symbol engine deployments (one feed/state per symbol).
 - Exactly-once delivery. The contract is monotone update ids, snapshot + delta, client-side
   re-sync on discontinuity — the same as Binance.
 
@@ -219,8 +222,9 @@ Binance's documented procedure for maintaining a local book from the diff stream
 ```
 
 - The JSONL debug sink (`--market-data-log`) remains node-local and independent.
-- One engine deployment = one symbol = one multicast channel/stream set. P3 instances may
-  subscribe to several channels and route by `symbol_id`.
+- One engine deployment = one symbol = one multicast channel/stream set. A service instance may
+  subscribe to several channels (one per configured symbol) and route by `symbol_id`; its shared
+  hub lets one WebSocket connection hold streams from any of them.
 
 ### 4.2 Engine side — the Aeron publication adapter (U7 realized)
 
@@ -242,7 +246,7 @@ and only lightly extended here.
   it only consumes.
 - **Frames:** the existing wire v6 format, unchanged (golden-tested with a strict reference
   decoder). The market-data system reuses `wire::decode` from the engine crate via a path
-  dependency, exactly like `demo/` reuses the client.
+  dependency, exactly like `demos/order_system/` reuses the client.
 - **Backpressure:** the processor task is off the matching path and *may* slow down; per the
   Aeron design's §17 rule, a stalled publication slows the processor, the bounded tap queue fills
   and the feed degrades to `GAP` while consensus continues. `apply` latency is independent of the
@@ -271,13 +275,13 @@ and only lightly extended here.
 
 ### 4.3 Market-data system — ingestion from Aeron
 
-The market-data system is a new crate `marketdata/` (sibling of `demo/`, own `Cargo.toml`, binary
+The market-data system is the new crate `demos/market_data_system/` (sibling of `demos/order_system/`, own `Cargo.toml`, binary
 `matchengine-marketdata`), depending on `matchengine-raft` by path (for `wire`, `MarketMessage`
 and the record types), `rusteron-client`, `actix-web`/`actix-ws` and `tokio`.
 
-- **Subscriptions:** one Aeron `Subscription` per stream id (2001–2007) on the engine's channel.
-  Aeron reassembles fragmented publications; the subscriber decodes only complete frames through
-  the existing `wire::decode`.
+- **Subscriptions:** one Aeron `Subscription` per stream id (2001–2007) on each engine's channel,
+  with one source per configured symbol. Aeron reassembles fragmented publications; the subscriber
+  decodes only complete frames through the existing `wire::decode`.
 - **`!Send` isolation:** rusteron handles are not `Send`. A **dedicated subscriber thread** (an OS
   thread, not a tokio task) owns the Aeron context and all subscriptions, polls with an idle
   strategy, decodes frames and hands complete `MarketMessage`s to the async side through a
@@ -384,13 +388,14 @@ OS threads that never run async code; all async work is pure tokio tasks.
 ```text
 dedicated OS thread                     main multi-thread Tokio runtime
 ┌──────────────────────────┐   bounded  ┌────────────────────────────────────────────┐
-│ Aeron subscriptions      │   handoff  │ assembler task                             │
-│ poll · decode wire v6    │──queue────►│   dedupe · depth map · BBO · bars ·         │
-│ (rusteron, !Send)        │  (drop→gap)│   watermark · gap policy                   │
-└──────────────────────────┘            │   caches: watch<Arc<Payload>>              │
-                                        │   conflation: interval(100ms/1000ms)       │
+│ Aeron subscriptions      │   handoff  │ one feed task per symbol                   │
+│ (one source per symbol)  │──queue────►│   dedupe · depth map · BBO · bars ·         │
+│ poll · decode wire v6    │  (drop→gap)│   watermark · gap policy                   │
+│ (rusteron, !Send)        │            │   caches: watch<Arc<Payload>>              │
+└──────────────────────────┘            │   conflation: interval(100ms/1000ms)       │
                                         │   serialize once → Bytes                   │
-                                        │   registry: per stream-key broadcast<Bytes>│
+                                        │ shared registry: per stream-key            │
+                                        │   broadcast<Bytes>                         │
                                         │        │                ▲                  │
                                         │ session task ◄───────────│ subscribe       │
                                         │   socket halves · control frames           │
@@ -416,7 +421,7 @@ it; the lock guards a lookup plus a `Sender::send`/clone — both synchronous, n
 
 ### 4.9 The assembler/hub task
 
-One task owns all derived state (sketch):
+One feed task per symbol owns that symbol's derived state (sketch):
 
 ```rust
 struct Assembler {
@@ -586,8 +591,8 @@ engine (O(1) publish) ────┤─ instance 2 · 256 conns ─┤───
 - **Capacity arithmetic is linear.** Per connection: its FIFO (1024 pointers), shared payload
   refcounts and socket buffers; per instance: the writer tasks' socket writes of
   already-serialized bytes. With the §15 budget (roughly one core per ~256 active connections at
-  default limits on a busy book), a fleet of N instances serves ≈ N × `--ws-max-connections`
-  clients — 10 instances ≈ 2 500, 40 ≈ 10 000. Raise `--ws-max-connections` (and the process file
+  default limits on a busy book), a fleet of N instances serves ≈ N × `--max-connections`
+  clients — 10 instances ≈ 2 500, 40 ≈ 10 000. Raise `--max-connections` (and the process file
   descriptor limit) for larger instances; the limit is an abuse guard, not the design's ceiling.
 - **The knobs that actually bound an instance** are file descriptors, socket write bandwidth
   (bytes/s × connections) and writer-task CPU. None of them is shared state, and none requires an
@@ -599,8 +604,9 @@ subscribing once and re-publishing locally — the WS tier is unchanged.
 
 ## 5. Endpoints, stream names and control protocol
 
-All served by the **market-data system** (not the engine). Defaults assume one instance per engine
-deployment; a load balancer may front many.
+All served by the **market-data system** (not the engine). One instance may consume several
+engine deployments (one symbol each) and serve them from a shared hub; a load balancer may front
+many instances.
 
 ### 5.1 URLs
 
@@ -613,10 +619,15 @@ deployment; a load balancer may front many.
 ### 5.2 Stream names
 
 `<symbol>` is the lowercase concatenation of the traded asset codes (`eurusd`, `btcusdt`). The wire
-carries only `symbol_id`, so the pair name is **service configuration** (`--pair eurusd
---symbol-id 1`), validated against every frame's `symbol_id`; frames for any other id are rejected
-as a configuration error. (Asset codes are deliberately not on the wire; replicating them in every
-frame would bloat it for one field a deployment sets once.)
+carries only `symbol_id`, so the symbol name and id are **service configuration**
+(`--symbol eurusd:0:EUR:USD`, repeatable), validated against every frame's `symbol_id`; frames for
+an unconfigured id are rejected as a configuration error. (Asset codes are deliberately not on the
+wire; replicating them in every frame would bloat it for one field a deployment sets once.)
+
+The subscription set belongs to the **connection**, not to a server-side current symbol. A client
+can subscribe streams for several symbols on one socket and route frames by `s`; switching a UI's
+symbol is `UNSUBSCRIBE` of the old symbol's topics plus `SUBSCRIBE` of the new ones on the same
+connection.
 
 | Stream name | Source stream(s) | Binance equivalent | Phase |
 |---|---|---|---|
@@ -647,7 +658,8 @@ limit exceeded, `3` rate limit exceeded, `4` instance not ready (assembler synci
 
 ### 5.4 Combined streams
 
-`GET /stream?streams=eurusd@bookTicker/eurusd@depth@100ms` wraps every payload:
+`GET /stream?streams=eurusd@bookTicker/btcusdt@depth@100ms` wraps every payload (the
+`stream` field identifies the symbol and stream):
 
 ```json
 {"stream":"eurusd@bookTicker","data":{"u":135,"s":"eurusd","b":"1.085","B":"800","a":"1.086","A":"500"}}
@@ -876,7 +888,7 @@ the tap queue degrades to `GAP` while consensus continues (§4.2).
 | Server ping interval | 180 s | Binance: 3 min |
 | Pong timeout | 600 s | disconnect after 10 min without pong |
 | Connection lifetime | 24 h | close 1000, Binance parity |
-| Streams per connection | 64 | one symbol; cap is abuse guard (Binance: 1024) |
+| Streams per connection | 1024 | Binance parity; covers several symbols on one socket |
 | Connections per instance | 256 | plus per-IP connection throttling (300/5 min) at the gateway or, optionally, in-process |
 | Inbound control messages | 10/s per connection | excess answered with error code 3 |
 | Inbound frame size | 4 KiB | control frames only |
@@ -897,7 +909,7 @@ Two trust boundaries, both matching the existing engine edge (AGENTS.md):
 - Stream names and control payloads are strictly validated (length, charset, known names) before
   any allocation or lookup.
 - `@lifecycle` exposes order metadata (sequences, prices, volumes, fees) exactly like the engine's
-  `/events` API; `--ws-lifecycle=false` disables the stream on a given instance.
+  `/events` API; `--no-lifecycle` hides the stream on a given instance.
 - Each instance exposes counters (connections, messages sent, slow-consumer closes, resyncs,
   assembler gaps) at `GET /metrics`-style JSON for monitoring and abuse detection.
 
@@ -926,16 +938,17 @@ from streams; the durable source is the engine's replicated event log, not the f
 | Flag | Default | Meaning |
 |---|---|---|
 | `--addr` | `127.0.0.1:24700` | HTTP/WS listener |
-| `--aeron-channel` | required | the engine's channel to subscribe to |
-| `--aeron-stream-base` | 2001 | must match the engine |
-| `--pair` / `--symbol-id` | required | stream-name symbol and the id validated against frames |
-| `--bar-intervals-ms` | `1000,60000` | must match the engine's bar intervals |
-| `--ws-max-connections` | 256 | per instance |
-| `--ws-max-streams` | 64 | per connection |
-| `--ws-queue` | 1024 | per-connection sequenced FIFO |
-| `--ws-lifecycle` | true | allow the `@lifecycle` stream |
-| `--ws-ping-secs` | 180 | ping interval (pong timeout = 10 × ping) |
-| `--heartbeat-timeout-ms` | 5000 | `/ready` false and `resync` beyond this silence |
+| `--aeron-channel` | required | the engine channel to subscribe to; repeat per symbol |
+| `--aeron-dir` | `AERON_DIR` | media-driver directory; repeat per symbol |
+| `--aeron-stream-base` | 2001 | must match every engine |
+| `--symbol` | required | `name:id:base:quote`, repeatable; the id is validated against frames |
+| `--bar-intervals-ms` | `1000,60000` | must match the engines' bar intervals |
+| `--max-connections` | 256 | per instance |
+| `--max-streams` | 1024 | per connection |
+| `--queue` | 1024 | per-connection sequenced FIFO |
+| `--no-lifecycle` | off | hide the extension `@lifecycle` stream |
+| `--ping-secs` | 180 | ping interval (pong timeout = 10 × ping) |
+| `--pong-timeout-secs` | 600 | disconnect when no pong arrives within this window |
 
 ## 14. Testing
 
@@ -951,7 +964,7 @@ from streams; the durable source is the engine's replicated event log, not the f
 | Sync contract | snapshot + buffered diffs, Binance rules 3–6 as literal test cases, gap → resync + re-snapshot, empty-book snapshot (`lastUpdateId` 0) then first `U == 1` |
 | Payloads | golden JSON for every stream (incl. fee fields, `Fixed` decimal strings); extension fields stable |
 | Limits | ping/pong timeout, 24 h rotation, connection cap, FIFO overflow → 1013, latest-value conflation under burst |
-| End-to-end | `tests/cluster/test_market_data_ws.rs`-style integration: embedded Aeron driver, one engine node publishing, one service instance, a `tokio-tungstenite` client subscribing and asserting trade/bookTicker/depth/kline frames in order through place/fill/amend/cancel, a forced gap and a leadership change |
+| End-to-end | `demos/market_data_system/tests/ws.rs` drives snapshots, conflation, combined streams, control errors, two symbols held on one connection and a symbol switch on the same socket; `tests/aeron.rs` (feature `aeron`) publishes engine wire frames over IPC to a `tokio-tungstenite` client. A full place/fill/amend/cancel + forced-gap + leadership-change scenario is still open |
 | Bench | engine: tap/publication cost with the feed on/off (gates "matching does not regress"); service: `ws_fanout` — N connections × `bookTicker`/`depth@100ms`, serialize-once reuse, per-connection send cost, assembler memory |
 
 ## 15. Performance budget
@@ -965,7 +978,7 @@ from streams; the durable source is the engine's replicated event log, not the f
   send plus per-connection socket writes. Target: 256 connections × `bookTicker` +
   `depth@100ms` on a busy book (≥ 1k updates/s) within one core.
 - **Fleet:** capacity is linear in instance count (§4.13) — N instances ≈ N ×
-  `--ws-max-connections` clients, while the engine's publish cost and each instance's upstream
+  `--max-connections` clients, while the engine's publish cost and each instance's upstream
   cost stay constant. These figures are budgets to be replaced by measured numbers under the
   `docs/PERFORMANCE.md` discipline once the service exists.
 - **Memory:** assembler state ≈ one depth map (levels × ~32 B) + bars + dedupe ring; per
@@ -1009,7 +1022,7 @@ identical frames still emit identical messages; no matching-path change.
 3. Streams: `@trade`, `@sweep`, `@bookTicker`, `@depth@speed`, `@depth5/10/20@speed`,
    `@kline_<interval>`, `@status`, `@lifecycle`.
 4. Tests: the §14 service rows driven by `ChannelSource`, plus the end-to-end embedded-driver
-   integration with a real WS client; CI gains the crate's fmt/clippy/test jobs (as `demo/` has).
+   integration with a real WS client; CI gains the crate's fmt/clippy/test jobs (as `demos/order_system/` has).
 
 **Acceptance:** a browser-style client maintains a correct local book through
 place/fill/amend/cancel, a forced gap and an engine leadership change, using only Binance rules
@@ -1064,8 +1077,8 @@ differ) behind one load balancer — multi-instance fleets work from day one (§
 - **24 h ticker/miniTicker is service-local state.** After an instance restart the rolling window
   is rebuilt from bars + live trades; the first minutes are approximate. Acceptable for ticker
   semantics; the durable truth stays in the engine's event log.
-- **Pair name is configuration, not wire data.** `--pair`/`--symbol-id` must match the engine's
-  symbol; a mismatch is detected (frames rejected) rather than silent.
+- **Symbol name/id are configuration, not wire data.** Each `--symbol name:id:base:quote` must
+  match its engine's symbol; a mismatch is detected (frames rejected) rather than silent.
 - **Slow-consumer close (1013) vs Binance's silent 24 h rotate:** closing on overflow is more
   aggressive but honest; "conflate everything" would corrupt local books.
 - **Open:** default diff-depth speed (100 ms vs 1000 ms); whether `@lifecycle` should be opt-in;

@@ -69,6 +69,7 @@
 **API 与数据 Feed**
 - **持久化撮合事件 Feed**：`POST /events` 游标分页、长轮询（`wait_ms`）、保留上限、`client_order_id` 幂等、gRPC `StreamEvents` 流式推送和参考 MQ bridge sidecar，安全重试。
 - **确定性行情 Feed**：领导者门控、影子订单簿、BBO、深度快照/增量、生命周期事件、OHLC K 线和紧凑二进制行情格式（含参考解码器）。
+- **独立行情数据系统** `demos/market_data_system/`：通过 Aeron（feature 门控）或 JSONL 消费 feed，并提供 Binance 风格 WebSocket 行情流。一个实例通过共享 hub 服务多个 symbol；连接持有自己的订阅集合，可用实时 `UNSUBSCRIBE`/`SUBSCRIBE` 切换 symbol，并可水平扩展而不增加引擎开销。
 - **灵活读取一致性**：本地读、领导者线性一致读和 follower 线性一致读。
 - **领导者感知 Rust 客户端**，自动跟踪并转发到当前领导者，支持可配置超时、瞬时错误重试/退避以及类型化的 API/无领导者错误；重试是至少一次语义，写入重试应使用 `client_order_id` 实现幂等。
 - **运维 API**：初始化、成员变更、指标、事件状态和行情状态。
@@ -77,7 +78,7 @@
 **运维可见性**
 - **内置 WebUI 控制台** `/console/`：集群健康、Raft 领导与复制、存储/事件/行情状态、仅领导者可见的事件查看器和诊断信息，无需构建步骤或外部资源。
 - **受保护的 Raft 操作**：通过 gRPC `TransferLeader` 进行优雅领导者切换、尽力而为的 Pre-Vote 选举请求和快照触发，带确认、操作锁和审计日志。
-- **独立演示下单系统** `demo/`：独立进程与 crate，可提交真实订单，展示完整订单簿、标的自定义、游标跟随的 `/events` 事件流，以及带“演示估算”标注的订单系统冻结额与 maker/taker 费用结算预览，并复用控制台主题。
+- **独立演示下单系统** `demos/order_system/`：独立进程与 crate，可提交真实订单，展示完整订单簿、标的自定义、游标跟随的 `/events` 事件流，以及带“演示估算”标注的订单系统冻结额与 maker/taker 费用结算预览，并复用控制台主题。
 - **健康与就绪探针**：`/health` 报告 gRPC 监听器、Raft 核心和 WAL/状态机前沿；`/ready` 还要求已知领导者，适合编排系统使用。
 
 **可信赖的工程质量**
@@ -316,11 +317,11 @@ curl -X POST -H "Content-Type: application/json" \
 
 ## 演示下单系统
 
-`demo/` 是面向运行中节点的独立下单 WebUI。它是单独的 crate 和进程，不修改引擎二进制及其路由；
+`demos/order_system/` 是面向运行中节点的独立下单 WebUI。它是单独的 crate 和进程，不修改引擎二进制及其路由；
 通过 leader-aware 客户端调用公共 HTTP API，并复用控制台主题。先启动并初始化引擎，再运行：
 
 ```shell
-cargo run --manifest-path demo/Cargo.toml -- \
+cargo run --manifest-path demos/order_system/Cargo.toml -- \
   --addr 127.0.0.1:24300 --engine 127.0.0.1:24301 --engine-id 1
 ```
 
@@ -333,7 +334,7 @@ quote 保证金叠加层，会估算名义价值、初始保证金和费用，�
 
 ![演示下单系统](./docs/demo-order-desk.png)
 
-运行流程见 [`demo/README.md`](./demo/README.md)，设计见
+运行流程见 [`demos/order_system/README.md`](./demos/order_system/README.md)，设计见
 [`docs/DEMO_ORDER_SYSTEM.md`](./docs/DEMO_ORDER_SYSTEM.md)。
 
 ## 安全与部署边界
@@ -398,6 +399,9 @@ examples/
 ├── dump_snapshot.rs         # 当前快照的 JSONL 转储
 ├── replay_orders.rs         # 回放订单并对比撮合结果 JSONL
 └── replay_orders_events.rs  # 回放订单并从 POST /events 读取事件对比
+demos/
+├── order_system/            # 独立下单系统
+└── market_data_system/      # 独立 Binance 风格 WebSocket 行情系统
 tests/
 ├── cluster/
     ├── main.rs              # 单一集成测试目标
@@ -926,6 +930,7 @@ ETF/股票 base 的费用始终以 quote 资产结算；加密货币和法币对
 | `tests/cluster/test_restart.rs` | 完整节点重启后通过日志重放恢复，以及通过快照 + 更新的 WAL 尾部恢复订单簿、序列号、事件窗口和幂等表；另含 2000 单大日志重放和多分块（约 120 KB）快照启动 |
 | `tests/cluster/test_match_results.rs` | 以 `--match-event-log` 启动的节点按日志顺序记录 rest/fill/cancel 事件，同时 `/write` 响应保持不变；第二个节点验证止损触发、GTD 过期和新增的 `/read` 键 |
 | `tests/cluster/test_market_data.rs` | 以 `--market-data-log` 启动的节点发布重置快照、每个 taker 一条成交消息、BBO、批后深度总量和一根已收盘 K 线；断言同时检查 `market_seq` 锚点与 `/read marketdata_status` 计数器 |
+| `demos/market_data_system` | 流名称解析与载荷、WebSocket 快照/合并/组合流/控制错误、单连接承载多个 symbol 并用实时 `UNSUBSCRIBE`/`SUBSCRIBE` 切换，以及嵌入式 Aeron 引擎→服务→WebSocket 测试（`aeron` feature） |
 | `tests/cluster/test_events.rs` | `/write` 返回事件、`/events` 游标分页、`client_order_id` 重试不重复下单、`--max-events` 淘汰与 `/events/status` 计数、长轮询在并发写入时唤醒或在超时后返回空页、gRPC `StreamEvents` 推送成交与空闲心跳、bridge sidecar 发布事件并记录游标 |
 | `tests/cluster/test_membership.rs` | 杀掉当前领导者：存活的投票节点接管已提交订单簿并接受新写入；写入后加入的学习者通过普通日志复制追赶、晋升成员并从自己的节点写入 |
 | `tests/cluster/test_late_join.rs` | 带过期快照/WAL 的节点被移出集群、错过 40 次写入（期间领导者生成快照并 purge），再以学习者身份重新加入并从活动集群追赶 |

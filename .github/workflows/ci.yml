@@ -22,11 +22,30 @@ jobs:
       - name: Test
         run: cargo test
       - name: Demo format
-        run: cargo fmt --manifest-path demo/Cargo.toml -- --check
+        run: cargo fmt --manifest-path demos/order_system/Cargo.toml -- --check
       - name: Demo clippy
-        run: cargo clippy --manifest-path demo/Cargo.toml --all-targets -- -D warnings
+        run: cargo clippy --manifest-path demos/order_system/Cargo.toml --all-targets -- -D warnings
       - name: Demo test
-        run: cargo test --manifest-path demo/Cargo.toml --locked
+        run: cargo test --manifest-path demos/order_system/Cargo.toml --locked
+      - name: Market-data format
+        run: cargo fmt --manifest-path demos/market_data_system/Cargo.toml -- --check
+      - name: Market-data clippy
+        run: cargo clippy --manifest-path demos/market_data_system/Cargo.toml --all-targets -- -D warnings
+      - name: Market-data test
+        run: cargo test --manifest-path demos/market_data_system/Cargo.toml --locked
+
+  marketdata-aeron:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # rusteron is pinned to 0.2.13 and uses precompiled Aeron C libraries
+      # (`static`, `precompile-rustls`); no Java or cmake is required.
+      - name: Engine Aeron sink test
+        run: cargo test --features market-data-aeron --lib market_data::aeron --locked
+      - name: Market-data Aeron end-to-end test
+        run: cargo test --manifest-path demos/market_data_system/Cargo.toml --features aeron --test aeron --locked
 
   msrv:
     runs-on: ubuntu-latest

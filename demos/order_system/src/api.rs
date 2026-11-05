@@ -21,7 +21,7 @@ use crate::state::PlaceTicket;
 const INDEX_HTML: &str = include_str!("../web/index.html");
 const APP_JS: &str = include_str!("../web/app.js");
 const APP_CSS: &str = concat!(
-    include_str!("../../web/console/app.css"),
+    include_str!("../../../web/console/app.css"),
     "\n",
     include_str!("../web/app.css")
 );

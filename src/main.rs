@@ -80,6 +80,30 @@ pub struct Opt {
     /// downstream. This is mainly a testing switch.
     #[clap(long, num_args = 0..=1, default_missing_value = "true", default_value_t = true)]
     pub market_data_leader_only: bool,
+
+    /// Aeron channel for the market-data feed, e.g. `aeron:ipc` or a multicast
+    /// URI. Requires a binary built with the `market-data-aeron` feature.
+    #[clap(long, env = "MARKET_DATA_AERON_CHANNEL")]
+    pub market_data_aeron_channel: Option<String>,
+
+    /// First Aeron stream id; the seven feed streams are `base..base+6`.
+    #[clap(long, default_value_t = 2001)]
+    pub market_data_aeron_stream_base: u16,
+
+    /// Aeron media-driver directory. With an embedded driver this is where it
+    /// runs; otherwise the client connects there (falling back to `AERON_DIR`).
+    #[clap(long, env = "MARKET_DATA_AERON_DIR")]
+    pub market_data_aeron_dir: Option<String>,
+
+    /// Start an embedded media driver (demos/tests; production normally runs a
+    /// supervised driver).
+    #[clap(long)]
+    pub market_data_aeron_embedded_driver: bool,
+
+    /// Re-broadcast a fresh reset depth snapshot on this cadence while
+    /// publishing, so consumers can join mid-stream (0 disables).
+    #[clap(long, default_value_t = 30_000)]
+    pub market_data_aeron_snapshot_every_ms: u64,
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -97,11 +121,19 @@ async fn main() -> std::io::Result<()> {
     if let Some(path) = options.match_event_log {
         storage = storage.with_match_event_log(path);
     }
-    if let Some(path) = options.market_data_log {
-        let mut config = MarketDataConfig::jsonl(path);
+    if options.market_data_log.is_some() || options.market_data_aeron_channel.is_some() {
+        let mut config = match options.market_data_log {
+            Some(path) => MarketDataConfig::jsonl(path),
+            None => MarketDataConfig::default(),
+        };
         config.depth_levels = options.market_data_depth;
         config.status_every = options.market_data_status_every;
         config.leader_only = options.market_data_leader_only;
+        config.aeron_channel = options.market_data_aeron_channel;
+        config.aeron_stream_base = options.market_data_aeron_stream_base;
+        config.aeron_dir = options.market_data_aeron_dir;
+        config.aeron_embedded_driver = options.market_data_aeron_embedded_driver;
+        config.snapshot_every_ms = options.market_data_aeron_snapshot_every_ms;
         if !options.market_data_bar_intervals_ms.is_empty() {
             config.bar_intervals_ms = options.market_data_bar_intervals_ms;
         }

@@ -630,7 +630,7 @@ Example freeze requirements (ignoring buffers and rounding):
 | Linear perp, 1 BTC at 50,000 USDT, 10x | `Quote` | 5,000 USDT margin + fee + buffer |
 | Inverse perp, fee in BTC, 10x | `Base` | BTC margin + BTC fee + buffer |
 
-The standalone demo order desk (`demo/src/freeze.rs`) implements a labelled **demo estimate** of the
+The standalone demo order desk (`demos/order_system/src/freeze.rs`) implements a labelled **demo estimate** of the
 cash/spot rows above and of the **linear quote-margined perpetual** row: it derives the freeze,
 maker/taker settlement legs and, for a perpetual ticket, the leverage, position side, notional,
 initial margin and quote fee from the replicated `SymbolConfig`, the order fields and the fee rates.

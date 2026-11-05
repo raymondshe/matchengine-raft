@@ -85,7 +85,7 @@ write_config() {
 }
 
 cargo build
-cargo build --manifest-path demo/Cargo.toml
+cargo build --manifest-path demos/order_system/Cargo.toml
 
 if [ -z "${DEMO_PAIR_DATA_DIR:-}" ]; then
     rm -rf "$DATA_DIR"
@@ -153,7 +153,7 @@ echo "Logs:             $DATA_DIR/logs"
 echo "Press Ctrl-C to stop the demo and both engines."
 echo
 
-./demo/target/debug/matchengine-raft-demo \
+./demos/order_system/target/debug/matchengine-raft-demo \
     --addr "$DEMO_ADDR" \
     --engine "$SPOT_ADDR" \
     --engine-id 1 \

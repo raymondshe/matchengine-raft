@@ -439,6 +439,10 @@ pub async fn build_match_engine_node(
                 .market_data
                 .as_ref()
                 .is_none_or(|config| config.leader_only),
+            storage
+                .market_data
+                .as_ref()
+                .map_or(0, |config| config.snapshot_every_ms),
         )
     });
 
@@ -570,11 +574,15 @@ fn spawn_market_data_watch(
     control: MarketDataControl,
     depth_levels: usize,
     leader_only: bool,
+    snapshot_every_ms: u64,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut metrics = raft.metrics();
         let mut leader = false;
         let mut started = false;
+        let period = std::time::Duration::from_millis(snapshot_every_ms.max(1));
+        let mut reset = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+        reset.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             let (is_leader, epoch, leader_id) = {
                 let metrics = metrics.borrow_and_update();
@@ -607,8 +615,19 @@ fn spawn_market_data_watch(
                     control.set_leader(false);
                 }
             }
-            if metrics.changed().await.is_err() {
-                return;
+            let publishing = if leader_only { leader } else { true };
+            tokio::select! {
+                changed = metrics.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                }
+                _ = reset.tick(), if snapshot_every_ms > 0 && publishing => {
+                    // A fresh reset point for consumers that joined mid-stream.
+                    state_machine
+                        .start_market_data_feed(&control, depth_levels)
+                        .await;
+                }
             }
         }
     })

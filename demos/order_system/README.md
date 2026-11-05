@@ -1,14 +1,14 @@
 # Demo order desk
 
 A standalone order-entry WebUI for a running `matchengine-raft` node. It runs as a **separate
-process** in `demo/`; the engine binary is not modified.
+process** in `demos/order_system/`; the engine binary is not modified.
 
 The demo has two pieces:
 
-- an Actix Web BFF (`demo/src/`) that calls one or two engines' public HTTP APIs through the
+- an Actix Web BFF (`demos/order_system/src/`) that calls one or two engines' public HTTP APIs through the
   leader-aware `MatchEngineClient`, and computes demo-side freeze/settlement and linear-perpetual
-  margin estimates in `demo/src/freeze.rs`,
-- a dependency-free HTML/CSS/JavaScript UI (`demo/web/`) that reuses `web/console/app.css` and adds
+  margin estimates in `demos/order_system/src/freeze.rs`,
+- a dependency-free HTML/CSS/JavaScript UI (`demos/order_system/web/`) that reuses `web/console/app.css` and adds
   only the trading-desk layout.
 
 The Spot and Perpetual products each use **their own engine process and order book**. One engine
@@ -16,7 +16,7 @@ process trades exactly one symbol, and the pair script's Spot EUR/USD uses
 `fee_asset_policy = received` while the linear Perpetual BTC/USDT uses `quote`, so the two cannot
 share a book.
 
-![Demo order desk](../docs/demo-order-desk.png)
+![Demo order desk](../../docs/demo-order-desk.png)
 
 ## Run
 
@@ -51,7 +51,7 @@ curl -s -X POST http://127.0.0.1:24301/init \
 Then start the demo process with only the Spot backend:
 
 ```shell
-cargo run --manifest-path demo/Cargo.toml -- \
+cargo run --manifest-path demos/order_system/Cargo.toml -- \
   --addr 127.0.0.1:24300 \
   --engine 127.0.0.1:24301 \
   --engine-id 1
@@ -92,7 +92,7 @@ Fee fields take decimal rate fractions, not basis points: `0.001` = 10 bps = 0.1
 
 The engine is balance-agnostic: it reports fills and fees but holds no accounts, freezes or
 balances. The desk therefore estimates what an order system following
-[`docs/FEE_DEDUCTION.md`](../docs/FEE_DEDUCTION.md) §6.6 would reserve and settle:
+[`docs/FEE_DEDUCTION.md`](../../docs/FEE_DEDUCTION.md) §6.6 would reserve and settle:
 
 - the frozen asset and amount for every open order, parked stop and ticket preview,
 - the assets each side of a fill delivers and receives, plus the fee amount, fee asset, signed rate
@@ -127,7 +127,7 @@ tracks no position, PnL, funding, liquidation, maintenance margin or contract mu
 delivery legs are shown for a perpetual. Product/leverage tags live in demo-process memory keyed by
 the backend's order sequence, so they survive a page reload but not a demo restart; after that,
 still-resting perp orders display as Perpetual with unknown leverage and no estimate. See
-[`docs/FEE_DEDUCTION.md`](../docs/FEE_DEDUCTION.md) §6.6.3 for the general derivative policy.
+[`docs/FEE_DEDUCTION.md`](../../docs/FEE_DEDUCTION.md) §6.6.3 for the general derivative policy.
 
 ## Safety
 
@@ -142,7 +142,7 @@ still-resting perp orders display as Perpetual with unknown leverage and no esti
 ## Checks
 
 ```shell
-cargo test --manifest-path demo/Cargo.toml
-cargo clippy --manifest-path demo/Cargo.toml --all-targets -- -D warnings
-cargo fmt --manifest-path demo/Cargo.toml -- --check
+cargo test --manifest-path demos/order_system/Cargo.toml
+cargo clippy --manifest-path demos/order_system/Cargo.toml --all-targets -- -D warnings
+cargo fmt --manifest-path demos/order_system/Cargo.toml -- --check
 ```

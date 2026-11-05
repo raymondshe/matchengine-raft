@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Market-data system — WebSocket test page</title>
+<link rel="stylesheet" href="/app.css">
+<script src="/app.js" defer></script>
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <div class="brand-mark">MD</div>
+    <div>
+      <strong>Market-data system</strong>
+      <span>WebSocket test page</span>
+    </div>
+  </div>
+  <div class="topbar-status">
+    <span class="chip" id="conn-chip"><span class="dot" id="conn-dot"></span><span id="conn-label">disconnected</span></span>
+    <span class="chip" id="symbol-chip">Symbol —</span>
+    <span class="chip" id="ready-chip">Ready —</span>
+    <span class="muted mono" id="frame-count">0 frames</span>
+  </div>
+</header>
+
+<main class="page">
+  <div class="page-head">
+    <div>
+      <div class="eyebrow">Market-data system</div>
+      <h1>WebSocket test page</h1>
+      <p>One WebSocket connection holds the subscription set. Switch symbols from the dropdown
+        and the page sends <code>UNSUBSCRIBE</code> for the old topics plus <code>SUBSCRIBE</code>
+        for the new ones over the same socket — no reconnect.</p>
+    </div>
+  </div>
+
+  <section class="panel controls">
+    <div class="control-row">
+      <label class="field">Symbol
+        <select id="symbol" disabled>
+          <option value="">loading…</option>
+        </select>
+      </label>
+      <label class="field grow">WebSocket URL
+        <input id="url" type="text" spellcheck="false" autocomplete="off">
+      </label>
+      <button class="btn primary" id="connect" type="button">Connect</button>
+      <button class="btn" id="disconnect" type="button" disabled>Disconnect</button>
+    </div>
+    <div class="streams" id="streams"></div>
+    <div class="control-row">
+      <button class="btn ghost" id="list" type="button">List subscriptions</button>
+      <button class="btn ghost" id="clear" type="button">Clear frames/trades</button>
+      <span class="hint" id="hint"></span>
+    </div>
+  </section>
+
+  <div class="grid">
+    <section class="panel">
+      <div class="panel-head"><h2>Book</h2><span class="badge neutral" id="book-source">no data</span></div>
+      <div class="bbo" id="bbo">
+        <div><span>Best bid</span><strong class="good" id="best-bid">—</strong><span class="sub" id="best-bid-size">—</span></div>
+        <div><span>Best ask</span><strong class="bad" id="best-ask">—</strong><span class="sub" id="best-ask-size">—</span></div>
+        <div><span>Spread</span><strong id="spread">—</strong><span class="sub" id="mid">—</span></div>
+      </div>
+      <div class="book-grid">
+        <div>
+          <div class="subhead">Bids</div>
+          <table class="depth"><thead><tr><th class="num">Price</th><th class="num">Size</th></tr></thead><tbody id="bids-body"></tbody></table>
+        </div>
+        <div>
+          <div class="subhead">Asks</div>
+          <table class="depth"><thead><tr><th class="num">Price</th><th class="num">Size</th></tr></thead><tbody id="asks-body"></tbody></table>
+        </div>
+      </div>
+      <div class="note" id="book-note">Subscribe to <code>depth@100ms</code> or a partial depth stream.</div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head"><h2>Trades</h2><span class="badge neutral" id="trade-count">0</span></div>
+      <div class="table-wrap">
+        <table class="trades"><thead><tr><th>Time</th><th>Side</th><th class="num">Price</th><th class="num">Qty</th><th class="num">Fee</th></tr></thead><tbody id="trades-body"></tbody></table>
+      </div>
+      <div class="panel-head"><h2>Kline</h2><span class="badge neutral" id="kline-interval">—</span></div>
+      <div class="kline" id="kline">—</div>
+      <div class="panel-head"><h2>Status</h2></div>
+      <pre class="json" id="status">—</pre>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head"><h2>Service</h2><span class="badge neutral" id="metrics-age">—</span></div>
+      <pre class="json" id="metrics">—</pre>
+      <div class="note" id="ready-note">—</div>
+    </section>
+
+    <section class="panel wide">
+      <div class="panel-head"><h2>Frames</h2><span class="badge neutral" id="frame-kind">—</span></div>
+      <pre class="json frames" id="frames">Connect to see frames.</pre>
+    </section>
+  </div>
+</main>
+</body>
+</html>

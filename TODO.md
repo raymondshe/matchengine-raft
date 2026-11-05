@@ -194,7 +194,7 @@ Remaining:
 - [ ] **P2** Consider streaming snapshot bytes into the state machine or a temp file instead of
   buffering the whole snapshot. The current API needs a contiguous buffer, but the receiver's
   total allocation still needs a policy (see §3).
-- [ ] **P3** Aeron remains gated on a measured bottleneck; no adapter is adopted.
+- [ ] **P3** The Aeron **Raft transport** remains gated on a measured bottleneck; the market-data Aeron egress is implemented (§6).
 
 ## 5. Matching-engine features and correctness
 
@@ -264,12 +264,18 @@ Done:
 - [x] **P2** Wire v6 reference decoder (`wire::decode`) with a strict `WireError`: validates the
   header, body length, enum codes and length prefixes; golden round-trip tests cover every body
   type, a checked-in golden frame and malformed-frame rejection.
+- [x] **P2** Aeron market-data egress and the reference consumer: `src/market_data/aeron.rs`
+  (`market-data-aeron`, rusteron 0.2.13, embedded or external driver, one exclusive publication
+  per stream) plus the periodic reset snapshot; `demos/market_data_system` ingests Aeron or JSONL
+  and serves Binance-style WebSocket streams with depth conflation and subscribe-time snapshots.
+  One instance serves multiple symbols behind a shared hub; a connection can hold several symbols'
+  streams and switch them with live `UNSUBSCRIBE`/`SUBSCRIBE` (1024-stream cap, Binance parity).
 
 Remaining:
 
 - [ ] **P2** Archive recording/replay and the snapshot-request stream (2003/2010).
-- [ ] **P3** Aeron adapter: `MarketDataSink` with `rusteron-client` plus an embedded driver in
-  tests, feature-gated (`market-data-aeron`); see AERON_SOLUTION §20/§23.
+- [ ] **P2** Aeron production hardening: external-driver runbook, multicast/fan-out validation,
+  idle heartbeat, and the `ws_fanout` benchmark/performance numbers for the market-data service.
 
 ## 7. Tests and CI
 
@@ -508,7 +514,7 @@ Ownership boundaries (outside the matching engine):
   system reserves the trading asset using the policy in `docs/FEE_DEDUCTION.md` §6.6, and clearing
   deducts each fill's fee from the freeze or the settlement leg. The engine holds no freeze state.
   The standalone demo desk renders a labelled estimate of the cash/spot freeze and settlement legs
-  for demonstration (`demo/src/freeze.rs`); it does not enforce or persist a freeze. It also offers a
+  for demonstration (`demos/order_system/src/freeze.rs`); it does not enforce or persist a freeze. It also offers a
   demo-only linear quote-margined perpetual toggle with leverage, estimating notional, initial margin
   and fee without engine product/leverage fields or margin state.
 - [ ] **P3** Engine-level derivative support (instrument kind, leverage/margin fields, contract

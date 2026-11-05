@@ -44,6 +44,7 @@ use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
+use serde::Deserialize;
 use serde::Serialize;
 
 use crate::match_result::MatchEvent;
@@ -57,6 +58,8 @@ use crate::order_book::OrderSide;
 use crate::order_book::RejectReason;
 use crate::order_book::VolumeUnit;
 
+#[cfg(feature = "market-data-aeron")]
+pub mod aeron;
 pub mod wire;
 
 /// Aeron stream IDs reserved by the design (§15).
@@ -119,6 +122,21 @@ pub struct MarketDataConfig {
     pub queue_capacity: usize,
     /// Publish only on the leader (default true).
     pub leader_only: bool,
+    /// Aeron channel for the feed (e.g. `aeron:ipc` or a multicast URI). When
+    /// set, the Aeron sink replaces the JSONL/null sink.
+    pub aeron_channel: Option<String>,
+    /// First Aeron stream id; the seven feed streams are `base..base+6`.
+    pub aeron_stream_base: u16,
+    /// Directory of the Aeron media driver. With `aeron_embedded_driver` this
+    /// starts an embedded driver there; otherwise the client connects to it
+    /// (falling back to `AERON_DIR`).
+    pub aeron_dir: Option<String>,
+    /// Start an embedded media driver instead of connecting to an external one.
+    /// Intended for demos and tests.
+    pub aeron_embedded_driver: bool,
+    /// Re-broadcast a fresh reset depth snapshot on this cadence while
+    /// publishing (0 disables). Late-joining consumers need a snapshot.
+    pub snapshot_every_ms: u64,
 }
 
 impl Default for MarketDataConfig {
@@ -131,6 +149,11 @@ impl Default for MarketDataConfig {
             bar_intervals_ms: vec![1_000, 60_000],
             queue_capacity: 8_192,
             leader_only: true,
+            aeron_channel: None,
+            aeron_stream_base: 2001,
+            aeron_dir: None,
+            aeron_embedded_driver: false,
+            snapshot_every_ms: 30_000,
         }
     }
 }
@@ -232,7 +255,7 @@ impl MarketDataStats {
 // ---------------------------------------------------------------------------
 
 /// One executed fill in a `TRADE` batch.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TradeRecord {
     /// Raft log index of the entry that produced the fill.
     pub log_index: u64,
@@ -265,7 +288,7 @@ pub struct TradeRecord {
 }
 
 /// Latest-value top of book.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BboRecord {
     /// Last trade price, if any.
     pub last_trade: Option<Fixed>,
@@ -284,7 +307,7 @@ pub struct BboRecord {
 }
 
 /// Full top-N depth for one instrument.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DepthSnapshotRecord {
     /// Bid levels, best first.
     pub bids: Vec<DepthLevel>,
@@ -293,7 +316,7 @@ pub struct DepthSnapshotRecord {
 }
 
 /// One touched price level with its post-batch totals.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LevelUpdate {
     /// Side of the level.
     pub side: OrderSide,
@@ -302,7 +325,7 @@ pub struct LevelUpdate {
 }
 
 /// One order-lifecycle event.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LifecycleRecord {
     /// Raft log index.
     pub log_index: u64,
@@ -341,7 +364,7 @@ pub struct LifecycleRecord {
 }
 
 /// One OHLCV bar.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BarRecord {
     /// Bar width.
     pub interval_ms: u64,
@@ -366,7 +389,7 @@ pub struct BarRecord {
 }
 
 /// Deterministic status cadence record.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StatusRecord {
     /// Last processed log index.
     pub last_log_index: u64,
@@ -385,7 +408,7 @@ pub struct StatusRecord {
 }
 
 /// A hard-failure marker: frames were dropped before this message.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GapRecord {
     /// Last position published before the gap.
     pub last_good_log_index: u64,
@@ -396,7 +419,7 @@ pub struct GapRecord {
 }
 
 /// A decoded market-data message: one wire frame.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MarketMessage {
     /// Destination stream (2001..2007).
     pub stream: u16,
@@ -424,7 +447,7 @@ pub struct MarketMessage {
 }
 
 /// Payload variants; one per stream.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MessageBody {
     /// Executed fills.
@@ -808,13 +831,45 @@ impl fmt::Debug for MarketDataHandle {
     }
 }
 
+async fn build_sink(
+    config: &MarketDataConfig,
+    node_id: u64,
+) -> io::Result<Box<dyn MarketDataSink>> {
+    if config.aeron_channel.is_some() {
+        #[cfg(feature = "market-data-aeron")]
+        {
+            return Ok(Box::new(aeron::AeronSink::start(config).await?));
+        }
+        #[cfg(not(feature = "market-data-aeron"))]
+        {
+            return Err(io::Error::other(
+                "an Aeron market-data channel is configured, but this binary was built without the `market-data-aeron` feature",
+            ));
+        }
+    }
+    match &config.log_path {
+        Some(path) => Ok(Box::new(JsonlSink::open(path, node_id)?)),
+        None => Ok(Box::new(NullSink)),
+    }
+}
+
 impl MarketDataHandle {
-    /// Starts the tokio processor task with the configured sink.
+    ///
+    /// The Aeron sink wins when `aeron_channel` is set; otherwise the JSONL
+    /// debug sink or the null sink is used.
     pub async fn start(config: MarketDataConfig, node_id: u64) -> io::Result<Self> {
-        let sink: Box<dyn MarketDataSink> = match &config.log_path {
-            Some(path) => Box::new(JsonlSink::open(path, node_id)?),
-            None => Box::new(NullSink),
-        };
+        let sink = build_sink(&config, node_id).await?;
+        Self::start_with_sink(config, sink).await
+    }
+
+    /// Starts the processor with a caller-provided sink.
+    ///
+    /// This is the seam for transports and tests: the processor does not care
+    /// whether messages go to JSONL, Aeron or a test sink.
+    pub async fn start_with_sink(
+        config: MarketDataConfig,
+        sink: Box<dyn MarketDataSink>,
+    ) -> io::Result<Self> {
         let leader_only = config.leader_only;
         let (tap, channels) = MarketDataTap::channel(config.queue_capacity);
         channels.stats.set_sink(sink.name());

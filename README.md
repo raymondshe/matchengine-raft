@@ -69,6 +69,7 @@ Built for teams that need deterministic execution, durable recovery and a clean 
 **APIs and data feeds**
 - **Durable match-event feed** at `POST /events` with cursor pagination, long-poll (`wait_ms`), retention limits, `client_order_id` idempotency, gRPC `StreamEvents` streaming and a reference MQ bridge sidecar; replay-safe retries.
 - **Deterministic market-data feed** with leader gating, shadow book, BBO, depth snapshots/deltas, lifecycle events, OHLC bars and a compact binary wire format with a reference decoder.
+- **Standalone market-data system** at `demos/market_data_system/`: consumes the feed over Aeron (feature-gated) or JSONL and serves Binance-style WebSocket streams. One instance serves several symbols from a shared hub; clients hold a per-connection subscription set, switch symbols with live `UNSUBSCRIBE`/`SUBSCRIBE`, and scale horizontally without adding engine work.
 - **Flexible read consistency**: local reads, linearizable leader reads and linearizable follower reads.
 - **Leader-aware Rust client** that tracks and forwards requests to the current leader, with configurable timeouts, transient retry/backoff and typed API/no-leader errors; retries are at-least-once, so use `client_order_id` for idempotent write retries.
 - **Operational APIs** for initialization, membership changes, metrics, event status and market-data status.
@@ -77,7 +78,7 @@ Built for teams that need deterministic execution, durable recovery and a clean 
 **Operational visibility**
 - **Embedded WebUI console** at `/console/`: cluster health, Raft leadership and replication, storage/event/feed state, a leader-only event viewer and diagnostics — no build step or external assets.
 - **Guarded Raft actions**: graceful leadership transfer over the gRPC `TransferLeader` RPC, a best-effort Pre-Vote election request, and snapshot triggering, with confirmation, action locking and audit logs.
-- **Standalone demo order desk** at `demo/`: a separate process and crate that places real orders and shows the full book, symbol configuration, a cursor-following `/events` tape and labelled demo estimates of the order-system freeze plus maker/taker fee settlement, with a demo-only linear perpetual/leverage overlay; reuses the console theme.
+- **Standalone demo order desk** at `demos/order_system/`: a separate process and crate that places real orders and shows the full book, symbol configuration, a cursor-following `/events` tape and labelled demo estimates of the order-system freeze plus maker/taker fee settlement, with a demo-only linear perpetual/leverage overlay; reuses the console theme.
 - **Health and readiness probes**: `/health` reports the gRPC listener, Raft core and WAL/state-machine frontier; `/ready` additionally requires a known leader, making both suitable for orchestrators.
 
 **Built to be trusted**
@@ -323,12 +324,12 @@ mockup.
 
 ## Demo Order Desk
 
-`demo/` is a standalone order-entry WebUI for a running node. It is a separate crate and process;
+`demos/order_system/` is a standalone order-entry WebUI for a running node. It is a separate crate and process;
 the engine binary and its routes are unchanged. It calls the public HTTP API through the
 leader-aware client and reuses the console theme. Start an initialized engine, then run:
 
 ```shell
-cargo run --manifest-path demo/Cargo.toml -- \
+cargo run --manifest-path demos/order_system/Cargo.toml -- \
   --addr 127.0.0.1:24300 --engine 127.0.0.1:24301 --engine-id 1
 ```
 
@@ -337,7 +338,7 @@ Open <http://127.0.0.1:24300/demo/>. Tabs cover the order ticket, the full order
 
 ![Demo order desk](./docs/demo-order-desk.png)
 
-See [`demo/README.md`](./demo/README.md) for the demo flow and
+See [`demos/order_system/README.md`](./demos/order_system/README.md) for the demo flow and
 [`docs/DEMO_ORDER_SYSTEM.md`](./docs/DEMO_ORDER_SYSTEM.md) for the design.
 
 ## Security and Deployment Boundary
@@ -406,6 +407,9 @@ examples/
 ├── dump_snapshot.rs         # JSONL dump of the current snapshot
 ├── replay_orders.rs         # Replay orders and compare match-result JSONL
 └── replay_orders_events.rs  # Replay orders and compare events from POST /events
+demos/
+├── order_system/            # Standalone order desk (separate crate)
+└── market_data_system/      # Standalone Binance-style WebSocket market-data service
 tests/
 ├── cluster/
     ├── main.rs              # Single integration test target
@@ -996,6 +1000,7 @@ placeholder). `sequence` is optional and defaults to `0`.
 | `tests/cluster/test_restart.rs` | Full node restart recovering the order book, sequence, event window and idempotency map via WAL replay and via snapshot + newer WAL tail; also 2k-order large-log replay and a multi-chunk (~120 KB) snapshot boot |
 | `tests/cluster/test_match_results.rs` | A node started with `--match-event-log` records rest/fill/cancel events in log order while the `/write` response stays unchanged; a second node checks stop triggers, GTD expiry and the new `/read` keys |
 | `tests/cluster/test_market_data.rs` | A node started with `--market-data-log` publishes a reset snapshot, one trade message per taker, BBO, post-entry depth totals and a closed OHLC bar; the assertions check `market_seq` anchors and `/read marketdata_status` counters |
+| `demos/market_data_system` | Stream parsing and payloads, WebSocket snapshots/conflation/combined streams/control errors, multiple symbols on one connection with live `UNSUBSCRIBE`/`SUBSCRIBE`, and an embedded-Aeron engine→service→WebSocket test (feature `aeron`) |
 | `tests/cluster/test_events.rs` | `/write` returns events, `/events` pages by cursor, `client_order_id` retries do not duplicate an order, `--max-events` eviction is visible in `/events/status`, long-poll wakes on a racing write or returns an empty page at the deadline, gRPC `StreamEvents` streams a fill and an idle heartbeat, and the bridge sidecar publishes events and checkpoints its cursor |
 | `tests/cluster/test_membership.rs` | Kill the elected leader: a surviving voter takes over with the committed book and accepts new writes. A learner added after the writes catches up through normal log replication, is promoted, and writes through its own node |
 | `tests/cluster/test_late_join.rs` | A node with a stale snapshot/WAL is removed, misses 40 writes while the leader snapshots and purges, then rejoins as a learner and catches up from the live cluster |

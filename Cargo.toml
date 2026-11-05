@@ -57,6 +57,10 @@ openraft = { version = "0.10.0-alpha.37", features = ["serde", "type-alias"] }
 futures = "0.3.34"
 i256 = "0.2.5"
 postcard = { version = "1.1.3", features = ["use-std"] }
+# Optional Aeron transport for the market-data feed. Pinned to 0.2.13: 0.2.14+
+# uses `std::hint::cold_path`, which is unstable on the project MSRV toolchain.
+rusteron-client = { version = "=0.2.13", default-features = false, features = ["static", "precompile-rustls"], optional = true }
+rusteron-media-driver = { version = "=0.2.13", default-features = false, features = ["static", "precompile-rustls"], optional = true }
 prost = "0.14.4"
 reqwest = { version = "0.13.5", features = ["json"] }
 serde = { version = "1.0.229", features = ["derive", "rc"] }
@@ -81,6 +85,8 @@ tonic-prost-build = "0.14.9"
 
 [features]
 docinclude = [] # Used only for activating `doc(include="...")` on nightly.
+# Publishes the market-data feed to Aeron channels (one publication per stream).
+market-data-aeron = ["dep:rusteron-client", "dep:rusteron-media-driver"]
 
 [package.metadata.docs.rs]
 features = ["docinclude"] # Activate `docinclude` during docs.rs build.

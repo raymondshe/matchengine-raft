@@ -1,6 +1,6 @@
 # Demo order system (WebUI) design
 
-Status: **implemented (M0/M1)** — the standalone `demo/` crate serves the order desk from its own
+Status: **implemented (M0/M1)** — the standalone `demos/order_system/` crate serves the order desk from its own
 listener; the engine binary and its routes are unchanged. M2 polish remains optional future work.
 
 Last updated: 2026-11-04.
@@ -154,7 +154,7 @@ Primary flow:
 browser
    │  demo process: static HTML/CSS/JS
    ▼
-demo Actix listener (demo/)
+demo Actix listener (demos/order_system/)
    ├── /demo/                  embedded assets
    ├── /demo/api/backends      both product backends (or perpetual: null)
    ├── /demo/api/state         active product's /read snapshot + Raft metrics
@@ -211,7 +211,7 @@ the leader-aware client.
 
 ### 5.4 Process and enablement
 
-The demo is a standalone crate at `demo/` with its own `Cargo.toml`, binary and embedded assets.
+The demo is a standalone crate at `demos/order_system/` with its own `Cargo.toml`, binary and embedded assets.
 It is never compiled into the matchengine-raft node. `scripts/demo-pair.sh` builds both binaries,
 starts the Spot and Perpetual engines on separate data dirs, configures EUR/USD and BTC/USDT, and
 runs the demo:
@@ -237,7 +237,7 @@ cargo run --bin matchengine-raft -- --id 1 --http-addr 127.0.0.1:24402 \
   --data-dir /tmp/matchengine-raft-demo/perp --instance-prefix demo-perp
 
 # demo process
-cargo run --manifest-path demo/Cargo.toml -- \
+cargo run --manifest-path demos/order_system/Cargo.toml -- \
   --addr 127.0.0.1:24400 \
   --engine 127.0.0.1:24401 --engine-id 1 \
   --perp-engine 127.0.0.1:24402 --perp-engine-id 1
@@ -395,7 +395,7 @@ legs; a market order, an IOC/FOK limit and a stop child have only the taker leg 
 rest. Fees are signed, so a negative rate shows as a rebate. Resting freezes use remaining open
 volume (including an iceberg's hidden reserve).
 
-**Estimation rules implemented in `demo/src/freeze.rs`:**
+**Estimation rules implemented in `demos/order_system/src/freeze.rs`:**
 
 - Reference price: order price, else stop price, else last trade for a market ticket preview.
 - Quote-volume limit orders normalize to floor base at the limit price and re-derive the notional
@@ -413,7 +413,7 @@ volume (including an iceberg's hidden reserve).
   precision, base freezes round up to the base lot, and a zero lot does not disable precision
   rounding. The browser never performs fee or freeze arithmetic.
 
-**Perpetual overlay rules implemented in `demo/src/freeze.rs`:**
+**Perpetual overlay rules implemented in `demos/order_system/src/freeze.rs`:**
 
 - The product is a **linear quote-margined perpetual**. Buy opens a long and sell opens a short;
   the order is sent to the **Perpetual backend's** engine as a normal cash order for that engine's
@@ -902,13 +902,13 @@ Kinds: `bad_request`, `not_configured`, `not_leader`, `no_leader`, `timeout`, `t
 
 The demo is a separate crate, outside the engine binary:
 
-- `demo/Cargo.toml` — standalone package; depends on `matchengine-raft` via a path.
-- `demo/src/main.rs` — CLI, Actix listener and route registration.
-- `demo/src/api.rs` — demo routes, assets and the write-action header check.
-- `demo/src/state.rs` — engine HTTP reads, DTOs, order construction, depth aggregation and errors.
-- `demo/src/freeze.rs` — demo-only freeze/settlement estimates for the cash/spot policy and the
+- `demos/order_system/Cargo.toml` — standalone package; depends on `matchengine-raft` via a path.
+- `demos/order_system/src/main.rs` — CLI, Actix listener and route registration.
+- `demos/order_system/src/api.rs` — demo routes, assets and the write-action header check.
+- `demos/order_system/src/state.rs` — engine HTTP reads, DTOs, order construction, depth aggregation and errors.
+- `demos/order_system/src/freeze.rs` — demo-only freeze/settlement estimates for the cash/spot policy and the
   linear perpetual overlay, exact `Fixed` arithmetic and aggregation by asset.
-- `demo/web/index.html`, `demo/web/app.js`, `demo/web/app.css` — demo UI.
+- `demos/order_system/web/index.html`, `demos/order_system/web/app.js`, `demos/order_system/web/app.css` — demo UI.
 - `docs/DEMO_ORDER_LAYOUT.html` — static layout preview.
 
 No `src/` file, engine route or `StorageConfig` field is changed by the demo.
@@ -930,7 +930,7 @@ const APP_CSS: &str = concat!(
 
 - `web/console/app.css` remains the single source of truth for colours, typography, topbar,
   buttons, tabs, panels, tables, filters, forms and banners.
-- `demo/web/app.css` adds only the trading-desk-specific layout: instrument grid, depth ladder,
+- `demos/order_system/web/app.css` adds only the trading-desk-specific layout: instrument grid, depth ladder,
   ticket fields, event tape/detail, symbol cards and full-book tables.
 - The console's HTML/CSS are untouched; `/demo/app.css` is a separate URL served by the demo
   process.
@@ -940,7 +940,7 @@ Reused classes include `.topbar`, `.brand`, `.chip`, `.badge`, `.dot`, `.btn`, `
 `.table-wrap`, `table`, `.filter-bar`, `.pager`, `.action-form`, `.check`, `.banner`, `.muted`,
 `.mono`, `.good`, `.warn`, `.bad`.
 
-New demo-only classes live in `demo/web/app.css` and cover:
+New demo-only classes live in `demos/order_system/web/app.css` and cover:
 
 - layout: `.desk-grid`, `.recent-events`, `.events-layout`, `.full-book-grid`, `.symbol-grid`
 - instrument/book: `.instrument-grid`, `.ladder`, `.spread-row`, `.orders-table`, `.full-table`,
@@ -1060,7 +1060,7 @@ const state = {
 - The event map is the dedupe source; the DOM is a projection of it.
 - No client-side calculation of balances, fees or freezes: the browser renders the engine's event
   fields verbatim and the demo BFF's clearly labelled estimates. Freeze and perpetual margin
-  arithmetic happens once, in `demo/src/freeze.rs`, using exact `Fixed` values. The leverage `<select>`
+  arithmetic happens once, in `demos/order_system/src/freeze.rs`, using exact `Fixed` values. The leverage `<select>`
   only supplies the `leverage` integer; the UI never derives margin or fee amounts.
 - Product/leverage metadata is demo-process state keyed by order sequence. It is not persisted,
   replicated or snapshot-backed; after a demo restart, still-resting perpetual orders render as
@@ -1093,7 +1093,7 @@ const state = {
 - The BFF never accepts a URL; the leader address comes from membership.
 - One submit in flight per tab; no destructive reset endpoint.
 - The demo is an order-entry path. The gateway must protect `/demo` and `/demo/api/*` exactly like
-  `/write`; this is documented in `demo/README.md`.
+  `/write`; this is documented in `demos/order_system/README.md`.
 
 ## 13. Testing
 
@@ -1111,28 +1111,28 @@ worth adding as the DTO layer grows:
 - Error mapping for no-leader, follower/forward, timeout and engine rejection.
 - Freeze estimation for every fee-asset policy and side, quote/base volume units, iceberg reserve,
   taker-only economics (market/stop/IOC/FOK), worst-case ticket rates, precision rounding and
-  missing reference prices. *(implemented in `demo/src/freeze.rs` — 23 cases)*
+  missing reference prices. *(implemented in `demos/order_system/src/freeze.rs` — 23 cases)*
 - Perpetual overlay: long/short mapping, margin plus quote fee, leverage bounds, quote-policy
   requirement (quote only; `received` and `base` refused), quote-volume market-sell collateral,
-  worst-case ticket rate and zero buffer. *(implemented in `demo/src/freeze.rs`)*
+  worst-case ticket rate and zero buffer. *(implemented in `demos/order_system/src/freeze.rs`)*
 - Perpetual edge cases: leverage-boundary estimates (1x and 100x) and out-of-range rejection,
   rebate clamping (the freeze never drops below the initial margin), margin-plus-fee rounding to
   quote precision, quote-volume limit normalization, stop-market reference price, IOC taker-only
   rate, missing-reference rejection for market and limit tickets, exact 18-decimal arithmetic
   with end-only rounding, overflow returning `None` instead of panicking, and margin aggregation
-  by quote asset. *(implemented in `demo/src/freeze.rs`)*
+  by quote asset. *(implemented in `demos/order_system/src/freeze.rs`)*
 - Perpetual DTO/state: `DeskOrder` product/leverage serialization, margin terms, ticket defaults,
   `validate_product` leverage/policy guards (spot bypasses both), leverage metadata surviving an
   amend's sequence change and being ignored on the spot backend, and fractional-leverage ticket
-  rejection. *(implemented in `demo/src/state.rs`)*
+  rejection. *(implemented in `demos/order_system/src/state.rs`)*
 
 ### Demo crate tests
 
-- `cargo test --manifest-path demo/Cargo.toml` (47 tests) covers ticket/TIF conversion, exact fee
+- `cargo test --manifest-path demos/order_system/Cargo.toml` (47 tests) covers ticket/TIF conversion, exact fee
   rates, best-first depth aggregation, `DeskOrder`/freeze-state payloads, product validation and
-  leverage metadata in `demo/src/state.rs`, plus the freeze policy, settlement math and the
-  perpetual margin/fee/rounding/rebate/overflow cases in `demo/src/freeze.rs`.
-- `cargo clippy --manifest-path demo/Cargo.toml --all-targets -- -D warnings` and the demo fmt
+  leverage metadata in `demos/order_system/src/state.rs`, plus the freeze policy, settlement math and the
+  perpetual margin/fee/rounding/rebate/overflow cases in `demos/order_system/src/freeze.rs`.
+- `cargo clippy --manifest-path demos/order_system/Cargo.toml --all-targets -- -D warnings` and the demo fmt
   check keep the separate crate clean.
 - Manual/scripted smoke: run an engine, initialize it, start the demo process, then configure a
   symbol, place/cancel/amend orders, page `/events` with `limit=1`, reload with a saved cursor and
@@ -1163,15 +1163,15 @@ worth adding as the DTO layer grows:
 
 ## 15. Implementation plan
 
-Implemented: **M0** and **M1** ship in `demo/`. **M2** remains optional future work.
+Implemented: **M0** and **M1** ship in `demos/order_system/`. **M2** remains optional future work.
 
 ### M0 — Standalone demo foundation
 
-1. Create the `demo/` crate; depend on `matchengine-raft` by path and leave the engine binary
+1. Create the `demos/order_system/` crate; depend on `matchengine-raft` by path and leave the engine binary
    unchanged.
 2. Add HTTP state aggregation over `/read` and `/metrics`, event paging over `/events`, and order
    DTOs over `/write`.
-3. Serve the demo assets and combine `web/console/app.css` with `demo/web/app.css`.
+3. Serve the demo assets and combine `web/console/app.css` with `demos/order_system/web/app.css`.
 4. Add unit tests for ticket conversion, fee rates and depth aggregation.
 5. Smoke-test against a separately running engine: configure, place, cancel/amend, page events and
    load the full book.
@@ -1225,7 +1225,7 @@ Implemented: **M0** and **M1** ship in `demo/`. **M2** remains optional future w
 
 ## 18. Acceptance criteria
 
-1. The `demo/` binary starts separately with `--addr`, `--engine` and `--engine-id`; the engine
+1. The `demos/order_system/` binary starts separately with `--addr`, `--engine` and `--engine-id`; the engine
    binary and its routes are unchanged. The page uses the shared console theme.
 2. The page shows node/leader/term/ready, the symbol (or the configuration form), BBO, depth,
    open orders, parked stops and the event window.
@@ -1244,5 +1244,5 @@ Implemented: **M0** and **M1** ship in `demo/`. **M2** remains optional future w
 10. The ticket offers Spot/Perpetual and, for a quote-fee symbol, a leverage selection in
    `1..=100`; a perpetual order shows leverage, long/short, notional, initial margin, fee and zero
    buffer, and the demo rejects perpetual orders on a non-quote policy with a clear message.
-11. `cargo test --manifest-path demo/Cargo.toml`, the demo fmt check and the demo Clippy run are
+11. `cargo test --manifest-path demos/order_system/Cargo.toml`, the demo fmt check and the demo Clippy run are
    clean; the engine's `cargo fmt`, Clippy and MSRV checks are unaffected.
