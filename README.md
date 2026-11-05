@@ -19,15 +19,26 @@
 [![Snapshot v10](https://img.shields.io/badge/snapshot-v10-blue.svg)](./docs)
 [![Market-data wire v6](https://img.shields.io/badge/marketdata%20wire-v6-blue.svg)](./docs/MARKET_DATA_PLAN.md)
 
-A practical implementation of a distributed matching engine built upon [OpenRaft](https://github.com/datafuselabs/openraft). Raft logs are persisted in a hand-written segmented write-ahead log and the state machine is made durable with atomic snapshots, so a node recovers all committed state after a restart.
+A Raft-replicated matching engine in Rust for teams that need deterministic execution, durable recovery and a live market-data path — without treating the engine as a black box.
+
+**Why teams pick it**
+
+- **Deterministic execution** — price-time matching where `apply` reads no wall clock; replaying the log reproduces the book exactly.
+- **Durable by default** — a hand-written segmented WAL, atomic snapshots and snapshot + WAL-tail recovery, all exercised by restart and failure tests.
+- **Raft-native** — OpenRaft 0.10 over gRPC with Pre-Vote, leadership transfer, learner catch-up and chunked snapshot install.
+- **Exact 18-decimal fixed point** — no `f64` in the matching path; prices, quantities and fees survive the API, events, snapshots and feeds.
+- **Live data, not batch** — the deterministic feed is published over Aeron (one exclusive publication per stream) and served as Binance-style WebSocket streams with 100/1000 ms depth conflation and horizontal scale-out.
+- **Operable** — embedded console, `/health` + `/ready`, metrics, replay tools and a standalone order-desk demo.
 
 | Area | Today |
 |---|---|
 | Execution | Deterministic price-time matching; `apply` reads no wall clock |
 | Durability | Segmented WAL + atomic snapshots; snapshot every 100k entries or 30 minutes |
 | Replication | Raft peer RPCs over gRPC |
+| Market data | Aeron egress on streams 2001–2007 + Binance-style WebSocket service |
 | Symbol model | One symbol per process/cluster, configured and locked through Raft |
 | Numeric model | Exact 18-decimal fixed point through matching, events, snapshots and feeds |
+| Observability | Embedded console, health/readiness endpoints and metrics |
 | Public edge | Bounded request/snapshot limits; loopback or private-network deployment |
 
 ## Table of Contents
@@ -38,6 +49,7 @@ A practical implementation of a distributed matching engine built upon [OpenRaft
 - [Running the Cluster](#running-the-cluster)
 - [Operational Console](#operational-console)
 - [Demo Order Desk](#demo-order-desk)
+- [Market-Data System over Aeron](#market-data-system-over-aeron)
 - [Security and Deployment Boundary](#security-and-deployment-boundary)
 - [Project Structure](#project-structure)
 - [Storage Implementation](#storage-implementation)
@@ -49,7 +61,7 @@ A practical implementation of a distributed matching engine built upon [OpenRaft
 
 ## Features
 
-Built for teams that need deterministic execution, durable recovery and a clean downstream feed — without treating the matching engine as a black box.
+Everything below is implemented in this repository and exercised by tests; the links point at the code.
 
 **Matching engine**
 - **Price-time priority order book** with GTC, IOC, FOK, GTD, Day, market, post-only, iceberg, stop-market and stop-limit orders.
@@ -68,8 +80,8 @@ Built for teams that need deterministic execution, durable recovery and a clean 
 
 **APIs and data feeds**
 - **Durable match-event feed** at `POST /events` with cursor pagination, long-poll (`wait_ms`), retention limits, `client_order_id` idempotency, gRPC `StreamEvents` streaming and a reference MQ bridge sidecar; replay-safe retries.
-- **Deterministic market-data feed** with leader gating, shadow book, BBO, depth snapshots/deltas, lifecycle events, OHLC bars and a compact binary wire format with a reference decoder.
-- **Standalone market-data system** at `demos/market_data_system/`: consumes the feed over Aeron (feature-gated) or JSONL and serves Binance-style WebSocket streams. One instance serves several symbols from a shared hub; clients hold a per-connection subscription set, switch symbols with live `UNSUBSCRIBE`/`SUBSCRIBE`, and scale horizontally without adding engine work.
+- **Deterministic market-data feed** with leader gating, shadow book, BBO, depth snapshots/deltas, lifecycle events, OHLC bars and a compact binary wire format with a reference decoder. The feature-gated **Aeron** egress publishes it on streams 2001–2007 with one exclusive publication per stream.
+- **Standalone market-data system** at `demos/market_data_system/`: consumes the feed over Aeron or JSONL and serves Binance-style WebSocket streams. One instance serves several symbols from a shared hub; clients hold a per-connection subscription set, switch symbols with live `UNSUBSCRIBE`/`SUBSCRIBE`, and scale horizontally without adding engine work.
 - **Flexible read consistency**: local reads, linearizable leader reads and linearizable follower reads.
 - **Leader-aware Rust client** that tracks and forwards requests to the current leader, with configurable timeouts, transient retry/backoff and typed API/no-leader errors; retries are at-least-once, so use `client_order_id` for idempotent write retries.
 - **Operational APIs** for initialization, membership changes, metrics, event status and market-data status.
@@ -110,7 +122,7 @@ This project extends the [example-raft-kv](https://github.com/datafuselabs/openr
                                         │                                 │ MarketDataSink
                                         │                                 ▼
                                         │             ┌──────────────────────────────────────┐
-                                        │             │   JSONL now · Aeron 2001–2007 next   │
+                                        │             │  JSONL debug · Aeron 2001–2007 live  │
                                         │             │      TRADE BBO DEPTH LIFECYCLE       │
                                         │             │              STATUS BAR              │
                                         ▼             └──────────────────────────────────────┘
@@ -132,9 +144,10 @@ This project extends the [example-raft-kv](https://github.com/datafuselabs/openr
 Peer-to-peer Raft RPCs use gRPC on `port + 1000`. The public application and management API
 stays on the `--http-addr` listener. Raft RPCs are not part of the HTTP JSON API.
 
-Market-data egress is node-local and off the consensus path: the tap is a bounded `try_send`, so a
-slow subscriber can never block `apply`. The JSONL sink is for debugging; the same wire-v6 messages
-are what the Aeron adapter (streams 2001–2007) will publish next.
+Market-data egress is off the consensus path: the tap is a bounded `try_send`, so a slow
+subscriber can never block `apply`. The feature-gated `AeronSink` publishes the same wire-v6
+messages on streams 2001–2007 from a dedicated publisher thread, with one exclusive publication
+per stream; the JSONL sink remains available for debugging.
 
 ### Key Components
 
@@ -160,7 +173,7 @@ are what the Aeron adapter (streams 2001–2007) will publish next.
    - `apply` hands match events and a depth journal to a bounded tap (`try_send`; matching never waits)
    - A leader-gated tokio task keeps a shadow book, derives BBO/OHLC bars and encodes wire v6
    - Keys are `(symbol_id, stream_id, market_seq, sub_seq)`; one uncapped `TRADE` per taker
-   - JSONL sink today; Aeron streams 2001–2007 are the next phase
+   - JSONL sink for debugging; the feature-gated `AeronSink` publishes streams 2001–2007 with one exclusive publication per stream
 
 ## Getting Started
 
@@ -340,6 +353,45 @@ Open <http://127.0.0.1:24300/demo/>. Tabs cover the order ticket, the full order
 
 See [`demos/order_system/README.md`](./demos/order_system/README.md) for the demo flow and
 [`docs/DEMO_ORDER_SYSTEM.md`](./docs/DEMO_ORDER_SYSTEM.md) for the design.
+
+## Market-Data System over Aeron
+
+`demos/market_data_system/` is the live distribution tier. The engine publishes
+its deterministic feed through the feature-gated `AeronSink` on streams
+2001–2007; one exclusive publication per stream and a dedicated publisher
+thread keep a large depth snapshot from head-of-line-blocking trades. Aeron
+multicast fans the same bytes out to any number of stateless service instances,
+so the engine's publish cost is independent of WebSocket clients.
+
+The service keeps a shadow book per symbol, conflates diff depth at 100/1000 ms,
+pushes a snapshot on subscribe, serializes each stream message once and fans it
+out through bounded per-connection queues. The test page uses one WebSocket and
+switches symbols with live `UNSUBSCRIBE`/`SUBSCRIBE`:
+
+<p align="center">
+  <img src="./docs/market-data-system.png" alt="Market-data WebSocket test page" width="900">
+</p>
+
+**Why it is fast and live-safe**
+
+- `apply` never waits on a subscriber: the tap is a bounded `try_send`, and a
+  full queue drops frames and emits `GAP` while consensus continues.
+- One exclusive Aeron publication per stream; a depth snapshot cannot block a
+  trade or status stream.
+- One JSON encode per stream message, shared as `Bytes` across every subscriber.
+- 100/1000 ms depth conflation and latest-value collapse for `bookTicker` and
+  partial depth, so bursts do not multiply socket writes.
+- Deterministic `(symbol_id, stream_id, market_seq, sub_seq)` keys make
+  failover, restart and multi-instance fan-out content-identical.
+- Stateless instances rebuild from a periodic reset snapshot plus deltas and
+  scale horizontally behind a load balancer.
+- The feed path is load-tested at 500k fills/s (495k fills/s, zero drops at the
+  8,192-frame tap queue).
+
+Run it with `./scripts/market-data-system.sh` (two engines over Aeron IPC) and
+open <http://127.0.0.1:24800/>. See
+[`demos/market_data_system/README.md`](./demos/market_data_system/README.md)
+and [`docs/MARKET_DATA_WEBSOCKET.md`](./docs/MARKET_DATA_WEBSOCKET.md).
 
 ## Security and Deployment Boundary
 
@@ -704,10 +756,15 @@ designed in `docs/AERON_SOLUTION.md` Part II and implemented in `src/market_data
   every leadership gain starts with a reset snapshot whose boundary is the next `market_seq`. A full
   queue drops frames and emits a `GAP`; `apply` is never blocked or slowed by a subscriber.
 
-The shipped sink is JSONL for debugging. The same messages have a binary encoding in
-`src/market_data/wire.rs` (64-byte header, version 6, scale-18 `i128` bodies), and `MarketDataSink`
-is the seam the Aeron adapter will implement (next phase). Every message carries the configured
-process `symbol_id`, so separate per-symbol deployments can share a bus. Tuning: `--market-data-depth`, `--market-data-status-every`,
+The JSONL sink remains available for debugging. The same messages have a binary encoding in
+`src/market_data/wire.rs` (64-byte header, version 6, scale-18 `i128` bodies). With the
+`market-data-aeron` feature, `AeronSink` publishes them on streams 2001–2007 from a dedicated
+thread: one exclusive publication per stream, an embedded or external media driver, and a periodic
+reset depth snapshot (`--market-data-aeron-snapshot-every-ms`, default 30 s) so a service can join
+mid-stream. Every message carries the configured process `symbol_id`, so separate per-symbol
+deployments can share a bus. Tuning: `--market-data-aeron-channel`,
+`--market-data-aeron-stream-base`, `--market-data-aeron-dir`,
+`--market-data-aeron-embedded-driver`, `--market-data-depth`, `--market-data-status-every`,
 `--market-data-bar-intervals-ms`, `--market-data-leader-only`.
 
 `/read marketdata_status` returns the feed counters and the leader gate.

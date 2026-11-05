@@ -11,6 +11,15 @@ symbols is `UNSUBSCRIBE` for the old symbol's topics plus `SUBSCRIBE` for the
 new ones **on the same socket** — no reconnect. A client may also hold streams
 for several symbols at once (up to 1024 streams per connection).
 
+<p align="center">
+  <img src="../../docs/market-data-system.png" alt="Market-data WebSocket test page" width="900">
+</p>
+
+The page shows the shared hub in action: one WebSocket connection, per-symbol
+readiness, a live book/trade tape and the raw frames. Switching the dropdown
+unsubscribes the old symbol's topics and subscribes the new ones without
+reconnecting.
+
 The production transport is **Aeron**: each engine publishes one stream per
 product on a multicast/unicast channel (or IPC on one host), and each service
 instance subscribes independently. That gives low latency and horizontal
@@ -27,6 +36,35 @@ engine B (BTC/USDT) ─ AeronSink ── streams 2001..2007 ──┤  multicast
                                                         │
                                           shared WS hub → clients
 ```
+
+## Why Aeron
+
+The production path is built for a live feed, not a request/response API:
+
+- **One exclusive publication per stream** (TRADE, BBO, DEPTH_SNAPSHOT,
+  DEPTH_DELTA, LIFECYCLE, STATUS, BAR) from a dedicated publisher thread. A
+  large depth snapshot cannot head-of-line-block a trade or status frame.
+- **Multicast fan-out**: the engine publishes once and every market-data
+  instance subscribes independently. Adding WebSocket clients or service
+  instances does not change the engine's publish cost.
+- **Never on the matching path**: `apply` only appends the visible-depth
+  journal and `try_send`s into a bounded tap. A full queue drops frames and
+  emits `GAP`; consensus latency is independent of subscribers.
+- **Deterministic content**: `(symbol_id, stream_id, market_seq, sub_seq)` keys
+  are identical on leader, followers, failover and restart, so instances and
+  clients can deduplicate and replay safely.
+- **Service-side fan-out**: a per-symbol assembler, 100/1000 ms depth
+  conflation, one JSON encode per stream message shared as `Bytes`, bounded
+  per-connection FIFOs, and close code `1013` for slow consumers.
+- **Stateless scale-out**: an instance rebuilds from the periodic reset
+  snapshot plus deltas; add instances behind a load balancer without any engine
+  involvement.
+
+The feed path has been load-tested at 500k fills/s (495k fills/s, zero drops
+at the 8,192-frame tap queue; see [`docs/PERFORMANCE.md`](../../docs/PERFORMANCE.md)).
+The Aeron transport keeps that same backpressure contract: a slow instance
+falls behind and re-syncs from the next snapshot rather than slowing the
+engine.
 
 ## Run with Aeron (one host, IPC)
 

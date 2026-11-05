@@ -19,15 +19,26 @@
 [![快照 v10](https://img.shields.io/badge/%E5%BF%AB%E7%85%A7-v10-blue.svg)](./docs)
 [![行情线格式 v6](https://img.shields.io/badge/%E8%A1%8C%E6%83%85%20wire-v6-blue.svg)](./docs/MARKET_DATA_PLAN.md)
 
-这是一个基于 [OpenRaft](https://github.com/datafuselabs/openraft) 构建的分布式撮合引擎的实践实现。Raft 日志持久化在自研的分段预写日志（WAL）中，状态机通过原子快照落盘，因此节点重启后可以恢复全部已提交状态。
+一个用 Rust 构建、基于 Raft 复制的撮合引擎，面向需要确定性执行、可靠恢复和实时行情链路的团队——而不是把撮合引擎当成黑盒。
+
+**为什么选择它**
+
+- **确定性执行** — 价格-时间优先撮合，`apply` 不读墙上时钟；重放日志可以精确复现订单簿。
+- **默认持久化** — 自研分段 WAL、原子快照和“快照 + WAL 尾部”恢复，均由重启和故障测试覆盖。
+- **Raft 原生** — OpenRaft 0.10 + gRPC，支持 Pre-Vote、领导权转移、学习者追赶和分块快照安装。
+- **18 位定点数** — 撮合路径不使用 `f64`；价格、数量和费用在 API、事件、快照和 feed 中全程精确。
+- **实时行情** — 确定性 feed 通过 Aeron 发布（每个流一个独占 publication），再由 Binance 风格 WebSocket 服务分发，支持 100/1000 ms 深度合并和水平扩展。
+- **可运维** — 内置控制台、`/health` + `/ready`、指标、重放工具和独立下单演示。
 
 | 维度 | 当前状态 |
 |---|---|
 | 执行 | 确定性价格-时间撮合；`apply` 不读墙上时钟 |
 | 持久化 | 分段 WAL + 原子快照；每 100,000 条日志或 30 分钟生成快照 |
 | 复制 | Raft 节点间 RPC 使用 gRPC |
+| 行情数据 | Aeron 出口（2001–2007 流）+ Binance 风格 WebSocket 服务 |
 | 标的模型 | 一个进程/集群一个标的，经 Raft 配置并在交易开始后锁定 |
 | 数值模型 | 撮合、事件、快照和 feed 全程使用 18 位定点数 |
+| 可观测性 | 内置控制台、健康/就绪检查和指标 |
 | 公共入口 | 请求/快照大小受限；仅支持回环或私有网络部署 |
 
 ## 目录
@@ -38,6 +49,7 @@
 - [运行集群](#运行集群)
 - [运维控制台](#运维控制台)
 - [演示下单系统](#演示下单系统)
+- [基于 Aeron 的行情数据系统](#基于-aeron-的行情数据系统)
 - [安全与部署边界](#安全与部署边界)
 - [项目结构](#项目结构)
 - [存储实现](#存储实现)
@@ -49,7 +61,7 @@
 
 ## 功能特性
 
-面向需要确定性执行、可靠恢复和清晰下游 feed 的团队，而不是把撮合引擎当成黑盒。
+以下能力均已实现并有测试覆盖，链接指向对应代码。
 
 **撮合引擎**
 - **价格-时间优先订单簿**，支持 GTC、IOC、FOK、GTD、Day、市价、Post-Only、冰山单、止损市价单和止损限价单。
@@ -68,8 +80,8 @@
 
 **API 与数据 Feed**
 - **持久化撮合事件 Feed**：`POST /events` 游标分页、长轮询（`wait_ms`）、保留上限、`client_order_id` 幂等、gRPC `StreamEvents` 流式推送和参考 MQ bridge sidecar，安全重试。
-- **确定性行情 Feed**：领导者门控、影子订单簿、BBO、深度快照/增量、生命周期事件、OHLC K 线和紧凑二进制行情格式（含参考解码器）。
-- **独立行情数据系统** `demos/market_data_system/`：通过 Aeron（feature 门控）或 JSONL 消费 feed，并提供 Binance 风格 WebSocket 行情流。一个实例通过共享 hub 服务多个 symbol；连接持有自己的订阅集合，可用实时 `UNSUBSCRIBE`/`SUBSCRIBE` 切换 symbol，并可水平扩展而不增加引擎开销。
+- **确定性行情 Feed**：领导者门控、影子订单簿、BBO、深度快照/增量、生命周期事件、OHLC K 线和紧凑二进制行情格式（含参考解码器）。feature 门控的 **Aeron** 出口通过 2001–2007 流发布，每个流一个独占 publication。
+- **独立行情数据系统** `demos/market_data_system/`：通过 Aeron 或 JSONL 消费 feed，并提供 Binance 风格 WebSocket 行情流。一个实例通过共享 hub 服务多个 symbol；连接持有自己的订阅集合，可用实时 `UNSUBSCRIBE`/`SUBSCRIBE` 切换 symbol，并可水平扩展而不增加引擎开销。
 - **灵活读取一致性**：本地读、领导者线性一致读和 follower 线性一致读。
 - **领导者感知 Rust 客户端**，自动跟踪并转发到当前领导者，支持可配置超时、瞬时错误重试/退避以及类型化的 API/无领导者错误；重试是至少一次语义，写入重试应使用 `client_order_id` 实现幂等。
 - **运维 API**：初始化、成员变更、指标、事件状态和行情状态。
@@ -110,7 +122,7 @@
                                         │                                 │ MarketDataSink
                                         │                                 ▼
                                         │             ┌──────────────────────────────────────┐
-                                        │             │  当前 JSONL · 后续 Aeron 2001–2007   │
+                                        │             │  JSONL 调试 · Aeron 2001–2007 实时   │
                                         │             │        成交 BBO 深度 生命周期        │
                                         │             │               状态 K线               │
                                         ▼             └──────────────────────────────────────┘
@@ -132,9 +144,9 @@
 节点间 Raft RPC 使用 `端口 + 1000` 上的 gRPC。公共应用/管理 API 仍由 `--http-addr` 监听器提供；
 Raft RPC 不属于 HTTP JSON API。
 
-行情输出是节点本地的，且不参与共识：tap 使用有界 `try_send`，因此慢订阅者永远不会阻塞
-`apply`。JSONL sink 仅用于调试；同样的线格式 v6 消息就是后续 Aeron 适配器（2001–2007 流）
-要发布的内容。
+行情输出不参与共识：tap 使用有界 `try_send`，因此慢订阅者永远不会阻塞 `apply`。feature 门控的
+`AeronSink` 由专用发布线程把同样的线格式 v6 消息发布到 2001–2007 流，每个流一个独占 publication；
+JSONL sink 继续用于调试。
 
 ### 核心组件
 
@@ -159,7 +171,7 @@ Raft RPC 不属于 HTTP JSON API。
    - `apply` 将撮合事件和深度日志交给有界 tap（`try_send`，撮合路径永不等待）
    - 仅领导者发布的任务维护影子订单簿、生成 BBO/OHLC K 线并编码线格式 v6
    - 消息键为 `(symbol_id, stream_id, market_seq, sub_seq)`；每个 taker 一条不设上限的 `TRADE`
-   - 当前使用 JSONL sink；下一阶段是 Aeron 2001–2007 流
+   - JSONL sink 用于调试；feature 门控的 `AeronSink` 通过 2001–2007 流发布，每个流一个独占 publication
 
 ## 快速开始
 
@@ -336,6 +348,34 @@ quote 保证金叠加层，会估算名义价值、初始保证金和费用，�
 
 运行流程见 [`demos/order_system/README.md`](./demos/order_system/README.md)，设计见
 [`docs/DEMO_ORDER_SYSTEM.md`](./docs/DEMO_ORDER_SYSTEM.md)。
+
+## 基于 Aeron 的行情数据系统
+
+`demos/market_data_system/` 是实时行情分发层。引擎通过 feature 门控的 `AeronSink` 把确定性 feed
+发布到 2001–2007 流；每个流一个独占 publication，并由专用发布线程发送，因此大深度快照不会阻塞成交或
+状态流。Aeron 多播把同一份字节扇出到任意数量的无状态服务实例，引擎发布成本与 WebSocket 客户端数量无关。
+
+服务按 symbol 维护影子订单簿，以 100/1000 ms 合并深度增量，订阅时推送快照，每条流消息只编码一次 JSON，
+再通过有界连接队列扇出。测试页面只使用一个 WebSocket，通过实时 `UNSUBSCRIBE`/`SUBSCRIBE` 切换 symbol：
+
+<p align="center">
+  <img src="./docs/market-data-system.png" alt="行情数据 WebSocket 测试页" width="900">
+</p>
+
+**高性能与实时安全设计**
+
+- `apply` 从不等待订阅者：tap 是有界 `try_send`，队列满时丢帧并发送 `GAP`，共识继续推进。
+- 每个流一个独占 Aeron publication；深度快照不会阻塞成交或状态流。
+- 每条流消息只编码一次 JSON，以 `Bytes` 共享给所有订阅者。
+- 100/1000 ms 深度合并，`bookTicker` 和部分深度按最新值折叠，突发流量不会放大 socket 写入。
+- 确定性的 `(symbol_id, stream_id, market_seq, sub_seq)` 键保证主备切换、重启和多实例扇出内容一致。
+- 无状态实例从周期重置快照 + 增量恢复，可在负载均衡后水平扩展。
+- feed 路径已按 500k fills/s 压测（495k fills/s，8,192 帧 tap 队列零丢弃）。
+
+运行 `./scripts/market-data-system.sh`（两个引擎通过 Aeron IPC）并打开
+<http://127.0.0.1:24800/>。详见
+[`demos/market_data_system/README.md`](./demos/market_data_system/README.md) 和
+[`docs/MARKET_DATA_WEBSOCKET.md`](./docs/MARKET_DATA_WEBSOCKET.md)。
 
 ## 安全与部署边界
 
@@ -667,10 +707,14 @@ cargo run --bin events_bridge -- \
   重置快照（边界为下一个 `market_seq`）。队列满时丢弃帧并发送 `GAP`，`apply` 永远不会被订阅者阻塞
   或拖慢。
 
-当前 sink 是用于调试的 JSONL。同样的消息在 `src/market_data/wire.rs` 有二进制编码（64 字节头、
-版本 6、scale-18 `i128`、小端消息体），`MarketDataSink` 就是后续 Aeron 适配器的接入点。每条消息携带
-当前进程配置的 `symbol_id`，便于多个按标的部署共享总线。可调参数：`--market-data-depth`、`--market-data-status-every`、
-`--market-data-bar-intervals-ms`、`--market-data-leader-only`。
+JSONL sink 继续用于调试。同样的消息在 `src/market_data/wire.rs` 有二进制编码（64 字节头、版本 6、
+scale-18 `i128`、小端消息体）。启用 `market-data-aeron` feature 后，`AeronSink` 由专用线程把它们发布到
+2001–2007 流：每个流一个独占 publication，支持嵌入式或外部 media driver，并周期重发重置深度快照
+（`--market-data-aeron-snapshot-every-ms`，默认 30 秒），让服务可以在流中途加入。每条消息携带当前进程配置的
+`symbol_id`，便于多个按标的部署共享总线。可调参数：`--market-data-aeron-channel`、
+`--market-data-aeron-stream-base`、`--market-data-aeron-dir`、`--market-data-aeron-embedded-driver`、
+`--market-data-depth`、`--market-data-status-every`、`--market-data-bar-intervals-ms`、
+`--market-data-leader-only`。
 
 `/read marketdata_status` 返回 feed 计数器和领导者门控状态。
 
