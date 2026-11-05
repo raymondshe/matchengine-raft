@@ -32,19 +32,17 @@ restarts without a partial snapshot and retries cleanly. Pre-Vote is enabled wit
 RPC (§4), so an isolated node asks before campaigning. The wire v6 reference decoder and golden
 tests are complete (§6).
 
-The next work, in order (re-prioritised 2026-11-04 after the benchmark-measurement pass and the
+The next work, in order (re-prioritised 2026-11-05 after the benchmark-measurement pass and the
 external optimization-notes re-review, whose verdicts are in
 [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md)):
 
 1. **Benchmark regression gate (§8, P2).** Gate CI on `apply_path` allocs/entry (deterministic) plus
    loose percentile thresholds now that `book_replay` and `level_book` report warm p50/p99.
-2. **Event delivery Phase 4 (§5).** Long-poll `wait_ms`, gRPC `StreamEvents` and the optional MQ
-   bridge; this also settles the event-time/cursor item in §11.
-3. **Realistic-mix replay benchmark (§8, P2).** Replay a large fixture with a real
+2. **Realistic-mix replay benchmark (§8, P2).** Replay a large fixture with a real
    add/cancel/amend mix (stops, icebergs, fees) and report percentiles - the load analogue of
    `tests/replay` and the closest equivalent to the ITCH-style replay the external notes treat as
    the only production-like signal.
-4. **Linux pinned-core `e2e` pass (§8, P2).** `--pin <cpu>` is implemented (Linux
+3. **Linux pinned-core `e2e` pass (§8, P2).** `--pin <cpu>` is implemented (Linux
    `sched_setaffinity`) and fails loudly on macOS; run
    `cargo bench --bench e2e -- --pin 0` once on a Linux host to record the true single-core number.
 
@@ -236,9 +234,9 @@ Remaining:
   tombstones.
 - [ ] **P2** Port the missing OrderBook-rs types: trailing stops, pegged orders, custom reserve
   replenishment, stop-protection collars, market-to-limit and self-trade prevention.
-- [ ] **P2** Phase 4 of match-result delivery: long-poll/short-poll `/events` (`wait_ms`), gRPC
-  `StreamEvents`, and an optional MQ bridge sidecar. Decide event time and per-instrument cursors
-  for multi-symbol deployments.
+- [x] **P2** Phase 4 of match-result delivery: long-poll `/events` (`wait_ms`), gRPC
+  `StreamEvents` and a reference MQ bridge sidecar (`src/bin/events_bridge.rs`) with cursor
+  checkpointing; event time and cursor scope decided in `docs/MATCH_RESULTS.md` §4.8.
 - [ ] **P3** Consider protobuf/Avro on the public HTTP API. Raft RPCs already use postcard over
   gRPC.
 
@@ -463,8 +461,10 @@ These choices feed the priorities above; write them down as ADRs or doc notes wh
   79-88% *worse* for single-operation latency and removed it again (their Optimization 7 -> 9);
   inline `SmallVec` buffers are the adopted approach. See
   [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md).
-- [ ] **P2** Decide the event time source for the clearing feed and per-instrument cursor retention
-  (Phase 4 in §5).
+- [x] **P2** Decide the event time source for the clearing feed and per-instrument cursor retention
+  (Phase 4 in §5): events are ordered by `(log_index, ordinal)` only and carry no wall clock;
+  the intake timestamp stays on the order/market data. Cursors are per deployment, which is
+  already per instrument (one symbol per process/cluster). See `docs/MATCH_RESULTS.md` §4.8.
 
 ## 12. Maker and taker fees — done
 

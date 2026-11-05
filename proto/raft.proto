@@ -36,6 +36,35 @@ service RaftService {
   rpc TransferLeader(TransferLeaderCall) returns (TransferLeaderResponse);
 }
 
+// Internal match-event streaming for clearing systems and MQ bridge sidecars.
+//
+// Pages are `postcard`-encoded `EventsResponse` values, the same schema as
+// `POST /events`. The stream is anchored with one ReadIndex at open (the
+// serving node must be the leader); later pages are committed applied events.
+service EventService {
+  // Stream event pages as they are applied. An idle stream delivers an empty
+  // page after at most `wait_ms`, which doubles as a liveness heartbeat.
+  rpc StreamEvents(StreamEventsRequest) returns (stream StreamEventsPage);
+}
+
+message StreamEventsRequest {
+  // Cursor: events strictly after this id. Omit both fields to start at the
+  // oldest retained event.
+  optional uint64 after_log_index = 1;
+  optional uint32 after_ordinal = 2;
+  // Page size, 1..=1000 (default 500).
+  optional uint32 limit = 3;
+  // Idle wait per page in milliseconds, 0..=1000 (default 0, no wait).
+  optional uint32 wait_ms = 4;
+  // Stop after this many pages; 0 streams until the client cancels.
+  optional uint32 max_pages = 5;
+}
+
+message StreamEventsPage {
+  // JSON-encoded `EventsResponse`, the same object as `POST /events`.
+  bytes payload = 1;
+}
+
 message AppendRequest {
   bytes payload = 1;
 }

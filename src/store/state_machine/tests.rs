@@ -1643,3 +1643,78 @@ async fn event_log_and_dedupe_survive_a_snapshot() {
     assert_eq!(1, content.orders.len());
     assert_eq!(1, content.sequence);
 }
+
+/// Long-poll readers sleep on the event watermark; only appends may wake them.
+#[tokio::test]
+async fn apply_wakes_event_waiters_only_when_events_are_appended() {
+    use openraft::alias::EntryOf;
+    use openraft::alias::EntryPayloadOf;
+
+    fn entry(
+        index: u64,
+        payload: EntryPayloadOf<MatchEngineTypeConfig>,
+    ) -> EntryOf<MatchEngineTypeConfig> {
+        Entry {
+            log_id: log_id(1, index),
+            payload,
+        }
+    }
+
+    let dir = tempdir();
+    let mut store = StateMachineStore::<MatchEngineTypeConfig>::open(dir.path()).unwrap();
+    let mut changed = store.subscribe_events();
+    assert_eq!(&None, &*changed.borrow_and_update());
+
+    // A blank entry applies but appends no events.
+    store
+        .apply(futures::stream::iter(vec![Ok((
+            entry(1, EntryPayload::Blank),
+            None,
+        ))]))
+        .await
+        .unwrap();
+    assert!(
+        !changed.has_changed().unwrap(),
+        "a blank entry woke waiters"
+    );
+
+    // A resting order appends one event and advances the watermark.
+    store
+        .apply(futures::stream::iter(vec![Ok((
+            entry(
+                2,
+                EntryPayload::Normal(MatchEngineRequest::place(Order::new(
+                    OrderSide::Sell,
+                    100.0,
+                    1.0,
+                    0,
+                ))),
+            ),
+            None,
+        ))]))
+        .await
+        .unwrap();
+    assert!(
+        changed.has_changed().unwrap(),
+        "an appended event did not wake waiters"
+    );
+    let watermark = *changed.borrow_and_update();
+    assert_eq!(
+        Some(EventId {
+            log_index: 2,
+            ordinal: 0,
+        }),
+        watermark
+    );
+
+    // Another no-event entry leaves the watermark where it was.
+    store
+        .apply(futures::stream::iter(vec![Ok((
+            entry(3, EntryPayload::Blank),
+            None,
+        ))]))
+        .await
+        .unwrap();
+    assert!(!changed.has_changed().unwrap());
+    assert_eq!(watermark, *changed.borrow_and_update());
+}

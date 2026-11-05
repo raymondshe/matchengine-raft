@@ -67,7 +67,7 @@ Built for teams that need deterministic execution, durable recovery and a clean 
 - **gRPC replication** with bidirectional `stream_append`, chunked snapshot transfer, Pre-Vote elections, leadership transfer and independent per-peer channels.
 
 **APIs and data feeds**
-- **Durable match-event feed** at `POST /events` with cursor pagination, retention limits, `client_order_id` idempotency and replay-safe retries.
+- **Durable match-event feed** at `POST /events` with cursor pagination, long-poll (`wait_ms`), retention limits, `client_order_id` idempotency, gRPC `StreamEvents` streaming and a reference MQ bridge sidecar; replay-safe retries.
 - **Deterministic market-data feed** with leader gating, shadow book, BBO, depth snapshots/deltas, lifecycle events, OHLC bars and a compact binary wire format with a reference decoder.
 - **Flexible read consistency**: local reads, linearizable leader reads and linearizable follower reads.
 - **Leader-aware Rust client** that tracks and forwards requests to the current leader, with configurable timeouts, transient retry/backoff and typed API/no-leader errors; retries are at-least-once, so use `client_order_id` for idempotent write retries.
@@ -357,6 +357,7 @@ the edge, before Raft proposes anything:
 | `client_order_id` | 1–128 bytes, ASCII letters/digits plus `. _ - :`; empty rejected |
 | `/read` key | 1–128 printable ASCII bytes |
 | `/events` page size | 1–1000 events |
+| `/events` long-poll wait | 0–1000 ms (`wait_ms`) |
 | `/write_batch` | 1–128 non-nested requests, unique `client_order_id`s |
 | gRPC Raft message | 64 MiB (`MAX_MESSAGE_SIZE`) |
 | gRPC snapshot stream | 256 MiB total (`MAX_SNAPSHOT_BYTES`), checked before each chunk is appended |
@@ -608,7 +609,7 @@ POST /write { Place | Cancel | Amend | PurgeExpired }
         │
         ├──► MatchEvent batch ──► /write response                [capped at 512]
         │
-        └──► POST /events + GET /events/status                   [cursor + retention]
+        └──► POST /events (long-poll) + GET /events/status       [cursor + retention]
                     │
                     ▼
           MatchResultSink                                     [node-local, best effort]
@@ -642,7 +643,7 @@ Cursor example:
 
 ```json
 POST /events
-{"after": {"log_index": 100, "ordinal": 3}, "limit": 500}
+{"after": {"log_index": 100, "ordinal": 3}, "limit": 500, "wait_ms": 1000}
 ```
 
 ```json
@@ -659,6 +660,23 @@ Omitting `after` starts at the oldest retained event; `limit` must be between 1 
 older than `oldest_event_id`, the window has evicted events and clearing must resync out of band.
 `GET /events/status` reports `retained_events`, `evictions_total`, `retention_limit`,
 `submission_retention_limit` and `submission_evictions_total`.
+
+`wait_ms` (0–1000, default 0) turns the call into a long-poll: when the cursor is at the tail the
+request waits for the next applied event and returns as soon as one exists, or with an empty page
+after the deadline. The wait is woken by a node-local watch channel and holds no state-machine
+lock.
+
+In-cluster consumers can use the gRPC `EventService.StreamEvents` RPC on the gRPC listener
+(HTTP port + 1000) instead: it streams the same JSON pages as `POST /events`, sends an empty
+heartbeat page after at most `wait_ms`, and accepts the same cursor plus `max_pages`. The
+reference MQ bridge sidecar consumes `POST /events` and checkpoints its cursor after the
+destination acknowledged each page:
+
+```bash
+cargo run --bin events_bridge -- \
+    --engine 127.0.0.1:21001 --engine-id 1 \
+    --out /tmp/events.jsonl --cursor /tmp/events.cursor
+```
 
 ### Market-data feed (opt-in)
 
@@ -841,8 +859,9 @@ the internal-only HTTP contract; TLS and operator authentication stay at the gat
 - `POST /read` - Read from the local state machine (may be stale)
 - `POST /linearizable_read` - Linearizable read; the request must reach the leader
 - `POST /follower_read` - Linearizable read served locally after fetching a linearizer from the leader
-- `POST /events` - Read a page of the replicated match-event log (`after`, `limit`); linearizable and leader-only
+- `POST /events` - Read a page of the replicated match-event log (`after`, `limit`, `wait_ms`); linearizable and leader-only, with optional long-poll
 - `GET /events/status` - Retained event window, eviction counters and retention limit
+- gRPC `EventService.StreamEvents` - Stream JSON event pages with the same cursor, `wait_ms` and `max_pages` on the gRPC listener
 
 The Rust request/response types behind `/write` are:
 
@@ -977,7 +996,7 @@ placeholder). `sequence` is optional and defaults to `0`.
 | `tests/cluster/test_restart.rs` | Full node restart recovering the order book, sequence, event window and idempotency map via WAL replay and via snapshot + newer WAL tail; also 2k-order large-log replay and a multi-chunk (~120 KB) snapshot boot |
 | `tests/cluster/test_match_results.rs` | A node started with `--match-event-log` records rest/fill/cancel events in log order while the `/write` response stays unchanged; a second node checks stop triggers, GTD expiry and the new `/read` keys |
 | `tests/cluster/test_market_data.rs` | A node started with `--market-data-log` publishes a reset snapshot, one trade message per taker, BBO, post-entry depth totals and a closed OHLC bar; the assertions check `market_seq` anchors and `/read marketdata_status` counters |
-| `tests/cluster/test_events.rs` | `/write` returns events, `/events` pages by cursor, `client_order_id` retries do not duplicate an order, and `--max-events` eviction is visible in `/events/status` |
+| `tests/cluster/test_events.rs` | `/write` returns events, `/events` pages by cursor, `client_order_id` retries do not duplicate an order, `--max-events` eviction is visible in `/events/status`, long-poll wakes on a racing write or returns an empty page at the deadline, gRPC `StreamEvents` streams a fill and an idle heartbeat, and the bridge sidecar publishes events and checkpoints its cursor |
 | `tests/cluster/test_membership.rs` | Kill the elected leader: a surviving voter takes over with the committed book and accepts new writes. A learner added after the writes catches up through normal log replication, is promoted, and writes through its own node |
 | `tests/cluster/test_late_join.rs` | A node with a stale snapshot/WAL is removed, misses 40 writes while the leader snapshots and purges, then rejoins as a learner and catches up from the live cluster |
 | `tests/cluster/test_exactness.rs` | An 18-fractional-digit price and quantity round-trip through `/write`, `/read`, `/events`, the JSONL market-data feed, snapshot v10 and a restart without passing through `f64` |

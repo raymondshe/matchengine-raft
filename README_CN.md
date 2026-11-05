@@ -67,7 +67,7 @@
 - **gRPC 复制**，支持双向 `stream_append`、分块快照传输、Pre-Vote 选举、领导权转移和每个对端独立通道。
 
 **API 与数据 Feed**
-- **持久化撮合事件 Feed**：`POST /events` 游标分页、保留上限、`client_order_id` 幂等和安全重试。
+- **持久化撮合事件 Feed**：`POST /events` 游标分页、长轮询（`wait_ms`）、保留上限、`client_order_id` 幂等、gRPC `StreamEvents` 流式推送和参考 MQ bridge sidecar，安全重试。
 - **确定性行情 Feed**：领导者门控、影子订单簿、BBO、深度快照/增量、生命周期事件、OHLC K 线和紧凑二进制行情格式（含参考解码器）。
 - **灵活读取一致性**：本地读、领导者线性一致读和 follower 线性一致读。
 - **领导者感知 Rust 客户端**，自动跟踪并转发到当前领导者，支持可配置超时、瞬时错误重试/退避以及类型化的 API/无领导者错误；重试是至少一次语义，写入重试应使用 `client_order_id` 实现幂等。
@@ -350,6 +350,7 @@ HTTP API 与 gRPC Raft 监听端口（HTTP 端口 + 1000）**按设计就是明�
 | `client_order_id` | 1–128 字节，仅限 ASCII 字母/数字及 `. _ - :`；拒绝空字符串 |
 | `/read` 键 | 1–128 个可打印 ASCII 字节 |
 | `/events` 分页大小 | 1–1000 个事件 |
+| `/events` 长轮询等待 | 0–1000 ms（`wait_ms`） |
 | `/write_batch` | 1–128 个非嵌套请求，`client_order_id` 不得重复 |
 | gRPC Raft 消息 | 64 MiB（`MAX_MESSAGE_SIZE`） |
 | gRPC 快照流 | 总量 256 MiB（`MAX_SNAPSHOT_BYTES`），在追加每个 chunk 前检查 |
@@ -581,7 +582,7 @@ POST /write { Place | Cancel | Amend | PurgeExpired | ConfigureSymbol }
         │
         ├──► MatchEvent 批次 ──► /write 响应        [上限 512]
         │
-        └──► POST /events + GET /events/status      [游标 + 保留策略]
+        └──► POST /events (long-poll) + GET /events/status   [游标 + 保留策略]
                     │
                     ▼
           MatchResultSink                           [节点本地，尽力而为]
@@ -613,7 +614,7 @@ POST /write { Place | Cancel | Amend | PurgeExpired | ConfigureSymbol }
 
 ```json
 POST /events
-{"after": {"log_index": 100, "ordinal": 3}, "limit": 500}
+{"after": {"log_index": 100, "ordinal": 3}, "limit": 500, "wait_ms": 1000}
 ```
 
 ```json
@@ -630,6 +631,19 @@ POST /events
 说明事件已被保留策略淘汰，清结算需要带外重建。`GET /events/status` 返回 `retained_events`、
 `evictions_total`、`retention_limit`、`submission_retention_limit` 和
 `submission_evictions_total`。
+
+`wait_ms`（0–1000，默认 0）把请求变成长轮询：游标位于尾部时最多等待该时长，有新事件就立即返回，
+否则在超时后返回空页（`next_after` 保持不变）。等待由节点本地 `watch` 通道唤醒，不持有状态机锁。
+
+集群内消费者也可以使用 gRPC 监听器（HTTP 端口 + 1000）上的 `EventService.StreamEvents`：它按同一
+游标流式推送与 `POST /events` 相同的 JSON 页，空闲时每 `wait_ms` 发一个空心跳页，并支持
+`max_pages`。参考 MQ bridge sidecar 消费 `POST /events`，在目标确认每一页后提交游标：
+
+```bash
+cargo run --bin events_bridge -- \
+    --engine 127.0.0.1:21001 --engine-id 1 \
+    --out /tmp/events.jsonl --cursor /tmp/events.cursor
+```
 
 ### 行情数据 feed（可选）
 
@@ -800,7 +814,9 @@ Raft 节点间 RPC 仅由 `--http-addr` 端口 + 1000 上的 gRPC 提供；HTTP 
 - `POST /read` - 从本地状态机读取（可能读到旧值）
 - `POST /linearizable_read` - 线性一致性读；请求必须到达领导者
 - `POST /follower_read` - 从领导者获取 linearizer 后在本地完成的线性一致性读
-- `POST /events` - 分页读取复制的撮合事件日志（`after`、`limit`）；线性一致，仅领导者
+- `POST /events` - 分页读取复制的撮合事件日志（`after`、`limit`、`wait_ms`）；线性一致，仅领导者，支持长轮询
+- `GET /events/status` - 保留事件窗口、淘汰计数和保留上限
+- gRPC `EventService.StreamEvents` - 在 gRPC 监听器上按同一游标流式推送 JSON 事件页，支持 `wait_ms` 和 `max_pages`
 - `GET /events/status` - 保留事件窗口、淘汰计数和保留上限
 
 `/write` 背后的 Rust 类型：
@@ -910,7 +926,7 @@ ETF/股票 base 的费用始终以 quote 资产结算；加密货币和法币对
 | `tests/cluster/test_restart.rs` | 完整节点重启后通过日志重放恢复，以及通过快照 + 更新的 WAL 尾部恢复订单簿、序列号、事件窗口和幂等表；另含 2000 单大日志重放和多分块（约 120 KB）快照启动 |
 | `tests/cluster/test_match_results.rs` | 以 `--match-event-log` 启动的节点按日志顺序记录 rest/fill/cancel 事件，同时 `/write` 响应保持不变；第二个节点验证止损触发、GTD 过期和新增的 `/read` 键 |
 | `tests/cluster/test_market_data.rs` | 以 `--market-data-log` 启动的节点发布重置快照、每个 taker 一条成交消息、BBO、批后深度总量和一根已收盘 K 线；断言同时检查 `market_seq` 锚点与 `/read marketdata_status` 计数器 |
-| `tests/cluster/test_events.rs` | `/write` 返回事件、`/events` 游标分页、`client_order_id` 重试不重复下单、`--max-events` 淘汰与 `/events/status` 计数 |
+| `tests/cluster/test_events.rs` | `/write` 返回事件、`/events` 游标分页、`client_order_id` 重试不重复下单、`--max-events` 淘汰与 `/events/status` 计数、长轮询在并发写入时唤醒或在超时后返回空页、gRPC `StreamEvents` 推送成交与空闲心跳、bridge sidecar 发布事件并记录游标 |
 | `tests/cluster/test_membership.rs` | 杀掉当前领导者：存活的投票节点接管已提交订单簿并接受新写入；写入后加入的学习者通过普通日志复制追赶、晋升成员并从自己的节点写入 |
 | `tests/cluster/test_late_join.rs` | 带过期快照/WAL 的节点被移出集群、错过 40 次写入（期间领导者生成快照并 purge），再以学习者身份重新加入并从活动集群追赶 |
 | `tests/cluster/test_exactness.rs` | 18 位小数的价格/数量经 `/write`、`/read`、`/events`、JSONL 行情、快照 v10 和重启后仍然精确，全程不经过 `f64` |

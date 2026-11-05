@@ -86,6 +86,7 @@ fn maker_and_taker_fees_survive_events_feed_and_snapshot_restart() {
             .events(&EventsRequest {
                 after: None,
                 limit: Some(100),
+                wait_ms: None,
             })
             .await
             .unwrap()

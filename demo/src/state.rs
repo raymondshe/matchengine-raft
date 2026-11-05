@@ -300,6 +300,7 @@ impl EngineBackend {
         let request = EventsRequest {
             after,
             limit: Some(limit),
+            wait_ms: None,
         };
         let page = self
             .client

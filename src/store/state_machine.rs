@@ -39,6 +39,7 @@ use openraft::storage::RaftStateMachine;
 use serde::Deserialize;
 use serde::Serialize;
 use smallvec::SmallVec;
+use tokio::sync::watch;
 
 use crate::market_data::MarketDataControl;
 use crate::market_data::MarketDataTap;
@@ -622,6 +623,9 @@ pub struct StateMachineStore<C: RaftTypeConfig> {
     /// Set by `build_match_engine_node` when a market-data feed is enabled. It
     /// lets a symbol configuration change reset consumers to the new symbol.
     market_data_control: Arc<OnceLock<(MarketDataControl, usize)>>,
+    /// Last retained event id, updated after every apply that appended events.
+    /// Node-local wakeup for long-poll readers; never part of snapshots.
+    events_changed: watch::Sender<Option<EventId>>,
 }
 
 /// A sink/tap publication produced while applying one entry.
@@ -650,6 +654,7 @@ impl<C: RaftTypeConfig> Clone for StateMachineStore<C> {
             dir: self.dir.clone(),
             sink: self.sink.clone(),
             market_data_control: self.market_data_control.clone(),
+            events_changed: self.events_changed.clone(),
         }
     }
 }
@@ -736,11 +741,14 @@ impl<C: RaftTypeConfig> StateMachineStore<C> {
         }
         inner.market_data = market_data;
 
+        let (events_changed, _) = watch::channel(inner.last_event_id());
+
         Ok(Self {
             inner: Arc::new(Mutex::new(inner)),
             dir: Arc::new(dir),
             sink,
             market_data_control: Arc::new(OnceLock::new()),
+            events_changed,
         })
     }
 
@@ -769,6 +777,27 @@ impl<C: RaftTypeConfig> StateMachineStore<C> {
 
     pub fn inner(&self) -> &Arc<Mutex<StateMachineStoreInner<C>>> {
         &self.inner
+    }
+
+    /// Subscribes to retained-event-window changes for long-poll readers.
+    ///
+    /// The value is the window's last event id (`Option<EventId>`); it changes
+    /// only when an apply appended events (or a snapshot install replaced the
+    /// window), so a waiter can sleep between checks.
+    pub fn subscribe_events(&self) -> watch::Receiver<Option<EventId>> {
+        self.events_changed.subscribe()
+    }
+
+    /// Wakes long-poll readers when the retained event window advances.
+    fn notify_events(&self, last_event: Option<EventId>) {
+        self.events_changed.send_if_modified(|current| {
+            if *current == last_event {
+                false
+            } else {
+                *current = last_event;
+                true
+            }
+        });
     }
 
     /// The sink this store publishes match results to.
@@ -1304,7 +1333,7 @@ where
                 }
                 _ => PendingPublishes::new(),
             };
-            let response = {
+            let (response, last_event) = {
                 // Lock per entry, not for the whole Apply range: reads and
                 // snapshot capture can interleave between entries, and the log
                 // reader is not called while the lock is held.
@@ -1314,7 +1343,7 @@ where
                 // Application code below stays deterministic: events are derived from the entry
                 // alone, and publishing them is best-effort (a sink failure is logged, never
                 // propagated) so replicas with different sinks still converge.
-                match &entry.payload {
+                let response = match &entry.payload {
                     EntryPayload::Blank => MatchEngineResponse::none(),
                     EntryPayload::Normal(MatchEngineRequest::Batch { requests }) => {
                         let mut responses = Vec::with_capacity(requests.len());
@@ -1342,11 +1371,14 @@ where
                             StoredMembership::new(Some(entry.log_id.clone()), mem.clone());
                         MatchEngineResponse::none()
                     }
-                }
+                };
+                (response, inner.last_event_id())
             };
 
             // Sink and tap work happens outside the state-machine lock.
             self.publish_pending(publishes);
+            // Wake long-poll readers only when the retained window advanced.
+            self.notify_events(last_event);
 
             if let Some(responder) = responder {
                 responder.send(response);
@@ -1374,14 +1406,18 @@ where
         })
         .await?;
 
-        let mut inner = self.inner.lock().await;
-        inner.last_applied_log = meta.last_log_id.clone();
-        inner.last_membership = meta.last_membership.clone();
-        inner.install_content(content);
-        inner.current_snapshot = Some(StoredSnapshot {
-            meta: meta.clone(),
-            data,
-        });
+        let last_event = {
+            let mut inner = self.inner.lock().await;
+            inner.last_applied_log = meta.last_log_id.clone();
+            inner.last_membership = meta.last_membership.clone();
+            inner.install_content(content);
+            inner.current_snapshot = Some(StoredSnapshot {
+                meta: meta.clone(),
+                data,
+            });
+            inner.last_event_id()
+        };
+        self.notify_events(last_event);
 
         Ok(())
     }

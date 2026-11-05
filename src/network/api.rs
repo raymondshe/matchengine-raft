@@ -18,6 +18,7 @@ use serde::Serialize;
 use web::Json;
 
 use crate::MatchEngineTypeConfig;
+use crate::StateMachineStore;
 use crate::app::MatchEngineApp;
 use crate::client::FollowerReadError;
 use crate::client::FollowerReadErrorKind;
@@ -38,6 +39,8 @@ use crate::store::state_machine::StateMachineStoreInner;
 pub const DEFAULT_EVENTS_PAGE: usize = 500;
 /// Hard cap on one `/events` response.
 pub const MAX_EVENTS_PAGE: usize = 1_000;
+/// Hard cap on the `/events` long-poll wait.
+pub const MAX_EVENTS_WAIT_MS: u64 = 1_000;
 /// Maximum JSON body accepted by the application and management API.
 ///
 /// Raft snapshot and append bodies use their own larger caps because they carry
@@ -99,6 +102,13 @@ fn validate_events_request(req: &EventsRequest) -> Result<(), String> {
     {
         return Err(format!(
             "events limit must be between 1 and {MAX_EVENTS_PAGE}"
+        ));
+    }
+    if let Some(wait_ms) = req.wait_ms
+        && wait_ms > MAX_EVENTS_WAIT_MS
+    {
+        return Err(format!(
+            "events wait_ms must be at most {MAX_EVENTS_WAIT_MS}"
         ));
     }
     Ok(())
@@ -212,6 +222,11 @@ pub struct EventsRequest {
     /// Page size; must be between 1 and [`MAX_EVENTS_PAGE`].
     #[serde(default)]
     pub limit: Option<usize>,
+    /// If the cursor is at the tail, wait up to this many milliseconds for new
+    /// events before returning an empty page. Must be at most
+    /// [`MAX_EVENTS_WAIT_MS`]; 0 (the default) returns immediately.
+    #[serde(default)]
+    pub wait_ms: Option<u64>,
 }
 
 /// One page of the replicated match-event log.
@@ -442,7 +457,9 @@ pub async fn linearizable_read(
 /// Reads a page of the replicated match-event log.
 ///
 /// The read is linearizable (leader-only) so clearing sees committed events;
-/// consumers resume from `next_after` and dedupe on `event_id`.
+/// consumers resume from `next_after` and dedupe on `event_id`. When the cursor
+/// is at the tail and `wait_ms` is set, the handler waits up to that long for
+/// the next event instead of returning an empty page immediately.
 #[post("/events")]
 pub async fn events(
     app: Data<MatchEngineApp>,
@@ -480,21 +497,61 @@ pub async fn events(
         ));
     }
 
-    let inner = app.state_machine_store.inner().lock().await;
     let limit = req
         .limit
         .unwrap_or(DEFAULT_EVENTS_PAGE)
         .clamp(1, MAX_EVENTS_PAGE);
-    let (events, next_after, has_more) = inner.events_since(req.after, limit);
-    let response = EventsResponse {
-        events,
-        next_after,
-        oldest_event_id: inner.oldest_event_id(),
-        last_event_id: inner.last_event_id(),
-        has_more,
-    };
+    let response = read_events_page(
+        &app.state_machine_store,
+        req.after,
+        limit,
+        req.wait_ms.unwrap_or(0),
+    )
+    .await;
     let res: Result<EventsResponse, LinearizableReadError<MatchEngineTypeConfig>> = Ok(response);
     Ok(Json(res))
+}
+
+/// Reads one event page, waiting for new events at the tail when requested.
+///
+/// The caller establishes the linearizable anchor once; this helper only reads
+/// locally applied (hence committed) events, so a wait needs no additional
+/// quorum round-trip. A `watch` channel wakes waiters when the retained window
+/// advances, and the deadline bounds an idle wait.
+pub(crate) async fn read_events_page(
+    store: &StateMachineStore,
+    after: Option<EventId>,
+    limit: usize,
+    wait_ms: u64,
+) -> EventsResponse {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(wait_ms);
+    let mut changed = store.subscribe_events();
+    loop {
+        // Mark the current watermark seen before reading the state, so an
+        // append between the read and the wait below cannot be lost.
+        let _ = changed.borrow_and_update();
+        let page = {
+            let inner = store.inner().lock().await;
+            let (page_events, next_after, has_more) = inner.events_since(after, limit);
+            EventsResponse {
+                events: page_events,
+                next_after,
+                oldest_event_id: inner.oldest_event_id(),
+                last_event_id: inner.last_event_id(),
+                has_more,
+            }
+        };
+        if !page.events.is_empty() || wait_ms == 0 || tokio::time::Instant::now() >= deadline {
+            return page;
+        }
+        if changed.has_changed().unwrap_or(false) {
+            continue;
+        }
+        tokio::select! {
+            _ = changed.changed() => {}
+            _ = tokio::time::sleep_until(deadline) => {}
+        }
+    }
 }
 
 /// Reports the retained event window and eviction counters.
@@ -888,6 +945,7 @@ mod tests {
             validate_events_request(&EventsRequest {
                 after: None,
                 limit: Some(1),
+                wait_ms: None,
             })
             .is_ok()
         );
@@ -895,6 +953,7 @@ mod tests {
             validate_events_request(&EventsRequest {
                 after: None,
                 limit: Some(MAX_EVENTS_PAGE),
+                wait_ms: Some(MAX_EVENTS_WAIT_MS),
             })
             .is_ok()
         );
@@ -902,6 +961,7 @@ mod tests {
             validate_events_request(&EventsRequest {
                 after: None,
                 limit: Some(0),
+                wait_ms: None,
             })
             .is_err()
         );
@@ -909,6 +969,17 @@ mod tests {
             validate_events_request(&EventsRequest {
                 after: None,
                 limit: Some(MAX_EVENTS_PAGE + 1),
+                wait_ms: None,
+            })
+            .is_err()
+        );
+        // The long-poll wait is bounded, never clamped: a caller asking for
+        // more than the cap gets a 400 instead of an unexpectedly short wait.
+        assert!(
+            validate_events_request(&EventsRequest {
+                after: None,
+                limit: None,
+                wait_ms: Some(MAX_EVENTS_WAIT_MS + 1),
             })
             .is_err()
         );

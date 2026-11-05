@@ -458,6 +458,7 @@ fn restart_loads_snapshot_then_replays_newer_wal_events() {
             .events(&EventsRequest {
                 after: None,
                 limit: Some(100),
+                wait_ms: None,
             })
             .await
             .unwrap()

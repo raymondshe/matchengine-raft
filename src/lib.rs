@@ -30,6 +30,8 @@ use crate::network::api;
 use crate::network::console;
 use crate::network::grpc::MAX_MESSAGE_SIZE;
 use crate::network::grpc::client::GrpcNetworkFactory;
+use crate::network::grpc::events::EventStreamService;
+use crate::network::grpc::pb::event_service_server::EventServiceServer;
 use crate::network::grpc::pb::raft_service_server::RaftServiceServer;
 use crate::network::grpc::server::RaftGrpcService;
 use crate::network::health;
@@ -443,6 +445,7 @@ pub async fn build_match_engine_node(
     // Serve the gRPC transport. The listener is already bound, so peers can
     // connect as soon as this node is initialized.
     let grpc_service = RaftGrpcService::new(raft.clone());
+    let event_service = EventStreamService::new(raft.clone(), state_machine_store.clone());
     let (grpc_shutdown, grpc_shutdown_rx) = tokio::sync::oneshot::channel();
     let (grpc_failure_tx, grpc_failure_rx) = tokio::sync::oneshot::channel();
     let grpc_health_task = grpc_health.clone();
@@ -451,6 +454,11 @@ pub async fn build_match_engine_node(
         let server = tonic::transport::Server::builder()
             .add_service(
                 RaftServiceServer::new(grpc_service)
+                    .max_decoding_message_size(MAX_MESSAGE_SIZE)
+                    .max_encoding_message_size(MAX_MESSAGE_SIZE),
+            )
+            .add_service(
+                EventServiceServer::new(event_service)
                     .max_decoding_message_size(MAX_MESSAGE_SIZE)
                     .max_encoding_message_size(MAX_MESSAGE_SIZE),
             )

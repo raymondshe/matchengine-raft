@@ -88,6 +88,7 @@ fn write_batch_applies_multiple_requests_in_one_entry() {
             .events(&matchengine_raft::network::api::EventsRequest {
                 after: None,
                 limit: Some(10),
+                wait_ms: None,
             })
             .await
             .unwrap()

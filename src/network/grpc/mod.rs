@@ -5,6 +5,7 @@
 //! hot path binary.
 
 pub mod client;
+pub mod events;
 pub mod server;
 
 pub mod pb {

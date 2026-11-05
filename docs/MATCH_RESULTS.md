@@ -1,10 +1,11 @@
 # Delivering match results to the order / clearing system
 
-Status: **phases 1a–3 implemented.** `apply` turns results into [`MatchEvent`]s, returns the first
+Status: **phases 1a–4 implemented.** `apply` turns results into [`MatchEvent`]s, returns the first
 512 in the `/write` response, appends them to a bounded event window that is part of snapshot v10,
 and serves that window through `POST /events` and `GET /events/status`. `client_order_id` makes
 submissions idempotent across retries. `--match-event-log <path>` remains a node-local JSONL
-debugging sink. Phase 4 (long-poll, gRPC streaming, MQ bridge) is the remaining proposal.
+debugging sink. Phase 4 adds long-poll (`wait_ms`), a gRPC `StreamEvents` stream and a reference
+MQ bridge sidecar (`src/bin/events_bridge.rs`).
 
 [`MatchEvent`]: ../src/match_result/mod.rs
 
@@ -370,7 +371,65 @@ POST /events
   on `ForwardToLeader`. `/events/status` is a local read for dashboards.
 - Implemented in `src/network/api.rs` with `EventsRequest`/`EventsResponse`/`EventsStatus`; the
   client exposes `events()` and `events_status()`.
-- Phase 4: long-poll `wait_ms` (≤ 1000) and gRPC `StreamEvents` using the same cursor.
+
+#### 4.6.1 Long-poll (implemented)
+
+`POST /events` accepts `wait_ms` (0–1000, default 0). When the cursor is at the tail the handler
+waits for the next applied event instead of returning an empty page immediately: it returns as soon
+as an event exists, or after `wait_ms` with an empty page (whose `next_after` stays at the input
+cursor). The wait is woken by a node-local `watch` channel that advances after each apply which
+appends events; a blank or membership entry does not wake anyone. The state-machine lock is never
+held while waiting, and only the request's initial linearizer is used — events applied later are
+committed by definition, so no extra quorum round-trip is needed per wake.
+
+A `wait_ms` beyond the cap is rejected with `400`, consistent with `limit`; neither is silently
+clamped. The long-poll is the recommended polling mode for clearing daemons and the demo desk.
+
+#### 4.6.2 gRPC `StreamEvents` (implemented)
+
+The node's gRPC listener (HTTP port + 1000) additionally serves `EventService.StreamEvents`, a
+server-streaming RPC for in-cluster consumers:
+
+```proto
+rpc StreamEvents(StreamEventsRequest) returns (stream StreamEventsPage);
+
+message StreamEventsRequest {
+  optional uint64 after_log_index = 1;  // cursor; both cursor fields or neither
+  optional uint32 after_ordinal = 2;
+  optional uint32 limit = 3;            // 1..=1000, default 500
+  optional uint32 wait_ms = 4;          // idle wait per page, 0..=1000
+  optional uint32 max_pages = 5;        // 0 = until cancelled
+}
+message StreamEventsPage { bytes payload = 1; }  // JSON EventsResponse
+```
+
+- Each page is the **same JSON object** as `POST /events`, carried as bytes. JSON is deliberate:
+  `MatchEvent` omits absent optional fields with `skip_serializing_if`, which positional formats
+  such as postcard cannot deserialize reliably, and a JSON page lets non-Rust consumers share the
+  documented schema.
+- The stream is anchored with one `ReadIndex` linearizable read when it opens, so the serving node
+  must be the leader at that point (`FAILED_PRECONDITION` with the leader error otherwise). Later
+  pages read locally applied committed events with no per-page quorum round-trip.
+- An idle stream sends an empty page after at most `wait_ms`, doubling as a liveness heartbeat.
+  `max_pages` bounds tests and short-lived consumers; 0 streams until cancelled.
+
+#### 4.6.3 MQ bridge sidecar (implemented reference)
+
+`src/bin/events_bridge.rs` is the reference bridge: it long-polls `/events`, appends one JSON object
+per event to `--out`, flushes and fsyncs the file, then checkpoints `--cursor` via temp file +
+rename. A crash between publish and checkpoint replays the page; consumers dedupe on `event_id`.
+If the cursor falls behind `oldest_event_id`, the bridge exits with code 2 instead of silently
+skipping events. A Kafka/NATS adapter replaces the append with a broker publish and the checkpoint
+with a broker-acknowledged offset; the loop and commit order are the contract.
+
+```shell
+cargo run --bin events_bridge -- \
+  --engine 127.0.0.1:21001 --engine-id 1 \
+  --out /tmp/events.jsonl --cursor /tmp/events.cursor
+```
+
+An MQ bridge is just another consumer: it runs outside `apply` and uses the same cursor as any
+other consumer.
 
 Consumer contract (this is what makes R4 achievable):
 
@@ -383,10 +442,6 @@ Consumer contract (this is what makes R4 achievable):
    clearing snapshot at some `event_id >= oldest_event_id` and replay from there. The server's job
    is only to make the gap loud, not to invent history.
 5. Duplicates are normal (at-least-once); dedupe handles them.
-
-An MQ bridge is just another consumer: a small sidecar reads `/events`, publishes to Kafka/NATS keyed
-by `event_id`, and commits its cursor after the broker acknowledges. Crucially, this runs outside
-`apply`.
 
 ### 4.7 Idempotent submission (implemented)
 
@@ -405,15 +460,30 @@ Returning events does not by itself make retries safe. Two independent dedupe la
 Without the first layer, an HTTP timeout after commit produces two orders that genuinely trade
 twice; clearing dedupe cannot fix that because both are real fills.
 
-### 4.8 Time and ordering
+### 4.8 Time and ordering (decided 2026-11-05)
 
 Do **not** call `SystemTime::now()` inside `apply`: it differs between replicas and breaks R2.
-Ordering is Raft log order, which is all clearing needs for FIFO processing. If a human-readable
-timestamp is required, either:
+The event feed therefore carries **no wall-clock timestamp**. Ordering and identity are
+`(log_index, ordinal)`, which is Raft log order — all clearing needs for FIFO processing.
 
-- let the ingress gateway stamp the request (`client_ts_ms`) and carry it through the log entry, or
-- record the leader's apply time outside the state machine (observability only, never used for
-  ordering or idempotency).
+**Decision: event time and cursor scope.**
+
+- **Event time:** log order only. The replicated intake timestamp stays on the originating order
+  (the receiving leader stamps `Order.timestamp` before proposing) and labels market-data records;
+  it is deliberately not duplicated into every `MatchEvent`, because `apply` must stay deterministic
+  and the timestamp does not belong to ordering or idempotency. A consumer that needs a receive
+  timestamp stamps it at its own ingress (observability only). If a future clearing contract needs
+  the intake time inline, it can be added as an additive `ts_ms` field carrying the log-carried
+  intake value — never an apply-time clock — with the usual snapshot/wire version bump.
+- **Cursor scope:** one cursor per deployment. One engine process/cluster trades exactly one
+  symbol, so the event id space is already per instrument; there is no extra per-instrument
+  dimension to retain. A future multi-symbol gateway would route by deployment (`symbol_id` in the
+  message schema), not split one deployment's cursor.
+
+A leader that steps down while a long-poll is sleeping simply stops applying; the request returns
+its empty page at the deadline and the client retries against the new leader. A `StreamEvents`
+stream that opened on the old leader keeps delivering already-applied committed events until the
+client reconnects and re-anchors; duplicates are handled by the `event_id` contract.
 
 ### 4.9 Observability
 
@@ -445,6 +515,10 @@ event rate per apply batch at debug level, consistent with the existing `tracing
 | Duplicate delivery | Consumer sees an event twice | Dedupe on `event_id` |
 | Huge sweep (many fills) | Large response | Response capped with `events_truncated`; full set available from `/events` |
 | Slow consumer | — | Pull-based, so it cannot block `apply`; only its own cursor lags |
+| Long-poll leader steps down | The wait expires with an empty page; events already returned are committed | Retry; the client forwards to the new leader |
+| `StreamEvents` leader steps down | The stream keeps delivering committed applied events from the old leader | Reconnect and re-anchor on the new leader; dedupe on `event_id` |
+| Slow gRPC stream consumer | Pages queue up to the stream channel bound, then HTTP/2 backpressure | The consumer catches up or reconnects; `apply` is unaffected |
+| Bridge crash between publish and checkpoint | The page is replayed | Dedupe on `event_id`; the cursor advances only after the destination acknowledged |
 | Snapshot from an older binary | v9 or earlier payload | Version check rejects it with a clear error; v10 is the current error-aware snapshot |
 
 ---
@@ -501,7 +575,19 @@ Implemented with phases 2–3:
 - Diffing two processors fed the same frames covers the market-data side; the match-event side is
   deterministic by construction (`EventId` from the applied log, no clock).
 
-Still to write (mainly phase 4 / operational tests):
+Implemented with phase 4:
+
+- Long-poll: idle at the tail returns an empty page after roughly `wait_ms`; a write racing the
+  wait wakes it promptly with the new events (`tests/cluster/test_events.rs`).
+- `StreamEvents`: an idle stream delivers a heartbeat page after `wait_ms`, a concurrent write is
+  streamed as a fill page, `max_pages` terminates the stream and a partial cursor is rejected with
+  `INVALID_ARGUMENT`.
+- Bridge: the sidecar publishes rest + fill events as JSON lines and checkpoints the cursor; unit
+  tests cover cursor round-trip, corrupt checkpoints and retention-gap detection.
+- State machine: only applies that append events wake long-poll readers; a blank entry leaves the
+  watermark unchanged.
+
+Still to write (operational tests):
 
 - Restart a full node after a write; `/events` returns the fills and new ids continue after the
   replayed ones (snapshot persistence is unit-tested).
@@ -521,9 +607,9 @@ Still to write (mainly phase 4 / operational tests):
 | 1b ✅ | Events in `MatchEngineResponse`; 512-event cap with `events_truncated` | done |
 | 2 ✅ | Bounded event window + snapshot v4–v10 + `oldest_event_id`/`last_event_id`; `/events` and `/events/status`; restart/snapshot/retention tests | done |
 | 3 ✅ | `client_order_id` submission dedupe with bounded map | done |
-| 4 | Optional: long-poll, gRPC `StreamEvents`, MQ bridge sidecar | 2–3 days |
+| 4 ✅ | Long-poll `wait_ms` (node-local `watch` wakeup), gRPC `StreamEvents` (JSON pages, heartbeat, `max_pages`) and the reference MQ bridge sidecar (`src/bin/events_bridge.rs`) | done |
 
-Phases 1a–3 are implemented; phase 4 is operational convenience.
+Phases 1a–4 are implemented; phase 4 is operational convenience.
 
 ---
 
@@ -555,11 +641,11 @@ and two read endpoints (`/events`, `/events/status`).
 2. **Scope of v1 events** — answered for now: `Rested`, `Fill`, `Cancelled`, `Triggered`, `Expired`,
    `Rejected` and `Amended` are all emitted. Revisit if clearing only wants fills and the extra
    volume matters.
-3. **Consumer placement** — in-cluster sidecar pulling `/events`, or an external service? Affects
-   whether long-poll/streaming is worth building.
-4. **Timestamp** — resolved for market data: the receiving leader stamps `Order.timestamp` at
-   intake (client values are overwritten), so it is log-carried and trustworthy. Clearing still
-   needs to decide whether it wants that intake time in the event feed or log order alone.
+3. **Consumer placement** — resolved for the built-in options: long-poll `/events` (default),
+   gRPC `StreamEvents` for in-cluster streams, and the reference sidecar for MQ fan-out. An
+   external service remains a deployment choice, not a missing API.
+4. **Timestamp** — resolved in §4.8: event ordering is `(log_index, ordinal)` only; no wall clock
+   is added in `apply`. The replicated intake timestamp stays on the order and market-data records.
 5. **Cancel identity** — `cancel()` currently keys on `(price, sequence)`, which clearing has from
    the events, but humans think in `order id`; consider an order-id index as a follow-up.
 6. **Multi-instrument** — one process/cluster per symbol; event ids are per deployment, not per

@@ -114,6 +114,7 @@ fn exact_18_decimal_values_survive_api_events_feed_and_snapshot_restart() {
             .events(&EventsRequest {
                 after: None,
                 limit: Some(100),
+                wait_ms: None,
             })
             .await
             .unwrap()
@@ -191,6 +192,7 @@ fn exact_18_decimal_values_survive_api_events_feed_and_snapshot_restart() {
             .events(&EventsRequest {
                 after: None,
                 limit: Some(100),
+                wait_ms: None,
             })
             .await
             .unwrap()

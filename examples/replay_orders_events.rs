@@ -213,6 +213,7 @@ async fn fetch_events(
         let request = EventsRequest {
             after,
             limit: Some(limit),
+            wait_ms: None,
         };
         let page = client.events(&request).await??;
         let next_after = page.next_after;
