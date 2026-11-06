@@ -102,44 +102,11 @@
 
 ## 架构概述
 
-本项目扩展了 [example-raft-kv](https://github.com/datafuselabs/openraft/tree/main/example-raft-kv)，增加了持久化存储和 gRPC 传输。另见交互式、带源码引用的[架构图](./docs/matchengine-raft-architecture.html)：
+本项目扩展了 [example-raft-kv](https://github.com/datafuselabs/openraft/tree/main/example-raft-kv)，增加了持久化存储和 gRPC 传输。另见[交互式架构图](./docs/matchengine-raft-architecture.html)（带源码引用）。
 
-```
-                  ┌─────────────────────────────────────────────────────────┐
-                  │                         应用层                          │
-                  │                    (订单簿撮合引擎)                     │
-                  │          apply ──► 订单簿 + 复制的 market_seq           │
-                  │      MatchEvent ──► MatchResultSink（审计/清结算）      │
-                  └─────────────────────┬───────────────────────────┬───────┘
-                                        │                           │ MatchEvent + 深度日志
-                                        │                           │ try_send（有界，不阻塞）
-                                        │                           ▼
-                                        │             ┌──────────────────────────────────────┐
-                                        │             │       行情任务（按领导者发布）       │
-                                        │             │    影子订单簿 · OHLC · 线格式 v6     │
-                                        │             │      确定性 market_seq/sub_seq       │
-                                        │             └──────────────────────────────────────┘
-                                        │                                 │ MarketDataSink
-                                        │                                 ▼
-                                        │             ┌──────────────────────────────────────┐
-                                        │             │  JSONL 调试 · Aeron 2001–2007 实时   │
-                                        │             │        成交 BBO 深度 生命周期        │
-                                        │             │               状态 K线               │
-                                        ▼             └──────────────────────────────────────┘
-                  ┌─────────────────────────────────────────────────────────┐
-                  │                      OpenRaft 核心                      │
-                  │                (共识、复制、领导者选举)                 │
-                  └────────────────────────────┬────────────────────────────┘
-                                               │
-                                               │
-               ┌───────────────────────────────┴───────────────────────────────┐
-               │                               │                               │
-               ▼                               ▼                               ▼
-    ┌─────────────────────┐         ┌─────────────────────┐         ┌─────────────────────┐
-    │     日志 + 状态     │         │     RaftNetwork     │         │      HTTP API       │
-    │    (WAL + 快照)     │         │       (gRPC)        │         │     (Actix-web)     │
-    └─────────────────────┘         └─────────────────────┘         └─────────────────────┘
-```
+<p align="center">
+  <img src="./docs/matchengine-raft.png" alt="matchengine-raft 架构图" width="1000">
+</p>
 
 节点间 Raft RPC 使用 `端口 + 1000` 上的 gRPC。公共应用/管理 API 仍由 `--http-addr` 监听器提供；
 Raft RPC 不属于 HTTP JSON API。

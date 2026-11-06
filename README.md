@@ -102,44 +102,11 @@ Everything below is implemented in this repository and exercised by tests; the l
 
 ## Architecture Overview
 
-This project extends the [example-raft-kv](https://github.com/datafuselabs/openraft/tree/main/example-raft-kv) with persistent storage and a gRPC transport. For an interactive, source-linked view of the same system, open the [architecture diagram](./docs/matchengine-raft-architecture.html).
+This project extends the [example-raft-kv](https://github.com/datafuselabs/openraft/tree/main/example-raft-kv) with persistent storage and a gRPC transport. For an interactive, source-linked version, open the [interactive architecture diagram](./docs/matchengine-raft-architecture.html).
 
-```
-                  ┌─────────────────────────────────────────────────────────┐
-                  │                    Application Layer                    │
-                  │              (Order Book Matching Engine)               │
-                  │      apply ──► order book + replicated market_seq       │
-                  │    MatchEvent ──► MatchResultSink (audit / clearing)    │
-                  └─────────────────────┬───────────────────────────┬───────┘
-                                        │                           │ MatchEvent + depth journal
-                                        │                           │ try_send (never blocks)
-                                        │                           ▼
-                                        │             ┌──────────────────────────────────────┐
-                                        │             │  Market-data task (leader-gated)   │
-                                        │             │     shadow book · OHLC · wire v6     │
-                                        │             │   deterministic market_seq/sub_seq   │
-                                        │             └──────────────────────────────────────┘
-                                        │                                 │ MarketDataSink
-                                        │                                 ▼
-                                        │             ┌──────────────────────────────────────┐
-                                        │             │  JSONL debug · Aeron 2001–2007 live  │
-                                        │             │      TRADE BBO DEPTH LIFECYCLE       │
-                                        │             │              STATUS BAR              │
-                                        ▼             └──────────────────────────────────────┘
-                  ┌─────────────────────────────────────────────────────────┐
-                  │                      OpenRaft Core                      │
-                  │          (Consensus, Replication, Leadership)           │
-                  └────────────────────────────┬────────────────────────────┘
-                                               │
-                                               │
-               ┌───────────────────────────────┴───────────────────────────────┐
-               │                               │                               │
-               ▼                               ▼                               ▼
-    ┌─────────────────────┐         ┌─────────────────────┐         ┌─────────────────────┐
-    │     Log + State     │         │     RaftNetwork     │         │      HTTP API       │
-    │  (WAL + Snapshots)  │         │       (gRPC)        │         │     (Actix-web)     │
-    └─────────────────────┘         └─────────────────────┘         └─────────────────────┘
-```
+<p align="center">
+  <img src="./docs/matchengine-raft.png" alt="matchengine-raft architecture" width="1000">
+</p>
 
 Peer-to-peer Raft RPCs use gRPC on `port + 1000`. The public application and management API
 stays on the `--http-addr` listener. Raft RPCs are not part of the HTTP JSON API.
