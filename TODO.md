@@ -23,10 +23,10 @@ important but not blocking; **P3** = later/optional.
 No P0 work remains. The P1 OpenRaft utilization quick wins in §16 are implemented; the remaining
 OpenRaft items are P2/P3. The measured baselines are in
 [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md), the third-party follow-ups are P2/P3 (§14), and
-measurement scope, peak RSS, the book-only replay benchmark, the fuzz targets, health/readiness
-and the operational console are in place. Equity/ETF sessions, holidays, auctions, T+1/T+2 settlement,
-corporate actions and fixed/regulatory/minimum/tax fees are owned by the external order system
-(§13).
+measurement scope, peak RSS, the book-only and realistic-mix replay benchmarks, the fuzz targets,
+health/readiness and the operational console are in place. Equity/ETF sessions, holidays, auctions,
+T+1/T+2 settlement, corporate actions and fixed/regulatory/minimum/tax fees are owned by the
+external order system (§13).
 
 Failure behavior is complete (§15): the node fail-stops on WAL `ENOSPC`/`EIO`, recovers from
 `SIGKILL` during writes, keeps snapshot writes atomic, and a learner killed mid-snapshot-install
@@ -46,20 +46,18 @@ The next work, in order (re-prioritised 2026-11-06 after the OpenRaft utilizatio
 [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md)):
 
 1. **Benchmark regression gate (§8, P2).** Gate CI on `apply_path` allocs/entry (deterministic) plus
-   loose percentile thresholds now that `book_replay` and `level_book` report warm p50/p99.
-2. **Realistic-mix replay benchmark (§8, P2).** Replay a large fixture with a real
-   add/cancel/amend mix (stops, icebergs, fees) and report percentiles - the load analogue of
-   `tests/replay` and the closest equivalent to the ITCH-style replay the external notes treat as
-   the only production-like signal.
-3. **Linux pinned-core `e2e` pass (§8, P2).** `--pin <cpu>` is implemented (Linux
+   loose percentile thresholds now that `book_replay`, `level_book` and `replay_mix` report warm
+   p50/p99.
+2. **Linux pinned-core `e2e` pass (§8, P2).** `--pin <cpu>` is implemented (Linux
    `sched_setaffinity`) and fails loudly on macOS; run
    `cargo bench --bench e2e -- --pin 0` once on a Linux host to record the true single-core number.
 
 The measurement work from the re-review is done: `book_replay` and `level_book` now report warm
-p50/p99 plus an interleaved cold pass with setup/drop outside the timer, and this macOS host's
-closest pinned approximation (current-thread runtime) showed no change. The quick wins from the
-last review are also complete: `Order` identity `PartialEq`, optional `Order::sequence`, a BTC/USDT
-quote-volume case, and the `fee_overflow_base_orders` replay case.
+p50/p99 plus an interleaved cold pass with setup/drop outside the timer, and `replay_mix` replays a
+deterministic 100,000-operation add/cancel/amend/stop/iceberg/taker fixture with fees. This macOS
+host's closest pinned approximation (current-thread runtime) showed no change. The quick wins from
+the last review are also complete: `Order` identity `PartialEq`, optional `Order::sequence`, a
+BTC/USDT quote-volume case, and the `fee_overflow_base_orders` replay case.
 
 ## 1. Exact fixed-point end-to-end — done
 
@@ -390,9 +388,14 @@ Remaining:
   best-of-5, and interleaves a cold pass with a 64 MiB eviction sweep. `book_replay` now shows the
   1k-ask sweep at 85.7µs p50 / 171.8µs p99; `level_book` keeps best-of-5 for continuity and uses
   p50 as the headline.
-- [ ] **P1** Add one realistic-mix replay benchmark: replay a large fixture (add/cancel/amend with
-  stops, icebergs and fees) and report p50/p99. `tests/replay` is correctness-only; this is its
-  load analogue.
+- [x] **P1** Add one realistic-mix replay benchmark (`cargo bench --bench replay_mix`): a
+  deterministic 100,000-operation fixture (55,546 limit adds, 9,903 icebergs, 4,858 parked stops,
+  9,928 cancels, 9,757 amends, 10,008 market takers) with maker 0.0002 / taker 0.0005 fees.
+  Whole replay warm p50 107.252ms / p99 109.363ms (968,709 ops/s at the 103.230ms best round),
+  cold p50 106.638ms / p99 108.522ms; per-operation p50/p99: all 791ns/3.041µs, limit add
+  1.333µs/2.833µs, iceberg 1.375µs/2.834µs, stop 84ns/292ns, cancel 625ns/2.041µs, amend
+  292ns/666ns, taker 1.417µs/6.833µs. `tests/replay` remains correctness-only; this is its load
+  analogue.
 - [ ] **P2** Adopt per-level buckets or a compact resting record only if the P1 prototype and
   new 3-node or real-sink measurements justify the complexity. The 2026-11-04 run wins 1.84x
   match, 3.31x cancel, 1.75x/2.59x amend and 4.90x BBO query, but loses 0.75x sparse amend, 0.87x
@@ -628,7 +631,10 @@ Open follow-ups:
 
 - [x] **P1** Add percentiles and cache-warmth labels to the book benchmarks. Done: shared
   `benches/bench_support` with warm/cold, setup/drop exclusion and p50/p99 (tracked in §8).
-- [ ] **P1** Add the realistic-mix replay benchmark (tracked in §8, from the same re-review).
+- [x] **P1** Add the realistic-mix replay benchmark (tracked in §8, from the same re-review).
+  Done: `cargo bench --bench replay_mix` replays a deterministic 100,000-operation
+  add/cancel/amend/stop/iceberg/taker fixture with maker/taker fees and reports whole-replay
+  warm/cold p50/p99 plus per-operation p50/p99/max; results are in `docs/PERFORMANCE.md`.
 - [ ] **P2** Run the Linux pinned-core `e2e` pass; the `--pin` flag exists and this macOS host
   cannot pin (tracked in §8).
 - [ ] **P2** Evaluate a binary order-entry path (gRPC/protobuf or compact codec) and feature-gated

@@ -47,6 +47,10 @@ harness = false
 name = "apply_path"
 harness = false
 
+[[bench]]
+name = "replay_mix"
+harness = false
+
 [dependencies]
 actix-web = "4.18.1"
 async-stream = "0.3.6"

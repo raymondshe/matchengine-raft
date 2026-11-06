@@ -1,6 +1,6 @@
 # Performance measurements
 
-Measured on **2026-10-30** (runtime flavor A/B and P0 offloads: **2026-10-31**; measurement scope and RSS: **2026-11-01**; book p50/p99 and the pinned-core approximation: **2026-11-04**; end-to-end/storage rerun with the OpenRaft quick wins: **2026-11-06**) on the reference development machine:
+Measured on **2026-10-30** (runtime flavor A/B and P0 offloads: **2026-10-31**; measurement scope and RSS: **2026-11-01**; book p50/p99 and the pinned-core approximation: **2026-11-04**; end-to-end/storage rerun with the OpenRaft quick wins: **2026-11-06**; realistic-mix replay: **2026-11-06**) on the reference development machine:
 
 - Apple M4 (`arm64`)
 - Rust `1.93.1`
@@ -19,6 +19,7 @@ cargo bench --bench feed_load     # market-data feed at 50k/500k fills/s
 cargo bench --bench storage       # WAL append/read/recovery
 cargo bench --bench p0_bench -- duplicate|read|snapshot  # P0 lock/scan A/B
 cargo bench --bench book_replay   # book-only sweeps, deep cancels and BBO advances
+cargo bench --bench replay_mix    # realistic add/cancel/amend/stop/iceberg replay with per-op percentiles
 cargo bench --bench level_book    # per-level bucket prototype vs the current book
 cargo bench --bench apply_path    # apply-path heap allocations per applied entry
 ```
@@ -32,6 +33,7 @@ its scope.
 |---|---|---|---|---|---|
 | `matchengine` | Order-book operations: sweep, rest, partial fill, IOC cancel, iceberg refill, amend, cancel; optional depth journal | HTTP, Raft, WAL, snapshots, market-data encoding/sink | Closed-loop, in-process | `Instant`, best-of-5 per round | Best-of-5 only; not a tail study |
 | `book_replay` | `OrderBook` only: 100-level and single-level sweeps, deep cancels, BBO advancement and static BBO queries; clone/eviction outside the timed window | HTTP, Raft, WAL/snapshots, market-data feed, event construction, fees | Closed-loop, in-process; one pristine book per round | `Instant` per round; best-of-5 repeats, warm p50/p99, interleaved cold p50/p99 after a 64 MiB eviction sweep | 5-14% run-to-run; cold adds ~8-22%; 1k/20k cases differ in tree depth, not just order count |
+| `replay_mix` | Deterministic 100,000-operation `OrderBook` stream: limit adds, icebergs, parked stops, cancels, amendments and market takers, with maker/taker fees on every order; whole-replay and per-operation timings | HTTP, Raft, WAL/snapshots, market-data feed, event construction, symbol/tick validation | Closed-loop, in-process; fixture generated at startup, book rebuilt per round | `Instant` per operation for the per-kind table; 20 whole-replay warm rounds plus 20 interleaved cold rounds after a 64 MiB eviction sweep | Four runs; whole-replay warm p50 within 5%, per-operation p50 within ~30%; p99 and max are host-noise sensitive |
 | `level_book` | Prototype per-level buckets plus the current `OrderBook`: match sweeps, deep cancels, sparse/dense amends, depth, BBO queries and BBO advancement; plain limit orders only; clone/eviction outside the timed window | Stops, icebergs, GTD expiry, validation, events, depth journal, market-data feed, fees beyond `MatchResult` construction | Closed-loop, in-process; paired current/prototype books | `Instant` per round; best-of-5 repeats, warm p50/p99, interleaved cold p50/p99 after a 64 MiB eviction sweep | 5-10% run-to-run, BBO-query ratio 4.9-5.6x; sparse one-order-per-level cases are the prototype's worst case |
 | `apply_path` | `StateMachineStore::apply` only: blank, rest, cancel, fill and 128-request batch workloads; a counting global allocator reports heap calls and requested bytes | HTTP, Raft, WAL, snapshots, market-data tap, event-log reads, response serialization | Closed-loop, direct apply; 50k entries or 1k batches per workload | Counting allocator; per-entry averages | Requested bytes include realloc churn and are not a live-memory high-water mark |
 | `e2e` `/write` | HTTP decode/validation, Raft proposal/commit, WAL append + `sync_data`, apply, response serialization | Cross-node replication, external client network beyond loopback | Sequential is closed-loop; concurrent is a 1,000-request burst | `Instant` per request; p50/p95/p99/max | Medians/percentiles; runtime A/B uses four alternating runs, the 2026-11-06 rerun uses three |
@@ -132,6 +134,43 @@ the 100-level sweep, 2.26-2.50 ms / 2.32-2.49 ms for the single-level sweep, 255
 257-271 µs for the deep cancels, 98-108 µs / 98-107 µs for BBO advancement and 2.30-2.59 ms /
 2.49-2.85 ms for the 1M-query loop. Treat these as order-of-magnitude baselines, not exact
 constants.
+
+## Realistic-mix replay benchmark (2026-11-06)
+
+`cargo bench --bench replay_mix` is the load analogue of `tests/replay`: it replays a deterministic
+100,000-operation fixture through `OrderBook` directly (no HTTP, Raft, WAL, snapshot or
+market-data feed) and reports whole-replay percentiles plus per-operation p50/p99/max by operation
+kind. The fixture is generated at startup from a fixed-seed LCG rather than checked in, so the
+operation stream is identical across runs and machines.
+
+| Operation | Count | Share | Warm p50 | Warm p99 | Max |
+|---|---:|---:|---:|---:|---:|
+| Limit add | 55,546 | 55.5% | 1.333 µs | 2.833 µs | 775.500 µs |
+| Iceberg add | 9,903 | 9.9% | 1.375 µs | 2.834 µs | 15.583 µs |
+| Stop add (parked) | 4,858 | 4.9% | 84 ns | 292 ns | 3.291 µs |
+| Cancel | 9,928 | 9.9% | 625 ns | 2.041 µs | 7.667 µs |
+| Amend | 9,757 | 9.8% | 292 ns | 666 ns | 11.125 µs |
+| Market taker | 10,008 | 10.0% | 1.417 µs | 6.833 µs | 17.875 µs |
+| **All operations** | **100,000** | **100%** | **791 ns** | **3.041 µs** | **775.500 µs** |
+
+Whole replay: warm best 103.230 ms, warm p50 107.252 ms, warm p99 109.363 ms (**968,709 ops/s**
+at the best round), cold p50 106.638 ms, cold p99 108.522 ms (n=20). Warm and cold rounds are
+interleaved; at n=20 the nearest-rank p99 is the slowest round, so the per-operation table is the
+stronger tail signal. Across four runs the whole-replay warm p50 was 107.25-112.32 ms (within 5%)
+and per-operation p50 varied by up to ~30%; one noisy run produced a 182.6 ms warm p99 and a
+10.1 µs per-operation p99, so treat p99 and max as host-noise sensitive.
+
+Every order carries maker `0.0002` / taker `0.0005` fee rates, so fee computation is on every fill
+path. The fixture is built to exercise the full lifecycle rather than to hit a target reject rate:
+all 55,546 limit adds and 9,903 icebergs rest, all 4,858 stops park, and there are no rejections.
+The takers produce 12,212 fills and elect 2,546 parked stops; 9,526 of the 9,928 cancel attempts
+find a live order (the rest target an order already consumed by a fill or stop trigger), and all
+9,757 amendments succeed.
+
+The per-operation max is host-noise sensitive (a single 0.8-2.3 ms outlier moved between
+operation kinds across runs); p99 is the useful tail. Market takers have the widest p99/p50 ratio
+(~4.8x) because each taker may sweep several price levels and elect stop children, while parked
+stops and amendments are single tree insertions and stay sub-microsecond at p99.
 
 ## Per-level bucket prototype (2026-11-04)
 
@@ -634,9 +673,11 @@ The measurement rules transferred regardless of layout and are now implemented:
 - **Percentiles, not just best-of-5.** `book_replay` and `level_book` report warm p50/p99 over every
   per-round sample and keep best-of-5 for continuity. The 1k-ask sweep's p99 is 2.0x its p50 while
   best-of-5 sits on the p50, which is exactly the tail a regression gate needs to see.
-- **A realistic-mix replay is still open.** They treat ITCH replay as the only production-like
-  signal because it carries a real add/cancel/modify mix. Our `tests/replay` fixtures are
-  correctness-only; a large realistic replay with percentiles remains a TODO.md §8 item.
+- **A realistic-mix replay is now implemented.** They treat ITCH replay as the only
+  production-like signal because it carries a real add/cancel/modify mix. `cargo bench --bench
+  replay_mix` replays a deterministic 100,000-operation add/cancel/amend/stop/iceberg/taker
+  fixture with fees and reports warm/cold whole-replay percentiles plus per-operation p50/p99;
+  see the realistic-mix section above. `tests/replay` remains correctness-only.
 - **Scheduler noise is now measurable.** `cargo bench --bench e2e -- --pin <cpu>` pins the process on
   Linux; on this macOS host the current-thread run was the closest approximation and showed no
   change (see "Pinned-core pass"). A true pinned Linux run is still pending.
@@ -658,6 +699,10 @@ The measurement rules transferred regardless of layout and are now implemented:
   improves throughput substantially.
 - The feed has ample headroom at 500k fills/s with a null sink. A real sink
   (JSONL or Aeron) must be measured separately because it adds encoding and I/O.
+- The realistic-mix replay sustains ~1.0M book operations/s warm (791 ns per-operation p50).
+  Single-order operations stay at or below 2.9 µs p99; market takers are the widest tail (6.8 µs
+  p99) because they sweep levels and elect stops. This is book-only load, not an end-to-end
+  capacity number.
 - The per-level bucket prototype wins match, deep-cancel, dense-amend and
   BBO-query workloads but loses sparse one-order-per-level re-queue and BBO
   advance. Full adoption still needs a sparse-level fast path (or a hybrid) and
