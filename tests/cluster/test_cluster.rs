@@ -18,6 +18,7 @@ use matchengine_raft::order_book::OrderSide;
 use matchengine_raft::store::MatchEngineRequest;
 use openraft::BasicNode;
 use openraft::type_config::TypeConfigExt;
+use reqwest::StatusCode;
 use tracing_subscriber::EnvFilter;
 
 pub fn log_panic(panic: &PanicHookInfo) {
@@ -44,6 +45,24 @@ pub fn log_panic(panic: &PanicHookInfo) {
     }
 
     eprintln!("{}", backtrace);
+}
+
+/// Waits until the node reports ready, which includes Raft recovery.
+async fn wait_ready(addr: &str) -> anyhow::Result<()> {
+    let http = reqwest::Client::builder().no_proxy().build()?;
+    let deadline = Instant::now() + Duration::from_secs(15);
+
+    loop {
+        if let Ok(response) = http.get(format!("http://{addr}/ready")).send().await
+            && response.status() == StatusCode::OK
+        {
+            return Ok(());
+        }
+        if Instant::now() > deadline {
+            anyhow::bail!("node {addr} never became ready");
+        }
+        MatchEngineTypeConfig::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 /// Setup a cluster of 3 nodes.
@@ -118,8 +137,10 @@ async fn test_cluster_inner() -> anyhow::Result<()> {
         println!("=== init single node cluster");
         client.init().await??;
 
-        // Wait for the initial membership log to commit after election
-        MatchEngineTypeConfig::sleep(Duration::from_millis(200)).await;
+        // `/ready` waits for Raft recovery, which also covers the initial
+        // membership log. A fixed sleep can race add_learner on a loaded CI
+        // runner and surface "already undergoing a configuration change".
+        wait_ready(&get_addr(1)?).await?;
 
         println!("=== metrics after init");
         client.metrics().await?;
