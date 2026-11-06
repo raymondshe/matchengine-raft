@@ -671,3 +671,33 @@ The measurement rules transferred regardless of layout and are now implemented:
   encode/decode and read serialization are off the lock, apply locks per entry
   and publishes after release, and duplicate retries binary-search the event
   window. Snapshot byte sharing and optional sink offload remain open.
+
+## Implementation notes (2026-11-06)
+
+### Implemented choices
+
+- One `write_all` + one `sync_data` per replicated append batch, so N entries in one AppendEntries
+  RPC cost one fsync.
+- `pread` reads against cached file handles, so replication can read while an append is in flight.
+- The order book, event window and dedupe map stay in memory; `apply` does no disk IO.
+- gRPC uses bidirectional `AppendStream` for pipelined replication, separate replication,
+  heartbeat and snapshot connections per peer, and tuned HTTP/2 flow-control windows/keepalive.
+- Snapshots stream in OpenRaft-configured chunks (3 MiB default, 8 MiB cap); `log/state` and
+  `snapshot/current.snap` are replaced atomically.
+- The event window is bounded by `--max-events` and paged through `/events`; `/read
+  orderbook_orders` does not clone it.
+- WAL appends avoid per-entry clones, recovery scans segments sequentially, contiguous log reads share one `pread`, snapshot encoding/writing runs outside the state-machine lock, and snapshot bodies stream to disk through an incremental CRC writer.
+- A gRPC server failure is fatal to `run()`: HTTP is stopped, background tasks are joined and Raft is shut down before the error is returned. HTTP requests are logged once per request.
+
+### Current limits and known gaps
+
+- TLS/mTLS and API authentication are intentionally gateway responsibilities; this process is an internal service.
+- Snapshot installation needs one contiguous buffer, bounded by 256 MiB per snapshot.
+- One process/cluster trades one symbol; run one deployment per symbol to scale.
+
+### Data format `Order` prices/quantities, `last_trade_price`, match events, depth/BBO/spread, the
+JSONL feed and wire v6 use exact 18-scale fixed-point integers. Snapshot **v10** and wire **v6** are
+breaking changes from earlier builds, so recreate data directories when upgrading. See
+[`docs/DECIMAL.md`](./DECIMAL.md).
+
+Known gaps and the roadmap are tracked in [`TODO.md`](../TODO.md).

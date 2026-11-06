@@ -8,8 +8,8 @@ The demo has two pieces:
 - an Actix Web BFF (`demos/order_system/src/`) that calls one or two engines' public HTTP APIs through the
   leader-aware `MatchEngineClient`, and computes demo-side freeze/settlement and linear-perpetual
   margin estimates in `demos/order_system/src/freeze.rs`,
-- a dependency-free HTML/CSS/JavaScript UI (`demos/order_system/web/`) that reuses `web/console/app.css` and adds
-  only the trading-desk layout.
+- a dependency-free HTML/CSS/JavaScript UI (`demos/order_system/web/`) that reuses the engine
+  console stylesheet at `web/console/app.css` and adds only the trading-desk layout.
 
 The Spot and Perpetual products each use **their own engine process and order book**. One engine
 process trades exactly one symbol, and the pair script's Spot EUR/USD uses
