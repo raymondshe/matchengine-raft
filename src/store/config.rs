@@ -7,7 +7,7 @@
 //! <data_dir>/<instance_prefix>-<node_id>/
 //!   log/
 //!     state            # vote + last purged log id, written atomically
-//!     0000000000.wal   # append-only segments, one fsync per append
+//!     0000000000.wal   # append-only segments, fsync policy is configurable
 //!   snapshot/
 //!     current.snap     # latest state machine snapshot, written atomically
 //! ```
@@ -33,11 +33,20 @@ pub const MARKET_DATA_LOG_ENV: &str = "MARKET_DATA_LOG";
 pub const MAX_EVENTS_ENV: &str = "MAX_EVENTS";
 /// Environment variable that overrides the periodic snapshot interval in milliseconds.
 pub const SNAPSHOT_INTERVAL_MS_ENV: &str = "SNAPSHOT_INTERVAL_MS";
+/// Environment variable that sets the WAL fsync policy in milliseconds.
+///
+/// Unset means no fsync; `0` fsyncs every append; `N > 0` fsyncs every N ms.
+pub const WAL_FSYNC_MS_ENV: &str = "RAFT_WAL_FSYNC_MS";
 
 /// Default root directory for node data.
 pub const DEFAULT_DATA_DIR: &str = "/tmp/matchengine-raft";
 /// Default prefix used when naming a node directory.
 pub const DEFAULT_INSTANCE_PREFIX: &str = "matchengine";
+/// Voter floor used when WAL fsync is disabled.
+///
+/// Four voters put a committed entry on at least three nodes, so one node
+/// losing its unsynced tail still leaves at least two copies.
+pub const NO_FSYNC_MIN_VOTERS: usize = 4;
 
 /// Where a node keeps its durable state.
 #[derive(Clone, Debug)]
@@ -69,6 +78,36 @@ pub struct StorageConfig {
     /// been applied. `Duration::ZERO` disables the timer; the log-count policy
     /// still applies.
     pub snapshot_interval: Duration,
+
+    /// WAL fsync policy.
+    ///
+    /// `None` disables fsync, `Some(Duration::ZERO)` fsyncs every append, and
+    /// `Some(interval)` fsyncs the active segment every `interval`.
+    pub wal_fsync: Option<Duration>,
+
+    /// Minimum voter count required for initialization, membership changes and
+    /// writes. The binary sets 4 when WAL fsync is disabled; library callers
+    /// default to 1.
+    pub min_voters: usize,
+}
+
+/// Reads the WAL fsync policy from `RAFT_WAL_FSYNC_MS`.
+///
+/// Unset means no fsync; `0` fsyncs every append; `N > 0` fsyncs every N ms.
+pub fn wal_fsync_from_env() -> Option<Duration> {
+    match std::env::var(WAL_FSYNC_MS_ENV) {
+        Ok(value) => match value.parse::<u64>() {
+            Ok(ms) => Some(Duration::from_millis(ms)),
+            Err(_) => {
+                tracing::warn!(
+                    value,
+                    "RAFT_WAL_FSYNC_MS must be a non-negative integer; WAL fsync is disabled"
+                );
+                None
+            }
+        },
+        Err(_) => None,
+    }
 }
 
 impl Default for StorageConfig {
@@ -91,6 +130,13 @@ impl Default for StorageConfig {
             .map(Duration::from_millis)
             .unwrap_or(DEFAULT_SNAPSHOT_INTERVAL);
 
+        let wal_fsync = wal_fsync_from_env();
+        let min_voters = if wal_fsync.is_none() {
+            NO_FSYNC_MIN_VOTERS
+        } else {
+            1
+        };
+
         Self {
             data_dir,
             instance_prefix,
@@ -98,6 +144,8 @@ impl Default for StorageConfig {
             market_data,
             max_events,
             snapshot_interval,
+            wal_fsync,
+            min_voters,
         }
     }
 }
@@ -112,6 +160,8 @@ impl StorageConfig {
             market_data: None,
             max_events: DEFAULT_MAX_EVENTS,
             snapshot_interval: DEFAULT_SNAPSHOT_INTERVAL,
+            wal_fsync: None,
+            min_voters: 1,
         }
     }
 
@@ -142,6 +192,22 @@ impl StorageConfig {
     /// Sets the periodic snapshot interval; zero disables the timer.
     pub fn with_snapshot_interval(mut self, interval: Duration) -> Self {
         self.snapshot_interval = interval;
+        self
+    }
+
+    /// Sets the WAL fsync policy.
+    ///
+    /// `None` disables fsync, `Some(Duration::ZERO)` fsyncs every append, and
+    /// `Some(interval)` fsyncs the active segment every `interval`.
+    pub fn with_wal_fsync(mut self, fsync: Option<Duration>) -> Self {
+        self.wal_fsync = fsync;
+        self
+    }
+
+    /// Sets the minimum voter count required for initialization, membership
+    /// changes and writes.
+    pub fn with_min_voters(mut self, min_voters: usize) -> Self {
+        self.min_voters = min_voters.max(1);
         self
     }
 
@@ -220,6 +286,29 @@ mod tests {
         assert_eq!(DEFAULT_MAX_EVENTS, StorageConfig::new("/data").max_events);
         let config = StorageConfig::new("/data").with_max_events(32);
         assert_eq!(32, config.max_events);
+    }
+
+    #[test]
+    fn min_voters_defaults_to_one_and_is_configurable() {
+        assert_eq!(1, StorageConfig::new("/data").min_voters);
+        assert_eq!(4, StorageConfig::new("/data").with_min_voters(4).min_voters);
+    }
+
+    #[test]
+    fn wal_fsync_defaults_to_disabled_and_is_configurable() {
+        assert!(StorageConfig::new("/data").wal_fsync.is_none());
+        assert_eq!(
+            Some(Duration::ZERO),
+            StorageConfig::new("/data")
+                .with_wal_fsync(Some(Duration::ZERO))
+                .wal_fsync
+        );
+        assert_eq!(
+            Some(Duration::from_millis(50)),
+            StorageConfig::new("/data")
+                .with_wal_fsync(Some(Duration::from_millis(50)))
+                .wal_fsync
+        );
     }
 
     #[test]

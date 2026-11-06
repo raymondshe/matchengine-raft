@@ -123,7 +123,8 @@ async fn start_node(
     let dir = temp_dir(runtime);
     let storage = StorageConfig::new(dir.clone())
         .with_instance_prefix(format!("e2e-{runtime}"))
-        .with_snapshot_interval(Duration::ZERO);
+        .with_snapshot_interval(Duration::ZERO)
+        .with_wal_fsync(matchengine_raft::store::config::wal_fsync_from_env());
     let node = build_match_engine_node(1, addr.to_string(), default_raft_config(), storage).await?;
     let client = MatchEngineClient::<C>::new(1, addr.to_string());
     client.init().await??;
@@ -309,6 +310,11 @@ fn main() -> anyhow::Result<()> {
     if let Some(cpu) = pin {
         pin_to_cpu(cpu)?;
         println!("process pinned to CPU {cpu}");
+    }
+    match matchengine_raft::store::config::wal_fsync_from_env() {
+        None => println!("WAL fsync disabled (RAFT_WAL_FSYNC_MS unset)"),
+        Some(interval) if interval.is_zero() => println!("WAL fsync: every append"),
+        Some(interval) => println!("WAL fsync: every {}ms", interval.as_millis()),
     }
     let run_current = matches!(selection.as_str(), "current" | "both");
     let run_multi = selection != "current";

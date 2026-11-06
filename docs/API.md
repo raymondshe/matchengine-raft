@@ -28,6 +28,9 @@ OpenRaft-configured chunks (3 MiB default, 8 MiB cap), and both message directio
   `[[1, "127.0.0.1:21001"], ...]` for an explicit membership
 - `POST /add-learner` - Add a learner node; body is `[id, "host:port"]`
 - `POST /change-membership` - Change the voter set; body is `[1, 2, 3]`
+- When `RAFT_WAL_FSYNC_MS` is unset, the binary requires at least four voters: `/init` and
+  `/change-membership` reject smaller sets, and `/write`/`/write_batch` return `503` until four
+  voters exist.
 - `GET /metrics` - Get Raft metrics
 - `POST /get_linearizer` - Fetch a read linearizer from the leader (used by `/follower_read`)
 

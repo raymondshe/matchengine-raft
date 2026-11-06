@@ -11,6 +11,10 @@ set -eu
 
 cd "$(dirname "$0")/.."
 
+# These demos use fewer than the four voters required when WAL fsync is
+# disabled; use every-append fsync unless the caller overrides it.
+export RAFT_WAL_FSYNC_MS=${RAFT_WAL_FSYNC_MS:-0}
+
 DATA_DIR=${MARKET_DATA_SYSTEM_DATA_DIR:-/tmp/matchengine-marketdata-demo}
 DEMO_ADDR=${MARKET_DATA_SYSTEM_ADDR:-127.0.0.1:24800}
 EUR_ADDR=${MARKET_DATA_EUR_ADDR:-127.0.0.1:24801}

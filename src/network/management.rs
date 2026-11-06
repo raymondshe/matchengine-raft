@@ -32,6 +32,21 @@ pub struct LinearizerData {
 
 // --- Cluster management
 
+/// Rejects membership changes that would leave fewer voters than configured.
+///
+/// The binary sets `min_voters = 4` when WAL fsync is disabled, so a committed
+/// entry is on at least three nodes and one node's unsynced tail loss leaves at
+/// least two copies.
+fn ensure_min_voters(app: &MatchEngineApp, voters: usize) -> actix_web::Result<()> {
+    if voters < app.min_voters {
+        return Err(actix_web::error::ErrorBadRequest(format!(
+            "cluster has {voters} voters; at least {} are required while WAL fsync is disabled",
+            app.min_voters
+        )));
+    }
+    Ok(())
+}
+
 /// Add a node as **Learner**.
 ///
 /// A Learner receives log replication from the leader but does not vote.
@@ -64,6 +79,7 @@ pub async fn change_membership(
     app: Data<MatchEngineApp>,
     req: Json<BTreeSet<MatchEngineNodeId>>,
 ) -> actix_web::Result<impl Responder> {
+    ensure_min_voters(&app, req.0.len())?;
     let res = match app.raft.change_membership(req.0, false).await.decompose() {
         Ok(res) => res,
         Err(error) => {
@@ -96,6 +112,7 @@ pub async fn init(
             nodes.insert(id, BasicNode { addr });
         }
     };
+    ensure_min_voters(&app, nodes.len())?;
     let res = match app.raft.initialize(nodes).await.decompose() {
         Ok(res) => res,
         Err(error) => {

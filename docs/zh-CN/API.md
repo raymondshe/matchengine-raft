@@ -26,6 +26,8 @@ Raft 节点间 RPC 仅由 `--http-addr` 端口 + 1000 上的 gRPC 提供；HTTP 
   `[[1, "127.0.0.1:21001"], ...]` 显式指定成员
 - `POST /add-learner` - 添加学习者节点；请求体为 `[id, "host:port"]`
 - `POST /change-membership` - 变更投票成员集合；请求体为 `[1, 2, 3]`
+- `RAFT_WAL_FSYNC_MS` 未设置时，二进制要求至少 4 个投票成员：`/init` 和
+  `/change-membership` 会拒绝更小的集合，`/write`/`/write_batch` 在达到 4 个成员前返回 `503`。
 - `GET /metrics` - 获取 Raft 指标
 - `POST /get_linearizer` - 从领导者获取读 linearizer（供 `/follower_read` 使用）
 

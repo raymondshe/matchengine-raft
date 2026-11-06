@@ -5,7 +5,7 @@
 Raft 日志追加写入 `log/NNNNNNNNNN.wal` 分段文件：
 
 - 每条记录格式为 `[len: u32 LE][crc32: u32 LE][postcard 负载]`；启动时逐段扫描，遇到撕裂或校验失败的尾部直接截断，而不是当作有效记录解析。
-- `append()` 用一次 `write_all` 写入整个 openraft 批次，再执行一次 `sync_data`，因此一次 AppendEntries RPC 中的 N 条记录只付一次 fsync 的代价。
+- `append()` 用一次 `write_all` 写入整个 openraft 批次；fsync 由 `RAFT_WAL_FSYNC_MS` 控制：未设置 = 不 fsync（默认），`0` = 每次追加 fsync，`N > 0` = 每 N ms 周期 fsync。
 - 读取使用 `pread`（`read_at`）和缓存的文件句柄，复制任务可以在追加进行时并发读取，磁盘 IO 期间不持有全局锁。
 - 所有阻塞 IO 都放在 `spawn_blocking` 中执行，异步运行时只负责编解码。
 - 分段默认 64 MiB；只有被 purge 完全覆盖的分段才会删除，删除前先轮转活跃分段，保证日志不出现空洞。
@@ -13,7 +13,36 @@ Raft 日志追加写入 `log/NNNNNNNNNN.wal` 分段文件：
   （`get_log_state`、`read_vote`/`save_vote`、`read_committed`/`save_committed`、`append`、
   `truncate_after`、`purge`、`get_log_reader`）。
 
-投票和最后一次 purge 的日志 id 属于安全关键且低频的状态，单独存放在 `log/state` 文件中，采用原子重写（临时文件 → fsync → rename → 目录 fsync）。committed 日志 id 追加到 WAL 尾部但不单独 fsync，随下一次 append 一起持久化，避免每批次多一次 fsync。
+投票和最后一次 purge 的日志 id 属于安全关键且低频的状态，单独存放在 `log/state` 文件中，采用原子重写（临时文件 → fsync → rename → 目录 fsync）。committed 日志 id 追加到 WAL 尾部但不单独 fsync：每次追加模式下随下一次 append 持久化，周期模式在下一次 tick 持久化，不 fsync 模式则不保证持久化；这样避免每批次多一次 fsync。
+
+### WAL 持久性与从 peer 恢复
+
+`RAFT_WAL_FSYNC_MS` 控制 WAL fsync：
+
+- 未设置：不 fsync（默认）。
+- `0`：每次追加批次 fsync。
+- `N > 0`：专用 `wal-fsync` 线程每 N ms fsync 活跃分段。
+
+只有每次追加 fsync 完全满足 `RaftLogStorage::append` 的持久性契约。不 fsync 或周期 fsync 时，
+崩溃可能丢失自上次 fsync 以来的已确认写入（周期模式下最多约 N ms）。
+
+崩溃后本地 WAL 可能短于集群已提交日志。Raft 能处理**合法的较短日志**：leader 补齐缺失条目或
+安装快照；选举限制阻止较短日志的节点在多数派拥有已提交条目时当选；`/ready` 会等待
+`wait_for_recovery`；投票和 purge 状态始终 fsync，即使 WAL fsync 关闭。
+
+如果崩溃在非最后分段留下撕裂记录，非每次追加模式下 `LogStore::open` 会做尽力恢复：在第一个
+损坏记录、索引空洞或分段处截断，删除后续分段，返回最长合法前缀，随后由 Raft 从 peer 追赶。
+只有该节点拥有的条目可能丢失；如果没有任何 peer 拥有，则不可恢复。每次追加 fsync 模式下同样的
+损坏会直接报错并拒绝启动。
+
+生产环境建议设置 `RAFT_WAL_FSYNC_MS=0` 获得最强持久性，或设置较小的 N 将丢失窗口限制在约
+N ms；未设置最快，但崩溃可能丢失已确认写入。
+
+`RAFT_WAL_FSYNC_MS` 未设置时，二进制还要求至少 **4 个投票成员**：`/init` 和
+`/change-membership` 会拒绝更小的集合，`/write`/`/write_batch` 在达到 4 个成员前返回 `503`。
+4 个投票成员使一条已提交日志至少存在于 3 个节点上，单个节点丢失未 fsync 的尾部后仍至少保留 2 份。
+启动 4 个节点后，用包含全部 4 个 `[id, addr]` 的 `/init` 请求初始化；单节点 `[]` 形式会被拒绝。
+演示脚本默认设置 `RAFT_WAL_FSYNC_MS=0`，因此三节点和单节点示例仍然可用。
 
 ## 快照（`src/store/state_machine.rs`）
 
@@ -76,7 +105,8 @@ config.max_in_snapshot_log_to_keep = 0; // 清理快照已覆盖的全部日志
 ## 数据恢复
 
 启动时节点会：
-1. 恢复 WAL 索引、投票和 purge 标记（并丢弃撕裂的尾部）。
+1. 恢复 WAL 索引、投票和 purge 标记（并丢弃撕裂的尾部；非每次追加模式下在第一个损坏分段处
+   截断，让 Raft 追赶）。
 2. 选择并加载 `snapshot/current.snap`（如果存在）。该文件原子替换，因此始终是最新的完整快照；
    崩溃只会留下不会被选中的 `.tmp` 文件。
 3. 从快照元数据恢复状态机的 `last_applied`，再由 openraft 重放日志索引大于快照最后日志索引的

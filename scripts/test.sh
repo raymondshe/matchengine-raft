@@ -5,6 +5,10 @@ set -o errexit
 # Always run from the repository root.
 cd "$(dirname "$0")/.."
 
+# These demos use fewer than the four voters required when WAL fsync is
+# disabled; use every-append fsync unless the caller overrides it.
+export RAFT_WAL_FSYNC_MS=${RAFT_WAL_FSYNC_MS:-0}
+
 kill() {
     if [ "$(uname)" = "Darwin" ]; then
         # `pgrep -x` does not match the `./target/.../matchengine-raft` argv

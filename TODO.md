@@ -401,6 +401,27 @@ Remaining:
   match, 3.31x cancel, 1.75x/2.59x amend and 4.90x BBO query, but loses 0.75x sparse amend, 0.87x
   BBO advance and 0.96x depth; full adoption is not justified yet, and a hybrid or sparse-level
   fast path is the next experiment.
+- [x] **P1** Isolate OpenRaft on a dedicated multi-threaded runtime: set `RAFT_CORE_WORKERS` to
+  a positive count to build with `Raft::build` and run on a `raft-worker` runtime; unset or `0`
+  keeps `Raft::new` on the shared runtime. RaftCore and the state-machine worker no longer
+  compete with HTTP/gRPC/feed tasks when enabled. A/B: sequential p50/p99 unchanged; concurrent
+  writes within the host's noise (17.0/14.8k/s dedicated vs 17.8/19.2k/s shared in the final
+  pairs). Apply can still migrate between the dedicated workers.
+- [x] **P1** Add configurable WAL fsync via `RAFT_WAL_FSYNC_MS` (unset = none, `0` = every
+  append, `N` = periodic every N ms) and measure it: e2e sequential p50 90.9µs (none), 98.5µs
+  (10ms), 84.0µs (100ms), 3.93ms (every append); sequential throughput 8.6k / 7.5k / 9.9k / 267
+  writes/s. Every-append is ~43x slower at p50; periodic 10ms costs ~13% throughput vs none.
+  Non-every-append modes use best-effort WAL truncation so Raft can catch up from peers, but data
+  no peer has is unrecoverable.
+- [x] **P1** Require four voters when WAL fsync is disabled: the binary sets `min_voters = 4`,
+  `/init` and `/change-membership` reject smaller voter sets, and `/write`/`/write_batch` return
+  `503` until four voters exist. Four voters keep a committed entry on at least three nodes, so one
+  node's unsynced tail loss leaves at least two copies. Demo scripts default
+  `RAFT_WAL_FSYNC_MS=0` for their three-node/single-node setups; `test_min_voters.rs` covers the
+  guard.
+- [ ] **P2** Decide whether strict apply-thread affinity is worth the cost: the single-worker
+  dedicated runtime keeps apply on one thread but measured ~7% lower concurrent writes; a batched
+  apply actor is the alternative.
 - [ ] **P2** Add a benchmark regression gate (threshold or recorded baseline) to CI.
 - [ ] **P2** Run `cargo bench --bench e2e -- --pin <cpu>` on a Linux host once, to separate
   scheduler noise from the fsync cost that dominates the current p99. The flag is implemented; this

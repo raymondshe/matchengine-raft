@@ -1,6 +1,6 @@
 # Performance measurements
 
-Measured on **2026-10-30** (runtime flavor A/B and P0 offloads: **2026-10-31**; measurement scope and RSS: **2026-11-01**; book p50/p99 and the pinned-core approximation: **2026-11-04**; end-to-end/storage rerun with the OpenRaft quick wins: **2026-11-06**; realistic-mix replay: **2026-11-06**) on the reference development machine:
+Measured on **2026-10-30** (runtime flavor A/B and P0 offloads: **2026-10-31**; measurement scope and RSS: **2026-11-01**; book p50/p99 and the pinned-core approximation: **2026-11-04**; end-to-end/storage rerun with the OpenRaft quick wins: **2026-11-06**; realistic-mix replay: **2026-11-06**; dedicated Raft runtime: **2026-11-06**) on the reference development machine:
 
 - Apple M4 (`arm64`)
 - Rust `1.93.1`
@@ -23,6 +23,9 @@ cargo bench --bench replay_mix    # realistic add/cancel/amend/stop/iceberg repl
 cargo bench --bench level_book    # per-level bucket prototype vs the current book
 cargo bench --bench apply_path    # apply-path heap allocations per applied entry
 ```
+
+Set `RAFT_CORE_WORKERS` to a positive worker count to run Raft on a dedicated runtime; unset or `0` uses the shared runtime.
+Set `RAFT_WAL_FSYNC_MS` to control WAL fsync: unset = no fsync, `0` = every append, `N > 0` = every N ms.
 
 ## Measurement scope
 
@@ -438,9 +441,46 @@ entries in batches of 100, with 512 KiB segments:
 | Reopen/recover 20k entries | 7.30 ms |
 | Recovered entries | 20,000 |
 
-The 2026-11-06 rerun reports the median of three runs. Append throughput is
-fsync-bound (one durable batch per 100 entries); read and recovery benefit from
-sequential segment scanning and coalesced `pread` calls.
+The 2026-11-06 rerun reports the median of three runs with fsync every append.
+Append throughput is fsync-bound in that mode (one durable batch per 100 entries); read and
+recovery benefit from sequential segment scanning and coalesced `pread` calls. The A/B below
+covers no-fsync and periodic modes.
+
+### WAL fsync A/B (2026-11-06)
+
+WAL fsync is controlled by `RAFT_WAL_FSYNC_MS`:
+
+- unset: no fsync (the default); a crash can lose acknowledged writes.
+- `0`: fsync every append batch.
+- `N > 0`: a dedicated `wal-fsync` thread fsyncs the active segment every `N` ms. This bounds the
+  loss window to roughly `N` ms; it does not make every acknowledged write durable.
+
+The numbers below use the default shared runtime (`RAFT_CORE_WORKERS` unset). The single-node
+bench uses `StorageConfig::new` (`min_voters = 1`), so it measures raw storage performance without
+the production four-voter guard. When `RAFT_WAL_FSYNC_MS` is unset, the binary requires at least
+four voters; see [`docs/STORAGE.md`](./STORAGE.md) for the durability and peer-recovery contract.
+
+| Workload | every append (`0`) | every 10 ms | every 100 ms | disabled (unset) |
+|---|---:|---:|---:|---:|
+| e2e sequential `/write` p50 | 3.93 ms | 98.5 µs | 84.0 µs | 90.9 µs |
+| e2e sequential throughput | 267 writes/s | 7,459 writes/s | 9,938 writes/s | 8,586 writes/s |
+| e2e concurrent 1,000 writes | 18.3k writes/s | 32.5k writes/s | 32.9k writes/s | 32.9k writes/s |
+| e2e concurrent 100×32 batch | 201.6k orders/s | 222.8k orders/s | 213.0k orders/s | 219.2k orders/s |
+| WAL append, 20k entries | 26.2k entries/s | 815k entries/s | 1.33M entries/s | 1.66M entries/s |
+| WAL read, 20k entries | 3.0M entries/s | 7.6M entries/s | 7.8M entries/s | 4.1M entries/s |
+| WAL reopen, 20k entries | 5.2 ms | 2.9 ms | 2.6 ms | 4.5 ms |
+
+These are single runs and the storage bench is short; a 100 ms interval may not tick before its
+append phase ends, so its WAL append number is close to disabled. The e2e run is the better
+periodic-fsync comparison. Every-append fsync accounts for about **97%** of sequential write
+latency; periodic fsync at 10 ms costs about 13% sequential throughput versus disabled while
+keeping p50 within ~8%, and 100 ms is within the same range as disabled. Concurrent writes improve
+~1.8x from every-append to the non-blocking modes because fsyncs overlap across concurrent
+requests. Read and reopen gains are partly page-cache residency; the append comparison is the
+direct measure. With
+the dedicated runtime (`RAFT_CORE_WORKERS=2`) and no fsync, the e2e run measured 9,584 writes/s,
+p50 97.8 µs and 32,416 concurrent writes/s, so the fsync share dominates regardless of runtime
+topology.
 
 ## Storage-path improvements
 
@@ -470,14 +510,20 @@ itself is already cheap.
 
 - `src/main.rs` uses `#[tokio::main(flavor = "multi_thread")]`, so the node's
   background tasks run on a **multi-threaded Tokio runtime**.
-- `build_match_engine_node` spawns the OpenRaft core and state-machine worker,
-  the tonic gRPC server, the snapshot timer, the market-data watcher and
-  processor, and the HTTP server future on that runtime.
+- `build_match_engine_node` uses `Raft::new` on the main runtime by default.
+  When `RAFT_CORE_WORKERS` is positive it calls `Raft::build`, then starts
+  OpenRaft with `Raft::run` on a **dedicated multi-threaded runtime**
+  (`RaftThread`, thread name `raft-worker`, that many workers). RaftCore and the
+  state-machine worker live there. The tonic gRPC server, the snapshot timer,
+  the market-data watcher and processor, and the HTTP server future stay on the
+  main runtime.
 - Actix HTTP handlers run on the HTTP worker threads (one current-thread runtime
   per worker), not on the main runtime. They reach the state machine through the
   async mutex and Raft through its command channel.
 - WAL append/read/recovery and snapshot file writes already use
-  `spawn_blocking`, so their disk I/O does not stall the main runtime.
+  `spawn_blocking`, so their disk I/O does not stall the main runtime. Raft's
+  WAL work uses the dedicated runtime's blocking pool; HTTP/feed work uses the
+  main runtime's pool.
 - The integration tests and benchmarks already call `build_match_engine_node`
   from a multi-threaded Tokio runtime (openraft's test runtime uses 8 worker
   threads), and `actix-server` detects an existing Tokio runtime and starts its
@@ -494,8 +540,10 @@ itself is already cheap.
   `#[actix_web::main]` setup had this shape.
 - On a multi-threaded Tokio runtime, spawned tasks are distributed across worker
   threads and can run in parallel. This is the right way to offload independent
-  services: RaftCore, apply, gRPC, the snapshot timer and the feed can be
-  separate green threads.
+  services. Set `RAFT_CORE_WORKERS` >0 to give OpenRaft its own runtime so
+  RaftCore and the state-machine worker are not scheduled behind HTTP, gRPC or
+  feed tasks; the rest of the node stays on the main runtime. Unset or `0`
+  keeps Raft on the shared runtime.
 - Use `spawn_blocking` only for work that cannot yield: blocking file I/O,
   synchronous `std::fs`, and CPU-heavy encode/decode. It is Tokio's blocking
   pool, not a manually managed OS thread; the runtime bounds and reuses those
@@ -507,9 +555,9 @@ itself is already cheap.
 
 | Work | Current location | Cost | Can be offloaded? |
 |---|---|---|---|
-| Price-time matching | `apply_one`, under the lock | CPU, short | No; keep it on apply |
-| Event construction and event-window append | `apply_one`, under the lock | CPU, bounded | No; part of apply |
-| Match-result sink (`--match-event-log`) | `publish_pending`, after the lock | JSON + file write + flush | Yes; a dedicated writer task is still open |
+| Price-time matching | `apply_one`, on the dedicated Raft runtime, under the lock | CPU, short | No; keep it on apply |
+| Event construction and event-window append | `apply_one`, on the dedicated Raft runtime, under the lock | CPU, bounded | No; part of apply |
+| Match-result sink (`--match-event-log`) | `publish_pending`, on the dedicated Raft runtime, after the lock | JSON + file write + flush | Yes; a dedicated writer task is still open |
 | Market-data frame construction | `take_market_frame`, under the lock | event clone + journal drain | Sent after the lock; gate checked first |
 | Duplicate `client_order_id` response | `submission_events`, under the lock | binary search + range copy | Implemented |
 | Snapshot capture (`to_content`) | snapshot task, under the lock | full book/event copy | Hard (COW) |
@@ -521,18 +569,55 @@ itself is already cheap.
 | gRPC decode/encode and snapshot assembly | tonic tasks, runtime | message-size dependent | Yes, on the multi-thread runtime |
 | WAL append/read | `LogStore`, `spawn_blocking` | disk I/O | Already offloaded |
 
+### Dedicated Raft runtime (2026-11-06)
+
+OpenRaft's state-machine worker is a `tokio::spawn` task. On the shared node runtime, `apply`
+migrated across worker threads during one e2e run (observed ThreadIds 4, 9, 10 and 11), so it
+competed with HTTP, gRPC and feed tasks for a worker. When `RAFT_CORE_WORKERS` is positive,
+`build_match_engine_node` builds Raft with `Raft::build` and calls `Raft::run` on a dedicated
+multi-threaded runtime (`RaftThread`, thread name `raft-worker`) with that many workers. RaftCore
+and the state-machine worker stay on this runtime; the gRPC server, HTTP server, snapshot timer
+and feed remain on the main runtime. Unset or `0` keeps the shared-runtime behavior.
+
+Single-node e2e A/B (two alternating pairs, `cargo bench --bench e2e`; each cell is one pair):
+
+| Workload | Shared node runtime | Dedicated Raft runtime (2 workers) |
+|---|---:|---:|
+| Sequential `/write` | 269 / 247 writes/s | 251 / 262 writes/s |
+| Sequential p50 | 3.937 / 3.967 ms | 3.979 / 3.928 ms |
+| Sequential p99 | 4.251 / 7.202 ms | 7.979 / 5.140 ms |
+| Concurrent 1,000 `/write` | 17,817 / 19,218 writes/s | 17,001 / 14,834 writes/s |
+| Concurrent 100×32 batch | 148,757 / 154,644 orders/s | 145,499 / 131,136 orders/s |
+
+A clean dedicated-runtime run measured 266 writes/s, p50 3.945 ms / p99 4.617 ms, 18,028
+concurrent writes/s and 138,183 concurrent-batch orders/s. The host was noisy (the shared
+runtime's p99 also ranged 4.25-7.20 ms), so the throughput ranges overlap; the dedicated runtime
+shows **no consistent throughput win** in this fsync-bound single-node test. Its benefit is
+isolation: RaftCore and apply no longer share workers with HTTP, gRPC and the feed. An earlier
+prototype run saw 19.3-20.2k concurrent writes/s, but the final implementation did not reproduce
+that consistently.
+
+The dedicated runtime does **not** pin apply to one thread: with 2 workers, apply still moved
+between `raft-worker` threads. A single-worker variant kept apply on one thread but lowered the
+concurrent-write burst to 15.3-16.6k/s (about 7% below the shared runtime). Three workers measured
+15.6-18.1k/s and four workers were mixed; none was consistently better than two. If strict
+one-thread affinity is required, the options are the single-worker variant or a dedicated apply
+actor with batching; otherwise `RAFT_CORE_WORKERS=2` is the practical compromise.
+
 ### Prioritized opportunities
 
-1. **Run the node on a multi-threaded Tokio runtime (P0, implemented).**
+1. **Run the node on a multi-threaded Tokio runtime, with OpenRaft isolated (P0, implemented).**
    `src/main.rs` now uses `#[tokio::main(flavor = "multi_thread")]` instead of
    `#[actix_web::main]`. `actix-server` detects the Tokio runtime and starts its
    HTTP workers from it; the integration tests already exercised this path.
-   RaftCore, the state-machine worker, gRPC, the snapshot timer and the feed are
-   now green threads distributed across workers instead of sharing one thread.
-   The full test suite and a binary init/write/read/shutdown smoke test pass.
-   The A/B above shows the switch is neutral for the fsync-bound write path; it
-   is the enabler for the isolation/offload items below, not a standalone win.
-   Items 2-7 are implemented; items 8-11 remain open.
+   The main runtime runs gRPC, the snapshot timer, the feed and HTTP. When
+   `RAFT_CORE_WORKERS` is positive, OpenRaft's RaftCore and state-machine worker
+   run on a dedicated runtime with that many workers (2 is the tested default);
+   unset or `0` keeps the shared runtime. The 2026-11-06 A/B shows sequential
+   latency unchanged and concurrent writes within the host's noise
+   (17.0/14.8k/s dedicated vs 17.8/19.2k/s shared in the final pairs; an earlier
+   prototype saw 19.3-20.2k/s). The benefit is isolation, not a measured
+   throughput win. Items 2-7 are implemented; items 8-11 remain open.
 
 2. **Move snapshot encode/decode to the blocking pool (P0, implemented).**
    `build_snapshot`, `persist_snapshot` and `install_snapshot` now encode/decode
@@ -703,6 +788,11 @@ The measurement rules transferred regardless of layout and are now implemented:
   Single-order operations stay at or below 2.9 µs p99; market takers are the widest tail (6.8 µs
   p99) because they sweep levels and elect stops. This is book-only load, not an end-to-end
   capacity number.
+- Setting `RAFT_CORE_WORKERS` to a positive count isolates OpenRaft on its own runtime. With 2
+  workers, sequential p50/p99 were unchanged and concurrent single writes stayed within the
+  host's noise (17.0/14.8k/s dedicated vs 17.8/19.2k/s shared in the final pairs), so the win is
+  isolation rather than throughput. Apply can still migrate between the two `raft-worker`
+  threads; the single-worker variant gives strict affinity at ~7% lower concurrent throughput.
 - The per-level bucket prototype wins match, deep-cancel, dense-amend and
   BBO-query workloads but loses sparse one-order-per-level re-queue and BBO
   advance. Full adoption still needs a sparse-level fast path (or a hybrid) and

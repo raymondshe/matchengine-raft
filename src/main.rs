@@ -114,10 +114,28 @@ async fn main() -> std::io::Result<()> {
     // Parse the parameters passed by arguments.
     let options = Opt::parse();
 
+    let wal_fsync = matchengine_raft::store::config::wal_fsync_from_env();
+    let min_voters = if wal_fsync.is_none() {
+        matchengine_raft::store::config::NO_FSYNC_MIN_VOTERS
+    } else {
+        1
+    };
+    match wal_fsync {
+        None => tracing::warn!(
+            min_voters,
+            "WAL fsync is disabled (RAFT_WAL_FSYNC_MS unset); a crash can lose acknowledged writes and the cluster requires at least 4 voters"
+        ),
+        Some(interval) if interval.is_zero() => tracing::info!("WAL fsync: every append"),
+        Some(interval) => {
+            tracing::info!(interval_ms = interval.as_millis(), "WAL fsync: periodic")
+        }
+    }
     let mut storage = StorageConfig::new(options.data_dir)
         .with_instance_prefix(options.instance_prefix)
         .with_max_events(options.max_events)
-        .with_snapshot_interval(Duration::from_millis(options.snapshot_interval_ms));
+        .with_snapshot_interval(Duration::from_millis(options.snapshot_interval_ms))
+        .with_wal_fsync(wal_fsync)
+        .with_min_voters(min_voters);
     if let Some(path) = options.match_event_log {
         storage = storage.with_match_event_log(path);
     }

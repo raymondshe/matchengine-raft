@@ -53,6 +53,27 @@ pub const MAX_READ_KEY_BYTES: usize = 128;
 /// Maximum number of sub-requests in one `/write_batch` entry.
 pub const MAX_BATCH_REQUESTS: usize = 128;
 
+/// Refuses writes until the cluster has the configured minimum number of voters.
+///
+/// The binary sets `min_voters = 4` when WAL fsync is disabled, so a committed
+/// entry is on at least three nodes and one node's unsynced tail loss leaves at
+/// least two copies.
+fn ensure_min_voters(app: &MatchEngineApp) -> actix_web::Result<()> {
+    if app.min_voters <= 1 {
+        return Ok(());
+    }
+    let metrics = app.raft.metrics();
+    let current = metrics.borrow_watched();
+    let voters = current.membership_config.voter_ids().count();
+    if voters < app.min_voters {
+        return Err(actix_web::error::ErrorServiceUnavailable(format!(
+            "cluster has {voters} voters; at least {} are required while WAL fsync is disabled",
+            app.min_voters
+        )));
+    }
+    Ok(())
+}
+
 /// Validates a client idempotency key before it can enter the Raft log.
 ///
 /// Empty keys are rejected: omit the field to disable idempotency. Restricting
@@ -277,6 +298,7 @@ pub async fn write(
     app: Data<MatchEngineApp>,
     req: Json<MatchEngineRequest>,
 ) -> actix_web::Result<impl Responder> {
+    ensure_min_voters(&app)?;
     let mut request = req.into_inner();
     validate_request(&request).map_err(actix_web::error::ErrorBadRequest)?;
     guard_request_symbol(&app, &request)
@@ -311,6 +333,7 @@ pub async fn write_batch(
     app: Data<MatchEngineApp>,
     req: Json<Vec<MatchEngineRequest>>,
 ) -> actix_web::Result<impl Responder> {
+    ensure_min_voters(&app)?;
     let requests = req.into_inner();
     validate_batch(&requests).map_err(actix_web::error::ErrorBadRequest)?;
     let mut request = MatchEngineRequest::Batch { requests };

@@ -246,6 +246,85 @@ fn segments_rotate_and_survive_reopen() {
 }
 
 #[test]
+fn corrupt_non_last_segment_recovers_a_valid_prefix_without_fsync() {
+    let dir = TempDir::new("corrupt-non-last");
+
+    block_on(async {
+        let store = Store::open_with_segment_size_and_fsync(dir.path(), 512, None).unwrap();
+        for i in 0..40 {
+            append(&store, vec![blank(i)]).await;
+        }
+        drop(store);
+    });
+
+    let files = wal_files(dir.path());
+    assert!(files.len() > 1, "small segments should have rotated");
+    let first = &files[0];
+    let good_len = std::fs::metadata(first).unwrap().len();
+    assert!(good_len > 16, "first segment should contain a record");
+
+    // Cut three bytes off the last frame in a non-last segment: a torn record
+    // that a crash can leave when append fsync is disabled.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(first)
+        .unwrap()
+        .set_len(good_len - 3)
+        .unwrap();
+
+    // Strict recovery still rejects corruption in a non-last segment.
+    assert!(
+        Store::open_with_segment_size_and_fsync(dir.path(), 512, Some(std::time::Duration::ZERO))
+            .is_err()
+    );
+
+    // Best-effort recovery keeps the valid prefix, removes later segments, and
+    // leaves the log appendable so Raft can catch up from peers.
+    block_on(async {
+        let store = Store::open_with_segment_size_and_fsync(dir.path(), 512, None).unwrap();
+        let entries = read(&store, 0..100).await;
+        assert!(!entries.is_empty());
+        assert_eq!(
+            (0..entries.len() as u64).collect::<Vec<_>>(),
+            indexes(&entries)
+        );
+        assert_eq!(
+            Some(log_id(1, entries.len() as u64 - 1)),
+            log_state(&store).await.last_log_id
+        );
+        assert_eq!(1, wal_files(dir.path()).len(), "later segments are removed");
+
+        append(&store, vec![blank(entries.len() as u64)]).await;
+        assert_eq!(
+            (0..=entries.len() as u64).collect::<Vec<_>>(),
+            indexes(&read(&store, 0..100).await)
+        );
+    });
+}
+
+#[test]
+fn periodic_fsync_thread_clears_dirty_state() {
+    let dir = TempDir::new("periodic-fsync");
+
+    block_on(async {
+        let store = Store::open_with_segment_size_and_fsync(
+            dir.path(),
+            512,
+            Some(std::time::Duration::from_millis(20)),
+        )
+        .unwrap();
+        append(&store, vec![blank(0)]).await;
+        assert!(store.wal_dirty(), "append should mark the WAL dirty");
+
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(
+            !store.wal_dirty(),
+            "periodic fsync should clear the dirty flag"
+        );
+    });
+}
+
+#[test]
 fn truncate_after_drops_the_suffix_across_segments() {
     let dir = TempDir::new("truncate");
 

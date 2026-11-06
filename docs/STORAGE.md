@@ -5,7 +5,8 @@
 Raft log entries are appended to `log/NNNNNNNNNN.wal` segment files:
 
 - Each record is framed as `[len: u32 LE][crc32: u32 LE][postcard payload]`. On open, recovery walks
-  every segment and truncates a torn or corrupt tail instead of parsing it as a valid entry.
+  every segment and truncates a torn or corrupt tail instead of parsing it as a valid entry; it
+  also rejects an index gap, because openraft requires a hole-free log.
 - `append()` writes the whole openraft batch with a single `write_all` followed by a single
   `sync_data`, so N entries replicated in one AppendEntries RPC cost one fsync.
 - Reads use `pread` (`read_at`) against cached file handles, so replication can read while an
@@ -19,8 +20,50 @@ Raft log entries are appended to `log/NNNNNNNNNN.wal` segment files:
 
 Vote and the last purged log id are safety-critical and rare, so they live in a small `log/state`
 file that is rewritten atomically (temp file → fsync → rename → directory fsync). The committed
-log id is appended to the WAL without its own fsync and becomes durable with the next append,
-avoiding a second fsync per batch.
+log id is appended to the WAL without its own fsync: every-append mode makes it durable with the
+next append, periodic mode on the next tick, and no-fsync mode not at all. This avoids a second
+fsync per batch.
+
+### WAL durability and recovery from peers
+
+WAL fsync is controlled by `RAFT_WAL_FSYNC_MS`:
+
+- unset: no fsync (the default).
+- `0`: fsync every append batch.
+- `N > 0`: a dedicated `wal-fsync` thread fsyncs the active segment every `N` ms.
+
+Only every-append mode satisfies `RaftLogStorage::append`'s contract fully: entries are persisted
+when the callback runs, and the log has no holes. With no fsync or periodic fsync, the callback can
+fire after the page-cache write, so a crash can lose the writes since the last fsync (the last
+`N` ms in periodic mode).
+
+If a node crashes in those modes, its WAL may be shorter than the cluster's committed log. Raft
+handles a **valid shorter log**:
+
+- The leader replicates the missing entries, or installs a snapshot if the node is too far behind.
+- Election restriction prevents a node with a shorter log from winning against a majority that has
+  the committed entries.
+- `/ready` waits for `wait_for_recovery`, which confirms the cluster commit covers the node's
+  durable log tail before reads are served.
+- Vote and purge state stay fsynced even when WAL fsync is disabled or periodic, so the node cannot
+  vote twice in one term.
+
+A crash can also leave a torn record in a non-last segment. When fsync is not every-append,
+`LogStore::open` uses best-effort recovery: it truncates at the first corrupt record, index gap or
+segment, deletes later segments, and returns the longest valid prefix. The node then catches up from
+peers. This can discard entries that only this node had; if no peer has them, they are unrecoverable.
+In every-append mode the same corruption is a fatal open error and the node refuses to start.
+
+For production, set `RAFT_WAL_FSYNC_MS=0` for the strongest durability, or a small `N` to bound the
+loss window to roughly `N` ms. Leaving it unset is fastest but can lose acknowledged writes on a
+crash; use it only when that risk is acceptable.
+
+When `RAFT_WAL_FSYNC_MS` is unset, the binary also requires at least **four voters**: `/init` and
+`/change-membership` reject smaller voter sets, and `/write`/`/write_batch` return `503` until four
+voters exist. Four voters put a committed entry on at least three nodes, so one node losing its
+unsynced tail still leaves at least two copies. Bootstrap such a cluster by starting four nodes and
+calling `/init` with all four `[id, addr]` pairs; the single-node `[]` form is rejected. The demo
+scripts default to `RAFT_WAL_FSYNC_MS=0` so their three-node and single-node setups remain valid.
 
 ## Snapshots (`src/store/state_machine.rs`)
 
@@ -90,7 +133,8 @@ config.max_in_snapshot_log_to_keep = 0; // purge everything the snapshot covers
 ## Data recovery
 
 On startup the node:
-1. Recovers the WAL index, vote and purge marker (discarding a torn tail).
+1. Recovers the WAL index, vote and purge marker (discarding a torn tail; when fsync is not
+   every-append it truncates at the first corrupt segment and lets Raft catch up).
 2. Selects and loads `snapshot/current.snap` if it exists. The file is replaced atomically, so it
    is always the latest complete snapshot; a crash leaves only an ignored `.tmp` file.
 3. Sets the state machine's `last_applied` from the snapshot metadata and lets openraft replay

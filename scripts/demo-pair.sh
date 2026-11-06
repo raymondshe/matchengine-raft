@@ -8,6 +8,10 @@ set -eu
 
 cd "$(dirname "$0")/.."
 
+# These demos use fewer than the four voters required when WAL fsync is
+# disabled; use every-append fsync unless the caller overrides it.
+export RAFT_WAL_FSYNC_MS=${RAFT_WAL_FSYNC_MS:-0}
+
 DEMO_ADDR=${DEMO_ADDR:-127.0.0.1:24400}
 SPOT_ADDR=${SPOT_ADDR:-127.0.0.1:24401}
 PERP_ADDR=${PERP_ADDR:-127.0.0.1:24402}

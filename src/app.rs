@@ -55,6 +55,10 @@ pub struct MatchEngineApp {
     /// before recovery catches up.
     pub recovered: Arc<AtomicBool>,
 
+    /// Minimum voter count required for initialization, membership changes and
+    /// writes. Set to 4 by the binary when WAL fsync is disabled.
+    pub min_voters: usize,
+
     /// Operational-console state: action lock and recent action history.
     pub console: ConsoleState,
 }

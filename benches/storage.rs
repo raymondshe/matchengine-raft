@@ -71,8 +71,25 @@ async fn read(store: &LogStore, range: std::ops::Range<u64>) -> usize {
 
 #[tokio::main]
 async fn main() {
+    for arg in std::env::args().skip(1) {
+        match arg.as_str() {
+            // Cargo passes `--bench` to harness-less bench binaries.
+            "--bench" => {}
+            other => {
+                eprintln!("unknown argument {other:?}; set RAFT_WAL_FSYNC_MS instead");
+                std::process::exit(2);
+            }
+        }
+    }
+    let fsync = matchengine_raft::store::config::wal_fsync_from_env();
+    match fsync {
+        None => println!("WAL fsync disabled (RAFT_WAL_FSYNC_MS unset)"),
+        Some(interval) if interval.is_zero() => println!("WAL fsync: every append"),
+        Some(interval) => println!("WAL fsync: every {}ms", interval.as_millis()),
+    }
+
     let dir = temp_dir("wal");
-    let store = LogStore::open_with_segment_size(&dir, SEGMENT_SIZE).unwrap();
+    let store = LogStore::open_with_segment_size_and_fsync(&dir, SEGMENT_SIZE, fsync).unwrap();
 
     let started = Instant::now();
     for start in (1..=ENTRIES).step_by(BATCH as usize) {
@@ -89,7 +106,7 @@ async fn main() {
     drop(store);
 
     let started = Instant::now();
-    let reopened = LogStore::open_with_segment_size(&dir, SEGMENT_SIZE).unwrap();
+    let reopened = LogStore::open_with_segment_size_and_fsync(&dir, SEGMENT_SIZE, fsync).unwrap();
     let reopen_elapsed = started.elapsed();
     let recovered = read(&reopened, 1..ENTRIES + 1).await;
     assert_eq!(ENTRIES as usize, recovered);

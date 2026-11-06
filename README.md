@@ -18,13 +18,20 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
 [![Snapshot v10](https://img.shields.io/badge/snapshot-v10-blue.svg)](./docs)
 [![Market-data wire v6](https://img.shields.io/badge/marketdata%20wire-v6-blue.svg)](./docs/MARKET_DATA_PLAN.md)
+[![WAL fsync: configurable](https://img.shields.io/badge/WAL%20fsync-configurable-blue.svg)](./docs/STORAGE.md)
 
-A Raft-replicated matching engine in Rust for teams that need deterministic execution, durable recovery and a live market-data path — without treating the engine as a black box.
+A Raft-replicated matching engine in Rust for teams that need deterministic execution, configurable durability and a live market-data path — without treating the engine as a black box.
+
+> **WAL durability is configurable.** `RAFT_WAL_FSYNC_MS` controls WAL fsync:
+> **unset** = no fsync (default, fastest; a crash can lose acknowledged writes and the cluster
+> requires at least 4 voters), **`0`** = fsync every append (strongest durability), **`N > 0`** =
+> periodic fsync every N ms (bounds the loss window to roughly N ms). See
+> [Storage](./docs/STORAGE.md) for the recovery contract.
 
 **Why teams pick it**
 
 - **Deterministic execution** — price-time matching where `apply` reads no wall clock; replaying the log reproduces the book exactly.
-- **Durable by default** — a hand-written segmented WAL, atomic snapshots and snapshot + WAL-tail recovery, all exercised by restart and failure tests.
+- **Configurable durability** — a hand-written segmented WAL with selectable fsync policy, atomic snapshots and snapshot + WAL-tail recovery, all exercised by restart and failure tests.
 - **Raft-native** — OpenRaft 0.10 over gRPC with Pre-Vote, leadership transfer, learner catch-up and chunked snapshot install.
 - **Exact 18-decimal fixed point** — no `f64` in the matching path; prices, quantities and fees survive the API, events, snapshots and feeds.
 - **Live data, not batch** — the deterministic feed is published over Aeron (one exclusive publication per stream) and served as Binance-style WebSocket streams with 100/1000 ms depth conflation and horizontal scale-out.
@@ -33,7 +40,7 @@ A Raft-replicated matching engine in Rust for teams that need deterministic exec
 | Area | Today |
 |---|---|
 | Execution | Deterministic price-time matching; `apply` reads no wall clock |
-| Durability | Segmented WAL + atomic snapshots; snapshot every 100k entries or 30 minutes |
+| Durability | Segmented WAL + atomic snapshots; `RAFT_WAL_FSYNC_MS` (default: no fsync, 4 voters); snapshot every 100k entries or 30 minutes |
 | Replication | Raft peer RPCs over gRPC |
 | Market data | Aeron egress on streams 2001–2007 + Binance-style WebSocket service |
 | Symbol model | One symbol per process/cluster, configured and locked through Raft |
@@ -70,8 +77,9 @@ Everything below is implemented in this repository and exercised by tests; the l
 - **Exact 18-decimal fixed point** from API input through matching, events, snapshots and the market-data feed — no `f64` arithmetic in the matching path.
 
 **Durability and recovery**
-- **Raft-replicated state machine** with durable membership, log and application state.
-- **Segmented, checksummed WAL** with one fsync per replicated batch and torn-tail recovery.
+- **Raft-replicated state machine** with durable membership and application state; WAL fsync is configurable.
+- **Segmented, checksummed WAL** with `RAFT_WAL_FSYNC_MS`: unset = no fsync (default; requires at least 4 voters), `0` = every append, `N > 0` = periodic every N ms; torn-tail recovery.
+- **Four-voter no-fsync floor**: `/init` and `/change-membership` reject fewer than four voters, and writes return `503` until four voters exist, so a committed entry stays on at least three nodes.
 - **Atomic snapshots** written by temp file → fsync → rename → directory fsync, with checksum validation before install.
 - **Snapshot policy for real workloads**: every 100,000 applied entries or 30 minutes when newer entries exist, configurable with `--snapshot-interval-ms`.
 - **Snapshot + WAL-tail recovery** that restores the latest snapshot, event window and idempotency map, then replays only newer log entries.
@@ -84,7 +92,7 @@ Everything below is implemented in this repository and exercised by tests; the l
 - **Flexible read consistency**: local reads, linearizable leader reads and linearizable follower reads.
 - **Leader-aware Rust client** that tracks and forwards requests to the current leader, with configurable timeouts, transient retry/backoff and typed API/no-leader errors; retries are at-least-once, so use `client_order_id` for idempotent write retries.
 - **Operational APIs** for initialization, membership changes, metrics, event status and market-data status.
-- **Batch writes** at `POST /write_batch`: multiple requests in one Raft entry and one WAL fsync, with per-request sequences and continuous event ordinals.
+- **Batch writes** at `POST /write_batch`: multiple requests in one Raft entry and one WAL append, with per-request sequences and continuous event ordinals.
 
 **Operational visibility**
 - **Embedded WebUI console** at `/console/`: cluster health, Raft leadership and replication, storage/event/feed state, a leader-only event viewer and diagnostics — no build step or external assets.
@@ -109,6 +117,10 @@ This project extends the [example-raft-kv](https://github.com/datafuselabs/openr
 
 Peer-to-peer Raft RPCs use gRPC on `port + 1000`. The public application and management API
 stays on the `--http-addr` listener. Raft RPCs are not part of the HTTP JSON API.
+
+Set `RAFT_CORE_WORKERS` to a positive worker count to run OpenRaft's RaftCore and state-machine
+worker on a dedicated multi-threaded runtime, isolated from the HTTP, gRPC and market-data tasks;
+unset or `0` keeps Raft on the shared runtime.
 
 Market-data egress is off the consensus path: the tap is a bounded `try_send`, so a slow
 subscriber can never block `apply`. The feature-gated `AeronSink` publishes the same wire-v6
@@ -299,7 +311,13 @@ Measured baseline (Apple M4, Rust 1.93.1, release bench profile; e2e/storage med
 | Sequential `/write_batch` (128 orders/batch) | 23,249 orders/s |
 | Concurrent `/write_batch` (100 × 32 orders) | 139,323 orders/s |
 | Market-data feed at 500k fills/s | 495k fills/s, 0 drops at 8,192-frame queue |
-| WAL append / read (20k entries, 100-entry batches) | 25,547 / 2,408,176 entries/s |
+| WAL append / read (20k entries, 100-entry batches, fsync every append) | 25,547 / 2,408,176 entries/s |
+
+WAL fsync is controlled by `RAFT_WAL_FSYNC_MS`: unset = no fsync (default), `0` = every append,
+`N > 0` = periodic every N ms. Non-every-append modes trade durability for throughput; with fsync
+disabled the same WAL benchmark appends about 1.66M entries/s. When fsync is disabled the node
+requires at least four voters; the demo scripts use `RAFT_WAL_FSYNC_MS=0` for three-node setups.
+See [Storage](./docs/STORAGE.md).
 
 The full benchmark methodology, storage-path details and optimization history are in
 [PERFORMANCE.md](./docs/PERFORMANCE.md). Snapshot **v10** and wire **v6** are breaking changes;

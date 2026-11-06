@@ -352,6 +352,10 @@ fn start_node_process(
         ])
         .arg("--data-dir")
         .arg(data_dir)
+        // These tests assume every acknowledged write survives SIGKILL and use a
+        // single-voter cluster; keep the durable fsync mode so the no-fsync
+        // four-voter policy does not apply.
+        .env("RAFT_WAL_FSYNC_MS", "0")
         .envs(envs.iter().copied())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

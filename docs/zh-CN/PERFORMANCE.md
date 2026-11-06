@@ -2,7 +2,7 @@
 
 ## 已实现的性能设计
 
-- 每个复制追加批次一次 `write_all` + 一次 `sync_data`，一次 AppendEntries 中的 N 条记录只付一次 fsync。
+- 每个复制追加批次一次 `write_all`；fsync 由 `RAFT_WAL_FSYNC_MS` 控制（未设置 = 不 fsync，`0` = 每次追加，`N` = 每 N ms 周期）。
 - `pread` 读取配缓存文件句柄，追加与复制读取互不阻塞。
 - 订单簿、事件窗口和去重表常驻内存，`apply` 不做磁盘 IO。
 - gRPC 使用双向 `AppendStream` 流水线复制，并为每个对端维护独立的复制、心跳、快照连接和调优的

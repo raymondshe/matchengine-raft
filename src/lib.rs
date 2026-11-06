@@ -85,6 +85,28 @@ pub type LogStore = store::LogStore<MatchEngineTypeConfig>;
 pub type StateMachineStore = store::StateMachineStore<MatchEngineTypeConfig>;
 pub type MatchEngineRaft = openraft::Raft<MatchEngineTypeConfig, StateMachineStore>;
 
+/// Number of workers for OpenRaft's dedicated runtime.
+///
+/// Unset or `0` returns `None`, which keeps Raft on the shared node runtime.
+/// A positive `RAFT_CORE_WORKERS` isolates RaftCore and the state-machine
+/// worker on their own multi-threaded runtime.
+fn raft_core_workers() -> Option<usize> {
+    match std::env::var("RAFT_CORE_WORKERS") {
+        Ok(value) => match value.parse::<usize>() {
+            Ok(0) => None,
+            Ok(workers) => Some(workers),
+            Err(_) => {
+                tracing::warn!(
+                    value,
+                    "RAFT_CORE_WORKERS must be a non-negative integer; using the shared runtime"
+                );
+                None
+            }
+        },
+        Err(_) => None,
+    }
+}
+
 /// A running node: the Raft instance plus the HTTP and gRPC servers serving it.
 ///
 /// Keep this value alive for as long as the node should run. Call
@@ -107,6 +129,95 @@ pub struct MatchEngineNode {
     market_data: Option<MarketDataHandle>,
     market_data_task: Option<tokio::task::JoinHandle<()>>,
     snapshot_task: Option<tokio::task::JoinHandle<()>>,
+    /// When `RAFT_CORE_WORKERS` is positive, OpenRaft's RaftCore and
+    /// state-machine worker run on this dedicated runtime, isolated from the
+    /// HTTP, gRPC and feed tasks.
+    raft_thread: Option<RaftThread>,
+}
+
+/// Runs OpenRaft's tasks on a dedicated multi-threaded runtime.
+///
+/// Only used when `RAFT_CORE_WORKERS` is positive; the caller passes that
+/// worker count. OpenRaft spawns RaftCore and the state-machine worker with
+/// `tokio::spawn`. Calling `Raft::run` inside this runtime puts both tasks here
+/// instead of the shared node runtime, so they no longer compete with HTTP,
+/// gRPC and feed tasks. With more than one worker the state-machine worker can
+/// still migrate between them.
+struct RaftThread {
+    shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+    join: Option<std::thread::JoinHandle<()>>,
+}
+
+impl RaftThread {
+    async fn spawn(raft: MatchEngineRaft, workers: usize) -> std::io::Result<Self> {
+        tracing::info!(workers, "starting dedicated Raft runtime");
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let join = std::thread::Builder::new()
+            .name("raft-core".to_string())
+            .spawn(move || {
+                let runtime = match tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(workers)
+                    .thread_name("raft-worker")
+                    .enable_all()
+                    .build()
+                {
+                    Ok(runtime) => runtime,
+                    Err(error) => {
+                        let _ = started_tx.send(Err(error.to_string()));
+                        return;
+                    }
+                };
+                let (stopped_tx, stopped_rx) = std::sync::mpsc::channel();
+                runtime.spawn(async move {
+                    raft.run();
+                    let _ = started_tx.send(Ok(()));
+                    let _ = shutdown_rx.await;
+                    let _ = stopped_tx.send(());
+                });
+                // Park this thread until the Raft runtime stops; do not join
+                // the runtime's scheduler. Dropping the runtime here (outside
+                // async) avoids the "drop runtime in async context" panic.
+                let _ = stopped_rx.recv();
+            })
+            .map_err(|error| {
+                std::io::Error::other(format!("failed to spawn raft thread: {error}"))
+            })?;
+
+        match started_rx.await {
+            Ok(Ok(())) => Ok(Self {
+                shutdown: Some(shutdown_tx),
+                join: Some(join),
+            }),
+            Ok(Err(error)) => {
+                let _ = join.join();
+                Err(std::io::Error::other(error))
+            }
+            Err(error) => {
+                let _ = join.join();
+                Err(std::io::Error::other(format!(
+                    "raft thread failed to start: {error}"
+                )))
+            }
+        }
+    }
+
+    async fn shutdown(mut self) {
+        if let Some(tx) = self.shutdown.take() {
+            let _ = tx.send(());
+        }
+        if let Some(join) = self.join.take() {
+            let _ = tokio::task::spawn_blocking(move || join.join()).await;
+        }
+    }
+}
+
+impl Drop for RaftThread {
+    fn drop(&mut self) {
+        if let Some(tx) = self.shutdown.take() {
+            let _ = tx.send(());
+        }
+    }
 }
 
 impl MatchEngineNode {
@@ -179,10 +290,15 @@ impl MatchEngineNode {
             task.abort();
         }
 
-        self.raft
+        let raft_result = self
+            .raft
             .shutdown()
             .await
-            .map_err(|e| std::io::Error::other(format!("Raft shutdown failed: {e}")))
+            .map_err(|e| std::io::Error::other(format!("Raft shutdown failed: {e}")));
+        if let Some(thread) = self.raft_thread.take() {
+            thread.shutdown().await;
+        }
+        raft_result
     }
 }
 
@@ -386,7 +502,7 @@ pub async fn build_match_engine_node(
     );
 
     // Open (or create) the durable log; recovery replays segments and discards a torn tail.
-    let log_store = LogStore::open(storage.log_dir(node_id))?;
+    let log_store = LogStore::open_with_fsync(storage.log_dir(node_id), storage.wal_fsync)?;
     // Match results are computed by `apply`; the sink decides what happens with them. The default
     // drops them, exactly as before.
     let match_result_sink: Arc<dyn MatchResultSink> = match &storage.match_event_log {
@@ -426,16 +542,34 @@ pub async fn build_match_engine_node(
     // will be used in conjunction with the store created above.
     let network = GrpcNetworkFactory::new(node_id);
 
-    // Create a local raft instance.
-    let raft = openraft::Raft::new(
-        node_id,
-        config.clone(),
-        network,
-        log_store.clone(),
-        state_machine_store.clone(),
-    )
-    .await
+    // A positive RAFT_CORE_WORKERS isolates OpenRaft on its own runtime so
+    // RaftCore and the state-machine worker do not share workers with HTTP,
+    // gRPC and the feed. Unset or 0 keeps the shared-runtime behavior.
+    let core_workers = raft_core_workers();
+    let raft = if core_workers.is_some() {
+        openraft::Raft::build(
+            node_id,
+            config.clone(),
+            network,
+            log_store.clone(),
+            state_machine_store.clone(),
+        )
+        .await
+    } else {
+        openraft::Raft::new(
+            node_id,
+            config.clone(),
+            network,
+            log_store.clone(),
+            state_machine_store.clone(),
+        )
+        .await
+    }
     .map_err(|e| std::io::Error::other(format!("failed to create Raft instance: {e}")))?;
+    let raft_thread = match core_workers {
+        Some(workers) => Some(RaftThread::spawn(raft.clone(), workers).await?),
+        None => None,
+    };
 
     // The WAL commit marker is written without its own fsync. Do not report the
     // node ready for reads until OpenRaft has re-established the cluster commit
@@ -530,6 +664,7 @@ pub async fn build_match_engine_node(
         log_store: log_store.clone(),
         grpc_health,
         recovered,
+        min_voters: storage.min_voters,
         console: console::ConsoleState::new(),
     });
 
@@ -595,6 +730,7 @@ pub async fn build_match_engine_node(
         market_data,
         market_data_task,
         snapshot_task,
+        raft_thread,
     })
 }
 

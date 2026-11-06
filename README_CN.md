@@ -18,13 +18,19 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
 [![快照 v10](https://img.shields.io/badge/%E5%BF%AB%E7%85%A7-v10-blue.svg)](./docs)
 [![行情线格式 v6](https://img.shields.io/badge/%E8%A1%8C%E6%83%85%20wire-v6-blue.svg)](./docs/MARKET_DATA_PLAN.md)
+[![WAL fsync: 可配置](https://img.shields.io/badge/WAL%20fsync-%E5%8F%AF%E9%85%8D%E7%BD%AE-blue.svg)](./docs/zh-CN/STORAGE.md)
 
 一个用 Rust 构建、基于 Raft 复制的撮合引擎，面向需要确定性执行、可靠恢复和实时行情链路的团队——而不是把撮合引擎当成黑盒。
+
+> **WAL 持久性可配置。** `RAFT_WAL_FSYNC_MS` 控制 WAL fsync：
+> **未设置** = 不 fsync（默认，最快；崩溃可能丢失已确认写入，且集群要求至少 4 个投票成员），
+> **`0`** = 每次追加都 fsync（最强持久性），**`N > 0`** = 每 N 毫秒周期 fsync（将丢失窗口限制在约 N ms）。
+> 恢复契约见[存储](./docs/zh-CN/STORAGE.md)。
 
 **为什么选择它**
 
 - **确定性执行** — 价格-时间优先撮合，`apply` 不读墙上时钟；重放日志可以精确复现订单簿。
-- **默认持久化** — 自研分段 WAL、原子快照和“快照 + WAL 尾部”恢复，均由重启和故障测试覆盖。
+- **可配置持久化** — 自研分段 WAL（fsync 策略可选）、原子快照和“快照 + WAL 尾部”恢复，均由重启和故障测试覆盖。
 - **Raft 原生** — OpenRaft 0.10 + gRPC，支持 Pre-Vote、领导权转移、学习者追赶和分块快照安装。
 - **18 位定点数** — 撮合路径不使用 `f64`；价格、数量和费用在 API、事件、快照和 feed 中全程精确。
 - **实时行情** — 确定性 feed 通过 Aeron 发布（每个流一个独占 publication），再由 Binance 风格 WebSocket 服务分发，支持 100/1000 ms 深度合并和水平扩展。
@@ -33,7 +39,7 @@
 | 维度 | 当前状态 |
 |---|---|
 | 执行 | 确定性价格-时间撮合；`apply` 不读墙上时钟 |
-| 持久化 | 分段 WAL + 原子快照；每 100,000 条日志或 30 分钟生成快照 |
+| 持久化 | 可配置 fsync 的分段 WAL + 原子快照；`RAFT_WAL_FSYNC_MS` 默认不 fsync（要求 4 个投票成员）；每 100,000 条或 30 分钟生成快照 |
 | 复制 | Raft 节点间 RPC 使用 gRPC |
 | 行情数据 | Aeron 出口（2001–2007 流）+ Binance 风格 WebSocket 服务 |
 | 标的模型 | 一个进程/集群一个标的，经 Raft 配置并在交易开始后锁定 |
@@ -70,8 +76,9 @@
 - **端到端 18 位定点数**，从 API 输入、撮合、事件、快照到行情 feed 全程使用定点数，撮合路径不做 `f64` 运算。
 
 **持久化与恢复**
-- **Raft 复制状态机**，成员、日志和应用状态全部持久化。
-- **分段校验 WAL**，每个复制批次一次 fsync，支持撕裂尾部恢复。
+- **Raft 复制状态机**，成员和应用状态持久化，WAL fsync 可配置。
+- **分段校验 WAL**，`RAFT_WAL_FSYNC_MS`：未设置 = 不 fsync（默认，要求至少 4 个投票成员），`0` = 每次追加，`N > 0` = 每 N ms 周期；支持撕裂尾部恢复。
+- **无 fsync 的四投票成员下限**：`/init` 和 `/change-membership` 拒绝少于 4 个投票成员，写入在达到 4 个成员前返回 `503`，使一条已提交日志至少存在于 3 个节点。
 - **原子快照**，通过临时文件 → fsync → rename → 目录 fsync 写入，安装前校验 checksum。
 - **面向真实负载的快照策略**：每 100,000 条已应用日志或每 30 分钟（有新 entry 时）生成快照，可用 `--snapshot-interval-ms` 调整。
 - **快照 + WAL 尾部恢复**：先加载最新快照、事件窗口和幂等表，再只重放更新的日志条目。
@@ -84,7 +91,7 @@
 - **灵活读取一致性**：本地读、领导者线性一致读和 follower 线性一致读。
 - **领导者感知 Rust 客户端**，自动跟踪并转发到当前领导者，支持可配置超时、瞬时错误重试/退避以及类型化的 API/无领导者错误；重试是至少一次语义，写入重试应使用 `client_order_id` 实现幂等。
 - **运维 API**：初始化、成员变更、指标、事件状态和行情状态。
-- **批量写入**：`POST /write_batch` 将多个请求放入一个 Raft entry 和一次 WAL fsync，逐项返回序列号，事件序号在 entry 内连续。
+- **批量写入**：`POST /write_batch` 将多个请求放入一个 Raft entry 和一次 WAL 追加，逐项返回序列号，事件序号在 entry 内连续。
 
 **运维可见性**
 - **内置 WebUI 控制台** `/console/`：集群健康、Raft 领导与复制、存储/事件/行情状态、仅领导者可见的事件查看器和诊断信息，无需构建步骤或外部资源。
@@ -109,6 +116,9 @@
 
 节点间 Raft RPC 使用 `端口 + 1000` 上的 gRPC。公共应用/管理 API 仍由 `--http-addr` 监听器提供；
 Raft RPC 不属于 HTTP JSON API。
+
+将 `RAFT_CORE_WORKERS` 设为正数时，OpenRaft 的 RaftCore 和状态机 worker 运行在专用多线程运行时，
+与 HTTP、gRPC 和行情任务隔离；未设置或设为 `0` 时 Raft 继续使用共享运行时。
 
 行情输出不参与共识：tap 使用有界 `try_send`，因此慢订阅者永远不会阻塞 `apply`。feature 门控的
 `AeronSink` 由专用发布线程把同样的线格式 v6 消息发布到 2001–2007 流，每个流一个独占 publication；
@@ -280,7 +290,12 @@ HTTP 应用/管理 API 和 gRPC Raft 服务见 [API 参考](./docs/zh-CN/API.md)
 | 串行 `/write_batch`（每批 128 单） | 23,249 单/s |
 | 并发 `/write_batch`（100 × 32 单） | 139,323 单/s |
 | 行情 feed 500k fills/s | 495k fills/s，8,192 队列下 0 丢弃 |
-| WAL 追加 / 读取（20k 条、每批 100 条） | 25,547 / 2,408,176 条/s |
+| WAL 追加 / 读取（20k 条、每批 100 条，每次追加 fsync） | 25,547 / 2,408,176 条/s |
+
+WAL fsync 由 `RAFT_WAL_FSYNC_MS` 控制：未设置 = 不 fsync（默认），`0` = 每次追加都 fsync，
+`N > 0` = 每 N 毫秒周期 fsync。非每次追加模式以持久性换吞吐；关闭 fsync 时同一 WAL 基准约
+1.66M 条/s。关闭 fsync 时节点要求至少 4 个投票成员；演示脚本使用 `RAFT_WAL_FSYNC_MS=0`
+以保持三节点部署可用。详见[存储](./docs/zh-CN/STORAGE.md)。
 
 完整基准方法、存储路径细节和优化历史见 [性能细节](./docs/zh-CN/PERFORMANCE.md)。快照 **v10** 和
 wire **v6** 是破坏性变更，见 [DECIMAL.md](./docs/DECIMAL.md)。已知差距和路线图见

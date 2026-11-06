@@ -5,6 +5,10 @@ set -o errexit
 # Always run from the repository root.
 cd "$(dirname "$0")/.."
 
+# These demos use fewer than the four voters required when WAL fsync is
+# disabled; use every-append fsync unless the caller overrides it.
+export RAFT_WAL_FSYNC_MS=${RAFT_WAL_FSYNC_MS:-0}
+
 # Demo script: use a dedicated data dir so a rerun starts from a clean cluster.
 # An explicit RAFT_DATA_DIR is respected and never wiped.
 if [ -z "${RAFT_DATA_DIR:-}" ]; then

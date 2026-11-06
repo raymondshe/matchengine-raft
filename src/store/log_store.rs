@@ -7,13 +7,17 @@
 //! - `append()` writes the whole openraft batch with **one** `write_all` and **one** `sync_data`.
 //!   openraft batches entries per AppendEntries RPC, which makes that group commit at the Raft
 //!   layer: N client requests replicated in one RPC cost one fsync.
+//! - `open_with_fsync(..., None)` (the default, and `RAFT_WAL_FSYNC_MS` unset) skips append and
+//!   rotation fsyncs. `Some(Duration::ZERO)` fsyncs every append; `Some(interval)` fsyncs the
+//!   active segment every `interval` on a dedicated thread. Without fsync a crash can lose
+//!   acknowledged writes.
 //! - Reads use `pread` (`read_at`), so replication can read while a write is in flight and no
 //!   global lock is held during disk IO.
 //! - All blocking IO runs on `spawn_blocking`; the async runtime only encodes.
 //! - Vote and the last purged log id are kept in a small `state` file that is rewritten atomically.
 //!   They are rare, safety-critical updates and must survive segment deletion. `committed` rides
-//!   at the tail of the WAL and becomes durable with the next append fsync, which avoids a second
-//!   fsync per batch.
+//!   at the tail of the WAL; every-append mode makes it durable with the next append, periodic
+//!   mode on the next tick, and no-fsync mode not at all. This avoids a second fsync per batch.
 //! - Segments are deleted only when fully covered by a purge, and the active segment is rotated
 //!   first, so a purge never leaves a hole.
 
@@ -30,10 +34,11 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::RwLock;
+use std::sync::atomic::AtomicBool;
 #[cfg(debug_assertions)]
 use std::sync::atomic::AtomicU8;
-#[cfg(debug_assertions)]
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use openraft::LogState;
 use openraft::RaftTypeConfig;
@@ -143,6 +148,31 @@ impl<C: RaftTypeConfig> Default for RuntimeState<C> {
     }
 }
 
+/// How the WAL makes appended data durable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FsyncPolicy {
+    /// Do not fsync. Fastest; a crash can lose acknowledged writes.
+    None,
+    /// Fsync every append batch.
+    EveryAppend,
+    /// Fsync the active segment periodically on a dedicated thread.
+    Interval(Duration),
+}
+
+impl FsyncPolicy {
+    fn from_option(fsync: Option<Duration>) -> Self {
+        match fsync {
+            None => Self::None,
+            Some(interval) if interval.is_zero() => Self::EveryAppend,
+            Some(interval) => Self::Interval(interval),
+        }
+    }
+
+    fn enabled(self) -> bool {
+        !matches!(self, Self::None)
+    }
+}
+
 struct Disk<C: RaftTypeConfig> {
     /// Active segment, opened in append mode.
     writer: File,
@@ -174,9 +204,12 @@ impl<C: RaftTypeConfig> Disk<C> {
         self.segments.iter_mut().find(|s| s.seq == seq)
     }
 
-    /// Starts a new segment. The previous one is fsynced first so nothing is lost.
-    fn rotate(&mut self, dir: &Path) -> io::Result<()> {
-        self.writer.sync_data()?;
+    /// Starts a new segment. When fsync is enabled, the previous one is
+    /// fsynced first so nothing is lost.
+    fn rotate(&mut self, dir: &Path, fsync: FsyncPolicy) -> io::Result<()> {
+        if fsync.enabled() {
+            self.writer.sync_data()?;
+        }
 
         let seq = self.writer_seq + 1;
         let path = segment_path(dir, seq);
@@ -186,8 +219,10 @@ impl<C: RaftTypeConfig> Disk<C> {
             .append(true)
             .open(&path)?;
         file.write_all(&segment_header())?;
-        file.sync_data()?;
-        sync_dir(dir)?;
+        if fsync.enabled() {
+            file.sync_data()?;
+            sync_dir(dir)?;
+        }
 
         self.writer = file;
         self.writer_seq = seq;
@@ -197,7 +232,7 @@ impl<C: RaftTypeConfig> Disk<C> {
     }
 
     /// Reopens an existing segment for appending at `len`.
-    fn reopen(&mut self, seq: u32, len: u64) -> io::Result<()> {
+    fn reopen(&mut self, seq: u32, len: u64, fsync: FsyncPolicy) -> io::Result<()> {
         let path = self
             .segments
             .iter()
@@ -209,7 +244,9 @@ impl<C: RaftTypeConfig> Disk<C> {
 
         let file = OpenOptions::new().read(true).append(true).open(&path)?;
         file.set_len(len)?;
-        file.sync_data()?;
+        if fsync.enabled() {
+            file.sync_data()?;
+        }
 
         self.writer = file;
         self.writer_seq = seq;
@@ -222,6 +259,12 @@ impl<C: RaftTypeConfig> Disk<C> {
 struct Inner<C: RaftTypeConfig> {
     dir: PathBuf,
     segment_size: u64,
+    /// How appended data is fsynced.
+    fsync: FsyncPolicy,
+    /// Set after a write that is not yet known to be durable.
+    dirty: AtomicBool,
+    /// Wakes the periodic fsync thread on drop.
+    fsync_stop: Option<std::sync::mpsc::Sender<()>>,
     index: RwLock<BTreeMap<u64, RecordLoc>>,
     state: RwLock<RuntimeState<C>>,
     disk: RwLock<Disk<C>>,
@@ -230,6 +273,14 @@ struct Inner<C: RaftTypeConfig> {
     /// One-shot fault injection for tests: 0 = off, 1 = ENOSPC, 2 = EIO.
     #[cfg(debug_assertions)]
     append_fault: AtomicU8,
+}
+
+impl<C: RaftTypeConfig> Drop for Inner<C> {
+    fn drop(&mut self) {
+        if let Some(stop) = self.fsync_stop.take() {
+            let _ = stop.send(());
+        }
+    }
 }
 
 impl<C: RaftTypeConfig> Inner<C> {
@@ -266,7 +317,7 @@ impl<C: RaftTypeConfig> Inner<C> {
         if disk.writer_len > SEGMENT_HEADER_LEN
             && disk.writer_len + buf.len() as u64 > self.segment_size
         {
-            disk.rotate(&self.dir)?;
+            disk.rotate(&self.dir, self.fsync)?;
         }
 
         let seq = disk.writer_seq;
@@ -275,16 +326,24 @@ impl<C: RaftTypeConfig> Inner<C> {
         if let Err(e) = disk.writer.write_all(&buf) {
             // Undo a partial write: a hole in the log is much worse than losing the batch.
             let _ = disk.writer.set_len(base);
-            let _ = disk.writer.sync_data();
+            if self.fsync.enabled() {
+                let _ = disk.writer.sync_data();
+            }
             disk.writer_len = base;
             return Err(e);
         }
-        if let Err(e) = disk.writer.sync_data() {
+        self.dirty.store(true, Ordering::Release);
+        if self.fsync == FsyncPolicy::EveryAppend
+            && let Err(e) = disk.writer.sync_data()
+        {
             // The bytes may or may not be durable; drop them so the retry starts at `base`.
             let _ = disk.writer.set_len(base);
             let _ = disk.writer.sync_data();
             disk.writer_len = base;
             return Err(e);
+        }
+        if self.fsync == FsyncPolicy::EveryAppend {
+            self.dirty.store(false, Ordering::Release);
         }
         disk.writer_len = base + buf.len() as u64;
 
@@ -324,7 +383,7 @@ impl<C: RaftTypeConfig> Inner<C> {
         if disk.writer_len > SEGMENT_HEADER_LEN
             && disk.writer_len + payload.len() as u64 > self.segment_size
         {
-            disk.rotate(&self.dir)?;
+            disk.rotate(&self.dir, self.fsync)?;
         }
         let base = disk.writer_len;
         if let Err(e) = disk.write_frame(&payload) {
@@ -333,6 +392,7 @@ impl<C: RaftTypeConfig> Inner<C> {
             disk.writer_len = base;
             return Err(e);
         }
+        self.dirty.store(true, Ordering::Release);
         drop(disk);
 
         self.state.write().unwrap().committed = committed;
@@ -387,7 +447,7 @@ impl<C: RaftTypeConfig> Inner<C> {
                 .and_then(|s| s.last_index)
                 .is_some_and(|last| last <= log_id.index);
             if active_covered {
-                disk.rotate(&self.dir)?;
+                disk.rotate(&self.dir, self.fsync)?;
             }
 
             // Never drop the active segment: it is where the next append goes.
@@ -463,7 +523,7 @@ impl<C: RaftTypeConfig> Inner<C> {
         }
         disk.segments.retain(|s| !stale.contains(&s.seq));
 
-        disk.reopen(cut.0, cut.1)?;
+        disk.reopen(cut.0, cut.1, self.fsync)?;
         drop(disk);
 
         // Update the index first, then derive the surviving bounds from it.
@@ -624,12 +684,41 @@ impl<C: RaftTypeConfig> LogStore<C> {
 
     /// Same as [`Self::open`] with an explicit segment size. Small values are useful in tests.
     pub fn open_with_segment_size(dir: impl Into<PathBuf>, segment_size: u64) -> io::Result<Self> {
+        Self::open_with_segment_size_and_fsync(dir, segment_size, None)
+    }
+
+    /// Opens the log with the default segment size and an explicit fsync policy.
+    ///
+    /// `None` disables fsync; `Some(Duration::ZERO)` fsyncs every append;
+    /// `Some(interval)` fsyncs the active segment every `interval`.
+    pub fn open_with_fsync(dir: impl Into<PathBuf>, fsync: Option<Duration>) -> io::Result<Self> {
+        Self::open_with_segment_size_and_fsync(dir, DEFAULT_SEGMENT_SIZE, fsync)
+    }
+
+    /// Compatibility wrapper: `true` means fsync every append, `false` means no fsync.
+    pub fn open_with_sync(dir: impl Into<PathBuf>, sync: bool) -> io::Result<Self> {
+        let fsync = if sync { Some(Duration::ZERO) } else { None };
+        Self::open_with_fsync(dir, fsync)
+    }
+
+    /// Same as [`Self::open_with_segment_size`] with an explicit fsync policy.
+    pub fn open_with_segment_size_and_fsync(
+        dir: impl Into<PathBuf>,
+        segment_size: u64,
+        fsync: Option<Duration>,
+    ) -> io::Result<Self> {
         let dir = dir.into();
         std::fs::create_dir_all(&dir)?;
 
+        let fsync = FsyncPolicy::from_option(fsync);
+        // Strict recovery only when every append is fsynced; otherwise a crash
+        // can leave a torn non-last segment, so keep the longest valid prefix
+        // and let Raft catch up from peers.
+        let recover_corrupt = fsync != FsyncPolicy::EveryAppend;
+
         let mut index = BTreeMap::new();
         let mut state = RuntimeState::<C>::default();
-        let mut segments = recover_segments::<C>(&dir, &mut index, &mut state)?;
+        let mut segments = recover_segments::<C>(&dir, &mut index, &mut state, recover_corrupt)?;
 
         // The state file is written atomically, so a decode failure is real corruption.
         if let Some(bytes) = read_state_file(&dir)? {
@@ -681,9 +770,22 @@ impl<C: RaftTypeConfig> LogStore<C> {
         let writer_len = writer.metadata()?.len();
         let writer_seq = active.seq;
 
-        let inner = Inner {
+        let (fsync_stop, fsync_rx) = match fsync {
+            FsyncPolicy::Interval(_) => {
+                let (tx, rx) = std::sync::mpsc::channel();
+                (Some(tx), Some(rx))
+            }
+            _ => (None, None),
+        };
+
+        let inner = Arc::new(Inner {
             dir,
             segment_size,
+            fsync,
+            // Recovered data may still be unsynced; the periodic thread should
+            // flush it on its first tick.
+            dirty: AtomicBool::new(true),
+            fsync_stop,
             index: RwLock::new(index),
             state: RwLock::new(state),
             disk: RwLock::new(Disk {
@@ -697,16 +799,60 @@ impl<C: RaftTypeConfig> LogStore<C> {
             write_order: tokio::sync::Mutex::new(()),
             #[cfg(debug_assertions)]
             append_fault: AtomicU8::new(0),
-        };
+        });
 
-        Ok(Self {
-            inner: Arc::new(inner),
-        })
+        if let (FsyncPolicy::Interval(interval), Some(rx)) = (fsync, fsync_rx) {
+            let weak = Arc::downgrade(&inner);
+            std::thread::Builder::new()
+                .name("wal-fsync".to_string())
+                .spawn(move || {
+                    loop {
+                        match rx.recv_timeout(interval) {
+                            Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                                let Some(inner) = weak.upgrade() else {
+                                    return;
+                                };
+                                if !inner.dirty.swap(false, Ordering::AcqRel) {
+                                    continue;
+                                }
+                                let disk = inner.disk.read().unwrap();
+                                if let Err(error) = disk.writer.sync_data() {
+                                    inner.dirty.store(true, Ordering::Release);
+                                    tracing::warn!(%error, "periodic WAL fsync failed");
+                                }
+                            }
+                        }
+                    }
+                })
+                .map_err(|error| {
+                    io::Error::other(format!("failed to spawn WAL fsync thread: {error}"))
+                })?;
+        }
+
+        Ok(Self { inner })
+    }
+
+    /// Compatibility wrapper: `true` means fsync every append, `false` means no fsync.
+    pub fn open_with_segment_size_and_sync(
+        dir: impl Into<PathBuf>,
+        segment_size: u64,
+        sync: bool,
+    ) -> io::Result<Self> {
+        let fsync = if sync { Some(Duration::ZERO) } else { None };
+        Self::open_with_segment_size_and_fsync(dir, segment_size, fsync)
     }
 
     /// Directory holding this log's segments.
     pub fn dir(&self) -> &Path {
         &self.inner.dir
+    }
+
+    /// Whether the WAL has writes that have not been fsynced yet.
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn wal_dirty(&self) -> bool {
+        self.inner.dirty.load(Ordering::Acquire)
     }
 
     /// Arms a one-shot WAL append failure for fault-injection tests.
@@ -952,10 +1098,18 @@ where
 }
 
 /// Rebuilds the index and hard state from every segment, truncating a torn tail in the last one.
+struct RecoveredSegment {
+    /// The segment metadata when the segment remains part of the log.
+    meta: Option<SegmentMeta>,
+    /// This segment is unusable; the caller must remove it and every later segment.
+    stop: bool,
+}
+
 fn recover_segments<C: RaftTypeConfig>(
     dir: &Path,
     index: &mut BTreeMap<u64, RecordLoc>,
     state: &mut RuntimeState<C>,
+    recover_corrupt: bool,
 ) -> io::Result<Vec<SegmentMeta>> {
     let mut found: Vec<(u32, PathBuf)> = std::fs::read_dir(dir)?
         .filter_map(Result::ok)
@@ -967,13 +1121,32 @@ fn recover_segments<C: RaftTypeConfig>(
         .collect();
     found.sort_by_key(|(seq, _)| *seq);
 
-    let count = found.len();
-    let mut segments = Vec::with_capacity(count);
-
-    for (position, (seq, path)) in found.into_iter().enumerate() {
-        let is_last = position + 1 == count;
-        let meta = recover_segment::<C>(seq, &path, is_last, index, state)?;
-        segments.push(meta);
+    let mut segments = Vec::with_capacity(found.len());
+    let mut expected_next = None;
+    for position in 0..found.len() {
+        let (seq, path) = &found[position];
+        let is_last = position + 1 == found.len();
+        let recovered = recover_segment::<C>(
+            *seq,
+            path,
+            is_last,
+            index,
+            state,
+            recover_corrupt,
+            &mut expected_next,
+        )?;
+        let stop = recovered.stop;
+        if let Some(meta) = recovered.meta {
+            segments.push(meta);
+        } else if stop {
+            let _ = std::fs::remove_file(path);
+        }
+        if stop {
+            for (_, later) in &found[position + 1..] {
+                let _ = std::fs::remove_file(later);
+            }
+            break;
+        }
     }
 
     Ok(segments)
@@ -985,7 +1158,9 @@ fn recover_segment<C: RaftTypeConfig>(
     is_last: bool,
     index: &mut BTreeMap<u64, RecordLoc>,
     state: &mut RuntimeState<C>,
-) -> io::Result<SegmentMeta> {
+    recover_corrupt: bool,
+    expected_next: &mut Option<u64>,
+) -> io::Result<RecoveredSegment> {
     let file = OpenOptions::new().read(true).write(true).open(path)?;
     let bytes = std::fs::read(path)?;
     let file_len = bytes.len() as u64;
@@ -994,6 +1169,16 @@ fn recover_segment<C: RaftTypeConfig>(
     if file_len < SEGMENT_HEADER_LEN {
         // A crash while creating a segment: only the last one may be repaired.
         if !is_last {
+            if recover_corrupt {
+                tracing::warn!(
+                    path = %path.display(),
+                    "discarding a non-last WAL segment with a truncated header"
+                );
+                return Ok(RecoveredSegment {
+                    meta: None,
+                    stop: true,
+                });
+            }
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("segment {} has a truncated header", path.display()),
@@ -1003,11 +1188,24 @@ fn recover_segment<C: RaftTypeConfig>(
         let mut file = OpenOptions::new().write(true).open(path)?;
         file.write_all(&segment_header())?;
         file.sync_all()?;
-        return Ok(meta);
+        return Ok(RecoveredSegment {
+            meta: Some(meta),
+            stop: false,
+        });
     }
 
     let header = &bytes[..SEGMENT_HEADER_LEN as usize];
     if &header[0..4] != SEGMENT_MAGIC {
+        if recover_corrupt {
+            tracing::warn!(
+                path = %path.display(),
+                "discarding a WAL segment with a bad magic"
+            );
+            return Ok(RecoveredSegment {
+                meta: None,
+                stop: true,
+            });
+        }
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("segment {} has a bad magic", path.display()),
@@ -1015,6 +1213,17 @@ fn recover_segment<C: RaftTypeConfig>(
     }
     let version = u32::from_le_bytes(header[4..8].try_into().unwrap());
     if version != SEGMENT_VERSION {
+        if recover_corrupt {
+            tracing::warn!(
+                path = %path.display(),
+                version,
+                "discarding a WAL segment with an unsupported version"
+            );
+            return Ok(RecoveredSegment {
+                meta: None,
+                stop: true,
+            });
+        }
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
@@ -1063,6 +1272,15 @@ fn recover_segment<C: RaftTypeConfig>(
             WalRecord::Entry(entry) => {
                 let log_id = entry.log_id();
                 let index_value = log_id.index;
+                if let Some(expected) = *expected_next
+                    && index_value != expected
+                {
+                    // A gap violates openraft's no-hole contract. Treat it like
+                    // a torn record: keep the prefix before it.
+                    torn = true;
+                    break;
+                }
+                *expected_next = Some(index_value + 1);
                 index.insert(
                     index_value,
                     RecordLoc {
@@ -1087,7 +1305,7 @@ fn recover_segment<C: RaftTypeConfig>(
     }
 
     if torn {
-        if !is_last {
+        if !is_last && !recover_corrupt {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
@@ -1103,9 +1321,16 @@ fn recover_segment<C: RaftTypeConfig>(
         );
         file.set_len(valid_tail)?;
         file.sync_all()?;
+        return Ok(RecoveredSegment {
+            meta: Some(meta),
+            stop: !is_last,
+        });
     }
 
-    Ok(meta)
+    Ok(RecoveredSegment {
+        meta: Some(meta),
+        stop: false,
+    })
 }
 
 fn read_state_file(dir: &Path) -> io::Result<Option<Vec<u8>>> {
