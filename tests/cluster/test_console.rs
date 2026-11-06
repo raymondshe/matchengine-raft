@@ -35,6 +35,7 @@ fn console_reports_cluster_and_transfers_leader() {
         let mut config = default_raft_config();
         config.heartbeat_interval = 200;
         config.election_timeout_min = 500;
+        config.heartbeat_min_interval = None;
         config.election_timeout_max = 1_000;
 
         let mut nodes: Vec<Option<MatchEngineNode>> = Vec::new();

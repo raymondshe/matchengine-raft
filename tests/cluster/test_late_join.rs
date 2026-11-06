@@ -33,6 +33,7 @@ fn test_config() -> Config {
     let mut config = default_raft_config();
     config.heartbeat_interval = 200;
     config.election_timeout_min = 500;
+    config.heartbeat_min_interval = None;
     config.election_timeout_max = 1_000;
     config.snapshot_policy = SnapshotPolicy::LogsSinceLast(10);
     config.max_in_snapshot_log_to_keep = 0;

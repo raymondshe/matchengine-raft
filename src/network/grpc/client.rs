@@ -40,9 +40,14 @@ use tonic::Status;
 use tonic::transport::Channel;
 use tonic::transport::Endpoint;
 
+use crate::network::grpc::HTTP2_CONNECTION_WINDOW;
+use crate::network::grpc::HTTP2_KEEPALIVE_INTERVAL;
+use crate::network::grpc::HTTP2_KEEPALIVE_TIMEOUT;
+use crate::network::grpc::HTTP2_STREAM_WINDOW;
 use crate::network::grpc::MAX_MESSAGE_SIZE;
 use crate::network::grpc::SNAPSHOT_CHANNEL_SIZE;
 use crate::network::grpc::SNAPSHOT_CHUNK_SIZE;
+use crate::network::grpc::SNAPSHOT_CHUNK_SIZE_MAX;
 use crate::network::grpc::STREAM_APPEND_CHANNEL_SIZE;
 use crate::network::grpc::decode;
 use crate::network::grpc::encode;
@@ -134,8 +139,10 @@ fn make_channel(addr: &str) -> Result<Channel, String> {
         .map_err(|e| format!("invalid gRPC endpoint for `{addr}`: {e}"))?
         .connect_timeout(Duration::from_secs(2))
         .tcp_nodelay(true)
-        .http2_keep_alive_interval(Duration::from_secs(5))
-        .keep_alive_timeout(Duration::from_secs(3))
+        .initial_stream_window_size(HTTP2_STREAM_WINDOW)
+        .initial_connection_window_size(HTTP2_CONNECTION_WINDOW)
+        .http2_keep_alive_interval(HTTP2_KEEPALIVE_INTERVAL)
+        .keep_alive_timeout(HTTP2_KEEPALIVE_TIMEOUT)
         .keep_alive_while_idle(true);
     Ok(endpoint.connect_lazy())
 }
@@ -265,9 +272,9 @@ where
         result.map_err(|e| RPCError::Network(NetworkError::new(&e)))
     }
 
-    /// Streams the snapshot in fixed-size chunks. The stream is cancelled with
-    /// `cancel`, and a stream that ends before the terminal `done` chunk is
-    /// discarded by the follower.
+    /// Streams the snapshot in OpenRaft-configured chunks. The stream is
+    /// cancelled with `cancel`, and a stream that ends before the terminal
+    /// `done` chunk is discarded by the follower.
     #[tracing::instrument(level = "debug", skip_all, err(Debug))]
     async fn full_snapshot(
         &mut self,
@@ -278,6 +285,11 @@ where
     ) -> Result<SnapshotResponse<C>, StreamingError<C>> {
         let mut client = self.client().map_err(StreamingError::from)?;
         let ttl = option.soft_ttl();
+        let chunk_size = option
+            .snapshot_chunk_size()
+            .filter(|size| *size > 0)
+            .unwrap_or(SNAPSHOT_CHUNK_SIZE)
+            .min(SNAPSHOT_CHUNK_SIZE_MAX);
 
         let meta = snapshot.meta;
         let data = snapshot.snapshot.into_inner();
@@ -293,7 +305,7 @@ where
             let mut first = true;
 
             while pos < total {
-                let end = (pos + SNAPSHOT_CHUNK_SIZE).min(total);
+                let end = (pos + chunk_size).min(total);
                 let chunk = SnapshotChunk {
                     vote: if first { vote.clone() } else { Vec::new() },
                     meta: if first { meta.clone() } else { Vec::new() },

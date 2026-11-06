@@ -60,6 +60,7 @@ impl Drop for TempDir {
 fn test_config(snapshot_policy: SnapshotPolicy) -> Config {
     Config {
         heartbeat_interval: 150,
+        heartbeat_min_interval: None,
         election_timeout_min: 400,
         election_timeout_max: 800,
         snapshot_policy,

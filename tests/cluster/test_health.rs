@@ -48,6 +48,7 @@ fn health_reports_grpc_leadership_and_storage() {
         assert_eq!(body["http_addr"], ADDR);
         assert_eq!(body["grpc_addr"], RAFT_ADDR);
         assert_eq!(body["grpc_listening"], true);
+        assert_eq!(body["recovered"], false);
         assert!(body["storage"]["wal"].is_object());
         assert!(body["storage"]["state_machine"].is_object());
         assert!(body["leadership"]["leader_id"].is_null());
@@ -59,11 +60,13 @@ fn health_reports_grpc_leadership_and_storage() {
         let client = MatchEngineClient::<C>::new(1, ADDR.to_string());
         client.init().await.unwrap().unwrap();
         wait_for_leader(&client).await;
+        wait_for_ready(&http, &base).await;
 
         let (status, body) = get_json(&http, &format!("{base}/ready")).await;
         assert_eq!(StatusCode::OK, status);
         assert_eq!(body["status"], "ok");
         assert_eq!(body["ready"], true);
+        assert_eq!(body["recovered"], true);
         assert_eq!(body["leadership"]["state"], "Leader");
         assert_eq!(body["leadership"]["is_leader"], true);
         assert_eq!(body["leadership"]["leader_id"], 1);
@@ -115,5 +118,17 @@ async fn wait_for_leader(client: &MatchEngineClient<C>) {
         }
         assert!(Instant::now() <= deadline, "node 1 never became leader");
         C::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+async fn wait_for_ready(http: &reqwest::Client, base: &str) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let (status, _) = get_json(http, &format!("{base}/ready")).await;
+        if status == StatusCode::OK {
+            return;
+        }
+        assert!(Instant::now() <= deadline, "node 1 never became ready");
+        C::sleep(Duration::from_millis(50)).await;
     }
 }

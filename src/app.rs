@@ -1,3 +1,6 @@
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+
 use crate::LogStore;
 use crate::MatchEngineNodeId;
 use crate::MatchEngineRaft;
@@ -43,6 +46,14 @@ pub struct MatchEngineApp {
 
     /// Whether the gRPC Raft listener task is still serving.
     pub grpc_health: GrpcListenerHealth,
+
+    /// Set once `Raft::wait_for_recovery` confirms that the state machine has
+    /// applied the cluster commit covering this node's durable log tail.
+    ///
+    /// The WAL commit marker is not fsynced on every commit; gating readiness
+    /// on this flag prevents a restarted node from serving a reverted read
+    /// before recovery catches up.
+    pub recovered: Arc<AtomicBool>,
 
     /// Operational-console state: action lock and recent action history.
     pub console: ConsoleState,

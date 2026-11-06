@@ -6,6 +6,8 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use actix_web::App;
@@ -28,6 +30,10 @@ use crate::match_result::MatchResultSink;
 use crate::match_result::NoopSink;
 use crate::network::api;
 use crate::network::console;
+use crate::network::grpc::HTTP2_CONNECTION_WINDOW;
+use crate::network::grpc::HTTP2_KEEPALIVE_INTERVAL;
+use crate::network::grpc::HTTP2_KEEPALIVE_TIMEOUT;
+use crate::network::grpc::HTTP2_STREAM_WINDOW;
 use crate::network::grpc::MAX_MESSAGE_SIZE;
 use crate::network::grpc::client::GrpcNetworkFactory;
 use crate::network::grpc::events::EventStreamService;
@@ -194,13 +200,25 @@ pub const DEFAULT_SNAPSHOT_LOG_THRESHOLD: u64 = 100_000;
 /// Periodic snapshot interval used when no explicit storage setting is supplied.
 pub const DEFAULT_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(30 * 60);
 
+/// Suppress a periodic heartbeat when a replication/heartbeat response arrived
+/// within this window. Must leave room for `heartbeat_interval` plus one tick
+/// before `election_timeout_min`.
+const DEFAULT_HEARTBEAT_MIN_INTERVAL_MS: u64 = 500;
+
+/// A follower this far behind is caught up with a snapshot instead of log
+/// entries. Kept above the snapshot policy so a snapshot is newer than the
+/// retained log window (openraft's documented requirement).
+const DEFAULT_REPLICATION_LAG_THRESHOLD: u64 = DEFAULT_SNAPSHOT_LOG_THRESHOLD * 3 / 2;
+
 /// The Raft configuration used by the binary and the integration tests.
 pub fn default_raft_config() -> Config {
     Config {
         heartbeat_interval: 500,
+        heartbeat_min_interval: Some(DEFAULT_HEARTBEAT_MIN_INTERVAL_MS),
         election_timeout_min: 1500,
         election_timeout_max: 3000,
         snapshot_policy: SnapshotPolicy::LogsSinceLast(DEFAULT_SNAPSHOT_LOG_THRESHOLD),
+        replication_lag_threshold: DEFAULT_REPLICATION_LAG_THRESHOLD,
         // Ask peers before campaigning so a restarted or partitioned node cannot
         // inflate the term and depose a healthy leader. The gRPC transport
         // implements `RaftNetworkV2::pre_vote`; openraft's default grants
@@ -419,6 +437,19 @@ pub async fn build_match_engine_node(
     .await
     .map_err(|e| std::io::Error::other(format!("failed to create Raft instance: {e}")))?;
 
+    // The WAL commit marker is written without its own fsync. Do not report the
+    // node ready for reads until OpenRaft has re-established the cluster commit
+    // covering the durable log tail and the state machine has applied it.
+    let recovered = Arc::new(AtomicBool::new(false));
+    let recovery_raft = raft.clone();
+    let recovery_flag = recovered.clone();
+    tokio::spawn(async move {
+        match recovery_raft.wait_for_recovery(None).await {
+            Ok(_) => recovery_flag.store(true, Ordering::Release),
+            Err(error) => tracing::debug!(%error, "Raft recovery wait ended"),
+        }
+    });
+
     // The log-count policy bounds the WAL; this timer also bounds snapshot age
     // even on a mostly idle or low-volume node.
     let snapshot_task = spawn_snapshot_timer(raft.clone(), storage.snapshot_interval);
@@ -456,6 +487,10 @@ pub async fn build_match_engine_node(
     let grpc_task = tokio::spawn(async move {
         let _stop_guard = GrpcListenerStopGuard::new(grpc_health_task);
         let server = tonic::transport::Server::builder()
+            .initial_stream_window_size(Some(HTTP2_STREAM_WINDOW))
+            .initial_connection_window_size(Some(HTTP2_CONNECTION_WINDOW))
+            .http2_keepalive_interval(Some(HTTP2_KEEPALIVE_INTERVAL))
+            .http2_keepalive_timeout(Some(HTTP2_KEEPALIVE_TIMEOUT))
             .add_service(
                 RaftServiceServer::new(grpc_service)
                     .max_decoding_message_size(MAX_MESSAGE_SIZE)
@@ -494,6 +529,7 @@ pub async fn build_match_engine_node(
         state_machine_store: state_machine_store.clone(),
         log_store: log_store.clone(),
         grpc_health,
+        recovered,
         console: console::ConsoleState::new(),
     });
 
@@ -657,6 +693,24 @@ mod tests {
     #[test]
     fn default_config_enables_pre_vote() {
         assert_eq!(Some(true), default_raft_config().enable_pre_vote);
+    }
+
+    #[test]
+    fn default_config_tunes_openraft_for_the_workload() {
+        let config = default_raft_config();
+
+        assert_eq!(
+            Some(DEFAULT_HEARTBEAT_MIN_INTERVAL_MS),
+            config.heartbeat_min_interval
+        );
+        assert!(
+            config.heartbeat_interval + DEFAULT_HEARTBEAT_MIN_INTERVAL_MS
+                < config.election_timeout_min
+        );
+        assert!(config.replication_lag_threshold > DEFAULT_SNAPSHOT_LOG_THRESHOLD);
+        config
+            .validate()
+            .expect("default Raft config must validate");
     }
 
     #[tokio::test]

@@ -1,6 +1,6 @@
 # TODO
 
-Last reviewed: 2026-11-04. This is the working roadmap; see `AGENTS.md` for commands and the
+Last reviewed: 2026-11-06. This is the working roadmap; see `AGENTS.md` for commands and the
 current branch state.
 
 **Current baseline:** the OpenRaft 0.10 port, durable WAL/snapshot storage and exact scale-18
@@ -11,18 +11,20 @@ fill-level `error` code set.
 One process/cluster trades exactly one symbol; multi-symbol is isolated by running one process per
 symbol. Base/quote volume and asset-aware fee deduction are done, and the market-data processor
 runs as a tokio task. Edge request/snapshot limits and the loopback/private-network contract are in
-place. The remaining work is measured performance evidence and event delivery; TLS/authentication
-stays at the gateway and is out of scope for this process.
+place. The remaining work is measured performance evidence, event delivery and the OpenRaft
+utilization follow-ups in [`RAFT_REVIEW.md`](./docs/RAFT_REVIEW.md) (§16); TLS/authentication stays at
+the gateway and is out of scope for this process.
 
 Priority key: **P0** = correctness/security, do next; **P1** = production readiness; **P2** =
 important but not blocking; **P3** = later/optional.
 
 ## Top priorities
 
-No P0/P1 feature work remains: the measured baselines are in
+No P0 work remains. The P1 OpenRaft utilization quick wins in §16 are implemented; the remaining
+OpenRaft items are P2/P3. The measured baselines are in
 [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md), the third-party follow-ups are P2/P3 (§14), and
-measurement scope, peak RSS, the book-only replay benchmark, the fuzz targets, health/readiness and
-the operational console are in place. Equity/ETF sessions, holidays, auctions, T+1/T+2 settlement,
+measurement scope, peak RSS, the book-only replay benchmark, the fuzz targets, health/readiness
+and the operational console are in place. Equity/ETF sessions, holidays, auctions, T+1/T+2 settlement,
 corporate actions and fixed/regulatory/minimum/tax fees are owned by the external order system
 (§13).
 
@@ -32,8 +34,15 @@ restarts without a partial snapshot and retries cleanly. Pre-Vote is enabled wit
 RPC (§4), so an isolated node asks before campaigning. The wire v6 reference decoder and golden
 tests are complete (§6).
 
-The next work, in order (re-prioritised 2026-11-05 after the benchmark-measurement pass and the
-external optimization-notes re-review, whose verdicts are in
+An OpenRaft utilization review (2026-11-06, [`RAFT_REVIEW.md`](./docs/RAFT_REVIEW.md)) found the
+transport already uses `stream_append` and streamed snapshots correctly. Its P1 quick wins are
+implemented: the replication lag threshold now sits above the 100k snapshot policy, heartbeat
+suppression is enabled, HTTP/2 windows/keepalive are tuned, snapshot chunks follow OpenRaft's
+configured size and readiness waits for recovery. The remaining P2/P3 items (snapshot `Arc`
+data, WAL byte caps, asynchronous WAL append, metrics/runtime controls) are tracked in §16.
+
+The next work, in order (re-prioritised 2026-11-06 after the OpenRaft utilization review and the
+2026-11-05 benchmark/external-notes pass, whose verdicts are in
 [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md)):
 
 1. **Benchmark regression gate (§8, P2).** Gate CI on `apply_path` allocs/entry (deterministic) plus
@@ -659,3 +668,75 @@ Guardrails / what not to copy:
 - [x] **P1** SIGKILL during a learner snapshot install: `test_failure.rs` pauses the install after
   the first chunk with a debug-only delay, kills the learner, asserts no `current.snap` was written,
   restarts it, and proves the full snapshot is retried and installed.
+
+## 16. OpenRaft utilization review (2026-11-06)
+
+The full review is in [`RAFT_REVIEW.md`](./docs/RAFT_REVIEW.md). The transport already uses
+`RaftNetworkV2::stream_append` for replication and heartbeats and `full_snapshot` for snapshots;
+these follow-ups are about aligning OpenRaft 0.10 configuration with this workload and reducing
+storage/transport overhead.
+
+**Configuration and transport quick wins**
+
+- [x] **P1** Align `replication_lag_threshold` with the snapshot policy. Done:
+  `default_raft_config` sets 150,000, above the 100k `LogsSinceLast` policy; `test_late_join`
+  and `test_snapshot` still pass.
+- [x] **P1** Enable `heartbeat_min_interval` so sustained replication suppresses redundant
+  heartbeat `AppendStream` sessions. Done: 500 ms, with
+  `heartbeat_interval = 500` and `election_timeout_min = 1500`.
+- [x] **P1** Tune HTTP/2 flow control and keepalive. Done: client and server use 1 MiB stream /
+  4 MiB connection windows and 5 s / 3 s keepalive; the server now has
+  keepalive enabled.
+- [x] **P1** Honor `RPCOption::snapshot_chunk_size()` in `full_snapshot`. Done: chunks follow
+  OpenRaft's configured size (3 MiB by default) capped at 8 MiB; `install_snapshot_timeout`
+  remains intentionally unused by `full_snapshot`, which is bounded by cancellation and HTTP/2
+  keepalive.
+- [ ] **P2** Override `new_heartbeat_client` and `new_snapshot_client` explicitly with
+  role-specific channel profiles. The current separate channels are correct but rely on the
+  default factory delegation; make the isolation intentional before adding channel pooling or
+  preconnect.
+- [ ] **P2** Benchmark `max_payload_entries`, `STREAM_APPEND_CHANNEL_SIZE` and
+  `api_batch_linger_ms` (defaults 300, 64 and 0). The append channel is bounded by count, not
+  bytes, so large payloads can queue significant memory; keep linger at 0 unless measurements
+  justify the latency tradeoff.
+- [ ] **P2** Record before/after measurements for heartbeat `AppendStream` count under sustained
+  writes and snapshot transfer time. The post-change e2e/storage baseline is now in
+  [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md); use it to confirm the 1 MiB / 4 MiB HTTP/2
+  window choice before tuning further.
+
+**Storage**
+
+- [x] **P1** Review `save_committed` durability and recovery readiness. Done: the marker stays
+  non-fsynced, but `/ready` now requires `Raft::wait_for_recovery` to confirm the state machine
+  applied the cluster commit covering the durable log tail. `/health` exposes the `recovered`
+  flag for diagnostics.
+- [ ] **P2** Change snapshot data from `Cursor<Vec<u8>>` to `Cursor<Arc<[u8]>>` (or a
+  `Bytes`-backed reader) so `get_current_snapshot` and `build_snapshot` do not copy the whole
+  snapshot under the state-machine lock.
+- [ ] **P2** Bound WAL append size by bytes, not only by OpenRaft's `max_append_entries`
+  (default 4,096). A merged append can contain many 128-request batches; add a byte cap or lower
+  `max_append_entries` and measure throughput.
+- [ ] **P3** Evaluate an asynchronous WAL append: return after the entries are readable in
+  memory, write/fsync on a background task and call `IOFlushed` when durable. This needs a
+  pending-entry read cache so `try_get_log_entries` remains correct before the on-disk copy is
+  visible.
+- [ ] **P3** When exposing the snapshot policy, expose `purge_batch_size` and
+  `max_in_snapshot_log_to_keep` together; the current 100k snapshot policy makes the defaults
+  mostly harmless, but a lower policy would otherwise cause frequent small purges.
+
+**OpenRaft APIs and observability**
+
+- [ ] **P2** Expose `raft.data_metrics()` and `raft.server_metrics()` in `/metrics` (the current
+  handler only returns `RaftMetrics`); optionally enable OpenRaft's `runtime-stats` feature or
+  install a `MetricsRecorder` for append/replication histograms.
+- [ ] **P2** Add guarded console actions for `raft.trigger().purge_log()` and supported
+  `raft.runtime_config()` changes after a snapshot; document the safety constraints.
+- [ ] **P3** Evaluate `ReadPolicy::LeaseRead` as an opt-in for `/linearizable_read` and
+  `/events`. The current `ReadIndex` path costs a quorum round trip per read; lease reads remove
+  it but require bounded clock drift.
+- [ ] **P3** Replace metrics polling in the market-data leader watcher with OpenRaft's
+  `on_leader_change` callbacks (minor cleanup).
+- [ ] **P3** Optional transport work: preconnect peers after startup/membership changes, larger
+  HTTP/2 frames and snapshot compression. Persistent `AppendStream` sessions across OpenRaft
+  replication sessions are not possible without changing the OpenRaft contract; heartbeat
+  suppression is the practical way to reduce stream churn.

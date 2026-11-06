@@ -1,6 +1,6 @@
 # Performance measurements
 
-Measured on **2026-10-30** (runtime flavor A/B and P0 offloads: **2026-10-31**; measurement scope and RSS: **2026-11-01**; book p50/p99 and the pinned-core approximation: **2026-11-04**) on the reference development machine:
+Measured on **2026-10-30** (runtime flavor A/B and P0 offloads: **2026-10-31**; measurement scope and RSS: **2026-11-01**; book p50/p99 and the pinned-core approximation: **2026-11-04**; end-to-end/storage rerun with the OpenRaft quick wins: **2026-11-06**) on the reference development machine:
 
 - Apple M4 (`arm64`)
 - Rust `1.93.1`
@@ -34,10 +34,10 @@ its scope.
 | `book_replay` | `OrderBook` only: 100-level and single-level sweeps, deep cancels, BBO advancement and static BBO queries; clone/eviction outside the timed window | HTTP, Raft, WAL/snapshots, market-data feed, event construction, fees | Closed-loop, in-process; one pristine book per round | `Instant` per round; best-of-5 repeats, warm p50/p99, interleaved cold p50/p99 after a 64 MiB eviction sweep | 5-14% run-to-run; cold adds ~8-22%; 1k/20k cases differ in tree depth, not just order count |
 | `level_book` | Prototype per-level buckets plus the current `OrderBook`: match sweeps, deep cancels, sparse/dense amends, depth, BBO queries and BBO advancement; plain limit orders only; clone/eviction outside the timed window | Stops, icebergs, GTD expiry, validation, events, depth journal, market-data feed, fees beyond `MatchResult` construction | Closed-loop, in-process; paired current/prototype books | `Instant` per round; best-of-5 repeats, warm p50/p99, interleaved cold p50/p99 after a 64 MiB eviction sweep | 5-10% run-to-run, BBO-query ratio 4.9-5.6x; sparse one-order-per-level cases are the prototype's worst case |
 | `apply_path` | `StateMachineStore::apply` only: blank, rest, cancel, fill and 128-request batch workloads; a counting global allocator reports heap calls and requested bytes | HTTP, Raft, WAL, snapshots, market-data tap, event-log reads, response serialization | Closed-loop, direct apply; 50k entries or 1k batches per workload | Counting allocator; per-entry averages | Requested bytes include realloc churn and are not a live-memory high-water mark |
-| `e2e` `/write` | HTTP decode/validation, Raft proposal/commit, WAL append + `sync_data`, apply, response serialization | Cross-node replication, external client network beyond loopback | Sequential is closed-loop; concurrent is a 1,000-request burst | `Instant` per request; p50/p95/p99/max | Medians/percentiles; runtime A/B uses four alternating runs |
-| `e2e` `/write_batch` | Same as `/write`, with 1–128 requests per Raft entry and one WAL fsync per entry | Same as `/write` | 200 sequential batches per size; 100 concurrent 32-order batches | `Instant` per batch | Single run per size; batch latency includes payload/apply growth |
+| `e2e` `/write` | HTTP decode/validation, Raft proposal/commit, WAL append + `sync_data`, apply, response serialization | Cross-node replication, external client network beyond loopback | Sequential is closed-loop; concurrent is a 1,000-request burst | `Instant` per request; p50/p95/p99/max | Medians/percentiles; runtime A/B uses four alternating runs, the 2026-11-06 rerun uses three |
+| `e2e` `/write_batch` | Same as `/write`, with 1–128 requests per Raft entry and one WAL fsync per entry | Same as `/write` | 200 sequential batches per size; 100 concurrent 32-order batches | `Instant` per batch | Medians of three runs per size; batch latency includes payload/apply growth |
 | `feed_load` | Tokio tap, bounded queue, shadow book, wire encoding and processor drain with a null sink | JSONL/network sink I/O, Raft, HTTP | Offered-load generator at 50k/500k/2M fills/s | `Instant`; queue/drain counters | One run per target; no p99 table |
-| `storage` | WAL append/read/reopen with 20k real order entries and 512 KiB segments | State machine, Raft, HTTP | Closed-loop, 100-entry batches | `Instant` | One run; no tail study |
+| `storage` | WAL append/read/reopen with 20k real order entries and 512 KiB segments | State machine, Raft, HTTP | Closed-loop, 100-entry batches | `Instant` | Three runs, medians; no tail study |
 | `p0_bench duplicate` | State-machine duplicate-retry lookup over a 262k-event window | HTTP, Raft, WAL | 200 retries after one setup | `Instant`; mean/p50/p99/max | Single run; a single scheduling outlier moves the mean |
 | `p0_bench read` | In-process node `/read orderbook_orders` with 100k orders and 8 concurrent writers | Cross-node replication; client-side parsing beyond bytes received | 2 readers x 10 large reads, writers in flight | `Instant`; read/write p50/p99/max | Single run; allocator/HTTP buffers affect peak RSS |
 | `p0_bench snapshot` | `persist_snapshot` encode/write/fsync for 100k orders while 8 writers run | Raft snapshot shipping; cross-node replication | 8 writers, snapshot on the main benchmark task | `Instant`; writer p50/p99/max and snapshot duration | Single run; encode/fsync dominated |
@@ -231,13 +231,17 @@ majority round trip on top of these numbers.
 | Measurement | Result |
 |---|---:|
 | Sequential writes | 500 |
-| Sequential throughput | 253 writes/s |
-| Mean latency | 3.96 ms |
-| p50 latency | 3.99 ms |
-| p95 latency | 4.90 ms |
+| Sequential throughput | 262 writes/s |
+| Mean latency | 3.81 ms |
+| p50 latency | 3.96 ms |
+| p95 latency | 4.66 ms |
 | p99 latency | 5.17 ms |
-| Max latency | 5.36 ms |
-| Concurrent writes (1,000 in flight) | 18,350 writes/s |
+| Max latency | 7.22 ms |
+| Concurrent writes (1,000 in flight) | 17,245 writes/s |
+
+The 2026-11-06 rerun reports the median of three runs. The per-run maxima varied
+from 5.55 to 12.40 ms, so the max above is the median of those per-run maxima and
+is not a stable tail estimate.
 
 The gap between sequential and concurrent throughput is the expected batching
 effect: sequential clients pay one WAL fsync per request, while concurrent
@@ -253,24 +257,34 @@ not matching):
 
 | Batch size | Batches | Orders | Batches/s | Orders/s | Speedup vs size 1 | Batch mean | p50 | p99 |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 1 | 200 | 200 | 236 | 236 | 1.00x | 4.23 ms | 4.17 ms | 5.41 ms |
-| 8 | 200 | 1,600 | 229 | 1,829 | 7.73x | 4.37 ms | 4.22 ms | 5.73 ms |
-| 32 | 200 | 6,400 | 230 | 7,345 | 31.06x | 4.35 ms | 4.28 ms | 5.34 ms |
-| 64 | 200 | 12,800 | 218 | 13,929 | 58.90x | 4.59 ms | 4.72 ms | 5.50 ms |
-| 128 | 200 | 25,600 | 197 | 25,183 | 106.48x | 5.08 ms | 5.05 ms | 6.04 ms |
+| 1 | 200 | 200 | 258 | 258 | 1.00x | 3.87 ms | 3.99 ms | 4.86 ms |
+| 8 | 200 | 1,600 | 253 | 2,020 | 7.81x | 3.96 ms | 4.00 ms | 5.12 ms |
+| 32 | 200 | 6,400 | 216 | 6,918 | 26.80x | 4.62 ms | 4.88 ms | 5.54 ms |
+| 64 | 200 | 12,800 | 206 | 13,208 | 51.45x | 4.84 ms | 4.97 ms | 5.96 ms |
+| 128 | 200 | 25,600 | 182 | 23,249 | 91.06x | 5.50 ms | 5.47 ms | 6.76 ms |
 
-The same run measured 257 single `/write` requests/s. The size-1 `/write_batch`
-path (236 orders/s) pays only the array envelope overhead; by size 128 the
+The same rerun measured 262 single `/write` requests/s. The size-1 `/write_batch`
+path (258 orders/s) pays only the array envelope overhead; by size 128 the
 per-order cost falls by roughly two orders of magnitude because the fsync is
-amortized. Batch latency grows only from 4.23 ms to 5.08 ms as the payload and
+amortized. Batch latency grows only from 3.87 ms to 5.50 ms as the payload and
 apply work grow, so throughput scales close to the batch size.
 
 With 100 concurrent 32-order batches (3,200 orders in flight), the same node
-reached **157,035 orders/s** (4,907 batches/s), showing that concurrent batches
+reached **139,323 orders/s** (4,354 batches/s), showing that concurrent batches
 also coalesce into Raft append batches. These are single-node loopback numbers;
 a 3-node cluster adds one majority round trip per batch, but the WAL fsync
 amortization is unchanged. Keep batches within the 128-request cap: `apply`
 holds the state-machine lock for the whole batch.
+
+### OpenRaft quick wins (2026-11-06)
+
+The 2026-11-06 rerun includes the P1 OpenRaft utilization changes:
+`replication_lag_threshold = 150_000`, `heartbeat_min_interval = 500 ms`,
+1 MiB HTTP/2 stream / 4 MiB connection windows with 5 s / 3 s keepalive on both
+sides, snapshot chunks from `RPCOption::snapshot_chunk_size()` (3 MiB default,
+8 MiB cap), and `/ready` gated on `Raft::wait_for_recovery`. The e2e and storage
+tables above are the post-change baseline. A dedicated heartbeat-stream-count
+and snapshot-transfer-time measurement is still a P2 follow-up (`TODO.md` §16).
 
 ### Runtime flavor A/B (2026-10-31)
 
@@ -378,15 +392,16 @@ entries in batches of 100, with 512 KiB segments:
 
 | Operation | Result |
 |---|---:|
-| Append 20k entries | 767.8 ms |
-| Append throughput | 26,049 entries/s |
-| Read 20k entries | 8.38 ms |
-| Read throughput | 2,386,089 entries/s |
-| Reopen/recover 20k entries | 6.33 ms |
+| Append 20k entries | 782.9 ms |
+| Append throughput | 25,547 entries/s |
+| Read 20k entries | 8.31 ms |
+| Read throughput | 2,408,176 entries/s |
+| Reopen/recover 20k entries | 7.30 ms |
 | Recovered entries | 20,000 |
 
-Append throughput is fsync-bound (one durable batch per 100 entries); read and
-recovery benefit from sequential segment scanning and coalesced `pread` calls.
+The 2026-11-06 rerun reports the median of three runs. Append throughput is
+fsync-bound (one durable batch per 100 entries); read and recovery benefit from
+sequential segment scanning and coalesced `pread` calls.
 
 ## Storage-path improvements
 

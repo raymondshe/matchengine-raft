@@ -91,8 +91,11 @@ pub struct HealthResponse {
     pub status: String,
     /// Liveness: the gRPC listener, Raft core and storage are healthy.
     pub healthy: bool,
-    /// Readiness: `healthy` and a cluster leader is known.
+    /// Readiness: `healthy`, a cluster leader is known, and the state machine
+    /// has recovered to the cluster commit covering the durable log tail.
     pub ready: bool,
+    /// Whether startup recovery has completed.
+    pub recovered: bool,
     /// This node's Raft id.
     pub node_id: MatchEngineNodeId,
     /// The public HTTP API address.
@@ -189,6 +192,7 @@ pub async fn ready(app: Data<MatchEngineApp>) -> HttpResponse {
 pub(crate) async fn collect_health(app: &MatchEngineApp) -> HealthResponse {
     let metrics = app.raft.metrics().borrow_watched().clone();
     let grpc_listening = app.grpc_health.is_listening();
+    let recovered = app.recovered.load(Ordering::Acquire);
     let mut errors = Vec::new();
 
     if !grpc_listening {
@@ -223,7 +227,8 @@ pub(crate) async fn collect_health(app: &MatchEngineApp) -> HealthResponse {
     HealthResponse {
         status: if healthy { "ok" } else { "unhealthy" }.to_string(),
         healthy,
-        ready: healthy && metrics.current_leader.is_some(),
+        ready: healthy && metrics.current_leader.is_some() && recovered,
+        recovered,
         node_id: app.id,
         http_addr: app.addr.clone(),
         grpc_addr: app.grpc_health.addr().to_string(),
