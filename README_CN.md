@@ -102,7 +102,7 @@
 
 ## 架构概述
 
-本项目扩展了 [example-raft-kv](https://github.com/datafuselabs/openraft/tree/main/example-raft-kv)，增加了持久化存储和 gRPC 传输：
+本项目扩展了 [example-raft-kv](https://github.com/datafuselabs/openraft/tree/main/example-raft-kv)，增加了持久化存储和 gRPC 传输。另见交互式、带源码引用的[架构图](./docs/matchengine-raft-architecture.html)：
 
 ```
                   ┌─────────────────────────────────────────────────────────┐

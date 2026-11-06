@@ -102,7 +102,7 @@ Everything below is implemented in this repository and exercised by tests; the l
 
 ## Architecture Overview
 
-This project extends the [example-raft-kv](https://github.com/datafuselabs/openraft/tree/main/example-raft-kv) with persistent storage and a gRPC transport:
+This project extends the [example-raft-kv](https://github.com/datafuselabs/openraft/tree/main/example-raft-kv) with persistent storage and a gRPC transport. For an interactive, source-linked view of the same system, open the [architecture diagram](./docs/matchengine-raft-architecture.html).
 
 ```
                   ┌─────────────────────────────────────────────────────────┐
