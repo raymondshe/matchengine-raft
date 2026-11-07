@@ -250,8 +250,7 @@ MatchEngineRequest::Place { order, client_order_id } => {
     let events = /* fills, rests, cancels, triggers, expiries, rejections */;
     inner.record_events(&events);
     inner.record_submission(client_order_id, o.sequence, log_index, events.len());
-    self.publish_match_events(&events);
-
+    // Sink/tap work is collected in PendingPublish and published after the lock.
     MatchEngineResponse::applied(o.sequence, &events)
 }
 ```
@@ -260,6 +259,8 @@ The real arm is slightly longer because it also anchors automatic-purge events a
 market-data frame; the window and submission map are updated before publishing, so a sink
 failure cannot lose them. Sink and market-data publishing are collected in `PendingPublish` and
 run after the state-machine lock is released, so a slow sink cannot extend the lock hold time.
+`FileLogSink` is marked `is_blocking()` and runs on `spawn_blocking`; the apply task still awaits
+it, so a slow file sink delays the next entry but does not block a Tokio worker.
 `Cancel`, `Amend` and `PurgeExpired` use the same `record_events`/`MatchEngineResponse::applied`
 path.
 

@@ -1,15 +1,14 @@
 //! Aeron publication sink for the market-data feed.
 //!
-//! rusteron's Aeron handles are `!Send`, so a dedicated publisher thread owns
-//! the driver, client and one exclusive publication per stream (2001–2007 by
-//! default). The processor task hands encoded frames to that thread through a
+//! rusteron's Aeron handles are `!Send`, so a `spawn_blocking` task owns the
+//! driver, client and one exclusive publication per stream (2001–2007 by
+//! default). The processor task hands encoded frames to that task through a
 //! bounded channel; the matching path is untouched.
 
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::io;
 use std::sync::mpsc;
-use std::thread;
 use std::time::Duration;
 
 use rusteron_client::Aeron;
@@ -26,14 +25,14 @@ use crate::market_data::wire;
 /// Queue from the processor task to the publication thread.
 const PUBLISH_QUEUE: usize = 8_192;
 
-/// Publishes wire-v6 frames to Aeron streams through a dedicated thread.
+/// Publishes wire-v6 frames to Aeron streams through a blocking task.
 pub struct AeronSink {
     tx: mpsc::SyncSender<(u16, Vec<u8>)>,
     stream_base: u16,
 }
 
 impl AeronSink {
-    /// Starts the publisher thread, connects/embeds the media driver and waits
+    /// Starts the publisher task, connects/embeds the media driver and waits
     /// until the Aeron client is ready.
     pub async fn start(config: &MarketDataConfig) -> io::Result<Self> {
         let channel = config.aeron_channel.clone().ok_or_else(|| {
@@ -48,16 +47,17 @@ impl AeronSink {
 
         let (tx, rx) = mpsc::sync_channel(PUBLISH_QUEUE);
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-        thread::Builder::new()
-            .name("aeron-publisher".to_string())
-            .spawn(move || publisher_thread(channel, stream_base, dir, embedded, rx, ready_tx))
-            .map_err(|error| io::Error::other(format!("spawn Aeron publisher: {error}")))?;
+        // rusteron handles are `!Send`, so the blocking publisher owns them
+        // inside a `spawn_blocking` closure instead of a Tokio task.
+        tokio::task::spawn_blocking(move || {
+            publisher_thread(channel, stream_base, dir, embedded, rx, ready_tx)
+        });
 
         match ready_rx.await {
             Ok(Ok(())) => Ok(Self { tx, stream_base }),
             Ok(Err(error)) => Err(error),
             Err(_) => Err(io::Error::other(
-                "Aeron publisher thread stopped during setup",
+                "Aeron publisher task stopped during setup",
             )),
         }
     }
@@ -88,7 +88,7 @@ impl MarketDataSink for AeronSink {
             )),
             Err(mpsc::TrySendError::Disconnected(_)) => Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
-                "Aeron publisher thread stopped",
+                "Aeron publisher task stopped",
             )),
         }
     }
@@ -304,7 +304,7 @@ mod tests {
             if received.is_some() {
                 break;
             }
-            std::thread::sleep(Duration::from_millis(10));
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
         let received = received.expect("published frame");
         assert_eq!(STREAM_BBO, received.stream);

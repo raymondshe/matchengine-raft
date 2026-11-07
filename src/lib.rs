@@ -502,13 +502,18 @@ pub async fn build_match_engine_node(
     );
 
     // Open (or create) the durable log; recovery replays segments and discards a torn tail.
-    let log_store = LogStore::open_with_fsync(storage.log_dir(node_id), storage.wal_fsync)?;
+    // Recovery can scan many segments, so keep it off the async runtime.
+    let log_dir = storage.log_dir(node_id);
+    let wal_fsync = storage.wal_fsync;
+    let log_store =
+        tokio::task::spawn_blocking(move || LogStore::open_with_fsync(log_dir, wal_fsync))
+            .await
+            .map_err(|error| std::io::Error::other(format!("WAL open task failed: {error}")))??;
+    log_store.start_fsync_worker()?;
     // Match results are computed by `apply`; the sink decides what happens with them. The default
-    // drops them, exactly as before.
-    let match_result_sink: Arc<dyn MatchResultSink> = match &storage.match_event_log {
-        Some(path) => Arc::new(FileLogSink::open(path)?.with_node_id(node_id)),
-        None => Arc::new(NoopSink),
-    };
+    // drops them, exactly as before. Create it with the state machine so its file open also runs
+    // on the blocking pool.
+    let sink_path = storage.match_event_log.clone();
     // Start the market-data publisher before the state machine so the tap can
     // be installed at open; it is node-local and never affects replication.
     let market_data = match &storage.market_data {
@@ -516,12 +521,24 @@ pub async fn build_match_engine_node(
         None => None,
     };
     // Load the latest snapshot, if any. openraft replays the retained log tail on top of it.
-    let state_machine_store = StateMachineStore::open_with_sinks_and_retention(
-        storage.snapshot_dir(node_id),
-        match_result_sink,
-        market_data.as_ref().map(|handle| handle.tap()),
-        storage.max_events,
-    )?;
+    // Snapshot decode and state-machine restore can be large, so run them off the async runtime.
+    let snapshot_dir = storage.snapshot_dir(node_id);
+    let max_events = storage.max_events;
+    let snapshot_tap = market_data.as_ref().map(|handle| handle.tap());
+    let state_machine_store = tokio::task::spawn_blocking(move || {
+        let sink: Arc<dyn MatchResultSink> = match sink_path {
+            Some(path) => Arc::new(FileLogSink::open(path)?.with_node_id(node_id)),
+            None => Arc::new(NoopSink),
+        };
+        StateMachineStore::open_with_sinks_and_retention(
+            snapshot_dir,
+            sink,
+            snapshot_tap,
+            max_events,
+        )
+    })
+    .await
+    .map_err(|error| std::io::Error::other(format!("state-machine open task failed: {error}")))??;
     if let Some(handle) = &market_data {
         let depth_levels = storage
             .market_data

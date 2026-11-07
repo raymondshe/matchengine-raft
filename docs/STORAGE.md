@@ -30,7 +30,9 @@ WAL fsync is controlled by `RAFT_WAL_FSYNC_MS`:
 
 - unset: no fsync (the default).
 - `0`: fsync every append batch.
-- `N > 0`: a dedicated `wal-fsync` thread fsyncs the active segment every `N` ms.
+- `N > 0`: a Tokio `wal-fsync` task fsyncs the active segment every `N` ms. It clones the active
+  file handle under a short lock and runs `sync_data` on the clone in `spawn_blocking`, so appends
+  do not wait on the disk lock during the fsync.
 
 Only every-append mode satisfies `RaftLogStorage::append`'s contract fully: entries are persisted
 when the callback runs, and the log has no holes. With no fsync or periodic fsync, the callback can

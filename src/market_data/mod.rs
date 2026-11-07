@@ -24,11 +24,7 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::fmt;
-use std::fs::File;
-use std::fs::OpenOptions;
 use std::io;
-use std::io::BufWriter;
-use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -37,6 +33,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
+use tokio::io::AsyncWriteExt;
 use tokio::sync::Notify;
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::mpsc::Sender;
@@ -553,7 +550,7 @@ impl MarketDataSink for NullSink {
 /// A debugging aid, like [`crate::match_result::FileLogSink`]: node-local, not
 /// replicated, not fsynced, and replayed after a restart if the log is replayed.
 pub struct JsonlSink {
-    writer: BufWriter<File>,
+    tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     node_id: u64,
 }
 
@@ -566,19 +563,38 @@ impl fmt::Debug for JsonlSink {
 }
 
 impl JsonlSink {
-    /// Opens `path` in append mode, creating parent directories.
-    pub fn open(path: impl AsRef<Path>, node_id: u64) -> io::Result<Self> {
+    /// Opens `path` in append mode and starts the async writer task.
+    pub async fn open(path: impl AsRef<Path>, node_id: u64) -> io::Result<Self> {
         let path = path.as_ref();
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
         {
-            std::fs::create_dir_all(parent)?;
+            tokio::fs::create_dir_all(parent).await?;
         }
-        let file = OpenOptions::new().create(true).append(true).open(path)?;
-        Ok(Self {
-            writer: BufWriter::new(file),
-            node_id,
-        })
+        let file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .await?;
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8_192);
+        tokio::spawn(async move {
+            let mut writer = tokio::io::BufWriter::new(file);
+            while let Some(line) = rx.recv().await {
+                if let Err(error) = writer.write_all(&line).await {
+                    tracing::warn!(%error, "market-data JSONL write failed");
+                    return;
+                }
+                if let Err(error) = writer.write_all(b"\n").await {
+                    tracing::warn!(%error, "market-data JSONL write failed");
+                    return;
+                }
+                if let Err(error) = writer.flush().await {
+                    tracing::warn!(%error, "market-data JSONL flush failed");
+                    return;
+                }
+            }
+        });
+        Ok(Self { tx, node_id })
     }
 }
 
@@ -594,14 +610,20 @@ impl MarketDataSink for JsonlSink {
             #[serde(flatten)]
             message: &'a MarketMessage,
         }
-        let line = serde_json::to_string(&Record {
+        let line = serde_json::to_vec(&Record {
             node_id: self.node_id,
             message,
         })
         .map_err(io::Error::other)?;
-        self.writer.write_all(line.as_bytes())?;
-        self.writer.write_all(b"\n")?;
-        self.writer.flush()
+        self.tx.try_send(line).map_err(|error| match error {
+            tokio::sync::mpsc::error::TrySendError::Full(_) => {
+                io::Error::new(io::ErrorKind::WouldBlock, "market-data JSONL queue is full")
+            }
+            tokio::sync::mpsc::error::TrySendError::Closed(_) => io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "market-data JSONL writer stopped",
+            ),
+        })
     }
 }
 
@@ -848,7 +870,7 @@ async fn build_sink(
         }
     }
     match &config.log_path {
-        Some(path) => Ok(Box::new(JsonlSink::open(path, node_id)?)),
+        Some(path) => Ok(Box::new(JsonlSink::open(path, node_id).await?)),
         None => Ok(Box::new(NullSink)),
     }
 }

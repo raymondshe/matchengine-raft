@@ -404,7 +404,7 @@ PARTIAL_BAR|BAR_CLOSE`; bit 4 reserved), `market_seq`, `log_index`, `ordinal`, b
 | U6 | **done** | README/README_CN/AGENTS/TODO/AERON updates; bench `rest 1k bids + journal` |
 | U8 | **done** | deterministic `(market_seq, sub_seq)` across replicas; all mutations sequenced; auto GTD purge; one TRADE per taker; wire v6 encoder + reference decoder |
 | U9 | **partial** | `start_with_sink` seam done; per-entry empty depth deltas and bar quote volume still open (the service derives contiguity and kline `q`) |
-| U10 | **partial** | `AeronSink` (rusteron 0.2.13, embedded/external driver, one publication per stream, dedicated thread, periodic reset snapshot) done; idle heartbeat and leadership-scoped publication lifecycle still open |
+| U10 | **partial** | `AeronSink` (rusteron 0.2.13, embedded/external driver, one publication per stream, blocking publisher task, periodic reset snapshot) done; idle heartbeat and leadership-scoped publication lifecycle still open |
 | U11 | **done (demo)** | `demos/market_data_system/`: `FrameSource` (JSONL + Aeron + channel), per-symbol feeds, assembler, dedupe/watermark/gap policy, caches |
 | U12 | **done (demo)** | shared WS hub: serialize-once broadcast, 100/1000 ms conflation, snapshot-on-subscribe, Binance payloads, multi-symbol keys |
 | U13 | **done (demo)** | Binance client protocol: raw/combined endpoints, live `SUBSCRIBE`/`UNSUBSCRIBE` across symbols on one connection, 1024-stream cap, ping/pong, 24 h rotation |

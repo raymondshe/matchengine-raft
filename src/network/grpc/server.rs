@@ -88,7 +88,7 @@ async fn maybe_delay_snapshot_install() {
         return;
     };
     if let Ok(marker) = std::env::var("MATCHENGINE_TEST_SNAPSHOT_INSTALL_MARKER") {
-        let _ = std::fs::write(marker, b"installing");
+        let _ = tokio::fs::write(marker, b"installing").await;
     }
     tokio::time::sleep(std::time::Duration::from_millis(millis)).await;
 }

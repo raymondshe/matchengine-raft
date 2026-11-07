@@ -836,18 +836,33 @@ impl<C: RaftTypeConfig> StateMachineStore<C> {
     /// Publishes one entry's events, logging (but swallowing) sink failures.
     ///
     /// Failure must never fail `apply`: replicas that cannot reach their sink have to keep
-    /// converging with replicas that can.
-    fn publish_match_events(&self, events: &[MatchEvent]) {
+    /// converging with replicas that can. Blocking sinks run on the blocking pool so a file
+    /// write cannot stall a Tokio worker.
+    async fn publish_match_events(&self, events: EventBuffer) {
         if events.is_empty() {
             return;
         }
-        if let Err(e) = self.sink.publish(events) {
-            tracing::warn!(
+        let count = events.len();
+        let result = if self.sink.is_blocking() {
+            let sink = self.sink.clone();
+            tokio::task::spawn_blocking(move || sink.publish(&events)).await
+        } else {
+            Ok(self.sink.publish(&events))
+        };
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => tracing::warn!(
                 sink = self.sink.name(),
-                events = events.len(),
-                error = %e,
+                events = count,
+                %error,
                 "match result sink failed; the state machine is unaffected"
-            );
+            ),
+            Err(error) => tracing::warn!(
+                sink = self.sink.name(),
+                events = count,
+                %error,
+                "match result sink task failed; the state machine is unaffected"
+            ),
         }
     }
 
@@ -890,9 +905,9 @@ impl<C: RaftTypeConfig> StateMachineStore<C> {
 
     /// Publishes one entry's sink and tap work after the state-machine lock is
     /// released. Ordering matches the order the entries were applied in.
-    fn publish_pending(&self, pending: impl IntoIterator<Item = PendingPublish>) {
+    async fn publish_pending(&self, pending: impl IntoIterator<Item = PendingPublish>) {
         for publish in pending {
-            self.publish_match_events(&publish.events);
+            self.publish_match_events(publish.events).await;
             if let Some((tap, frame)) = publish.market {
                 tap.publish(frame);
             }
@@ -1376,7 +1391,7 @@ where
             };
 
             // Sink and tap work happens outside the state-machine lock.
-            self.publish_pending(publishes);
+            self.publish_pending(publishes).await;
             // Wake long-poll readers only when the retained window advanced.
             self.notify_events(last_event);
 

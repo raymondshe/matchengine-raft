@@ -21,10 +21,6 @@
 //! bridge with exit code 2: events were evicted and the consumer must resync
 //! out of band. It never silently skips a gap.
 
-use std::fs::File;
-use std::fs::OpenOptions;
-use std::io::BufWriter;
-use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -32,6 +28,8 @@ use std::time::Duration;
 use clap::Parser;
 use serde::Deserialize;
 use serde::Serialize;
+
+use tokio::io::AsyncWriteExt;
 
 use matchengine_raft::MatchEngineTypeConfig;
 use matchengine_raft::client::MatchEngineClient;
@@ -97,8 +95,8 @@ impl From<Cursor> for EventId {
 }
 
 /// Loads the checkpoint, or `None` to start at the oldest retained event.
-fn load_cursor(path: &Path) -> std::io::Result<Option<EventId>> {
-    match std::fs::read(path) {
+async fn load_cursor(path: &Path) -> std::io::Result<Option<EventId>> {
+    match tokio::fs::read(path).await {
         Ok(bytes) => {
             let cursor: Cursor = serde_json::from_slice(&bytes).map_err(|error| {
                 std::io::Error::new(
@@ -115,19 +113,17 @@ fn load_cursor(path: &Path) -> std::io::Result<Option<EventId>> {
 
 /// Writes the checkpoint via a temporary file + rename, so a crash never leaves
 /// a torn cursor.
-fn save_cursor(path: &Path, cursor: Option<EventId>) -> std::io::Result<()> {
+async fn save_cursor(path: &Path, cursor: Option<EventId>) -> std::io::Result<()> {
     let tmp = path.with_extension("tmp");
-    {
-        let mut file = File::create(&tmp)?;
-        match cursor {
-            Some(id) => serde_json::to_writer(&mut file, &Cursor::from(id))
-                .map_err(std::io::Error::other)?,
-            None => file.write_all(b"null")?,
-        }
-        file.write_all(b"\n")?;
-        file.sync_data()?;
-    }
-    std::fs::rename(&tmp, path)?;
+    let bytes = match cursor {
+        Some(id) => serde_json::to_vec(&Cursor::from(id)).map_err(std::io::Error::other)?,
+        None => b"null".to_vec(),
+    };
+    let mut file = tokio::fs::File::create(&tmp).await?;
+    file.write_all(&bytes).await?;
+    file.write_all(b"\n").await?;
+    file.sync_data().await?;
+    tokio::fs::rename(&tmp, path).await?;
     Ok(())
 }
 
@@ -152,22 +148,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(parent) = opt.out.parent()
         && !parent.as_os_str().is_empty()
     {
-        std::fs::create_dir_all(parent)?;
+        tokio::fs::create_dir_all(parent).await?;
     }
     if let Some(parent) = opt.cursor.parent()
         && !parent.as_os_str().is_empty()
     {
-        std::fs::create_dir_all(parent)?;
+        tokio::fs::create_dir_all(parent).await?;
     }
 
-    let out = OpenOptions::new()
+    let out = tokio::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(&opt.out)?;
-    let mut publisher = BufWriter::new(out);
+        .open(&opt.out)
+        .await?;
+    let mut publisher = tokio::io::BufWriter::new(out);
 
     let client = MatchEngineClient::<C>::new(opt.engine_id, opt.engine.clone());
-    let mut cursor = load_cursor(&opt.cursor)?;
+    let mut cursor = load_cursor(&opt.cursor).await?;
     let mut pages = 0u64;
 
     loop {
@@ -204,15 +201,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Publish the page, then acknowledge it by moving the checkpoint. A
         // crash in between replays the page; consumers dedupe on event_id.
         for event in &page.events {
-            serde_json::to_writer(&mut publisher, event)?;
-            publisher.write_all(b"\n")?;
+            let line = serde_json::to_vec(event)?;
+            publisher.write_all(&line).await?;
+            publisher.write_all(b"\n").await?;
         }
-        publisher.flush()?;
-        publisher.get_ref().sync_data()?;
+        publisher.flush().await?;
+        publisher.get_ref().sync_data().await?;
 
         if let Some(next) = page.next_after {
             cursor = Some(next);
-            save_cursor(&opt.cursor, cursor)?;
+            save_cursor(&opt.cursor, cursor).await?;
         }
 
         pages = pages.saturating_add(1);
@@ -237,26 +235,26 @@ mod tests {
         ))
     }
 
-    #[test]
-    fn cursor_round_trips_through_the_checkpoint_file() {
+    #[tokio::test]
+    async fn cursor_round_trips_through_the_checkpoint_file() {
         let path = temp_path("cursor");
-        assert_eq!(None, load_cursor(&path).unwrap());
+        assert_eq!(None, load_cursor(&path).await.unwrap());
         let id = EventId {
             log_index: 42,
             ordinal: 3,
         };
-        save_cursor(&path, Some(id)).unwrap();
-        assert_eq!(Some(id), load_cursor(&path).unwrap());
+        save_cursor(&path, Some(id)).await.unwrap();
+        assert_eq!(Some(id), load_cursor(&path).await.unwrap());
         // A torn write leaves the previous checkpoint intact.
         assert!(!path.with_extension("tmp").exists());
         let _ = std::fs::remove_file(path);
     }
 
-    #[test]
-    fn a_corrupt_cursor_fails_loudly() {
+    #[tokio::test]
+    async fn a_corrupt_cursor_fails_loudly() {
         let path = temp_path("corrupt");
         std::fs::write(&path, b"not-json").unwrap();
-        assert!(load_cursor(&path).is_err());
+        assert!(load_cursor(&path).await.is_err());
         let _ = std::fs::remove_file(path);
     }
 

@@ -294,7 +294,7 @@ HTTP 应用/管理 API 和 gRPC Raft 服务见 [API 参考](./docs/zh-CN/API.md)
 
 WAL fsync 由 `RAFT_WAL_FSYNC_MS` 控制：未设置 = 不 fsync（默认），`0` = 每次追加都 fsync，
 `N > 0` = 每 N 毫秒周期 fsync。非每次追加模式以持久性换吞吐；关闭 fsync 时同一 WAL 基准约
-1.66M 条/s。关闭 fsync 时节点要求至少 4 个投票成员；演示脚本使用 `RAFT_WAL_FSYNC_MS=0`
+约 2M 条/s。关闭 fsync 时节点要求至少 4 个投票成员；演示脚本使用 `RAFT_WAL_FSYNC_MS=0`
 以保持三节点部署可用。详见[存储](./docs/zh-CN/STORAGE.md)。
 
 完整基准方法、存储路径细节和优化历史见 [性能细节](./docs/zh-CN/PERFORMANCE.md)。快照 **v10** 和

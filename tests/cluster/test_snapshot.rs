@@ -1,4 +1,3 @@
-use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -12,9 +11,7 @@ use matchengine_raft::order_book::OrderSide;
 use matchengine_raft::start_match_engine_node_with_storage;
 use matchengine_raft::store::MatchEngineRequest;
 use openraft::SnapshotPolicy;
-use openraft::async_runtime::AsyncRuntime;
 use openraft::type_config::TypeConfigExt;
-use openraft::type_config::alias::AsyncRuntimeOf;
 
 /// A learner that joins after the leader purged its log must be caught up with a
 /// streamed snapshot over gRPC.
@@ -45,28 +42,28 @@ async fn test_grpc_snapshot_install_inner() -> anyhow::Result<()> {
 
     let _h1 = {
         let storage = storage.clone();
-        thread::spawn(move || {
-            let mut rt = AsyncRuntimeOf::<MatchEngineTypeConfig>::new(1);
-            let x = rt.block_on(start_match_engine_node_with_storage(
+        tokio::spawn(async move {
+            let x = start_match_engine_node_with_storage(
                 1,
                 "127.0.0.1:21101".to_string(),
                 config(),
                 storage,
-            ));
+            )
+            .await;
             println!("node1: {:?}", x);
         })
     };
 
     let _h2 = {
         let storage = storage.clone();
-        thread::spawn(move || {
-            let mut rt = AsyncRuntimeOf::<MatchEngineTypeConfig>::new(1);
-            let x = rt.block_on(start_match_engine_node_with_storage(
+        tokio::spawn(async move {
+            let x = start_match_engine_node_with_storage(
                 2,
                 "127.0.0.1:21102".to_string(),
                 config(),
                 storage,
-            ));
+            )
+            .await;
             println!("node2: {:?}", x);
         })
     };

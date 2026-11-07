@@ -118,24 +118,24 @@ fn publication(aeron: &Aeron, stream: u16) -> AeronPublication {
 }
 
 /// Waits until a subscriber image is connected to the publication.
-fn wait_connected(publication: &AeronPublication) {
+async fn wait_connected(publication: &AeronPublication) {
     for _ in 0..1_000 {
         if publication.is_connected() {
             return;
         }
-        std::thread::sleep(Duration::from_millis(10));
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
     panic!("Aeron publication never connected");
 }
 
 /// Offers until the subscription image is connected.
-fn publish(publication: &AeronPublication, message: &MarketMessage) {
+async fn publish(publication: &AeronPublication, message: &MarketMessage) {
     let payload = wire::encode(message);
     for _ in 0..2_000 {
         match publication.offer(&payload) {
             Ok(_) => return,
             Err(error) if error.is_retryable() => {
-                std::thread::sleep(Duration::from_millis(5));
+                tokio::time::sleep(Duration::from_millis(5)).await;
             }
             Err(error) => panic!("Aeron offer failed: {error}"),
         }
@@ -181,13 +181,13 @@ async fn aeron_channel_feeds_the_service() {
     let snapshot_publication = publication(&aeron, STREAM_DEPTH_SNAPSHOT);
     let bbo_publication = publication(&aeron, STREAM_BBO);
     let delta_publication = publication(&aeron, STREAM_DEPTH_DELTA);
-    wait_connected(&snapshot_publication);
-    wait_connected(&bbo_publication);
-    wait_connected(&delta_publication);
+    wait_connected(&snapshot_publication).await;
+    wait_connected(&bbo_publication).await;
+    wait_connected(&delta_publication).await;
 
     // Seed book state, then subscribe and verify snapshot-on-subscribe.
-    publish(&snapshot_publication, &snapshot());
-    publish(&bbo_publication, &bbo());
+    publish(&snapshot_publication, &snapshot()).await;
+    publish(&bbo_publication, &bbo()).await;
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{}/ws", running.addr))
@@ -217,7 +217,7 @@ async fn aeron_channel_feeds_the_service() {
     assert!(saw_bbo, "no Aeron bookTicker reached the socket");
 
     // A delta published over Aeron is conflated and forwarded.
-    publish(&delta_publication, &delta());
+    publish(&delta_publication, &delta()).await;
     let update = loop {
         let frame = next_json(&mut ws).await;
         if frame["e"] == "depthUpdate" {

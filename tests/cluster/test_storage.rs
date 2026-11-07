@@ -303,7 +303,7 @@ fn corrupt_non_last_segment_recovers_a_valid_prefix_without_fsync() {
 }
 
 #[test]
-fn periodic_fsync_thread_clears_dirty_state() {
+fn periodic_fsync_task_clears_dirty_state() {
     let dir = TempDir::new("periodic-fsync");
 
     block_on(async {
@@ -313,10 +313,11 @@ fn periodic_fsync_thread_clears_dirty_state() {
             Some(std::time::Duration::from_millis(20)),
         )
         .unwrap();
+        store.start_fsync_worker().unwrap();
         append(&store, vec![blank(0)]).await;
         assert!(store.wal_dirty(), "append should mark the WAL dirty");
 
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         assert!(
             !store.wal_dirty(),
             "periodic fsync should clear the dirty flag"

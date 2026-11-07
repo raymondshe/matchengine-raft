@@ -315,7 +315,7 @@ Measured baseline (Apple M4, Rust 1.93.1, release bench profile; e2e/storage med
 
 WAL fsync is controlled by `RAFT_WAL_FSYNC_MS`: unset = no fsync (default), `0` = every append,
 `N > 0` = periodic every N ms. Non-every-append modes trade durability for throughput; with fsync
-disabled the same WAL benchmark appends about 1.66M entries/s. When fsync is disabled the node
+disabled the same WAL benchmark appends about 2M entries/s. When fsync is disabled the node
 requires at least four voters; the demo scripts use `RAFT_WAL_FSYNC_MS=0` for three-node setups.
 See [Storage](./docs/STORAGE.md).
 

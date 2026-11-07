@@ -440,6 +440,14 @@ pub trait MatchResultSink: Send + Sync + 'static {
 
     /// Handles one applied entry's events. Called at most once per non-empty batch, in log order.
     fn publish(&self, events: &[MatchEvent]) -> io::Result<()>;
+
+    /// Whether [`Self::publish`] performs blocking I/O.
+    ///
+    /// The state machine runs blocking sinks through `spawn_blocking`, so a
+    /// file sink never stalls a Tokio worker.
+    fn is_blocking(&self) -> bool {
+        false
+    }
 }
 
 /// The default sink: match results are computed and dropped.
@@ -553,6 +561,10 @@ impl FileLogSink {
 impl MatchResultSink for FileLogSink {
     fn name(&self) -> &'static str {
         "file"
+    }
+
+    fn is_blocking(&self) -> bool {
+        true
     }
 
     fn publish(&self, events: &[MatchEvent]) -> io::Result<()> {

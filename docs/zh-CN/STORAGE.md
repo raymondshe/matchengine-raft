@@ -21,7 +21,8 @@ Raft 日志追加写入 `log/NNNNNNNNNN.wal` 分段文件：
 
 - 未设置：不 fsync（默认）。
 - `0`：每次追加批次 fsync。
-- `N > 0`：专用 `wal-fsync` 线程每 N ms fsync 活跃分段。
+- `N > 0`：Tokio `wal-fsync` 任务每 N ms fsync 活跃分段；阻塞的 `sync_data` 在
+  `spawn_blocking` 上执行。
 
 只有每次追加 fsync 完全满足 `RaftLogStorage::append` 的持久性契约。不 fsync 或周期 fsync 时，
 崩溃可能丢失自上次 fsync 以来的已确认写入（周期模式下最多约 N ms）。

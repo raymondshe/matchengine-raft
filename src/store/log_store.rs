@@ -9,7 +9,7 @@
 //!   layer: N client requests replicated in one RPC cost one fsync.
 //! - `open_with_fsync(..., None)` (the default, and `RAFT_WAL_FSYNC_MS` unset) skips append and
 //!   rotation fsyncs. `Some(Duration::ZERO)` fsyncs every append; `Some(interval)` fsyncs the
-//!   active segment every `interval` on a dedicated thread. Without fsync a crash can lose
+//!   active segment every `interval` on a Tokio task. Without fsync a crash can lose
 //!   acknowledged writes.
 //! - Reads use `pread` (`read_at`), so replication can read while a write is in flight and no
 //!   global lock is held during disk IO.
@@ -33,7 +33,9 @@ use std::ops::RangeBounds;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::RwLock;
+use std::sync::Weak;
 use std::sync::atomic::AtomicBool;
 #[cfg(debug_assertions)]
 use std::sync::atomic::AtomicU8;
@@ -155,7 +157,7 @@ enum FsyncPolicy {
     None,
     /// Fsync every append batch.
     EveryAppend,
-    /// Fsync the active segment periodically on a dedicated thread.
+    /// Fsync the active segment periodically on a Tokio task.
     Interval(Duration),
 }
 
@@ -263,8 +265,10 @@ struct Inner<C: RaftTypeConfig> {
     fsync: FsyncPolicy,
     /// Set after a write that is not yet known to be durable.
     dirty: AtomicBool,
-    /// Wakes the periodic fsync thread on drop.
-    fsync_stop: Option<std::sync::mpsc::Sender<()>>,
+    /// Whether the periodic fsync task has been started.
+    fsync_started: AtomicBool,
+    /// Wakes the periodic fsync task on drop.
+    fsync_stop: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     index: RwLock<BTreeMap<u64, RecordLoc>>,
     state: RwLock<RuntimeState<C>>,
     disk: RwLock<Disk<C>>,
@@ -277,7 +281,11 @@ struct Inner<C: RaftTypeConfig> {
 
 impl<C: RaftTypeConfig> Drop for Inner<C> {
     fn drop(&mut self) {
-        if let Some(stop) = self.fsync_stop.take() {
+        let mut stop = self
+            .fsync_stop
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(stop) = stop.take() {
             let _ = stop.send(());
         }
     }
@@ -690,7 +698,8 @@ impl<C: RaftTypeConfig> LogStore<C> {
     /// Opens the log with the default segment size and an explicit fsync policy.
     ///
     /// `None` disables fsync; `Some(Duration::ZERO)` fsyncs every append;
-    /// `Some(interval)` fsyncs the active segment every `interval`.
+    /// `Some(interval)` fsyncs the active segment every `interval` after
+    /// [`Self::start_fsync_worker`] is called from a Tokio runtime.
     pub fn open_with_fsync(dir: impl Into<PathBuf>, fsync: Option<Duration>) -> io::Result<Self> {
         Self::open_with_segment_size_and_fsync(dir, DEFAULT_SEGMENT_SIZE, fsync)
     }
@@ -770,22 +779,15 @@ impl<C: RaftTypeConfig> LogStore<C> {
         let writer_len = writer.metadata()?.len();
         let writer_seq = active.seq;
 
-        let (fsync_stop, fsync_rx) = match fsync {
-            FsyncPolicy::Interval(_) => {
-                let (tx, rx) = std::sync::mpsc::channel();
-                (Some(tx), Some(rx))
-            }
-            _ => (None, None),
-        };
-
         let inner = Arc::new(Inner {
             dir,
             segment_size,
             fsync,
-            // Recovered data may still be unsynced; the periodic thread should
+            // Recovered data may still be unsynced; the periodic task should
             // flush it on its first tick.
             dirty: AtomicBool::new(true),
-            fsync_stop,
+            fsync_started: AtomicBool::new(false),
+            fsync_stop: Mutex::new(None),
             index: RwLock::new(index),
             state: RwLock::new(state),
             disk: RwLock::new(Disk {
@@ -801,35 +803,6 @@ impl<C: RaftTypeConfig> LogStore<C> {
             append_fault: AtomicU8::new(0),
         });
 
-        if let (FsyncPolicy::Interval(interval), Some(rx)) = (fsync, fsync_rx) {
-            let weak = Arc::downgrade(&inner);
-            std::thread::Builder::new()
-                .name("wal-fsync".to_string())
-                .spawn(move || {
-                    loop {
-                        match rx.recv_timeout(interval) {
-                            Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
-                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                                let Some(inner) = weak.upgrade() else {
-                                    return;
-                                };
-                                if !inner.dirty.swap(false, Ordering::AcqRel) {
-                                    continue;
-                                }
-                                let disk = inner.disk.read().unwrap();
-                                if let Err(error) = disk.writer.sync_data() {
-                                    inner.dirty.store(true, Ordering::Release);
-                                    tracing::warn!(%error, "periodic WAL fsync failed");
-                                }
-                            }
-                        }
-                    }
-                })
-                .map_err(|error| {
-                    io::Error::other(format!("failed to spawn WAL fsync thread: {error}"))
-                })?;
-        }
-
         Ok(Self { inner })
     }
 
@@ -841,6 +814,38 @@ impl<C: RaftTypeConfig> LogStore<C> {
     ) -> io::Result<Self> {
         let fsync = if sync { Some(Duration::ZERO) } else { None };
         Self::open_with_segment_size_and_fsync(dir, segment_size, fsync)
+    }
+
+    /// Starts the periodic fsync task for [`FsyncPolicy::Interval`].
+    ///
+    /// Must be called from a Tokio runtime. The node calls this during startup;
+    /// direct [`LogStore`] users that configure a periodic policy must call it
+    /// themselves. Calling it twice is a no-op.
+    pub fn start_fsync_worker(&self) -> io::Result<()> {
+        let interval = match self.inner.fsync {
+            FsyncPolicy::Interval(interval) => interval,
+            _ => return Ok(()),
+        };
+        let handle = tokio::runtime::Handle::try_current()
+            .map_err(|_| io::Error::other("periodic WAL fsync requires a Tokio runtime"))?;
+        if self
+            .inner
+            .fsync_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Ok(());
+        }
+
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+        *self
+            .inner
+            .fsync_stop
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(stop_tx);
+        let weak = Arc::downgrade(&self.inner);
+        handle.spawn(fsync_loop(weak, interval, stop_rx));
+        Ok(())
     }
 
     /// Directory holding this log's segments.
@@ -1370,6 +1375,60 @@ fn read_exact_at(file: &File, mut offset: u64, mut buf: &mut [u8]) -> io::Result
         offset += read as u64;
     }
     Ok(())
+}
+
+/// Periodic fsync task. The actual `sync_data` call stays on the blocking pool.
+async fn fsync_loop<C: RaftTypeConfig>(
+    inner: Weak<Inner<C>>,
+    interval: Duration,
+    mut stop: tokio::sync::oneshot::Receiver<()>,
+) {
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // The first interval tick is immediate; recovered data should get a full
+    // interval like the old thread did.
+    ticker.tick().await;
+
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {
+                let Some(inner) = inner.upgrade() else {
+                    return;
+                };
+                if !inner.dirty.swap(false, Ordering::AcqRel) {
+                    continue;
+                }
+                // Clone the file descriptor under a short read lock, then fsync
+                // the clone without holding the disk lock. Appends can continue
+                // while the filesystem flushes the previous writes.
+                let file = {
+                    let disk = inner.disk.read().unwrap();
+                    disk.writer.try_clone()
+                };
+                let file = match file {
+                    Ok(file) => file,
+                    Err(error) => {
+                        inner.dirty.store(true, Ordering::Release);
+                        tracing::warn!(%error, "periodic WAL fsync clone failed");
+                        continue;
+                    }
+                };
+                let result = tokio::task::spawn_blocking(move || file.sync_data()).await;
+                match result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        inner.dirty.store(true, Ordering::Release);
+                        tracing::warn!(%error, "periodic WAL fsync failed");
+                    }
+                    Err(error) => {
+                        inner.dirty.store(true, Ordering::Release);
+                        tracing::warn!(%error, "periodic WAL fsync task failed");
+                    }
+                }
+            }
+            _ = &mut stop => return,
+        }
+    }
 }
 
 /// Runs blocking storage work without stalling the async runtime.

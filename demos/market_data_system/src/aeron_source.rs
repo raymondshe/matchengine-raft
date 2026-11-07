@@ -1,14 +1,13 @@
 //! Aeron multicast ingestion for the demo service.
 //!
 //! The engine publishes one wire-v6 stream per product (2001–2007). This source
-//! creates one subscription per stream on a dedicated OS thread (rusteron
-//! handles stay off the Tokio runtime), decodes frames and feeds the assembler
-//! through a bounded channel. A full instance can therefore run next to each
+//! creates one subscription per stream in a `spawn_blocking` task (rusteron
+//! handles stay off the Tokio worker threads), decodes frames and feeds the
+//! assembler through a bounded channel. A full instance can therefore run next to each
 //! other and scale out without touching the engine.
 
 use std::ffi::CString;
 use std::io;
-use std::thread;
 use std::time::Duration;
 
 use rusteron_client::Aeron;
@@ -38,15 +37,14 @@ pub async fn aeron_source(aeron: &AeronSpec) -> io::Result<BoxedSource> {
 
     let (tx, rx) = mpsc::channel::<Item>(8_192);
     let (ready_tx, ready_rx) = oneshot::channel();
-    thread::Builder::new()
-        .name("aeron-source".to_string())
-        .spawn(move || run(channel, stream_base, dir, embedded, tx, ready_tx))
-        .map_err(|error| io::Error::other(format!("spawn Aeron source thread: {error}")))?;
+    // rusteron handles are `!Send`, so the blocking source owns them inside a
+    // `spawn_blocking` closure instead of a Tokio task.
+    tokio::task::spawn_blocking(move || run(channel, stream_base, dir, embedded, tx, ready_tx));
 
     match ready_rx.await {
         Ok(Ok(())) => Ok(Box::new(ReceiverStream::new(rx))),
         Ok(Err(error)) => Err(error),
-        Err(_) => Err(io::Error::other("Aeron source thread stopped during setup")),
+        Err(_) => Err(io::Error::other("Aeron source task stopped during setup")),
     }
 }
 
@@ -174,7 +172,9 @@ fn poll_loop(subscriptions: Vec<AeronSubscription>, tx: mpsc::Sender<Item>) {
             return;
         }
         if received == 0 {
-            thread::sleep(Duration::from_micros(100));
+            // Blocking poll backoff: this function runs inside `spawn_blocking`,
+            // so a Tokio timer cannot be awaited here.
+            std::thread::sleep(Duration::from_micros(100));
         }
     }
 }

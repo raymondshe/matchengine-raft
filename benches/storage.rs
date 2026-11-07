@@ -90,6 +90,7 @@ async fn main() {
 
     let dir = temp_dir("wal");
     let store = LogStore::open_with_segment_size_and_fsync(&dir, SEGMENT_SIZE, fsync).unwrap();
+    store.start_fsync_worker().unwrap();
 
     let started = Instant::now();
     for start in (1..=ENTRIES).step_by(BATCH as usize) {
@@ -107,6 +108,7 @@ async fn main() {
 
     let started = Instant::now();
     let reopened = LogStore::open_with_segment_size_and_fsync(&dir, SEGMENT_SIZE, fsync).unwrap();
+    reopened.start_fsync_worker().unwrap();
     let reopen_elapsed = started.elapsed();
     let recovered = read(&reopened, 1..ENTRIES + 1).await;
     assert_eq!(ENTRIES as usize, recovered);

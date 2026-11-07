@@ -1,6 +1,6 @@
 # Performance measurements
 
-Measured on **2026-10-30** (runtime flavor A/B and P0 offloads: **2026-10-31**; measurement scope and RSS: **2026-11-01**; book p50/p99 and the pinned-core approximation: **2026-11-04**; end-to-end/storage rerun with the OpenRaft quick wins: **2026-11-06**; realistic-mix replay: **2026-11-06**; dedicated Raft runtime: **2026-11-06**) on the reference development machine:
+Measured on **2026-10-30** (runtime flavor A/B and P0 offloads: **2026-10-31**; measurement scope and RSS: **2026-11-01**; book p50/p99 and the pinned-core approximation: **2026-11-04**; end-to-end/storage rerun with the OpenRaft quick wins: **2026-11-06**; realistic-mix replay: **2026-11-06**; dedicated Raft runtime: **2026-11-06**; WAL fsync Tokio rerun: **2026-11-07**) on the reference development machine:
 
 - Apple M4 (`arm64`)
 - Rust `1.93.1`
@@ -263,9 +263,13 @@ Single node, HTTP JSON `/write`, including:
 
 1. HTTP request decode and request validation
 2. Raft proposal and commit
-3. WAL append and `sync_data`
+3. WAL append (and `sync_data` when fsync is enabled)
 4. State-machine apply and order-book mutation
 5. Response serialization and HTTP response
+
+The table below uses the historical durable baseline `RAFT_WAL_FSYNC_MS=0` (fsync every
+append). The default is now unset (no fsync); see [WAL fsync A/B](#wal-fsync-ab-2026-11-07)
+for the current default and periodic modes.
 
 It excludes cross-node network replication, so a 3-node cluster adds one
 majority round trip on top of these numbers.
@@ -288,7 +292,7 @@ is not a stable tail estimate.
 The gap between sequential and concurrent throughput is the expected batching
 effect: sequential clients pay one WAL fsync per request, while concurrent
 requests share append batches. Matching itself is measured separately above;
-the single-node e2e path is dominated by HTTP plus durable append.
+the single-node e2e path is dominated by HTTP plus durable append in every-append mode.
 
 ### Batch writes
 
@@ -446,41 +450,74 @@ Append throughput is fsync-bound in that mode (one durable batch per 100 entries
 recovery benefit from sequential segment scanning and coalesced `pread` calls. The A/B below
 covers no-fsync and periodic modes.
 
-### WAL fsync A/B (2026-11-06)
+### WAL fsync A/B (2026-11-07)
 
 WAL fsync is controlled by `RAFT_WAL_FSYNC_MS`:
 
 - unset: no fsync (the default); a crash can lose acknowledged writes.
 - `0`: fsync every append batch.
-- `N > 0`: a dedicated `wal-fsync` thread fsyncs the active segment every `N` ms. This bounds the
-  loss window to roughly `N` ms; it does not make every acknowledged write durable.
+- `N > 0`: a Tokio `wal-fsync` task fsyncs the active segment every `N` ms. It clones the active
+  file handle under a short lock and fsyncs the clone on `spawn_blocking`, so appends do not wait
+  on the disk lock during the fsync. This bounds the loss window to roughly `N` ms; it does not
+  make every acknowledged write durable.
 
 The numbers below use the default shared runtime (`RAFT_CORE_WORKERS` unset). The single-node
 bench uses `StorageConfig::new` (`min_voters = 1`), so it measures raw storage performance without
 the production four-voter guard. When `RAFT_WAL_FSYNC_MS` is unset, the binary requires at least
 four voters; see [`docs/STORAGE.md`](./STORAGE.md) for the durability and peer-recovery contract.
+The table reports the median of two runs (2026-11-07); ranges that matter are called out below.
 
 | Workload | every append (`0`) | every 10 ms | every 100 ms | disabled (unset) |
 |---|---:|---:|---:|---:|
-| e2e sequential `/write` p50 | 3.93 ms | 98.5 µs | 84.0 µs | 90.9 µs |
-| e2e sequential throughput | 267 writes/s | 7,459 writes/s | 9,938 writes/s | 8,586 writes/s |
-| e2e concurrent 1,000 writes | 18.3k writes/s | 32.5k writes/s | 32.9k writes/s | 32.9k writes/s |
-| e2e concurrent 100×32 batch | 201.6k orders/s | 222.8k orders/s | 213.0k orders/s | 219.2k orders/s |
-| WAL append, 20k entries | 26.2k entries/s | 815k entries/s | 1.33M entries/s | 1.66M entries/s |
-| WAL read, 20k entries | 3.0M entries/s | 7.6M entries/s | 7.8M entries/s | 4.1M entries/s |
-| WAL reopen, 20k entries | 5.2 ms | 2.9 ms | 2.6 ms | 4.5 ms |
+| e2e sequential `/write` p50 | 3.898 ms | 88.2 µs | 101.1 µs | 87.9 µs |
+| e2e sequential `/write` p99 | 4.979 ms | 2.639 ms | 219.1 µs | 270.8 µs |
+| e2e sequential throughput | 262.5 writes/s | 7,374 writes/s | 9,495 writes/s | 9,648 writes/s |
+| e2e concurrent 1,000 writes | 17.9k writes/s | 34.4k writes/s | 32.8k writes/s | 33.5k writes/s |
+| e2e concurrent 100×32 batch | 180.2k orders/s | 221.7k orders/s | 218.7k orders/s | 230.5k orders/s |
+| WAL append, 20k entries | 25.9k entries/s | 742k entries/s | 1.43M entries/s | 2.15M entries/s |
+| WAL read, 20k entries | 2.84M entries/s | 6.98M entries/s | 7.36M entries/s | 5.66M entries/s |
+| WAL reopen, 20k entries | 6.87 ms | 2.94 ms | 2.86 ms | 3.64 ms |
 
-These are single runs and the storage bench is short; a 100 ms interval may not tick before its
-append phase ends, so its WAL append number is close to disabled. The e2e run is the better
-periodic-fsync comparison. Every-append fsync accounts for about **97%** of sequential write
-latency; periodic fsync at 10 ms costs about 13% sequential throughput versus disabled while
-keeping p50 within ~8%, and 100 ms is within the same range as disabled. Concurrent writes improve
-~1.8x from every-append to the non-blocking modes because fsyncs overlap across concurrent
-requests. Read and reopen gains are partly page-cache residency; the append comparison is the
-direct measure. With
-the dedicated runtime (`RAFT_CORE_WORKERS=2`) and no fsync, the e2e run measured 9,584 writes/s,
-p50 97.8 µs and 32,416 concurrent writes/s, so the fsync share dominates regardless of runtime
-topology.
+The every-append concurrent-batch row is the noisiest (two runs: 143.7k and 216.7k orders/s);
+the 10 ms and 100 ms rows were 216.8-226.7k and 217.9-219.5k. The storage bench is short enough
+that a 100 ms interval may not tick before its append phase ends, and the disabled-mode storage
+read/reopen numbers are page-cache sensitive.
+
+#### Compared with the 2026-11-06 matrix
+
+| Metric | Previous | 2026-11-07 | Change |
+|---|---:|---:|---:|
+| every-append sequential p50 | 3.93 ms | 3.898 ms | -0.8% |
+| every-append sequential throughput | 267 writes/s | 262.5 writes/s | -1.7% |
+| every-append concurrent writes | 18.3k writes/s | 17.9k writes/s | -2.2% |
+| 10 ms sequential p50 | 98.5 µs | 88.2 µs | -10.5% |
+| 10 ms sequential throughput | 7,459 writes/s | 7,374 writes/s | -1.1% |
+| 10 ms concurrent writes | 32.5k writes/s | 34.4k writes/s | +5.8% |
+| 100 ms sequential p50 | 84.0 µs | 101.1 µs | +20.4% |
+| 100 ms sequential throughput | 9,938 writes/s | 9,495 writes/s | -4.5% |
+| disabled sequential p50 | 90.9 µs | 87.9 µs | -3.3% |
+| disabled sequential throughput | 8,586 writes/s | 9,648 writes/s | +12.4% |
+| WAL append, every append | 26.2k entries/s | 25.9k entries/s | -1.1% |
+| WAL append, 10 ms | 815k entries/s | 742k entries/s | -9.0% |
+| WAL append, 100 ms | 1.33M entries/s | 1.43M entries/s | +7.5% |
+| WAL append, disabled | 1.66M entries/s | 2.15M entries/s | noisy (runs 1.20-3.10M) |
+
+Every-append throughput/latency moved by about 2%, and disabled throughput was 8.0-11.2k
+writes/s versus 8.6k previously, so the Tokio fsync worker did not regress the normal paths. The
+100 ms p50 moved from 84 to 101 µs, but the previous value sat below both new runs (100.7 and
+101.5 µs) and is within this host's run-to-run spread. The one clear change is the **periodic 10 ms tail**: p99 is 2.24-3.04 ms in the new runs.
+The previous matrix did not record p99, but an earlier single run measured ~0.30 ms. The first
+Tokio implementation held the disk lock during `sync_data` and produced ~4.0 ms p99; cloning the
+FD under a short lock reduced that to 2.2-3.0 ms, but filesystem-level write contention remains.
+If a multi-millisecond periodic tail matters, use a larger interval or accept the trade-off.
+
+Every-append fsync accounts for about **97%** of sequential write latency; 10 ms periodic fsync
+costs about 24% sequential throughput versus disabled in the median (7,374 vs 9,648 writes/s),
+while keeping p50 essentially flat. Concurrent writes improve ~1.9x from every-append to the
+non-blocking modes because fsyncs overlap across concurrent requests. Read and reopen gains are
+partly page-cache residency; the append comparison is the direct measure. With the dedicated
+runtime (`RAFT_CORE_WORKERS=2`) and no fsync, the e2e run measured 9,584 writes/s, p50 97.8 µs and
+32,416 concurrent writes/s, so the fsync share dominates regardless of runtime topology.
 
 ## Storage-path improvements
 
@@ -520,10 +557,10 @@ itself is already cheap.
 - Actix HTTP handlers run on the HTTP worker threads (one current-thread runtime
   per worker), not on the main runtime. They reach the state machine through the
   async mutex and Raft through its command channel.
-- WAL append/read/recovery and snapshot file writes already use
-  `spawn_blocking`, so their disk I/O does not stall the main runtime. Raft's
-  WAL work uses the dedicated runtime's blocking pool; HTTP/feed work uses the
-  main runtime's pool.
+- WAL append/read/recovery, startup WAL/snapshot open and snapshot file writes
+  use `spawn_blocking`, so their disk I/O does not stall the main runtime.
+  Raft's WAL work uses the dedicated runtime's blocking pool; HTTP/feed work
+  uses the main runtime's pool.
 - The integration tests and benchmarks already call `build_match_engine_node`
   from a multi-threaded Tokio runtime (openraft's test runtime uses 8 worker
   threads), and `actix-server` detects an existing Tokio runtime and starts its
@@ -557,7 +594,7 @@ itself is already cheap.
 |---|---|---|---|
 | Price-time matching | `apply_one`, on the dedicated Raft runtime, under the lock | CPU, short | No; keep it on apply |
 | Event construction and event-window append | `apply_one`, on the dedicated Raft runtime, under the lock | CPU, bounded | No; part of apply |
-| Match-result sink (`--match-event-log`) | `publish_pending`, on the dedicated Raft runtime, after the lock | JSON + file write + flush | Yes; a dedicated writer task is still open |
+| Match-result sink (`--match-event-log`) | `publish_pending`, after the lock; blocking sinks run on `spawn_blocking` | JSON + file write + flush | Offloaded; a dedicated writer task is still optional |
 | Market-data frame construction | `take_market_frame`, under the lock | event clone + journal drain | Sent after the lock; gate checked first |
 | Duplicate `client_order_id` response | `submission_events`, under the lock | binary search + range copy | Implemented |
 | Snapshot capture (`to_content`) | snapshot task, under the lock | full book/event copy | Hard (COW) |
@@ -565,9 +602,37 @@ itself is already cheap.
 | Snapshot decode | `install_snapshot`, `spawn_blocking` | CPU, tens of MB | Implemented |
 | Snapshot bytes copy | `build_snapshot` / `get_current_snapshot`, under the lock | full-body memcpy | Yes (`Arc<[u8]>`) |
 | Read JSON (`/read orderbook_orders`) | `read_state_owned`, lock; `into_json` after | clone + JSON of the whole book | Implemented |
-| Market-data processing (`--market-data-log`) | `MarketDataProcessor` task, runtime | shadow book + wire encode + JSONL flush | Yes, Tokio task + async/blocking sink |
+| Market-data processing (`--market-data-log`) | `MarketDataProcessor` task, runtime | shadow book + wire encode + JSONL flush | JSONL uses a Tokio writer task (`tokio::fs`); Aeron uses a `spawn_blocking` publisher task because its handles are `!Send` |
 | gRPC decode/encode and snapshot assembly | tonic tasks, runtime | message-size dependent | Yes, on the multi-thread runtime |
 | WAL append/read | `LogStore`, `spawn_blocking` | disk I/O | Already offloaded |
+
+### Tokio blocking audit (2026-11-07)
+
+Migrated off async workers:
+
+- `FileLogSink` opts into `MatchResultSink::is_blocking()`, so `publish_match_events` runs it on
+  `spawn_blocking` instead of a Tokio worker.
+- `JsonlSink` serializes each message and `try_send`s it to a Tokio writer task using
+  `tokio::fs::File` + `tokio::io::BufWriter`; the processor no longer blocks on file I/O.
+- `events_bridge` uses `tokio::fs` for the JSONL writer and cursor checkpoint, including
+  `sync_data().await`.
+- The debug snapshot-install marker uses `tokio::fs::write`.
+
+Kept intentionally:
+
+- `RaftThread` (dedicated Raft runtime) owns affinity-sensitive work; the `wal-fsync` Tokio task
+  routes its blocking `sync_data` through `spawn_blocking`; the Aeron publisher runs in a
+  `spawn_blocking` task because rusteron's handles are `!Send` and its API is blocking.
+- `LogStore` uses `std::sync::RwLock` for the disk, index and runtime state, but only inside
+  `spawn_blocking` closures and the fsync task's blocking sync. Tokio locks cannot be held in that
+  blocking code.
+- The remaining `std::sync::Mutex` guards are short and never cross an `.await`: client leader
+  target, console action history, gRPC stream decode error, market-data pending snapshot and
+  `MemorySink`. `FileLogSink`'s writer mutex is held during its blocking writes, but those run on
+  the blocking pool, not on a Tokio worker. Async mutexes would add overhead without removing a
+  stall.
+- The state machine uses `futures::lock::Mutex`, which is already async; the WAL append order
+  uses `tokio::sync::Mutex`.
 
 ### Dedicated Raft runtime (2026-11-06)
 
@@ -635,9 +700,10 @@ actor with batching; otherwise `RAFT_CORE_WORKERS=2` is the practical compromise
 4. **Publish match results after releasing the lock (P0, implemented).**
    `apply_one` collects `PendingPublish` (events plus an optional market frame);
    `apply` releases the lock and calls `publish_pending`, which invokes the sink
-   and `try_send`s the tap frame. The sink still runs on the apply task, so a
-   slow sink delays the next entry; moving it to a dedicated writer task remains
-   a P1 follow-up.
+   and `try_send`s the tap frame. `FileLogSink` is marked `is_blocking()`, so
+   `publish_match_events` runs it on `spawn_blocking`; the apply task still
+   awaits completion, so a slow sink delays the next entry but no longer blocks
+   a Tokio worker. A dedicated writer task remains optional.
 
 5. **Lock per entry, not per Apply command (P0, implemented).**
    `apply` now acquires `inner` inside the loop, updates `last_applied_log` with
@@ -658,13 +724,12 @@ actor with batching; otherwise `RAFT_CORE_WORKERS=2` is the practical compromise
    term, share the entry's events as `Arc<[MatchEvent]>` between the response,
    event window and tap.
 
-8. **Make the market-data task yield (P1, medium risk).**
-   `MarketDataHandle::start` already uses `tokio::spawn`; once the node runs on
-   a multi-threaded runtime it can execute on another worker. The remaining
-   problem is that `JsonlSink::publish` performs blocking `BufWriter` writes and
-   flushes inside the task. Switch the sink to `tokio::fs::File` +
-   `tokio::io::BufWriter` and await the writes, or wrap the existing synchronous
-   sink in `spawn_blocking`. No dedicated OS thread is needed.
+8. **Make the market-data task yield (P1, implemented 2026-11-07).**
+   `JsonlSink` now serializes each message and `try_send`s it to a Tokio writer
+   task that uses `tokio::fs::File` + `tokio::io::BufWriter` and flushes
+   asynchronously. The processor task no longer performs blocking file I/O;
+   Aeron runs in a `spawn_blocking` task because its handles are `!Send` and
+   the API is blocking.
 
 9. **Keep gRPC on the shared Tokio runtime (P1, satisfied by item 1).**
    The tonic server is already a set of green threads on the multi-thread
