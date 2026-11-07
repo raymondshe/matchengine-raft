@@ -10,7 +10,7 @@
 # Match Engine Raft
 
 <p align="center">
-  <img src="MatchEngineRaft.png" alt="Match Engine Raft logo" width="220">
+  <img src="MatchEngineRaft.png" alt="Match Engine Raft logo" width="360">
 </p>
 
 [![CI](https://github.com/raymondshe/matchengine-raft/actions/workflows/ci.yml/badge.svg)](https://github.com/raymondshe/matchengine-raft/actions/workflows/ci.yml)
@@ -109,11 +109,21 @@ Everything below is implemented in this repository and exercised by tests; the l
 
 ## Architecture Overview
 
-This project extends the [example-raft-kv](https://github.com/datafuselabs/openraft/tree/main/example-raft-kv) with persistent storage and a gRPC transport. For an interactive, source-linked version, open the [interactive architecture diagram](./docs/matchengine-raft-architecture.html).
+This project extends the [example-raft-kv](https://github.com/datafuselabs/openraft/tree/main/example-raft-kv) with persistent storage and a gRPC transport. The software architecture is shown first, followed by the runtime architecture with the four-voter engine cluster, the order-desk tier shared by user ID, and the market-data fan-out. For an interactive, source-linked view of the engine internals, open the [interactive architecture diagram](./docs/matchengine-raft-architecture.html).
+
+<p align="center"><strong>Software architecture</strong></p>
 
 <p align="center">
-  <img src="./docs/matchengine-raft.png" alt="matchengine-raft architecture" width="1000">
+  <img src="./docs/matchengine-raft.png" alt="matchengine-raft software architecture" width="1000">
 </p>
+
+<p align="center"><strong>Runtime architecture</strong></p>
+
+<p align="center">
+  <img src="./docs/matchengine-raft-runtime.png" alt="Four-voter match engine runtime with order-desk and market-data tiers" width="1000">
+</p>
+
+<p align="center"><em>Four-voter engine cluster, order-desk tier shared by user ID, and the leader-gated Aeron feed fanned out to stateless market-data instances.</em></p>
 
 Peer-to-peer Raft RPCs use gRPC on `port + 1000`. The public application and management API
 stays on the `--http-addr` listener. Raft RPCs are not part of the HTTP JSON API.
@@ -220,9 +230,7 @@ pushes a snapshot on subscribe, serializes each stream message once and fans it
 out through bounded per-connection queues. The test page uses one WebSocket and
 switches symbols with live `UNSUBSCRIBE`/`SUBSCRIBE`:
 
-<p align="center">
-  <img src="./docs/market-data-system.png" alt="Market-data WebSocket test page" width="900">
-</p>
+![Market-data WebSocket test page"](./docs/market-data-system.png)
 
 **Why it is fast and live-safe**
 

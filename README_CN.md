@@ -10,7 +10,7 @@
 # Match Engine Raft
 
 <p align="center">
-  <img src="MatchEngineRaft.png" alt="Match Engine Raft logo" width="220">
+  <img src="MatchEngineRaft.png" alt="Match Engine Raft logo" width="360">
 </p>
 
 [![CI](https://github.com/raymondshe/matchengine-raft/actions/workflows/ci.yml/badge.svg)](https://github.com/raymondshe/matchengine-raft/actions/workflows/ci.yml)
@@ -108,11 +108,21 @@
 
 ## 架构概述
 
-本项目扩展了 [example-raft-kv](https://github.com/datafuselabs/openraft/tree/main/example-raft-kv)，增加了持久化存储和 gRPC 传输。另见[交互式架构图](./docs/matchengine-raft-architecture.html)（带源码引用）。
+本项目扩展了 [example-raft-kv](https://github.com/datafuselabs/openraft/tree/main/example-raft-kv)，增加了持久化存储和 gRPC 传输。下面先展示软件架构，再展示四投票成员集群、按用户 ID 共享的订单系统层和行情分发的运行时架构；引擎内部的可交互、带源码引用架构图见[交互式架构图](./docs/matchengine-raft-architecture.html)。
+
+<p align="center"><strong>软件架构</strong></p>
 
 <p align="center">
-  <img src="./docs/matchengine-raft.png" alt="matchengine-raft 架构图" width="1000">
+  <img src="./docs/matchengine-raft.png" alt="matchengine-raft 软件架构" width="1000">
 </p>
+
+<p align="center"><strong>运行时架构</strong></p>
+
+<p align="center">
+  <img src="./docs/matchengine-raft-runtime.png" alt="四节点撮合引擎运行时与订单、行情演示层" width="1000">
+</p>
+
+<p align="center"><em>四投票成员集群、按用户 ID 共享的订单系统层，以及由 leader 门控的 Aeron 行情总线向无状态行情服务实例分发。</em></p>
 
 节点间 Raft RPC 使用 `端口 + 1000` 上的 gRPC。公共应用/管理 API 仍由 `--http-addr` 监听器提供；
 Raft RPC 不属于 HTTP JSON API。
@@ -211,9 +221,7 @@ quote 保证金叠加层，会估算名义价值、初始保证金和费用，�
 服务按 symbol 维护影子订单簿，以 100/1000 ms 合并深度增量，订阅时推送快照，每条流消息只编码一次 JSON，
 再通过有界连接队列扇出。测试页面只使用一个 WebSocket，通过实时 `UNSUBSCRIBE`/`SUBSCRIBE` 切换 symbol：
 
-<p align="center">
-  <img src="./docs/market-data-system.png" alt="行情数据 WebSocket 测试页" width="900">
-</p>
+![行情数据 WebSocket 测试页"](./docs/market-data-system.png)
 
 **高性能与实时安全设计**
 
