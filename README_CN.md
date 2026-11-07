@@ -288,17 +288,25 @@ HTTP 应用/管理 API 和 gRPC Raft 服务见 [API 参考](./docs/zh-CN/API.md)
 
 ## 性能与当前限制
 
-实测基线（Apple M4、Rust 1.93.1、release bench profile；端到端/存储为 2026-11-06 三次运行中位数）：
+实测基线（Apple M4、Rust 1.93.1、release bench profile；单节点端到端/存储为 2026-11-06 三次运行中位数；
+4 节点无 fsync 集群为 2026-11-07 三轮中位数；完整方法见[性能细节](./docs/zh-CN/PERFORMANCE.md)）：
 
 | 工作负载 | 结果 |
 |---|---:|
 | 订单簿：1k 卖单 / 100 档全扫 | 105.6 µs |
-| 端到端 `/write` p50 / p99 | 3.96 ms / 5.17 ms |
-| 并发 `/write` 吞吐（1,000 个在途） | 17,245 writes/s |
-| 串行 `/write_batch`（每批 128 单） | 23,249 单/s |
-| 并发 `/write_batch`（100 × 32 单） | 139,323 单/s |
+| 端到端 `/write` p50 / p99（单节点，每次追加 fsync） | 3.96 ms / 5.17 ms |
+| 并发 `/write`（单节点，每次追加 fsync） | 17,245 writes/s |
+| 串行 `/write_batch`（单节点，每次追加 fsync，每批 128 单） | 23,249 单/s |
+| 并发 `/write_batch`（单节点，每次追加 fsync，100 × 32 单） | 139,323 单/s |
+| 4 节点无 fsync 集群：串行 `/write` p50 / p99 | 186.8 µs / 368.9 µs |
+| 4 节点无 fsync 集群：并发 `/write`（1,000 个在途） | 35,152 writes/s |
+| 4 节点无 fsync 集群：串行 `/write_batch`（每批 128 单） | 227,319 单/s |
+| 4 节点无 fsync 集群：并发 `/write_batch`（100 × 32 单） | 216,163 单/s |
 | 行情 feed 500k fills/s | 495k fills/s，8,192 队列下 0 丢弃 |
 | WAL 追加 / 读取（20k 条、每批 100 条，每次追加 fsync） | 25,547 / 2,408,176 条/s |
+
+4 节点数据为 loopback 上、关闭 WAL fsync 的 3/4 法定人数集群，四个节点在同一进程内；
+范围和跨主机限制见[性能细节](./docs/zh-CN/PERFORMANCE.md)。
 
 WAL fsync 由 `RAFT_WAL_FSYNC_MS` 控制：未设置 = 不 fsync（默认），`0` = 每次追加都 fsync，
 `N > 0` = 每 N 毫秒周期 fsync。非每次追加模式以持久性换吞吐；关闭 fsync 时同一 WAL 基准约

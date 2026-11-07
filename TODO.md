@@ -456,6 +456,10 @@ Remaining:
   node's unsynced tail loss leaves at least two copies. Demo scripts default
   `RAFT_WAL_FSYNC_MS=0` for their three-node/single-node setups; `test_min_voters.rs` covers the
   guard.
+- [x] **P1** Add a four-node no-fsync cluster benchmark (`cargo bench --bench cluster_e2e`):
+  2026-11-07 medians 5,039 sequential writes/s (p50 186.75µs, p99 368.875µs), 35,152
+  concurrent writes/s, 227,319 orders/s at 128-order batches and 216,163 orders/s for
+  100×32 concurrent batches. Four in-process loopback voters, 3/4 quorum, no fsync.
 - [ ] **P2** Add a benchmark regression gate (threshold or recorded baseline) to CI: start with
   deterministic `apply_path` allocs/entry and loose p50/p99 bounds for `book_replay` and
   `replay_mix`; add the stable fsync rows (every append and disabled) once the gate format exists.

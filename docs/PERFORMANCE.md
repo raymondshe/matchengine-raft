@@ -1,6 +1,6 @@
 # Performance measurements
 
-Measured on **2026-10-30** (runtime flavor A/B and P0 offloads: **2026-10-31**; measurement scope and RSS: **2026-11-01**; book p50/p99 and the pinned-core approximation: **2026-11-04**; end-to-end/storage rerun with the OpenRaft quick wins: **2026-11-06**; realistic-mix replay: **2026-11-06**; dedicated Raft runtime: **2026-11-06**; WAL fsync Tokio rerun: **2026-11-07**) on the reference development machine:
+Measured on **2026-10-30** (runtime flavor A/B and P0 offloads: **2026-10-31**; measurement scope and RSS: **2026-11-01**; book p50/p99 and the pinned-core approximation: **2026-11-04**; end-to-end/storage rerun with the OpenRaft quick wins: **2026-11-06**; realistic-mix replay: **2026-11-06**; dedicated Raft runtime: **2026-11-06**; WAL fsync Tokio rerun: **2026-11-07**; four-node no-fsync cluster: **2026-11-07**) on the reference development machine:
 
 - Apple M4 (`arm64`)
 - Rust `1.93.1`
@@ -15,6 +15,7 @@ on the deployment hardware before using the numbers for sizing.
 ```shell
 cargo bench --bench matchengine   # order-book microbenchmarks
 cargo bench --bench e2e           # submit -> commit -> apply -> response (multi-thread; -- current|both for A/B, --pin <cpu> on Linux)
+cargo bench --bench cluster_e2e -- --rounds 3  # four in-process no-fsync voters, leader-direct writes
 cargo bench --bench feed_load     # market-data feed at 50k/500k fills/s
 cargo bench --bench storage       # WAL append/read/recovery
 cargo bench --bench p0_bench -- duplicate|read|snapshot  # P0 lock/scan A/B
@@ -41,6 +42,7 @@ its scope.
 | `apply_path` | `StateMachineStore::apply` only: blank, rest, cancel, fill and 128-request batch workloads; a counting global allocator reports heap calls and requested bytes | HTTP, Raft, WAL, snapshots, market-data tap, event-log reads, response serialization | Closed-loop, direct apply; 50k entries or 1k batches per workload | Counting allocator; per-entry averages | Requested bytes include realloc churn and are not a live-memory high-water mark |
 | `e2e` `/write` | HTTP decode/validation, Raft proposal/commit, WAL append + `sync_data`, apply, response serialization | Cross-node replication, external client network beyond loopback | Sequential is closed-loop; concurrent is a 1,000-request burst | `Instant` per request; p50/p95/p99/max | Medians/percentiles; runtime A/B uses four alternating runs, the 2026-11-06 rerun uses three |
 | `e2e` `/write_batch` | Same as `/write`, with 1–128 requests per Raft entry and one WAL fsync per entry | Same as `/write` | 200 sequential batches per size; 100 concurrent 32-order batches | `Instant` per batch | Medians of three runs per size; batch latency includes payload/apply growth |
+| `cluster_e2e` | Four in-process loopback voters; HTTP `/write`/`/write_batch`, Raft 3/4 quorum replication over gRPC, WAL append without fsync, apply and response | Cross-host network latency, independent machines, disk contention between nodes | 50 warm-up writes; 500 sequential, 1,000 concurrent, 200 batches/size and 100×32 concurrent batches per round; three fresh rounds | `Instant` per request/batch; p50/p95/p99 and medians | Three fresh rounds; ranges reported in the cluster section |
 | `feed_load` | Tokio tap, bounded queue, shadow book, wire encoding and processor drain with a null sink | JSONL/network sink I/O, Raft, HTTP | Offered-load generator at 50k/500k/2M fills/s | `Instant`; queue/drain counters | One run per target; no p99 table |
 | `storage` | WAL append/read/reopen with 20k real order entries and 512 KiB segments | State machine, Raft, HTTP | Closed-loop, 100-entry batches | `Instant` | Three runs, medians; no tail study |
 | `p0_bench duplicate` | State-machine duplicate-retry lookup over a 262k-event window | HTTP, Raft, WAL | 200 retries after one setup | `Instant`; mean/p50/p99/max | Single run; a single scheduling outlier moves the mean |
@@ -49,7 +51,8 @@ its scope.
 
 Timer source is `std::time::Instant` throughout; there is no `rdtsc` or assumed CPU frequency.
 Loopback HTTP and local disk are part of the measured path where stated. Run-to-run variance is
-not a confidence interval; the e2e runtime A/B is the only comparison with four alternating runs.
+not a confidence interval; the e2e runtime A/B uses four alternating runs, and the four-node
+cluster section reports three fresh rounds.
 
 The two book benches share `benches/bench_support`: each round clones the state before
 `Instant::now()` and drops the mutated state after the duration is recorded, so setup and teardown
@@ -271,8 +274,9 @@ The table below uses the historical durable baseline `RAFT_WAL_FSYNC_MS=0` (fsyn
 append). The default is now unset (no fsync); see [WAL fsync A/B](#wal-fsync-ab-2026-11-07)
 for the current default and periodic modes.
 
-It excludes cross-node network replication, so a 3-node cluster adds one
-majority round trip on top of these numbers.
+It excludes cross-node network replication. The
+[four-node no-fsync cluster](#four-node-no-fsync-cluster-2026-11-07) section adds
+the 3-of-4 quorum round trip over gRPC.
 
 | Measurement | Result |
 |---|---:|
@@ -318,9 +322,52 @@ apply work grow, so throughput scales close to the batch size.
 With 100 concurrent 32-order batches (3,200 orders in flight), the same node
 reached **139,323 orders/s** (4,354 batches/s), showing that concurrent batches
 also coalesce into Raft append batches. These are single-node loopback numbers;
-a 3-node cluster adds one majority round trip per batch, but the WAL fsync
-amortization is unchanged. Keep batches within the 128-request cap: `apply`
-holds the state-machine lock for the whole batch.
+the [four-node no-fsync cluster](#four-node-no-fsync-cluster-2026-11-07) section
+measures the quorum cost, while the WAL fsync amortization is unchanged. Keep
+batches within the 128-request cap: `apply` holds the state-machine lock for the
+whole batch.
+
+### Four-node no-fsync cluster (2026-11-07)
+
+`cargo bench --bench cluster_e2e -- --rounds 3` starts four in-process voters on loopback
+(HTTP 25101–25104, gRPC 26101–26104), initializes all four in one `/init`, disables WAL fsync and
+runs three fresh clusters. Every node has its own storage, HTTP and gRPC listener; all four share
+one process and the host CPU. Each round runs 50 excluded warm-up writes, then the same write and
+batch workloads as the single-node e2e benchmark. The measured path is client → leader HTTP
+`/write` → Raft 3-of-4 quorum replication over gRPC → WAL append without fsync → apply → response.
+
+| Workload | 4-node no-fsync median | Range |
+|---|---:|---:|
+| Sequential `/write` | 5,039 writes/s | 4,637–5,378 |
+| Sequential `/write` p50 | 186.75 µs | 182.67–206.42 µs |
+| Sequential `/write` p95 | 288.33 µs | 233.96–304.92 µs |
+| Sequential `/write` p99 | 368.88 µs | 260.92–457.71 µs |
+| Concurrent `/write` (1,000 in flight) | 35,152 writes/s | 32,851–36,055 |
+| Sequential `/write_batch`, 128 orders | 227,319 orders/s | 226,486–233,395 |
+| Batch 128 p50 / p99 | 563.42 µs / 622.46 µs | 545.46–563.96 / 616.08–626.17 µs |
+| Concurrent `/write_batch` (100 × 32) | 216,163 orders/s | 206,883–217,136 |
+
+The single-node no-fsync control on the same host (`cargo bench --bench e2e`, three fresh runs)
+measured 10,165 writes/s sequential (p50 87.46 µs, p99 166.96 µs), 33,831 concurrent writes/s,
+310,338 orders/s at batch size 128 (p50 411.75 µs, p99 441.63 µs) and 223,406 orders/s for
+100×32 concurrent batches.
+
+| Workload | Single node, no fsync | 4-node no-fsync | Cluster change |
+|---|---:|---:|---:|
+| Sequential `/write` | 10,165 writes/s | 5,039 writes/s | -50% |
+| Sequential p50 / p99 | 87.5 / 167.0 µs | 186.8 / 368.9 µs | 2.14x / 2.21x |
+| Concurrent `/write` (1,000) | 33,831 writes/s | 35,152 writes/s | +3.9% (ranges overlap) |
+| 128-order batch | 310,338 orders/s | 227,319 orders/s | -27% |
+| 128-order batch p50 / p99 | 411.8 / 441.6 µs | 563.4 / 622.5 µs | 1.37x / 1.41x |
+| 100×32 concurrent batches | 223,406 orders/s | 216,163 orders/s | -3.2% |
+
+The sequential path pays one quorum round trip per write, so throughput is about half and the
+p50/p99 are about 2.2x higher. Concurrent writes and batches pipeline enough replication to stay
+within a few percent of the single-node control (the concurrent-write median was slightly higher,
+but the ranges overlap). A 128-order batch still amortizes one quorum round trip across 128 orders,
+so it retains about 73% of the single-node throughput. This is an in-process loopback cluster, not
+four independent hosts: it covers the Raft quorum and gRPC transport cost, but not cross-host
+network latency, independent machine failure or disk contention between nodes.
 
 ### OpenRaft quick wins (2026-11-06)
 

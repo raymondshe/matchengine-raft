@@ -24,6 +24,10 @@ name = "e2e"
 harness = false
 
 [[bench]]
+name = "cluster_e2e"
+harness = false
+
+[[bench]]
 name = "feed_load"
 harness = false
 

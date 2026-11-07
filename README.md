@@ -308,18 +308,26 @@ failure matrix are documented in [Testing](./docs/TESTING.md).
 
 ## Performance and Current Limits
 
-Measured baseline (Apple M4, Rust 1.93.1, release bench profile; e2e/storage medians from
-2026-11-06; full methodology in [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md)):
+Measured baseline (Apple M4, Rust 1.93.1, release bench profile; single-node e2e/storage medians
+from 2026-11-06; 4-node no-fsync cluster from 2026-11-07; full methodology in
+[`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md)):
 
 | Workload | Result |
 |---|---:|
 | Order book: sweep 1k asks / 100 levels | 105.6 µs |
-| End-to-end `/write` p50 / p99 | 3.96 ms / 5.17 ms |
-| Concurrent `/write` throughput (1,000 in flight) | 17,245 writes/s |
-| Sequential `/write_batch` (128 orders/batch) | 23,249 orders/s |
-| Concurrent `/write_batch` (100 × 32 orders) | 139,323 orders/s |
+| End-to-end `/write` p50 / p99 (single node, fsync every append) | 3.96 ms / 5.17 ms |
+| Concurrent `/write` (single node, fsync every append) | 17,245 writes/s |
+| Sequential `/write_batch` (single node, fsync every append, 128 orders) | 23,249 orders/s |
+| Concurrent `/write_batch` (single node, fsync every append, 100 × 32) | 139,323 orders/s |
+| 4-node no-fsync cluster: sequential `/write` p50 / p99 | 186.8 µs / 368.9 µs |
+| 4-node no-fsync cluster: concurrent `/write` (1,000 in flight) | 35,152 writes/s |
+| 4-node no-fsync cluster: sequential `/write_batch` (128 orders) | 227,319 orders/s |
+| 4-node no-fsync cluster: concurrent `/write_batch` (100 × 32) | 216,163 orders/s |
 | Market-data feed at 500k fills/s | 495k fills/s, 0 drops at 8,192-frame queue |
 | WAL append / read (20k entries, 100-entry batches, fsync every append) | 25,547 / 2,408,176 entries/s |
+
+The 4-node figures use a 3-of-4 quorum on loopback with WAL fsync disabled and all four nodes in
+one process; the range and cross-host caveats are in [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md).
 
 WAL fsync is controlled by `RAFT_WAL_FSYNC_MS`: unset = no fsync (default), `0` = every append,
 `N > 0` = periodic every N ms. Non-every-append modes trade durability for throughput; with fsync
