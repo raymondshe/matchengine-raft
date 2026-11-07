@@ -1,6 +1,6 @@
 # TODO
 
-Last reviewed: 2026-11-06. This is the working roadmap; see `AGENTS.md` for commands and the
+Last reviewed: 2026-11-07. This is the working roadmap; see `AGENTS.md` for commands and the
 current branch state.
 
 **Current baseline:** the OpenRaft 0.10 port, durable WAL/snapshot storage and exact scale-18
@@ -10,23 +10,28 @@ single-symbol precision configuration, asset metadata, volume units, maker/taker
 fill-level `error` code set.
 One process/cluster trades exactly one symbol; multi-symbol is isolated by running one process per
 symbol. Base/quote volume and asset-aware fee deduction are done, and the market-data processor
-runs as a tokio task. Edge request/snapshot limits and the loopback/private-network contract are in
-place. The remaining work is measured performance evidence, event delivery and the OpenRaft
-utilization follow-ups in [`RAFT_REVIEW.md`](./docs/RAFT_REVIEW.md) (§16); TLS/authentication stays at
-the gateway and is out of scope for this process.
+runs as a tokio task. WAL durability is configurable (`RAFT_WAL_FSYNC_MS`: unset = no fsync with a
+four-voter floor, `0` = every append, `N > 0` = periodic), OpenRaft can run on a dedicated runtime
+(`RAFT_CORE_WORKERS`), and the thread/lock audit leaves only that env-controlled `RaftThread` as an
+explicit OS thread. Edge request/snapshot limits and the loopback/private-network contract are in
+place. The remaining work is performance evidence, OpenRaft utilization follow-ups (§16) and
+feature extensions (§5, §6, §13); TLS/authentication stays at the gateway and is out of scope for
+this process.
 
 Priority key: **P0** = correctness/security, do next; **P1** = production readiness; **P2** =
 important but not blocking; **P3** = later/optional.
 
 ## Top priorities
 
-No P0 work remains. The P1 OpenRaft utilization quick wins in §16 are implemented; the remaining
-OpenRaft items are P2/P3. The measured baselines are in
-[`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md), the third-party follow-ups are P2/P3 (§14), and
-measurement scope, peak RSS, the book-only and realistic-mix replay benchmarks, the fuzz targets,
-health/readiness and the operational console are in place. Equity/ETF sessions, holidays, auctions,
-T+1/T+2 settlement, corporate actions and fixed/regulatory/minimum/tax fees are owned by the
-external order system (§13).
+No P0 or P1 work remains. The remaining items are P2/P3, ordered below by production value.
+
+**Recently completed (2026-11-06/07):** configurable WAL fsync with a measured A/B matrix,
+best-effort WAL recovery, the four-voter no-fsync floor (`test_min_voters.rs`), the optional
+dedicated OpenRaft runtime (`RAFT_CORE_WORKERS`), the thread/lock audit (blocking sinks and startup
+recovery on `spawn_blocking`, async JSONL sink/events bridge, Aeron publisher/source blocking
+tasks, a Tokio WAL fsync worker; only the env-controlled `RaftThread` remains), and the
+realistic-mix replay benchmark. The measured baselines are in
+[`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md).
 
 Failure behavior is complete (§15): the node fail-stops on WAL `ENOSPC`/`EIO`, recovers from
 `SIGKILL` during writes, keeps snapshot writes atomic, and a learner killed mid-snapshot-install
@@ -38,26 +43,39 @@ An OpenRaft utilization review (2026-11-06, [`RAFT_REVIEW.md`](./docs/RAFT_REVIE
 transport already uses `stream_append` and streamed snapshots correctly. Its P1 quick wins are
 implemented: the replication lag threshold now sits above the 100k snapshot policy, heartbeat
 suppression is enabled, HTTP/2 windows/keepalive are tuned, snapshot chunks follow OpenRaft's
-configured size and readiness waits for recovery. The remaining P2/P3 items (snapshot `Arc`
-data, WAL byte caps, asynchronous WAL append, metrics/runtime controls) are tracked in §16.
+configured size and readiness waits for recovery. The remaining P2/P3 items are tracked in §16.
 
-The next work, in order (re-prioritised 2026-11-06 after the OpenRaft utilization review and the
-2026-11-05 benchmark/external-notes pass, whose verdicts are in
-[`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md)):
+The next work, in order (re-prioritised 2026-11-07 after the fsync/Tokio/benchmark pass):
 
-1. **Benchmark regression gate (§8, P2).** Gate CI on `apply_path` allocs/entry (deterministic) plus
-   loose percentile thresholds now that `book_replay`, `level_book` and `replay_mix` report warm
-   p50/p99.
+1. **Benchmark regression gate (§8, P2).** Gate CI on deterministic `apply_path` allocs/entry plus
+   loose p50/p99 thresholds for `book_replay` and `replay_mix`. Add the stable e2e fsync rows
+   (every append and disabled) once the gate format exists; keep the 10 ms tail advisory until
+   item 3 is resolved.
 2. **Linux pinned-core `e2e` pass (§8, P2).** `--pin <cpu>` is implemented (Linux
-   `sched_setaffinity`) and fails loudly on macOS; run
-   `cargo bench --bench e2e -- --pin 0` once on a Linux host to record the true single-core number.
+   `sched_setaffinity`) and fails loudly on macOS; run `cargo bench --bench e2e -- --pin 0` once
+   on a Linux host to record the true single-core number.
+3. **Decide the periodic-fsync tail (§8, P2).** The 10 ms mode has a 2.2-3.0 ms p99 while p50
+   stays near disabled (88.2 vs 87.9 µs). Either find the remaining filesystem/writeback
+   interaction or document 100 ms/disabled as the recommended modes and 10 ms as best-effort.
+4. **Prove the four-voter no-fsync contract under failure (§7, P2).** The voter guard is tested;
+   add a four-voter SIGKILL/failover case that proves the surviving cluster still commits and the
+   restarted node catches up after one node loses its unsynced tail.
+5. **OpenRaft observability and transport hygiene (§16, P2).** Expose `data_metrics`/
+   `server_metrics`, make heartbeat/snapshot channel profiles explicit, then record heartbeat
+   `AppendStream` and payload-window measurements before tuning `max_payload_entries` or channel
+   sizes.
+6. **Feature and extension work.** Amend parked stops/icebergs and port the missing order types
+   (§5), Aeron hardening and market-data archive/replay (§6), and the error-null/mixed-unit/
+   fee-token decisions (§13). The optional apply-path and per-level-bucket work in §8 is last
+   because the measured wins are small or split.
 
-The measurement work from the re-review is done: `book_replay` and `level_book` now report warm
-p50/p99 plus an interleaved cold pass with setup/drop outside the timer, and `replay_mix` replays a
-deterministic 100,000-operation add/cancel/amend/stop/iceberg/taker fixture with fees. This macOS
-host's closest pinned approximation (current-thread runtime) showed no change. The quick wins from
-the last review are also complete: `Order` identity `PartialEq`, optional `Order::sequence`, a
-BTC/USDT quote-volume case, and the `fee_overflow_base_orders` replay case.
+The earlier measurement work is done: `book_replay` and `level_book` report warm p50/p99 plus an
+interleaved cold pass, `replay_mix` replays a 100,000-operation fixture with fees, and the
+`Order` identity/optional-sequence/BTC-USDT/overflow-case quick wins landed. The third-party
+follow-ups are P2/P3 (§14); measurement scope, peak RSS, the fuzz targets, health/readiness and the
+operational console are in place. Equity/ETF sessions, holidays, auctions, T+1/T+2 settlement,
+corporate actions and fixed/regulatory/minimum/tax fees are owned by the external order system
+(§13).
 
 ## 1. Exact fixed-point end-to-end — done
 
@@ -122,7 +140,7 @@ Remaining:
 
 - [ ] **P2** Add a provisioning helper for `ConfigureSymbol` and a pre-trade readiness check.
 
-## 3. Public trust boundary and request safety [P1]
+## 3. Public trust boundary and request safety [done]
 
 - [x] **P0** Bound `client_order_id` to 1–128 bytes from `[A-Za-z0-9._:-]`;
   empty strings are rejected and invalid ids return `400` before the Raft proposal.
@@ -157,8 +175,9 @@ Remaining:
 
 Persistence is done:
 
-- [x] Segmented WAL (`MRFT` header, CRC32-framed postcard records, one `write_all` + one
-  `sync_data` per append batch, `pread` reads, torn-tail recovery).
+- [x] Segmented WAL (`MRFT` header, CRC32-framed postcard records, one `write_all` per append
+  batch plus the configured fsync policy (`RAFT_WAL_FSYNC_MS`: unset = none, `0` = every append,
+  `N > 0` = periodic Tokio task), `pread` reads, torn-tail recovery).
 - [x] Atomic snapshots (`MRFSNAP`, temp file → fsync → rename → directory fsync) with validation
   before replacing the durable copy.
 - [x] Per-node directories from `StorageConfig`; `--data-dir` / `--instance-prefix` and env
@@ -175,6 +194,11 @@ Persistence is done:
 - [x] Storage-path audit: borrowed WAL encoding (no per-entry clone), sequential segment
   recovery, coalesced contiguous log reads, snapshot encode/write outside the state-machine lock,
   and streamed snapshot bodies with incremental CRC (no full body Vec).
+- [x] Configurable durability: `RAFT_WAL_FSYNC_MS` selects no fsync (unset, the default), every
+  append (`0`) or a periodic Tokio `wal-fsync` task (`N > 0`, with the active FD cloned under a
+  short lock and `sync_data` on `spawn_blocking`). Non-every-append modes use best-effort WAL
+  truncation so Raft can catch up from peers, and the binary requires four voters when fsync is
+  disabled. Contract: [`docs/STORAGE.md`](./docs/STORAGE.md); measurements: §8.
 - [x] One request logger; the previous duplicate `Logger` middleware is gone.
 - [x] `POST /write_batch` applies 1–128 non-nested requests in one Raft entry, with per-item
   sequences/events and continuous event ordinals; empty, oversized, nested and duplicate-id
@@ -196,12 +220,13 @@ Transport decisions:
 
 Remaining:
 
-- [ ] **P2** Move off `openraft` 0.10.0-alpha once a stable 0.10 release exists; latest published
-  is still `0.10.0-alpha.37`.
 - [ ] **P2** Consider streaming snapshot bytes into the state machine or a temp file instead of
   buffering the whole snapshot. The current API needs a contiguous buffer, but the receiver's
   total allocation still needs a policy (see §3).
-- [ ] **P3** The Aeron **Raft transport** remains gated on a measured bottleneck; the market-data Aeron egress is implemented (§6).
+- [ ] **P2** Move off `openraft` 0.10.0-alpha once a stable 0.10 release exists; latest published
+  is still `0.10.0-alpha.37`.
+- [ ] **P3** The Aeron **Raft transport** remains gated on a measured bottleneck; the market-data
+  Aeron egress is implemented (§6).
 
 ## 5. Matching-engine features and correctness
 
@@ -280,9 +305,9 @@ Done:
 
 Remaining:
 
-- [ ] **P2** Archive recording/replay and the snapshot-request stream (2003/2010).
 - [ ] **P2** Aeron production hardening: external-driver runbook, multicast/fan-out validation,
   idle heartbeat, and the `ws_fanout` benchmark/performance numbers for the market-data service.
+- [ ] **P2** Archive recording/replay and the snapshot-request stream (2003/2010).
 
 ## 7. Tests and CI
 
@@ -297,7 +322,8 @@ Current coverage:
 - `tests/cluster/test_cluster.rs`: 3 nodes over gRPC, init/membership/read/write.
 - `test_snapshot.rs`: snapshot build/purge and learner install over gRPC.
 - `test_storage.rs`: WAL framing, torn-tail truncation, segment rotation, 20k-record multi-segment
-  reopen, purge/truncate, vote/committed persistence, snapshot build/install/reopen.
+  reopen, purge/truncate, vote/committed persistence, snapshot build/install/reopen, and the
+  periodic fsync task's dirty-state lifecycle.
 - `test_restart.rs`: restart via log replay and via snapshot + newer WAL tail (including event
   window and dedupe), 2k-order large-log replay and a multi-chunk (~120 KB) snapshot boot.
 - `test_events.rs`: `/write` events, `/events` cursor, retention, submission dedupe.
@@ -325,6 +351,11 @@ Current coverage:
   `/ready` is `503` before initialization and `200` after a leader is elected.
 - `test_console.rs`: three-node cluster checks the embedded console assets, node/cluster APIs,
   unsafe-action rejection and leadership transfer through `/console/api/actions/transfer-leader`.
+- `test_client.rs`: typed no-leader/API errors, retry/backoff after a dropped connection and
+  forwarding to the new leader after failover.
+- `test_failure.rs`: fail-stop when the Raft core stops, injected WAL `ENOSPC`/`EIO`, `SIGKILL`
+  during a write stream and `SIGKILL` during a learner snapshot install.
+- `test_min_voters.rs`: the four-voter no-fsync guard on `/init`, `/change-membership` and writes.
 - `tests/replay/`: shell-driven replay matrix for GTC, IOC, FOK, GTD, Day, market, post-only,
   iceberg, stop-market, stop-limit, amend, cancel, default-policy maker/taker fees, quote-asset fees
   and two fee-overflow scenarios (quote policy, and a `Received` fill that keeps an exact base fee).
@@ -352,6 +383,9 @@ Completed follow-ups:
 
 Remaining:
 
+- [ ] **P2** Add a four-voter no-fsync failover test: kill one voter during a write stream,
+  restart it, and prove the surviving cluster still commits and the restarted node catches up.
+  `test_min_voters.rs` covers only the voter-count guard.
 - [ ] **P2** Parameterize the fixed test ports; `test_cluster.rs` still binds 21001–21003.
 - [ ] **P2** Keep `AGENTS.md` and this file in sync after code changes; both are maintained by
   hand.
@@ -396,41 +430,55 @@ Remaining:
   1.333µs/2.833µs, iceberg 1.375µs/2.834µs, stop 84ns/292ns, cancel 625ns/2.041µs, amend
   292ns/666ns, taker 1.417µs/6.833µs. `tests/replay` remains correctness-only; this is its load
   analogue.
-- [ ] **P2** Adopt per-level buckets or a compact resting record only if the P1 prototype and
-  new 3-node or real-sink measurements justify the complexity. The 2026-11-04 run wins 1.84x
-  match, 3.31x cancel, 1.75x/2.59x amend and 4.90x BBO query, but loses 0.75x sparse amend, 0.87x
-  BBO advance and 0.96x depth; full adoption is not justified yet, and a hybrid or sparse-level
-  fast path is the next experiment.
 - [x] **P1** Isolate OpenRaft on a dedicated multi-threaded runtime: set `RAFT_CORE_WORKERS` to
   a positive count to build with `Raft::build` and run on a `raft-worker` runtime; unset or `0`
   keeps `Raft::new` on the shared runtime. RaftCore and the state-machine worker no longer
-  compete with HTTP/gRPC/feed tasks when enabled. A/B: sequential p50/p99 unchanged; concurrent
-  writes within the host's noise (17.0/14.8k/s dedicated vs 17.8/19.2k/s shared in the final
-  pairs). Apply can still migrate between the dedicated workers.
+  compete with HTTP/gRPC/feed tasks when enabled. A/B: the 2026-11-06 pairs were within noise
+  (17.0/14.8k/s dedicated vs 17.8/19.2k/s shared); a 2026-11-07 spot rerun measured 9,776 shared
+  vs 11,445 dedicated sequential writes/s and 30,204 vs 31,400 concurrent writes/s (both with
+  fsync disabled). Apply can still migrate between the dedicated workers.
+- [x] **P2** Complete the thread/lock audit: `FileLogSink` and startup WAL/snapshot recovery run on
+  `spawn_blocking`, the JSONL sink and `events_bridge` use Tokio I/O, the Aeron publisher/source
+  run as blocking tasks with their `!Send` rusteron handles inside the closure, and the periodic
+  WAL fsync is a Tokio task. Only the env-controlled `RaftThread` remains an explicit OS thread;
+  the demo Aeron poll loop keeps a blocking 100 µs sleep inside its `spawn_blocking` task.
 - [x] **P1** Add configurable WAL fsync via `RAFT_WAL_FSYNC_MS` (unset = none, `0` = every
-  append, `N` = periodic every N ms) and measure it: e2e sequential p50 90.9µs (none), 98.5µs
-  (10ms), 84.0µs (100ms), 3.93ms (every append); sequential throughput 8.6k / 7.5k / 9.9k / 267
-  writes/s. Every-append is ~43x slower at p50; periodic 10ms costs ~13% throughput vs none.
-  Non-every-append modes use best-effort WAL truncation so Raft can catch up from peers, but data
-  no peer has is unrecoverable.
+  append, `N` = periodic every N ms) and measure it: 2026-11-07 rerun e2e sequential p50 87.9µs
+  (none), 88.2µs (10ms), 101.1µs (100ms), 3.898ms (every append); sequential throughput 9.6k /
+  7.4k / 9.5k / 262.5 writes/s. Every-append is ~44x slower at p50; periodic 10ms costs ~24%
+  throughput vs none and has a 2.2-3.0ms p99 tail. The periodic task clones the active file handle
+  under a short lock and fsyncs the clone on `spawn_blocking`, so appends do not stall on the disk
+  lock. Non-every-append modes use best-effort WAL truncation so Raft can catch up from peers, but
+  data no peer has is unrecoverable.
 - [x] **P1** Require four voters when WAL fsync is disabled: the binary sets `min_voters = 4`,
   `/init` and `/change-membership` reject smaller voter sets, and `/write`/`/write_batch` return
   `503` until four voters exist. Four voters keep a committed entry on at least three nodes, so one
   node's unsynced tail loss leaves at least two copies. Demo scripts default
   `RAFT_WAL_FSYNC_MS=0` for their three-node/single-node setups; `test_min_voters.rs` covers the
   guard.
-- [ ] **P2** Decide whether strict apply-thread affinity is worth the cost: the single-worker
-  dedicated runtime keeps apply on one thread but measured ~7% lower concurrent writes; a batched
-  apply actor is the alternative.
-- [ ] **P2** Add a benchmark regression gate (threshold or recorded baseline) to CI.
+- [ ] **P2** Add a benchmark regression gate (threshold or recorded baseline) to CI: start with
+  deterministic `apply_path` allocs/entry and loose p50/p99 bounds for `book_replay` and
+  `replay_mix`; add the stable fsync rows (every append and disabled) once the gate format exists.
 - [ ] **P2** Run `cargo bench --bench e2e -- --pin <cpu>` on a Linux host once, to separate
   scheduler noise from the fsync cost that dominates the current p99. The flag is implemented; this
   macOS host has no core-pinning API, so the recorded 2026-11-04 approximation is the
   current-thread runtime (p50 3.95ms / p99 5.22ms vs 3.93ms / 5.10ms multi-thread, i.e. no change).
+- [ ] **P2** Decide the periodic-fsync tail: 10 ms mode has a 2.2-3.0 ms p99 (p50 88.2 µs) while
+  100 ms/disabled stay near 0.2-0.3 ms. Profile the fsync/writeback interaction, or document
+  100 ms/disabled as the recommended modes and 10 ms as best-effort. The FD-clone fsync removed
+  the disk-lock stall; the remaining tail is filesystem-level.
 - [ ] **P2** Reserve the known lengths for the remaining apply-path allocations (response `events`
   `Vec`, fill `MatchResult` `Vec`) where the shape is fixed; they are the `apply_path` leftovers.
+- [ ] **P2** Decide whether strict apply-thread affinity is worth the cost: the single-worker
+  dedicated runtime keeps apply on one thread but measured ~7% lower concurrent writes; a batched
+  apply actor is the alternative.
+- [ ] **P2** Adopt per-level buckets or a compact resting record only if the P1 prototype and
+  new 3-node or real-sink measurements justify the complexity. The 2026-11-04 run wins 1.84x
+  match, 3.31x cancel, 1.75x/2.59x amend and 4.90x BBO query, but loses 0.75x sparse amend, 0.87x
+  BBO advance and 0.96x depth; full adoption is not justified yet, and a hybrid or sparse-level
+  fast path is the next experiment.
 
-## 9. Client library
+## 9. Client library [done]
 
 - [x] **P2** Harden `src/client.rs` before use outside examples: retry/backoff on transient RPC
   errors, configurable timeouts, and a typed "no known leader" error. Done: `ClientConfig` sets
@@ -583,13 +631,14 @@ Done:
 
 Remaining extensions:
 
-- [ ] **P2** Add third-asset fee-token support only if a fee price and balance model are provided.
+- [ ] **P2** Decide whether the numeric fields named by an error code should become `Option<Fixed>`
+  (JSON `null`) instead of zero, so a real zero and an unavailable value cannot be confused
+  (`docs/FEE_DEDUCTION.md` §13 item 15). Do this before external consumers depend on the zero
+  sentinel.
 - [ ] **P2** Decide whether mixed-unit iceberg/FOK orders should normalize tranches; quote volume
   currently supports plain limit and market orders only, and those combinations are rejected at
   admission (`docs/FEE_DEDUCTION.md` §5.1, §13 item 16).
-- [ ] **P2** Decide whether the numeric fields named by an error code should become `Option<Fixed>`
-  (JSON `null`) instead of zero, so a real zero and an unavailable value cannot be confused
-  (`docs/FEE_DEDUCTION.md` §13 item 15).
+- [ ] **P2** Add third-asset fee-token support only if a fee price and balance model are provided.
 
 Resolved decisions: quote limit sell rounds base quantity down to cap notional; quote market sell
 rounds up and permits a bounded overshoot; `volume` is always gross; the fee policy is per symbol;
@@ -681,7 +730,7 @@ Guardrails / what not to copy:
 - Do not advertise a feature that exists only in an example, a separate book type, or an
   unreachable "optimized" implementation.
 
-## 15. Failure behavior
+## 15. Failure behavior [done]
 
 - [x] **P1** Fail-stop when the Raft core stops: `MatchEngineNode::run()` watches
   `running_state` and returns an error instead of leaving HTTP and `/health` serving;
@@ -701,9 +750,10 @@ Guardrails / what not to copy:
 The full review is in [`RAFT_REVIEW.md`](./docs/RAFT_REVIEW.md). The transport already uses
 `RaftNetworkV2::stream_append` for replication and heartbeats and `full_snapshot` for snapshots;
 these follow-ups are about aligning OpenRaft 0.10 configuration with this workload and reducing
-storage/transport overhead.
+storage/transport overhead. Re-prioritised 2026-11-07: observability first, then transport
+measurements, then storage allocation/size bounds, then optional APIs.
 
-**Configuration and transport quick wins**
+**Configuration, transport and observability**
 
 - [x] **P1** Align `replication_lag_threshold` with the snapshot policy. Done:
   `default_raft_config` sets 150,000, above the 100k `LogsSinceLast` policy; `test_late_join`
@@ -718,18 +768,23 @@ storage/transport overhead.
   OpenRaft's configured size (3 MiB by default) capped at 8 MiB; `install_snapshot_timeout`
   remains intentionally unused by `full_snapshot`, which is bounded by cancellation and HTTP/2
   keepalive.
+- [ ] **P2** Expose `raft.data_metrics()` and `raft.server_metrics()` in `/metrics` (the current
+  handler only returns `RaftMetrics`); optionally enable OpenRaft's `runtime-stats` feature or
+  install a `MetricsRecorder` for append/replication histograms.
 - [ ] **P2** Override `new_heartbeat_client` and `new_snapshot_client` explicitly with
   role-specific channel profiles. The current separate channels are correct but rely on the
   default factory delegation; make the isolation intentional before adding channel pooling or
   preconnect.
-- [ ] **P2** Benchmark `max_payload_entries`, `STREAM_APPEND_CHANNEL_SIZE` and
-  `api_batch_linger_ms` (defaults 300, 64 and 0). The append channel is bounded by count, not
-  bytes, so large payloads can queue significant memory; keep linger at 0 unless measurements
-  justify the latency tradeoff.
 - [ ] **P2** Record before/after measurements for heartbeat `AppendStream` count under sustained
   writes and snapshot transfer time. The post-change e2e/storage baseline is now in
   [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md); use it to confirm the 1 MiB / 4 MiB HTTP/2
   window choice before tuning further.
+- [ ] **P2** Benchmark `max_payload_entries`, `STREAM_APPEND_CHANNEL_SIZE` and
+  `api_batch_linger_ms` (defaults 300, 64 and 0). The append channel is bounded by count, not
+  bytes, so large payloads can queue significant memory; keep linger at 0 unless measurements
+  justify the latency tradeoff.
+- [ ] **P2** Add guarded console actions for `raft.trigger().purge_log()` and supported
+  `raft.runtime_config()` changes after a snapshot; document the safety constraints.
 
 **Storage**
 
@@ -737,12 +792,12 @@ storage/transport overhead.
   non-fsynced, but `/ready` now requires `Raft::wait_for_recovery` to confirm the state machine
   applied the cluster commit covering the durable log tail. `/health` exposes the `recovered`
   flag for diagnostics.
-- [ ] **P2** Change snapshot data from `Cursor<Vec<u8>>` to `Cursor<Arc<[u8]>>` (or a
-  `Bytes`-backed reader) so `get_current_snapshot` and `build_snapshot` do not copy the whole
-  snapshot under the state-machine lock.
 - [ ] **P2** Bound WAL append size by bytes, not only by OpenRaft's `max_append_entries`
   (default 4,096). A merged append can contain many 128-request batches; add a byte cap or lower
   `max_append_entries` and measure throughput.
+- [ ] **P2** Change snapshot data from `Cursor<Vec<u8>>` to `Cursor<Arc<[u8]>>` (or a
+  `Bytes`-backed reader) so `get_current_snapshot` and `build_snapshot` do not copy the whole
+  snapshot under the state-machine lock.
 - [ ] **P3** Evaluate an asynchronous WAL append: return after the entries are readable in
   memory, write/fsync on a background task and call `IOFlushed` when durable. This needs a
   pending-entry read cache so `try_get_log_entries` remains correct before the on-disk copy is
@@ -751,13 +806,8 @@ storage/transport overhead.
   `max_in_snapshot_log_to_keep` together; the current 100k snapshot policy makes the defaults
   mostly harmless, but a lower policy would otherwise cause frequent small purges.
 
-**OpenRaft APIs and observability**
+**Optional APIs**
 
-- [ ] **P2** Expose `raft.data_metrics()` and `raft.server_metrics()` in `/metrics` (the current
-  handler only returns `RaftMetrics`); optionally enable OpenRaft's `runtime-stats` feature or
-  install a `MetricsRecorder` for append/replication histograms.
-- [ ] **P2** Add guarded console actions for `raft.trigger().purge_log()` and supported
-  `raft.runtime_config()` changes after a snapshot; document the safety constraints.
 - [ ] **P3** Evaluate `ReadPolicy::LeaseRead` as an opt-in for `/linearizable_read` and
   `/events`. The current `ReadIndex` path costs a quorum round trip per read; lease reads remove
   it but require bounded clock drift.
