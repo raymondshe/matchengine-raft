@@ -7,6 +7,7 @@ use crate::MatchEngineRaft;
 use crate::StateMachineStore;
 use crate::network::console::ConsoleState;
 use crate::network::health::GrpcListenerHealth;
+use crate::network::read_policy::ReadPolicyRuntime;
 
 /// Application state that holds all core components of a Raft node.
 ///
@@ -58,6 +59,9 @@ pub struct MatchEngineApp {
     /// Minimum voter count required for initialization, membership changes and
     /// writes. Set to 4 by the binary when WAL fsync is disabled.
     pub min_voters: usize,
+
+    /// Leader-consistent read policy and lease/fallback counters.
+    pub read_policy: ReadPolicyRuntime,
 
     /// Operational-console state: action lock and recent action history.
     pub console: ConsoleState,

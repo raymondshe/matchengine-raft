@@ -88,7 +88,8 @@
 - **持久化撮合事件 Feed**：`POST /events` 游标分页、长轮询（`wait_ms`）、保留上限、`client_order_id` 幂等、gRPC `StreamEvents` 流式推送和参考 MQ bridge sidecar，安全重试。
 - **确定性行情 Feed**：领导者门控、影子订单簿、BBO、深度快照/增量、生命周期事件、OHLC K 线和紧凑二进制行情格式（含参考解码器）。feature 门控的 **Aeron** 出口通过 2001–2007 流发布，每个流一个独占 publication。
 - **独立行情数据系统** `demos/market_data_system/`：通过 Aeron 或 JSONL 消费 feed，并提供 Binance 风格 WebSocket 行情流。一个实例通过共享 hub 服务多个 symbol；连接持有自己的订阅集合，可用实时 `UNSUBSCRIBE`/`SUBSCRIBE` 切换 symbol，并可水平扩展而不增加引擎开销。
-- **灵活读取一致性**：本地读、领导者线性一致读和 follower 线性一致读。
+- **灵活读取一致性**：本地读、支持 `ReadIndex` 或可选 lease read 的 leader 线性一致读，以及 follower 线性一致读；`GET /read-policy/status` 报告 lease 命中与回退。
+- **可选 lease read**：`--read-policy lease` 会为 `/linearizable_read`、`/events`、gRPC `StreamEvents` 和 `/get_linearizer` 先尝试 `ReadPolicy::LeaseRead`，lease 过期时回退到 `ReadIndex`。默认仍为 `ReadIndex`；lease read 要求节点间时钟漂移有界。
 - **领导者感知 Rust 客户端**，自动跟踪并转发到当前领导者，支持可配置超时、瞬时错误重试/退避以及类型化的 API/无领导者错误；重试是至少一次语义，写入重试应使用 `client_order_id` 实现幂等。
 - **运维 API**：初始化、成员变更、指标、事件状态和行情状态。
 - **批量写入**：`POST /write_batch` 将多个请求放入一个 Raft entry 和一次 WAL 追加，逐项返回序列号，事件序号在 entry 内连续。
@@ -129,6 +130,11 @@ Raft RPC 不属于 HTTP JSON API。
 
 将 `RAFT_CORE_WORKERS` 设为正数时，OpenRaft 的 RaftCore 和状态机 worker 运行在专用多线程运行时，
 与 HTTP、gRPC 和行情任务隔离；未设置或设为 `0` 时 Raft 继续使用共享运行时。
+
+Leader 一致读默认使用 `ReadIndex`。设置 `--read-policy lease`（或
+`MATCHENGINE_READ_POLICY=lease`）后，`/linearizable_read`、`/events`、gRPC `StreamEvents` 和
+`/get_linearizer` 会先尝试 `ReadPolicy::LeaseRead`，lease 过期时回退到 `ReadIndex`。lease read
+要求节点间时钟漂移有界；`/read` 仍是本地、可能过期的读。
 
 行情输出不参与共识：tap 使用有界 `try_send`，因此慢订阅者永远不会阻塞 `apply`。feature 门控的
 `AeronSink` 由专用发布线程把同样的线格式 v6 消息发布到 2001–2007 流，每个流一个独占 publication；
@@ -278,7 +284,7 @@ HTTP API 与 gRPC Raft 监听端口（HTTP 端口 + 1000）**按设计就是明�
 ## API 参考
 
 HTTP 应用/管理 API 和 gRPC Raft 服务见 [API 参考](./docs/zh-CN/API.md)。主要路由：
-`/write`、`/write_batch`、`/read`、`/linearizable_read`、`/follower_read`、`/events`、
+`/write`、`/write_batch`、`/read`、`/linearizable_read`、`/follower_read`、`/events`、`/read-policy/status`、
 `/health`、`/ready`、`/metrics` 和 `/console/`。
 
 ## 测试
@@ -289,7 +295,8 @@ HTTP 应用/管理 API 和 gRPC Raft 服务见 [API 参考](./docs/zh-CN/API.md)
 ## 性能与当前限制
 
 实测基线（Apple M4、Rust 1.93.1、release bench profile；单节点端到端/存储为 2026-11-06 三次运行中位数；
-4 节点无 fsync 集群为 2026-11-07 三轮中位数；完整方法见[性能细节](./docs/zh-CN/PERFORMANCE.md)）：
+4 节点无 fsync 集群为 2026-11-07 三轮中位数；读路径基准为 2026-11-08；完整方法见
+[性能细节](./docs/zh-CN/PERFORMANCE.md)）：
 
 | 工作负载 | 结果 |
 |---|---:|
@@ -302,11 +309,14 @@ HTTP 应用/管理 API 和 gRPC Raft 服务见 [API 参考](./docs/zh-CN/API.md)
 | 4 节点无 fsync 集群：并发 `/write`（1,000 个在途） | 35,152 writes/s |
 | 4 节点无 fsync 集群：串行 `/write_batch`（每批 128 单） | 227,319 单/s |
 | 4 节点无 fsync 集群：并发 `/write_batch`（100 × 32 单） | 216,163 单/s |
+| 4 节点无 fsync 集群：`/linearizable_read` p50 / p99（1 读者，ReadIndex → lease） | 119.7 / 243.6 µs → 54.9 / 83.9 µs |
+| 4 节点无 fsync 集群：`/linearizable_read` 吞吐（64 读者，ReadIndex → lease） | 30,232 → 51,777 reads/s |
 | 行情 feed 500k fills/s | 495k fills/s，8,192 队列下 0 丢弃 |
 | WAL 追加 / 读取（20k 条、每批 100 条，每次追加 fsync） | 25,547 / 2,408,176 条/s |
 
 4 节点数据为 loopback 上、关闭 WAL fsync 的 3/4 法定人数集群，四个节点在同一进程内；
-范围和跨主机限制见[性能细节](./docs/zh-CN/PERFORMANCE.md)。
+范围和跨主机限制见[性能细节](./docs/zh-CN/PERFORMANCE.md)。lease read 为可选，默认仍为
+`ReadIndex`，因为 lease read 要求节点间时钟漂移有界。
 
 WAL fsync 由 `RAFT_WAL_FSYNC_MS` 控制：未设置 = 不 fsync（默认），`0` = 每次追加都 fsync，
 `N > 0` = 每 N 毫秒周期 fsync。非每次追加模式以持久性换吞吐；关闭 fsync 时同一 WAL 基准约

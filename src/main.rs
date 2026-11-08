@@ -6,6 +6,7 @@ use env_logger::Env;
 use matchengine_raft::DEFAULT_SNAPSHOT_INTERVAL;
 use matchengine_raft::StorageConfig;
 use matchengine_raft::market_data::MarketDataConfig;
+use matchengine_raft::network::read_policy::ReadPolicyMode;
 use matchengine_raft::start_match_engine_node_with_storage;
 use matchengine_raft::store::state_machine::DEFAULT_MAX_EVENTS;
 
@@ -33,6 +34,13 @@ pub struct Opt {
     /// dedupe uses a separate fixed cap so retries cannot diverge across nodes.
     #[clap(long, env = "MAX_EVENTS", default_value_t = DEFAULT_MAX_EVENTS)]
     pub max_events: usize,
+
+    /// Leader-consistent read policy: `read_index` (default) or `lease`.
+    ///
+    /// Lease reads reuse a recent quorum acknowledgement and fall back to
+    /// ReadIndex when the lease is stale. They assume bounded clock drift.
+    #[clap(long, env = "MATCHENGINE_READ_POLICY", default_value = "read_index")]
+    pub read_policy: ReadPolicyMode,
 
     /// Periodic snapshot interval in milliseconds (0 disables the timer).
     ///
@@ -135,7 +143,8 @@ async fn main() -> std::io::Result<()> {
         .with_max_events(options.max_events)
         .with_snapshot_interval(Duration::from_millis(options.snapshot_interval_ms))
         .with_wal_fsync(wal_fsync)
-        .with_min_voters(min_voters);
+        .with_min_voters(min_voters)
+        .with_read_policy(options.read_policy);
     if let Some(path) = options.match_event_log {
         storage = storage.with_match_event_log(path);
     }

@@ -18,8 +18,6 @@
 use std::pin::Pin;
 
 use futures::Stream;
-use openraft::ReadPolicy;
-use openraft::errors::decompose::DecomposeResult;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::Request;
@@ -36,6 +34,8 @@ use crate::network::api::read_events_page;
 use crate::network::grpc::pb::StreamEventsPage;
 use crate::network::grpc::pb::StreamEventsRequest;
 use crate::network::grpc::pb::event_service_server::EventService;
+use crate::network::read_policy::ReadPath;
+use crate::network::read_policy::ReadPolicyRuntime;
 
 /// Buffer for pages queued toward one streaming client.
 const EVENT_STREAM_CHANNEL_SIZE: usize = 8;
@@ -44,11 +44,20 @@ const EVENT_STREAM_CHANNEL_SIZE: usize = 8;
 pub struct EventStreamService {
     raft: MatchEngineRaft,
     store: StateMachineStore,
+    read_policy: ReadPolicyRuntime,
 }
 
 impl EventStreamService {
-    pub fn new(raft: MatchEngineRaft, store: StateMachineStore) -> Self {
-        Self { raft, store }
+    pub fn new(
+        raft: MatchEngineRaft,
+        store: StateMachineStore,
+        read_policy: ReadPolicyRuntime,
+    ) -> Self {
+        Self {
+            raft,
+            store,
+            read_policy,
+        }
     }
 }
 
@@ -94,10 +103,9 @@ impl EventService for EventStreamService {
         // Anchor the stream with one linearizable read. Later pages only read
         // committed applied events, so they need no extra quorum round-trip.
         let ret = self
-            .raft
-            .get_read_linearizer(ReadPolicy::ReadIndex)
+            .read_policy
+            .linearizer(&self.raft, ReadPath::StreamEvents)
             .await
-            .decompose()
             .map_err(|e| Status::internal(format!("event stream read setup failed: {e}")))?;
         match ret {
             Ok(linearizer) => {

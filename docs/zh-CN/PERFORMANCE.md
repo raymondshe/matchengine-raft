@@ -34,6 +34,50 @@
 loopback 上运行，覆盖 Raft quorum 与 gRPC 传输成本，但不模拟跨主机网络、独立机器故障或
 节点间磁盘竞争。
 
+## 读路径基准：ReadIndex vs lease（2026-11-08）
+
+`cargo bench --bench read_e2e -- --policy both` 在服务端运行时启动同样的四节点无 fsync 集群，
+客户端运行在独立运行时。集群预置 2,000 个挂单；本地读为 `orderbook_depth:20`，`/events` 每页
+100 条；混合场景以 2,000 writes/s 施加写入。每个场景每读者 2,000 次读，预热 100 次；下表为
+两轮中位数（只读结果稳定，混合结果受实际写入节奏影响）。
+
+| 读路径 | readers | ReadIndex reads/s | lease reads/s | 吞吐提升 | ReadIndex p50 / p99 | lease p50 / p99 |
+|---|---:|---:|---:|---:|---:|---:|
+| `/linearizable_read` | 1 | 8,092 | 17,559 | 2.17x | 119.7 / 243.6 µs | 54.9 / 83.9 µs |
+| `/linearizable_read` | 64 | 30,232 | 51,777 | 1.71x | 317.2 µs / 3.847 ms | 91.5 µs / 1.155 ms |
+| `/events` | 1 | 5,100 | 7,461 | 1.46x | 191.7 / 352.1 µs | 131.7 / 194.3 µs |
+| `/events` | 64 | 32,979 | 38,856 | 1.18x | 1.768 / 4.366 ms | 1.584 / 3.552 ms |
+
+本地 `/read` 基本不变（1 读者约 20k reads/s，64 读者约 50-59k），符合预期。混合场景方向一致但
+波动更大：单读者 `/linearizable_read` 吞吐 7,469 → 17,973 reads/s（2.41x），p50 122.1 → 48.0 µs；
+64 读者 p50 338.6 → 91.1 µs（3.72x），吞吐提升 1.55-2.28x。`/events` 混合场景分别提升 1.52x
+（1 读者）和 1.17x（64 读者）。
+
+两轮 lease 命中率均为 **100%**：1 读者每路径 2,000/2,000，64 读者 128,000/128,000，无回退。
+四个节点在同一主机，lease 一直新鲜，回退分支未被触发；计数器已实现并有单元测试，真实跨主机
+时钟漂移部署应观察 `/read-policy/status` 的 fallback 计数。收益小于上游 90.4x/3.9x 的本地
+lease 结果，因为 alpha.37 的 `ReadPolicy::LeaseRead` 仍经过 RaftCore；上游的
+`enable_local_lease_read` 本地缓存路径更新。默认仍为 `ReadIndex`，lease 为可选。
+
+## 上游 OpenRaft minimal 基准对比（2026-11-08）
+
+上游 `openraft/benchmarks/minimal` 用单进程三节点、内存日志/空状态机、函数调用网络和空请求
+隔离 OpenRaft：1 客户端 33k put/s，4,096 客户端 3.5M put/s，batch 4 5.6M put/s；lease read
+单读者 90.4x、64 读者 3.9x。我们的 4 节点无 fsync 集群为 5,039 串行 / 35,152 并发
+writes/s。Raft 不是当前瓶颈，HTTP/JSON、WAL、apply 和基准运行时竞争占主导。
+
+可执行项（详见英文 [PERFORMANCE.md](../PERFORMANCE.md)）：
+
+- 读取路径：为 `/linearizable_read`、`/events` 和 gRPC `StreamEvents` 增加可选
+  `ReadPolicy::LeaseRead` 与 `ReadIndex` 回退；alpha.37 没有 `enable_local_lease_read`，
+  完整的本地缓存路径需要升级 OpenRaft。先加读取基准再改默认值。
+- 写入/批处理：扩展 `cluster_e2e` 的客户端数（1/8/64/256/1024/4096）和独立客户端运行时，
+  测试 `max_payload_entries` 300/1024、`purge_batch_size` 1/1024、
+  `api_batch_linger_ms` 0/100/500µs 以及 `RAFT_CORE_WORKERS`。
+- 观测/存储：启用 `runtime-stats`、暴露 data/server metrics、加入 flamegraph/tokio-console；
+  异步 WAL append（pending cache + `IOFlushed`）是每次追加 fsync 模式下最大的存储机会。
+  薄 LTO + `codegen-units=1` 做 A/B。
+
 ## 当前限制与已知差距
 
 - TLS/mTLS 与 API 认证由前置网关负责；本进程是内部服务。

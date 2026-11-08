@@ -37,6 +37,7 @@ Raft 节点间 RPC 仅由 `--http-addr` 端口 + 1000 上的 gRPC 提供；HTTP 
   核心和存储可用时返回 `200`，否则返回 `503`。
 - `GET /ready` - 就绪检查：仅在节点健康且已知集群领导者时返回 `200`；启动、选举或分区期间返回
   `503`。知道领导者的 follower 可服务读请求，写请求仍需发送给领导者。
+- `GET /read-policy/status` - 当前 leader 读策略及各读路径的 lease/ReadIndex 计数
 - `GET /console/` - 内置运维控制台（HTML/CSS/JS），无需构建步骤或外部资源
 - `GET /console/api/node` - 稳定的节点快照：健康、Raft 角色、存储前沿、事件和 feed
 - `GET /console/api/cluster` - 当前成员关系中的本节点与对端快照
@@ -62,6 +63,22 @@ Raft 节点间 RPC 仅由 `--http-addr` 端口 + 1000 上的 gRPC 提供；HTTP 
 - `POST /follower_read` - 从领导者获取 linearizer 后在本地完成的线性一致性读
 - `POST /events` - 分页读取复制的撮合事件日志（`after`、`limit`、`wait_ms`）；线性一致，仅领导者，支持长轮询
 - `GET /events/status` - 保留事件窗口、淘汰计数和保留上限
+
+#### 读一致性与 lease read
+
+`POST /read` 是本地读，可能过期，不受读策略影响。需要 leader 一致性的路径默认使用
+`ReadPolicy::ReadIndex`：`/linearizable_read`、`/events`、gRPC `StreamEvents` 锚点，以及
+`/follower_read` 使用的 `/get_linearizer`。每次 ReadIndex 读都会用一次新的 quorum 往返确认领导权。
+
+启动参数 `--read-policy lease`（环境变量 `MATCHENGINE_READ_POLICY=lease`）会先尝试
+`ReadPolicy::LeaseRead`：在 leader lease 有效时复用最近的 quorum 确认，省去新的往返；lease
+过期时自动回退到 `ReadIndex`，quorum 可用时承担回退延迟后成功，否则返回 Raft 读错误。默认仍为
+`read_index`。
+
+Lease read 假设节点间**时钟漂移有界**。使用 NTP 或 PTP；除非部署能保证 leader lease 不会
+超过实际领导权，否则保持默认 `read_index`。状态端点按读路径报告 `lease_attempts`、
+`lease_hits`、`lease_fallbacks`、`lease_failures`、`read_index_attempts` 和
+`read_index_failures`。
 - gRPC `EventService.StreamEvents` - 在 gRPC 监听器上按同一游标流式推送 JSON 事件页，支持 `wait_ms` 和 `max_pages`
 - `GET /events/status` - 保留事件窗口、淘汰计数和保留上限
 

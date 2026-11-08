@@ -8,7 +8,6 @@ use actix_web::web::Data;
 use actix_web::web::Json;
 use openraft::BasicNode;
 use openraft::RaftMetrics;
-use openraft::ReadPolicy;
 use openraft::alias::LogIdOf;
 use openraft::async_runtime::WatchReceiver;
 use openraft::errors::Infallible;
@@ -20,6 +19,7 @@ use serde::Serialize;
 use crate::MatchEngineNodeId;
 use crate::MatchEngineTypeConfig;
 use crate::app::MatchEngineApp;
+use crate::network::read_policy::ReadPath;
 
 /// Serializable representation of linearizer data for follower reads
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -125,6 +125,12 @@ pub async fn init(
     Ok(Json(res))
 }
 
+/// Reports the configured read policy and per-endpoint lease/fallback counters.
+#[get("/read-policy/status")]
+pub async fn read_policy_status(app: Data<MatchEngineApp>) -> actix_web::Result<impl Responder> {
+    Ok(Json(app.read_policy.status()))
+}
+
 /// Get the latest metrics of the cluster
 #[get("/metrics")]
 pub async fn metrics(app: Data<MatchEngineApp>) -> actix_web::Result<impl Responder> {
@@ -142,10 +148,9 @@ pub async fn metrics(app: Data<MatchEngineApp>) -> actix_web::Result<impl Respon
 #[post("/get_linearizer")]
 pub async fn get_linearizer(app: Data<MatchEngineApp>) -> actix_web::Result<impl Responder> {
     let linearizer = match app
-        .raft
-        .get_read_linearizer(ReadPolicy::ReadIndex)
+        .read_policy
+        .linearizer(&app.raft, ReadPath::GetLinearizer)
         .await
-        .decompose()
     {
         Ok(linearizer) => linearizer,
         Err(error) => {

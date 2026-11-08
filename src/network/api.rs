@@ -7,7 +7,6 @@ use actix_web::get;
 use actix_web::post;
 use actix_web::web;
 use actix_web::web::Data;
-use openraft::ReadPolicy;
 use openraft::async_runtime::WatchReceiver;
 use openraft::errors::Infallible;
 use openraft::errors::LinearizableReadError;
@@ -24,6 +23,7 @@ use crate::client::FollowerReadError;
 use crate::client::FollowerReadErrorKind;
 use crate::match_result::EventId;
 use crate::match_result::MatchEvent;
+use crate::network::read_policy::ReadPath;
 use crate::order_book::Order;
 use crate::store::MatchEngineRequest;
 use crate::store::MatchEngineResponse;
@@ -438,10 +438,9 @@ pub async fn linearizable_read(
     let key = req.into_inner();
     validate_read_key(&key).map_err(actix_web::error::ErrorBadRequest)?;
     let ret = match app
-        .raft
-        .get_read_linearizer(ReadPolicy::ReadIndex)
+        .read_policy
+        .linearizer(&app.raft, ReadPath::LinearizableRead)
         .await
-        .decompose()
     {
         Ok(ret) => ret,
         Err(error) => {
@@ -490,10 +489,9 @@ pub async fn events(
 ) -> actix_web::Result<impl Responder> {
     validate_events_request(&req).map_err(actix_web::error::ErrorBadRequest)?;
     let ret = match app
-        .raft
-        .get_read_linearizer(ReadPolicy::ReadIndex)
+        .read_policy
+        .linearizer(&app.raft, ReadPath::Events)
         .await
-        .decompose()
     {
         Ok(ret) => ret,
         Err(error) => {

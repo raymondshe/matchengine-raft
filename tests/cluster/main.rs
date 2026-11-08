@@ -15,6 +15,7 @@ mod test_market_data;
 mod test_match_results;
 mod test_membership;
 mod test_min_voters;
+mod test_read_policy;
 mod test_request_limits;
 mod test_restart;
 mod test_snapshot;

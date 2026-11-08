@@ -3,6 +3,7 @@ pub mod console;
 pub mod grpc;
 pub mod health;
 pub mod management;
+pub mod read_policy;
 
 /// Ports for the Raft transport are derived from the public HTTP port so that
 /// `BasicNode.addr` keeps one meaning (the API address) for every node.

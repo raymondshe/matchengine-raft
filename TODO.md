@@ -1,6 +1,6 @@
 # TODO
 
-Last reviewed: 2026-11-07. This is the working roadmap; see `AGENTS.md` for commands and the
+Last reviewed: 2026-11-08. This is the working roadmap; see `AGENTS.md` for commands and the
 current branch state.
 
 **Current baseline:** the OpenRaft 0.10 port, durable WAL/snapshot storage and exact scale-18
@@ -14,9 +14,11 @@ runs as a tokio task. WAL durability is configurable (`RAFT_WAL_FSYNC_MS`: unset
 four-voter floor, `0` = every append, `N > 0` = periodic), OpenRaft can run on a dedicated runtime
 (`RAFT_CORE_WORKERS`), and the thread/lock audit leaves only that env-controlled `RaftThread` as an
 explicit OS thread. Edge request/snapshot limits and the loopback/private-network contract are in
-place. The remaining work is performance evidence, OpenRaft utilization follow-ups (§16) and
-feature extensions (§5, §6, §13); TLS/authentication stays at the gateway and is out of scope for
-this process.
+place. The 4-node no-fsync cluster benchmark and the 2026-11-08 OpenRaft minimal-benchmark
+comparison are in [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md); Raft is below the application path
+as the current bottleneck. The remaining work is performance evidence, OpenRaft utilization
+follow-ups (§16) and feature extensions (§5, §6, §13); TLS/authentication stays at the gateway and
+is out of scope for this process.
 
 Priority key: **P0** = correctness/security, do next; **P1** = production readiness; **P2** =
 important but not blocking; **P3** = later/optional.
@@ -25,13 +27,19 @@ important but not blocking; **P3** = later/optional.
 
 No P0 or P1 work remains. The remaining items are P2/P3, ordered below by production value.
 
-**Recently completed (2026-11-06/07):** configurable WAL fsync with a measured A/B matrix,
+**Recently completed (2026-11-06/08):** configurable WAL fsync with a measured A/B matrix,
 best-effort WAL recovery, the four-voter no-fsync floor (`test_min_voters.rs`), the optional
 dedicated OpenRaft runtime (`RAFT_CORE_WORKERS`), the thread/lock audit (blocking sinks and startup
 recovery on `spawn_blocking`, async JSONL sink/events bridge, Aeron publisher/source blocking
-tasks, a Tokio WAL fsync worker; only the env-controlled `RaftThread` remains), and the
-realistic-mix replay benchmark. The measured baselines are in
-[`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md).
+tasks, a Tokio WAL fsync worker; only the env-controlled `RaftThread` remains), the realistic-mix
+replay benchmark, the four-node no-fsync cluster benchmark (`cluster_e2e`), and the read-path
+benchmark plus opt-in lease reads (`read_e2e`). The measured baselines, lease gains and upstream
+OpenRaft comparison are in [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md).
+
+The upstream OpenRaft minimal benchmark (three in-process nodes, in-memory log/state machine,
+function-call network, empty requests) reports 33k put/s with one client and 3.5M put/s with 4,096,
+while our 4-node no-fsync cluster reports 5,039 sequential and 35,152 concurrent writes/s. Raft is
+not the current bottleneck; the application read/write path and benchmark isolation are.
 
 Failure behavior is complete (§15): the node fail-stops on WAL `ENOSPC`/`EIO`, recovers from
 `SIGKILL` during writes, keeps snapshot writes atomic, and a learner killed mid-snapshot-install
@@ -45,34 +53,38 @@ implemented: the replication lag threshold now sits above the 100k snapshot poli
 suppression is enabled, HTTP/2 windows/keepalive are tuned, snapshot chunks follow OpenRaft's
 configured size and readiness waits for recovery. The remaining P2/P3 items are tracked in §16.
 
-The next work, in order (re-prioritised 2026-11-07 after the fsync/Tokio/benchmark pass):
+The next work, in order (re-prioritised 2026-11-08 after the OpenRaft minimal-benchmark review):
 
-1. **Benchmark regression gate (§8, P2).** Gate CI on deterministic `apply_path` allocs/entry plus
-   loose p50/p99 thresholds for `book_replay` and `replay_mix`. Add the stable e2e fsync rows
-   (every append and disabled) once the gate format exists; keep the 10 ms tail advisory until
-   item 3 is resolved.
-2. **Linux pinned-core `e2e` pass (§8, P2).** `--pin <cpu>` is implemented (Linux
-   `sched_setaffinity`) and fails loudly on macOS; run `cargo bench --bench e2e -- --pin 0` once
-   on a Linux host to record the true single-core number.
-3. **Decide the periodic-fsync tail (§8, P2).** The 10 ms mode has a 2.2-3.0 ms p99 while p50
-   stays near disabled (88.2 vs 87.9 µs). Either find the remaining filesystem/writeback
-   interaction or document 100 ms/disabled as the recommended modes and 10 ms as best-effort.
-4. **Prove the four-voter no-fsync contract under failure (§7, P2).** The voter guard is tested;
+1. **Sweep write concurrency and batching (§8/§16, P2).** Extend `cluster_e2e` with
+   1/8/64/256/1024/4096 clients and a separate client runtime/process. Sweep
+   `max_payload_entries` 300/1024, `purge_batch_size` 1/1024, `api_batch_linger_ms` 0/100/500µs
+   and `RAFT_CORE_WORKERS`; A/B thin LTO + `codegen-units = 1`. Keep p99 in the decision.
+2. **Add OpenRaft observability, profiling and transport hygiene (§16, P2).** Expose
+   `data_metrics`, `server_metrics` and `runtime_stats`; enable `runtime-stats` in profiling
+   builds; make heartbeat/snapshot channel profiles explicit; add flamegraph/tokio-console
+   guidance to `cluster_e2e`. This is the prerequisite for attributing the gap between our 5,039
+   sequential writes/s and the 33k one-client upstream floor.
+3. **Prototype asynchronous WAL append (§16, P2).** Adopt the upstream `append` → `IOFlushed`
+   pattern with a pending-entry cache and a background writer/fsync. It is the largest storage-side
+   opportunity for every-append/periodic modes; feature-gate it and prove crash recovery before
+   default.
+4. **Benchmark regression gate and measurement hygiene (§8, P2).** Gate CI on deterministic
+   `apply_path` allocs/entry plus loose p50/p99 thresholds; run the Linux pinned-core `e2e` pass;
+   resolve or document the 10ms periodic-fsync tail. Add the 4-node and read-path rows once their
+   measurement variance settles.
+5. **Prove the four-voter no-fsync contract under failure (§7, P2).** The voter guard is tested;
    add a four-voter SIGKILL/failover case that proves the surviving cluster still commits and the
    restarted node catches up after one node loses its unsynced tail.
-5. **OpenRaft observability and transport hygiene (§16, P2).** Expose `data_metrics`/
-   `server_metrics`, make heartbeat/snapshot channel profiles explicit, then record heartbeat
-   `AppendStream` and payload-window measurements before tuning `max_payload_entries` or channel
-   sizes.
 6. **Feature and extension work.** Amend parked stops/icebergs and port the missing order types
    (§5), Aeron hardening and market-data archive/replay (§6), and the error-null/mixed-unit/
    fee-token decisions (§13). The optional apply-path and per-level-bucket work in §8 is last
    because the measured wins are small or split.
 
 The earlier measurement work is done: `book_replay` and `level_book` report warm p50/p99 plus an
-interleaved cold pass, `replay_mix` replays a 100,000-operation fixture with fees, and the
-`Order` identity/optional-sequence/BTC-USDT/overflow-case quick wins landed. The third-party
-follow-ups are P2/P3 (§14); measurement scope, peak RSS, the fuzz targets, health/readiness and the
+interleaved cold pass, `replay_mix` replays a 100,000-operation fixture with fees, the 4-node
+no-fsync cluster, the read-path/lease results and the upstream OpenRaft comparison are recorded in
+`PERFORMANCE.md`, and the `Order` identity/optional-sequence/BTC-USDT/overflow-case quick wins
+landed. The third-party follow-ups are P2/P3 (§14); measurement scope, peak RSS, the fuzz targets, health/readiness and the
 operational console are in place. Equity/ETF sessions, holidays, auctions, T+1/T+2 settlement,
 corporate actions and fixed/regulatory/minimum/tax fees are owned by the external order system
 (§13).
@@ -356,6 +368,8 @@ Current coverage:
 - `test_failure.rs`: fail-stop when the Raft core stops, injected WAL `ENOSPC`/`EIO`, `SIGKILL`
   during a write stream and `SIGKILL` during a learner snapshot install.
 - `test_min_voters.rs`: the four-voter no-fsync guard on `/init`, `/change-membership` and writes.
+- `test_read_policy.rs`: opt-in lease reads serve `/linearizable_read` and `/events`, local `/read`
+  bypasses the policy, and `/read-policy/status` reports lease hits and fallbacks.
 - `tests/replay/`: shell-driven replay matrix for GTC, IOC, FOK, GTD, Day, market, post-only,
   iceberg, stop-market, stop-limit, amend, cancel, default-policy maker/taker fees, quote-asset fees
   and two fee-overflow scenarios (quote policy, and a `Received` fill that keeps an exact base fee).
@@ -460,9 +474,15 @@ Remaining:
   2026-11-07 medians 5,039 sequential writes/s (p50 186.75µs, p99 368.875µs), 35,152
   concurrent writes/s, 227,319 orders/s at 128-order batches and 216,163 orders/s for
   100×32 concurrent batches. Four in-process loopback voters, 3/4 quorum, no fsync.
+- [ ] **P2** Extend `cluster_e2e` with a client-count sweep (1/8/64/256/1024/4096) and a separate
+  client runtime or process; report p50/p99 at each point and keep the load generator off the
+  server runtime. The current 4-node numbers share one runtime.
+- [ ] **P2** A/B thin LTO + `codegen-units = 1` for release/bench builds; record build time,
+  throughput and p99. The upstream minimal benchmark uses this profile.
 - [ ] **P2** Add a benchmark regression gate (threshold or recorded baseline) to CI: start with
   deterministic `apply_path` allocs/entry and loose p50/p99 bounds for `book_replay` and
-  `replay_mix`; add the stable fsync rows (every append and disabled) once the gate format exists.
+  `replay_mix`; add the stable fsync rows (every append and disabled) and the 4-node cluster rows
+  after the client/payload sweep settles.
 - [ ] **P2** Run `cargo bench --bench e2e -- --pin <cpu>` on a Linux host once, to separate
   scheduler noise from the fsync cost that dominates the current p99. The flag is implemented; this
   macOS host has no core-pinning API, so the recorded 2026-11-04 approximation is the
@@ -754,8 +774,27 @@ Guardrails / what not to copy:
 The full review is in [`RAFT_REVIEW.md`](./docs/RAFT_REVIEW.md). The transport already uses
 `RaftNetworkV2::stream_append` for replication and heartbeats and `full_snapshot` for snapshots;
 these follow-ups are about aligning OpenRaft 0.10 configuration with this workload and reducing
-storage/transport overhead. Re-prioritised 2026-11-07: observability first, then transport
-measurements, then storage allocation/size bounds, then optional APIs.
+storage/transport overhead. Re-prioritised 2026-11-08 after the upstream minimal-benchmark
+comparison: the read path is complete; observability and batching/payload/purge sweeps are next,
+then async WAL and optional APIs.
+
+**Read path**
+
+- [x] **P2** Add a read benchmark covering local `/read`, `/linearizable_read` and `/events` at
+  1/64 readers, read-only and mixed with paced writes. Done: `cargo bench --bench read_e2e`.
+  Read-only medians: `/linearizable_read` 8,092 → 17,559 reads/s at 1 reader and 30,232 → 51,777 at
+  64; p50 119.7 → 54.9µs and 317.2 → 91.5µs. `/events` 5,100 → 7,461 and 32,979 → 38,856 reads/s.
+  Local `/read` stayed at ~20k/50-59k. Mixed cases confirm the direction but are noisier.
+- [x] **P2** Add an opt-in `ReadPolicy::LeaseRead` for `/linearizable_read`, `/events` and the
+  gRPC `StreamEvents` anchor, with a `ReadIndex` fallback on lease expiry and lease-hit/fallback
+  metrics. Done: `--read-policy lease` / `MATCHENGINE_READ_POLICY=lease`, `GET
+  /read-policy/status`, per-path counters, `test_read_policy.rs`, and the bounded-clock-drift
+  contract in `docs/API.md`. Both benchmark runs had 100% lease hits and no fallbacks on one host.
+- [ ] **P3** Upgrade OpenRaft for `enable_local_lease_read`/`get_local_read_linearizer` and measure
+  the full local-read path; the API is not in alpha.37. The current LeaseRead still passes through
+  RaftCore and delivered 2.17x/1.71x linearizable-read throughput, not the upstream 90.4x/3.9x.
+- [ ] **P3** Cache follower-read linearizers for a short TTL bounded by the leader lease, or add a
+  lease-based `/get_linearizer` mode; measure the per-read leader hop.
 
 **Configuration, transport and observability**
 
@@ -772,9 +811,10 @@ measurements, then storage allocation/size bounds, then optional APIs.
   OpenRaft's configured size (3 MiB by default) capped at 8 MiB; `install_snapshot_timeout`
   remains intentionally unused by `full_snapshot`, which is bounded by cancellation and HTTP/2
   keepalive.
-- [ ] **P2** Expose `raft.data_metrics()` and `raft.server_metrics()` in `/metrics` (the current
-  handler only returns `RaftMetrics`); optionally enable OpenRaft's `runtime-stats` feature or
-  install a `MetricsRecorder` for append/replication histograms.
+- [ ] **P2** Enable OpenRaft's `runtime-stats` feature in a profiling build and expose
+  `raft.runtime_stats()`, `data_metrics()` and `server_metrics()` in `/metrics` (the current
+  handler only returns `RaftMetrics`); optionally install a `MetricsRecorder` for
+  append/replication histograms. Add flamegraph/tokio-console guidance to `cluster_e2e`.
 - [ ] **P2** Override `new_heartbeat_client` and `new_snapshot_client` explicitly with
   role-specific channel profiles. The current separate channels are correct but rely on the
   default factory delegation; make the isolation intentional before adding channel pooling or
@@ -783,10 +823,11 @@ measurements, then storage allocation/size bounds, then optional APIs.
   writes and snapshot transfer time. The post-change e2e/storage baseline is now in
   [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md); use it to confirm the 1 MiB / 4 MiB HTTP/2
   window choice before tuning further.
-- [ ] **P2** Benchmark `max_payload_entries`, `STREAM_APPEND_CHANNEL_SIZE` and
-  `api_batch_linger_ms` (defaults 300, 64 and 0). The append channel is bounded by count, not
-  bytes, so large payloads can queue significant memory; keep linger at 0 unless measurements
-  justify the latency tradeoff.
+- [ ] **P2** Benchmark `max_payload_entries` (300 vs 1,024), `purge_batch_size` (1 vs 1,024),
+  `api_batch_linger_ms` (0/100/500µs) and `STREAM_APPEND_CHANNEL_SIZE` under the 4-node cluster and
+  a client-count sweep. The upstream minimal benchmark uses 1,024/1,024; our defaults are 300/1/0.
+  The append channel is bounded by count, not bytes, so large payloads can queue significant
+  memory; keep linger at 0 unless measurements justify the latency tradeoff.
 - [ ] **P2** Add guarded console actions for `raft.trigger().purge_log()` and supported
   `raft.runtime_config()` changes after a snapshot; document the safety constraints.
 
@@ -802,19 +843,17 @@ measurements, then storage allocation/size bounds, then optional APIs.
 - [ ] **P2** Change snapshot data from `Cursor<Vec<u8>>` to `Cursor<Arc<[u8]>>` (or a
   `Bytes`-backed reader) so `get_current_snapshot` and `build_snapshot` do not copy the whole
   snapshot under the state-machine lock.
-- [ ] **P3** Evaluate an asynchronous WAL append: return after the entries are readable in
-  memory, write/fsync on a background task and call `IOFlushed` when durable. This needs a
-  pending-entry read cache so `try_get_log_entries` remains correct before the on-disk copy is
-  visible.
+- [ ] **P2** Prototype an asynchronous WAL append: insert into a pending-entry cache, write/fsync
+  on a background task and call `IOFlushed` only when durable. The upstream minimal benchmark
+  demonstrates this contract and tests that entries are readable before the flush completes. This
+  needs pending-entry reads, crash/recovery tests and a feature flag; benchmark it against
+  every-append and periodic-fsync modes.
 - [ ] **P3** When exposing the snapshot policy, expose `purge_batch_size` and
   `max_in_snapshot_log_to_keep` together; the current 100k snapshot policy makes the defaults
   mostly harmless, but a lower policy would otherwise cause frequent small purges.
 
 **Optional APIs**
 
-- [ ] **P3** Evaluate `ReadPolicy::LeaseRead` as an opt-in for `/linearizable_read` and
-  `/events`. The current `ReadIndex` path costs a quorum round trip per read; lease reads remove
-  it but require bounded clock drift.
 - [ ] **P3** Replace metrics polling in the market-data leader watcher with OpenRaft's
   `on_leader_change` callbacks (minor cleanup).
 - [ ] **P3** Optional transport work: preconnect peers after startup/membership changes, larger

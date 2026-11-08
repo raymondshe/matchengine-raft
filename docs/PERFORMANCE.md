@@ -1,6 +1,6 @@
 # Performance measurements
 
-Measured on **2026-10-30** (runtime flavor A/B and P0 offloads: **2026-10-31**; measurement scope and RSS: **2026-11-01**; book p50/p99 and the pinned-core approximation: **2026-11-04**; end-to-end/storage rerun with the OpenRaft quick wins: **2026-11-06**; realistic-mix replay: **2026-11-06**; dedicated Raft runtime: **2026-11-06**; WAL fsync Tokio rerun: **2026-11-07**; four-node no-fsync cluster: **2026-11-07**) on the reference development machine:
+Measured on **2026-10-30** (runtime flavor A/B and P0 offloads: **2026-10-31**; measurement scope and RSS: **2026-11-01**; book p50/p99 and the pinned-core approximation: **2026-11-04**; end-to-end/storage rerun with the OpenRaft quick wins: **2026-11-06**; realistic-mix replay: **2026-11-06**; dedicated Raft runtime: **2026-11-06**; WAL fsync Tokio rerun: **2026-11-07**; four-node no-fsync cluster: **2026-11-07**; read-path benchmark: **2026-11-08**; OpenRaft minimal-benchmark comparison: **2026-11-08**) on the reference development machine:
 
 - Apple M4 (`arm64`)
 - Rust `1.93.1`
@@ -16,6 +16,7 @@ on the deployment hardware before using the numbers for sizing.
 cargo bench --bench matchengine   # order-book microbenchmarks
 cargo bench --bench e2e           # submit -> commit -> apply -> response (multi-thread; -- current|both for A/B, --pin <cpu> on Linux)
 cargo bench --bench cluster_e2e -- --rounds 3  # four in-process no-fsync voters, leader-direct writes
+cargo bench --bench read_e2e -- --policy both  # local /read, /linearizable_read and /events; ReadIndex vs lease
 cargo bench --bench feed_load     # market-data feed at 50k/500k fills/s
 cargo bench --bench storage       # WAL append/read/recovery
 cargo bench --bench p0_bench -- duplicate|read|snapshot  # P0 lock/scan A/B
@@ -27,6 +28,10 @@ cargo bench --bench apply_path    # apply-path heap allocations per applied entr
 
 Set `RAFT_CORE_WORKERS` to a positive worker count to run Raft on a dedicated runtime; unset or `0` uses the shared runtime.
 Set `RAFT_WAL_FSYNC_MS` to control WAL fsync: unset = no fsync, `0` = every append, `N > 0` = every N ms.
+
+The OpenRaft minimal comparison below is reproduced from the upstream
+[`openraft/benchmarks/minimal`](https://github.com/databendlabs/openraft/tree/main/benchmarks/minimal)
+crate; it is not a local benchmark.
 
 ## Measurement scope
 
@@ -43,6 +48,7 @@ its scope.
 | `e2e` `/write` | HTTP decode/validation, Raft proposal/commit, WAL append + `sync_data`, apply, response serialization | Cross-node replication, external client network beyond loopback | Sequential is closed-loop; concurrent is a 1,000-request burst | `Instant` per request; p50/p95/p99/max | Medians/percentiles; runtime A/B uses four alternating runs, the 2026-11-06 rerun uses three |
 | `e2e` `/write_batch` | Same as `/write`, with 1–128 requests per Raft entry and one WAL fsync per entry | Same as `/write` | 200 sequential batches per size; 100 concurrent 32-order batches | `Instant` per batch | Medians of three runs per size; batch latency includes payload/apply growth |
 | `cluster_e2e` | Four in-process loopback voters; HTTP `/write`/`/write_batch`, Raft 3/4 quorum replication over gRPC, WAL append without fsync, apply and response | Cross-host network latency, independent machines, disk contention between nodes | 50 warm-up writes; 500 sequential, 1,000 concurrent, 200 batches/size and 100×32 concurrent batches per round; three fresh rounds | `Instant` per request/batch; p50/p95/p99 and medians | Three fresh rounds; ranges reported in the cluster section |
+| `read_e2e` | Four in-process loopback voters with a separate client runtime; local `/read`, `/linearizable_read` and `/events`; ReadIndex and lease policies; 1/64 readers; read-only and mixed with an offered 2,000 writes/s | Cross-host network and clock skew; independent machines | 100 warm-up reads per endpoint; 2,000 reads/reader per case; 100-event pages; depth-20 local reads; two runs per policy | `Instant` per request; p50/p95/p99 and throughput | Two runs; read-only rows are stable, mixed rows depend on writer pacing |
 | `feed_load` | Tokio tap, bounded queue, shadow book, wire encoding and processor drain with a null sink | JSONL/network sink I/O, Raft, HTTP | Offered-load generator at 50k/500k/2M fills/s | `Instant`; queue/drain counters | One run per target; no p99 table |
 | `storage` | WAL append/read/reopen with 20k real order entries and 512 KiB segments | State machine, Raft, HTTP | Closed-loop, 100-entry batches | `Instant` | Three runs, medians; no tail study |
 | `p0_bench duplicate` | State-machine duplicate-retry lookup over a 262k-event window | HTTP, Raft, WAL | 200 retries after one setup | `Instant`; mean/p50/p99/max | Single run; a single scheduling outlier moves the mean |
@@ -368,6 +374,108 @@ but the ranges overlap). A 128-order batch still amortizes one quorum round trip
 so it retains about 73% of the single-node throughput. This is an in-process loopback cluster, not
 four independent hosts: it covers the Raft quorum and gRPC transport cost, but not cross-host
 network latency, independent machine failure or disk contention between nodes.
+
+### Read-path benchmark: ReadIndex vs lease (2026-11-08)
+
+`cargo bench --bench read_e2e -- --policy both` starts the same four-node no-fsync topology on a
+server runtime and runs the read clients on a separate runtime. The cluster is seeded with 2,000
+resting orders; the local read is `orderbook_depth:20`, `/events` returns a 100-event page, and the
+mixed cases offer 2,000 writes/s. Each case runs 2,000 reads per reader after 100 warm-up reads.
+The table reports the median of two runs per policy; the read-only rows were stable, while the
+mixed rows depend on how many paced writes actually completed.
+
+| Read path | Readers | ReadIndex reads/s | Lease reads/s | Throughput gain | ReadIndex p50 / p99 | Lease p50 / p99 | p50 / p99 gain |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `/linearizable_read` | 1 | 8,092 | 17,559 | 2.17x | 119.7 / 243.6 µs | 54.9 / 83.9 µs | 2.18x / 2.90x |
+| `/linearizable_read` | 64 | 30,232 | 51,777 | 1.71x | 317.2 µs / 3.847 ms | 91.5 µs / 1.155 ms | 3.46x / 3.33x |
+| `/events` | 1 | 5,100 | 7,461 | 1.46x | 191.7 / 352.1 µs | 131.7 / 194.3 µs | 1.46x / 1.81x |
+| `/events` | 64 | 32,979 | 38,856 | 1.18x | 1.768 / 4.366 ms | 1.584 / 3.552 ms | 1.12x / 1.23x |
+
+The local `/read` baseline was unchanged, as expected: about 20k reads/s at one reader and
+50-59k at 64 readers, with run-to-run noise larger than any policy difference.
+
+The mixed cases show the same direction, but with more variance because the writer competes with
+the readers. With one linearizable reader, throughput rose from 7,469 to 17,973 reads/s (2.41x)
+and p50 from 122.1 to 48.0 µs (2.54x). At 64 readers, the mixed linearizable p50 fell from 338.6
+to 91.1 µs (3.72x) while throughput gain ranged from 1.55x to 2.28x. Mixed `/events` improved
+1.52x at one reader and 1.17x at 64; p50 improved 1.56x and 1.13x.
+
+Lease hits were **100%** in both runs: 2,000/2,000 at one reader and 128,000/128,000 at 64 readers
+for both `/linearizable_read` and `/events`; there were no fallbacks. This cluster has all four
+nodes on one host, so the lease remained fresh and the fallback branch was not exercised. The
+counters are implemented and unit-tested; a real deployment with clock drift should exercise the
+fallback and report it through `GET /read-policy/status`.
+
+These gains are smaller than the upstream 90.4x/3.9x local-lease result because alpha.37's
+`ReadPolicy::LeaseRead` still goes through RaftCore; the benchmark's `enable_local_lease_read`
+local-cache path is newer. The gain is still material: **2.17x** for one linearizable reader,
+**1.71x** at 64 readers, with p50/p99 reduced by 2-3x. Lease reads are opt-in and default to
+ReadIndex; the contract and fallback are documented in `docs/API.md`.
+
+### OpenRaft minimal benchmark comparison (2026-11-08)
+
+The upstream [`openraft/benchmarks/minimal`](https://github.com/databendlabs/openraft/tree/main/benchmarks/minimal)
+harness isolates OpenRaft: three nodes in one process, an in-memory log store and empty state
+machine, a function-call network and empty requests. It is an overhead floor, not a capacity
+number for this engine. The upstream README reports M1 Max/M3 Max numbers; ours are M4, so compare
+directions rather than exact ratios.
+
+| Upstream measurement | Result |
+|---|---:|
+| 1 client, single writes | 33,000 put/s |
+| 64 clients | 912,000 put/s |
+| 256 clients | 1,808,000 put/s |
+| 1,024 clients | 3,006,000 put/s |
+| 4,096 clients | 3,548,000 put/s |
+| 4,096 clients, batch 4 | 5,615,000 put/s |
+| Lease read, 1 reader | 100,805 → 9,110,300 reads/s (90.4x) |
+| Lease read, 64 readers | 2,347,080 → 9,139,761 reads/s (3.9x) |
+
+The one-client result is about 30µs per write; our 4-node no-fsync cluster measures 186.75µs p50
+(5,039 writes/s), and the single-node no-fsync control 87.46µs (10,165 writes/s). The upstream
+harness has no HTTP JSON, WAL, order book, event construction or real gRPC, so the gap is the
+application path, not Raft itself. The 3.5M/s and 5.6M/s figures are not capacity targets.
+
+What transfers:
+
+- **Lease reads are the largest read-side lever.** Our `/linearizable_read` and `/events` anchor
+  on `ReadPolicy::ReadIndex` (`src/network/api.rs`); the gRPC `StreamEvents` stream anchors once
+  per stream (`src/network/grpc/events.rs`), and follower reads fetch a leader linearizer through
+  `src/network/management.rs`. Each `ReadIndex` pays a quorum round trip. The upstream benchmark
+  reports 90.4x/3.9x for its local lease path. Our pinned `openraft 0.10.0-alpha.37` has
+  `ReadPolicy::LeaseRead` but not `enable_local_lease_read`/`get_local_read_linearizer`; the
+  immediate opt-in removes the heartbeat round, while the full local-cache path needs a newer
+  OpenRaft. Measure both; keep `ReadIndex` as the default until measured, and fall back on lease
+  expiry.
+- **Batch and concurrency tuning still has headroom.** Our `/write_batch` 128-order path reaches
+  227,319 orders/s versus 5,039 sequential writes/s, so application batching is already the main
+  throughput lever. For independent clients, sweep client count and the server-side batch knobs:
+  the upstream benchmark sets `max_payload_entries = 1,024` and `purge_batch_size = 1,024`; our
+  defaults are 300 and 1, with `api_batch_linger_ms = 0`. Test 1/8/64/256/1,024/4,096 clients and
+  a small linger (0/100/500µs) before changing defaults; keep p99 in the decision.
+- **Separate client and server runtimes.** The upstream harness runs clients on one runtime and
+  servers on 16 workers. Our `cluster_e2e` currently runs the load generator and all four nodes on
+  one runtime, so the published 5,039/35,152 numbers include driver contention. A separate client
+  runtime or process is the next measurement fix; a four-process/four-host run is the deployment
+  check.
+- **Asynchronous append is the storage-side analogue.** The upstream `LogStore::append` inserts
+  into memory, returns, and signals `IOFlushed` after a delayed flush; its test asserts entries are
+  readable before the flush completes. Our async-WAL item (§16) can use the same contract: a
+  pending-entry cache, a background writer/fsync, `IOFlushed` only when durable, and crash tests
+  proving unflushed entries are uncommitted. This matters for every-append and periodic-fsync
+  modes, not no-fsync.
+- **Instrumentation and build settings.** The upstream harness uses `runtime-stats`, flamegraph,
+  tokio-console and a profile binary that measures startup memory, write allocations, latency and
+  snapshot cost; it also builds with thin LTO and `codegen-units = 1`. We should expose
+  `data_metrics`/`server_metrics`/`runtime_stats`, profile `cluster_e2e`, and A/B thin LTO before
+  drawing conclusions.
+- **Follower-read cache is a later step.** The leader's lease read makes `/get_linearizer`
+  cheaper, but a follower still pays one leader HTTP hop per read. A short-TTL linearizer cache
+  bounded by the leader lease could remove it; it needs a safety analysis and is not a first move.
+
+Do not copy the upstream in-memory store, function-call network, disabled heartbeats/elections,
+200ms election timeout or empty-request capacity numbers into production. The harness is for
+attribution, not deployment sizing.
 
 ### OpenRaft quick wins (2026-11-06)
 
@@ -718,6 +826,10 @@ actor with batching; otherwise `RAFT_CORE_WORKERS=2` is the practical compromise
 
 ### Prioritized opportunities
 
+The 2026-11-08 read-path and OpenRaft minimal comparisons put batching/payload and async-WAL work
+ahead of the items below; see [Read-path benchmark](#read-path-benchmark-readindex-vs-lease-2026-11-08)
+and [OpenRaft minimal benchmark comparison](#openraft-minimal-benchmark-comparison-2026-11-08).
+
 1. **Run the node on a multi-threaded Tokio runtime, with OpenRaft isolated (P0, implemented).**
    `src/main.rs` now uses `#[tokio::main(flavor = "multi_thread")]` instead of
    `#[actix_web::main]`. `actix-server` detects the Tokio runtime and starts its
@@ -892,6 +1004,15 @@ The measurement rules transferred regardless of layout and are now implemented:
 ## Interpretation
 
 - Matching and feed derivation are not the current bottleneck.
+- The upstream OpenRaft minimal benchmark (in-memory, no network, empty state machine) runs at
+  33k put/s with one client and 3.5M/s with 4,096, while our 4-node no-fsync cluster runs at
+  5.0k/35.2k. Raft is not the current bottleneck; HTTP/JSON, WAL, apply and benchmark-runtime
+  contention dominate. Lease reads are implemented and measured; batching/payload tuning is the
+  highest-value next performance work.
+- Opt-in lease reads remove the fresh quorum round on leader reads and produced 2.17x/1.71x
+  throughput and 2.18x/3.46x p50 gains for `/linearizable_read` at 1/64 readers in the 4-node
+  loopback benchmark; `/events` gained 1.46x/1.18x. `ReadIndex` remains the default because lease
+  reads require bounded clock drift and the fallback path was not exercised on one host.
 - Sequential write latency is fsync-dominated; batching concurrent submissions
   improves throughput substantially.
 - The feed has ample headroom at 500k fills/s with a null sink. A real sink

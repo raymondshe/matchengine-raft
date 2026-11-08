@@ -41,6 +41,7 @@ OpenRaft-configured chunks (3 MiB default, 8 MiB cap), and both message directio
 - `GET /ready` - Readiness: returns `200` only when the node is healthy and a cluster leader is
   known; `503` during startup, elections or a partition. A follower with a known leader is ready
   for reads; writes still go to the leader.
+- `GET /read-policy/status` - Configured leader-read policy and per-endpoint lease/ReadIndex counters
 - `GET /console/` - Embedded operational console (HTML/CSS/JS); no build step or external assets
 - `GET /console/api/node` - Stable node snapshot: health, Raft role, storage frontier, events and feed
 - `GET /console/api/cluster` - Local node plus peer snapshots from the current membership
@@ -68,6 +69,24 @@ the internal-only HTTP contract; TLS and operator authentication stay at the gat
 - `POST /events` - Read a page of the replicated match-event log (`after`, `limit`, `wait_ms`); linearizable and leader-only, with optional long-poll
 - `GET /events/status` - Retained event window, eviction counters and retention limit
 - gRPC `EventService.StreamEvents` - Stream JSON event pages with the same cursor, `wait_ms` and `max_pages` on the gRPC listener
+
+#### Read consistency and lease reads
+
+`POST /read` is a local, possibly stale read and is not affected by the read policy. The leader-consistent
+paths use `ReadPolicy::ReadIndex` by default: `/linearizable_read`, `/events`, the gRPC
+`StreamEvents` anchor and `/get_linearizer` (used by `/follower_read`). Each ReadIndex read confirms
+leadership with a fresh quorum round.
+
+Start the node with `--read-policy lease` (env `MATCHENGINE_READ_POLICY=lease`) to try
+`ReadPolicy::LeaseRead` first. A lease read reuses a recent quorum acknowledgement and avoids the
+fresh round while the leader lease is valid. If the lease is stale, the node falls back to
+`ReadIndex`; if quorum is available the read succeeds at fallback latency, otherwise it returns the
+Raft read error. The default remains `read_index`.
+
+Lease reads assume **bounded clock drift** between nodes. Use NTP or PTP and keep the default
+`read_index` unless the deployment guarantees that the leader's lease cannot outlive its actual
+leadership. The status endpoint reports the mode and, per path, `lease_attempts`, `lease_hits`,
+`lease_fallbacks`, `lease_failures`, `read_index_attempts` and `read_index_failures`.
 
 The Rust request/response types behind `/write` are:
 

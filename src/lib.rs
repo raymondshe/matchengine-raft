@@ -44,6 +44,7 @@ use crate::network::health;
 use crate::network::health::GrpcListenerHealth;
 use crate::network::health::GrpcListenerStopGuard;
 use crate::network::management;
+use crate::network::read_policy::ReadPolicyRuntime;
 
 pub use store::StorageConfig;
 
@@ -630,8 +631,13 @@ pub async fn build_match_engine_node(
 
     // Serve the gRPC transport. The listener is already bound, so peers can
     // connect as soon as this node is initialized.
+    let read_policy = ReadPolicyRuntime::new(storage.read_policy);
     let grpc_service = RaftGrpcService::new(raft.clone());
-    let event_service = EventStreamService::new(raft.clone(), state_machine_store.clone());
+    let event_service = EventStreamService::new(
+        raft.clone(),
+        state_machine_store.clone(),
+        read_policy.clone(),
+    );
     let (grpc_shutdown, grpc_shutdown_rx) = tokio::sync::oneshot::channel();
     let (grpc_failure_tx, grpc_failure_rx) = tokio::sync::oneshot::channel();
     let grpc_health_task = grpc_health.clone();
@@ -682,6 +688,7 @@ pub async fn build_match_engine_node(
         grpc_health,
         recovered,
         min_voters: storage.min_voters,
+        read_policy,
         console: console::ConsoleState::new(),
     });
 
@@ -714,6 +721,7 @@ pub async fn build_match_engine_node(
             .service(management::change_membership)
             .service(management::metrics)
             .service(management::get_linearizer)
+            .service(management::read_policy_status)
             // application API
             .service(api::write)
             .service(api::write_batch)

@@ -89,7 +89,8 @@ Everything below is implemented in this repository and exercised by tests; the l
 - **Durable match-event feed** at `POST /events` with cursor pagination, long-poll (`wait_ms`), retention limits, `client_order_id` idempotency, gRPC `StreamEvents` streaming and a reference MQ bridge sidecar; replay-safe retries.
 - **Deterministic market-data feed** with leader gating, shadow book, BBO, depth snapshots/deltas, lifecycle events, OHLC bars and a compact binary wire format with a reference decoder. The feature-gated **Aeron** egress publishes it on streams 2001–2007 with one exclusive publication per stream.
 - **Standalone market-data system** at `demos/market_data_system/`: consumes the feed over Aeron or JSONL and serves Binance-style WebSocket streams. One instance serves several symbols from a shared hub; clients hold a per-connection subscription set, switch symbols with live `UNSUBSCRIBE`/`SUBSCRIBE`, and scale horizontally without adding engine work.
-- **Flexible read consistency**: local reads, linearizable leader reads and linearizable follower reads.
+- **Flexible read consistency**: local reads, linearizable leader reads with `ReadIndex` or opt-in lease reads, and linearizable follower reads; `GET /read-policy/status` reports lease hits and fallbacks.
+- **Opt-in lease reads**: `--read-policy lease` tries `ReadPolicy::LeaseRead` for `/linearizable_read`, `/events`, gRPC `StreamEvents` and `/get_linearizer`, falling back to `ReadIndex` when the lease is stale. The default remains `ReadIndex`; lease reads require bounded clock drift.
 - **Leader-aware Rust client** that tracks and forwards requests to the current leader, with configurable timeouts, transient retry/backoff and typed API/no-leader errors; retries are at-least-once, so use `client_order_id` for idempotent write retries.
 - **Operational APIs** for initialization, membership changes, metrics, event status and market-data status.
 - **Batch writes** at `POST /write_batch`: multiple requests in one Raft entry and one WAL append, with per-request sequences and continuous event ordinals.
@@ -131,6 +132,11 @@ stays on the `--http-addr` listener. Raft RPCs are not part of the HTTP JSON API
 Set `RAFT_CORE_WORKERS` to a positive worker count to run OpenRaft's RaftCore and state-machine
 worker on a dedicated multi-threaded runtime, isolated from the HTTP, gRPC and market-data tasks;
 unset or `0` keeps Raft on the shared runtime.
+
+Leader-consistent reads use `ReadIndex` by default. Set `--read-policy lease` (or
+`MATCHENGINE_READ_POLICY=lease`) to try `ReadPolicy::LeaseRead` for `/linearizable_read`, `/events`,
+gRPC `StreamEvents` and `/get_linearizer`, falling back to `ReadIndex` when the lease is stale.
+Lease reads require bounded clock drift between nodes; `/read` remains a local, possibly stale read.
 
 Market-data egress is off the consensus path: the tap is a bounded `try_send`, so a slow
 subscriber can never block `apply`. The feature-gated `AeronSink` publishes the same wire-v6
@@ -299,7 +305,7 @@ delivery and the market-data feed are documented separately:
 
 The HTTP application/admin APIs and the gRPC Raft service are documented in
 [API reference](./docs/API.md). Main routes: `/write`, `/write_batch`, `/read`,
-`/linearizable_read`, `/follower_read`, `/events`, `/health`, `/ready`, `/metrics` and `/console/`.
+`/linearizable_read`, `/follower_read`, `/events`, `/read-policy/status`, `/health`, `/ready`, `/metrics` and `/console/`.
 
 ## Testing
 
@@ -309,8 +315,8 @@ failure matrix are documented in [Testing](./docs/TESTING.md).
 ## Performance and Current Limits
 
 Measured baseline (Apple M4, Rust 1.93.1, release bench profile; single-node e2e/storage medians
-from 2026-11-06; 4-node no-fsync cluster from 2026-11-07; full methodology in
-[`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md)):
+from 2026-11-06; 4-node no-fsync cluster from 2026-11-07; read-path benchmark from 2026-11-08;
+full methodology in [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md)):
 
 | Workload | Result |
 |---|---:|
@@ -323,11 +329,14 @@ from 2026-11-06; 4-node no-fsync cluster from 2026-11-07; full methodology in
 | 4-node no-fsync cluster: concurrent `/write` (1,000 in flight) | 35,152 writes/s |
 | 4-node no-fsync cluster: sequential `/write_batch` (128 orders) | 227,319 orders/s |
 | 4-node no-fsync cluster: concurrent `/write_batch` (100 × 32) | 216,163 orders/s |
+| 4-node no-fsync cluster: `/linearizable_read` p50 / p99 (1 reader, ReadIndex → lease) | 119.7 / 243.6 µs → 54.9 / 83.9 µs |
+| 4-node no-fsync cluster: `/linearizable_read` throughput (64 readers, ReadIndex → lease) | 30,232 → 51,777 reads/s |
 | Market-data feed at 500k fills/s | 495k fills/s, 0 drops at 8,192-frame queue |
 | WAL append / read (20k entries, 100-entry batches, fsync every append) | 25,547 / 2,408,176 entries/s |
 
 The 4-node figures use a 3-of-4 quorum on loopback with WAL fsync disabled and all four nodes in
 one process; the range and cross-host caveats are in [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md).
+Lease reads are opt-in; the default remains `ReadIndex` because lease reads require bounded clock drift.
 
 WAL fsync is controlled by `RAFT_WAL_FSYNC_MS`: unset = no fsync (default), `0` = every append,
 `N > 0` = periodic every N ms. Non-every-append modes trade durability for throughput; with fsync

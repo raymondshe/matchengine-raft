@@ -19,6 +19,7 @@ use std::time::Duration;
 use crate::DEFAULT_SNAPSHOT_INTERVAL;
 use crate::MatchEngineNodeId;
 use crate::market_data::MarketDataConfig;
+use crate::network::read_policy::ReadPolicyMode;
 use crate::store::state_machine::DEFAULT_MAX_EVENTS;
 
 /// Environment variable that overrides [`StorageConfig::data_dir`].
@@ -89,6 +90,10 @@ pub struct StorageConfig {
     /// writes. The binary sets 4 when WAL fsync is disabled; library callers
     /// default to 1.
     pub min_voters: usize,
+
+    /// Leader-consistent read policy. `ReadIndex` is the default; `Lease` is
+    /// opt-in and falls back to `ReadIndex` when the lease is stale.
+    pub read_policy: ReadPolicyMode,
 }
 
 /// Reads the WAL fsync policy from `RAFT_WAL_FSYNC_MS`.
@@ -146,6 +151,7 @@ impl Default for StorageConfig {
             snapshot_interval,
             wal_fsync,
             min_voters,
+            read_policy: ReadPolicyMode::default(),
         }
     }
 }
@@ -162,6 +168,7 @@ impl StorageConfig {
             snapshot_interval: DEFAULT_SNAPSHOT_INTERVAL,
             wal_fsync: None,
             min_voters: 1,
+            read_policy: ReadPolicyMode::default(),
         }
     }
 
@@ -208,6 +215,12 @@ impl StorageConfig {
     /// changes and writes.
     pub fn with_min_voters(mut self, min_voters: usize) -> Self {
         self.min_voters = min_voters.max(1);
+        self
+    }
+
+    /// Sets the leader-consistent read policy.
+    pub fn with_read_policy(mut self, read_policy: ReadPolicyMode) -> Self {
+        self.read_policy = read_policy;
         self
     }
 
@@ -292,6 +305,20 @@ mod tests {
     fn min_voters_defaults_to_one_and_is_configurable() {
         assert_eq!(1, StorageConfig::new("/data").min_voters);
         assert_eq!(4, StorageConfig::new("/data").with_min_voters(4).min_voters);
+    }
+
+    #[test]
+    fn read_policy_defaults_to_read_index_and_is_configurable() {
+        assert_eq!(
+            ReadPolicyMode::ReadIndex,
+            StorageConfig::new("/data").read_policy
+        );
+        assert_eq!(
+            ReadPolicyMode::Lease,
+            StorageConfig::new("/data")
+                .with_read_policy(ReadPolicyMode::Lease)
+                .read_policy
+        );
     }
 
     #[test]
