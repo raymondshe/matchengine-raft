@@ -295,33 +295,27 @@ HTTP 应用/管理 API 和 gRPC Raft 服务见 [API 参考](./docs/zh-CN/API.md)
 
 ## 性能与当前限制
 
-实测基线（Apple M4、Rust 1.93.1、release bench profile；单节点端到端/存储为 2026-11-06 三次运行中位数；
-4 节点无 fsync 集群为 2026-11-07 三轮中位数；写并发/批处理 sweep、异步 WAL 原型与读路径基准为 2026-11-08；完整方法见
-[性能细节](./docs/zh-CN/PERFORMANCE.md)）：
+参考机器（Apple M4、Rust 1.93.1、release bench profile）的头部数字。订单簿行不含 HTTP、Raft 和 WAL；
+复制行使用四个同进程 loopback 投票节点并关闭 WAL fsync。方法、分位数、持久化模式和限制见
+[性能细节](./docs/zh-CN/PERFORMANCE.md)。
 
 | 工作负载 | 结果 |
 |---|---:|
-| 订单簿：1k 卖单 / 100 档全扫 | 105.6 µs |
-| 端到端 `/write` p50 / p99（单节点，每次追加 fsync） | 3.96 ms / 5.17 ms |
-| 并发 `/write`（单节点，每次追加 fsync） | 17,245 writes/s |
-| 串行 `/write_batch`（单节点，每次追加 fsync，每批 128 单） | 23,249 单/s |
-| 并发 `/write_batch`（单节点，每次追加 fsync，100 × 32 单） | 139,323 单/s |
-| 4 节点无 fsync 集群：串行 `/write` p50 / p99 | 186.8 µs / 368.9 µs |
-| 4 节点无 fsync 集群：并发 sweep 峰值（256 在途） | 90,569 writes/s，p99 6.47 ms |
-| 4 节点无 fsync 集群：1,024 / 4,096 在途 | 44,829 / 50,996 writes/s，p99 21.79 / 76.47 ms |
-| 4 节点无 fsync 集群：串行 `/write_batch`（每批 128 单） | 227,319 单/s |
-| 4 节点无 fsync 集群：并发 `/write_batch`（100 × 32 单） | 216,163 单/s |
-| 4 节点无 fsync 集群：`/linearizable_read` p50 / p99（1 读者，ReadIndex → lease） | 119.7 / 243.6 µs → 54.9 / 83.9 µs |
-| 4 节点无 fsync 集群：`/linearizable_read` 吞吐（64 读者，ReadIndex → lease） | 30,232 → 51,777 reads/s |
-| 行情 feed 500k fills/s | 495k fills/s，8,192 队列下 0 丢弃 |
-| WAL 追加 / 读取（20k 条、每批 100 条，每次追加 fsync） | 26,043 / 2,614,579 条/s |
-| WAL 追加，异步原型（feature-gated，每次追加） | 中位数 172k 条/s；范围 65.2k-192.2k |
-| 单节点 e2e 并发写入，每次追加（同步 → 异步） | 18,344 → 17,277 writes/s（噪声范围内） |
+| 订单簿深扫（100 档） | 11.66M fills/s |
+| 订单簿深取消 | 19.63M cancels/s |
+| BBO advance / BBO query | 20.37M advances/s / 434.5M queries/s |
+| 真实混合 replay（add/cancel/amend/stop/iceberg/taker） | 968,709 ops/s |
+| 4 节点复制写入，256 在途 | 90,569 writes/s，p99 6.47 ms |
+| 4 节点串行 128 单批次 | 227,319 orders/s |
+| 4 节点 100 x 32 并发批次 | 216,163 orders/s |
+| Lease 线性一致读（1 / 64 读者） | 17,559 / 51,777 reads/s；p50 54.9 / 91.5 µs |
+| 行情 feed（null sink） | 495k fills/s，8,192 帧队列 0 丢弃 |
+| WAL 追加 / 读取，不 fsync（仅存储） | 2.15M / 5.66M entries/s |
 
-4 节点数据为 loopback 上、关闭 WAL fsync 的 3/4 法定人数集群，四个节点在同一进程内；
-范围和跨主机限制见[性能细节](./docs/zh-CN/PERFORMANCE.md)。lease read 是默认读策略；
-时钟漂移无界时使用 `--read-policy read_index`。写并发 sweep 在 256 在途达到峰值；
-单因素 sweep 未改善 payload/purge/linger/运行时/LTO 默认值。
+订单簿数字是单进程订单簿操作的最佳值，不是端到端容量。四节点行使用 loopback 上 3/4 quorum、四个节点在同一
+进程，不模拟跨主机网络、独立磁盘竞争或主机故障。写入 sweep 在 256 在途达到峰值。每次追加 fsync
+的持久模式在单节点串行路径低得多（262 writes/s），但单节点 100 x 32 批次仍可达 180k orders/s；
+持久性权衡见 PERFORMANCE.md。
 
 **推荐生产配置。** 追求最大吞吐时保持 `RAFT_WAL_FSYNC_MS` 未设置（默认；要求至少 4 个投票节点），
 保持 `RAFT_CORE_WORKERS` 未设置和 OpenRaft `300/1/0` 默认参数，使用 `/write_batch`（每批 32–128 单），
@@ -330,9 +324,9 @@ HTTP 应用/管理 API 和 gRPC Raft 服务见 [API 参考](./docs/zh-CN/API.md)
 不要使用 10ms fsync、1ms batch linger、1,024 的 payload/purge、异步 WAL 或 thin LTO；这些都没有
 超过默认配置。详见[生产配置决策](./docs/zh-CN/PERFORMANCE.md#生产配置决策2026-11-08)。
 
-WAL fsync 由 `RAFT_WAL_FSYNC_MS` 控制：未设置 = 不 fsync（默认），`0` = 每次追加都 fsync，
-`N > 0` = 每 N 毫秒周期 fsync。非每次追加模式以持久性换吞吐；关闭 fsync 时同一 WAL 基准约 2M 条/s。关闭 fsync 时节点要求至少 4 个投票成员；演示脚本使用 `RAFT_WAL_FSYNC_MS=0`
-以保持三节点部署可用。详见[存储](./docs/zh-CN/STORAGE.md)。
+WAL fsync 由 `RAFT_WAL_FSYNC_MS` 控制：未设置 = 不 fsync（默认；要求至少 4 个投票成员），`0` = 每次
+追加，`N > 0` = 周期 fsync。持久性契约见[存储](./docs/zh-CN/STORAGE.md)，权衡见
+[生产配置决策](./docs/zh-CN/PERFORMANCE.md#生产配置决策2026-11-08)。
 
 完整基准方法、存储路径细节和优化历史见 [性能细节](./docs/zh-CN/PERFORMANCE.md)。快照 **v10** 和
 wire **v6** 是破坏性变更，见 [DECIMAL.md](./docs/DECIMAL.md)。已知差距和路线图见

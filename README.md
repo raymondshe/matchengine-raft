@@ -316,33 +316,30 @@ failure matrix are documented in [Testing](./docs/TESTING.md).
 
 ## Performance and Current Limits
 
-Measured baseline (Apple M4, Rust 1.93.1, release bench profile; single-node e2e/storage medians
-from 2026-11-06; 4-node no-fsync cluster from 2026-11-07; write concurrency/batching sweep, async WAL prototype and read-path benchmark from 2026-11-08;
-full methodology in [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md)):
+Headline numbers from the reference machine (Apple M4, Rust 1.93.1, release bench profile). Book-only
+rows exclude HTTP, Raft and WAL; replicated rows use four in-process loopback voters with WAL fsync
+disabled. Methodology, percentiles, durability modes and caveats are in
+[`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md).
 
 | Workload | Result |
 |---|---:|
-| Order book: sweep 1k asks / 100 levels | 105.6 µs |
-| End-to-end `/write` p50 / p99 (single node, fsync every append) | 3.96 ms / 5.17 ms |
-| Concurrent `/write` (single node, fsync every append) | 17,245 writes/s |
-| Sequential `/write_batch` (single node, fsync every append, 128 orders) | 23,249 orders/s |
-| Concurrent `/write_batch` (single node, fsync every append, 100 × 32) | 139,323 orders/s |
-| 4-node no-fsync cluster: sequential `/write` p50 / p99 | 186.8 µs / 368.9 µs |
-| 4-node no-fsync cluster: concurrency sweep peak (256 in flight) | 90,569 writes/s, p99 6.47 ms |
-| 4-node no-fsync cluster: 1,024 / 4,096 in flight | 44,829 / 50,996 writes/s, p99 21.79 / 76.47 ms |
-| 4-node no-fsync cluster: sequential `/write_batch` (128 orders) | 227,319 orders/s |
-| 4-node no-fsync cluster: concurrent `/write_batch` (100 × 32) | 216,163 orders/s |
-| 4-node no-fsync cluster: `/linearizable_read` p50 / p99 (1 reader, ReadIndex → lease) | 119.7 / 243.6 µs → 54.9 / 83.9 µs |
-| 4-node no-fsync cluster: `/linearizable_read` throughput (64 readers, ReadIndex → lease) | 30,232 → 51,777 reads/s |
-| Market-data feed at 500k fills/s | 495k fills/s, 0 drops at 8,192-frame queue |
-| WAL append / read (20k entries, 100-entry batches, fsync every append) | 26,043 / 2,614,579 entries/s |
-| WAL append, async prototype (feature-gated, every append) | 172k entries/s median; 65.2k-192.2k range |
-| Single-node e2e concurrent writes, every append (sync → async) | 18,344 → 17,277 writes/s (within noise) |
+| Order-book deep sweep (100 levels) | 11.66M fills/s |
+| Order-book deep cancels | 19.63M cancels/s |
+| BBO advance / BBO query | 20.37M advances/s / 434.5M queries/s |
+| Realistic mixed replay (add/cancel/amend/stop/iceberg/taker) | 968,709 ops/s |
+| Replicated writes, 256 in flight | 90,569 writes/s, p99 6.47 ms |
+| Replicated sequential 128-order batches | 227,319 orders/s |
+| Replicated 100 x 32 concurrent batches | 216,163 orders/s |
+| Lease linearizable reads (1 / 64 readers) | 17,559 / 51,777 reads/s; p50 54.9 / 91.5 µs |
+| Market-data feed (null sink) | 495k fills/s, 0 drops at an 8,192-frame queue |
+| WAL append / read, no fsync (storage-only) | 2.15M / 5.66M entries/s |
 
-The 4-node figures use a 3-of-4 quorum on loopback with WAL fsync disabled and all four nodes in
-one process; the range and cross-host caveats are in [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md).
-Lease reads are the default; set `--read-policy read_index` when bounded clock drift is not guaranteed.
-The write sweep peaks at 256 in-flight; payload/purge/linger/runtime/LTO defaults were not improved by the one-factor sweeps.
+Book-only figures are best-case single-process order-book numbers, not end-to-end capacity. The four-node
+rows use a 3-of-4 quorum on loopback with all nodes in one process; they do not model cross-host
+network latency, independent disk contention or host failure. The write sweep peaks at 256 in
+flight. Every-append durability is much lower on the single-node sequential path (262 writes/s)
+but still reaches 180k orders/s for 100 x 32 batches on one node; see PERFORMANCE.md for that
+trade-off.
 
 **Recommended production profile.** For maximum throughput, leave `RAFT_WAL_FSYNC_MS` unset
 (default; requires at least four voters), keep `RAFT_CORE_WORKERS` unset and the OpenRaft
@@ -353,11 +350,10 @@ to amortize the fsync. Do not use the 10 ms fsync mode, 1 ms batch linger, 1,024
 payload/purge settings, async WAL or thin LTO; none beat the defaults. See
 [production configuration decisions](./docs/PERFORMANCE.md#production-configuration-decisions-2026-11-08).
 
-WAL fsync is controlled by `RAFT_WAL_FSYNC_MS`: unset = no fsync (default), `0` = every append,
-`N > 0` = periodic every N ms. Non-every-append modes trade durability for throughput; with fsync
-disabled the same WAL benchmark appends about 2M entries/s. When fsync is disabled the node
-requires at least four voters; the demo scripts use `RAFT_WAL_FSYNC_MS=0` for three-node setups.
-See [Storage](./docs/STORAGE.md).
+WAL fsync is controlled by `RAFT_WAL_FSYNC_MS`: unset = no fsync (default; requires at least four
+voters), `0` = every append, `N > 0` = periodic. See [Storage](./docs/STORAGE.md) for the durability
+contract and [production decisions](./docs/PERFORMANCE.md#production-configuration-decisions-2026-11-08)
+for the trade-offs.
 
 The full benchmark methodology, storage-path details and optimization history are in
 [PERFORMANCE.md](./docs/PERFORMANCE.md). Snapshot **v10** and wire **v6** are breaking changes;
