@@ -33,7 +33,7 @@ dedicated OpenRaft runtime (`RAFT_CORE_WORKERS`), the thread/lock audit (blockin
 recovery on `spawn_blocking`, async JSONL sink/events bridge, Aeron publisher/source blocking
 tasks, a Tokio WAL fsync worker; only the env-controlled `RaftThread` remains), the realistic-mix
 replay benchmark, the four-node no-fsync cluster benchmark (`cluster_e2e`), the write
-concurrency/batching sweep, the read-path benchmark plus opt-in lease reads (`read_e2e`), and the
+concurrency/batching sweep, the read-path benchmark plus lease reads (now the default; `read_e2e`), and the
 feature-gated async WAL prototype with crash-recovery tests, and the production configuration
 decision record (two durability profiles and rejected options). The measured baselines,
 write/lease decisions, async-WAL numbers and upstream OpenRaft comparison are in
@@ -366,7 +366,7 @@ Current coverage:
 - `test_failure.rs`: fail-stop when the Raft core stops, injected WAL `ENOSPC`/`EIO`, `SIGKILL`
   during a write stream and `SIGKILL` during a learner snapshot install.
 - `test_min_voters.rs`: the four-voter no-fsync guard on `/init`, `/change-membership` and writes.
-- `test_read_policy.rs`: opt-in lease reads serve `/linearizable_read` and `/events`, local `/read`
+- `test_read_policy.rs`: default lease reads and explicit `read_index` reads serve `/linearizable_read` and `/events`, local `/read`
   bypasses the policy, and `/read-policy/status` reports lease hits and fallbacks.
 - `tests/replay/`: shell-driven replay matrix for GTC, IOC, FOK, GTD, Day, market, post-only,
   iceberg, stop-market, stop-limit, amend, cancel, default-policy maker/taker fees, quote-asset fees

@@ -408,9 +408,10 @@ message StreamEventsPage { bytes payload = 1; }  // JSON EventsResponse
   `MatchEvent` omits absent optional fields with `skip_serializing_if`, which positional formats
   such as postcard cannot deserialize reliably, and a JSON page lets non-Rust consumers share the
   documented schema.
-- The stream is anchored with one `ReadIndex` linearizable read when it opens, so the serving node
-  must be the leader at that point (`FAILED_PRECONDITION` with the leader error otherwise). Later
-  pages read locally applied committed events with no per-page quorum round-trip.
+- The stream is anchored with one leader-consistent read (lease by default, `ReadIndex` fallback)
+  when it opens, so the serving node must be the leader at that point (`FAILED_PRECONDITION` with
+  the leader error otherwise). Later pages read locally applied committed events with no per-page
+  quorum round-trip.
 - An idle stream sends an empty page after at most `wait_ms`, doubling as a liveness heartbeat.
   `max_pages` bounds tests and short-lived consumers; 0 streams until cancelled.
 

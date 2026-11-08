@@ -89,8 +89,8 @@
 - **持久化撮合事件 Feed**：`POST /events` 游标分页、长轮询（`wait_ms`）、保留上限、`client_order_id` 幂等、gRPC `StreamEvents` 流式推送和参考 MQ bridge sidecar，安全重试。
 - **确定性行情 Feed**：领导者门控、影子订单簿、BBO、深度快照/增量、生命周期事件、OHLC K 线和紧凑二进制行情格式（含参考解码器）。feature 门控的 **Aeron** 出口通过 2001–2007 流发布，每个流一个独占 publication。
 - **独立行情数据系统** `demos/market_data_system/`：通过 Aeron 或 JSONL 消费 feed，并提供 Binance 风格 WebSocket 行情流。一个实例通过共享 hub 服务多个 symbol；连接持有自己的订阅集合，可用实时 `UNSUBSCRIBE`/`SUBSCRIBE` 切换 symbol，并可水平扩展而不增加引擎开销。
-- **灵活读取一致性**：本地读、支持 `ReadIndex` 或可选 lease read 的 leader 线性一致读，以及 follower 线性一致读；`GET /read-policy/status` 报告 lease 命中与回退。
-- **可选 lease read**：`--read-policy lease` 会为 `/linearizable_read`、`/events`、gRPC `StreamEvents` 和 `/get_linearizer` 先尝试 `ReadPolicy::LeaseRead`，lease 过期时回退到 `ReadIndex`。默认仍为 `ReadIndex`；lease read 要求节点间时钟漂移有界。
+- **灵活读取一致性**：本地读、默认使用 lease read 并可回退 `ReadIndex` 的 leader 线性一致读，以及 follower 线性一致读；`GET /read-policy/status` 报告 lease 命中与回退。
+- **默认 lease read**：leader 一致读会为 `/linearizable_read`、`/events`、gRPC `StreamEvents` 和 `/get_linearizer` 先尝试 `ReadPolicy::LeaseRead`，lease 过期时回退到 `ReadIndex`。设置 `--read-policy read_index` 可强制每次使用新的 quorum 往返。lease read 要求节点间时钟漂移有界（NTP/PTP）。
 - **领导者感知 Rust 客户端**，自动跟踪并转发到当前领导者，支持可配置超时、瞬时错误重试/退避以及类型化的 API/无领导者错误；重试是至少一次语义，写入重试应使用 `client_order_id` 实现幂等。
 - **运维 API**：初始化、成员变更、指标、事件状态和行情状态。
 - **批量写入**：`POST /write_batch` 将多个请求放入一个 Raft entry 和一次 WAL 追加，逐项返回序列号，事件序号在 entry 内连续。
@@ -132,10 +132,10 @@ Raft RPC 不属于 HTTP JSON API。
 将 `RAFT_CORE_WORKERS` 设为正数时，OpenRaft 的 RaftCore 和状态机 worker 运行在专用多线程运行时，
 与 HTTP、gRPC 和行情任务隔离；未设置或设为 `0` 时 Raft 继续使用共享运行时。
 
-Leader 一致读默认使用 `ReadIndex`。设置 `--read-policy lease`（或
-`MATCHENGINE_READ_POLICY=lease`）后，`/linearizable_read`、`/events`、gRPC `StreamEvents` 和
-`/get_linearizer` 会先尝试 `ReadPolicy::LeaseRead`，lease 过期时回退到 `ReadIndex`。lease read
-要求节点间时钟漂移有界；`/read` 仍是本地、可能过期的读。
+Leader 一致读默认使用 lease：`/linearizable_read`、`/events`、gRPC `StreamEvents` 和
+`/get_linearizer` 会先尝试 `ReadPolicy::LeaseRead`，lease 过期时回退到 `ReadIndex`。设置
+`--read-policy read_index`（或 `MATCHENGINE_READ_POLICY=read_index`）可强制每次使用新的 quorum
+往返。lease read 要求节点间时钟漂移有界；`/read` 仍是本地、可能过期的读。
 
 行情输出不参与共识：tap 使用有界 `try_send`，因此慢订阅者永远不会阻塞 `apply`。feature 门控的
 `AeronSink` 由专用发布线程把同样的线格式 v6 消息发布到 2001–2007 流，每个流一个独占 publication；
@@ -319,13 +319,13 @@ HTTP 应用/管理 API 和 gRPC Raft 服务见 [API 参考](./docs/zh-CN/API.md)
 | 单节点 e2e 并发写入，每次追加（同步 → 异步） | 18,344 → 17,277 writes/s（噪声范围内） |
 
 4 节点数据为 loopback 上、关闭 WAL fsync 的 3/4 法定人数集群，四个节点在同一进程内；
-范围和跨主机限制见[性能细节](./docs/zh-CN/PERFORMANCE.md)。lease read 为可选，默认仍为
-`ReadIndex`，因为 lease read 要求节点间时钟漂移有界。写并发 sweep 在 256 在途达到峰值；
+范围和跨主机限制见[性能细节](./docs/zh-CN/PERFORMANCE.md)。lease read 是默认读策略；
+时钟漂移无界时使用 `--read-policy read_index`。写并发 sweep 在 256 在途达到峰值；
 单因素 sweep 未改善 payload/purge/linger/运行时/LTO 默认值。
 
 **推荐生产配置。** 追求最大吞吐时保持 `RAFT_WAL_FSYNC_MS` 未设置（默认；要求至少 4 个投票节点），
 保持 `RAFT_CORE_WORKERS` 未设置和 OpenRaft `300/1/0` 默认参数，使用 `/write_batch`（每批 32–128 单），
-单个 `/write` 请求的在途数量不超过 256。NTP/PTP 时钟漂移有界时设置 `--read-policy lease`，否则保持 `ReadIndex`。
+单个 `/write` 请求的在途数量不超过 256。只有在 NTP/PTP 时钟漂移有界时保留默认 lease read，否则设置 `--read-policy read_index`。
 如果已确认写入必须在非正常崩溃后仍不丢失，设置 `RAFT_WAL_FSYNC_MS=0`，并用批量写入摊薄 fsync 成本。
 不要使用 10ms fsync、1ms batch linger、1,024 的 payload/purge、异步 WAL 或 thin LTO；这些都没有
 超过默认配置。详见[生产配置决策](./docs/zh-CN/PERFORMANCE.md#生产配置决策2026-11-08)。

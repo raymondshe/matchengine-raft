@@ -1,11 +1,11 @@
-//! Opt-in lease reads with a ReadIndex fallback.
+//! Lease reads by default, with a ReadIndex fallback.
 //!
-//! `ReadIndex` is the default: it confirms leadership with a fresh quorum
-//! round. `LeaseRead` reuses a recent quorum acknowledgement, so it avoids that
-//! round while the leader's lease is valid. It assumes bounded clock drift
-//! between nodes; if the lease is stale, this runtime falls back to
-//! `ReadIndex` instead of failing immediately (a ReadIndex failure is still
-//! returned to the caller).
+//! `LeaseRead` is the default: it reuses a recent quorum acknowledgement and
+//! avoids a fresh quorum round while the leader's lease is valid. It assumes
+//! bounded clock drift between nodes; if the lease is stale, this runtime falls
+//! back to `ReadIndex` instead of failing immediately (a ReadIndex failure is
+//! still returned to the caller). Set `--read-policy read_index` to force a
+//! fresh quorum round on every read when clock discipline is not guaranteed.
 //!
 //! `/read` stays a local, possibly stale read and is intentionally not routed
 //! through this policy.
@@ -36,9 +36,9 @@ pub const READ_POLICY_ENV: &str = "MATCHENGINE_READ_POLICY";
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ReadPolicyMode {
     /// Confirm leadership with a fresh quorum round on every read.
-    #[default]
     ReadIndex,
     /// Try a recent quorum acknowledgement first and fall back to `ReadIndex`.
+    #[default]
     Lease,
 }
 
@@ -284,6 +284,7 @@ mod tests {
         assert_eq!(ReadPolicyMode::Lease, "lease_read".parse().unwrap());
         assert!("sticky".parse::<ReadPolicyMode>().is_err());
         assert_eq!("lease", ReadPolicyMode::Lease.to_string());
+        assert_eq!(ReadPolicyMode::Lease, ReadPolicyMode::default());
     }
 
     #[test]

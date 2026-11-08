@@ -10,7 +10,7 @@
 |---|---|
 | WAL 持久化 | 保持 `RAFT_WAL_FSYNC_MS` 未设置（不 fsync） |
 | 投票者 | 至少 4 个；无 fsync 时二进制强制 |
-| 读策略 | 时钟漂移有界且 `/read-policy/status` 显示 lease 命中时用 `--read-policy lease`；否则 `ReadIndex` |
+| 读策略 | lease（默认）；NTP/PTP 时钟漂移有界且 `/read-policy/status` 显示 lease 命中时保留，否则设置 `--read-policy read_index` |
 | Raft 运行时 | `RAFT_CORE_WORKERS` 未设置或 0（共享运行时） |
 | OpenRaft 批处理 | 默认 `max_payload_entries=300`、`purge_batch_size=1`、`api_batch_linger_ms=0` |
 | 快照 | 默认每 100,000 条日志或 30 分钟 |
@@ -18,8 +18,8 @@
 | 构建 | 默认 release profile，无需 LTO |
 | 行情 | 8,192 帧队列、默认 leader-only、生产使用外部 sink |
 
-二进制默认值已经实现该方案，只有读策略例外：默认仍是安全的 `ReadIndex`，确认时钟纪律后再设置
-`--read-policy lease`。
+二进制默认值已经实现该方案，包括默认 lease read；无法保证时钟漂移有界时设置
+`--read-policy read_index`。
 
 方案 A 在非正常崩溃时**会丢失数据**。四投票者保护的是单个节点丢失未 fsync 尾部的情况，不保护
 同时多节点故障或整机断电。已确认写入必须在这种情况下存活时，使用方案 B。
@@ -172,7 +172,8 @@ flush 前可读、丢失尾部恢复和日志可继续追加；`tests/cluster/te
 四个节点在同一主机，lease 一直新鲜，回退分支未被触发；计数器已实现并有单元测试，真实跨主机
 时钟漂移部署应观察 `/read-policy/status` 的 fallback 计数。收益小于上游 90.4x/3.9x 的本地
 lease 结果，因为 alpha.37 的 `ReadPolicy::LeaseRead` 仍经过 RaftCore；上游的
-`enable_local_lease_read` 本地缓存路径更新。默认仍为 `ReadIndex`，lease 为可选。
+`enable_local_lease_read` 本地缓存路径更新。lease 现在是默认；设置 `--read-policy read_index`
+可强制新的 quorum 往返。
 
 ## 上游 OpenRaft minimal 基准对比（2026-11-08）
 
@@ -183,10 +184,10 @@ writes/s。Raft 不是当前瓶颈，HTTP/JSON、WAL、apply 和基准运行时�
 
 执行结果与后续项（详见英文 [PERFORMANCE.md](../PERFORMANCE.md)）：
 
-- 读取路径：为 `/linearizable_read`、`/events` 和 gRPC `StreamEvents` 增加可选
-  `ReadPolicy::LeaseRead` 与 `ReadIndex` 回退；alpha.37 没有 `enable_local_lease_read`，
+- 读取路径：`/linearizable_read`、`/events` 和 gRPC `StreamEvents` 默认使用
+  `ReadPolicy::LeaseRead`，并回退到 `ReadIndex`；alpha.37 没有 `enable_local_lease_read`，
   完整的本地缓存路径需要升级 OpenRaft。基准已完成：lease 在 1/64 读者下提升 2.17x/1.71x；
-  默认仍为 `ReadIndex`，生产在时钟有界时选 lease。
+  时钟漂移无界时用 `--read-policy read_index` 强制新的 quorum 往返。
 - 写入/批处理：已完成 1/8/64/256/1024/4096 客户端 sweep；256 在途峰值 90,569 writes/s，
   1,024/4,096 降至 44,829/50,996 writes/s。`max_payload_entries=1024`、`purge_batch_size=1024`、
   `api_batch_linger_ms=1`、`RAFT_CORE_WORKERS=2` 和薄 LTO 均无稳定收益；保留

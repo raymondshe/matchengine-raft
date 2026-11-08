@@ -82,7 +82,7 @@ with a single-voter deployment. The four-voter floor is part of the no-fsync con
 |---|---|
 | WAL durability | leave `RAFT_WAL_FSYNC_MS` unset (no fsync) |
 | Voters | at least 4; the binary enforces this when fsync is disabled |
-| Read policy | `--read-policy lease` when NTP/PTP keeps clock drift bounded and `/read-policy/status` shows lease hits; otherwise `ReadIndex` |
+| Read policy | lease (the default); keep it when NTP/PTP keeps clock drift bounded and `/read-policy/status` shows lease hits, otherwise set `--read-policy read_index` |
 | Raft runtime | `RAFT_CORE_WORKERS` unset or `0` (shared runtime) |
 | OpenRaft batching | defaults: `max_payload_entries=300`, `purge_batch_size=1`, `api_batch_linger_ms=0` |
 | Snapshots | defaults: every 100,000 log entries or 30 minutes |
@@ -90,8 +90,8 @@ with a single-voter deployment. The four-voter floor is part of the no-fsync con
 | Build | default release profile; no LTO requirement |
 | Market data | 8,192-frame queue, leader-only default, external sink for production |
 
-The binary defaults already implement this profile except for the read policy: `ReadIndex` remains
-the safe default, so set `--read-policy lease` only after validating clock discipline.
+The binary defaults implement this profile, including lease reads. Set `--read-policy read_index`
+when the deployment cannot guarantee bounded clock drift.
 
 Profile A is **lossy on an unclean crash**. The four-voter floor protects against one node losing
 its unsynced tail; it does not protect against simultaneous failures or host power loss. Use
@@ -539,8 +539,9 @@ fallback and report it through `GET /read-policy/status`.
 These gains are smaller than the upstream 90.4x/3.9x local-lease result because alpha.37's
 `ReadPolicy::LeaseRead` still goes through RaftCore; the benchmark's `enable_local_lease_read`
 local-cache path is newer. The gain is still material: **2.17x** for one linearizable reader,
-**1.71x** at 64 readers, with p50/p99 reduced by 2-3x. Lease reads are opt-in and default to
-ReadIndex; the contract and fallback are documented in `docs/API.md`.
+**1.71x** at 64 readers, with p50/p99 reduced by 2-3x. Lease reads are now the default; set
+`--read-policy read_index` to force a fresh quorum round. The contract and fallback are documented
+in `docs/API.md`.
 
 ### OpenRaft minimal benchmark comparison (2026-11-08)
 
@@ -568,15 +569,15 @@ application path, not Raft itself. The 3.5M/s and 5.6M/s figures are not capacit
 
 What transfers:
 
-- **Lease reads are the largest read-side lever.** Our `/linearizable_read` and `/events` anchor
-  on `ReadPolicy::ReadIndex` (`src/network/api.rs`); the gRPC `StreamEvents` stream anchors once
+- **Lease reads are the largest read-side lever.** Our `/linearizable_read` and `/events` use
+  the configured read policy (`src/network/api.rs`); the gRPC `StreamEvents` stream anchors once
   per stream (`src/network/grpc/events.rs`), and follower reads fetch a leader linearizer through
-  `src/network/management.rs`. Each `ReadIndex` pays a quorum round trip. The upstream benchmark
-  reports 90.4x/3.9x for its local lease path. Our pinned `openraft 0.10.0-alpha.37` has
-  `ReadPolicy::LeaseRead` but not `enable_local_lease_read`/`get_local_read_linearizer`; the
-  immediate opt-in removes the heartbeat round, while the full local-cache path needs a newer
-  OpenRaft. Measure both; keep `ReadIndex` as the default until measured, and fall back on lease
-  expiry.
+  `src/network/management.rs`. `LeaseRead` is now the default and avoids the heartbeat round while
+  the lease is valid; a stale lease falls back to `ReadIndex`, which pays the quorum round trip.
+  The upstream benchmark reports 90.4x/3.9x for its local lease path. Our pinned
+  `openraft 0.10.0-alpha.37` has `ReadPolicy::LeaseRead` but not
+  `enable_local_lease_read`/`get_local_read_linearizer`; the full local-cache path needs a newer
+  OpenRaft. Use `--read-policy read_index` when clock drift is not bounded.
 - **Batch and concurrency tuning still has headroom.** Our `/write_batch` 128-order path reaches
   227,319 orders/s versus 5,039 sequential writes/s, so application batching is already the main
   throughput lever. For independent clients, sweep client count and the server-side batch knobs:
@@ -1175,13 +1176,14 @@ The measurement rules transferred regardless of layout and are now implemented:
 - The upstream OpenRaft minimal benchmark (in-memory, no network, empty state machine) runs at
   33k put/s with one client and 3.5M/s with 4,096, while our 4-node no-fsync cluster runs at
   5.0k sequential and 90.6k writes/s at the 256-client knee. Raft is not the current bottleneck;
-  HTTP/JSON, WAL, apply and client concurrency dominate. Lease reads and write batching are
-  implemented and measured; the remaining levers are admission control and read-policy adoption,
-  not Raft or book-level work.
-- Opt-in lease reads remove the fresh quorum round on leader reads and produced 2.17x/1.71x
-  throughput and 2.18x/3.46x p50 gains for `/linearizable_read` at 1/64 readers in the 4-node
-  loopback benchmark; `/events` gained 1.46x/1.18x. `ReadIndex` remains the default because lease
-  reads require bounded clock drift and the fallback path was not exercised on one host.
+  HTTP/JSON, WAL, apply and client concurrency dominate. Lease reads are the default and write
+  batching is implemented; the remaining levers are admission control and verifying lease
+  fallback behavior on multi-host clocks, not Raft or book-level work.
+- Lease reads (the default) remove the fresh quorum round on leader reads and produced
+  2.17x/1.71x throughput and 2.18x/3.46x p50 gains for `/linearizable_read` at 1/64 readers in the
+  4-node loopback benchmark; `/events` gained 1.46x/1.18x. Set `--read-policy read_index` when
+  bounded clock drift is not guaranteed; the fallback path is unit-tested but should be monitored
+  on multi-host clocks.
 - The write concurrency sweep peaks at 256 in-flight (90.6k writes/s, p99 6.47 ms); 1,024 and
   4,096 in-flight fall to 44.8k/51.0k writes/s with 21.8/76.5 ms p99. The server is saturated
   well before 4,096 clients. `/write_batch` remains the throughput path; the default OpenRaft

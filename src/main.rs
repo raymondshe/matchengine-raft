@@ -35,11 +35,11 @@ pub struct Opt {
     #[clap(long, env = "MAX_EVENTS", default_value_t = DEFAULT_MAX_EVENTS)]
     pub max_events: usize,
 
-    /// Leader-consistent read policy: `read_index` (default) or `lease`.
+    /// Leader-consistent read policy: `lease` (default) or `read_index`.
     ///
     /// Lease reads reuse a recent quorum acknowledgement and fall back to
     /// ReadIndex when the lease is stale. They assume bounded clock drift.
-    #[clap(long, env = "MATCHENGINE_READ_POLICY", default_value = "read_index")]
+    #[clap(long, env = "MATCHENGINE_READ_POLICY", default_value = "lease")]
     pub read_policy: ReadPolicyMode,
 
     /// Prototype asynchronous WAL append (requires the `async-wal` feature and
@@ -133,6 +133,13 @@ async fn main() -> std::io::Result<()> {
 
     // Parse the parameters passed by arguments.
     let options = Opt::parse();
+
+    match options.read_policy {
+        ReadPolicyMode::Lease => tracing::warn!(
+            "leader-consistent reads use lease mode by default; this requires bounded clock drift (NTP/PTP). Use --read-policy read_index when that is not guaranteed"
+        ),
+        ReadPolicyMode::ReadIndex => tracing::info!("leader-consistent reads use ReadIndex"),
+    }
 
     let wal_fsync = matchengine_raft::store::config::wal_fsync_from_env();
     let min_voters = if wal_fsync.is_none() {

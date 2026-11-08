@@ -336,6 +336,11 @@ pub fn default_raft_config() -> Config {
         election_timeout_max: 3000,
         snapshot_policy: SnapshotPolicy::LogsSinceLast(DEFAULT_SNAPSHOT_LOG_THRESHOLD),
         replication_lag_threshold: DEFAULT_REPLICATION_LAG_THRESHOLD,
+        // Measured production values: 1,024 payloads, 1,024 purge batches and a
+        // 1 ms linger all regressed throughput or tail latency.
+        max_payload_entries: 300,
+        purge_batch_size: 1,
+        api_batch_linger_ms: 0,
         // Ask peers before campaigning so a restarted or partitioned node cannot
         // inflate the term and depose a healthy leader. The gRPC transport
         // implements `RaftNetworkV2::pre_vote`; openraft's default grants
@@ -872,6 +877,9 @@ mod tests {
                 < config.election_timeout_min
         );
         assert!(config.replication_lag_threshold > DEFAULT_SNAPSHOT_LOG_THRESHOLD);
+        assert_eq!(300, config.max_payload_entries);
+        assert_eq!(1, config.purge_batch_size);
+        assert_eq!(0, config.api_batch_linger_ms);
         config
             .validate()
             .expect("default Raft config must validate");

@@ -90,8 +90,8 @@ Everything below is implemented in this repository and exercised by tests; the l
 - **Durable match-event feed** at `POST /events` with cursor pagination, long-poll (`wait_ms`), retention limits, `client_order_id` idempotency, gRPC `StreamEvents` streaming and a reference MQ bridge sidecar; replay-safe retries.
 - **Deterministic market-data feed** with leader gating, shadow book, BBO, depth snapshots/deltas, lifecycle events, OHLC bars and a compact binary wire format with a reference decoder. The feature-gated **Aeron** egress publishes it on streams 2001–2007 with one exclusive publication per stream.
 - **Standalone market-data system** at `demos/market_data_system/`: consumes the feed over Aeron or JSONL and serves Binance-style WebSocket streams. One instance serves several symbols from a shared hub; clients hold a per-connection subscription set, switch symbols with live `UNSUBSCRIBE`/`SUBSCRIBE`, and scale horizontally without adding engine work.
-- **Flexible read consistency**: local reads, linearizable leader reads with `ReadIndex` or opt-in lease reads, and linearizable follower reads; `GET /read-policy/status` reports lease hits and fallbacks.
-- **Opt-in lease reads**: `--read-policy lease` tries `ReadPolicy::LeaseRead` for `/linearizable_read`, `/events`, gRPC `StreamEvents` and `/get_linearizer`, falling back to `ReadIndex` when the lease is stale. The default remains `ReadIndex`; lease reads require bounded clock drift.
+- **Flexible read consistency**: local reads, linearizable leader reads with lease reads by default and `ReadIndex` fallback, and linearizable follower reads; `GET /read-policy/status` reports lease hits and fallbacks.
+- **Lease reads by default**: leader-consistent reads try `ReadPolicy::LeaseRead` for `/linearizable_read`, `/events`, gRPC `StreamEvents` and `/get_linearizer`, falling back to `ReadIndex` when the lease is stale. Set `--read-policy read_index` to force a fresh quorum round. Lease reads require bounded clock drift (NTP/PTP).
 - **Leader-aware Rust client** that tracks and forwards requests to the current leader, with configurable timeouts, transient retry/backoff and typed API/no-leader errors; retries are at-least-once, so use `client_order_id` for idempotent write retries.
 - **Operational APIs** for initialization, membership changes, metrics, event status and market-data status.
 - **Batch writes** at `POST /write_batch`: multiple requests in one Raft entry and one WAL append, with per-request sequences and continuous event ordinals.
@@ -134,10 +134,11 @@ Set `RAFT_CORE_WORKERS` to a positive worker count to run OpenRaft's RaftCore an
 worker on a dedicated multi-threaded runtime, isolated from the HTTP, gRPC and market-data tasks;
 unset or `0` keeps Raft on the shared runtime.
 
-Leader-consistent reads use `ReadIndex` by default. Set `--read-policy lease` (or
-`MATCHENGINE_READ_POLICY=lease`) to try `ReadPolicy::LeaseRead` for `/linearizable_read`, `/events`,
-gRPC `StreamEvents` and `/get_linearizer`, falling back to `ReadIndex` when the lease is stale.
-Lease reads require bounded clock drift between nodes; `/read` remains a local, possibly stale read.
+Leader-consistent reads use lease by default: `/linearizable_read`, `/events`, gRPC `StreamEvents`
+and `/get_linearizer` try `ReadPolicy::LeaseRead` and fall back to `ReadIndex` when the lease is
+stale. Set `--read-policy read_index` (or `MATCHENGINE_READ_POLICY=read_index`) to force a fresh
+quorum round. Lease reads require bounded clock drift between nodes; `/read` remains a local,
+possibly stale read.
 
 Market-data egress is off the consensus path: the tap is a bounded `try_send`, so a slow
 subscriber can never block `apply`. The feature-gated `AeronSink` publishes the same wire-v6
@@ -340,13 +341,13 @@ full methodology in [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md)):
 
 The 4-node figures use a 3-of-4 quorum on loopback with WAL fsync disabled and all four nodes in
 one process; the range and cross-host caveats are in [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md).
-Lease reads are opt-in; the default remains `ReadIndex` because lease reads require bounded clock drift.
+Lease reads are the default; set `--read-policy read_index` when bounded clock drift is not guaranteed.
 The write sweep peaks at 256 in-flight; payload/purge/linger/runtime/LTO defaults were not improved by the one-factor sweeps.
 
 **Recommended production profile.** For maximum throughput, leave `RAFT_WAL_FSYNC_MS` unset
 (default; requires at least four voters), keep `RAFT_CORE_WORKERS` unset and the OpenRaft
 `300/1/0` defaults, use `/write_batch` with 32–128 orders, and cap individual `/write` requests at 256 in flight.
-Set `--read-policy lease` when NTP/PTP keeps clock drift bounded; otherwise keep `ReadIndex`.
+Keep the default lease reads only when NTP/PTP keeps clock drift bounded; otherwise set `--read-policy read_index`.
 If acknowledged writes must survive an unclean crash, set `RAFT_WAL_FSYNC_MS=0` and batch writes
 to amortize the fsync. Do not use the 10 ms fsync mode, 1 ms batch linger, 1,024-entry
 payload/purge settings, async WAL or thin LTO; none beat the defaults. See

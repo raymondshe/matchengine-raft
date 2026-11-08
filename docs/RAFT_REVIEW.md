@@ -320,8 +320,9 @@ These are adjacent to storage/transport and improve operability:
   the console.
 - **`Raft::trigger().purge_log()`** — add a guarded console action for explicit log purge
   after a snapshot.
-- **`ReadPolicy::LeaseRead`** — opt-in lower-latency linearizable reads; requires bounded
-  clock drift. The current `/linearizable_read` and `/events` use `ReadIndex`.
+- **`ReadPolicy::LeaseRead`** — lower-latency linearizable reads; requires bounded clock drift.
+  It is now the default with a `ReadIndex` fallback; `--read-policy read_index` forces the
+  conservative path.
 - **`on_leader_change` callbacks** — replace metrics polling in the market-data leader
   watcher, a minor cleanup.
 - **`client_write_many`** — not recommended for `/write_batch`: the current

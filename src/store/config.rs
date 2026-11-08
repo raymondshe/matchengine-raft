@@ -91,8 +91,9 @@ pub struct StorageConfig {
     /// default to 1.
     pub min_voters: usize,
 
-    /// Leader-consistent read policy. `ReadIndex` is the default; `Lease` is
-    /// opt-in and falls back to `ReadIndex` when the lease is stale.
+    /// Leader-consistent read policy. `Lease` is the default and falls back to
+    /// `ReadIndex` when the lease is stale; set `ReadIndex` explicitly when
+    /// bounded clock drift is not guaranteed.
     pub read_policy: ReadPolicyMode,
 
     /// Prototype asynchronous WAL append. Only effective with the `async-wal`
@@ -329,15 +330,15 @@ mod tests {
     }
 
     #[test]
-    fn read_policy_defaults_to_read_index_and_is_configurable() {
+    fn read_policy_defaults_to_lease_and_is_configurable() {
         assert_eq!(
-            ReadPolicyMode::ReadIndex,
+            ReadPolicyMode::Lease,
             StorageConfig::new("/data").read_policy
         );
         assert_eq!(
-            ReadPolicyMode::Lease,
+            ReadPolicyMode::ReadIndex,
             StorageConfig::new("/data")
-                .with_read_policy(ReadPolicyMode::Lease)
+                .with_read_policy(ReadPolicyMode::ReadIndex)
                 .read_policy
         );
     }
