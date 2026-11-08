@@ -1,6 +1,6 @@
 # Performance measurements
 
-Measured on **2026-10-30** (runtime flavor A/B and P0 offloads: **2026-10-31**; measurement scope and RSS: **2026-11-01**; book p50/p99 and the pinned-core approximation: **2026-11-04**; end-to-end/storage rerun with the OpenRaft quick wins: **2026-11-06**; realistic-mix replay: **2026-11-06**; dedicated Raft runtime: **2026-11-06**; WAL fsync Tokio rerun: **2026-11-07**; four-node no-fsync cluster: **2026-11-07**; write concurrency/batching sweep: **2026-11-08**; async WAL prototype: **2026-11-08**; read-path benchmark: **2026-11-08**; OpenRaft minimal-benchmark comparison: **2026-11-08**) on the reference development machine:
+Measured on **2026-10-30** (runtime flavor A/B and P0 offloads: **2026-10-31**; measurement scope and RSS: **2026-11-01**; book p50/p99 and the pinned-core approximation: **2026-11-04**; end-to-end/storage rerun with the OpenRaft quick wins: **2026-11-06**; realistic-mix replay: **2026-11-06**; dedicated Raft runtime: **2026-11-06**; WAL fsync Tokio rerun: **2026-11-07**; four-node no-fsync cluster: **2026-11-07**; write concurrency/batching sweep: **2026-11-08**; async WAL prototype: **2026-11-08**; production configuration decisions: **2026-11-08**; read-path benchmark: **2026-11-08**; OpenRaft minimal-benchmark comparison: **2026-11-08**) on the reference development machine:
 
 - Apple M4 (`arm64`)
 - Rust `1.93.1`
@@ -53,7 +53,7 @@ its scope.
 | `cluster_e2e` | Four in-process loopback voters with a separate client runtime; HTTP `/write`/`/write_batch`, Raft 3/4 quorum replication over gRPC, WAL append without fsync, apply and response; optional client-count and OpenRaft config sweeps | Cross-host network latency, independent machines, disk contention between nodes | 50 warm-up writes; 500 sequential, 200 batches/size, 100×32 concurrent batches, and a 1/8/64/256/1024/4096-client sweep; fresh rounds | `Instant` per request/batch; p50/p95/p99 and medians | Two or three fresh rounds; high-concurrency tail is host-sensitive |
 | `read_e2e` | Four in-process loopback voters with a separate client runtime; local `/read`, `/linearizable_read` and `/events`; ReadIndex and lease policies; 1/64 readers; read-only and mixed with an offered 2,000 writes/s | Cross-host network and clock skew; independent machines | 100 warm-up reads per endpoint; 2,000 reads/reader per case; 100-event pages; depth-20 local reads; two runs per policy | `Instant` per request; p50/p95/p99 and throughput | Two runs; read-only rows are stable, mixed rows depend on writer pacing |
 | `feed_load` | Tokio tap, bounded queue, shadow book, wire encoding and processor drain with a null sink | JSONL/network sink I/O, Raft, HTTP | Offered-load generator at 50k/500k/2M fills/s | `Instant`; queue/drain counters | One run per target; no p99 table |
-| `storage` | WAL append/read/reopen with 20k real order entries and 512 KiB segments; optional `async-wal` prototype | State machine, Raft, HTTP | Closed-loop, 100-entry batches | `Instant` | Three runs, medians; no tail study; async variance is high |
+| `storage` | WAL append/read/reopen with 20k real order entries and 512 KiB segments; optional `async-wal` prototype | State machine, Raft, HTTP | Closed-loop, 100-entry batches | `Instant` | Five runs per mode; no tail study; async variance is high |
 | `p0_bench duplicate` | State-machine duplicate-retry lookup over a 262k-event window | HTTP, Raft, WAL | 200 retries after one setup | `Instant`; mean/p50/p99/max | Single run; a single scheduling outlier moves the mean |
 | `p0_bench read` | In-process node `/read orderbook_orders` with 100k orders and 8 concurrent writers | Cross-node replication; client-side parsing beyond bytes received | 2 readers x 10 large reads, writers in flight | `Instant`; read/write p50/p99/max | Single run; allocator/HTTP buffers affect peak RSS |
 | `p0_bench snapshot` | `persist_snapshot` encode/write/fsync for 100k orders while 8 writers run | Raft snapshot shipping; cross-node replication | 8 writers, snapshot on the main benchmark task | `Instant`; writer p50/p99/max and snapshot duration | Single run; encode/fsync dominated |
@@ -70,6 +70,81 @@ means a 64 MiB read-modify-write sweep runs between the clone and the timed oper
 cold rounds are interleaved in one time window: running all warm rounds first biased the warm pass
 (early samples carried clock ramp-up and the cold pass inherited a boosted clock), which showed up
 as cold p50 beating warm p50 on this host.
+
+## Production configuration decisions (2026-11-08)
+
+The measurements support two production profiles. Choose one; do not combine a lossy WAL mode
+with a single-voter deployment. The four-voter floor is part of the no-fsync contract.
+
+### Profile A: maximum throughput (recommended for performance)
+
+| Setting | Production choice |
+|---|---|
+| WAL durability | leave `RAFT_WAL_FSYNC_MS` unset (no fsync) |
+| Voters | at least 4; the binary enforces this when fsync is disabled |
+| Read policy | `--read-policy lease` when NTP/PTP keeps clock drift bounded and `/read-policy/status` shows lease hits; otherwise `ReadIndex` |
+| Raft runtime | `RAFT_CORE_WORKERS` unset or `0` (shared runtime) |
+| OpenRaft batching | defaults: `max_payload_entries=300`, `purge_batch_size=1`, `api_batch_linger_ms=0` |
+| Snapshots | defaults: every 100,000 log entries or 30 minutes |
+| Async WAL | off (no `--async-wal`, no `async-wal` feature needed) |
+| Build | default release profile; no LTO requirement |
+| Market data | 8,192-frame queue, leader-only default, external sink for production |
+
+The binary defaults already implement this profile except for the read policy: `ReadIndex` remains
+the safe default, so set `--read-policy lease` only after validating clock discipline.
+
+Profile A is **lossy on an unclean crash**. The four-voter floor protects against one node losing
+its unsynced tail; it does not protect against simultaneous failures or host power loss. Use
+Profile B when acknowledged writes must survive those cases.
+
+Measured envelope: the four-node no-fsync cluster does **5,039 sequential writes/s**,
+**90,569 writes/s at 256 in-flight** (p99 6.47 ms), **227,319 orders/s** for sequential
+128-order batches and **216,163 orders/s** for 100 x 32 concurrent batches. The single-node
+no-fsync control is higher for sequential writes (9,648/s) because there is no 3/4 quorum round
+trip; use the cluster rows for sizing.
+
+Client shape: use `/write_batch` with 32-128 orders per entry. 128 maximizes throughput
+(227k orders/s in the four-node cluster); 32-64 keeps batch latency lower. For individual
+`/write` requests, cap in-flight work at **256**; 1,024/4,096 fell to 44.8k/51.0k writes/s with
+21.8/76.5 ms p99. The measured batch shape is 100 concurrent 32-order batches. `apply` holds the
+state-machine lock for the whole batch, so do not exceed the 128-request cap.
+
+### Profile B: durable writes
+
+Set `RAFT_WAL_FSYNC_MS=0`. Keep the same runtime, OpenRaft, snapshot, feed and build choices,
+and use `/write_batch` for throughput. Single-node measurements: 262 sequential writes/s,
+17.9k concurrent writes/s, 180.2k orders/s for 100 x 32 concurrent batches, sequential
+p50/p99 3.9/5.0 ms. A four-node every-append run has not been measured; expect the quorum
+round trip plus follower fsyncs to reduce these numbers.
+
+### Rejected options
+
+| Option | Measurement | Decision |
+|---|---|---|
+| `max_payload_entries=1,024` | 66.0k vs 90.6k writes/s at 256 | keep 300 |
+| `purge_batch_size=1,024` with snapshots every 1,000 | 58.3k writes/s; snapshot-heavy control 60.3k | keep 1 and the 100k snapshot policy |
+| `api_batch_linger_ms=1` | 37.4k writes/s, p99 19.75 ms | keep 0 |
+| `RAFT_CORE_WORKERS=2` | 65.7k vs 90.6k at 256; paired A/B within noise; one worker is ~7% lower | keep shared; use 2 only for isolation |
+| Thin LTO + `codegen-units=1` | 77.8k vs 74.1k paired control, within host spread | keep the default profile |
+| Async WAL | storage 6.6x, but e2e 18.3k vs 17.3k writes/s (noise) | keep off; not a request-path win |
+| Fsync every 10 ms | 7,374 writes/s and 2.2-3.0 ms p99 | reject: dominated by both alternatives |
+| Fsync every 100 ms | 9,495 writes/s vs 9,648 disabled; still lossy and no four-voter guard | not selected; use only with four voters and an accepted 100 ms loss window |
+| Per-level bucket book | 1.84x sweep/3.31x cancel but 0.75x sparse amend/0.87x BBO advance | keep the current book; prototype only |
+| Arena allocator (`bumpalo`) | 79-88% worse single-operation latency in the external review | keep inline buffers; do not adopt |
+| Full-book `/read orderbook_orders` under load | p99 134 ms, 1.49 GiB peak RSS | use `orderbook_depth:N`; keep full-book reads off the hot path |
+| Unbounded market-data queue | the 2M fills/s overload test relies on drops + `GAP` | keep the bounded 8,192 queue |
+
+### Rules of thumb
+
+- Local `/read` is the fast path and may be stale; `/linearizable_read` and `/events` use the
+  read policy. Lease reads measured 2.17x/1.71x for `/linearizable_read` at 1/64 readers and
+  1.46x/1.18x for `/events`; confirm fallback counters before relying on them.
+- Do not use `--match-event-log` or `--market-data-log` as production feeds; they are node-local
+  debug sinks. Use the replicated `/events` cursor or the Aeron market-data service.
+- Keep `--max-events` at the default 262,144 unless the event window is deliberately sized; a
+  larger window increases memory and snapshot cost. External consumers should follow `/events`.
+- Re-run `cargo bench --bench cluster_e2e`, `read_e2e` and `e2e` on deployment hardware before
+  treating these as capacity numbers; all cluster rows are four in-process loopback voters.
 
 ## Memory footprint (measured peak RSS)
 
@@ -516,15 +591,15 @@ What transfers:
   check.
 - **Asynchronous append is the storage-side analogue.** The upstream `LogStore::append` inserts
   into memory, returns, and signals `IOFlushed` after a delayed flush; its test asserts entries are
-  readable before the flush completes. Our async-WAL item (§16) can use the same contract: a
-  pending-entry cache, a background writer/fsync, `IOFlushed` only when durable, and crash tests
-  proving unflushed entries are uncommitted. This matters for every-append and periodic-fsync
-  modes, not no-fsync.
+  readable before the flush completes. The async-WAL prototype now implements the same contract
+  behind the `async-wal` feature: a pending-entry cache, a background fsync, `IOFlushed` only
+  when durable, and crash tests. It improved storage throughput 6.6x but did not improve Raft
+  request throughput, so it remains off by default.
 - **Instrumentation and build settings.** The upstream harness uses `runtime-stats`, flamegraph,
   tokio-console and a profile binary that measures startup memory, write allocations, latency and
-  snapshot cost; it also builds with thin LTO and `codegen-units = 1`. We should expose
-  `data_metrics`/`server_metrics`/`runtime_stats`, profile `cluster_e2e`, and A/B thin LTO before
-  drawing conclusions.
+  snapshot cost; it also builds with thin LTO and `codegen-units = 1`. The local thin-LTO A/B was
+  within host spread and did not beat the default profile. Exposing
+  `data_metrics`/`server_metrics`/`runtime_stats` remains open.
 - **Follower-read cache is a later step.** The leader's lease read makes `/get_linearizer`
   cheaper, but a follower still pays one leader HTTP hop per read. A short-TTL linearizer cache
   bounded by the leader lease could remove it; it needs a safety analysis and is not a first move.
@@ -745,8 +820,8 @@ segments:
 
 The async median is about **6.6x** the synchronous median, but the range is wide: one run only
 reached 65.2k while four reached 168k-192k. The worker's fsync batching and filesystem timing
-dominate. Read/reopen numbers were similar. This is a storage-only measurement; a Raft-level A/B
-has not been run yet.
+dominate. Read/reopen numbers were similar. This is a storage-only measurement; the
+Raft-level A/B follows.
 
 A single-node Raft-level A/B used the same `e2e` suite on the multi-thread runtime, every-append
 mode, three runs per configuration. Sequential writes stayed at ~258-260 writes/s in both modes
@@ -929,12 +1004,12 @@ productionization ahead of the items below; see
    HTTP workers from it; the integration tests already exercised this path.
    The main runtime runs gRPC, the snapshot timer, the feed and HTTP. When
    `RAFT_CORE_WORKERS` is positive, OpenRaft's RaftCore and state-machine worker
-   run on a dedicated runtime with that many workers (2 is the tested default);
+   run on a dedicated runtime with that many workers (2 is the tested worker count);
    unset or `0` keeps the shared runtime. The 2026-11-06 A/B shows sequential
    latency unchanged and concurrent writes within the host's noise
    (17.0/14.8k/s dedicated vs 17.8/19.2k/s shared in the final pairs; an earlier
    prototype saw 19.3-20.2k/s). The benefit is isolation, not a measured
-   throughput win. Items 2-7 are implemented; items 8-11 remain open.
+   throughput win. Items 2-9 are implemented; items 10-11 remain open.
 
 2. **Move snapshot encode/decode to the blocking pool (P0, implemented).**
    `build_snapshot`, `persist_snapshot` and `install_snapshot` now encode/decode
@@ -1099,9 +1174,10 @@ The measurement rules transferred regardless of layout and are now implemented:
 - Matching and feed derivation are not the current bottleneck.
 - The upstream OpenRaft minimal benchmark (in-memory, no network, empty state machine) runs at
   33k put/s with one client and 3.5M/s with 4,096, while our 4-node no-fsync cluster runs at
-  5.0k/35.2k. Raft is not the current bottleneck; HTTP/JSON, WAL, apply and benchmark-runtime
-  contention dominate. Lease reads are implemented and measured; batching/payload tuning is the
-  highest-value next performance work.
+  5.0k sequential and 90.6k writes/s at the 256-client knee. Raft is not the current bottleneck;
+  HTTP/JSON, WAL, apply and client concurrency dominate. Lease reads and write batching are
+  implemented and measured; the remaining levers are admission control and read-policy adoption,
+  not Raft or book-level work.
 - Opt-in lease reads remove the fresh quorum round on leader reads and produced 2.17x/1.71x
   throughput and 2.18x/3.46x p50 gains for `/linearizable_read` at 1/64 readers in the 4-node
   loopback benchmark; `/events` gained 1.46x/1.18x. `ReadIndex` remains the default because lease
@@ -1146,8 +1222,8 @@ The measurement rules transferred regardless of layout and are now implemented:
 
 ### Implemented choices
 
-- One `write_all` + one `sync_data` per replicated append batch, so N entries in one AppendEntries
-  RPC cost one fsync.
+- In every-append mode, one `write_all` + one `sync_data` per replicated append batch, so N
+  entries in one AppendEntries RPC cost one fsync; the default no-fsync mode skips the `sync_data`.
 - `pread` reads against cached file handles, so replication can read while an append is in flight.
 - The order book, event window and dedupe map stay in memory; `apply` does no disk IO.
 - gRPC uses bidirectional `AppendStream` for pipelined replication, separate replication,

@@ -34,8 +34,9 @@ recovery on `spawn_blocking`, async JSONL sink/events bridge, Aeron publisher/so
 tasks, a Tokio WAL fsync worker; only the env-controlled `RaftThread` remains), the realistic-mix
 replay benchmark, the four-node no-fsync cluster benchmark (`cluster_e2e`), the write
 concurrency/batching sweep, the read-path benchmark plus opt-in lease reads (`read_e2e`), and the
-feature-gated async WAL prototype with crash-recovery tests. The measured baselines, write/lease
-decisions, async-WAL numbers and upstream OpenRaft comparison are in
+feature-gated async WAL prototype with crash-recovery tests, and the production configuration
+decision record (two durability profiles and rejected options). The measured baselines,
+write/lease decisions, async-WAL numbers and upstream OpenRaft comparison are in
 [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md).
 
 The upstream OpenRaft minimal benchmark (three in-process nodes, in-memory log/state machine,
@@ -57,19 +58,18 @@ configured size and readiness waits for recovery. The remaining P2/P3 items are 
 
 The next work, in order (re-prioritised 2026-11-08 after the write and read sweeps):
 
-1. **Add p99-aware concurrency/admission control (§8, P2).** The write sweep peaks at 256
-   in-flight requests and then falls to 44.8k/51.0k writes/s with 21.8/76.5 ms p99 at
-   1,024/4,096. Add a server-side in-flight limit or queue-depth metric, or document a 256-512
-   client cap for p99-sensitive deployments; re-measure with `/write` and `/write_batch`.
+1. **Add server-side p99-aware admission control (§8, P2).** The client-side 256-in-flight cap
+   is now documented in `PERFORMANCE.md`/`README.md` (256-512 for p99-sensitive deployments).
+   Remaining: a server-side in-flight limit or queue-depth metric, and a re-measurement with
+   `/write` and `/write_batch`.
 2. **Add OpenRaft observability, profiling and transport hygiene (§16, P2).** Expose
    `data_metrics`, `server_metrics` and `runtime_stats`; enable `runtime-stats` in profiling
    builds; make heartbeat/snapshot channel profiles explicit; add flamegraph/tokio-console
    guidance to `cluster_e2e`. This is the prerequisite for attributing the gap between our 5,039
    sequential writes/s and the 33k one-client upstream floor.
 3. **Benchmark regression gate and measurement hygiene (§8, P2).** Gate CI on deterministic
-   `apply_path` allocs/entry plus loose p50/p99 thresholds; run the Linux pinned-core `e2e` pass;
-   resolve or document the 10ms periodic-fsync tail. Add the 4-node, write-sweep, read-path and
-   async-WAL rows once their variance settles.
+   `apply_path` allocs/entry plus loose p50/p99 thresholds; run the Linux pinned-core `e2e` pass.
+   Add the 4-node, write-sweep, read-path and async-WAL rows once their variance settles.
 4. **Prove the four-voter no-fsync contract under failure (§7, P2).** The voter guard is tested;
    add a four-voter SIGKILL/failover case that proves the surviving cluster still commits and the
    restarted node catches up after one node loses its unsynced tail.
@@ -489,10 +489,13 @@ Remaining:
   scheduler noise from the fsync cost that dominates the current p99. The flag is implemented; this
   macOS host has no core-pinning API, so the recorded 2026-11-04 approximation is the
   current-thread runtime (p50 3.95ms / p99 5.22ms vs 3.93ms / 5.10ms multi-thread, i.e. no change).
-- [ ] **P2** Decide the periodic-fsync tail: 10 ms mode has a 2.2-3.0 ms p99 (p50 88.2 µs) while
-  100 ms/disabled stay near 0.2-0.3 ms. Profile the fsync/writeback interaction, or document
-  100 ms/disabled as the recommended modes and 10 ms as best-effort. The FD-clone fsync removed
-  the disk-lock stall; the remaining tail is filesystem-level.
+- [x] **P2** Decide the periodic-fsync tail. Decision: production uses either disabled fsync
+  with at least four voters (maximum throughput) or every-append fsync (durable writes). The 10 ms
+  mode is dominated: 7,374 writes/s and a 2.2-3.0 ms p99. The 100 ms mode is within noise of
+  disabled (9,495 vs 9,648 writes/s) but still lossy and has no four-voter guard, so it is not a
+  default; use it only with four voters and an accepted 100 ms loss window. The FD-clone fsync
+  removed the disk-lock stall; the remaining tail is filesystem-level. See the production
+  configuration section in `docs/PERFORMANCE.md`.
 - [ ] **P2** Reserve the known lengths for the remaining apply-path allocations (response `events`
   `Vec`, fill `MatchResult` `Vec`) where the shape is fixed; they are the `apply_path` leftovers.
 - [ ] **P2** Decide whether strict apply-thread affinity is worth the cost: the single-worker

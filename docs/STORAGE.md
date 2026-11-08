@@ -56,9 +56,12 @@ segment, deletes later segments, and returns the longest valid prefix. The node 
 peers. This can discard entries that only this node had; if no peer has them, they are unrecoverable.
 In every-append mode the same corruption is a fatal open error and the node refuses to start.
 
-For production, set `RAFT_WAL_FSYNC_MS=0` for the strongest durability, or a small `N` to bound the
-loss window to roughly `N` ms. Leaving it unset is fastest but can lose acknowledged writes on a
-crash; use it only when that risk is acceptable.
+For production, choose `RAFT_WAL_FSYNC_MS=0` for durable writes, or leave it unset with at least
+four voters for maximum throughput. The 100 ms periodic mode measured within noise of disabled but
+is still lossy and is not guarded by the four-voter floor; use it only with four voters and an
+accepted 100 ms loss window. The 10 ms mode is dominated (7.4k sequential writes/s and a 2.2-3.0 ms
+p99), so it is not a production choice. See the production configuration section in
+[`PERFORMANCE.md`](./PERFORMANCE.md#production-configuration-decisions-2026-11-08).
 
 When `RAFT_WAL_FSYNC_MS` is unset, the binary also requires at least **four voters**: `/init` and
 `/change-membership` reject smaller voter sets, and `/write`/`/write_batch` return `503` until four

@@ -343,6 +343,15 @@ one process; the range and cross-host caveats are in [`docs/PERFORMANCE.md`](./d
 Lease reads are opt-in; the default remains `ReadIndex` because lease reads require bounded clock drift.
 The write sweep peaks at 256 in-flight; payload/purge/linger/runtime/LTO defaults were not improved by the one-factor sweeps.
 
+**Recommended production profile.** For maximum throughput, leave `RAFT_WAL_FSYNC_MS` unset
+(default; requires at least four voters), keep `RAFT_CORE_WORKERS` unset and the OpenRaft
+`300/1/0` defaults, use `/write_batch` with 32–128 orders, and cap individual `/write` requests at 256 in flight.
+Set `--read-policy lease` when NTP/PTP keeps clock drift bounded; otherwise keep `ReadIndex`.
+If acknowledged writes must survive an unclean crash, set `RAFT_WAL_FSYNC_MS=0` and batch writes
+to amortize the fsync. Do not use the 10 ms fsync mode, 1 ms batch linger, 1,024-entry
+payload/purge settings, async WAL or thin LTO; none beat the defaults. See
+[production configuration decisions](./docs/PERFORMANCE.md#production-configuration-decisions-2026-11-08).
+
 WAL fsync is controlled by `RAFT_WAL_FSYNC_MS`: unset = no fsync (default), `0` = every append,
 `N > 0` = periodic every N ms. Non-every-append modes trade durability for throughput; with fsync
 disabled the same WAL benchmark appends about 2M entries/s. When fsync is disabled the node

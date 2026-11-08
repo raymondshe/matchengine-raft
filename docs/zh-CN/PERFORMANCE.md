@@ -1,5 +1,69 @@
 # 性能细节
 
+## 生产配置决策（2026-11-08）
+
+测量支持两种生产配置；不要把有损 WAL 模式与单投票者部署混用。无 fsync 模式要求至少 4 个投票者。
+
+### 方案 A：最大吞吐（性能优先，推荐）
+
+| 配置 | 选择 |
+|---|---|
+| WAL 持久化 | 保持 `RAFT_WAL_FSYNC_MS` 未设置（不 fsync） |
+| 投票者 | 至少 4 个；无 fsync 时二进制强制 |
+| 读策略 | 时钟漂移有界且 `/read-policy/status` 显示 lease 命中时用 `--read-policy lease`；否则 `ReadIndex` |
+| Raft 运行时 | `RAFT_CORE_WORKERS` 未设置或 0（共享运行时） |
+| OpenRaft 批处理 | 默认 `max_payload_entries=300`、`purge_batch_size=1`、`api_batch_linger_ms=0` |
+| 快照 | 默认每 100,000 条日志或 30 分钟 |
+| 异步 WAL | 关闭 |
+| 构建 | 默认 release profile，无需 LTO |
+| 行情 | 8,192 帧队列、默认 leader-only、生产使用外部 sink |
+
+二进制默认值已经实现该方案，只有读策略例外：默认仍是安全的 `ReadIndex`，确认时钟纪律后再设置
+`--read-policy lease`。
+
+方案 A 在非正常崩溃时**会丢失数据**。四投票者保护的是单个节点丢失未 fsync 尾部的情况，不保护
+同时多节点故障或整机断电。已确认写入必须在这种情况下存活时，使用方案 B。
+
+实测范围：四节点无 fsync 集群 **5,039 串行 writes/s**、**256 在途 90,569 writes/s**（p99 6.47ms）、
+串行 128 单批次 **227,319 单/s**、100 x 32 并发批次 **216,163 单/s**。单节点无 fsync 串行更高
+（9,648/s），因为没有 3/4 quorum 往返；容量估算用集群行。
+
+客户端：`/write_batch` 每批 32–128 单。128 单吞吐最高；32–64 延迟更低。单个 `/write` 请求的
+在途上限为 **256**；1,024/4,096 降至 44.8k/51.0k writes/s，p99 21.8/76.5ms。批量实测形状为
+100 个并发 32 单批次。`apply` 在整批期间持有状态机锁，不要超过 128 单上限。
+
+### 方案 B：持久写入
+
+设置 `RAFT_WAL_FSYNC_MS=0`，其余运行时、OpenRaft、快照、行情和构建选择不变，并用 `/write_batch`
+摊薄 fsync。单节点实测：串行 262 writes/s、并发 17.9k writes/s、100 x 32 并发批次 180.2k 单/s，
+串行 p50/p99 3.9/5.0ms。四节点每次追加模式尚未测量；quorum 往返和 follower fsync 会进一步降低。
+
+### 不采用的选项
+
+| 选项 | 测量 | 决策 |
+|---|---|---|
+| `max_payload_entries=1,024` | 256 在途 66.0k vs 90.6k | 保留 300 |
+| `purge_batch_size=1,024` + 每 1,000 条快照 | 58.3k；快照密集对照 60.3k | 保留 1 和 100k 快照策略 |
+| `api_batch_linger_ms=1` | 37.4k，p99 19.75ms | 保留 0 |
+| `RAFT_CORE_WORKERS=2` | 65.7k vs 90.6k；配对 A/B 在噪声内；单 worker 再低约 7% | 共享；仅用于隔离 |
+| Thin LTO + `codegen-units=1` | 77.8k vs 74.1k 对照，在主机波动内 | 保留默认 profile |
+| 异步 WAL | 存储 6.6x，但 e2e 18.3k vs 17.3k（噪声） | 关闭；请求路径无收益 |
+| 10ms fsync | 7,374 writes/s，p99 2.2-3.0ms | 不采用：被两种方案同时压制 |
+| 100ms fsync | 9,495 vs 9,648 writes/s；仍有损且无四投票者保护 | 不选；仅在接受 100ms 丢失窗口且有 4 投票者时使用 |
+| 每价位 bucket | sweep 1.84x/cancel 3.31x，但稀疏 amend 0.75x/BBO advance 0.87x | 保留当前订单簿；仅原型 |
+| Arena 分配器（`bumpalo`） | 外部评审中单操作延迟差 79-88% | 保留内联缓冲；不采用 |
+| 高负载全量 `/read orderbook_orders` | p99 134ms，峰值 RSS 1.49GiB | 用 `orderbook_depth:N`，全量读不要放热路径 |
+| 无界行情队列 | 2M fills/s 过载测试依赖丢弃 + GAP | 保留 8,192 有界队列 |
+
+### 经验规则
+
+- 本地 `/read` 是快路径但可能过期；`/linearizable_read` 和 `/events` 使用读策略。lease 在 1/64
+  读者下把 `/linearizable_read` 提升 2.17x/1.71x，`/events` 提升 1.46x/1.18x；依赖前确认 fallback 计数。
+- 不要把 `--match-event-log` 或 `--market-data-log` 当生产 feed；它们是节点本地调试 sink。使用
+  复制 `/events` 游标或 Aeron 行情服务。
+- 除非刻意调整事件窗口，保持 `--max-events` 默认 262,144；更大窗口增加内存和快照成本。
+- 所有集群数字来自四节点同进程 loopback；上生产前在部署硬件重跑 `cluster_e2e`、`read_e2e` 和 `e2e`。
+
 ## 已实现的性能设计
 
 - 每个复制追加批次一次 `write_all`；fsync 由 `RAFT_WAL_FSYNC_MS` 控制（未设置 = 不 fsync，`0` = 每次追加，`N` = 每 N ms 周期）。
@@ -71,7 +135,7 @@ loopback 上运行，覆盖 Raft quorum 与 gRPC 传输成本，但不模拟跨�
 | 每次追加，异步原型 | **172,374 条/s** | 65,176-192,160 |
 
 异步中位数约为同步的 **6.6x**，但波动很大：一轮只有 65.2k，其余四轮为 168k-192k；worker 的
-fsync 批处理和文件系统时序影响明显。读/重开数字接近。这是存储层结果，尚未做 Raft 级 A/B。
+fsync 批处理和文件系统时序影响明显。读/重开数字接近。这是存储层结果；Raft 级 A/B 见下。
 
 单节点 Raft 级 A/B 使用同一 `e2e` 套件、多线程运行时、每次追加模式，每种配置 3 轮。串行写入
 两种模式都约 258-260 writes/s，因为每个请求仍需等待 `IOFlushed`。1,000 并发写入中位数为同步
@@ -114,21 +178,22 @@ lease 结果，因为 alpha.37 的 `ReadPolicy::LeaseRead` 仍经过 RaftCore；
 
 上游 `openraft/benchmarks/minimal` 用单进程三节点、内存日志/空状态机、函数调用网络和空请求
 隔离 OpenRaft：1 客户端 33k put/s，4,096 客户端 3.5M put/s，batch 4 5.6M put/s；lease read
-单读者 90.4x、64 读者 3.9x。我们的 4 节点无 fsync 集群为 5,039 串行 / 35,152 并发
+单读者 90.4x、64 读者 3.9x。我们的 4 节点无 fsync 集群为 5,039 串行 / 90,569（256 在途峰值）
 writes/s。Raft 不是当前瓶颈，HTTP/JSON、WAL、apply 和基准运行时竞争占主导。
 
 执行结果与后续项（详见英文 [PERFORMANCE.md](../PERFORMANCE.md)）：
 
 - 读取路径：为 `/linearizable_read`、`/events` 和 gRPC `StreamEvents` 增加可选
   `ReadPolicy::LeaseRead` 与 `ReadIndex` 回退；alpha.37 没有 `enable_local_lease_read`，
-  完整的本地缓存路径需要升级 OpenRaft。先加读取基准再改默认值。
+  完整的本地缓存路径需要升级 OpenRaft。基准已完成：lease 在 1/64 读者下提升 2.17x/1.71x；
+  默认仍为 `ReadIndex`，生产在时钟有界时选 lease。
 - 写入/批处理：已完成 1/8/64/256/1024/4096 客户端 sweep；256 在途峰值 90,569 writes/s，
   1,024/4,096 降至 44,829/50,996 writes/s。`max_payload_entries=1024`、`purge_batch_size=1024`、
   `api_batch_linger_ms=1`、`RAFT_CORE_WORKERS=2` 和薄 LTO 均无稳定收益；保留
   300/1/0/shared 和默认构建 profile。
 - 观测/存储：启用 `runtime-stats`、暴露 data/server metrics、加入 flamegraph/tokio-console；
-  异步 WAL append（pending cache + `IOFlushed`）是每次追加 fsync 模式下最大的存储机会。
-  薄 LTO + `codegen-units=1` 做 A/B。
+  异步 WAL 原型已完成（存储 6.6x，但 Raft 请求路径无稳定收益，默认关闭）。
+  薄 LTO + `codegen-units=1` A/B 无稳定收益，保留默认 profile。
 
 ## 当前限制与已知差距
 
