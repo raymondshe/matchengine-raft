@@ -32,9 +32,10 @@ best-effort WAL recovery, the four-voter no-fsync floor (`test_min_voters.rs`), 
 dedicated OpenRaft runtime (`RAFT_CORE_WORKERS`), the thread/lock audit (blocking sinks and startup
 recovery on `spawn_blocking`, async JSONL sink/events bridge, Aeron publisher/source blocking
 tasks, a Tokio WAL fsync worker; only the env-controlled `RaftThread` remains), the realistic-mix
-replay benchmark, the four-node no-fsync cluster benchmark (`cluster_e2e`), and the read-path
-benchmark plus opt-in lease reads (`read_e2e`). The measured baselines, lease gains and upstream
-OpenRaft comparison are in [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md).
+replay benchmark, the four-node no-fsync cluster benchmark (`cluster_e2e`), the write
+concurrency/batching sweep, and the read-path benchmark plus opt-in lease reads (`read_e2e`). The
+measured baselines, write/lease decisions and upstream OpenRaft comparison are in
+[`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md).
 
 The upstream OpenRaft minimal benchmark (three in-process nodes, in-memory log/state machine,
 function-call network, empty requests) reports 33k put/s with one client and 3.5M put/s with 4,096,
@@ -53,12 +54,12 @@ implemented: the replication lag threshold now sits above the 100k snapshot poli
 suppression is enabled, HTTP/2 windows/keepalive are tuned, snapshot chunks follow OpenRaft's
 configured size and readiness waits for recovery. The remaining P2/P3 items are tracked in §16.
 
-The next work, in order (re-prioritised 2026-11-08 after the OpenRaft minimal-benchmark review):
+The next work, in order (re-prioritised 2026-11-08 after the write and read sweeps):
 
-1. **Sweep write concurrency and batching (§8/§16, P2).** Extend `cluster_e2e` with
-   1/8/64/256/1024/4096 clients and a separate client runtime/process. Sweep
-   `max_payload_entries` 300/1024, `purge_batch_size` 1/1024, `api_batch_linger_ms` 0/100/500µs
-   and `RAFT_CORE_WORKERS`; A/B thin LTO + `codegen-units = 1`. Keep p99 in the decision.
+1. **Add p99-aware concurrency/admission control (§8, P2).** The write sweep peaks at 256
+   in-flight requests and then falls to 44.8k/51.0k writes/s with 21.8/76.5 ms p99 at
+   1,024/4,096. Add a server-side in-flight limit or queue-depth metric, or document a 256-512
+   client cap for p99-sensitive deployments; re-measure with `/write` and `/write_batch`.
 2. **Add OpenRaft observability, profiling and transport hygiene (§16, P2).** Expose
    `data_metrics`, `server_metrics` and `runtime_stats`; enable `runtime-stats` in profiling
    builds; make heartbeat/snapshot channel profiles explicit; add flamegraph/tokio-console
@@ -70,8 +71,8 @@ The next work, in order (re-prioritised 2026-11-08 after the OpenRaft minimal-be
    default.
 4. **Benchmark regression gate and measurement hygiene (§8, P2).** Gate CI on deterministic
    `apply_path` allocs/entry plus loose p50/p99 thresholds; run the Linux pinned-core `e2e` pass;
-   resolve or document the 10ms periodic-fsync tail. Add the 4-node and read-path rows once their
-   measurement variance settles.
+   resolve or document the 10ms periodic-fsync tail. Add the 4-node, write-sweep and read-path rows
+   once their variance settles.
 5. **Prove the four-voter no-fsync contract under failure (§7, P2).** The voter guard is tested;
    add a four-voter SIGKILL/failover case that proves the surviving cluster still commits and the
    restarted node catches up after one node loses its unsynced tail.
@@ -82,9 +83,9 @@ The next work, in order (re-prioritised 2026-11-08 after the OpenRaft minimal-be
 
 The earlier measurement work is done: `book_replay` and `level_book` report warm p50/p99 plus an
 interleaved cold pass, `replay_mix` replays a 100,000-operation fixture with fees, the 4-node
-no-fsync cluster, the read-path/lease results and the upstream OpenRaft comparison are recorded in
-`PERFORMANCE.md`, and the `Order` identity/optional-sequence/BTC-USDT/overflow-case quick wins
-landed. The third-party follow-ups are P2/P3 (§14); measurement scope, peak RSS, the fuzz targets, health/readiness and the
+no-fsync cluster, the write concurrency/batching sweep, the read-path/lease results and the
+upstream OpenRaft comparison are recorded in `PERFORMANCE.md`, and the `Order`
+identity/optional-sequence/BTC-USDT/overflow-case quick wins landed. The third-party follow-ups are P2/P3 (§14); measurement scope, peak RSS, the fuzz targets, health/readiness and the
 operational console are in place. Equity/ETF sessions, holidays, auctions, T+1/T+2 settlement,
 corporate actions and fixed/regulatory/minimum/tax fees are owned by the external order system
 (§13).
@@ -474,11 +475,15 @@ Remaining:
   2026-11-07 medians 5,039 sequential writes/s (p50 186.75µs, p99 368.875µs), 35,152
   concurrent writes/s, 227,319 orders/s at 128-order batches and 216,163 orders/s for
   100×32 concurrent batches. Four in-process loopback voters, 3/4 quorum, no fsync.
-- [ ] **P2** Extend `cluster_e2e` with a client-count sweep (1/8/64/256/1024/4096) and a separate
-  client runtime or process; report p50/p99 at each point and keep the load generator off the
-  server runtime. The current 4-node numbers share one runtime.
-- [ ] **P2** A/B thin LTO + `codegen-units = 1` for release/bench builds; record build time,
-  throughput and p99. The upstream minimal benchmark uses this profile.
+- [x] **P2** Extend `cluster_e2e` with a client-count sweep (1/8/64/256/1024/4096) and a separate
+  client runtime. Done: 2026-11-08 two-round medians peak at **90,569 writes/s at 256 in-flight**
+  (p99 6.47ms); 1,024/4,096 fall to 44,829/50,996 writes/s with 21.79/76.47ms p99.
+  `RAFT_CORE_WORKERS=2` measured 65.7k/42.1k/46.8k, no consistent win.
+- [x] **P2** A/B thin LTO + `codegen-units = 1` for release/bench builds. Done: paired control
+  74.1k/40.2k/40.8k vs LTO 77.8k/45.9k/45.4k at 256/1,024/4,096; within the host's run-to-run
+  spread, so the default profile stays.
+- [ ] **P2** Add p99-aware concurrency/admission control: a server-side in-flight limit or
+  queue-depth metric, or a documented 256-512 client cap; re-measure `/write` and `/write_batch`.
 - [ ] **P2** Add a benchmark regression gate (threshold or recorded baseline) to CI: start with
   deterministic `apply_path` allocs/entry and loose p50/p99 bounds for `book_replay` and
   `replay_mix`; add the stable fsync rows (every append and disabled) and the 4-node cluster rows
@@ -775,8 +780,8 @@ The full review is in [`RAFT_REVIEW.md`](./docs/RAFT_REVIEW.md). The transport a
 `RaftNetworkV2::stream_append` for replication and heartbeats and `full_snapshot` for snapshots;
 these follow-ups are about aligning OpenRaft 0.10 configuration with this workload and reducing
 storage/transport overhead. Re-prioritised 2026-11-08 after the upstream minimal-benchmark
-comparison: the read path is complete; observability and batching/payload/purge sweeps are next,
-then async WAL and optional APIs.
+comparison: the read path and payload/purge sweeps are complete; observability and admission
+control are next, then async WAL and optional APIs.
 
 **Read path**
 
@@ -823,11 +828,15 @@ then async WAL and optional APIs.
   writes and snapshot transfer time. The post-change e2e/storage baseline is now in
   [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md); use it to confirm the 1 MiB / 4 MiB HTTP/2
   window choice before tuning further.
-- [ ] **P2** Benchmark `max_payload_entries` (300 vs 1,024), `purge_batch_size` (1 vs 1,024),
-  `api_batch_linger_ms` (0/100/500µs) and `STREAM_APPEND_CHANNEL_SIZE` under the 4-node cluster and
-  a client-count sweep. The upstream minimal benchmark uses 1,024/1,024; our defaults are 300/1/0.
-  The append channel is bounded by count, not bytes, so large payloads can queue significant
-  memory; keep linger at 0 unless measurements justify the latency tradeoff.
+- [x] **P2** Benchmark `max_payload_entries` (300 vs 1,024), `purge_batch_size` (1 vs 1,024)
+  and `api_batch_linger_ms` under the 4-node cluster and a client sweep. Done: max_payload 1,024
+  measured 66.0k/42.5k/49.5k at 256/1,024/4,096 vs the 90.6k/44.8k/51.0k baseline; purge 1,024
+  with a snapshot every 1,000 gave no consistent win; linger 1ms regressed sharply. The field is
+  milliseconds, so 100/500µs is not representable; 100ms exhausted client ports. Keep 300/1/0.
+  The append channel is bounded by count, not bytes, so large payloads can still queue memory;
+  keep linger at 0 unless measurements justify the latency tradeoff.
+- [ ] **P2** Benchmark `STREAM_APPEND_CHANNEL_SIZE` separately; it is a compile-time transport
+  constant, so the runtime sweep above does not cover it.
 - [ ] **P2** Add guarded console actions for `raft.trigger().purge_log()` and supported
   `raft.runtime_config()` changes after a snapshot; document the safety constraints.
 

@@ -315,7 +315,7 @@ failure matrix are documented in [Testing](./docs/TESTING.md).
 ## Performance and Current Limits
 
 Measured baseline (Apple M4, Rust 1.93.1, release bench profile; single-node e2e/storage medians
-from 2026-11-06; 4-node no-fsync cluster from 2026-11-07; read-path benchmark from 2026-11-08;
+from 2026-11-06; 4-node no-fsync cluster from 2026-11-07; write concurrency/batching sweep and read-path benchmark from 2026-11-08;
 full methodology in [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md)):
 
 | Workload | Result |
@@ -326,7 +326,8 @@ full methodology in [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md)):
 | Sequential `/write_batch` (single node, fsync every append, 128 orders) | 23,249 orders/s |
 | Concurrent `/write_batch` (single node, fsync every append, 100 × 32) | 139,323 orders/s |
 | 4-node no-fsync cluster: sequential `/write` p50 / p99 | 186.8 µs / 368.9 µs |
-| 4-node no-fsync cluster: concurrent `/write` (1,000 in flight) | 35,152 writes/s |
+| 4-node no-fsync cluster: concurrency sweep peak (256 in flight) | 90,569 writes/s, p99 6.47 ms |
+| 4-node no-fsync cluster: 1,024 / 4,096 in flight | 44,829 / 50,996 writes/s, p99 21.79 / 76.47 ms |
 | 4-node no-fsync cluster: sequential `/write_batch` (128 orders) | 227,319 orders/s |
 | 4-node no-fsync cluster: concurrent `/write_batch` (100 × 32) | 216,163 orders/s |
 | 4-node no-fsync cluster: `/linearizable_read` p50 / p99 (1 reader, ReadIndex → lease) | 119.7 / 243.6 µs → 54.9 / 83.9 µs |
@@ -337,6 +338,7 @@ full methodology in [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md)):
 The 4-node figures use a 3-of-4 quorum on loopback with WAL fsync disabled and all four nodes in
 one process; the range and cross-host caveats are in [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md).
 Lease reads are opt-in; the default remains `ReadIndex` because lease reads require bounded clock drift.
+The write sweep peaks at 256 in-flight; payload/purge/linger/runtime/LTO defaults were not improved by the one-factor sweeps.
 
 WAL fsync is controlled by `RAFT_WAL_FSYNC_MS`: unset = no fsync (default), `0` = every append,
 `N > 0` = periodic every N ms. Non-every-append modes trade durability for throughput; with fsync

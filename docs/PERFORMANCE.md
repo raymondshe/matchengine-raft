@@ -1,6 +1,6 @@
 # Performance measurements
 
-Measured on **2026-10-30** (runtime flavor A/B and P0 offloads: **2026-10-31**; measurement scope and RSS: **2026-11-01**; book p50/p99 and the pinned-core approximation: **2026-11-04**; end-to-end/storage rerun with the OpenRaft quick wins: **2026-11-06**; realistic-mix replay: **2026-11-06**; dedicated Raft runtime: **2026-11-06**; WAL fsync Tokio rerun: **2026-11-07**; four-node no-fsync cluster: **2026-11-07**; read-path benchmark: **2026-11-08**; OpenRaft minimal-benchmark comparison: **2026-11-08**) on the reference development machine:
+Measured on **2026-10-30** (runtime flavor A/B and P0 offloads: **2026-10-31**; measurement scope and RSS: **2026-11-01**; book p50/p99 and the pinned-core approximation: **2026-11-04**; end-to-end/storage rerun with the OpenRaft quick wins: **2026-11-06**; realistic-mix replay: **2026-11-06**; dedicated Raft runtime: **2026-11-06**; WAL fsync Tokio rerun: **2026-11-07**; four-node no-fsync cluster: **2026-11-07**; write concurrency/batching sweep: **2026-11-08**; read-path benchmark: **2026-11-08**; OpenRaft minimal-benchmark comparison: **2026-11-08**) on the reference development machine:
 
 - Apple M4 (`arm64`)
 - Rust `1.93.1`
@@ -15,7 +15,8 @@ on the deployment hardware before using the numbers for sizing.
 ```shell
 cargo bench --bench matchengine   # order-book microbenchmarks
 cargo bench --bench e2e           # submit -> commit -> apply -> response (multi-thread; -- current|both for A/B, --pin <cpu> on Linux)
-cargo bench --bench cluster_e2e -- --rounds 3  # four in-process no-fsync voters, leader-direct writes
+cargo bench --bench cluster_e2e -- --rounds 3  # four in-process no-fsync voters, leader-direct writes and batches
+cargo bench --bench cluster_e2e -- --rounds 2 --concurrency-only  # 1/8/64/256/1024/4096-client sweep
 cargo bench --bench read_e2e -- --policy both  # local /read, /linearizable_read and /events; ReadIndex vs lease
 cargo bench --bench feed_load     # market-data feed at 50k/500k fills/s
 cargo bench --bench storage       # WAL append/read/recovery
@@ -47,7 +48,7 @@ its scope.
 | `apply_path` | `StateMachineStore::apply` only: blank, rest, cancel, fill and 128-request batch workloads; a counting global allocator reports heap calls and requested bytes | HTTP, Raft, WAL, snapshots, market-data tap, event-log reads, response serialization | Closed-loop, direct apply; 50k entries or 1k batches per workload | Counting allocator; per-entry averages | Requested bytes include realloc churn and are not a live-memory high-water mark |
 | `e2e` `/write` | HTTP decode/validation, Raft proposal/commit, WAL append + `sync_data`, apply, response serialization | Cross-node replication, external client network beyond loopback | Sequential is closed-loop; concurrent is a 1,000-request burst | `Instant` per request; p50/p95/p99/max | Medians/percentiles; runtime A/B uses four alternating runs, the 2026-11-06 rerun uses three |
 | `e2e` `/write_batch` | Same as `/write`, with 1–128 requests per Raft entry and one WAL fsync per entry | Same as `/write` | 200 sequential batches per size; 100 concurrent 32-order batches | `Instant` per batch | Medians of three runs per size; batch latency includes payload/apply growth |
-| `cluster_e2e` | Four in-process loopback voters; HTTP `/write`/`/write_batch`, Raft 3/4 quorum replication over gRPC, WAL append without fsync, apply and response | Cross-host network latency, independent machines, disk contention between nodes | 50 warm-up writes; 500 sequential, 1,000 concurrent, 200 batches/size and 100×32 concurrent batches per round; three fresh rounds | `Instant` per request/batch; p50/p95/p99 and medians | Three fresh rounds; ranges reported in the cluster section |
+| `cluster_e2e` | Four in-process loopback voters with a separate client runtime; HTTP `/write`/`/write_batch`, Raft 3/4 quorum replication over gRPC, WAL append without fsync, apply and response; optional client-count and OpenRaft config sweeps | Cross-host network latency, independent machines, disk contention between nodes | 50 warm-up writes; 500 sequential, 200 batches/size, 100×32 concurrent batches, and a 1/8/64/256/1024/4096-client sweep; fresh rounds | `Instant` per request/batch; p50/p95/p99 and medians | Two or three fresh rounds; high-concurrency tail is host-sensitive |
 | `read_e2e` | Four in-process loopback voters with a separate client runtime; local `/read`, `/linearizable_read` and `/events`; ReadIndex and lease policies; 1/64 readers; read-only and mixed with an offered 2,000 writes/s | Cross-host network and clock skew; independent machines | 100 warm-up reads per endpoint; 2,000 reads/reader per case; 100-event pages; depth-20 local reads; two runs per policy | `Instant` per request; p50/p95/p99 and throughput | Two runs; read-only rows are stable, mixed rows depend on writer pacing |
 | `feed_load` | Tokio tap, bounded queue, shadow book, wire encoding and processor drain with a null sink | JSONL/network sink I/O, Raft, HTTP | Offered-load generator at 50k/500k/2M fills/s | `Instant`; queue/drain counters | One run per target; no p99 table |
 | `storage` | WAL append/read/reopen with 20k real order entries and 512 KiB segments | State machine, Raft, HTTP | Closed-loop, 100-entry batches | `Instant` | Three runs, medians; no tail study |
@@ -375,6 +376,58 @@ so it retains about 73% of the single-node throughput. This is an in-process loo
 four independent hosts: it covers the Raft quorum and gRPC transport cost, but not cross-host
 network latency, independent machine failure or disk contention between nodes.
 
+### Write concurrency and batching sweep (2026-11-08)
+
+`cargo bench --bench cluster_e2e -- --rounds 2 --concurrency-only` starts the four-node no-fsync
+topology on a server runtime and runs the write clients on a separate runtime. Each client task
+sends one request at a time; 1/8/64 clients send about 2,000 requests per case, 256 sends 1,792,
+1,024 sends 1,024 and 4,096 sends 4,096. The table is the median of two fresh rounds.
+
+| Clients in flight | Writes/s | p50 | p95 | p99 |
+|---:|---:|---:|---:|---:|
+| 1 | 5,778 | 169.3 µs | 216.8 µs | 293.9 µs |
+| 8 | 26,958 | 309.8 µs | 413.1 µs | 455.7 µs |
+| 64 | 79,191 | 792.5 µs | 1.064 ms | 1.662 ms |
+| 256 | **90,569** | 2.256 ms | 5.487 ms | 6.467 ms |
+| 1,024 | 44,829 | 14.199 ms | 20.040 ms | 21.789 ms |
+| 4,096 | 50,996 | 19.707 ms | 64.566 ms | 76.465 ms |
+
+The knee is at **256 in-flight**: throughput peaks there and then falls, while p99 grows from
+6.5 ms to 21.8 ms and 76.5 ms at 1,024/4,096. More client concurrency does not add server
+throughput past that point. For p99-sensitive deployments, cap in-flight requests around 256-512
+or use `/write_batch` (128-order batches reach 227,319 orders/s in the four-node cluster section)
+instead of increasing concurrency. A server-side in-flight limit or queue-depth metric is the
+natural follow-up.
+
+One-factor sweeps at the same topology. The rows are separate runs on the same host; compare
+the shape and the p99 direction, not exact percentages.
+
+| Variant | 256 writes/s (p99) | 1,024 writes/s (p99) | 4,096 writes/s (p99) | Decision |
+|---|---:|---:|---:|---|
+| Default: 300 / 1 / 0 / shared | 90.6k (6.47 ms) | 44.8k (21.79 ms) | 51.0k (76.47 ms) | baseline |
+| `max_payload_entries = 1,024` | 66.0k (11.83 ms) | 42.5k (23.34 ms) | 49.5k (78.52 ms) | no win; keep 300 |
+| `purge_batch_size = 1,024`, snapshot every 1,000 | 58.3k (12.74 ms) | 30.5k (34.77 ms) | 34.5k (125.04 ms) | no consistent win; keep 1 |
+| `purge_batch_size = 1`, snapshot every 1,000 | 60.3k (12.23 ms) | 33.6k (29.03 ms) | 34.2k (136.02 ms) | snapshot-heavy control |
+| `api_batch_linger_ms = 1` | 37.4k (19.75 ms) | 31.3k (31.05 ms) | 45.1k (82.11 ms) | severe regression; keep 0 |
+| `RAFT_CORE_WORKERS = 2` | 65.7k (11.75 ms) | 42.1k (29.86 ms) | 46.8k (77.14 ms) | no consistent win; keep shared |
+| Thin LTO + `codegen-units = 1` | 77.8k (12.33 ms) | 45.9k (21.36 ms) | 45.4k (93.90 ms) | within host spread; keep default |
+| Paired default control for LTO | 74.1k (12.61 ms) | 40.2k (28.14 ms) | 40.8k (93.83 ms) | comparison control |
+
+`api_batch_linger_ms` is a millisecond field, so the requested 100/500 µs values are not
+representable; the smallest nonzero value is 1 ms, which already regressed throughput and tail.
+A 100 ms run also exhausted ephemeral client ports, so it is not a usable configuration. The
+default stays 0.
+
+`purge_batch_size` only matters when snapshots run; the sweep used a deliberately aggressive
+`LogsSinceLast(1,000)` policy so each round purged several times. That policy itself costs roughly
+a third of the 256-client throughput; changing only the purge batch did not recover it. Keep the
+production defaults 300/1/0 and the shared Raft runtime. The LTO A/B was within the host's
+run-to-run spread and is not adopted.
+
+Caveat: all four voters share one process and host; the 1,024/4,096 rows are burst tails, not a
+capacity guarantee. The important result is the shape — throughput peaks around 256 and tail
+latency grows sharply beyond it.
+
 ### Read-path benchmark: ReadIndex vs lease (2026-11-08)
 
 `cargo bench --bench read_e2e -- --policy both` starts the same four-node no-fsync topology on a
@@ -451,8 +504,9 @@ What transfers:
   227,319 orders/s versus 5,039 sequential writes/s, so application batching is already the main
   throughput lever. For independent clients, sweep client count and the server-side batch knobs:
   the upstream benchmark sets `max_payload_entries = 1,024` and `purge_batch_size = 1,024`; our
-  defaults are 300 and 1, with `api_batch_linger_ms = 0`. Test 1/8/64/256/1,024/4,096 clients and
-  a small linger (0/100/500µs) before changing defaults; keep p99 in the decision.
+  defaults are 300 and 1, with `api_batch_linger_ms = 0`. The 2026-11-08 sweep tested
+  1/8/64/256/1,024/4,096 clients and those knobs: the knee is at 256 in-flight, and no setting
+  beat the defaults; see the write-sweep section above.
 - **Separate client and server runtimes.** The upstream harness runs clients on one runtime and
   servers on 16 workers. Our `cluster_e2e` currently runs the load generator and all four nodes on
   one runtime, so the published 5,039/35,152 numbers include driver contention. A separate client
@@ -826,9 +880,10 @@ actor with batching; otherwise `RAFT_CORE_WORKERS=2` is the practical compromise
 
 ### Prioritized opportunities
 
-The 2026-11-08 read-path and OpenRaft minimal comparisons put batching/payload and async-WAL work
-ahead of the items below; see [Read-path benchmark](#read-path-benchmark-readindex-vs-lease-2026-11-08)
-and [OpenRaft minimal benchmark comparison](#openraft-minimal-benchmark-comparison-2026-11-08).
+The 2026-11-08 write/read sweeps put concurrency/admission control and async-WAL work ahead of the
+items below; see [Write concurrency and batching sweep](#write-concurrency-and-batching-sweep-2026-11-08),
+[Read-path benchmark](#read-path-benchmark-readindex-vs-lease-2026-11-08) and
+[OpenRaft minimal benchmark comparison](#openraft-minimal-benchmark-comparison-2026-11-08).
 
 1. **Run the node on a multi-threaded Tokio runtime, with OpenRaft isolated (P0, implemented).**
    `src/main.rs` now uses `#[tokio::main(flavor = "multi_thread")]` instead of
@@ -1013,6 +1068,10 @@ The measurement rules transferred regardless of layout and are now implemented:
   throughput and 2.18x/3.46x p50 gains for `/linearizable_read` at 1/64 readers in the 4-node
   loopback benchmark; `/events` gained 1.46x/1.18x. `ReadIndex` remains the default because lease
   reads require bounded clock drift and the fallback path was not exercised on one host.
+- The write concurrency sweep peaks at 256 in-flight (90.6k writes/s, p99 6.47 ms); 1,024 and
+  4,096 in-flight fall to 44.8k/51.0k writes/s with 21.8/76.5 ms p99. The server is saturated
+  well before 4,096 clients. `/write_batch` remains the throughput path; the default OpenRaft
+  payload/purge/linger and runtime/LTO settings were not improved by the one-factor sweeps.
 - Sequential write latency is fsync-dominated; batching concurrent submissions
   improves throughput substantially.
 - The feed has ample headroom at 500k fills/s with a null sink. A real sink

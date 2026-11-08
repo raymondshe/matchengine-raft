@@ -34,6 +34,31 @@
 loopback 上运行，覆盖 Raft quorum 与 gRPC 传输成本，但不模拟跨主机网络、独立机器故障或
 节点间磁盘竞争。
 
+## 写并发与批处理 sweep（2026-11-08）
+
+`cargo bench --bench cluster_e2e -- --rounds 2 --concurrency-only` 在服务端运行时启动四节点
+无 fsync 集群，客户端在独立运行时按 1/8/64/256/1024/4096 个在途请求扫描。两轮中位数：
+
+| 在途 clients | writes/s | p50 | p95 | p99 |
+|---:|---:|---:|---:|---:|
+| 1 | 5,778 | 169.3 µs | 216.8 µs | 293.9 µs |
+| 8 | 26,958 | 309.8 µs | 413.1 µs | 455.7 µs |
+| 64 | 79,191 | 792.5 µs | 1.064 ms | 1.662 ms |
+| 256 | **90,569** | 2.256 ms | 5.487 ms | 6.467 ms |
+| 1,024 | 44,829 | 14.199 ms | 20.040 ms | 21.789 ms |
+| 4,096 | 50,996 | 19.707 ms | 64.566 ms | 76.465 ms |
+
+吞吐在 **256 在途**达到峰值，之后 1,024/4,096 的 p99 升到 21.8/76.5 ms。对 p99 敏感的部署应把
+在途请求限制在 256-512，或改用 `/write_batch`（128 单批次在四节点集群上为 227,319 单/s）；
+继续增加并发不会增加服务端吞吐。服务端在途上限或队列深度指标是自然后续项。
+
+单因素 sweep（同一拓扑）结论：`max_payload_entries=1024`、`purge_batch_size=1024`（配合
+`LogsSinceLast(1000)`）、`RAFT_CORE_WORKERS=2` 和薄 LTO + `codegen-units=1` 都没有稳定收益；
+`api_batch_linger_ms=1` 明显退化。`api_batch_linger_ms` 字段单位是毫秒，100/500µs 无法表示；
+最小的非零值 1ms 已经伤害吞吐和尾延迟，100ms 还会耗尽客户端临时端口。因此保留
+`300 / 1 / 0 / shared` 和默认构建 profile。快照密集策略本身在 256 客户端下损失约三分之一吞吐，
+单纯增大 purge batch 没有恢复。所有节点仍在同一进程/主机，1,024/4,096 是突发尾延迟，不是容量保证。
+
 ## 读路径基准：ReadIndex vs lease（2026-11-08）
 
 `cargo bench --bench read_e2e -- --policy both` 在服务端运行时启动同样的四节点无 fsync 集群，
@@ -66,14 +91,15 @@ lease 结果，因为 alpha.37 的 `ReadPolicy::LeaseRead` 仍经过 RaftCore；
 单读者 90.4x、64 读者 3.9x。我们的 4 节点无 fsync 集群为 5,039 串行 / 35,152 并发
 writes/s。Raft 不是当前瓶颈，HTTP/JSON、WAL、apply 和基准运行时竞争占主导。
 
-可执行项（详见英文 [PERFORMANCE.md](../PERFORMANCE.md)）：
+执行结果与后续项（详见英文 [PERFORMANCE.md](../PERFORMANCE.md)）：
 
 - 读取路径：为 `/linearizable_read`、`/events` 和 gRPC `StreamEvents` 增加可选
   `ReadPolicy::LeaseRead` 与 `ReadIndex` 回退；alpha.37 没有 `enable_local_lease_read`，
   完整的本地缓存路径需要升级 OpenRaft。先加读取基准再改默认值。
-- 写入/批处理：扩展 `cluster_e2e` 的客户端数（1/8/64/256/1024/4096）和独立客户端运行时，
-  测试 `max_payload_entries` 300/1024、`purge_batch_size` 1/1024、
-  `api_batch_linger_ms` 0/100/500µs 以及 `RAFT_CORE_WORKERS`。
+- 写入/批处理：已完成 1/8/64/256/1024/4096 客户端 sweep；256 在途峰值 90,569 writes/s，
+  1,024/4,096 降至 44,829/50,996 writes/s。`max_payload_entries=1024`、`purge_batch_size=1024`、
+  `api_batch_linger_ms=1`、`RAFT_CORE_WORKERS=2` 和薄 LTO 均无稳定收益；保留
+  300/1/0/shared 和默认构建 profile。
 - 观测/存储：启用 `runtime-stats`、暴露 data/server metrics、加入 flamegraph/tokio-console；
   异步 WAL append（pending cache + `IOFlushed`）是每次追加 fsync 模式下最大的存储机会。
   薄 LTO + `codegen-units=1` 做 A/B。
