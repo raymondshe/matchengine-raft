@@ -78,6 +78,7 @@
 **持久化与恢复**
 - **Raft 复制状态机**，成员和应用状态持久化，WAL fsync 可配置。
 - **分段校验 WAL**，`RAFT_WAL_FSYNC_MS`：未设置 = 不 fsync（默认，要求至少 4 个投票成员），`0` = 每次追加，`N > 0` = 每 N ms 周期；支持撕裂尾部恢复。
+- **异步 WAL 原型**（feature-gated，默认关闭）：`append` 将 fsync 交给 Tokio worker，只有持久化后才触发 `IOFlushed`；包含 pending 读取和崩溃恢复测试。使用 `--features async-wal` 构建，运行时设置 `--async-wal` 和 `RAFT_WAL_FSYNC_MS=0`。
 - **无 fsync 的四投票成员下限**：`/init` 和 `/change-membership` 拒绝少于 4 个投票成员，写入在达到 4 个成员前返回 `503`，使一条已提交日志至少存在于 3 个节点。
 - **原子快照**，通过临时文件 → fsync → rename → 目录 fsync 写入，安装前校验 checksum。
 - **面向真实负载的快照策略**：每 100,000 条已应用日志或每 30 分钟（有新 entry 时）生成快照，可用 `--snapshot-interval-ms` 调整。
@@ -295,7 +296,7 @@ HTTP 应用/管理 API 和 gRPC Raft 服务见 [API 参考](./docs/zh-CN/API.md)
 ## 性能与当前限制
 
 实测基线（Apple M4、Rust 1.93.1、release bench profile；单节点端到端/存储为 2026-11-06 三次运行中位数；
-4 节点无 fsync 集群为 2026-11-07 三轮中位数；写并发/批处理 sweep 与读路径基准为 2026-11-08；完整方法见
+4 节点无 fsync 集群为 2026-11-07 三轮中位数；写并发/批处理 sweep、异步 WAL 原型与读路径基准为 2026-11-08；完整方法见
 [性能细节](./docs/zh-CN/PERFORMANCE.md)）：
 
 | 工作负载 | 结果 |
@@ -313,7 +314,9 @@ HTTP 应用/管理 API 和 gRPC Raft 服务见 [API 参考](./docs/zh-CN/API.md)
 | 4 节点无 fsync 集群：`/linearizable_read` p50 / p99（1 读者，ReadIndex → lease） | 119.7 / 243.6 µs → 54.9 / 83.9 µs |
 | 4 节点无 fsync 集群：`/linearizable_read` 吞吐（64 读者，ReadIndex → lease） | 30,232 → 51,777 reads/s |
 | 行情 feed 500k fills/s | 495k fills/s，8,192 队列下 0 丢弃 |
-| WAL 追加 / 读取（20k 条、每批 100 条，每次追加 fsync） | 25,547 / 2,408,176 条/s |
+| WAL 追加 / 读取（20k 条、每批 100 条，每次追加 fsync） | 26,043 / 2,614,579 条/s |
+| WAL 追加，异步原型（feature-gated，每次追加） | 中位数 172k 条/s；范围 65.2k-192.2k |
+| 单节点 e2e 并发写入，每次追加（同步 → 异步） | 18,344 → 17,277 writes/s（噪声范围内） |
 
 4 节点数据为 loopback 上、关闭 WAL fsync 的 3/4 法定人数集群，四个节点在同一进程内；
 范围和跨主机限制见[性能细节](./docs/zh-CN/PERFORMANCE.md)。lease read 为可选，默认仍为

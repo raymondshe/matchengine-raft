@@ -45,6 +45,23 @@ N ms；未设置最快，但崩溃可能丢失已确认写入。
 启动 4 个节点后，用包含全部 4 个 `[id, addr]` 的 `/init` 请求初始化；单节点 `[]` 形式会被拒绝。
 演示脚本默认设置 `RAFT_WAL_FSYNC_MS=0`，因此三节点和单节点示例仍然可用。
 
+### 异步 WAL 原型（`async-wal` feature）
+
+异步 WAL **默认关闭**，需要 `--features async-wal` 构建，并同时使用 `--async-wal`
+（环境变量 `MATCHENGINE_ASYNC_WAL`）和 `RAFT_WAL_FSYNC_MS=0`：
+
+- `append` 写入批次并更新可见日志，但把 `sync_data` 交给 Tokio `async-wal` worker；
+  只有 fsync 完成后才触发 OpenRaft 的 `IOFlushed`。
+- 尚未持久化的条目由内存 pending cache 提供，`try_get_log_entries` 在回调前仍能读到。
+- `truncate_after` 和 `purge` 会先等待 pending append 完成。
+- fsync 前崩溃可能丢失尾部；这些条目尚未被确认持久化，恢复只保留合法前缀。
+  `tests/cluster/test_storage.rs` 和 `tests/cluster/test_async_wal.rs` 覆盖回调门控、
+  丢失尾部恢复以及 Raft 提交/重开路径。
+- 原型只支持每次追加模式；周期和不 fsync 模式保持原行为。
+- fsync 落后于追加时 pending cache 没有上限；生产化需要加上限或背压，避免慢盘导致内存无限增长。
+
+该原型不是默认路径。生产化仍需 Raft 级 A/B、可选的周期模式支持以及更广的崩溃/故障转移覆盖。
+
 ## 快照（`src/store/state_machine.rs`）
 
 状态机（订单簿 + 序列号 + 保留的撮合事件窗口 + 提交去重表）常驻内存以保证 apply 速度。快照 v10 写入 `snapshot/current.snap`，通过临时文件 → fsync → rename → 目录 fsync 原子替换；`install_snapshot` 会先校验收到的数据再替换磁盘副本，坏快照不会破坏已有的好快照。

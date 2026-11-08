@@ -34,6 +34,19 @@ jobs:
       - name: Market-data test
         run: cargo test --manifest-path demos/market_data_system/Cargo.toml --locked
 
+  async-wal:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Async WAL clippy
+        run: cargo clippy --all-targets --features async-wal -- -D warnings
+      - name: Async WAL crash recovery
+        run: cargo test --features async-wal --test cluster async_wal --locked
+
   marketdata-aeron:
     runs-on: ubuntu-latest
     steps:

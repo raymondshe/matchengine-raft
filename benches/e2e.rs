@@ -8,6 +8,9 @@
 //! `-- both` compare the old current-thread flavor, and `--pin <cpu>` pins the
 //! process on Linux (`sched_setaffinity`) to remove scheduler noise. The
 //! order-book-only costs are measured by `cargo bench --bench matchengine`.
+//!
+//! `MATCHENGINE_ASYNC_WAL=1` with `--features async-wal` and `RAFT_WAL_FSYNC_MS=0`
+//! selects the prototype async WAL for the same suite.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -116,15 +119,31 @@ fn write_request(index: usize) -> MatchEngineRequest {
     MatchEngineRequest::place(Order::new(side, price, 1.0, 0))
 }
 
+fn async_wal_from_env() -> bool {
+    std::env::var("MATCHENGINE_ASYNC_WAL")
+        .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+}
+
 async fn start_node(
     addr: &str,
     runtime: &str,
 ) -> anyhow::Result<(MatchEngineNode, MatchEngineClient<C>, PathBuf)> {
     let dir = temp_dir(runtime);
+    let fsync = matchengine_raft::store::config::wal_fsync_from_env();
+    let async_wal = async_wal_from_env();
+    if async_wal {
+        #[cfg(not(feature = "async-wal"))]
+        anyhow::bail!("MATCHENGINE_ASYNC_WAL requires --features async-wal");
+        #[cfg(feature = "async-wal")]
+        if fsync != Some(Duration::ZERO) {
+            anyhow::bail!("async WAL requires RAFT_WAL_FSYNC_MS=0");
+        }
+    }
     let storage = StorageConfig::new(dir.clone())
         .with_instance_prefix(format!("e2e-{runtime}"))
         .with_snapshot_interval(Duration::ZERO)
-        .with_wal_fsync(matchengine_raft::store::config::wal_fsync_from_env());
+        .with_wal_fsync(fsync)
+        .with_async_wal(async_wal);
     let node = build_match_engine_node(1, addr.to_string(), default_raft_config(), storage).await?;
     let client = MatchEngineClient::<C>::new(1, addr.to_string());
     client.init().await??;
@@ -316,6 +335,10 @@ fn main() -> anyhow::Result<()> {
         Some(interval) if interval.is_zero() => println!("WAL fsync: every append"),
         Some(interval) => println!("WAL fsync: every {}ms", interval.as_millis()),
     }
+    println!(
+        "async WAL: {}",
+        if async_wal_from_env() { "on" } else { "off" }
+    );
     let run_current = matches!(selection.as_str(), "current" | "both");
     let run_multi = selection != "current";
 

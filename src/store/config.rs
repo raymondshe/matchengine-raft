@@ -1,4 +1,4 @@
-//! Filesystem layout for a node's durable state.
+//! Node storage layout and runtime configuration.
 //!
 //! Every node owns a directory so that several nodes can share one machine (the tests do exactly
 //! that). The layout is:
@@ -94,6 +94,10 @@ pub struct StorageConfig {
     /// Leader-consistent read policy. `ReadIndex` is the default; `Lease` is
     /// opt-in and falls back to `ReadIndex` when the lease is stale.
     pub read_policy: ReadPolicyMode,
+
+    /// Prototype asynchronous WAL append. Only effective with the `async-wal`
+    /// Cargo feature and `RAFT_WAL_FSYNC_MS=0`; off by default.
+    pub async_wal: bool,
 }
 
 /// Reads the WAL fsync policy from `RAFT_WAL_FSYNC_MS`.
@@ -152,6 +156,7 @@ impl Default for StorageConfig {
             wal_fsync,
             min_voters,
             read_policy: ReadPolicyMode::default(),
+            async_wal: false,
         }
     }
 }
@@ -169,6 +174,7 @@ impl StorageConfig {
             wal_fsync: None,
             min_voters: 1,
             read_policy: ReadPolicyMode::default(),
+            async_wal: false,
         }
     }
 
@@ -221,6 +227,15 @@ impl StorageConfig {
     /// Sets the leader-consistent read policy.
     pub fn with_read_policy(mut self, read_policy: ReadPolicyMode) -> Self {
         self.read_policy = read_policy;
+        self
+    }
+
+    /// Enables the prototype asynchronous WAL append path.
+    ///
+    /// Requires a binary built with the `async-wal` Cargo feature and
+    /// `RAFT_WAL_FSYNC_MS=0` (every append); otherwise startup returns an error.
+    pub fn with_async_wal(mut self, async_wal: bool) -> Self {
+        self.async_wal = async_wal;
         self
     }
 
@@ -305,6 +320,12 @@ mod tests {
     fn min_voters_defaults_to_one_and_is_configurable() {
         assert_eq!(1, StorageConfig::new("/data").min_voters);
         assert_eq!(4, StorageConfig::new("/data").with_min_voters(4).min_voters);
+    }
+
+    #[test]
+    fn async_wal_defaults_to_disabled_and_is_configurable() {
+        assert!(!StorageConfig::new("/data").async_wal);
+        assert!(StorageConfig::new("/data").with_async_wal(true).async_wal);
     }
 
     #[test]

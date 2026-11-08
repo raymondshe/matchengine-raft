@@ -4,6 +4,8 @@
 //! the real serialized `MatchEngineRequest` payload, not blank log entries.
 
 use std::path::PathBuf;
+#[cfg(feature = "async-wal")]
+use std::time::Duration;
 use std::time::Instant;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
@@ -22,6 +24,7 @@ use openraft::alias::LogIdOf;
 use openraft::storage::IOFlushed;
 use openraft::storage::RaftLogReader;
 use openraft::storage::RaftLogStorage;
+use openraft::type_config::TypeConfigExt;
 use openraft::vote::RaftLeaderId;
 
 type C = MatchEngineTypeConfig;
@@ -64,6 +67,16 @@ async fn append(store: &LogStore, entries: Vec<EntryOf<C>>) {
     store.append(entries, IOFlushed::noop()).await.unwrap();
 }
 
+async fn append_deferred(
+    store: &LogStore,
+    entries: Vec<EntryOf<C>>,
+) -> tokio::sync::oneshot::Receiver<Result<(), std::io::Error>> {
+    let (tx, rx) = C::oneshot();
+    let mut store = store.clone();
+    store.append(entries, IOFlushed::signal(tx)).await.unwrap();
+    rx
+}
+
 async fn read(store: &LogStore, range: std::ops::Range<u64>) -> usize {
     let mut store = store.clone();
     store.try_get_log_entries(range).await.unwrap().len()
@@ -88,14 +101,44 @@ async fn main() {
         Some(interval) => println!("WAL fsync: every {}ms", interval.as_millis()),
     }
 
+    let async_wal = std::env::var("MATCHENGINE_ASYNC_WAL")
+        .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
+    if async_wal {
+        #[cfg(not(feature = "async-wal"))]
+        {
+            eprintln!("MATCHENGINE_ASYNC_WAL requires --features async-wal");
+            std::process::exit(2);
+        }
+        #[cfg(feature = "async-wal")]
+        if fsync != Some(Duration::ZERO) {
+            eprintln!("async WAL requires RAFT_WAL_FSYNC_MS=0");
+            std::process::exit(2);
+        }
+    }
+
     let dir = temp_dir("wal");
-    let store = LogStore::open_with_segment_size_and_fsync(&dir, SEGMENT_SIZE, fsync).unwrap();
+    let store =
+        LogStore::open_with_segment_size_fsync_and_async_wal(&dir, SEGMENT_SIZE, fsync, async_wal)
+            .unwrap();
     store.start_fsync_worker().unwrap();
+    store.start_async_wal_worker().unwrap();
+    println!("async WAL: {}", if async_wal { "on" } else { "off" });
 
     let started = Instant::now();
-    for start in (1..=ENTRIES).step_by(BATCH as usize) {
-        let end = (start + BATCH - 1).min(ENTRIES);
-        append(&store, (start..=end).map(entry).collect()).await;
+    if async_wal {
+        let mut pending = Vec::new();
+        for start in (1..=ENTRIES).step_by(BATCH as usize) {
+            let end = (start + BATCH - 1).min(ENTRIES);
+            pending.push(append_deferred(&store, (start..=end).map(entry).collect()).await);
+        }
+        for receiver in pending {
+            receiver.await.unwrap().unwrap();
+        }
+    } else {
+        for start in (1..=ENTRIES).step_by(BATCH as usize) {
+            let end = (start + BATCH - 1).min(ENTRIES);
+            append(&store, (start..=end).map(entry).collect()).await;
+        }
     }
     let append_elapsed = started.elapsed();
 
@@ -107,8 +150,11 @@ async fn main() {
     drop(store);
 
     let started = Instant::now();
-    let reopened = LogStore::open_with_segment_size_and_fsync(&dir, SEGMENT_SIZE, fsync).unwrap();
+    let reopened =
+        LogStore::open_with_segment_size_fsync_and_async_wal(&dir, SEGMENT_SIZE, fsync, async_wal)
+            .unwrap();
     reopened.start_fsync_worker().unwrap();
+    reopened.start_async_wal_worker().unwrap();
     let reopen_elapsed = started.elapsed();
     let recovered = read(&reopened, 1..ENTRIES + 1).await;
     assert_eq!(ENTRIES as usize, recovered);

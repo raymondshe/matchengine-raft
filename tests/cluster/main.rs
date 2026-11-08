@@ -1,4 +1,5 @@
 mod common;
+mod test_async_wal;
 mod test_batch_write;
 mod test_client;
 mod test_cluster;

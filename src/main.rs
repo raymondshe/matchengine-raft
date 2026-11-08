@@ -42,6 +42,18 @@ pub struct Opt {
     #[clap(long, env = "MATCHENGINE_READ_POLICY", default_value = "read_index")]
     pub read_policy: ReadPolicyMode,
 
+    /// Prototype asynchronous WAL append (requires the `async-wal` feature and
+    /// `RAFT_WAL_FSYNC_MS=0`). Off by default.
+    #[clap(
+        long,
+        env = "MATCHENGINE_ASYNC_WAL",
+        num_args = 0..=1,
+        default_missing_value = "true",
+        default_value_t = false,
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    pub async_wal: bool,
+
     /// Periodic snapshot interval in milliseconds (0 disables the timer).
     ///
     /// The default asks Raft for a snapshot every 30 minutes when new entries
@@ -144,7 +156,8 @@ async fn main() -> std::io::Result<()> {
         .with_snapshot_interval(Duration::from_millis(options.snapshot_interval_ms))
         .with_wal_fsync(wal_fsync)
         .with_min_voters(min_voters)
-        .with_read_policy(options.read_policy);
+        .with_read_policy(options.read_policy)
+        .with_async_wal(options.async_wal);
     if let Some(path) = options.match_event_log {
         storage = storage.with_match_event_log(path);
     }

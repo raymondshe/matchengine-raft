@@ -79,6 +79,7 @@ Everything below is implemented in this repository and exercised by tests; the l
 **Durability and recovery**
 - **Raft-replicated state machine** with durable membership and application state; WAL fsync is configurable.
 - **Segmented, checksummed WAL** with `RAFT_WAL_FSYNC_MS`: unset = no fsync (default; requires at least 4 voters), `0` = every append, `N > 0` = periodic every N ms; torn-tail recovery.
+- **Prototype async WAL** (feature-gated, off by default): `append` defers fsync to a Tokio worker and fires `IOFlushed` only when durable; includes pending-entry reads and crash-recovery tests. Build with `--features async-wal`; run with `--async-wal` and `RAFT_WAL_FSYNC_MS=0`.
 - **Four-voter no-fsync floor**: `/init` and `/change-membership` reject fewer than four voters, and writes return `503` until four voters exist, so a committed entry stays on at least three nodes.
 - **Atomic snapshots** written by temp file → fsync → rename → directory fsync, with checksum validation before install.
 - **Snapshot policy for real workloads**: every 100,000 applied entries or 30 minutes when newer entries exist, configurable with `--snapshot-interval-ms`.
@@ -315,7 +316,7 @@ failure matrix are documented in [Testing](./docs/TESTING.md).
 ## Performance and Current Limits
 
 Measured baseline (Apple M4, Rust 1.93.1, release bench profile; single-node e2e/storage medians
-from 2026-11-06; 4-node no-fsync cluster from 2026-11-07; write concurrency/batching sweep and read-path benchmark from 2026-11-08;
+from 2026-11-06; 4-node no-fsync cluster from 2026-11-07; write concurrency/batching sweep, async WAL prototype and read-path benchmark from 2026-11-08;
 full methodology in [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md)):
 
 | Workload | Result |
@@ -333,7 +334,9 @@ full methodology in [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md)):
 | 4-node no-fsync cluster: `/linearizable_read` p50 / p99 (1 reader, ReadIndex → lease) | 119.7 / 243.6 µs → 54.9 / 83.9 µs |
 | 4-node no-fsync cluster: `/linearizable_read` throughput (64 readers, ReadIndex → lease) | 30,232 → 51,777 reads/s |
 | Market-data feed at 500k fills/s | 495k fills/s, 0 drops at 8,192-frame queue |
-| WAL append / read (20k entries, 100-entry batches, fsync every append) | 25,547 / 2,408,176 entries/s |
+| WAL append / read (20k entries, 100-entry batches, fsync every append) | 26,043 / 2,614,579 entries/s |
+| WAL append, async prototype (feature-gated, every append) | 172k entries/s median; 65.2k-192.2k range |
+| Single-node e2e concurrent writes, every append (sync → async) | 18,344 → 17,277 writes/s (within noise) |
 
 The 4-node figures use a 3-of-4 quorum on loopback with WAL fsync disabled and all four nodes in
 one process; the range and cross-host caveats are in [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md).

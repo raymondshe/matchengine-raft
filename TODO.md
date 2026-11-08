@@ -33,8 +33,9 @@ dedicated OpenRaft runtime (`RAFT_CORE_WORKERS`), the thread/lock audit (blockin
 recovery on `spawn_blocking`, async JSONL sink/events bridge, Aeron publisher/source blocking
 tasks, a Tokio WAL fsync worker; only the env-controlled `RaftThread` remains), the realistic-mix
 replay benchmark, the four-node no-fsync cluster benchmark (`cluster_e2e`), the write
-concurrency/batching sweep, and the read-path benchmark plus opt-in lease reads (`read_e2e`). The
-measured baselines, write/lease decisions and upstream OpenRaft comparison are in
+concurrency/batching sweep, the read-path benchmark plus opt-in lease reads (`read_e2e`), and the
+feature-gated async WAL prototype with crash-recovery tests. The measured baselines, write/lease
+decisions, async-WAL numbers and upstream OpenRaft comparison are in
 [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md).
 
 The upstream OpenRaft minimal benchmark (three in-process nodes, in-memory log/state machine,
@@ -65,26 +66,22 @@ The next work, in order (re-prioritised 2026-11-08 after the write and read swee
    builds; make heartbeat/snapshot channel profiles explicit; add flamegraph/tokio-console
    guidance to `cluster_e2e`. This is the prerequisite for attributing the gap between our 5,039
    sequential writes/s and the 33k one-client upstream floor.
-3. **Prototype asynchronous WAL append (§16, P2).** Adopt the upstream `append` → `IOFlushed`
-   pattern with a pending-entry cache and a background writer/fsync. It is the largest storage-side
-   opportunity for every-append/periodic modes; feature-gate it and prove crash recovery before
-   default.
-4. **Benchmark regression gate and measurement hygiene (§8, P2).** Gate CI on deterministic
+3. **Benchmark regression gate and measurement hygiene (§8, P2).** Gate CI on deterministic
    `apply_path` allocs/entry plus loose p50/p99 thresholds; run the Linux pinned-core `e2e` pass;
-   resolve or document the 10ms periodic-fsync tail. Add the 4-node, write-sweep and read-path rows
-   once their variance settles.
-5. **Prove the four-voter no-fsync contract under failure (§7, P2).** The voter guard is tested;
+   resolve or document the 10ms periodic-fsync tail. Add the 4-node, write-sweep, read-path and
+   async-WAL rows once their variance settles.
+4. **Prove the four-voter no-fsync contract under failure (§7, P2).** The voter guard is tested;
    add a four-voter SIGKILL/failover case that proves the surviving cluster still commits and the
    restarted node catches up after one node loses its unsynced tail.
-6. **Feature and extension work.** Amend parked stops/icebergs and port the missing order types
+5. **Feature and extension work.** Amend parked stops/icebergs and port the missing order types
    (§5), Aeron hardening and market-data archive/replay (§6), and the error-null/mixed-unit/
    fee-token decisions (§13). The optional apply-path and per-level-bucket work in §8 is last
    because the measured wins are small or split.
 
 The earlier measurement work is done: `book_replay` and `level_book` report warm p50/p99 plus an
 interleaved cold pass, `replay_mix` replays a 100,000-operation fixture with fees, the 4-node
-no-fsync cluster, the write concurrency/batching sweep, the read-path/lease results and the
-upstream OpenRaft comparison are recorded in `PERFORMANCE.md`, and the `Order`
+no-fsync cluster, the write concurrency/batching sweep, the read-path/lease results, the async-WAL
+prototype and the upstream OpenRaft comparison are recorded in `PERFORMANCE.md`, and the `Order`
 identity/optional-sequence/BTC-USDT/overflow-case quick wins landed. The third-party follow-ups are P2/P3 (§14); measurement scope, peak RSS, the fuzz targets, health/readiness and the
 operational console are in place. Equity/ETF sessions, holidays, auctions, T+1/T+2 settlement,
 corporate actions and fixed/regulatory/minimum/tax fees are owned by the external order system
@@ -780,8 +777,8 @@ The full review is in [`RAFT_REVIEW.md`](./docs/RAFT_REVIEW.md). The transport a
 `RaftNetworkV2::stream_append` for replication and heartbeats and `full_snapshot` for snapshots;
 these follow-ups are about aligning OpenRaft 0.10 configuration with this workload and reducing
 storage/transport overhead. Re-prioritised 2026-11-08 after the upstream minimal-benchmark
-comparison: the read path and payload/purge sweeps are complete; observability and admission
-control are next, then async WAL and optional APIs.
+comparison: the read path, payload/purge sweeps and async-WAL prototype are complete;
+observability and admission control are next, then async-WAL productionization and optional APIs.
 
 **Read path**
 
@@ -852,11 +849,20 @@ control are next, then async WAL and optional APIs.
 - [ ] **P2** Change snapshot data from `Cursor<Vec<u8>>` to `Cursor<Arc<[u8]>>` (or a
   `Bytes`-backed reader) so `get_current_snapshot` and `build_snapshot` do not copy the whole
   snapshot under the state-machine lock.
-- [ ] **P2** Prototype an asynchronous WAL append: insert into a pending-entry cache, write/fsync
-  on a background task and call `IOFlushed` only when durable. The upstream minimal benchmark
-  demonstrates this contract and tests that entries are readable before the flush completes. This
-  needs pending-entry reads, crash/recovery tests and a feature flag; benchmark it against
-  every-append and periodic-fsync modes.
+- [x] **P2** Prototype an asynchronous WAL append: insert into a pending-entry cache, write/fsync
+  on a background task and call `IOFlushed` only when durable. Done: `async-wal` Cargo feature,
+  `--async-wal`/`MATCHENGINE_ASYNC_WAL`, pending-entry reads, `truncate_after`/`purge` flush.
+  Storage benchmark median 172,374 entries/s (range 65,176-192,160) vs 26,043 synchronous over
+  five runs; `test_storage::async_wal_defers_io_flushed_and_recovers_a_lost_tail` proves the
+  callback gate and lost-tail recovery, and `test_async_wal` proves a Raft node commits/reopens.
+  Off by default; only every-append mode. A single-node e2e A/B found no consistent request-path
+  gain: sequential writes stayed at ~258-260/s because each waits for `IOFlushed`, and concurrent
+  writes were within run noise (18.3k sync vs 17.3k async median).
+- [ ] **P3** Productionize async WAL only after a Linux multi-node A/B and pipelining work: add
+  periodic-mode support if useful, bound the pending cache with backpressure, extend
+  crash/failover coverage, and test whether more append concurrency exposes a real gain. The
+  single-node A/B did not justify changing the default; keep the synchronous WAL as the default
+  until then.
 - [ ] **P3** When exposing the snapshot policy, expose `purge_batch_size` and
   `max_in_snapshot_log_to_keep` together; the current 100k snapshot policy makes the defaults
   mostly harmless, but a lower policy would otherwise cause frequent small purges.

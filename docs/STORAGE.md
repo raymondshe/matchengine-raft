@@ -67,6 +67,28 @@ unsynced tail still leaves at least two copies. Bootstrap such a cluster by star
 calling `/init` with all four `[id, addr]` pairs; the single-node `[]` form is rejected. The demo
 scripts default to `RAFT_WAL_FSYNC_MS=0` so their three-node and single-node setups remain valid.
 
+### Async WAL prototype (`async-wal` feature)
+
+The async WAL path is **off by default** and requires a binary built with `--features async-wal`
+plus `--async-wal` (env `MATCHENGINE_ASYNC_WAL`) and `RAFT_WAL_FSYNC_MS=0`:
+
+- `append` writes the batch and updates the visible log, but defers `sync_data` to a Tokio
+  `async-wal` worker. Openraft's `IOFlushed` callback fires only after the fsync.
+- Entries pending durability are served from an in-memory pending cache, so
+  `try_get_log_entries` remains correct before the callback.
+- `truncate_after` and `purge` wait for pending appends to flush before changing the log.
+- A crash before `IOFlushed` can lose the unsynced tail. Those entries were not acknowledged as
+  durable, and recovery keeps the valid prefix; `tests/cluster/test_storage.rs` and
+  `tests/cluster/test_async_wal.rs` cover the callback gate, lost-tail recovery and a Raft
+  commit/reopen path.
+- Only every-append mode is supported by the prototype; periodic and no-fsync modes keep their
+  existing behavior.
+- The pending cache is unbounded while fsyncs lag behind appends; productionizing needs a cap or
+  backpressure so a slow disk cannot grow memory without limit.
+
+The prototype is not the default. Productionizing it still needs a Raft-level A/B, periodic-mode
+support if desired, and broader crash/failover coverage.
+
 ## Snapshots (`src/store/state_machine.rs`)
 
 The state machine (order book + sequence counter + retained match-event window + submission dedupe

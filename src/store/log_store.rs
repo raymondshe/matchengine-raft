@@ -20,8 +20,12 @@
 //!   mode on the next tick, and no-fsync mode not at all. This avoids a second fsync per batch.
 //! - Segments are deleted only when fully covered by a purge, and the active segment is rotated
 //!   first, so a purge never leaves a hole.
+//! - With the `async-wal` feature and `--async-wal`, append writes the batch and defers
+//!   `sync_data` to a Tokio worker; `IOFlushed` fires only after the fsync. Pending entries are
+//!   readable from memory, and `truncate_after`/`purge` flush them first. Off by default.
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::fs::File;
@@ -39,6 +43,8 @@ use std::sync::Weak;
 use std::sync::atomic::AtomicBool;
 #[cfg(debug_assertions)]
 use std::sync::atomic::AtomicU8;
+#[cfg(feature = "async-wal")]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
@@ -54,6 +60,9 @@ use serde::Deserialize;
 use serde::Serialize;
 
 use crate::store::config::sync_dir;
+
+#[cfg(feature = "async-wal")]
+type AsyncWalSender<C> = tokio::sync::mpsc::UnboundedSender<(u64, IOFlushed<C>)>;
 
 /// Target size of one WAL segment before a new one is started.
 pub const DEFAULT_SEGMENT_SIZE: u64 = 64 * 1024 * 1024;
@@ -274,6 +283,20 @@ struct Inner<C: RaftTypeConfig> {
     disk: RwLock<Disk<C>>,
     /// Serializes mutations so concurrent appends cannot interleave on disk.
     write_order: tokio::sync::Mutex<()>,
+    /// Prototype asynchronous append is enabled.
+    async_wal: bool,
+    /// Entries written but not yet confirmed durable by the async worker.
+    pending: RwLock<BTreeMap<u64, C::Entry>>,
+    #[cfg(feature = "async-wal")]
+    async_tx: Mutex<Option<AsyncWalSender<C>>>,
+    #[cfg(feature = "async-wal")]
+    async_started: AtomicBool,
+    #[cfg(feature = "async-wal")]
+    async_pending: AtomicUsize,
+    #[cfg(feature = "async-wal")]
+    async_idle: tokio::sync::Notify,
+    #[cfg(feature = "async-wal")]
+    async_stop: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     /// One-shot fault injection for tests: 0 = off, 1 = ENOSPC, 2 = EIO.
     #[cfg(debug_assertions)]
     append_fault: AtomicU8,
@@ -287,6 +310,16 @@ impl<C: RaftTypeConfig> Drop for Inner<C> {
             .unwrap_or_else(|error| error.into_inner());
         if let Some(stop) = stop.take() {
             let _ = stop.send(());
+        }
+        #[cfg(feature = "async-wal")]
+        {
+            let mut stop = self
+                .async_stop
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if let Some(stop) = stop.take() {
+                let _ = stop.send(());
+            }
         }
     }
 }
@@ -306,6 +339,21 @@ impl<C: RaftTypeConfig> Inner<C> {
     }
 
     fn append_blocking(&self, entries: Vec<C::Entry>) -> io::Result<()>
+    where
+        C::Entry: Clone,
+    {
+        self.append_blocking_inner(entries, false)
+    }
+
+    #[cfg(feature = "async-wal")]
+    fn append_blocking_deferred(&self, entries: Vec<C::Entry>) -> io::Result<()>
+    where
+        C::Entry: Clone,
+    {
+        self.append_blocking_inner(entries, true)
+    }
+
+    fn append_blocking_inner(&self, entries: Vec<C::Entry>, defer_fsync: bool) -> io::Result<()>
     where
         C::Entry: Clone,
     {
@@ -342,6 +390,7 @@ impl<C: RaftTypeConfig> Inner<C> {
         }
         self.dirty.store(true, Ordering::Release);
         if self.fsync == FsyncPolicy::EveryAppend
+            && !defer_fsync
             && let Err(e) = disk.writer.sync_data()
         {
             // The bytes may or may not be durable; drop them so the retry starts at `base`.
@@ -350,7 +399,7 @@ impl<C: RaftTypeConfig> Inner<C> {
             disk.writer_len = base;
             return Err(e);
         }
-        if self.fsync == FsyncPolicy::EveryAppend {
+        if self.fsync == FsyncPolicy::EveryAppend && !defer_fsync {
             self.dirty.store(false, Ordering::Release);
         }
         disk.writer_len = base + buf.len() as u64;
@@ -704,6 +753,24 @@ impl<C: RaftTypeConfig> LogStore<C> {
         Self::open_with_segment_size_and_fsync(dir, DEFAULT_SEGMENT_SIZE, fsync)
     }
 
+    /// Opens the log with an explicit fsync policy and async-append switch.
+    ///
+    /// The async path is only active with the `async-wal` feature and
+    /// `Some(Duration::ZERO)`; otherwise it is rejected by
+    /// [`Self::start_async_wal_worker`].
+    pub fn open_with_fsync_and_async_wal(
+        dir: impl Into<PathBuf>,
+        fsync: Option<Duration>,
+        async_wal: bool,
+    ) -> io::Result<Self> {
+        Self::open_with_segment_size_fsync_and_async_wal(
+            dir,
+            DEFAULT_SEGMENT_SIZE,
+            fsync,
+            async_wal,
+        )
+    }
+
     /// Compatibility wrapper: `true` means fsync every append, `false` means no fsync.
     pub fn open_with_sync(dir: impl Into<PathBuf>, sync: bool) -> io::Result<Self> {
         let fsync = if sync { Some(Duration::ZERO) } else { None };
@@ -715,6 +782,16 @@ impl<C: RaftTypeConfig> LogStore<C> {
         dir: impl Into<PathBuf>,
         segment_size: u64,
         fsync: Option<Duration>,
+    ) -> io::Result<Self> {
+        Self::open_with_segment_size_fsync_and_async_wal(dir, segment_size, fsync, false)
+    }
+
+    /// Same as [`Self::open_with_segment_size_and_fsync`] with the async-append switch.
+    pub fn open_with_segment_size_fsync_and_async_wal(
+        dir: impl Into<PathBuf>,
+        segment_size: u64,
+        fsync: Option<Duration>,
+        async_wal: bool,
     ) -> io::Result<Self> {
         let dir = dir.into();
         std::fs::create_dir_all(&dir)?;
@@ -790,6 +867,18 @@ impl<C: RaftTypeConfig> LogStore<C> {
             fsync_stop: Mutex::new(None),
             index: RwLock::new(index),
             state: RwLock::new(state),
+            async_wal,
+            pending: RwLock::new(BTreeMap::new()),
+            #[cfg(feature = "async-wal")]
+            async_tx: Mutex::new(None),
+            #[cfg(feature = "async-wal")]
+            async_started: AtomicBool::new(false),
+            #[cfg(feature = "async-wal")]
+            async_pending: AtomicUsize::new(0),
+            #[cfg(feature = "async-wal")]
+            async_idle: tokio::sync::Notify::new(),
+            #[cfg(feature = "async-wal")]
+            async_stop: Mutex::new(None),
             disk: RwLock::new(Disk {
                 writer,
                 writer_seq,
@@ -848,6 +937,67 @@ impl<C: RaftTypeConfig> LogStore<C> {
         Ok(())
     }
 
+    /// Starts the prototype async WAL append worker.
+    ///
+    /// Requires the `async-wal` Cargo feature and `RAFT_WAL_FSYNC_MS=0`.
+    /// Calling it when async append is disabled is a no-op. Must be called from
+    /// a Tokio runtime; the node calls it during startup.
+    pub fn start_async_wal_worker(&self) -> io::Result<()> {
+        if !self.inner.async_wal {
+            return Ok(());
+        }
+        #[cfg(not(feature = "async-wal"))]
+        {
+            Err(io::Error::other(
+                "async WAL requested but the binary was built without the `async-wal` feature",
+            ))
+        }
+        #[cfg(feature = "async-wal")]
+        {
+            self.start_async_wal_worker_with_delay(Duration::ZERO)
+        }
+    }
+
+    /// Test hook: start the async WAL worker with a delay before the fsync.
+    #[cfg(feature = "async-wal")]
+    #[doc(hidden)]
+    pub fn start_async_wal_worker_with_delay(&self, delay: Duration) -> io::Result<()> {
+        if !self.inner.async_wal {
+            return Ok(());
+        }
+        if self.inner.fsync != FsyncPolicy::EveryAppend {
+            return Err(io::Error::other(
+                "async WAL prototype requires every-append fsync (RAFT_WAL_FSYNC_MS=0)",
+            ));
+        }
+        let handle = tokio::runtime::Handle::try_current()
+            .map_err(|_| io::Error::other("async WAL worker requires a Tokio runtime"))?;
+        if self
+            .inner
+            .async_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Ok(());
+        }
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<(u64, IOFlushed<C>)>();
+        *self
+            .inner
+            .async_tx
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(tx);
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+        *self
+            .inner
+            .async_stop
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(stop_tx);
+        let weak = Arc::downgrade(&self.inner);
+        handle.spawn(async_wal_loop(weak, rx, stop_rx, delay));
+        Ok(())
+    }
+
     /// Directory holding this log's segments.
     pub fn dir(&self) -> &Path {
         &self.inner.dir
@@ -873,6 +1023,96 @@ impl<C: RaftTypeConfig> LogStore<C> {
             .store(if storage_full { 1 } else { 2 }, Ordering::SeqCst);
     }
 
+    #[cfg(feature = "async-wal")]
+    async fn append_async(&self, entries: Vec<C::Entry>, callback: IOFlushed<C>) -> io::Result<()>
+    where
+        C::Entry: Clone + Send + 'static,
+    {
+        if entries.is_empty() {
+            callback.io_completed(Ok(()));
+            return Ok(());
+        }
+
+        let last_index = entries
+            .last()
+            .map(|entry| entry.log_id().index)
+            .expect("non-empty entries");
+        let pending_entries = entries.clone();
+        let inner = self.inner.clone();
+        // Hold the mutation lock until the batch is visible in `pending` and its
+        // callback is queued. Otherwise `truncate_after`/`purge` could acquire the
+        // lock, observe no pending work, and cut the log before this batch
+        // registers itself.
+        let _order = self.inner.write_order.lock().await;
+        let tx = self
+            .inner
+            .async_tx
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        let Some(tx) = tx else {
+            let error = io::Error::other("async WAL worker is not started");
+            callback.io_completed(Err(io::Error::new(error.kind(), error.to_string())));
+            return Err(error);
+        };
+        let write_result = blocking(move || inner.append_blocking_deferred(entries)).await;
+
+        if let Err(error) = write_result {
+            callback.io_completed(Err(io::Error::new(error.kind(), error.to_string())));
+            return Err(error);
+        }
+
+        {
+            let mut pending = self.inner.pending.write().unwrap();
+            for entry in &pending_entries {
+                pending.insert(entry.log_id().index, entry.clone());
+            }
+        }
+        self.inner.async_pending.fetch_add(1, Ordering::AcqRel);
+
+        if let Err(error) = tx.send((last_index, callback)) {
+            let (_, callback) = error.0;
+            self.rollback_pending(&pending_entries);
+            let error = io::Error::other("async WAL worker stopped");
+            callback.io_completed(Err(io::Error::new(error.kind(), error.to_string())));
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "async-wal")]
+    fn rollback_pending(&self, entries: &[C::Entry]) {
+        let mut pending = self.inner.pending.write().unwrap();
+        for entry in entries {
+            pending.remove(&entry.log_id().index);
+        }
+        drop(pending);
+        if self.inner.async_pending.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.inner.async_idle.notify_one();
+        }
+    }
+
+    #[cfg(feature = "async-wal")]
+    async fn flush_async_wal(&self) -> io::Result<()> {
+        if !self.inner.async_wal {
+            return Ok(());
+        }
+        loop {
+            if self.inner.async_pending.load(Ordering::Acquire) == 0 {
+                return Ok(());
+            }
+            self.inner.async_idle.notified().await;
+            if self.inner.async_pending.load(Ordering::Acquire) == 0 {
+                return Ok(());
+            }
+        }
+    }
+
+    #[cfg(not(feature = "async-wal"))]
+    async fn flush_async_wal(&self) -> io::Result<()> {
+        Ok(())
+    }
+
     async fn append_entries(&self, entries: Vec<C::Entry>) -> io::Result<()>
     where
         C::Entry: Clone + Send + 'static,
@@ -896,17 +1136,51 @@ where
         &mut self,
         range: RB,
     ) -> Result<Vec<C::Entry>, io::Error> {
+        let pending_entries: Vec<C::Entry> = if self.inner.async_wal {
+            let pending = self.inner.pending.read().unwrap();
+            pending
+                .range(range.clone())
+                .map(|(_, entry)| entry.clone())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if pending_entries.is_empty() {
+            let locs: Vec<RecordLoc> = {
+                let index = self.inner.index.read().unwrap();
+                index.range(range).map(|(_, loc)| *loc).collect()
+            };
+            if locs.is_empty() {
+                return Ok(Vec::new());
+            }
+            let inner = self.inner.clone();
+            return blocking(move || inner.read_entries_blocking(&locs)).await;
+        }
+
+        let pending_indexes: BTreeSet<u64> = pending_entries
+            .iter()
+            .map(|entry| entry.log_id().index)
+            .collect();
         let locs: Vec<RecordLoc> = {
             let index = self.inner.index.read().unwrap();
-            index.range(range).map(|(_, loc)| *loc).collect()
+            index
+                .range(range)
+                .filter(|(index, _)| !pending_indexes.contains(index))
+                .map(|(_, loc)| *loc)
+                .collect()
         };
 
         if locs.is_empty() {
-            return Ok(Vec::new());
+            let mut entries = pending_entries;
+            entries.sort_by_key(|entry| entry.log_id().index);
+            return Ok(entries);
         }
 
         let inner = self.inner.clone();
-        blocking(move || inner.read_entries_blocking(&locs)).await
+        let mut entries = blocking(move || inner.read_entries_blocking(&locs)).await?;
+        entries.extend(pending_entries);
+        entries.sort_by_key(|entry| entry.log_id().index);
+        Ok(entries)
     }
 
     async fn read_vote(&mut self) -> Result<Option<VoteOf<C>>, io::Error> {
@@ -956,6 +1230,18 @@ where
         I: IntoIterator<Item = C::Entry> + openraft::OptionalSend,
     {
         let entries: Vec<C::Entry> = entries.into_iter().collect();
+        #[cfg(feature = "async-wal")]
+        if self.inner.async_wal {
+            return self.append_async(entries, callback).await;
+        }
+        #[cfg(not(feature = "async-wal"))]
+        if self.inner.async_wal {
+            let error = io::Error::other(
+                "async WAL requested but the binary was built without the `async-wal` feature",
+            );
+            callback.io_completed(Err(io::Error::new(error.kind(), error.to_string())));
+            return Err(error);
+        }
         self.append_entries(entries).await?;
         callback.io_completed(Ok(()));
         Ok(())
@@ -963,12 +1249,14 @@ where
 
     async fn truncate_after(&mut self, last_log_id: Option<LogIdOf<C>>) -> Result<(), io::Error> {
         let _order = self.inner.write_order.lock().await;
+        self.flush_async_wal().await?;
         let inner = self.inner.clone();
         blocking(move || inner.truncate_after_blocking(last_log_id)).await
     }
 
     async fn purge(&mut self, log_id: LogIdOf<C>) -> Result<(), io::Error> {
         let _order = self.inner.write_order.lock().await;
+        self.flush_async_wal().await?;
         let inner = self.inner.clone();
         blocking(move || inner.purge_blocking(log_id)).await
     }
@@ -1427,6 +1715,92 @@ async fn fsync_loop<C: RaftTypeConfig>(
                 }
             }
             _ = &mut stop => return,
+        }
+    }
+}
+
+#[cfg(feature = "async-wal")]
+async fn async_wal_loop<C: RaftTypeConfig>(
+    inner: Weak<Inner<C>>,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<(u64, IOFlushed<C>)>,
+    mut stop: tokio::sync::oneshot::Receiver<()>,
+    delay: Duration,
+) {
+    loop {
+        let Some((mut max_index, first)) = (tokio::select! {
+            item = rx.recv() => item,
+            _ = &mut stop => return,
+        }) else {
+            return;
+        };
+        let mut callbacks = vec![first];
+        while let Ok((index, callback)) = rx.try_recv() {
+            max_index = max_index.max(index);
+            callbacks.push(callback);
+        }
+
+        if !delay.is_zero() {
+            tokio::select! {
+                _ = tokio::time::sleep(delay) => {}
+                _ = &mut stop => return,
+            }
+        }
+
+        let completed = callbacks.len();
+        let Some(inner) = inner.upgrade() else {
+            for callback in callbacks {
+                callback.io_completed(Err(io::Error::other("async WAL store dropped")));
+            }
+            return;
+        };
+
+        // Appends are serialized and segment rotation fsyncs the previous
+        // segment when fsync is enabled, so syncing the current writer covers
+        // every queued batch, including one written before a rotation.
+        let file = {
+            let disk = inner.disk.read().unwrap();
+            disk.writer.try_clone()
+        };
+        let result = match file {
+            Ok(file) => match tokio::task::spawn_blocking(move || file.sync_data()).await {
+                Ok(result) => result,
+                Err(error) => Err(io::Error::other(format!(
+                    "async WAL fsync task failed: {error}"
+                ))),
+            },
+            Err(error) => Err(error),
+        };
+
+        match result {
+            Ok(()) => {
+                inner
+                    .pending
+                    .write()
+                    .unwrap()
+                    .retain(|index, _| *index > max_index);
+                for callback in callbacks {
+                    callback.io_completed(Ok(()));
+                }
+            }
+            Err(error) => {
+                // The batch is not durable and its callbacks now carry an error;
+                // do not leave it readable in the pending cache.
+                inner
+                    .pending
+                    .write()
+                    .unwrap()
+                    .retain(|index, _| *index > max_index);
+                let kind = error.kind();
+                let message = error.to_string();
+                for callback in callbacks {
+                    callback.io_completed(Err(io::Error::new(kind, message.clone())));
+                }
+            }
+        }
+
+        if inner.async_pending.fetch_sub(completed, Ordering::AcqRel) == completed {
+            inner.async_idle.notify_waiters();
+            inner.async_idle.notify_one();
         }
     }
 }

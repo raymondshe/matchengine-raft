@@ -1,6 +1,6 @@
 # Performance measurements
 
-Measured on **2026-10-30** (runtime flavor A/B and P0 offloads: **2026-10-31**; measurement scope and RSS: **2026-11-01**; book p50/p99 and the pinned-core approximation: **2026-11-04**; end-to-end/storage rerun with the OpenRaft quick wins: **2026-11-06**; realistic-mix replay: **2026-11-06**; dedicated Raft runtime: **2026-11-06**; WAL fsync Tokio rerun: **2026-11-07**; four-node no-fsync cluster: **2026-11-07**; write concurrency/batching sweep: **2026-11-08**; read-path benchmark: **2026-11-08**; OpenRaft minimal-benchmark comparison: **2026-11-08**) on the reference development machine:
+Measured on **2026-10-30** (runtime flavor A/B and P0 offloads: **2026-10-31**; measurement scope and RSS: **2026-11-01**; book p50/p99 and the pinned-core approximation: **2026-11-04**; end-to-end/storage rerun with the OpenRaft quick wins: **2026-11-06**; realistic-mix replay: **2026-11-06**; dedicated Raft runtime: **2026-11-06**; WAL fsync Tokio rerun: **2026-11-07**; four-node no-fsync cluster: **2026-11-07**; write concurrency/batching sweep: **2026-11-08**; async WAL prototype: **2026-11-08**; read-path benchmark: **2026-11-08**; OpenRaft minimal-benchmark comparison: **2026-11-08**) on the reference development machine:
 
 - Apple M4 (`arm64`)
 - Rust `1.93.1`
@@ -15,11 +15,13 @@ on the deployment hardware before using the numbers for sizing.
 ```shell
 cargo bench --bench matchengine   # order-book microbenchmarks
 cargo bench --bench e2e           # submit -> commit -> apply -> response (multi-thread; -- current|both for A/B, --pin <cpu> on Linux)
+RAFT_WAL_FSYNC_MS=0 MATCHENGINE_ASYNC_WAL=1 cargo bench --features async-wal --bench e2e -- both  # prototype async WAL A/B
 cargo bench --bench cluster_e2e -- --rounds 3  # four in-process no-fsync voters, leader-direct writes and batches
 cargo bench --bench cluster_e2e -- --rounds 2 --concurrency-only  # 1/8/64/256/1024/4096-client sweep
 cargo bench --bench read_e2e -- --policy both  # local /read, /linearizable_read and /events; ReadIndex vs lease
 cargo bench --bench feed_load     # market-data feed at 50k/500k fills/s
 cargo bench --bench storage       # WAL append/read/recovery
+RAFT_WAL_FSYNC_MS=0 MATCHENGINE_ASYNC_WAL=1 cargo bench --features async-wal --bench storage  # prototype async WAL
 cargo bench --bench p0_bench -- duplicate|read|snapshot  # P0 lock/scan A/B
 cargo bench --bench book_replay   # book-only sweeps, deep cancels and BBO advances
 cargo bench --bench replay_mix    # realistic add/cancel/amend/stop/iceberg replay with per-op percentiles
@@ -51,7 +53,7 @@ its scope.
 | `cluster_e2e` | Four in-process loopback voters with a separate client runtime; HTTP `/write`/`/write_batch`, Raft 3/4 quorum replication over gRPC, WAL append without fsync, apply and response; optional client-count and OpenRaft config sweeps | Cross-host network latency, independent machines, disk contention between nodes | 50 warm-up writes; 500 sequential, 200 batches/size, 100×32 concurrent batches, and a 1/8/64/256/1024/4096-client sweep; fresh rounds | `Instant` per request/batch; p50/p95/p99 and medians | Two or three fresh rounds; high-concurrency tail is host-sensitive |
 | `read_e2e` | Four in-process loopback voters with a separate client runtime; local `/read`, `/linearizable_read` and `/events`; ReadIndex and lease policies; 1/64 readers; read-only and mixed with an offered 2,000 writes/s | Cross-host network and clock skew; independent machines | 100 warm-up reads per endpoint; 2,000 reads/reader per case; 100-event pages; depth-20 local reads; two runs per policy | `Instant` per request; p50/p95/p99 and throughput | Two runs; read-only rows are stable, mixed rows depend on writer pacing |
 | `feed_load` | Tokio tap, bounded queue, shadow book, wire encoding and processor drain with a null sink | JSONL/network sink I/O, Raft, HTTP | Offered-load generator at 50k/500k/2M fills/s | `Instant`; queue/drain counters | One run per target; no p99 table |
-| `storage` | WAL append/read/reopen with 20k real order entries and 512 KiB segments | State machine, Raft, HTTP | Closed-loop, 100-entry batches | `Instant` | Three runs, medians; no tail study |
+| `storage` | WAL append/read/reopen with 20k real order entries and 512 KiB segments; optional `async-wal` prototype | State machine, Raft, HTTP | Closed-loop, 100-entry batches | `Instant` | Three runs, medians; no tail study; async variance is high |
 | `p0_bench duplicate` | State-machine duplicate-retry lookup over a 262k-event window | HTTP, Raft, WAL | 200 retries after one setup | `Instant`; mean/p50/p99/max | Single run; a single scheduling outlier moves the mean |
 | `p0_bench read` | In-process node `/read orderbook_orders` with 100k orders and 8 concurrent writers | Cross-node replication; client-side parsing beyond bytes received | 2 readers x 10 large reads, writers in flight | `Instant`; read/write p50/p99/max | Single run; allocator/HTTP buffers affect peak RSS |
 | `p0_bench snapshot` | `persist_snapshot` encode/write/fsync for 100k orders while 8 writers run | Raft snapshot shipping; cross-node replication | 8 writers, snapshot on the main benchmark task | `Instant`; writer p50/p99/max and snapshot duration | Single run; encode/fsync dominated |
@@ -647,14 +649,14 @@ entries in batches of 100, with 512 KiB segments:
 
 | Operation | Result |
 |---|---:|
-| Append 20k entries | 782.9 ms |
-| Append throughput | 25,547 entries/s |
-| Read 20k entries | 8.31 ms |
-| Read throughput | 2,408,176 entries/s |
-| Reopen/recover 20k entries | 7.30 ms |
+| Append 20k entries | 768.0 ms |
+| Append throughput | 26,043 entries/s |
+| Read 20k entries | 7.65 ms |
+| Read throughput | 2,614,579 entries/s |
+| Reopen/recover 20k entries | 6.78 ms |
 | Recovered entries | 20,000 |
 
-The 2026-11-06 rerun reports the median of three runs with fsync every append.
+The 2026-11-08 rerun reports the median of five runs with fsync every append.
 Append throughput is fsync-bound in that mode (one durable batch per 100 entries); read and
 recovery benefit from sequential segment scanning and coalesced `pread` calls. The A/B below
 covers no-fsync and periodic modes.
@@ -727,6 +729,40 @@ non-blocking modes because fsyncs overlap across concurrent requests. Read and r
 partly page-cache residency; the append comparison is the direct measure. With the dedicated
 runtime (`RAFT_CORE_WORKERS=2`) and no fsync, the e2e run measured 9,584 writes/s, p50 97.8 µs and
 32,416 concurrent writes/s, so the fsync share dominates regardless of runtime topology.
+
+### Async WAL prototype (2026-11-08)
+
+The feature-gated async WAL prototype writes the WAL batch and updates the visible log, then
+defers `sync_data` to a Tokio `async-wal` worker; Openraft's `IOFlushed` callback fires only after
+the fsync. The storage benchmark queues all 200 batches before awaiting their callbacks, modelling
+Raft pipelining. Five runs per mode, 20,000 real order entries in 100-entry batches, 512 KiB
+segments:
+
+| Mode | Append throughput | Range |
+|---|---:|---:|
+| Every append, synchronous | 26,043 entries/s | 25,839-26,314 |
+| Every append, async prototype | **172,374 entries/s** | 65,176-192,160 |
+
+The async median is about **6.6x** the synchronous median, but the range is wide: one run only
+reached 65.2k while four reached 168k-192k. The worker's fsync batching and filesystem timing
+dominate. Read/reopen numbers were similar. This is a storage-only measurement; a Raft-level A/B
+has not been run yet.
+
+A single-node Raft-level A/B used the same `e2e` suite on the multi-thread runtime, every-append
+mode, three runs per configuration. Sequential writes stayed at ~258-260 writes/s in both modes
+because each request still waits for `IOFlushed`. Concurrent 1,000-write throughput was 18,344/s
+synchronous versus 17,277/s async (median), and 100 x 32 concurrent batches were 152,833 versus
+157,414 orders/s. Those differences are within the ~10% run-to-run noise: the async path produced
+**no consistent request-path gain** on this single-node macOS host. The storage result comes from
+queueing 200 append batches before awaiting callbacks; concurrent Raft requests already overlap
+synchronous fsync calls, so operating-system group commit captures most of the available batching.
+
+The prototype is off by default and only supports every-append mode. `tests/cluster/test_storage.rs`
+proves the callback waits for fsync, entries are readable before flush, a lost unsynced tail
+recovers to the valid prefix, and the log remains appendable; `tests/cluster/test_async_wal.rs`
+proves a Raft node commits and reopens with the async path. Productionizing still needs a Linux
+multi-node A/B, periodic-mode support, broader crash/failover coverage, and a design that exposes
+more append pipelining than the current request path offers.
 
 ## Storage-path improvements
 
@@ -880,9 +916,11 @@ actor with batching; otherwise `RAFT_CORE_WORKERS=2` is the practical compromise
 
 ### Prioritized opportunities
 
-The 2026-11-08 write/read sweeps put concurrency/admission control and async-WAL work ahead of the
-items below; see [Write concurrency and batching sweep](#write-concurrency-and-batching-sweep-2026-11-08),
-[Read-path benchmark](#read-path-benchmark-readindex-vs-lease-2026-11-08) and
+The 2026-11-08 sweeps and prototype put concurrency/admission control and async-WAL
+productionization ahead of the items below; see
+[Write concurrency and batching sweep](#write-concurrency-and-batching-sweep-2026-11-08),
+[Read-path benchmark](#read-path-benchmark-readindex-vs-lease-2026-11-08),
+[Async WAL prototype](#async-wal-prototype-2026-11-08) and
 [OpenRaft minimal benchmark comparison](#openraft-minimal-benchmark-comparison-2026-11-08).
 
 1. **Run the node on a multi-threaded Tokio runtime, with OpenRaft isolated (P0, implemented).**
@@ -1072,6 +1110,11 @@ The measurement rules transferred regardless of layout and are now implemented:
   4,096 in-flight fall to 44.8k/51.0k writes/s with 21.8/76.5 ms p99. The server is saturated
   well before 4,096 clients. `/write_batch` remains the throughput path; the default OpenRaft
   payload/purge/linger and runtime/LTO settings were not improved by the one-factor sweeps.
+- The async WAL prototype raised every-append storage throughput from a 26.0k entries/s median to
+  172k (range 65.2k-192.2k) while preserving the `IOFlushed` durability gate and crash recovery.
+  A single-node e2e A/B found no consistent request-path gain: sequential writes still wait for
+  durability, and concurrent writes were within noise. It remains off by default pending a Linux
+  multi-node A/B and pipelining work.
 - Sequential write latency is fsync-dominated; batching concurrent submissions
   improves throughput substantially.
 - The feed has ample headroom at 500k fills/s with a null sink. A real sink

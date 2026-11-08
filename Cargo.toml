@@ -97,6 +97,9 @@ tonic-prost-build = "0.14.9"
 
 [features]
 docinclude = [] # Used only for activating `doc(include="...")` on nightly.
+# Prototype: write the WAL batch, defer fsync to a background task and signal
+# OpenRaft's IOFlushed only after the fsync. Off by default.
+async-wal = []
 # Publishes the market-data feed to Aeron channels (one publication per stream).
 market-data-aeron = ["dep:rusteron-client", "dep:rusteron-media-driver"]
 

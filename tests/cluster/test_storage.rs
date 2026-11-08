@@ -34,6 +34,8 @@ use openraft::storage::IOFlushed;
 use openraft::storage::RaftLogReader;
 use openraft::storage::RaftLogStorage;
 use openraft::storage::RaftStateMachine;
+#[cfg(feature = "async-wal")]
+use openraft::type_config::TypeConfigExt;
 use openraft::vote::RaftLeaderId;
 
 type C = MatchEngineTypeConfig;
@@ -322,6 +324,80 @@ fn periodic_fsync_task_clears_dirty_state() {
             !store.wal_dirty(),
             "periodic fsync should clear the dirty flag"
         );
+    });
+}
+
+#[cfg(feature = "async-wal")]
+#[test]
+fn async_wal_defers_io_flushed_and_recovers_a_lost_tail() {
+    let dir = TempDir::new("async-wal");
+
+    block_on(async {
+        let store =
+            Store::open_with_fsync_and_async_wal(dir.path(), Some(std::time::Duration::ZERO), true)
+                .unwrap();
+        store.start_async_wal_worker().unwrap();
+
+        let (tx, rx) = C::oneshot();
+        let mut writer = store.clone();
+        writer
+            .append(vec![blank(0)], IOFlushed::signal(tx))
+            .await
+            .unwrap();
+        rx.await.unwrap().unwrap();
+
+        let files = wal_files(dir.path());
+        let last = files.last().unwrap().clone();
+        let durable_len = std::fs::metadata(&last).unwrap().len();
+        drop(writer);
+        drop(store);
+        tokio::task::yield_now().await;
+
+        // A second append is readable before the async fsync, and its
+        // IOFlushed callback is still pending.
+        let store =
+            Store::open_with_fsync_and_async_wal(dir.path(), Some(std::time::Duration::ZERO), true)
+                .unwrap();
+        store
+            .start_async_wal_worker_with_delay(std::time::Duration::from_secs(60))
+            .unwrap();
+        let (tx, mut rx) = C::oneshot();
+        let mut writer = store.clone();
+        writer
+            .append(vec![blank(1)], IOFlushed::signal(tx))
+            .await
+            .unwrap();
+        assert!(rx.try_recv().is_err(), "IOFlushed must wait for the fsync");
+        assert_eq!(vec![0, 1], indexes(&read(&store, 0..10).await));
+        assert_eq!(Some(log_id(1, 1)), log_state(&store).await.last_log_id);
+        drop(writer);
+        drop(store);
+        tokio::task::yield_now().await;
+
+        // Simulate a crash that loses the unsynced tail: truncate the last
+        // record back to the last durable offset, then reopen.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&last)
+            .unwrap()
+            .set_len(durable_len)
+            .unwrap();
+
+        let store = Store::open_with_fsync_and_async_wal(
+            dir.path(),
+            Some(std::time::Duration::ZERO),
+            false,
+        )
+        .unwrap();
+        assert_eq!(vec![0], indexes(&read(&store, 0..10).await));
+        assert_eq!(Some(log_id(1, 0)), log_state(&store).await.last_log_id);
+
+        let mut writer = store.clone();
+        writer
+            .append(vec![blank(1)], IOFlushed::noop())
+            .await
+            .unwrap();
+        assert_eq!(vec![0, 1], indexes(&read(&store, 0..10).await));
     });
 }
 

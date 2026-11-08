@@ -506,11 +506,14 @@ pub async fn build_match_engine_node(
     // Recovery can scan many segments, so keep it off the async runtime.
     let log_dir = storage.log_dir(node_id);
     let wal_fsync = storage.wal_fsync;
-    let log_store =
-        tokio::task::spawn_blocking(move || LogStore::open_with_fsync(log_dir, wal_fsync))
-            .await
-            .map_err(|error| std::io::Error::other(format!("WAL open task failed: {error}")))??;
+    let async_wal = storage.async_wal;
+    let log_store = tokio::task::spawn_blocking(move || {
+        LogStore::open_with_fsync_and_async_wal(log_dir, wal_fsync, async_wal)
+    })
+    .await
+    .map_err(|error| std::io::Error::other(format!("WAL open task failed: {error}")))??;
     log_store.start_fsync_worker()?;
+    log_store.start_async_wal_worker()?;
     // Match results are computed by `apply`; the sink decides what happens with them. The default
     // drops them, exactly as before. Create it with the state machine so its file open also runs
     // on the blocking pool.
