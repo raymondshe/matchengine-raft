@@ -196,14 +196,18 @@ optional and default to zero. The engine computes each fill's notional from the 
 matched quantity, then charges the taker order's taker rate and the maker order's maker rate.
 Fees are truncated toward zero at 18 places; a fill carries an ordered `error` set
 (`notional_overflow`, `taker_fee_overflow`, `maker_fee_overflow`) when a dependent value exceeds
-the supported fixed-point range. The engine records fees but does not move balances: the order
+the supported fixed-point range. The affected numeric field is `0` when its code is present, so a
+zero is authoritative only when the code is absent; Rust consumers can use the
+`MatchResult`/`MatchEvent` `exact_*` accessors. Nullable fields were rejected to keep the snapshot
+v10/wire v6 contract. The engine records fees but does not move balances: the order
 system freezes the trading asset and clearing deducts fees from that freeze.
 
 Base/quote volume semantics and asset-aware fee deduction for fiat, stablecoin, crypto, ETF and
 equity pairs are implemented. ETF/equity bases always settle fees in the quote asset; crypto/spot
 and fiat-to-fiat pairs default to the received asset, and crypto can explicitly select quote or
-base. The full model and the remaining open extension (fee tokens) are in
-[`docs/FEE_DEDUCTION.md`](./FEE_DEDUCTION.md); sessions, settlement, corporate actions and
+base. Quote volume is limited to plain limit and market orders; quote icebergs and FOK are rejected
+at admission. The full model is in [`docs/FEE_DEDUCTION.md`](./FEE_DEDUCTION.md); third-asset fee
+tokens and derivatives remain outside the engine, and sessions, settlement, corporate actions and
 fixed/regulatory/minimum/tax fees are owned by the external order system.
 
 Every other order-type field (`tif`, `post_only`, `stop_price`, `display_volume`, `hidden_volume`,

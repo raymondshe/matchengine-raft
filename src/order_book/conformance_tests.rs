@@ -658,6 +658,41 @@ fn amend_plain_order_rejects_a_stop_trigger() {
 }
 
 #[test]
+fn quote_iceberg_and_fok_are_rejected_at_admission() {
+    let config = SymbolConfig::new(0, 2, 8).unwrap();
+    let mut book = OrderBook::new();
+
+    let mut iceberg =
+        Order::new(OrderSide::Buy, 100.0, 100.0, 0).with_volume_unit(VolumeUnit::Quote);
+    iceberg.display_volume = Fixed::from(1);
+    assert_eq!(
+        Some(RejectReason::InvalidOrder),
+        book.execute_order_with_symbol(&mut iceberg, config.clone())
+            .rejected
+    );
+
+    let mut fok = Order::new(OrderSide::Buy, 100.0, 100.0, 0).with_volume_unit(VolumeUnit::Quote);
+    fok.tif = TimeInForce::Fok;
+    assert_eq!(
+        Some(RejectReason::InvalidOrder),
+        book.execute_order_with_symbol(&mut fok, config.clone())
+            .rejected
+    );
+
+    // A plain quote limit is the supported shape and still rests.
+    let mut plain = Order::new(OrderSide::Buy, 100.0, 100.0, 0).with_volume_unit(VolumeUnit::Quote);
+    assert_eq!(
+        None,
+        book.execute_order_with_symbol(&mut plain, config).rejected
+    );
+    assert_eq!(Fixed::from(1), book.best_bid().unwrap().volume);
+    assert_eq!(
+        3, book.sequence,
+        "each rejected/ accepted submission consumes one sequence"
+    );
+}
+
+#[test]
 fn fees_are_reported_on_market_ioc_and_stop_child_fills() {
     let mut book = OrderBook::new();
     let mut maker =

@@ -35,6 +35,7 @@ use serde::Serialize;
 use crate::order_book::Amendment;
 use crate::order_book::FeeAsset;
 use crate::order_book::Fixed;
+use crate::order_book::MatchErrorCode;
 use crate::order_book::MatchErrors;
 use crate::order_book::MatchResult;
 use crate::order_book::Order;
@@ -421,6 +422,33 @@ impl MatchEvent {
             error: MatchErrors::NONE,
             reason: None,
         }
+    }
+
+    /// Exact gross quote volume, or `None` for a non-fill event or a fill whose
+    /// `notional_overflow` code is set.
+    ///
+    /// `quote_volume` uses zero as the unavailable sentinel; this accessor is
+    /// the recommended consumer API.
+    pub fn exact_quote_volume(&self) -> Option<Fixed> {
+        (self.kind == MatchEventKind::Fill
+            && !self.error.contains(MatchErrorCode::NotionalOverflow))
+        .then_some(self.quote_volume)
+    }
+
+    /// Exact taker fee, or `None` for a non-fill event or a fill whose
+    /// `taker_fee_overflow` code is set.
+    pub fn exact_taker_fee(&self) -> Option<Fixed> {
+        (self.kind == MatchEventKind::Fill
+            && !self.error.contains(MatchErrorCode::TakerFeeOverflow))
+        .then_some(self.taker_fee)
+    }
+
+    /// Exact maker fee, or `None` for a non-fill event or a fill whose
+    /// `maker_fee_overflow` code is set.
+    pub fn exact_maker_fee(&self) -> Option<Fixed> {
+        (self.kind == MatchEventKind::Fill
+            && !self.error.contains(MatchErrorCode::MakerFeeOverflow))
+        .then_some(self.maker_fee)
     }
 }
 
@@ -822,6 +850,52 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn exact_accessors_make_overflow_sentinels_explicit() {
+        let rate = |value: &str| value.parse::<Fixed>().unwrap();
+        let price = Fixed::from_units(100_000_000_000);
+        let volume = Fixed::from_units(10_000_000_000);
+        let maker = Order::new(OrderSide::Sell, price, volume, 1)
+            .with_fee_rates(Fixed::ZERO, rate("0.001"));
+        let taker =
+            Order::new(OrderSide::Buy, price, volume, 2).with_fee_rates(Fixed::ZERO, rate("0.002"));
+
+        let fill = MatchResult::new_with_policy(
+            &taker,
+            &maker,
+            volume,
+            crate::order_book::FeeAssetPolicy::Base,
+        );
+        assert!(
+            fill.error
+                .contains(crate::order_book::MatchErrorCode::NotionalOverflow)
+        );
+        assert_eq!(None, fill.exact_notional());
+        assert!(fill.exact_taker_fee().is_some(), "base fee stays exact");
+        assert!(fill.exact_maker_fee().is_some(), "base fee stays exact");
+
+        let event = MatchEvent::for_fills(10, 0, OrderSide::Buy, 2, &[fill])[0];
+        assert_eq!(None, event.exact_quote_volume());
+        assert!(event.exact_taker_fee().is_some());
+        assert!(event.exact_maker_fee().is_some());
+
+        let plain_maker = order(OrderSide::Sell, 100.0, 1.0, 1);
+        let plain_taker = order(OrderSide::Buy, 100.0, 1.0, 2);
+        let plain = MatchResult::new(&plain_taker, &plain_maker, 1.0);
+        assert_eq!(Some(Fixed::from(100)), plain.exact_notional());
+        assert_eq!(Some(Fixed::ZERO), plain.exact_taker_fee());
+        assert_eq!(Some(Fixed::ZERO), plain.exact_maker_fee());
+
+        let plain_event = MatchEvent::for_fills(11, 0, OrderSide::Buy, 2, &[plain])[0];
+        assert_eq!(Some(Fixed::from(100)), plain_event.exact_quote_volume());
+        assert_eq!(Some(Fixed::ZERO), plain_event.exact_taker_fee());
+
+        let cancel = MatchEvent::for_cancel(12, &plain_maker);
+        assert_eq!(None, cancel.exact_quote_volume());
+        assert_eq!(None, cancel.exact_taker_fee());
+        assert_eq!(None, cancel.exact_maker_fee());
     }
 
     #[test]

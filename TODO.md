@@ -51,8 +51,10 @@ has a real-process leader-kill test: three survivors commit, and the restarted n
 after losing a truncated WAL tail (§7). Parked stops now accept direct trigger/limit/volume
 amendments and icebergs accept total-open-volume amendments with priority rules (§5). The
 market-data service records and replays per-symbol JSONL archives through the normal feed path
-(§6). The measured baselines, write/lease decisions, async-WAL numbers and upstream OpenRaft
-comparison are in [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md).
+(§6). The §13 external contract is settled: zero-plus-`MatchErrors` remains for v10/v6 with exact
+accessors, quote iceberg/FOK stay rejected, and fee tokens stay outside the engine. The measured
+baselines, write/lease decisions, async-WAL numbers and upstream OpenRaft comparison are in
+[`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md).
 
 The upstream OpenRaft minimal benchmark (three in-process nodes, in-memory log/state machine,
 function-call network, empty requests) reports 33k put/s with one client and 3.5M put/s with 4,096,
@@ -71,16 +73,28 @@ implemented: the replication lag threshold now sits above the 100k snapshot poli
 suppression is enabled, HTTP/2 windows/keepalive are tuned, snapshot chunks follow OpenRaft's
 configured size and readiness waits for recovery. The remaining P2/P3 items are tracked in §16.
 
-The next work, in order (re-prioritised 2026-11-09 after the public-suite review):
+The next work, in order (re-prioritised 2026-11-09 after the archive and external-contract slices):
 
-1. **Run the Linux pinned-core `e2e` pass (§8, P2).** The CI regression gate is now in place;
-   dispatch the manual `Linux benchmark` workflow (or run the same commands on deployment
-   hardware) to separate scheduler noise from the fsync cost and record the pinned short and
+1. **Run the Linux pinned-core `e2e` pass (§8, P2).** Dispatch the manual `Linux benchmark`
+   workflow (or run the same commands on deployment hardware) and record the pinned short and
    sustained rows.
-2. **Feature and extension work.** Port the remaining order types (§5), finish Aeron operation
-   hardening and the snapshot-request stream (§6), and the error-null/mixed-unit/fee-token
-   decisions (§13). The optional apply-path and per-level-bucket work in §8 is last because the
-   measured wins are small or split.
+2. **Plan one schema-v11 order-type batch (§5, P2).** Add market-to-limit, trailing stops, pegged
+   orders and self-trade prevention together so the snapshot/wire migration and conformance batch
+   are paid once. Custom reserve replenishment and stop-protection collars stay P3 and
+   product-conditional.
+3. **Aeron operation hardening and the snapshot-request stream (§6, P2).** Run external-driver
+   and multicast fan-out validation on Linux, add the idle heartbeat and publish `ws_fanout`
+   numbers; then add the late-joiner snapshot-request stream (2010).
+4. **Storage, transport and dependency hygiene (§4/§16, P2).** Bound WAL append size by bytes,
+   move snapshot data to `Arc<[u8]>`, stream snapshot receive instead of buffering the whole body,
+   and move off `openraft` 0.10.0-alpha when a stable 0.10 release exists.
+5. **Observability measurements and console actions (§16, P2).** Record heartbeat/`AppendStream`
+   counts and snapshot-transfer time, and add guarded purge-log/runtime-config console actions.
+6. **Provisioning and test hygiene (§2/§7, P2).** Add the `ConfigureSymbol` provisioning
+   helper/pre-trade readiness check, parameterize fixed test ports, and keep docs in sync.
+7. **Last: apply-path and per-level-bucket experiments (§8, P3).** Reserve known apply-path
+   lengths, evaluate apply-thread affinity and adopt per-level buckets only if a sparse-level fast
+   path or new measurements justify them; the measured wins are small or split.
 
 The earlier measurement work is done: `book_replay` and `level_book` report warm p50/p99 plus an
 interleaved cold pass, `replay_mix` replays a 100,000-operation fixture with fees, the 4-node
@@ -279,8 +293,11 @@ Done:
 
 Remaining:
 
-- [ ] **P2** Port the missing OrderBook-rs types: trailing stops, pegged orders, custom reserve
-  replenishment, stop-protection collars, market-to-limit and self-trade prevention.
+- [ ] **P2** Add one schema-v11 order-type batch: market-to-limit, trailing stops, pegged orders
+  and self-trade prevention. Pay the snapshot/wire migration and conformance batch once; define
+  the owner identity required by STP before adding it.
+- [ ] **P3** Add custom reserve replenishment and stop-protection collars only if the product
+  requires them; the current iceberg display tranche covers the existing reserve behaviour.
 - [x] **P2** Phase 4 of match-result delivery: long-poll `/events` (`wait_ms`), gRPC
   `StreamEvents` and a reference MQ bridge sidecar (`src/bin/events_bridge.rs`) with cursor
   checkpointing; event time and cursor scope decided in `docs/MATCH_RESULTS.md` §4.8.
@@ -532,12 +549,12 @@ Remaining (the public-suite follow-ups are tracked in §17):
   default; use it only with four voters and an accepted 100 ms loss window. The FD-clone fsync
   removed the disk-lock stall; the remaining tail is filesystem-level. See the production
   configuration section in `docs/PERFORMANCE.md`.
-- [ ] **P2** Reserve the known lengths for the remaining apply-path allocations (response `events`
+- [ ] **P3** Reserve the known lengths for the remaining apply-path allocations (response `events`
   `Vec`, fill `MatchResult` `Vec`) where the shape is fixed; they are the `apply_path` leftovers.
-- [ ] **P2** Decide whether strict apply-thread affinity is worth the cost: the single-worker
+- [ ] **P3** Decide whether strict apply-thread affinity is worth the cost: the single-worker
   dedicated runtime keeps apply on one thread but measured ~7% lower concurrent writes; a batched
   apply actor is the alternative.
-- [ ] **P2** Adopt per-level buckets or a compact resting record only if the P1 prototype and
+- [ ] **P3** Adopt per-level buckets or a compact resting record only if the P1 prototype and
   new 3-node or real-sink measurements justify the complexity. The 2026-11-04 run wins 1.84x
   match, 3.31x cancel, 1.75x/2.59x amend and 4.90x BBO query, but loses 0.75x sparse amend, 0.87x
   BBO advance and 0.96x depth; full adoption is not justified yet, and a hybrid or sparse-level
@@ -694,16 +711,18 @@ Done:
   fee-asset deduction in `tests/cluster/test_fee_assets.rs`, plus quote fees, fee overflow, fee
   policies, the file sink, `/events`, the feed and snapshot restart.
 
-Remaining extensions:
+Resolved extensions:
 
-- [ ] **P2** Decide whether the numeric fields named by an error code should become `Option<Fixed>`
-  (JSON `null`) instead of zero, so a real zero and an unavailable value cannot be confused
-  (`docs/FEE_DEDUCTION.md` §13 item 15). Do this before external consumers depend on the zero
-  sentinel.
-- [ ] **P2** Decide whether mixed-unit iceberg/FOK orders should normalize tranches; quote volume
-  currently supports plain limit and market orders only, and those combinations are rejected at
-  admission (`docs/FEE_DEDUCTION.md` §5.1, §13 item 16).
-- [ ] **P2** Add third-asset fee-token support only if a fee price and balance model are provided.
+- [x] **P2** Numeric sentinel policy: keep zero plus `MatchErrors` for snapshot v10/wire v6; a zero
+  is authoritative only when its code is absent. `MatchResult` and `MatchEvent` expose
+  `exact_notional`/`exact_quote_volume`, `exact_taker_fee` and `exact_maker_fee` accessors, and
+  market-data `TradeRecord`/`LifecycleRecord` expose the same helpers. A nullable-field migration
+  is explicitly rejected.
+- [x] **P2** Mixed-unit iceberg/FOK: quote volume remains limited to plain limit and market orders;
+  quote icebergs and FOK are deliberately rejected at admission. Clients submit base volume for
+  those shapes; no normalization rule is planned.
+- [x] **P3** Fee tokens: third-asset fees remain out of scope; the engine supports only base/quote
+  fee assets, and conversion/balances/freeze deduction belong to the external order system.
 
 Resolved decisions: quote limit sell rounds base quantity down to cap notional; quote market sell
 rounds up and permits a bounded overshoot; `volume` is always gross; the fee policy is per symbol;
@@ -772,9 +791,9 @@ Open follow-ups:
   warm/cold p50/p99 plus per-operation p50/p99/max; results are in `docs/PERFORMANCE.md`.
 - [ ] **P2** Run the Linux pinned-core `e2e` pass; the `--pin` flag exists and this macOS host
   cannot pin (tracked in §8). The manual `Linux benchmark` workflow is ready to dispatch.
-- [ ] **P2** Evaluate a binary order-entry path (gRPC/protobuf or compact codec) and feature-gated
+- [ ] **P3** Evaluate a binary order-entry path (gRPC/protobuf or compact codec) and feature-gated
   latency histograms only if a latency target requires them.
-- [ ] **P2** Evaluate real ITCH-style replay data and custom MPMC/SIMD/io_uring work only after a
+- [ ] **P3** Evaluate real ITCH-style replay data and custom MPMC/SIMD/io_uring work only after a
   measured bottleneck and a Linux-only deployment decision. `wire-mpmc` is not async-aware: use
   Tokio `mpsc` for task-to-task communication and keep spin-based queues off Tokio workers.
 
@@ -881,7 +900,7 @@ and optional APIs.
   milliseconds, so 100/500µs is not representable; 100ms exhausted client ports. Keep 300/1/0.
   The append channel is bounded by count, not bytes, so large payloads can still queue memory;
   keep linger at 0 unless measurements justify the latency tradeoff.
-- [ ] **P2** Benchmark `STREAM_APPEND_CHANNEL_SIZE` separately; it is a compile-time transport
+- [ ] **P3** Benchmark `STREAM_APPEND_CHANNEL_SIZE` separately; it is a compile-time transport
   constant, so the runtime sweep above does not cover it.
 - [ ] **P2** Add guarded console actions for `raft.trigger().purge_log()` and supported
   `raft.runtime_config()` changes after a snapshot; document the safety constraints.

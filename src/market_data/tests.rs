@@ -278,6 +278,61 @@ fn one_trade_message_carries_every_fill_of_the_taker() {
 }
 
 #[test]
+fn exact_accessors_resolve_feed_overflow_sentinels() {
+    let trade = TradeRecord {
+        log_index: 1,
+        ordinal: 0,
+        ts_ms: 1_000,
+        price: 100.0.into(),
+        volume: 5.0.into(),
+        quote_volume: Fixed::ZERO,
+        taker_fee: Fixed::from(1),
+        taker_fee_asset: Some(FeeAsset::Base),
+        maker_fee: Fixed::ZERO,
+        maker_fee_asset: Some(FeeAsset::Quote),
+        error: MatchErrors::NOTIONAL_OVERFLOW | MatchErrors::MAKER_FEE_OVERFLOW,
+        taker_side: OrderSide::Buy,
+        taker_sequence: 2,
+        maker_sequence: 1,
+    };
+    assert_eq!(None, trade.exact_quote_volume());
+    assert_eq!(Some(Fixed::from(1)), trade.exact_taker_fee());
+    assert_eq!(None, trade.exact_maker_fee());
+
+    let lifecycle = LifecycleRecord {
+        log_index: 2,
+        ordinal: 1,
+        ts_ms: 1_001,
+        kind: MatchEventKind::Fill,
+        order_sequence: 3,
+        side: OrderSide::Sell,
+        counterparty_sequence: Some(4),
+        price: 101.0.into(),
+        volume: 2.0.into(),
+        quote_volume: 202.0.into(),
+        volume_unit: VolumeUnit::Base,
+        taker_fee: Fixed::ZERO,
+        taker_fee_asset: Some(FeeAsset::Quote),
+        maker_fee: Fixed::from(2),
+        maker_fee_asset: Some(FeeAsset::Base),
+        error: MatchErrors::TAKER_FEE_OVERFLOW,
+        reason: None,
+    };
+    assert_eq!(Some(Fixed::from(202)), lifecycle.exact_quote_volume());
+    assert_eq!(None, lifecycle.exact_taker_fee());
+    assert_eq!(Some(Fixed::from(2)), lifecycle.exact_maker_fee());
+
+    let rested = LifecycleRecord {
+        kind: MatchEventKind::Rested,
+        error: MatchErrors::NONE,
+        ..lifecycle
+    };
+    assert_eq!(None, rested.exact_quote_volume());
+    assert_eq!(None, rested.exact_taker_fee());
+    assert_eq!(None, rested.exact_maker_fee());
+}
+
+#[test]
 fn each_frame_emits_its_own_post_batch_depth_total() {
     let mut h = harness(MarketDataConfig::default());
     h.processor.ingest(frame(

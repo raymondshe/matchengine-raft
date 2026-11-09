@@ -162,13 +162,16 @@ pub struct MatchEngineResponse {
 费率字段（`maker_fee_rate`、`taker_fee_rate`）是网关按用户等级带入的有符号 `Fixed` 小数：
 `"0.001"` 表示 10 bps，负值表示返佣，缺省为零。每笔成交的名义金额由 maker 价格 × 成交数量计算，
 吃单方按吃单费率收费，挂单方按挂单费率收费；费用按 18 位小数向零截断。名义金额或费用超出支持的定点范围时
-会通过 `error` 返回 `notional_overflow`、`taker_fee_overflow`、`maker_fee_overflow` 等错误码。引擎只记录费用，不维护余额：订单系统冻结交易资产，清算系统从冻结资产中扣费。
+会通过 `error` 返回 `notional_overflow`、`taker_fee_overflow`、`maker_fee_overflow` 等错误码。
+存在错误码时对应数值字段为 `0`，因此只有错误码缺失时零才是真实值；Rust 消费方可使用
+`MatchResult`/`MatchEvent` 的 `exact_*` 访问器。为保持 snapshot v10/wire v6 契约，未改为可空字段。
+引擎只记录费用，不维护余额：订单系统冻结交易资产，清算系统从冻结资产中扣费。
 
 法币、稳定币、加密货币、ETF 和股票等标的的 base/quote 数量语义与按资产扣费已实现。
 ETF/股票 base 的费用始终以 quote 资产结算；加密货币和法币对法币（FX）默认使用收到资产，
-加密货币也可显式选择 quote 或 base。完整模型和未完成扩展（fee token）见
-[`docs/FEE_DEDUCTION.md`](../FEE_DEDUCTION.md)；交易时段、结算、公司行为以及固定/监管/最低/税费
-由外部订单系统负责。
+加密货币也可显式选择 quote 或 base。quote 数量仅支持普通限价单和市价单；quote iceberg 和 FOK
+在准入时被拒绝。完整模型见 [`docs/FEE_DEDUCTION.md`](../FEE_DEDUCTION.md)；第三资产 fee token
+和衍生品不在引擎范围内，交易时段、结算、公司行为以及固定/监管/最低/税费由外部订单系统负责。
 
 其他订单类型字段（`tif`、`post_only`、`stop_price`、`display_volume`、`hidden_volume`、
 `timestamp`）都是可选的，默认就是普通的 GTC 限价单：

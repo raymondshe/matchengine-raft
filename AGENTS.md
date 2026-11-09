@@ -168,7 +168,7 @@ CI (`.github/workflows/ci.yml`) runs `cargo fmt --all -- --check` (and the `fuzz
 - `Order` deserializes `sequence` with a default of `0`; the scripts still send it, and
   `place_order()` overwrites it. `Order` equality compares `id`, `side`, `symbol_id`, `sequence`,
   `price` and `volume`.
-- Fills compute maker/taker fees from the two orders' user-level `maker_fee_rate`/`taker_fee_rate` (signed fractions of notional). `MatchResult` carries `notional`, both fees and `error` (an ordered `MatchErrors` set); `MatchEvent` carries the fees and error set, and market-data `TRADE`/fill `LIFECYCLE` mirror them. The engine records fees but does not maintain balances: the order system freezes the trading asset and clearing deducts fees from that freeze (`docs/FEE_DEDUCTION.md` §6.6).
+- Fills compute maker/taker fees from the two orders' user-level `maker_fee_rate`/`taker_fee_rate` (signed fractions of notional). `MatchResult` carries `notional`, both fees and `error` (an ordered `MatchErrors` set); `MatchEvent` carries the fees and error set, and market-data `TRADE`/fill `LIFECYCLE` mirror them. Snapshot v10/wire v6 keep zero as the unavailable sentinel; a zero is authoritative only when its code is absent. Use `exact_notional`/`exact_taker_fee`/`exact_maker_fee` on `MatchResult`, `exact_quote_volume`/`exact_taker_fee`/`exact_maker_fee` on `MatchEvent`, and the same accessors on market-data `TradeRecord`/`LifecycleRecord`. Quote iceberg/FOK stay rejected, and third-asset fee tokens remain outside the engine. The engine records fees but does not maintain balances: the order system freezes the trading asset and clearing deducts fees from that freeze (`docs/FEE_DEDUCTION.md` §6.6).
 - Match results leave `apply` as `MatchEvent`s through a `MatchResultSink`. `EventId` is
   `(log_index, ordinal)`, so no event counter is stored in snapshots; `OrderBook::resting_volume`
   is the authoritative source for a `Rested` event's volume (do not derive it by subtraction).
@@ -202,9 +202,10 @@ CI (`.github/workflows/ci.yml`) runs `cargo fmt --all -- --check` (and the `fuzz
   `demos/market_data_system` is the reference implementation (Aeron via rusteron `=0.2.13` plus
   the JSONL fallback).
 - `docs/FEE_DEDUCTION.md` documents the implemented base/quote volume semantics,
-  fiat/stablecoin/equity/ETF asset metadata, tick/lot rules and fee-asset policies. Remaining
-  extensions (fee tokens, mixed-unit iceberg/FOK) are listed there; sessions, settlement, corporate
-  actions and fixed/regulatory/minimum/tax fees are owned by the external order system.
+  fiat/stablecoin/equity/ETF asset metadata, tick/lot rules and fee-asset policies. Fee tokens and
+  mixed-unit iceberg/FOK are settled as out of scope; derivatives remain a documented extension.
+  Sessions, settlement, corporate actions and fixed/regulatory/minimum/tax fees are owned by the
+  external order system.
 - `docs/DECIMAL.md` compares integer ticks, `rust_decimal`, `fastnum`, `bigdecimal`, `decimal`
   and `fixed`, with microbenchmarks, an 18-decimal BTC range analysis and a migration plan. `Order`
   now uses 18-scale `Fixed` integers end-to-end (`last_trade_price`, events, depth/BBO, market data,

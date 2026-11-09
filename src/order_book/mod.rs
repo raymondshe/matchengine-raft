@@ -806,6 +806,25 @@ impl MatchResult {
             error,
         }
     }
+
+    /// Exact quote notional, or `None` when `notional_overflow` is set.
+    ///
+    /// This is the recommended consumer accessor: the `notional` field uses
+    /// zero as the unavailable sentinel, while `error` says whether that zero
+    /// is real.
+    pub fn exact_notional(&self) -> Option<Fixed> {
+        (!self.error.contains(MatchErrorCode::NotionalOverflow)).then_some(self.notional)
+    }
+
+    /// Exact taker fee, or `None` when `taker_fee_overflow` is set.
+    pub fn exact_taker_fee(&self) -> Option<Fixed> {
+        (!self.error.contains(MatchErrorCode::TakerFeeOverflow)).then_some(self.taker_fee)
+    }
+
+    /// Exact maker fee, or `None` when `maker_fee_overflow` is set.
+    pub fn exact_maker_fee(&self) -> Option<Fixed> {
+        (!self.error.contains(MatchErrorCode::MakerFeeOverflow)).then_some(self.maker_fee)
+    }
 }
 
 /// How the sweep tracks the taker's remaining size.

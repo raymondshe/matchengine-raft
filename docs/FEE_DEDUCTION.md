@@ -6,7 +6,7 @@ engine carries base/quote asset metadata, tick/lot rules, `VolumeUnit`, quote-aw
 `FeeAssetPolicy`. Snapshot **v9** and wire **v5** introduced those fields; snapshot **v10** and wire
 **v6** replace the boolean fee-overflow flag with the ordered `error`/`MatchErrors` code set.
 Derivatives and margin-asset settlement are a documented extension, not implemented; the model is in
-§3.2, the freeze policy is in §6.6.3 and the open items are §13 items 11-16. Sessions, settlement,
+§3.2, the freeze policy is in §6.6.3 and the open items are §13 items 11-13. Sessions, settlement,
 corporate actions and fixed/regulatory/minimum/tax fees are owned by the external order system.
 Asset freezing and fee funding are also order-system responsibilities: the order system reserves the
 trading asset before submission and clearing deducts fees when it processes match results. The engine
@@ -328,9 +328,10 @@ Quote market orders never rest. A stop-market child uses quote mode when elected
 child converts at its limit price when placed.
 
 Only plain limit and market orders may use quote volume. Combining quote volume with iceberg fields
-(`display_volume`/`hidden_volume`) or with `FOK` is rejected as `invalid_order` at admission: those
-shapes need a base-normalization rule that does not exist yet (§13 item 16). A quote amount must
-also carry no more than `quote_asset.decimals` fractional digits.
+(`display_volume`/`hidden_volume`) or with `FOK` is deliberately rejected as `invalid_order` at
+admission: tranche and fill-or-kill semantics need an explicit base-normalization rule that this
+API does not define. Submit those orders in base volume instead. A quote amount must also carry no
+more than `quote_asset.decimals` fractional digits.
 
 #### Icebergs, stops and amendments
 
@@ -653,7 +654,7 @@ pub struct SymbolConfig {
     pub price_tick: Fixed,
     pub base_lot: Fixed,
     pub fee_asset_policy: FeeAssetPolicy,
-    // optional fee-token configuration later
+    // base/quote only; third-asset fee tokens are outside the engine
 }
 ```
 
@@ -760,8 +761,13 @@ Examples:
 
 `MatchErrors` is a copyable bitmask internally, one `u8` in the snapshot and on the wire, and a
 JSON string array externally. New non-fatal fill conditions can add a code without changing the event
-shape. The affected numeric fields stay `0` today, so a consumer must cross-check the codes before
-using a zero; making those fields nullable instead is §13 item 15.
+shape. The affected numeric fields stay `0`; a zero is authoritative only when its code is absent.
+Use the `MatchResult::exact_notional` / `exact_taker_fee` / `exact_maker_fee`,
+`MatchEvent::exact_quote_volume` / `exact_taker_fee` / `exact_maker_fee` and the market-data
+`TradeRecord`/`LifecycleRecord` equivalents in Rust, or cross-check `error` in another language.
+Nullable fields were rejected because they would force a
+snapshot v11/wire v7 migration without adding information beyond the error set; the zero sentinel is
+now part of the v10/v6 contract.
 
 Derivatives make overflow easier to reach because notional includes the contract multiplier and the
 settlement asset may require a conversion. A fill with an overflow code must not be fed into margin,
@@ -902,8 +908,8 @@ pub struct MatchResult {
 ```
 
 `FeeAsset` names the side of the pair (`Base`/`Quote`); the actual `AssetId` comes from
-`SymbolConfig`. A future fee-token extension can replace it with an explicit `AssetId` and a
-fee-price model without changing the matching arithmetic.
+`SymbolConfig`. Third-asset fee tokens are out of scope: supporting them would require an explicit
+`AssetId` plus a fee-price and balance model, both owned by the external order/clearing system.
 
 `error` is a fill-scoped set of codes, not proof that both fees are zero; see §7.1. A base fee can
 remain exact when only the quote notional overflows. Downstream consumers must not treat a zeroed
@@ -1026,7 +1032,7 @@ Covered today by unit tests, the cluster tests and the replay matrix:
 - No negative/over-budget remainders; no crossed book.
 - Fee rates outside ±100%, and quote amounts with too many decimals, are rejected.
 
-Still to cover if the extensions in §3.2 and §13 items 11-16 are built:
+Still to cover if the extensions in §3.2 and §13 items 11-13 are built:
 
 - Derivatives: linear USDT-margined fees in quote, inverse fees in base, third-asset settlement,
   contract-multiplier notional, maker rebates and overflow quarantine; margin/PnL and funding stay
@@ -1075,22 +1081,27 @@ Still open:
 11. Which asset classes a deployment must enable: fiat, stablecoin, crypto, equity, ETF or a
     subset? `AssetId`/`AssetClass` cover all five; asset issuance and validation are a deployment
     concern.
-12. Can fees be charged in an asset other than base or quote (for example a broker fee in USD on a
-    BTC/USDT trade)? That requires a fee-token price and balance handling.
-13. Derivatives support requires an instrument kind, contract multiplier, settlement/margin asset,
+12. Derivatives support requires an instrument kind, contract multiplier, settlement/margin asset,
     `VolumeUnit::Contract` and `FeeAsset::Settlement`; the fee formula depends on whether the
     contract is linear, inverse, quanto or third-asset margined. This is a snapshot/wire-version
     change, not an incremental `FeeAssetPolicy` value.
-14. For third-asset margin, decide whether fees are charged directly in settlement units or
+13. For third-asset margin, decide whether fees are charged directly in settlement units or
     converted from the contract's quote currency at an explicit, versioned rate. The engine must not
     infer an FX rate.
-15. Should the numeric fields named by an error code become `Option<Fixed>` (JSON `null`) instead of
-    zero, so a real zero and an unavailable value cannot be confused?
-16. Quote volume for icebergs and FOK: today both are rejected at admission because they need a
-    base-normalization rule that does not exist.
 
 Resolved:
 
+14. **Numeric sentinel policy.** Keep zero plus `MatchErrors` for snapshot v10 and wire v6. A zero
+    is authoritative only when its code is absent; `MatchResult` and `MatchEvent` expose
+    `exact_notional`/`exact_quote_volume`, `exact_taker_fee` and `exact_maker_fee` accessors, and
+    market-data records expose the same helpers. Nullable fields were rejected because they would
+    require a v11/v7 migration without adding information beyond the error set.
+15. **Mixed-unit iceberg/FOK.** Quote volume remains limited to plain limit and market orders.
+    Quote icebergs and FOK are deliberately rejected at admission; clients must submit base volume
+    for those shapes. There is no planned base-normalization rule.
+16. **Fee-token scope.** Third-asset fee tokens remain out of scope. The engine supports only the
+    pair's base/quote fee assets; conversion, fee-token balances and freeze/deduction are owned by
+    the external order/clearing system, which must supply any explicit conversion policy.
 17. Fixed per-trade fees, per-share commissions, regulatory fees, minimum tickets and taxes are
     owned by the external order system; the engine computes only notional-proportional maker/taker
     rates.

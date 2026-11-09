@@ -50,6 +50,7 @@ use crate::order_book::DepthChange;
 use crate::order_book::DepthLevel;
 use crate::order_book::FeeAsset;
 use crate::order_book::Fixed;
+use crate::order_book::MatchErrorCode;
 use crate::order_book::MatchErrors;
 use crate::order_book::OrderSide;
 use crate::order_book::RejectReason;
@@ -284,6 +285,26 @@ pub struct TradeRecord {
     pub maker_sequence: u64,
 }
 
+impl TradeRecord {
+    /// Exact gross quote notional, or `None` when `notional_overflow` is set.
+    ///
+    /// `quote_volume` uses zero as the unavailable sentinel; this accessor is
+    /// the recommended feed-consumer API.
+    pub fn exact_quote_volume(&self) -> Option<Fixed> {
+        (!self.error.contains(MatchErrorCode::NotionalOverflow)).then_some(self.quote_volume)
+    }
+
+    /// Exact taker fee, or `None` when `taker_fee_overflow` is set.
+    pub fn exact_taker_fee(&self) -> Option<Fixed> {
+        (!self.error.contains(MatchErrorCode::TakerFeeOverflow)).then_some(self.taker_fee)
+    }
+
+    /// Exact maker fee, or `None` when `maker_fee_overflow` is set.
+    pub fn exact_maker_fee(&self) -> Option<Fixed> {
+        (!self.error.contains(MatchErrorCode::MakerFeeOverflow)).then_some(self.maker_fee)
+    }
+}
+
 /// Latest-value top of book.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BboRecord {
@@ -358,6 +379,32 @@ pub struct LifecycleRecord {
     pub error: MatchErrors,
     /// Rejection/expiry reason when present.
     pub reason: Option<RejectReason>,
+}
+
+impl LifecycleRecord {
+    /// Exact gross quote notional, or `None` for a non-fill event or a fill
+    /// whose `notional_overflow` code is set.
+    pub fn exact_quote_volume(&self) -> Option<Fixed> {
+        (self.kind == MatchEventKind::Fill
+            && !self.error.contains(MatchErrorCode::NotionalOverflow))
+        .then_some(self.quote_volume)
+    }
+
+    /// Exact taker fee, or `None` for a non-fill event or a fill whose
+    /// `taker_fee_overflow` code is set.
+    pub fn exact_taker_fee(&self) -> Option<Fixed> {
+        (self.kind == MatchEventKind::Fill
+            && !self.error.contains(MatchErrorCode::TakerFeeOverflow))
+        .then_some(self.taker_fee)
+    }
+
+    /// Exact maker fee, or `None` for a non-fill event or a fill whose
+    /// `maker_fee_overflow` code is set.
+    pub fn exact_maker_fee(&self) -> Option<Fixed> {
+        (self.kind == MatchEventKind::Fill
+            && !self.error.contains(MatchErrorCode::MakerFeeOverflow))
+        .then_some(self.maker_fee)
+    }
 }
 
 /// One OHLCV bar.

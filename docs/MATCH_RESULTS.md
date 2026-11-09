@@ -228,7 +228,11 @@ Notes:
   maker uses its maker rate; positive = charge, negative = rebate. `error` is an ordered set of codes for a fill whose notional or a fee fell outside the
   scale-18 range. Only the affected dependent fields are zero: a base-denominated fee can remain
   exact when the quote notional overflowed. A zero whose code is present must not be used as a real
-  value; see `docs/FEE_DEDUCTION.md` §7.1.
+  value; see `docs/FEE_DEDUCTION.md` §7.1. The zero-plus-`error` sentinel is part of the v10/v6
+  contract: `MatchEvent::exact_quote_volume`/`exact_taker_fee`/`exact_maker_fee`, the
+  `MatchResult` equivalents and the market-data `TradeRecord`/`LifecycleRecord` accessors return
+  `None` when the field is unavailable, while nullable JSON fields were rejected because they would
+  add a schema/wire migration without new information.
 
 Multi-instrument isolation is deployment-level: each symbol gets its own process/cluster and
 event sequence, so no per-instrument cursor split is needed inside one engine.
