@@ -301,6 +301,12 @@ pub async fn write(
     ensure_min_voters(&app)?;
     let mut request = req.into_inner();
     validate_request(&request).map_err(actix_web::error::ErrorBadRequest)?;
+    let Some(_admission) = app.admission.try_enter() else {
+        return Err(actix_web::error::ErrorTooManyRequests(format!(
+            "write admission limit reached ({} concurrent requests); retry later",
+            app.admission.limit()
+        )));
+    };
     guard_request_symbol(&app, &request)
         .await
         .map_err(actix_web::error::ErrorBadRequest)?;
@@ -337,6 +343,12 @@ pub async fn write_batch(
     let requests = req.into_inner();
     validate_batch(&requests).map_err(actix_web::error::ErrorBadRequest)?;
     let mut request = MatchEngineRequest::Batch { requests };
+    let Some(_admission) = app.admission.try_enter() else {
+        return Err(actix_web::error::ErrorTooManyRequests(format!(
+            "write-batch admission limit reached ({} concurrent requests); retry later",
+            app.admission.limit()
+        )));
+    };
     guard_request_symbol(&app, &request)
         .await
         .map_err(actix_web::error::ErrorBadRequest)?;

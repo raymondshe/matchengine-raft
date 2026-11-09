@@ -70,6 +70,7 @@ struct Args {
     purge_batch_size: u64,
     api_batch_linger_ms: u64,
     snapshot_logs: Option<u64>,
+    max_inflight_writes: usize,
 }
 
 impl Default for Args {
@@ -82,6 +83,7 @@ impl Default for Args {
             purge_batch_size: 1,
             api_batch_linger_ms: 0,
             snapshot_logs: None,
+            max_inflight_writes: 0,
         }
     }
 }
@@ -106,6 +108,8 @@ struct BatchRow {
 struct ConcurrencyRow {
     clients: usize,
     total: usize,
+    accepted: usize,
+    rejected: usize,
     throughput: f64,
     p50: Duration,
     p95: Duration,
@@ -116,6 +120,8 @@ struct RoundSummary {
     sequential: Option<Stats>,
     batch128: Option<BatchRow>,
     concurrent_batches: Option<f64>,
+    concurrent_batches_p50: Option<Duration>,
+    concurrent_batches_p99: Option<Duration>,
     concurrency: Vec<ConcurrencyRow>,
 }
 
@@ -171,7 +177,11 @@ fn config_from_args(args: &Args) -> Config {
 }
 
 impl Cluster {
-    async fn start(round: usize, config: Config) -> anyhow::Result<Self> {
+    async fn start(
+        round: usize,
+        config: Config,
+        max_inflight_writes: usize,
+    ) -> anyhow::Result<Self> {
         let root = temp_dir(&format!("cluster-e2e-r{round}"));
         let mut nodes = Vec::with_capacity(NODE_COUNT as usize);
         let mut clients = Vec::with_capacity(NODE_COUNT as usize);
@@ -183,7 +193,8 @@ impl Cluster {
                 .with_instance_prefix("cluster-e2e")
                 .with_snapshot_interval(Duration::ZERO)
                 .with_wal_fsync(None)
-                .with_min_voters(NODE_COUNT as usize);
+                .with_min_voters(NODE_COUNT as usize)
+                .with_max_inflight_writes(max_inflight_writes);
             let node = build_match_engine_node(id, addr.clone(), config.clone(), storage).await?;
             nodes.push(node);
             clients.push(Arc::new(MatchEngineClient::new(id, addr.clone())));
@@ -345,7 +356,9 @@ async fn batch_throughput(client: &MatchEngineClient<C>) -> anyhow::Result<Vec<B
     Ok(rows)
 }
 
-async fn concurrent_batch_throughput(client: &MatchEngineClient<C>) -> anyhow::Result<f64> {
+async fn concurrent_batch_throughput(
+    client: &MatchEngineClient<C>,
+) -> anyhow::Result<(f64, Duration, Duration)> {
     let batches: Vec<Vec<MatchEngineRequest>> = (0..CONCURRENT_BATCHES)
         .map(|batch| {
             (0..CONCURRENT_BATCH_SIZE)
@@ -356,12 +369,23 @@ async fn concurrent_batch_throughput(client: &MatchEngineClient<C>) -> anyhow::R
     let orders = CONCURRENT_BATCHES * CONCURRENT_BATCH_SIZE;
 
     let started = Instant::now();
-    let responses = join_all(batches.iter().map(|requests| client.write_batch(requests))).await;
+    let responses = join_all(batches.iter().map(|requests| {
+        let start = Instant::now();
+        async move { (client.write_batch(requests).await, start.elapsed()) }
+    }))
+    .await;
     let elapsed = started.elapsed();
-    let ok = responses
-        .iter()
-        .filter(|response| response.as_ref().is_ok_and(|inner| inner.is_ok()))
-        .count();
+    let mut latencies = Vec::with_capacity(CONCURRENT_BATCHES);
+    for (response, latency) in responses {
+        if response.as_ref().is_ok_and(|inner| inner.is_ok()) {
+            latencies.push(latency);
+        }
+    }
+    let ok = latencies.len();
+    if ok != CONCURRENT_BATCHES {
+        bail!("only {ok}/{CONCURRENT_BATCHES} concurrent batches succeeded");
+    }
+    latencies.sort_unstable();
     let throughput = orders as f64 / elapsed.as_secs_f64();
     println!(
         "concurrent /write_batch: {CONCURRENT_BATCHES} x {CONCURRENT_BATCH_SIZE} orders ({orders} total)"
@@ -372,10 +396,16 @@ async fn concurrent_batch_throughput(client: &MatchEngineClient<C>) -> anyhow::R
         CONCURRENT_BATCHES as f64 / elapsed.as_secs_f64()
     );
     println!("  completed:  {ok}/{CONCURRENT_BATCHES} batches");
-    if ok != CONCURRENT_BATCHES {
-        bail!("only {ok}/{CONCURRENT_BATCHES} concurrent batches succeeded");
-    }
-    Ok(throughput)
+    println!(
+        "  p50 / p99:  {:>10?} / {:?}",
+        percentile(&latencies, 0.50),
+        percentile(&latencies, 0.99)
+    );
+    Ok((
+        throughput,
+        percentile(&latencies, 0.50),
+        percentile(&latencies, 0.99),
+    ))
 }
 
 async fn write_concurrency(addr: &str, clients: usize) -> anyhow::Result<ConcurrencyRow> {
@@ -395,39 +425,49 @@ async fn write_concurrency(addr: &str, clients: usize) -> anyhow::Result<Concurr
         handles.push(tokio::spawn(async move {
             barrier.wait().await;
             let mut latencies = Vec::with_capacity(per_client);
+            let mut rejected = 0usize;
             for _ in 0..per_client {
                 let started = Instant::now();
-                let response = http
+                let status = http
                     .post(&url)
                     .header(reqwest::header::CONTENT_TYPE, "application/json")
                     .body(body.clone())
                     .send()
-                    .await?;
-                if !response.status().is_success() {
-                    bail!("write failed with HTTP {}", response.status());
+                    .await?
+                    .status();
+                if status.is_success() {
+                    latencies.push(started.elapsed());
+                } else if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                    rejected += 1;
+                } else {
+                    bail!("write failed with HTTP {status}");
                 }
-                latencies.push(started.elapsed());
             }
-            Ok::<_, anyhow::Error>(latencies)
+            Ok::<_, anyhow::Error>((latencies, rejected))
         }));
     }
 
     let started = Instant::now();
     barrier.wait().await;
     let mut latencies = Vec::with_capacity(total);
+    let mut rejected = 0usize;
     for handle in handles {
-        latencies.extend(handle.await??);
+        let (accepted, refused) = handle.await??;
+        latencies.extend(accepted);
+        rejected += refused;
     }
     let elapsed = started.elapsed();
-    let ok = latencies.len();
-    if ok != total {
-        bail!("only {ok}/{total} writes succeeded");
+    let accepted = latencies.len();
+    if accepted == 0 {
+        bail!("no writes were admitted");
     }
     latencies.sort_unstable();
     Ok(ConcurrencyRow {
         clients,
         total,
-        throughput: total as f64 / elapsed.as_secs_f64(),
+        accepted,
+        rejected,
+        throughput: accepted as f64 / elapsed.as_secs_f64(),
         p50: percentile(&latencies, 0.50),
         p95: percentile(&latencies, 0.95),
         p99: percentile(&latencies, 0.99),
@@ -465,15 +505,22 @@ async fn run_workloads(
 
     println!("concurrency sweep (one client task per in-flight request):");
     println!(
-        "  {:>7}  {:>7}  {:>11}  {:>10}  {:>10}  {:>10}",
-        "clients", "requests", "writes/s", "p50", "p95", "p99"
+        "  {:>7}  {:>8}  {:>8}  {:>8}  {:>10}  {:>10}  {:>10}  {:>10}",
+        "clients", "attempts", "accepted", "rejected", "writes/s", "p50", "p95", "p99"
     );
     let mut concurrency = Vec::with_capacity(args.clients.len());
     for &clients in &args.clients {
         let row = write_concurrency(&leader_addr, clients).await?;
         println!(
-            "  {:>7}  {:>7}  {:>11.0}  {:>10?}  {:>10?}  {:>10?}",
-            row.clients, row.total, row.throughput, row.p50, row.p95, row.p99
+            "  {:>7}  {:>8}  {:>8}  {:>8}  {:>10.0}  {:>10?}  {:>10?}  {:>10?}",
+            row.clients,
+            row.total,
+            row.accepted,
+            row.rejected,
+            row.throughput,
+            row.p50,
+            row.p95,
+            row.p99
         );
         concurrency.push(row);
     }
@@ -481,7 +528,9 @@ async fn run_workloads(
     Ok(RoundSummary {
         sequential,
         batch128: batch_rows.and_then(|rows| rows.into_iter().find(|row| row.size == 128)),
-        concurrent_batches,
+        concurrent_batches: concurrent_batches.map(|(throughput, _, _)| throughput),
+        concurrent_batches_p50: concurrent_batches.map(|(_, p50, _)| p50),
+        concurrent_batches_p99: concurrent_batches.map(|(_, _, p99)| p99),
         concurrency,
     })
 }
@@ -492,7 +541,11 @@ fn run_round(round: usize, rounds: usize, args: &Args) -> anyhow::Result<RoundSu
         .enable_all()
         .thread_name("cluster-bench-server")
         .build()?;
-    let cluster = server_rt.block_on(Cluster::start(round, config_from_args(args)))?;
+    let cluster = server_rt.block_on(Cluster::start(
+        round,
+        config_from_args(args),
+        args.max_inflight_writes,
+    ))?;
     let leader_index = server_rt.block_on(cluster.initialize())?;
     let leader_id = cluster.addrs[leader_index].0;
     let leader_addr = cluster.addrs[leader_index].1.clone();
@@ -589,12 +642,25 @@ fn print_summary(rounds: &[RoundSummary], args: &Args) {
         .any(|round| round.concurrent_batches.is_some())
     {
         let median = median_f64(rounds.iter().filter_map(|r| r.concurrent_batches).collect());
-        println!("concurrent batches 100x32: {median:>8.0} orders/s");
+        let p50 = median_duration(
+            rounds
+                .iter()
+                .filter_map(|r| r.concurrent_batches_p50)
+                .collect(),
+        );
+        let p99 = median_duration(
+            rounds
+                .iter()
+                .filter_map(|r| r.concurrent_batches_p99)
+                .collect(),
+        );
+        println!("concurrent batches 100x32: {median:>8.0} orders/s; p50 {p50:?}, p99 {p99:?}");
     }
 
     println!(
-        "concurrency sweep: clients={:?}, max_payload_entries={}, purge_batch_size={}, api_batch_linger_ms={}, snapshot_logs={:?}, RAFT_CORE_WORKERS={}",
+        "concurrency sweep: clients={:?}, max_inflight_writes={}, max_payload_entries={}, purge_batch_size={}, api_batch_linger_ms={}, snapshot_logs={:?}, RAFT_CORE_WORKERS={}",
         args.clients,
+        args.max_inflight_writes,
         args.max_payload_entries,
         args.purge_batch_size,
         args.api_batch_linger_ms,
@@ -602,8 +668,8 @@ fn print_summary(rounds: &[RoundSummary], args: &Args) {
         std::env::var("RAFT_CORE_WORKERS").unwrap_or_else(|_| "unset/shared".to_string())
     );
     println!(
-        "  {:>7}  {:>11}  {:>10}  {:>10}  {:>10}",
-        "clients", "writes/s", "p50", "p95", "p99"
+        "  {:>7}  {:>8}  {:>8}  {:>10}  {:>10}  {:>10}",
+        "clients", "accepted", "rejected", "writes/s", "p50", "p99"
     );
     for &clients in &args.clients {
         let rows: Vec<ConcurrencyRow> = rounds
@@ -615,12 +681,13 @@ fn print_summary(rounds: &[RoundSummary], args: &Args) {
             continue;
         }
         let throughput = median_f64(rows.iter().map(|row| row.throughput).collect());
+        let accepted = median_f64(rows.iter().map(|row| row.accepted as f64).collect());
+        let rejected = median_f64(rows.iter().map(|row| row.rejected as f64).collect());
         let p50 = median_duration(rows.iter().map(|row| row.p50).collect());
-        let p95 = median_duration(rows.iter().map(|row| row.p95).collect());
         let p99 = median_duration(rows.iter().map(|row| row.p99).collect());
         println!(
-            "  {:>7}  {:>11.0}  {:>10?}  {:>10?}  {:>10?}",
-            clients, throughput, p50, p95, p99
+            "  {:>7}  {:>8.0}  {:>8.0}  {:>10.0}  {:>10?}  {:>10?}",
+            clients, accepted, rejected, throughput, p50, p99
         );
     }
 }
@@ -685,6 +752,13 @@ fn parse_args() -> anyhow::Result<Args> {
                         .context("--snapshot-logs must be a number")?,
                 );
             }
+            "--max-inflight-writes" => {
+                args.max_inflight_writes = iter
+                    .next()
+                    .context("--max-inflight-writes needs a value")?
+                    .parse()
+                    .context("--max-inflight-writes must be a number")?;
+            }
             other => bail!("unknown argument {other:?}"),
         }
     }
@@ -700,8 +774,9 @@ fn main() -> anyhow::Result<()> {
     println!("all nodes run in one process; each has its own storage, HTTP and gRPC listener");
     println!("WAL fsync disabled; {WARMUP_WRITES} warm-up writes per round are excluded");
     println!(
-        "config: clients={:?}, max_payload_entries={}, purge_batch_size={}, api_batch_linger_ms={}, snapshot_logs={:?}, RAFT_CORE_WORKERS={}",
+        "config: clients={:?}, max_inflight_writes={}, max_payload_entries={}, purge_batch_size={}, api_batch_linger_ms={}, snapshot_logs={:?}, RAFT_CORE_WORKERS={}",
         args.clients,
+        args.max_inflight_writes,
         args.max_payload_entries,
         args.purge_batch_size,
         args.api_batch_linger_ms,

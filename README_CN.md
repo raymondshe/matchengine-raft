@@ -94,6 +94,7 @@
 - **领导者感知 Rust 客户端**，自动跟踪并转发到当前领导者，支持可配置超时、瞬时错误重试/退避以及类型化的 API/无领导者错误；重试是至少一次语义，写入重试应使用 `client_order_id` 实现幂等。
 - **运维 API**：初始化、成员变更、指标、事件状态和行情状态。
 - **批量写入**：`POST /write_batch` 将多个请求放入一个 Raft entry 和一次 WAL 追加，逐项返回序列号，事件序号在 entry 内连续。
+- **P99 感知写入准入**：每个节点默认限制 256 个并发 `/write` 和 `/write_batch` 请求，超出返回 `429`；`/admission/status` 报告当前、峰值、准入和拒绝计数。
 
 **运维可见性**
 - **内置 WebUI 控制台** `/console/`：集群健康、Raft 领导与复制、存储/事件/行情状态、仅领导者可见的事件查看器和诊断信息，无需构建步骤或外部资源。
@@ -286,7 +287,7 @@ HTTP API 与 gRPC Raft 监听端口（HTTP 端口 + 1000）**按设计就是明�
 
 HTTP 应用/管理 API 和 gRPC Raft 服务见 [API 参考](./docs/zh-CN/API.md)。主要路由：
 `/write`、`/write_batch`、`/read`、`/linearizable_read`、`/follower_read`、`/events`、`/read-policy/status`、
-`/health`、`/ready`、`/metrics` 和 `/console/`。
+`/admission/status`、`/health`、`/ready`、`/metrics` 和 `/console/`。
 
 ## 测试
 
@@ -306,6 +307,7 @@ HTTP 应用/管理 API 和 gRPC Raft 服务见 [API 参考](./docs/zh-CN/API.md)
 | BBO advance / BBO query | 20.37M advances/s / 434.5M queries/s |
 | 真实混合 replay（add/cancel/amend/stop/iceberg/taker） | 968,709 ops/s |
 | 4 节点复制写入，256 在途 | 90,569 writes/s，p99 6.47 ms |
+| 4 节点过载，4,096 在途且准入 256 | p99 72.8 → 15.4 ms；42.8k 准入 writes/s |
 | 4 节点串行 128 单批次 | 227,319 orders/s |
 | 4 节点 100 x 32 并发批次 | 216,163 orders/s |
 | Lease 线性一致读（1 / 64 读者） | 17,559 / 51,777 reads/s；p50 54.9 / 91.5 µs |
@@ -318,8 +320,10 @@ HTTP 应用/管理 API 和 gRPC Raft 服务见 [API 参考](./docs/zh-CN/API.md)
 持久性权衡见 PERFORMANCE.md。
 
 **推荐生产配置。** 追求最大吞吐时保持 `RAFT_WAL_FSYNC_MS` 未设置（默认；要求至少 4 个投票节点），
-保持 `RAFT_CORE_WORKERS` 未设置和 OpenRaft `300/1/0` 默认参数，使用 `/write_batch`（每批 32–128 单），
-单个 `/write` 请求的在途数量不超过 256。只有在 NTP/PTP 时钟漂移有界时保留默认 lease read，否则设置 `--read-policy read_index`。
+保持 `RAFT_CORE_WORKERS` 未设置和 OpenRaft `300/1/0` 默认参数，使用 `/write_batch`（每批 32–128 单）。
+服务端默认每个节点限制 256 个并发 `/write` 和 `/write_batch` 请求；超出返回 `429`，客户端应退避重试。
+降低 `--max-inflight-writes` 可进一步限制准入工作量；设为 `0` 可关闭拒绝；请按实际负载调优。只有在 NTP/PTP 时钟漂移有界时
+保留默认 lease read，否则设置 `--read-policy read_index`。
 如果已确认写入必须在非正常崩溃后仍不丢失，设置 `RAFT_WAL_FSYNC_MS=0`，并用批量写入摊薄 fsync 成本。
 不要使用 10ms fsync、1ms batch linger、1,024 的 payload/purge、异步 WAL 或 thin LTO；这些都没有
 超过默认配置。详见[生产配置决策](./docs/zh-CN/PERFORMANCE.md#生产配置决策2026-11-08)。

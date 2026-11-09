@@ -28,6 +28,7 @@ use crate::market_data::MarketDataHandle;
 use crate::match_result::FileLogSink;
 use crate::match_result::MatchResultSink;
 use crate::match_result::NoopSink;
+use crate::network::admission::AdmissionControl;
 use crate::network::api;
 use crate::network::console;
 use crate::network::grpc::HTTP2_CONNECTION_WINDOW;
@@ -687,6 +688,7 @@ pub async fn build_match_engine_node(
 
     // Create an application that will store all the instances created above, this will
     // be later used on the actix-web services.
+    let admission = AdmissionControl::new(storage.max_inflight_writes);
     let app_data = Data::new(MatchEngineApp {
         id: node_id,
         addr: http_addr.clone(),
@@ -697,6 +699,7 @@ pub async fn build_match_engine_node(
         recovered,
         min_voters: storage.min_voters,
         read_policy,
+        admission,
         console: console::ConsoleState::new(),
     });
 
@@ -730,6 +733,7 @@ pub async fn build_match_engine_node(
             .service(management::metrics)
             .service(management::get_linearizer)
             .service(management::read_policy_status)
+            .service(management::admission_status)
             // application API
             .service(api::write)
             .service(api::write_batch)

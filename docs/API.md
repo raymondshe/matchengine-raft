@@ -42,6 +42,7 @@ OpenRaft-configured chunks (3 MiB default, 8 MiB cap), and both message directio
   known; `503` during startup, elections or a partition. A follower with a known leader is ready
   for reads; writes still go to the leader.
 - `GET /read-policy/status` - Configured leader-read policy and per-endpoint lease/ReadIndex counters
+- `GET /admission/status` - Per-node write admission limit and current/peak/admitted/rejected counters
 - `GET /console/` - Embedded operational console (HTML/CSS/JS); no build step or external assets
 - `GET /console/api/node` - Stable node snapshot: health, Raft role, storage frontier, events and feed
 - `GET /console/api/cluster` - Local node plus peer snapshots from the current membership
@@ -63,6 +64,11 @@ the internal-only HTTP contract; TLS and operator authentication stay at the gat
   also accepted; `/write_batch` takes the same requests as a bare JSON array.
 - `POST /write_batch` - Submit 1–128 non-nested requests in one Raft entry. The response contains a
   `batch` array with one response per request; event ordinals are continuous across the entry.
+- `/write` and `/write_batch` share a per-node in-flight admission limit (default **256**
+  requests). At the limit the edge returns `429 Too Many Requests`; clients should retry with
+  backoff. The limit counts requests, not orders, so one 128-order batch consumes one slot.
+  `--max-inflight-writes 0` disables rejection. `GET /admission/status` reports the limit,
+  current in-flight count, peak, admitted and rejected totals.
 - `POST /read` - Read from the local state machine (may be stale)
 - `POST /linearizable_read` - Linearizable read; the request must reach the leader
 - `POST /follower_read` - Linearizable read served locally after fetching a linearizer from the leader

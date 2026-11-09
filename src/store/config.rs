@@ -19,6 +19,7 @@ use std::time::Duration;
 use crate::DEFAULT_SNAPSHOT_INTERVAL;
 use crate::MatchEngineNodeId;
 use crate::market_data::MarketDataConfig;
+use crate::network::admission::DEFAULT_MAX_INFLIGHT_WRITES;
 use crate::network::read_policy::ReadPolicyMode;
 use crate::store::state_machine::DEFAULT_MAX_EVENTS;
 
@@ -96,6 +97,11 @@ pub struct StorageConfig {
     /// bounded clock drift is not guaranteed.
     pub read_policy: ReadPolicyMode,
 
+    /// Maximum concurrent `/write` and `/write_batch` requests per node.
+    ///
+    /// `0` disables rejection while still collecting in-flight counters.
+    pub max_inflight_writes: usize,
+
     /// Prototype asynchronous WAL append. Only effective with the `async-wal`
     /// Cargo feature and `RAFT_WAL_FSYNC_MS=0`; off by default.
     pub async_wal: bool,
@@ -157,6 +163,7 @@ impl Default for StorageConfig {
             wal_fsync,
             min_voters,
             read_policy: ReadPolicyMode::default(),
+            max_inflight_writes: DEFAULT_MAX_INFLIGHT_WRITES,
             async_wal: false,
         }
     }
@@ -175,6 +182,7 @@ impl StorageConfig {
             wal_fsync: None,
             min_voters: 1,
             read_policy: ReadPolicyMode::default(),
+            max_inflight_writes: DEFAULT_MAX_INFLIGHT_WRITES,
             async_wal: false,
         }
     }
@@ -228,6 +236,14 @@ impl StorageConfig {
     /// Sets the leader-consistent read policy.
     pub fn with_read_policy(mut self, read_policy: ReadPolicyMode) -> Self {
         self.read_policy = read_policy;
+        self
+    }
+
+    /// Sets the concurrent `/write` and `/write_batch` request limit.
+    ///
+    /// `0` disables rejection while still collecting in-flight counters.
+    pub fn with_max_inflight_writes(mut self, max_inflight_writes: usize) -> Self {
+        self.max_inflight_writes = max_inflight_writes;
         self
     }
 
@@ -340,6 +356,26 @@ mod tests {
             StorageConfig::new("/data")
                 .with_read_policy(ReadPolicyMode::ReadIndex)
                 .read_policy
+        );
+    }
+
+    #[test]
+    fn max_inflight_writes_defaults_to_256_and_is_configurable() {
+        assert_eq!(
+            DEFAULT_MAX_INFLIGHT_WRITES,
+            StorageConfig::new("/data").max_inflight_writes
+        );
+        assert_eq!(
+            0,
+            StorageConfig::new("/data")
+                .with_max_inflight_writes(0)
+                .max_inflight_writes
+        );
+        assert_eq!(
+            512,
+            StorageConfig::new("/data")
+                .with_max_inflight_writes(512)
+                .max_inflight_writes
         );
     }
 

@@ -5,6 +5,7 @@ use crate::LogStore;
 use crate::MatchEngineNodeId;
 use crate::MatchEngineRaft;
 use crate::StateMachineStore;
+use crate::network::admission::AdmissionControl;
 use crate::network::console::ConsoleState;
 use crate::network::health::GrpcListenerHealth;
 use crate::network::read_policy::ReadPolicyRuntime;
@@ -62,6 +63,9 @@ pub struct MatchEngineApp {
 
     /// Leader-consistent read policy and lease/fallback counters.
     pub read_policy: ReadPolicyRuntime,
+
+    /// Bounded in-flight admission for `/write` and `/write_batch`.
+    pub admission: AdmissionControl,
 
     /// Operational-console state: action lock and recent action history.
     pub console: ConsoleState,

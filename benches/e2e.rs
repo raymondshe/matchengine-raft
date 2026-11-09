@@ -143,6 +143,9 @@ async fn start_node(
         .with_instance_prefix(format!("e2e-{runtime}"))
         .with_snapshot_interval(Duration::ZERO)
         .with_wal_fsync(fsync)
+        // This bench measures the unbounded write path; admission control is
+        // measured by `cluster_e2e --max-inflight-writes`.
+        .with_max_inflight_writes(0)
         .with_async_wal(async_wal);
     let node = build_match_engine_node(1, addr.to_string(), default_raft_config(), storage).await?;
     let client = MatchEngineClient::<C>::new(1, addr.to_string());

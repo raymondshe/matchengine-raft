@@ -95,6 +95,7 @@ Everything below is implemented in this repository and exercised by tests; the l
 - **Leader-aware Rust client** that tracks and forwards requests to the current leader, with configurable timeouts, transient retry/backoff and typed API/no-leader errors; retries are at-least-once, so use `client_order_id` for idempotent write retries.
 - **Operational APIs** for initialization, membership changes, metrics, event status and market-data status.
 - **Batch writes** at `POST /write_batch`: multiple requests in one Raft entry and one WAL append, with per-request sequences and continuous event ordinals.
+- **P99-aware write admission**: each node caps concurrent `/write` and `/write_batch` requests at 256 by default, returns `429` on overflow, and exposes current/peak/admitted/rejected counters at `/admission/status`.
 
 **Operational visibility**
 - **Embedded WebUI console** at `/console/`: cluster health, Raft leadership and replication, storage/event/feed state, a leader-only event viewer and diagnostics — no build step or external assets.
@@ -307,7 +308,7 @@ delivery and the market-data feed are documented separately:
 
 The HTTP application/admin APIs and the gRPC Raft service are documented in
 [API reference](./docs/API.md). Main routes: `/write`, `/write_batch`, `/read`,
-`/linearizable_read`, `/follower_read`, `/events`, `/read-policy/status`, `/health`, `/ready`, `/metrics` and `/console/`.
+`/linearizable_read`, `/follower_read`, `/events`, `/read-policy/status`, `/admission/status`, `/health`, `/ready`, `/metrics` and `/console/`.
 
 ## Testing
 
@@ -328,6 +329,7 @@ disabled. Methodology, percentiles, durability modes and caveats are in
 | BBO advance / BBO query | 20.37M advances/s / 434.5M queries/s |
 | Realistic mixed replay (add/cancel/amend/stop/iceberg/taker) | 968,709 ops/s |
 | Replicated writes, 256 in flight | 90,569 writes/s, p99 6.47 ms |
+| Replicated overload, 4,096 offered with 256 admission | p99 72.8 → 15.4 ms; 42.8k admitted writes/s |
 | Replicated sequential 128-order batches | 227,319 orders/s |
 | Replicated 100 x 32 concurrent batches | 216,163 orders/s |
 | Lease linearizable reads (1 / 64 readers) | 17,559 / 51,777 reads/s; p50 54.9 / 91.5 µs |
@@ -343,8 +345,11 @@ trade-off.
 
 **Recommended production profile.** For maximum throughput, leave `RAFT_WAL_FSYNC_MS` unset
 (default; requires at least four voters), keep `RAFT_CORE_WORKERS` unset and the OpenRaft
-`300/1/0` defaults, use `/write_batch` with 32–128 orders, and cap individual `/write` requests at 256 in flight.
-Keep the default lease reads only when NTP/PTP keeps clock drift bounded; otherwise set `--read-policy read_index`.
+`300/1/0` defaults, and use `/write_batch` with 32–128 orders. The server caps concurrent
+`/write` and `/write_batch` requests at 256 per node by default; excess requests receive `429`
+and should be retried with backoff. Lower `--max-inflight-writes` to cap admitted work more
+tightly, or set it to `0` to disable rejection; tune the value against the deployment load. Keep the default lease reads only when NTP/PTP keeps clock drift
+bounded; otherwise set `--read-policy read_index`.
 If acknowledged writes must survive an unclean crash, set `RAFT_WAL_FSYNC_MS=0` and batch writes
 to amortize the fsync. Do not use the 10 ms fsync mode, 1 ms batch linger, 1,024-entry
 payload/purge settings, async WAL or thin LTO; none beat the defaults. See

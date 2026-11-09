@@ -6,6 +6,7 @@ use env_logger::Env;
 use matchengine_raft::DEFAULT_SNAPSHOT_INTERVAL;
 use matchengine_raft::StorageConfig;
 use matchengine_raft::market_data::MarketDataConfig;
+use matchengine_raft::network::admission::DEFAULT_MAX_INFLIGHT_WRITES;
 use matchengine_raft::network::read_policy::ReadPolicyMode;
 use matchengine_raft::start_match_engine_node_with_storage;
 use matchengine_raft::store::state_machine::DEFAULT_MAX_EVENTS;
@@ -41,6 +42,17 @@ pub struct Opt {
     /// ReadIndex when the lease is stale. They assume bounded clock drift.
     #[clap(long, env = "MATCHENGINE_READ_POLICY", default_value = "lease")]
     pub read_policy: ReadPolicyMode,
+
+    /// Maximum concurrent `/write` and `/write_batch` requests per node.
+    ///
+    /// Excess requests receive HTTP 429. Set 0 to disable rejection while still
+    /// collecting in-flight counters.
+    #[clap(
+        long,
+        env = "MATCHENGINE_MAX_INFLIGHT_WRITES",
+        default_value_t = DEFAULT_MAX_INFLIGHT_WRITES
+    )]
+    pub max_inflight_writes: usize,
 
     /// Prototype asynchronous WAL append (requires the `async-wal` feature and
     /// `RAFT_WAL_FSYNC_MS=0`). Off by default.
@@ -141,6 +153,15 @@ async fn main() -> std::io::Result<()> {
         ReadPolicyMode::ReadIndex => tracing::info!("leader-consistent reads use ReadIndex"),
     }
 
+    if options.max_inflight_writes == 0 {
+        tracing::warn!("write admission limit is disabled; /write and /write_batch are unbounded");
+    } else {
+        tracing::info!(
+            limit = options.max_inflight_writes,
+            "write admission limit enabled"
+        );
+    }
+
     let wal_fsync = matchengine_raft::store::config::wal_fsync_from_env();
     let min_voters = if wal_fsync.is_none() {
         matchengine_raft::store::config::NO_FSYNC_MIN_VOTERS
@@ -164,6 +185,7 @@ async fn main() -> std::io::Result<()> {
         .with_wal_fsync(wal_fsync)
         .with_min_voters(min_voters)
         .with_read_policy(options.read_policy)
+        .with_max_inflight_writes(options.max_inflight_writes)
         .with_async_wal(options.async_wal);
     if let Some(path) = options.match_event_log {
         storage = storage.with_match_event_log(path);

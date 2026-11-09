@@ -1,6 +1,6 @@
 # Performance measurements
 
-Measured on **2026-10-30** (runtime flavor A/B and P0 offloads: **2026-10-31**; measurement scope and RSS: **2026-11-01**; book p50/p99 and the pinned-core approximation: **2026-11-04**; end-to-end/storage rerun with the OpenRaft quick wins: **2026-11-06**; realistic-mix replay: **2026-11-06**; dedicated Raft runtime: **2026-11-06**; WAL fsync Tokio rerun: **2026-11-07**; four-node no-fsync cluster: **2026-11-07**; write concurrency/batching sweep: **2026-11-08**; async WAL prototype: **2026-11-08**; production configuration decisions: **2026-11-08**; read-path benchmark: **2026-11-08**; OpenRaft minimal-benchmark comparison: **2026-11-08**) on the reference development machine:
+Measured on **2026-10-30** (runtime flavor A/B and P0 offloads: **2026-10-31**; measurement scope and RSS: **2026-11-01**; book p50/p99 and the pinned-core approximation: **2026-11-04**; end-to-end/storage rerun with the OpenRaft quick wins: **2026-11-06**; realistic-mix replay: **2026-11-06**; dedicated Raft runtime: **2026-11-06**; WAL fsync Tokio rerun: **2026-11-07**; four-node no-fsync cluster: **2026-11-07**; write concurrency/batching sweep: **2026-11-08**; async WAL prototype: **2026-11-08**; production configuration decisions: **2026-11-08**; write admission control: **2026-11-09**; read-path benchmark: **2026-11-08**; OpenRaft minimal-benchmark comparison: **2026-11-08**) on the reference development machine:
 
 - Apple M4 (`arm64`)
 - Rust `1.93.1`
@@ -18,6 +18,7 @@ cargo bench --bench e2e           # submit -> commit -> apply -> response (multi
 RAFT_WAL_FSYNC_MS=0 MATCHENGINE_ASYNC_WAL=1 cargo bench --features async-wal --bench e2e -- both  # prototype async WAL A/B
 cargo bench --bench cluster_e2e -- --rounds 3  # four in-process no-fsync voters, leader-direct writes and batches
 cargo bench --bench cluster_e2e -- --rounds 2 --concurrency-only  # 1/8/64/256/1024/4096-client sweep
+cargo bench --bench cluster_e2e -- --rounds 1 --concurrency-only --clients 256,512,1024,4096 --max-inflight-writes 256  # admission A/B
 cargo bench --bench read_e2e -- --policy both  # local /read, /linearizable_read and /events; ReadIndex vs lease
 cargo bench --bench feed_load     # market-data feed at 50k/500k fills/s
 cargo bench --bench storage       # WAL append/read/recovery
@@ -50,7 +51,7 @@ its scope.
 | `apply_path` | `StateMachineStore::apply` only: blank, rest, cancel, fill and 128-request batch workloads; a counting global allocator reports heap calls and requested bytes | HTTP, Raft, WAL, snapshots, market-data tap, event-log reads, response serialization | Closed-loop, direct apply; 50k entries or 1k batches per workload | Counting allocator; per-entry averages | Requested bytes include realloc churn and are not a live-memory high-water mark |
 | `e2e` `/write` | HTTP decode/validation, Raft proposal/commit, WAL append + `sync_data`, apply, response serialization | Cross-node replication, external client network beyond loopback | Sequential is closed-loop; concurrent is a 1,000-request burst | `Instant` per request; p50/p95/p99/max | Medians/percentiles; runtime A/B uses four alternating runs, the 2026-11-06 rerun uses three |
 | `e2e` `/write_batch` | Same as `/write`, with 1–128 requests per Raft entry and one WAL fsync per entry | Same as `/write` | 200 sequential batches per size; 100 concurrent 32-order batches | `Instant` per batch | Medians of three runs per size; batch latency includes payload/apply growth |
-| `cluster_e2e` | Four in-process loopback voters with a separate client runtime; HTTP `/write`/`/write_batch`, Raft 3/4 quorum replication over gRPC, WAL append without fsync, apply and response; optional client-count and OpenRaft config sweeps | Cross-host network latency, independent machines, disk contention between nodes | 50 warm-up writes; 500 sequential, 200 batches/size, 100×32 concurrent batches, and a 1/8/64/256/1024/4096-client sweep; fresh rounds | `Instant` per request/batch; p50/p95/p99 and medians | Two or three fresh rounds; high-concurrency tail is host-sensitive |
+| `cluster_e2e` | Four in-process loopback voters with a separate client runtime; HTTP `/write`/`/write_batch`, Raft 3/4 quorum replication over gRPC, WAL append without fsync, apply and response; optional client-count, write-admission and OpenRaft config sweeps | Cross-host network latency, independent machines, disk contention between nodes | 50 warm-up writes; 500 sequential, 200 batches/size, 100×32 concurrent batches, and a 1/8/64/256/1024/4096-client sweep; fresh rounds | `Instant` per request/batch; p50/p95/p99 and medians | Two or three fresh rounds; high-concurrency tail is host-sensitive |
 | `read_e2e` | Four in-process loopback voters with a separate client runtime; local `/read`, `/linearizable_read` and `/events`; ReadIndex and lease policies; 1/64 readers; read-only and mixed with an offered 2,000 writes/s | Cross-host network and clock skew; independent machines | 100 warm-up reads per endpoint; 2,000 reads/reader per case; 100-event pages; depth-20 local reads; two runs per policy | `Instant` per request; p50/p95/p99 and throughput | Two runs; read-only rows are stable, mixed rows depend on writer pacing |
 | `feed_load` | Tokio tap, bounded queue, shadow book, wire encoding and processor drain with a null sink | JSONL/network sink I/O, Raft, HTTP | Offered-load generator at 50k/500k/2M fills/s | `Instant`; queue/drain counters | One run per target; no p99 table |
 | `storage` | WAL append/read/reopen with 20k real order entries and 512 KiB segments; optional `async-wal` prototype | State machine, Raft, HTTP | Closed-loop, 100-entry batches | `Instant` | Five runs per mode; no tail study; async variance is high |
@@ -85,6 +86,7 @@ with a single-voter deployment. The four-voter floor is part of the no-fsync con
 | Read policy | lease (the default); keep it when NTP/PTP keeps clock drift bounded and `/read-policy/status` shows lease hits, otherwise set `--read-policy read_index` |
 | Raft runtime | `RAFT_CORE_WORKERS` unset or `0` (shared runtime) |
 | OpenRaft batching | defaults: `max_payload_entries=300`, `purge_batch_size=1`, `api_batch_linger_ms=0` |
+| Write admission | 256 concurrent `/write` or `/write_batch` requests per node; `429` overflow; `--max-inflight-writes 0` disables |
 | Snapshots | defaults: every 100,000 log entries or 30 minutes |
 | Async WAL | off (no `--async-wal`, no `async-wal` feature needed) |
 | Build | default release profile; no LTO requirement |
@@ -104,10 +106,12 @@ no-fsync control is higher for sequential writes (9,648/s) because there is no 3
 trip; use the cluster rows for sizing.
 
 Client shape: use `/write_batch` with 32-128 orders per entry. 128 maximizes throughput
-(227k orders/s in the four-node cluster); 32-64 keeps batch latency lower. For individual
-`/write` requests, cap in-flight work at **256**; 1,024/4,096 fell to 44.8k/51.0k writes/s with
-21.8/76.5 ms p99. The measured batch shape is 100 concurrent 32-order batches. `apply` holds the
-state-machine lock for the whole batch, so do not exceed the 128-request cap.
+(227k orders/s in the four-node cluster); 32-64 keeps batch latency lower. The server admits at
+most **256** concurrent `/write` or `/write_batch` requests per node by default; excess requests
+receive `429` and should be retried with backoff. Set `--max-inflight-writes 0` to disable
+rejection, or lower it to cap admitted work more tightly and measure p99 for the deployment
+burst shape. The measured batch shape is 100 concurrent 32-order batches, below the gate.
+`apply` holds the state-machine lock for the whole batch, so do not exceed the 128-request cap.
 
 ### Profile B: durable writes
 
@@ -456,7 +460,9 @@ network latency, independent machine failure or disk contention between nodes.
 ### Write concurrency and batching sweep (2026-11-08)
 
 `cargo bench --bench cluster_e2e -- --rounds 2 --concurrency-only` starts the four-node no-fsync
-topology on a server runtime and runs the write clients on a separate runtime. Each client task
+topology on a server runtime and runs the write clients on a separate runtime. The sweep sets
+`--max-inflight-writes 0`, so these rows measure the unbounded path; the default gate is
+evaluated in [Write admission control](#write-admission-control-2026-11-09). Each client task
 sends one request at a time; 1/8/64 clients send about 2,000 requests per case, 256 sends 1,792,
 1,024 sends 1,024 and 4,096 sends 4,096. The table is the median of two fresh rounds.
 
@@ -504,6 +510,44 @@ run-to-run spread and is not adopted.
 Caveat: all four voters share one process and host; the 1,024/4,096 rows are burst tails, not a
 capacity guarantee. The important result is the shape — throughput peaks around 256 and tail
 latency grows sharply beyond it.
+
+### Write admission control (2026-11-09)
+
+Each node now has a bounded in-flight gate for `/write` and `/write_batch`:
+`--max-inflight-writes` (env `MATCHENGINE_MAX_INFLIGHT_WRITES`) defaults to **256**; `0`
+disables rejection while still collecting counters. Excess requests return `429 Too Many
+Requests` instead of queueing behind Raft/apply. `GET /admission/status` reports the limit,
+current in-flight, peak, admitted and rejected totals. The limit counts requests, not orders: a
+128-order `/write_batch` consumes one slot.
+
+One fresh four-node no-fsync round, 256/512/1024/4096 offered clients, comparing the unbounded
+path (`0`) with the default gate (`256`). Throughput is admitted writes/s; rejected requests fail
+fast with `429`. This is an open-loop burst that does not retry rejected requests; production
+clients should back off and retry.
+
+| Offered clients | Limit | Admitted | Rejected | Admitted writes/s | p50 | p99 |
+|---:|---:|---:|---:|---:|---:|---:|
+| 256 | 0 | 1,792 | 0 | 90,312 | 2.28 ms | 5.01 ms |
+| 256 | 256 | 1,792 | 0 | 90,091 | 2.19 ms | 5.59 ms |
+| 512 | 0 | 1,536 | 0 | 50,053 | 8.66 ms | 21.30 ms |
+| 512 | 256 | 1,202 | 334 | 42,769 | 8.18 ms | 22.07 ms |
+| 1,024 | 0 | 1,024 | 0 | 43,267 | 13.39 ms | 21.02 ms |
+| 1,024 | 256 | 795 | 229 | 34,028 | 10.35 ms | 20.28 ms |
+| 4,096 | 0 | 4,096 | 0 | 45,912 | 16.07 ms | 72.77 ms |
+| 4,096 | 256 | 2,118 | 1,978 | 42,837 | 6.47 ms | **15.37 ms** |
+
+At the measured knee (256 offered) the gate is neutral. At 4,096 offered requests it cuts p99
+from **72.77 ms to 15.37 ms** (4.7x) while admitted throughput falls by 6.7%. At 512/1,024 the
+p99 does not improve because 256 admitted requests are already above the low-tail knee; the gate
+prevents unbounded queueing but cannot make that concurrency cheap. Lower limits of 64/128
+reduced admitted throughput without a consistent p99 win in this burst model, so 256 remains the
+default. For tighter tails, reduce client concurrency or use larger `/write_batch` entries.
+
+`/write_batch` stayed below the gate: 100 concurrent 32-order batches (3,200 orders) measured
+**309,180 orders/s** with p99 **10.31 ms** unbounded versus **303,609 orders/s** with p99
+**10.49 ms** at limit 256. This is one round; re-run on deployment hardware. A rejected request
+is a fast `429`, not a queued request; clients should retry with backoff (the Rust client treats
+429 as retryable).
 
 ### Read-path benchmark: ReadIndex vs lease (2026-11-08)
 
@@ -992,8 +1036,9 @@ actor with batching; otherwise `RAFT_CORE_WORKERS=2` is the practical compromise
 
 ### Prioritized opportunities
 
-The 2026-11-08 sweeps and prototype put concurrency/admission control and async-WAL
-productionization ahead of the items below; see
+The 2026-11-08 sweeps and prototype identified concurrency/admission control and async-WAL
+productionization as the next levers; admission control is now implemented (2026-11-09), and
+async-WAL productionization remains. See
 [Write concurrency and batching sweep](#write-concurrency-and-batching-sweep-2026-11-08),
 [Read-path benchmark](#read-path-benchmark-readindex-vs-lease-2026-11-08),
 [Async WAL prototype](#async-wal-prototype-2026-11-08) and
@@ -1176,9 +1221,10 @@ The measurement rules transferred regardless of layout and are now implemented:
 - The upstream OpenRaft minimal benchmark (in-memory, no network, empty state machine) runs at
   33k put/s with one client and 3.5M/s with 4,096, while our 4-node no-fsync cluster runs at
   5.0k sequential and 90.6k writes/s at the 256-client knee. Raft is not the current bottleneck;
-  HTTP/JSON, WAL, apply and client concurrency dominate. Lease reads are the default and write
-  batching is implemented; the remaining levers are admission control and verifying lease
-  fallback behavior on multi-host clocks, not Raft or book-level work.
+  HTTP/JSON, WAL, apply and client concurrency dominate. Lease reads, write batching and the
+  admission gate are implemented; the remaining levers are verifying lease fallback behavior on
+  multi-host clocks and tuning the admission limit for the deployment's p99 target, not Raft or
+  book-level work.
 - Lease reads (the default) remove the fresh quorum round on leader reads and produced
   2.17x/1.71x throughput and 2.18x/3.46x p50 gains for `/linearizable_read` at 1/64 readers in the
   4-node loopback benchmark; `/events` gained 1.46x/1.18x. Set `--read-policy read_index` when
@@ -1186,8 +1232,10 @@ The measurement rules transferred regardless of layout and are now implemented:
   on multi-host clocks.
 - The write concurrency sweep peaks at 256 in-flight (90.6k writes/s, p99 6.47 ms); 1,024 and
   4,096 in-flight fall to 44.8k/51.0k writes/s with 21.8/76.5 ms p99. The server is saturated
-  well before 4,096 clients. `/write_batch` remains the throughput path; the default OpenRaft
-  payload/purge/linger and runtime/LTO settings were not improved by the one-factor sweeps.
+  well before 4,096 clients. The default 256-request admission gate is neutral at the knee and
+  cut p99 at 4,096 offered requests from 72.8 ms to 15.4 ms while retaining 42.8k admitted
+  writes/s. `/write_batch` remains the throughput path; the default OpenRaft payload/purge/linger
+  and runtime/LTO settings were not improved by the one-factor sweeps.
 - The async WAL prototype raised every-append storage throughput from a 26.0k entries/s median to
   172k (range 65.2k-192.2k) while preserving the `IOFlushed` durability gate and crash recovery.
   A single-node e2e A/B found no consistent request-path gain: sequential writes still wait for
@@ -1224,6 +1272,9 @@ The measurement rules transferred regardless of layout and are now implemented:
 
 ### Implemented choices
 
+- Per-node write admission caps concurrent `/write` and `/write_batch` requests at 256 by
+  default, returns `429` on overflow and exposes limit/in-flight/peak/admitted/rejected counters
+  at `/admission/status`.
 - In every-append mode, one `write_all` + one `sync_data` per replicated append batch, so N
   entries in one AppendEntries RPC cost one fsync; the default no-fsync mode skips the `sync_data`.
 - `pread` reads against cached file handles, so replication can read while an append is in flight.

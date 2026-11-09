@@ -27,15 +27,16 @@ important but not blocking; **P3** = later/optional.
 
 No P0 or P1 work remains. The remaining items are P2/P3, ordered below by production value.
 
-**Recently completed (2026-11-06/08):** configurable WAL fsync with a measured A/B matrix,
+**Recently completed (2026-11-06/09):** configurable WAL fsync with a measured A/B matrix,
 best-effort WAL recovery, the four-voter no-fsync floor (`test_min_voters.rs`), the optional
 dedicated OpenRaft runtime (`RAFT_CORE_WORKERS`), the thread/lock audit (blocking sinks and startup
 recovery on `spawn_blocking`, async JSONL sink/events bridge, Aeron publisher/source blocking
 tasks, a Tokio WAL fsync worker; only the env-controlled `RaftThread` remains), the realistic-mix
 replay benchmark, the four-node no-fsync cluster benchmark (`cluster_e2e`), the write
 concurrency/batching sweep, the read-path benchmark plus lease reads (now the default; `read_e2e`), and the
-feature-gated async WAL prototype with crash-recovery tests, and the production configuration
-decision record (two durability profiles and rejected options). The measured baselines,
+feature-gated async WAL prototype with crash-recovery tests, the production configuration
+decision record (two durability profiles and rejected options), and the server-side 256-request
+write admission control with `/admission/status` and an overload A/B. The measured baselines,
 write/lease decisions, async-WAL numbers and upstream OpenRaft comparison are in
 [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md).
 
@@ -56,24 +57,20 @@ implemented: the replication lag threshold now sits above the 100k snapshot poli
 suppression is enabled, HTTP/2 windows/keepalive are tuned, snapshot chunks follow OpenRaft's
 configured size and readiness waits for recovery. The remaining P2/P3 items are tracked in §16.
 
-The next work, in order (re-prioritised 2026-11-08 after the write and read sweeps):
+The next work, in order (re-prioritised 2026-11-09):
 
-1. **Add server-side p99-aware admission control (§8, P2).** The client-side 256-in-flight cap
-   is now documented in `PERFORMANCE.md`/`README.md` (256-512 for p99-sensitive deployments).
-   Remaining: a server-side in-flight limit or queue-depth metric, and a re-measurement with
-   `/write` and `/write_batch`.
-2. **Add OpenRaft observability, profiling and transport hygiene (§16, P2).** Expose
+1. **Add OpenRaft observability, profiling and transport hygiene (§16, P2).** Expose
    `data_metrics`, `server_metrics` and `runtime_stats`; enable `runtime-stats` in profiling
    builds; make heartbeat/snapshot channel profiles explicit; add flamegraph/tokio-console
    guidance to `cluster_e2e`. This is the prerequisite for attributing the gap between our 5,039
    sequential writes/s and the 33k one-client upstream floor.
-3. **Benchmark regression gate and measurement hygiene (§8, P2).** Gate CI on deterministic
+2. **Benchmark regression gate and measurement hygiene (§8, P2).** Gate CI on deterministic
    `apply_path` allocs/entry plus loose p50/p99 thresholds; run the Linux pinned-core `e2e` pass.
    Add the 4-node, write-sweep, read-path and async-WAL rows once their variance settles.
-4. **Prove the four-voter no-fsync contract under failure (§7, P2).** The voter guard is tested;
+3. **Prove the four-voter no-fsync contract under failure (§7, P2).** The voter guard is tested;
    add a four-voter SIGKILL/failover case that proves the surviving cluster still commits and the
    restarted node catches up after one node loses its unsynced tail.
-5. **Feature and extension work.** Amend parked stops/icebergs and port the missing order types
+4. **Feature and extension work.** Amend parked stops/icebergs and port the missing order types
    (§5), Aeron hardening and market-data archive/replay (§6), and the error-null/mixed-unit/
    fee-token decisions (§13). The optional apply-path and per-level-bucket work in §8 is last
    because the measured wins are small or split.
@@ -479,8 +476,14 @@ Remaining:
 - [x] **P2** A/B thin LTO + `codegen-units = 1` for release/bench builds. Done: paired control
   74.1k/40.2k/40.8k vs LTO 77.8k/45.9k/45.4k at 256/1,024/4,096; within the host's run-to-run
   spread, so the default profile stays.
-- [ ] **P2** Add p99-aware concurrency/admission control: a server-side in-flight limit or
-  queue-depth metric, or a documented 256-512 client cap; re-measure `/write` and `/write_batch`.
+- [x] **P2** Add p99-aware concurrency/admission control. Done: per-node
+  `--max-inflight-writes` (default 256; `0` disables) gates `/write` and `/write_batch`, returns
+  `429` on overflow and exposes `GET /admission/status` counters. At 4,096 offered clients the
+  gate cut p99 from 72.77ms to 15.37ms while admitted throughput fell from 45.9k to 42.8k
+  writes/s; at 256 it was neutral, and 100x32 `/write_batch` was unchanged. See
+  `docs/PERFORMANCE.md`.
+- [ ] **P3** Evaluate bounded waiting/backpressure as an alternative to immediate `429` when
+  clients cannot retry promptly; keep the current fail-fast gate as the default until measured.
 - [ ] **P2** Add a benchmark regression gate (threshold or recorded baseline) to CI: start with
   deterministic `apply_path` allocs/entry and loose p50/p99 bounds for `book_replay` and
   `replay_mix`; add the stable fsync rows (every append and disabled) and the 4-node cluster rows
@@ -780,8 +783,8 @@ The full review is in [`RAFT_REVIEW.md`](./docs/RAFT_REVIEW.md). The transport a
 `RaftNetworkV2::stream_append` for replication and heartbeats and `full_snapshot` for snapshots;
 these follow-ups are about aligning OpenRaft 0.10 configuration with this workload and reducing
 storage/transport overhead. Re-prioritised 2026-11-08 after the upstream minimal-benchmark
-comparison: the read path, payload/purge sweeps and async-WAL prototype are complete;
-observability and admission control are next, then async-WAL productionization and optional APIs.
+comparison: the read path, payload/purge sweeps, admission control and async-WAL prototype are
+complete; observability is next, then async-WAL productionization and optional APIs.
 
 **Read path**
 

@@ -19,6 +19,7 @@ use serde::Serialize;
 use crate::MatchEngineNodeId;
 use crate::MatchEngineTypeConfig;
 use crate::app::MatchEngineApp;
+use crate::network::admission::AdmissionStatus;
 use crate::network::read_policy::ReadPath;
 
 /// Serializable representation of linearizer data for follower reads
@@ -129,6 +130,13 @@ pub async fn init(
 #[get("/read-policy/status")]
 pub async fn read_policy_status(app: Data<MatchEngineApp>) -> actix_web::Result<impl Responder> {
     Ok(Json(app.read_policy.status()))
+}
+
+/// Reports the write admission limit and in-flight/peak/admitted/rejected counters.
+#[get("/admission/status")]
+pub async fn admission_status(app: Data<MatchEngineApp>) -> actix_web::Result<impl Responder> {
+    let status: AdmissionStatus = app.admission.status();
+    Ok(Json(status))
 }
 
 /// Get the latest metrics of the cluster
