@@ -95,7 +95,7 @@ Everything below is implemented in this repository and exercised by tests; the l
 - **Leader-aware Rust client** that tracks and forwards requests to the current leader, with configurable timeouts, transient retry/backoff and typed API/no-leader errors; retries are at-least-once, so use `client_order_id` for idempotent write retries.
 - **Operational APIs** for initialization, membership changes, metrics, event status and market-data status.
 - **Batch writes** at `POST /write_batch`: multiple requests in one Raft entry and one WAL append, with per-request sequences and continuous event ordinals.
-- **P99-aware write admission**: each node caps concurrent `/write` and `/write_batch` requests at 256 by default, returns `429` on overflow, and exposes current/peak/admitted/rejected counters at `/admission/status`.
+- **P99-aware write admission**: each node caps concurrent `/write` and `/write_batch` requests at 1,024 by default, returns `429` on overflow, and exposes current/peak/admitted/rejected counters at `/admission/status`.
 
 **Operational visibility**
 - **Embedded WebUI console** at `/console/`: cluster health, Raft leadership and replication, storage/event/feed state, a leader-only event viewer and diagnostics — no build step or external assets.
@@ -328,8 +328,8 @@ disabled. Methodology, percentiles, durability modes and caveats are in
 | Order-book deep cancels | 19.63M cancels/s |
 | BBO advance / BBO query | 20.37M advances/s / 434.5M queries/s |
 | Realistic mixed replay (add/cancel/amend/stop/iceberg/taker) | 968,709 ops/s |
-| Replicated writes, 256 in flight | 90,569 writes/s, p99 6.47 ms |
-| Replicated overload, 4,096 offered with 256 admission | p99 72.8 → 15.4 ms; 42.8k admitted writes/s |
+| Replicated writes, 512 in flight (pre-connected) | 114,484 writes/s, p99 5.76 ms |
+| Replicated writes, 1,024 in flight (pre-connected) | 99,330 writes/s, p99 8.74 ms |
 | Replicated sequential 128-order batches | 227,319 orders/s |
 | Replicated 100 x 32 concurrent batches | 216,163 orders/s |
 | Lease linearizable reads (1 / 64 readers) | 17,559 / 51,777 reads/s; p50 54.9 / 91.5 µs |
@@ -338,18 +338,20 @@ disabled. Methodology, percentiles, durability modes and caveats are in
 
 Book-only figures are best-case single-process order-book numbers, not end-to-end capacity. The four-node
 rows use a 3-of-4 quorum on loopback with all nodes in one process; they do not model cross-host
-network latency, independent disk contention or host failure. The write sweep peaks at 256 in
-flight. Every-append durability is much lower on the single-node sequential path (262 writes/s)
+network latency, independent disk contention or host failure. Pre-connected writes plateau at
+512–1,024 in flight; the earlier connection-storm sweep included TCP setup and understated
+capacity. Every-append durability is much lower on the single-node sequential path (262 writes/s)
 but still reaches 180k orders/s for 100 x 32 batches on one node; see PERFORMANCE.md for that
 trade-off.
 
 **Recommended production profile.** For maximum throughput, leave `RAFT_WAL_FSYNC_MS` unset
 (default; requires at least four voters), keep `RAFT_CORE_WORKERS` unset and the OpenRaft
 `300/1/0` defaults, and use `/write_batch` with 32–128 orders. The server caps concurrent
-`/write` and `/write_batch` requests at 256 per node by default; excess requests receive `429`
-and should be retried with backoff. Lower `--max-inflight-writes` to cap admitted work more
-tightly, or set it to `0` to disable rejection; tune the value against the deployment load. Keep the default lease reads only when NTP/PTP keeps clock drift
-bounded; otherwise set `--read-policy read_index`.
+`/write` and `/write_batch` requests at 1,024 per node by default; excess requests receive `429`
+and should be retried with backoff. Lower `--max-inflight-writes` to `512` for a tighter tail at
+roughly 1,024 concurrent clients, or set it to `0` to disable rejection; tune the value against
+the deployment load. Keep the default lease reads only when NTP/PTP keeps clock drift bounded;
+otherwise set `--read-policy read_index`.
 If acknowledged writes must survive an unclean crash, set `RAFT_WAL_FSYNC_MS=0` and batch writes
 to amortize the fsync. Do not use the 10 ms fsync mode, 1 ms batch linger, 1,024-entry
 payload/purge settings, async WAL or thin LTO; none beat the defaults. See

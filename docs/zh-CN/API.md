@@ -59,10 +59,10 @@ Raft 节点间 RPC 仅由 `--http-addr` 端口 + 1000 上的 gRPC 提供；HTTP 
   JSON 数组接收同样的请求。
 - `POST /write_batch` - 将 1–128 个非嵌套请求放入一个 Raft entry；响应中的 `batch` 数组逐项返回结果，
   事件序号在整个 entry 内连续。
-- `/write` 和 `/write_batch` 共享每节点在途准入上限（默认 **256** 个请求）。达到上限时返回
+- `/write` 和 `/write_batch` 共享每节点在途准入上限（默认 **1,024** 个请求）。达到上限时返回
   `429 Too Many Requests`，客户端应退避重试。上限按请求计数，不按订单计数，因此一个 128 单批次
-  只占一个名额。`--max-inflight-writes 0` 可关闭拒绝；`GET /admission/status` 报告上限、当前在途、
-  峰值、准入和拒绝总数。
+  只占一个名额。约 1,024 个并发客户端且需要更紧尾延迟时可降到 `512`；`--max-inflight-writes 0`
+  可关闭拒绝；`GET /admission/status` 报告上限、当前在途、峰值、准入和拒绝总数。
 - `POST /read` - 从本地状态机读取（可能读到旧值）
 - `POST /linearizable_read` - 线性一致性读；请求必须到达领导者
 - `POST /follower_read` - 从领导者获取 linearizer 后在本地完成的线性一致性读

@@ -11,6 +11,7 @@
 //!
 //! ```text
 //! cargo bench --bench cluster_e2e -- --rounds 3 --concurrency-only
+//! cargo bench --bench cluster_e2e -- --concurrency-only --preconnect
 //! cargo bench --bench cluster_e2e -- --concurrency-only --max-payload-entries 1024
 //! cargo bench --bench cluster_e2e -- --concurrency-only --purge-batch-size 1024 --snapshot-logs 10000
 //! cargo bench --bench cluster_e2e -- --concurrency-only --api-batch-linger-ms 100
@@ -71,6 +72,7 @@ struct Args {
     api_batch_linger_ms: u64,
     snapshot_logs: Option<u64>,
     max_inflight_writes: usize,
+    preconnect: bool,
 }
 
 impl Default for Args {
@@ -84,6 +86,7 @@ impl Default for Args {
             api_batch_linger_ms: 0,
             snapshot_logs: None,
             max_inflight_writes: 0,
+            preconnect: false,
         }
     }
 }
@@ -408,12 +411,39 @@ async fn concurrent_batch_throughput(
     ))
 }
 
-async fn write_concurrency(addr: &str, clients: usize) -> anyhow::Result<ConcurrencyRow> {
+async fn write_concurrency(
+    addr: &str,
+    clients: usize,
+    preconnect: bool,
+) -> anyhow::Result<ConcurrencyRow> {
     let per_client = (TOTAL_CONCURRENCY_REQUESTS / clients).max(1);
     let total = clients * per_client;
     let body = serde_json::to_vec(&write_request(0))?;
-    let http = reqwest::Client::builder().no_proxy().build()?;
+    let http = if preconnect {
+        reqwest::Client::builder()
+            .no_proxy()
+            .pool_max_idle_per_host(clients)
+            .build()?
+    } else {
+        reqwest::Client::builder().no_proxy().build()?
+    };
     let url = format!("http://{addr}/write");
+
+    if preconnect {
+        // Establish one keep-alive connection per client before the barrier.
+        // Without this, TCP setup staggers the "burst" and a run offering
+        // 1,024 clients can have only a few hundred requests truly in flight.
+        let health_url = format!("http://{addr}/health");
+        let warm = (0..clients).map(|_| async {
+            let response = http.get(&health_url).send().await?;
+            let _ = response.bytes().await?;
+            Ok::<_, anyhow::Error>(())
+        });
+        for result in join_all(warm).await {
+            result?;
+        }
+    }
+
     let barrier = Arc::new(Barrier::new(clients + 1));
     let mut handles = Vec::with_capacity(clients);
 
@@ -428,13 +458,18 @@ async fn write_concurrency(addr: &str, clients: usize) -> anyhow::Result<Concurr
             let mut rejected = 0usize;
             for _ in 0..per_client {
                 let started = Instant::now();
-                let status = http
+                let response = http
                     .post(&url)
                     .header(reqwest::header::CONTENT_TYPE, "application/json")
                     .body(body.clone())
                     .send()
-                    .await?
-                    .status();
+                    .await?;
+                let status = response.status();
+                if preconnect {
+                    // Consume the body so the connection returns to the pool
+                    // and subsequent requests reuse it.
+                    let _ = response.bytes().await?;
+                }
                 if status.is_success() {
                     latencies.push(started.elapsed());
                 } else if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
@@ -510,7 +545,7 @@ async fn run_workloads(
     );
     let mut concurrency = Vec::with_capacity(args.clients.len());
     for &clients in &args.clients {
-        let row = write_concurrency(&leader_addr, clients).await?;
+        let row = write_concurrency(&leader_addr, clients, args.preconnect).await?;
         println!(
             "  {:>7}  {:>8}  {:>8}  {:>8}  {:>10.0}  {:>10?}  {:>10?}  {:>10?}",
             row.clients,
@@ -658,8 +693,9 @@ fn print_summary(rounds: &[RoundSummary], args: &Args) {
     }
 
     println!(
-        "concurrency sweep: clients={:?}, max_inflight_writes={}, max_payload_entries={}, purge_batch_size={}, api_batch_linger_ms={}, snapshot_logs={:?}, RAFT_CORE_WORKERS={}",
+        "concurrency sweep: clients={:?}, preconnect={}, max_inflight_writes={}, max_payload_entries={}, purge_batch_size={}, api_batch_linger_ms={}, snapshot_logs={:?}, RAFT_CORE_WORKERS={}",
         args.clients,
+        args.preconnect,
         args.max_inflight_writes,
         args.max_payload_entries,
         args.purge_batch_size,
@@ -759,6 +795,7 @@ fn parse_args() -> anyhow::Result<Args> {
                     .parse()
                     .context("--max-inflight-writes must be a number")?;
             }
+            "--preconnect" => args.preconnect = true,
             other => bail!("unknown argument {other:?}"),
         }
     }
@@ -774,8 +811,9 @@ fn main() -> anyhow::Result<()> {
     println!("all nodes run in one process; each has its own storage, HTTP and gRPC listener");
     println!("WAL fsync disabled; {WARMUP_WRITES} warm-up writes per round are excluded");
     println!(
-        "config: clients={:?}, max_inflight_writes={}, max_payload_entries={}, purge_batch_size={}, api_batch_linger_ms={}, snapshot_logs={:?}, RAFT_CORE_WORKERS={}",
+        "config: clients={:?}, preconnect={}, max_inflight_writes={}, max_payload_entries={}, purge_batch_size={}, api_batch_linger_ms={}, snapshot_logs={:?}, RAFT_CORE_WORKERS={}",
         args.clients,
+        args.preconnect,
         args.max_inflight_writes,
         args.max_payload_entries,
         args.purge_batch_size,

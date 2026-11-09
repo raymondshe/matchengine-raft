@@ -64,11 +64,12 @@ the internal-only HTTP contract; TLS and operator authentication stay at the gat
   also accepted; `/write_batch` takes the same requests as a bare JSON array.
 - `POST /write_batch` - Submit 1–128 non-nested requests in one Raft entry. The response contains a
   `batch` array with one response per request; event ordinals are continuous across the entry.
-- `/write` and `/write_batch` share a per-node in-flight admission limit (default **256**
+- `/write` and `/write_batch` share a per-node in-flight admission limit (default **1,024**
   requests). At the limit the edge returns `429 Too Many Requests`; clients should retry with
   backoff. The limit counts requests, not orders, so one 128-order batch consumes one slot.
-  `--max-inflight-writes 0` disables rejection. `GET /admission/status` reports the limit,
-  current in-flight count, peak, admitted and rejected totals.
+  Lower it to `512` for a tighter tail at roughly 1,024 concurrent clients; `--max-inflight-writes
+  0` disables rejection. `GET /admission/status` reports the limit, current in-flight count, peak,
+  admitted and rejected totals.
 - `POST /read` - Read from the local state machine (may be stale)
 - `POST /linearizable_read` - Linearizable read; the request must reach the leader
 - `POST /follower_read` - Linearizable read served locally after fetching a linearizer from the leader

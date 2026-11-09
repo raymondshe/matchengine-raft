@@ -1,13 +1,15 @@
 //! Bounded in-flight admission for write requests.
 //!
-//! The matching engine's write sweep peaks around 256 concurrent requests;
-//! beyond that, throughput falls and p99 latency rises sharply. This gate
-//! rejects excess `/write` and `/write_batch` requests at the HTTP edge instead
-//! of letting them queue behind Raft and apply work.
+//! Pre-connected four-node benchmarks put the write throughput plateau at
+//! 512-1,024 concurrent requests (~100-119k writes/s, p99 6-9 ms). Beyond that,
+//! queueing raises p99 without adding goodput. This gate rejects excess
+//! `/write` and `/write_batch` requests at the HTTP edge instead of letting
+//! them queue behind Raft and apply work.
 //!
 //! The limit counts requests, not orders: one `/write_batch` with 128 orders
 //! consumes one slot. Set the limit to zero to disable rejection while still
-//! collecting in-flight/peak counters.
+//! collecting in-flight/peak counters. Lower the default to 512 for a tighter
+//! tail when clients expect roughly 1,024 concurrent requests.
 
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::AtomicUsize;
@@ -18,9 +20,10 @@ use serde::Serialize;
 
 /// Default concurrent write-request limit.
 ///
-/// The 2026-11-08 concurrency sweep measured the throughput peak at 256
-/// in-flight writes; 1,024 and 4,096 in-flight requests had much worse p99.
-pub const DEFAULT_MAX_INFLIGHT_WRITES: usize = 256;
+/// The 2026-11-09 pre-connected sweep sustains 512-1,024 concurrent writes at
+/// the throughput plateau. 1,024 admits the whole plateau and still caps
+/// runaway concurrency; 512 is the tighter-tail alternative.
+pub const DEFAULT_MAX_INFLIGHT_WRITES: usize = 1_024;
 
 /// Tracks and optionally bounds concurrent write requests on one node.
 #[derive(Debug)]

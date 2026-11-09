@@ -360,7 +360,8 @@ mod tests {
     }
 
     #[test]
-    fn max_inflight_writes_defaults_to_256_and_is_configurable() {
+    fn max_inflight_writes_defaults_to_1024_and_is_configurable() {
+        assert_eq!(1_024, DEFAULT_MAX_INFLIGHT_WRITES);
         assert_eq!(
             DEFAULT_MAX_INFLIGHT_WRITES,
             StorageConfig::new("/data").max_inflight_writes

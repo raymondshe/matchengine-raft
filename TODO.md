@@ -35,8 +35,9 @@ tasks, a Tokio WAL fsync worker; only the env-controlled `RaftThread` remains), 
 replay benchmark, the four-node no-fsync cluster benchmark (`cluster_e2e`), the write
 concurrency/batching sweep, the read-path benchmark plus lease reads (now the default; `read_e2e`), and the
 feature-gated async WAL prototype with crash-recovery tests, the production configuration
-decision record (two durability profiles and rejected options), and the server-side 256-request
-write admission control with `/admission/status` and an overload A/B. The measured baselines,
+decision record (two durability profiles and rejected options), the server-side write admission
+control with `/admission/status`, and the pre-connected concurrency sweep that raised the default
+from 256 to 1,024 requests. The measured baselines,
 write/lease decisions, async-WAL numbers and upstream OpenRaft comparison are in
 [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md).
 
@@ -470,17 +471,20 @@ Remaining:
   concurrent writes/s, 227,319 orders/s at 128-order batches and 216,163 orders/s for
   100×32 concurrent batches. Four in-process loopback voters, 3/4 quorum, no fsync.
 - [x] **P2** Extend `cluster_e2e` with a client-count sweep (1/8/64/256/1024/4096) and a separate
-  client runtime. Done: 2026-11-08 two-round medians peak at **90,569 writes/s at 256 in-flight**
-  (p99 6.47ms); 1,024/4,096 fall to 44,829/50,996 writes/s with 21.79/76.47ms p99.
+  client runtime. Done: 2026-11-08 two-round medians peaked at 90,569 writes/s at 256 "in flight",
+  but the later `--preconnect` run showed the 1,024/4,096 rows were TCP-setup-bound; the real
+  plateau is 512-1,024 in flight at 99-117k writes/s.
   `RAFT_CORE_WORKERS=2` measured 65.7k/42.1k/46.8k, no consistent win.
 - [x] **P2** A/B thin LTO + `codegen-units = 1` for release/bench builds. Done: paired control
   74.1k/40.2k/40.8k vs LTO 77.8k/45.9k/45.4k at 256/1,024/4,096; within the host's run-to-run
   spread, so the default profile stays.
 - [x] **P2** Add p99-aware concurrency/admission control. Done: per-node
-  `--max-inflight-writes` (default 256; `0` disables) gates `/write` and `/write_batch`, returns
-  `429` on overflow and exposes `GET /admission/status` counters. At 4,096 offered clients the
-  gate cut p99 from 72.77ms to 15.37ms while admitted throughput fell from 45.9k to 42.8k
-  writes/s; at 256 it was neutral, and 100x32 `/write_batch` was unchanged. See
+  `--max-inflight-writes` (default 1,024; `512` for a tighter tail, `0` disables) gates `/write`
+  and `/write_batch`, returns `429` on overflow and exposes `GET /admission/status` counters.
+  The 2026-11-09 pre-connected sweep supersedes the earlier connection-storm numbers: 512 in
+  flight reaches 114,484 writes/s (p99 5.76ms) and 1,024 reaches 99,330 (p99 8.74ms); the old
+  256 default rejected about a third of a 512-client burst and was raised. At 2,048 clients the
+  512 gate cut p99 from 17.46ms to 13.39ms at 91.2k admitted writes/s. See
   `docs/PERFORMANCE.md`.
 - [ ] **P3** Evaluate bounded waiting/backpressure as an alternative to immediate `429` when
   clients cannot retry promptly; keep the current fail-fast gate as the default until measured.
