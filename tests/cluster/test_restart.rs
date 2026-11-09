@@ -20,6 +20,7 @@ use matchengine_raft::StorageConfig;
 use matchengine_raft::build_match_engine_node;
 use matchengine_raft::client::MatchEngineClient;
 use matchengine_raft::default_raft_config;
+use matchengine_raft::match_result::EventId;
 use matchengine_raft::match_result::MatchEventKind;
 use matchengine_raft::network::api::EventsRequest;
 use matchengine_raft::order_book::Order;
@@ -489,6 +490,373 @@ fn restart_loads_snapshot_then_replays_newer_wal_events() {
             .unwrap();
         assert_eq!(Some(0), duplicate.data.sequence);
         assert_order_state(&client, 5, "5").await.unwrap();
+
+        node.shutdown().await.unwrap();
+    });
+}
+
+/// A cursor taken before a snapshot still resumes exactly after the snapshot is
+/// loaded and the WAL tail is replayed: same event ids, no duplicates and no
+/// missing events.
+#[test]
+fn event_cursor_resumes_across_snapshot_and_restart() {
+    C::run(async {
+        let addr = "127.0.0.1:21206";
+        let temp = TempDir::new("event-cursor-snapshot");
+        let storage = StorageConfig::new(temp.0.clone())
+            .with_instance_prefix("event-cursor-snapshot")
+            .with_max_events(64);
+        let config = test_config(SnapshotPolicy::LogsSinceLast(1_000_000));
+
+        let node = start(addr, &storage, config.clone()).await.unwrap();
+        let client = make_client(addr);
+        client.init().await.unwrap().unwrap();
+        wait_for_leader(&client).await.unwrap();
+
+        // Three events before the snapshot.
+        for i in 0..3u64 {
+            client
+                .write(&MatchEngineRequest::place(Order::new(
+                    OrderSide::Buy,
+                    10.0 + i as f64,
+                    1.0,
+                    0,
+                )))
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        let page = client
+            .events(&EventsRequest {
+                after: None,
+                limit: Some(100),
+                wait_ms: None,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(3, page.events.len());
+        let cursor = page.next_after.expect("tail cursor");
+        let pre_snapshot_ids: Vec<EventId> =
+            page.events.iter().map(|event| event.event_id).collect();
+
+        node.raft.trigger().snapshot().await.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let metrics = client.metrics().await.unwrap();
+            let snapshot = metrics.snapshot.map(|log_id| log_id.index);
+            let purged = metrics.purged.map(|log_id| log_id.index);
+            if let (Some(snapshot), Some(purged)) = (snapshot, purged)
+                && purged >= snapshot
+            {
+                break;
+            }
+            assert!(
+                Instant::now() <= deadline,
+                "snapshot/purge did not happen: snapshot={snapshot:?}, purged={purged:?}"
+            );
+            C::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(storage.snapshot_dir(1).join("current.snap").exists());
+
+        // Two events after the snapshot. They must be replayed from the WAL
+        // tail when the node restarts.
+        for i in 0..2u64 {
+            client
+                .write(&MatchEngineRequest::place(Order::new(
+                    OrderSide::Buy,
+                    20.0 + i as f64,
+                    1.0,
+                    0,
+                )))
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        let page = client
+            .events(&EventsRequest {
+                after: None,
+                limit: Some(100),
+                wait_ms: None,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(5, page.events.len());
+        let pre_restart_ids: Vec<EventId> =
+            page.events.iter().map(|event| event.event_id).collect();
+        assert_eq!(pre_snapshot_ids.as_slice(), &pre_restart_ids[..3]);
+        let tail_cursor = page.next_after.expect("tail cursor");
+
+        node.shutdown().await.unwrap();
+
+        let node = start(addr, &storage, config).await.unwrap();
+        let client = make_client(addr);
+        wait_for_leader(&client).await.unwrap();
+
+        let restored = client
+            .events(&EventsRequest {
+                after: None,
+                limit: Some(100),
+                wait_ms: None,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        let restored_ids: Vec<EventId> =
+            restored.events.iter().map(|event| event.event_id).collect();
+        assert_eq!(
+            pre_restart_ids, restored_ids,
+            "snapshot + WAL-tail restore changed event ids"
+        );
+        assert_eq!(Some(pre_restart_ids[0]), restored.oldest_event_id);
+        assert_eq!(
+            Some(*pre_restart_ids.last().unwrap()),
+            restored.last_event_id
+        );
+
+        // Two events after the restart. Resuming from the pre-restart cursor
+        // must return the two WAL-tail events and the two new ones, in order.
+        for i in 0..2u64 {
+            client
+                .write(&MatchEngineRequest::place(Order::new(
+                    OrderSide::Buy,
+                    30.0 + i as f64,
+                    1.0,
+                    0,
+                )))
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        let resumed = client
+            .events(&EventsRequest {
+                after: Some(cursor),
+                limit: Some(100),
+                wait_ms: None,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        let resumed_ids: Vec<EventId> = resumed.events.iter().map(|event| event.event_id).collect();
+        assert_eq!(4, resumed_ids.len(), "unexpected resumed page");
+        assert_eq!(&pre_restart_ids[3..], &resumed_ids[..2]);
+        assert!(
+            resumed_ids.windows(2).all(|pair| pair[0] < pair[1]),
+            "resumed ids are not strictly increasing: {resumed_ids:?}"
+        );
+        assert!(
+            resumed_ids.iter().all(|id| *id > cursor),
+            "a resumed event did not follow the cursor"
+        );
+
+        // The tail cursor is exact: only the post-restart events follow it.
+        let tail = client
+            .events(&EventsRequest {
+                after: Some(tail_cursor),
+                limit: Some(100),
+                wait_ms: None,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(2, tail.events.len());
+        assert_eq!(
+            &resumed_ids[2..],
+            &tail
+                .events
+                .iter()
+                .map(|event| event.event_id)
+                .collect::<Vec<_>>()[..]
+        );
+        assert!(
+            tail.events
+                .iter()
+                .all(|event| event.kind == MatchEventKind::Rested),
+            "unexpected post-restart events: {:?}",
+            tail.events
+        );
+
+        node.shutdown().await.unwrap();
+    });
+}
+
+/// If retention evicts the cursor, the gap is explicit: the page reports an
+/// `oldest_event_id` after the cursor. The retained tail is gap-free and keeps
+/// the same ids across a snapshot/restart; a cursor at the tail still resumes
+/// exactly.
+#[test]
+fn event_cursor_reports_retention_gap_across_restart() {
+    C::run(async {
+        let addr = "127.0.0.1:21207";
+        let temp = TempDir::new("event-cursor-retention");
+        let storage = StorageConfig::new(temp.0.clone())
+            .with_instance_prefix("event-cursor-retention")
+            .with_max_events(6);
+        let config = test_config(SnapshotPolicy::LogsSinceLast(1_000_000));
+
+        let node = start(addr, &storage, config.clone()).await.unwrap();
+        let client = make_client(addr);
+        client.init().await.unwrap().unwrap();
+        wait_for_leader(&client).await.unwrap();
+
+        // Three events, then snapshot them before overflow.
+        for i in 0..3u64 {
+            client
+                .write(&MatchEngineRequest::place(Order::new(
+                    OrderSide::Buy,
+                    10.0 + i as f64,
+                    1.0,
+                    0,
+                )))
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        let page = client
+            .events(&EventsRequest {
+                after: None,
+                limit: Some(100),
+                wait_ms: None,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(3, page.events.len());
+        let stale_cursor = page.next_after.expect("tail cursor");
+
+        node.raft.trigger().snapshot().await.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let metrics = client.metrics().await.unwrap();
+            let snapshot = metrics.snapshot.map(|log_id| log_id.index);
+            let purged = metrics.purged.map(|log_id| log_id.index);
+            if let (Some(snapshot), Some(purged)) = (snapshot, purged)
+                && purged >= snapshot
+            {
+                break;
+            }
+            assert!(
+                Instant::now() <= deadline,
+                "snapshot/purge did not happen: snapshot={snapshot:?}, purged={purged:?}"
+            );
+            C::sleep(Duration::from_millis(50)).await;
+        }
+
+        // Six more events overflow the six-event window and evict the three
+        // events that include `stale_cursor`.
+        for i in 0..6u64 {
+            client
+                .write(&MatchEngineRequest::place(Order::new(
+                    OrderSide::Buy,
+                    9.0 - i as f64,
+                    1.0,
+                    0,
+                )))
+                .await
+                .unwrap()
+                .unwrap();
+        }
+
+        let status = client.events_status().await.unwrap();
+        assert_eq!(6, status.retained_events);
+        assert_eq!(3, status.evictions_total);
+        let oldest = status.oldest_event_id.expect("retained events");
+        assert!(
+            oldest > stale_cursor,
+            "the evicted cursor must be older than the retained window"
+        );
+
+        let page = client
+            .events(&EventsRequest {
+                after: Some(stale_cursor),
+                limit: Some(100),
+                wait_ms: None,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(6, page.events.len());
+        assert_eq!(Some(oldest), page.oldest_event_id);
+        assert_eq!(
+            Some(oldest),
+            page.events.first().map(|event| event.event_id)
+        );
+        assert_eq!(
+            Some(page.events.last().unwrap().event_id),
+            page.last_event_id
+        );
+        assert!(
+            page.events
+                .windows(2)
+                .all(|pair| pair[0].event_id < pair[1].event_id),
+            "retained events are not strictly increasing"
+        );
+        let retained_ids: Vec<EventId> = page.events.iter().map(|event| event.event_id).collect();
+        let tail_cursor = page.next_after.expect("retained tail cursor");
+
+        node.shutdown().await.unwrap();
+
+        let node = start(addr, &storage, config).await.unwrap();
+        let client = make_client(addr);
+        wait_for_leader(&client).await.unwrap();
+
+        let status = client.events_status().await.unwrap();
+        assert_eq!(6, status.retained_events);
+        assert_eq!(3, status.evictions_total);
+        assert_eq!(Some(oldest), status.oldest_event_id);
+
+        // The retained tail is stable across restart and the eviction gap is
+        // still explicit.
+        let page = client
+            .events(&EventsRequest {
+                after: Some(stale_cursor),
+                limit: Some(100),
+                wait_ms: None,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(6, page.events.len());
+        assert_eq!(
+            retained_ids,
+            page.events
+                .iter()
+                .map(|event| event.event_id)
+                .collect::<Vec<_>>()
+        );
+        assert!(page.oldest_event_id.unwrap() > stale_cursor);
+
+        // A cursor at the retained tail still resumes exactly after restart.
+        for i in 0..2u64 {
+            client
+                .write(&MatchEngineRequest::place(Order::new(
+                    OrderSide::Buy,
+                    6.0 + i as f64,
+                    1.0,
+                    0,
+                )))
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        let resumed = client
+            .events(&EventsRequest {
+                after: Some(tail_cursor),
+                limit: Some(100),
+                wait_ms: None,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(2, resumed.events.len());
+        assert!(
+            resumed
+                .events
+                .iter()
+                .all(|event| event.event_id > tail_cursor),
+            "resumed events did not follow the tail cursor"
+        );
 
         node.shutdown().await.unwrap();
     });

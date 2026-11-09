@@ -1,6 +1,6 @@
 # TODO
 
-Last reviewed: 2026-11-08. This is the working roadmap; see `AGENTS.md` for commands and the
+Last reviewed: 2026-11-09. This is the working roadmap; see `AGENTS.md` for commands and the
 current branch state.
 
 **Current baseline:** the OpenRaft 0.10 port, durable WAL/snapshot storage and exact scale-18
@@ -25,7 +25,8 @@ important but not blocking; **P3** = later/optional.
 
 ## Top priorities
 
-No P0 or P1 work remains. The remaining items are P2/P3, ordered below by production value.
+No P0 or P1 work remains. The remaining performance, feature and conditional conformance items
+are P2/P3, ordered below by production value.
 
 **Recently completed (2026-11-06/09):** configurable WAL fsync with a measured A/B matrix,
 best-effort WAL recovery, the four-voter no-fsync floor (`test_min_voters.rs`), the optional
@@ -37,7 +38,11 @@ concurrency/batching sweep, the read-path benchmark plus lease reads (now the de
 feature-gated async WAL prototype with crash-recovery tests, the production configuration
 decision record (two durability profiles and rejected options), the server-side write admission
 control with `/admission/status`, and the pre-connected concurrency sweep that raised the default
-from 256 to 1,024 requests. The measured baselines,
+from 256 to 1,024 requests. The public matching-engine test-suite inventory and two conformance
+batches landed too: FOK atomicity, iceberg conservation/refill priority, stop-cascade conservation,
+event-stream reconstruction, event-cursor survival across snapshot/restart and retention eviction,
+GTD purge idempotence, post-only/amend interactions, fee conservation and the modify-priority
+matrix (§17). The measured baselines,
 write/lease decisions, async-WAL numbers and upstream OpenRaft comparison are in
 [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md).
 
@@ -58,7 +63,7 @@ implemented: the replication lag threshold now sits above the 100k snapshot poli
 suppression is enabled, HTTP/2 windows/keepalive are tuned, snapshot chunks follow OpenRaft's
 configured size and readiness waits for recovery. The remaining P2/P3 items are tracked in §16.
 
-The next work, in order (re-prioritised 2026-11-09):
+The next work, in order (re-prioritised 2026-11-09 after the public-suite review):
 
 1. **Add OpenRaft observability, profiling and transport hygiene (§16, P2).** Expose
    `data_metrics`, `server_metrics` and `runtime_stats`; enable `runtime-stats` in profiling
@@ -259,6 +264,8 @@ Done:
   policies.
 - [x] Explicit conformance cases for market FOK, empty-book market orders, hidden iceberg
   cancel/expiry, parked-stop GTD/Day expiry and fee reporting on market/IOC/stop-child fills.
+  The first public-suite batch adds rejected-FOK atomicity, iceberg partial-fill conservation,
+  iceberg refill identity/queue priority and stop-cascade conservation (§17).
 - [x] Prototyped per-price-level buckets (`BTreeMap<price, Vec<Order>>` + `head` cursor +
   sequence index + cached BBO) in `benches/level_book.rs`; the benchmark verifies the prototype
   against `OrderBook` before timing. Results are in `docs/PERFORMANCE.md`: match 1.76–2.15x,
@@ -324,9 +331,17 @@ Current coverage:
 - Unit tests cover the order book, fixed-point parsing, Raft-address derivation and snapshot
   framing. `src/order_book/property_tests.rs` runs randomized traces against a reference model,
   including mixed order types and fee-rate styles; `conformance_tests.rs` covers the explicit
-  edge cases. `apply` event tests cover market, IOC, FOK, post-only, iceberg, stop-child
-  cancellation and automatic GTD expiry. `src/market_data/wire.rs` tests the encoder and
-  reference decoder, pins a v6 golden frame and rejects malformed frames.
+  edge cases (including the public-suite batches: rejected-FOK atomicity, iceberg partial-fill
+  conservation/refill priority, stop-cascade conservation, post-only/amend interactions and the
+  modify-priority matrix). `apply` event tests cover market, IOC, FOK, post-only, iceberg,
+  stop-child cancellation and automatic GTD expiry; `gtd_purge_is_idempotent_and_auto_expiry_keeps_place_ordinals`
+  pins repeated-purge idempotence and shared-entry ordinals. `src/market_data/wire.rs` tests the
+  encoder and reference decoder, pins a v6 golden frame and rejects malformed frames.
+- Fee unit tests cover combined-rate conservation on Base and Quote fees and the `Received`
+  split where the base fee stays exact while the quote fee overflows.
+- `test_restart.rs` also proves `/events` cursor stability across snapshot/restart and that an
+  evicted cursor produces an explicit `oldest_event_id` gap while the retained tail stays
+  duplicate-free.
 - `tests/cluster/test_cluster.rs`: 3 nodes over gRPC, init/membership/read/write.
 - `test_snapshot.rs`: snapshot build/purge and learner install over gRPC.
 - `test_storage.rs`: WAL framing, torn-tail truncation, segment rotation, 20k-record multi-segment
@@ -353,7 +368,8 @@ Current coverage:
 - `test_request_limits.rs`: oversized bodies, malformed JSON, invalid/oversized client ids,
   oversized read keys and out-of-range event pages are rejected before Raft.
 - `test_feature_matrix.rs`: every advertised order type reaches the engine through `/write`;
-  rest/amend/fill/cancel, expiry and stop lifecycles emit explicit events; malformed bodies and
+  rest/amend/fill/cancel, expiry and stop lifecycles emit explicit events; the `/events` log
+  replays into a visible-book mirror that matches `/read orderbook_orders`; malformed bodies and
   unknown read keys are covered.
 - `test_health.rs`: `/health` reports the gRPC listener, leadership and WAL/state-machine state;
   `/ready` is `503` before initialization and `200` after a leader is elected.
@@ -391,7 +407,7 @@ Completed follow-ups:
 - [x] **P2** MSRV job for Rust 1.89: the `msrv` job in `.github/workflows/ci.yml` runs
   `cargo check --all-targets --locked`; the main job uses stable.
 
-Remaining:
+Remaining (the public-suite follow-ups are tracked in §17):
 
 - [ ] **P2** Add a four-voter no-fsync failover test: kill one voter during a write stream,
   restart it, and prove the surviving cluster still commits and the restarted node catches up.
@@ -540,8 +556,8 @@ Done:
   JSONL dumpers; `examples/replay_orders.rs` is the order-replay/compare harness.
 - [x] The unused `match_engine.png` was removed and `logs/` is gitignored.
 - [x] README/README_CN, AGENTS, TODO, PERFORMANCE, AERON, MATCH_RESULTS, MARKET_DATA_PLAN,
-  FEE_DEDUCTION, DECIMAL and DEMO_ORDER_SYSTEM are synced with the WAL + snapshot + gRPC design,
-  snapshot v10 / wire v6 and the implemented demo crate.
+  FEE_DEDUCTION, DECIMAL, DEMO_ORDER_SYSTEM and MATCHING_ENGINE_TEST_SUITES are synced with the
+  WAL + snapshot + gRPC design, snapshot v10 / wire v6 and the implemented demo crate.
 - [x] `docs/DECIMAL.md` records the fixed-point research, BTC 18-decimal range analysis,
   microbenchmarks and the completed end-to-end migration.
 - [x] **P3** Renamed `src/matchengine/` to `src/order_book/` (2026-10-29); the public module is now
@@ -885,3 +901,58 @@ complete; observability is next, then async-WAL productionization and optional A
   HTTP/2 frames and snapshot compression. Persistent `AppendStream` sessions across OpenRaft
   replication sessions are not possible without changing the OpenRaft contract; heartbeat
   suppression is the practical way to reduce stream churn.
+
+## 17. Public matching-engine test suites (2026-11-09)
+
+Inventory, licence notes, coverage matrix and the full rationale:
+[`docs/MATCHING_ENGINE_TEST_SUITES.md`](./docs/MATCHING_ENGINE_TEST_SUITES.md). No public suite
+covers every order type, event reconstruction and replicated sequence invariants, so these cases
+extend this repository's own property, conformance, replay and cluster suites. Feature work that
+the inventory mentions (AON, self-trade prevention, order masks, multi-symbol isolation) stays in
+§5/§13/§2 and is not duplicated here.
+
+Done (2026-11-09; first batch in commit `acf8953`):
+
+- [x] **P1** Add the first conformance batch: rejected-FOK atomicity (book, last trade and stops
+  unchanged while one sequence is consumed), iceberg partial-fill/cancel conservation, iceberg
+  refill identity/queue priority, and stop-cascade child conservation.
+- [x] **P1** Reconstruct the visible book from `POST /events` and compare it with
+  `/read orderbook_orders` across limit, IOC, FOK-reject, market and stop-cascade flows; assert
+  page monotonicity/no duplication and record why parked stops and iceberg reserves are not
+  reconstructible from `MatchEvent`.
+- [x] **P1** Prove `/events` cursor stability across snapshot/restart and retention eviction:
+  `event_cursor_resumes_across_snapshot_and_restart` and
+  `event_cursor_reports_retention_gap_across_restart` assert stable `EventId`s, exact tail
+  resume, no duplicates, and an explicit `oldest_event_id` gap when the cursor was evicted.
+- [x] **P2** Add GTD purge idempotence and sequence-anchor coverage:
+  `gtd_purge_is_idempotent_and_auto_expiry_keeps_place_ordinals` proves a repeated purge emits no
+  duplicate expiry, and an automatic purge before a place keeps the place's sequence and the
+  entry's ordinal order.
+- [x] **P2** Add post-only/amend interactions: the flag survives a same-price reduction and a
+  price move, a crossing amendment is refused without touching the book, and the refused
+  amendment still consumes one sequence.
+- [x] **P2** Add fee conservation coverage: Base/Quote fees conserve the combined rate, and the
+  `Received` policy keeps the base fee exact when the quote fee overflows in either direction.
+- [x] **P2** Add the modify-priority matrix: same-price reduce/increase, price up and price
+  down, with the returned sequence and queue position asserted for each case.
+- [x] **P2** The independent FIFO oracle/fuzzer already exists in
+  `randomized_limit_book_matches_reference_model` (place/cancel/amend against a separate model,
+  plus deterministic replay) and `randomized_order_types_and_fee_styles_preserve_invariants`
+  (IOC among the mixed types). Added an operation-coverage guard so the generator cannot silently
+  stop exercising place/cancel/amend.
+
+Already covered before these batches (not backlog):
+
+- Iceberg hidden reserve counts as reachable depth for FOK
+  (`iceberg_reserves_count_as_reachable_depth_for_fill_or_kill`).
+- A stop-limit child fills exactly at its limit and cancels the remainder without resting
+  (`stop_limit_child_keeps_to_its_limit_and_never_rests`).
+- GTD expiry at the deadline and one millisecond before it, Day expiry only when a close is
+  supplied, and parked-stop expiry (`conformance_tests.rs`, `test_feature_matrix.rs`).
+- Fee assets, maker rebates and exact/overflow fee ordering (`test_fees.rs`,
+  `test_fee_assets.rs`, the replay matrix and `conformance_tests.rs`).
+
+Remaining:
+
+- [ ] **P3** Add AON, self-trade-prevention/order-mask and multi-symbol isolation cases only when
+  the product adds those behaviours; multi-symbol remains deployment-level isolation (§2).

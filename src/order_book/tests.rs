@@ -948,6 +948,85 @@ fn notional_overflow_keeps_base_fees_that_fit() {
 }
 
 #[test]
+fn fee_components_conserve_taker_plus_maker_on_the_charged_asset() {
+    let rate = |value: &str| value.parse::<Fixed>().unwrap();
+    let maker_rate = rate("-0.0005");
+    let taker_rate = rate("0.002");
+    let price = Fixed::from(100);
+    let volume = Fixed::from(3);
+    let maker =
+        Order::new(OrderSide::Sell, price, volume, 1).with_fee_rates(maker_rate, Fixed::ZERO);
+    let taker =
+        Order::new(OrderSide::Buy, price, volume, 2).with_fee_rates(Fixed::ZERO, taker_rate);
+
+    let base = MatchResult::new_with_policy(&taker, &maker, volume, FeeAssetPolicy::Base);
+    assert_eq!(FeeAsset::Base, base.taker_fee_asset);
+    assert_eq!(FeeAsset::Base, base.maker_fee_asset);
+    assert_eq!(volume * taker_rate, base.taker_fee);
+    assert_eq!(volume * maker_rate, base.maker_fee);
+    assert_eq!(
+        volume * (taker_rate + maker_rate),
+        base.taker_fee + base.maker_fee,
+        "base fees must conserve the combined rate"
+    );
+    assert!(base.error.is_empty());
+
+    let quote = MatchResult::new_with_policy(&taker, &maker, volume, FeeAssetPolicy::Quote);
+    assert_eq!(Fixed::from(300), quote.notional);
+    assert_eq!(FeeAsset::Quote, quote.taker_fee_asset);
+    assert_eq!(FeeAsset::Quote, quote.maker_fee_asset);
+    assert_eq!(quote.notional * taker_rate, quote.taker_fee);
+    assert_eq!(quote.notional * maker_rate, quote.maker_fee);
+    assert_eq!(
+        quote.notional * (taker_rate + maker_rate),
+        quote.taker_fee + quote.maker_fee,
+        "quote fees must conserve the combined rate"
+    );
+    assert!(quote.error.is_empty());
+}
+
+#[test]
+fn received_fees_split_exact_base_and_overflowed_quote() {
+    let rate = |value: &str| value.parse::<Fixed>().unwrap();
+    let price = Fixed::from_units(100_000_000_000);
+    let volume = Fixed::from_units(10_000_000_000);
+    let maker_rate = rate("0.001");
+    let taker_rate = rate("0.002");
+
+    // Buy taker: the base taker fee stays exact while the quote maker fee
+    // depends on the overflowed notional.
+    let maker =
+        Order::new(OrderSide::Sell, price, volume, 1).with_fee_rates(maker_rate, Fixed::ZERO);
+    let buy_taker =
+        Order::new(OrderSide::Buy, price, volume, 2).with_fee_rates(Fixed::ZERO, taker_rate);
+    let buy = MatchResult::new_with_policy(&buy_taker, &maker, volume, FeeAssetPolicy::Received);
+    assert!(buy.error.contains(MatchErrorCode::NotionalOverflow));
+    assert!(buy.error.contains(MatchErrorCode::MakerFeeOverflow));
+    assert!(!buy.error.contains(MatchErrorCode::TakerFeeOverflow));
+    assert_eq!(Fixed::ZERO, buy.notional);
+    assert_eq!(FeeAsset::Base, buy.taker_fee_asset);
+    assert_eq!(FeeAsset::Quote, buy.maker_fee_asset);
+    assert_eq!(Fixed::from_units(20_000_000), buy.taker_fee);
+    assert_eq!(Fixed::ZERO, buy.maker_fee);
+
+    // Sell taker: the sides swap, so the quote taker fee overflows while the
+    // base maker fee stays exact.
+    let maker =
+        Order::new(OrderSide::Buy, price, volume, 3).with_fee_rates(maker_rate, Fixed::ZERO);
+    let sell_taker =
+        Order::new(OrderSide::Sell, price, volume, 4).with_fee_rates(Fixed::ZERO, taker_rate);
+    let sell = MatchResult::new_with_policy(&sell_taker, &maker, volume, FeeAssetPolicy::Received);
+    assert!(sell.error.contains(MatchErrorCode::NotionalOverflow));
+    assert!(sell.error.contains(MatchErrorCode::TakerFeeOverflow));
+    assert!(!sell.error.contains(MatchErrorCode::MakerFeeOverflow));
+    assert_eq!(Fixed::ZERO, sell.notional);
+    assert_eq!(FeeAsset::Quote, sell.taker_fee_asset);
+    assert_eq!(FeeAsset::Base, sell.maker_fee_asset);
+    assert_eq!(Fixed::ZERO, sell.taker_fee);
+    assert_eq!(Fixed::from_units(10_000_000), sell.maker_fee);
+}
+
+#[test]
 fn match_errors_serialize_as_named_codes() {
     let mut errors = MatchErrors::NONE;
     errors.insert(MatchErrorCode::NotionalOverflow);

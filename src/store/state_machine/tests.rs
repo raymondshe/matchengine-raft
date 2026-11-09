@@ -1095,6 +1095,141 @@ async fn apply_publishes_automatic_gtd_expiry_before_matching() {
     assert_eq!(Fixed::from(1), events[2].volume);
 }
 
+/// Explicit purges are idempotent, and an automatic purge before a place keeps
+/// the place's sequence and the entry's event ordinals.
+#[tokio::test]
+async fn gtd_purge_is_idempotent_and_auto_expiry_keeps_place_ordinals() {
+    use crate::match_result::MatchEventKind;
+    use crate::match_result::MemorySink;
+    use crate::order_book::Fixed;
+    use crate::order_book::Order;
+    use crate::order_book::OrderSide;
+    use crate::order_book::TimeInForce;
+    use openraft::alias::EntryOf;
+    use openraft::alias::EntryPayloadOf;
+
+    fn entry(
+        index: u64,
+        payload: EntryPayloadOf<MatchEngineTypeConfig>,
+    ) -> EntryOf<MatchEngineTypeConfig> {
+        Entry {
+            log_id: log_id(1, index),
+            payload,
+        }
+    }
+
+    let dir = tempdir();
+    let sink = Arc::new(MemorySink::new());
+    let mut store =
+        StateMachineStore::<MatchEngineTypeConfig>::open_with_sink(dir.path(), sink.clone())
+            .unwrap();
+
+    let mut first_gtd = Order::new(OrderSide::Buy, 100.0, 5.0, 0);
+    first_gtd.tif = TimeInForce::Gtd(2_000);
+    first_gtd.timestamp = 1_000;
+
+    let mut second_gtd = Order::new(OrderSide::Buy, 99.0, 2.0, 0);
+    second_gtd.tif = TimeInForce::Gtd(3_000);
+    second_gtd.timestamp = 1_000;
+
+    let mut taker = Order::new(OrderSide::Sell, 99.0, 1.0, 0);
+    taker.timestamp = 3_000;
+
+    let entries = futures::stream::iter(vec![
+        Ok((
+            entry(
+                1,
+                EntryPayload::Normal(MatchEngineRequest::place(first_gtd)),
+            ),
+            None,
+        )),
+        Ok((
+            entry(
+                2,
+                EntryPayload::Normal(MatchEngineRequest::PurgeExpired {
+                    now_ms: 2_000,
+                    day_close_ms: None,
+                }),
+            ),
+            None,
+        )),
+        // The same purge at the same instant is a no-op: no duplicate event.
+        Ok((
+            entry(
+                3,
+                EntryPayload::Normal(MatchEngineRequest::PurgeExpired {
+                    now_ms: 2_000,
+                    day_close_ms: None,
+                }),
+            ),
+            None,
+        )),
+        Ok((
+            entry(
+                4,
+                EntryPayload::Normal(MatchEngineRequest::place(second_gtd)),
+            ),
+            None,
+        )),
+        // The taker's intake timestamp purges the second GTD before matching,
+        // then the taker itself is applied in the same entry.
+        Ok((
+            entry(5, EntryPayload::Normal(MatchEngineRequest::place(taker))),
+            None,
+        )),
+        // A later explicit purge finds nothing.
+        Ok((
+            entry(
+                6,
+                EntryPayload::Normal(MatchEngineRequest::PurgeExpired {
+                    now_ms: 3_000,
+                    day_close_ms: None,
+                }),
+            ),
+            None,
+        )),
+    ]);
+    store.apply(entries).await.unwrap();
+
+    let events = sink.events();
+    assert_eq!(5, events.len(), "unexpected events: {events:?}");
+    assert_eq!(
+        vec![
+            MatchEventKind::Rested,
+            MatchEventKind::Expired,
+            MatchEventKind::Rested,
+            MatchEventKind::Expired,
+            MatchEventKind::Rested,
+        ],
+        events.iter().map(|event| event.kind).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        vec![0, 0, 3, 3, 4],
+        events
+            .iter()
+            .map(|event| event.order_sequence)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        vec![1, 2, 4, 5, 5],
+        events
+            .iter()
+            .map(|event| event.event_id.log_index)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        vec![0, 0, 0, 0, 1],
+        events
+            .iter()
+            .map(|event| event.event_id.ordinal)
+            .collect::<Vec<_>>(),
+        "automatic expiry and the place share one entry and keep ordinal order"
+    );
+    assert_eq!(Fixed::from(5), events[1].volume);
+    assert_eq!(Fixed::from(2), events[3].volume);
+    assert_eq!(Fixed::from(1), events[4].volume);
+}
+
 /// Amendment goes through `apply`: the event carries both identities and the
 /// book keeps the new size; a failed amend publishes a rejection.
 #[tokio::test]

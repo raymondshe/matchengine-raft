@@ -358,6 +358,137 @@ fn stop_cascade_conserves_each_child_and_never_rests_one() {
 }
 
 #[test]
+fn post_only_amend_keeps_its_flag_and_refuses_crossing() {
+    let mut book = OrderBook::new();
+    let mut ask = Order::new(OrderSide::Sell, 101.0, 5.0, 0);
+    book.execute_order(&mut ask);
+    let mut post_only = order_with(OrderSide::Buy, 100.0, 10.0, |order| {
+        order.post_only = true;
+    });
+    assert_eq!(
+        Some(Fixed::from(10)),
+        book.execute_order(&mut post_only).resting
+    );
+    let original_sequence = post_only.sequence;
+    assert_eq!(1, original_sequence);
+
+    // A same-price reduction keeps time priority and the post-only flag.
+    let amended = book
+        .amend(&post_only, None, Some(Fixed::from(4)))
+        .expect("same-price reduction");
+    assert_eq!(2, amended.market_seq);
+    assert_eq!(original_sequence, amended.order.sequence);
+    assert!(amended.order.post_only);
+    let best = book.best_bid().expect("the order still rests");
+    assert_eq!(original_sequence, best.sequence);
+    assert_eq!(Fixed::from(4), best.volume);
+
+    // Moving onto the resting ask is still refused for a post-only order.
+    assert_eq!(
+        AmendError::WouldCross,
+        book.amend(&post_only, Some(Fixed::from(101)), None)
+            .unwrap_err()
+    );
+    let best = book.best_bid().expect("a refused amend leaves the order");
+    assert_eq!(original_sequence, best.sequence);
+    assert_eq!(Fixed::from(100), best.price);
+    assert_eq!(Fixed::from(4), best.volume);
+    assert!(best.post_only);
+    assert_eq!(
+        4, book.sequence,
+        "the refused crossing amendment consumed one sequence"
+    );
+
+    // Once the level is gone, the price move re-inserts under a new sequence
+    // and the post-only flag survives. The refused crossing amendment consumed
+    // one sequence, so this is sequence 4, not 3.
+    book.cancel(&ask).expect("the ask is resting");
+    let amended = book
+        .amend(&post_only, Some(Fixed::from(101)), None)
+        .expect("no longer crosses");
+    assert_eq!(4, amended.market_seq);
+    assert_eq!(amended.market_seq, amended.order.sequence);
+    assert!(amended.order.post_only);
+    let best = book.best_bid().expect("the amended order moved");
+    assert_eq!(Fixed::from(101), best.price);
+    assert_eq!(Fixed::from(4), best.volume);
+    assert!(best.post_only);
+}
+
+#[test]
+fn amend_priority_matrix_matches_price_time_rules() {
+    fn build() -> (OrderBook, Order, Order) {
+        let mut book = OrderBook::new();
+        let mut first = Order::new(OrderSide::Buy, 100.0, 10.0, 0);
+        let mut second = Order::new(OrderSide::Buy, 100.0, 10.0, 0);
+        book.execute_order(&mut first);
+        book.execute_order(&mut second);
+        (book, first, second)
+    }
+
+    fn sequences(book: &OrderBook) -> Vec<u64> {
+        book.bids.keys().map(|key| key.sequence).collect()
+    }
+
+    // Same price, smaller volume: keep the sequence and time priority.
+    let (mut book, first, second) = build();
+    let amended = book
+        .amend(&first, None, Some(Fixed::from(4)))
+        .expect("same-price reduction");
+    assert_eq!(2, amended.market_seq);
+    assert_eq!(first.sequence, amended.order.sequence);
+    assert_eq!(first.sequence, amended.previous_sequence);
+    assert_eq!(Fixed::from(10), amended.previous_volume);
+    assert_eq!(vec![first.sequence, second.sequence], sequences(&book));
+    assert_eq!(Fixed::from(4), book.best_bid().unwrap().volume);
+
+    // Same price, larger volume: re-insert behind the other order.
+    let (mut book, first, second) = build();
+    let amended = book
+        .amend(&first, None, Some(Fixed::from(12)))
+        .expect("same-price increase");
+    assert_eq!(2, amended.market_seq);
+    assert_eq!(2, amended.order.sequence);
+    assert_eq!(first.sequence, amended.previous_sequence);
+    assert_eq!(
+        vec![second.sequence, amended.order.sequence],
+        sequences(&book)
+    );
+    assert_eq!(Fixed::from(10), book.best_bid().unwrap().volume);
+    assert_eq!(Some(Fixed::from(12)), book.resting_volume(&amended.order));
+
+    // Price up: new sequence, best price, old level behind it.
+    let (mut book, first, second) = build();
+    let amended = book
+        .amend(&first, Some(Fixed::from(101)), None)
+        .expect("non-crossing price move up");
+    assert_eq!(2, amended.market_seq);
+    assert_eq!(2, amended.order.sequence);
+    assert_eq!(
+        vec![amended.order.sequence, second.sequence],
+        sequences(&book)
+    );
+    let best = book.best_bid().expect("the amended bid is best");
+    assert_eq!(Fixed::from(101), best.price);
+    assert_eq!(Fixed::from(10), best.volume);
+
+    // Price down: new sequence and now behind the untouched better bid.
+    let (mut book, first, second) = build();
+    let amended = book
+        .amend(&first, Some(Fixed::from(99)), None)
+        .expect("non-crossing price move down");
+    assert_eq!(2, amended.market_seq);
+    assert_eq!(2, amended.order.sequence);
+    assert_eq!(
+        vec![second.sequence, amended.order.sequence],
+        sequences(&book)
+    );
+    let best = book.best_bid().expect("the untouched bid is best");
+    assert_eq!(Fixed::from(100), best.price);
+    assert_eq!(second.sequence, best.sequence);
+}
+
+#[test]
 fn fees_are_reported_on_market_ioc_and_stop_child_fills() {
     let mut book = OrderBook::new();
     let mut maker =

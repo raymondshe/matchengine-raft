@@ -99,14 +99,14 @@ repository's own cluster and replay suites are for.
 
 ## 3. What this repository covers today
 
-Before the batch in section 5:
+After both batches in section 5:
 
 | Layer | Count | What it proves |
 |---|---:|---|
-| `src/` unit tests | 167 | Order-book algorithms, fees, property traces, protocol/storage units |
-| `tests/cluster/` integration tests | 61 | Raft, HTTP/gRPC, persistence, events, failover, market data |
+| `src/` unit tests | 176 | Order-book algorithms, fees, property traces, protocol/storage units |
+| `tests/cluster/` integration tests | 64 | Raft, HTTP/gRPC, persistence, events, failover, market data |
 | `tests/replay/` cases | 16 | End-to-end order-type lifecycles against checked-in expected events |
-| `src/order_book/conformance_tests.rs` | 5 | Explicit edge cases the randomized suite should not have to rediscover |
+| `src/order_book/conformance_tests.rs` | 11 | Explicit edge cases the randomized suite should not have to rediscover |
 
 The replay matrix already covers limit, market, IOC, FOK, GTD, Day, post-only,
 iceberg, stop-market, stop-limit, amend, cancel, default fees, quote-asset fees
@@ -114,9 +114,11 @@ and fee overflow. The randomized property tests cover mixed order types and fee
 policies. The gap was not raw type coverage; it was explicit invariants that are
 easy to miss when a type works "normally".
 
-Existing conformance cases already cover: market FOK all-or-nothing, empty-book
-market cancellation, hidden iceberg volume on cancel/expiry, GTD/Day stop
-expiry, and fees on market/IOC/stop-child fills.
+Existing conformance cases cover: market FOK all-or-nothing, rejected-FOK
+atomicity, empty-book market cancellation, hidden iceberg volume on
+cancel/expiry, iceberg partial-fill conservation, refill queue priority,
+stop-cascade conservation, GTD/Day stop expiry, post-only amendment and the
+modify-priority matrix, plus fees on market/IOC/stop-child fills.
 
 ## 4. What no public suite covers
 
@@ -136,13 +138,13 @@ A public suite being silent on these is not a defect in the suite. It is a
 reminder not to treat a matching-engine test suite as an exchange conformance
 program.
 
-## 5. First conformance batch added
+## 5. Conformance batches added
 
-The batch deliberately targets invariants, not new order types. Each case is
+The batches deliberately target invariants, not new order types. Each case is
 small enough to diagnose from its name and asserts conservation or atomicity
 rather than only the happy-path fill list.
 
-### `src/order_book/conformance_tests.rs`
+### First batch: `src/order_book/conformance_tests.rs`
 
 1. **`rejected_fok_is_atomic_but_consumes_one_sequence`**
    - Snapshots asks, bids, parked stops and last trade.
@@ -203,38 +205,77 @@ Known limits of event reconstruction, recorded by the test:
   `MatchEvent` alone.
 - The test restricts its mirror to plain, visible orders for those reasons.
 
-## 6. Port backlog
+### Second batch: event cursor, GTD, amend and fees
 
-Prioritized by invariant value divided by translation cost.
+- **`tests/cluster/test_restart.rs`**
+  - `event_cursor_resumes_across_snapshot_and_restart` takes a cursor before a
+    manual snapshot, appends a WAL tail, restarts, and asserts the restored
+    `EventId`s are identical. Resuming from the old cursor returns exactly the
+    tail plus new events, in order and without duplicates.
+  - `event_cursor_reports_retention_gap_across_restart` overflows a six-event
+    window, asserts the evicted cursor yields an explicit
+    `oldest_event_id > cursor` gap, restarts, and proves the retained tail and
+    eviction counter are stable. A cursor at the retained tail still resumes
+    exactly.
+- **`src/store/state_machine/tests.rs`**
+  - `gtd_purge_is_idempotent_and_auto_expiry_keeps_place_ordinals` repeats an
+    explicit purge at the same instant (no duplicate expiry event), then proves
+    an automatic purge before a place keeps the place's sequence and shares the
+    entry's ordinal order with the expiry.
+- **`src/order_book/conformance_tests.rs`**
+  - `post_only_amend_keeps_its_flag_and_refuses_crossing` covers a same-price
+    reduction, a refused crossing amendment (which still consumes a sequence),
+    and a non-crossing price move that re-inserts with the flag intact.
+  - `amend_priority_matrix_matches_price_time_rules` covers same-price
+    reduce/increase and price up/down, asserting the returned sequence and queue
+    position for each case.
+- **`src/order_book/tests.rs`**
+  - `fee_components_conserve_taker_plus_maker_on_the_charged_asset` checks the
+    combined-rate invariant for Base and Quote fees, including a maker rebate.
+  - `received_fees_split_exact_base_and_overflowed_quote` covers both taker
+    directions: the base fee stays exact while the quote fee overflows.
+- **`src/order_book/property_tests.rs`**
+  - The independent reference model already covers place/cancel/amend and
+    deterministic replay; the mixed test covers IOC. A new operation-coverage
+    guard prevents the generator from silently dropping place/cancel/amend.
 
-### P1 — next batch
+## 6. Follow-up status
 
-- **Post-only and amend interactions.** A same-price reduction keeps sequence;
-  a size increase or price move loses it. Assert the event's
-  `previous_sequence`/`order_sequence` pair and queue order for both outcomes.
-- **GTD boundary and purge idempotence.** Expiry exactly at the deadline, one
-  millisecond before, repeated purges, and an expiry event's sequence anchoring.
-- **Iceberg plus FOK.** FOK preflight counts hidden reserve as reachable depth;
-  an accepted FOK consumes tranches and leaves the correct visible/reserve
-  split.
-- **Stop-limit boundary.** Child fills exactly at its limit, does not fill one
-  tick away, and cancels the remainder without resting it.
-- **Fee arithmetic.** Maker rebates, both fee assets, and overflow cases where
-  one fee is exact and the other is not (the replay matrix has cases; unit-level
-  invariants are still thin).
-- **Event pagination under retention.** Eviction, cursor restart, and a
-  snapshot/restart replay that proves event IDs remain stable.
+The first two batches in section 5 are implemented. [`TODO.md`](../TODO.md)
+§17 carries the checklist.
 
-### P2 — useful but larger
+### Completed after the first batch
 
-- **Modify-priority matrix** translated from exchange-core/OrderBook-rs:
-  price up/down, size up/down, and the resulting queue position.
+- **Event pagination under retention.** Cursor resume across snapshot/restart,
+  duplicate-free retained pages, and an explicit `oldest_event_id` gap when the
+  cursor has been evicted.
+- **GTD purge idempotence and sequence anchoring.** Repeated purges at one
+  instant emit no duplicate expiry; an automatic purge before a place keeps the
+  place's sequence and the entry's ordinal order.
+- **Post-only and amend interactions.** Same-price reductions keep priority,
+  price moves re-insert, crossing amendments are refused, and the flag survives.
+- **Fee conservation.** Combined-rate conservation on Base/Quote and the
+  `Received` split where the base fee stays exact while the quote fee overflows.
+- **Modify-priority matrix.** Price up/down and size up/down with sequence and
+  queue-position assertions.
+- **Independent FIFO oracle.** The existing reference-model fuzzers cover
+  place/cancel/amend and IOC; an operation-coverage guard now protects them.
+
+### P3 — conditional
+
 - **AON semantics** from Liquibook, only if AON is added to the engine.
 - **Self-trade prevention** and order masks, only if the product requires them.
-- **Multi-symbol isolation** at the deployment level (one process per symbol),
-  including configuration lock and restart.
-- **Differential FIFO fuzzing** against a tiny independent oracle, extending the
-  FlashOne-style check beyond its five operations.
+- **Multi-symbol isolation** cases only if multi-symbol moves out of
+  deployment-level isolation (one process per symbol, §2 of `TODO.md`).
+
+### Already covered before these batches
+
+- **Iceberg plus FOK.** FOK preflight counts hidden reserve as reachable depth;
+  an accepted FOK consumes tranches and leaves the correct visible/reserve
+  split. Covered by `iceberg_reserves_count_as_reachable_depth_for_fill_or_kill`.
+- **Stop-limit boundary.** A child fills exactly at its limit, does not fill one
+  tick away, and cancels the remainder without resting. Covered by
+  `stop_limit_child_keeps_to_its_limit_and_never_rests`.
 
 ### Out of scope for now
 

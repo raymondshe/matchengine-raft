@@ -535,6 +535,10 @@ fn assert_priority(orders: impl Iterator<Item = (Fixed, u64)>, side: OrderSide, 
 
 #[test]
 fn randomized_limit_book_matches_reference_model() {
+    let mut saw_place = false;
+    let mut saw_cancel = false;
+    let mut saw_amend = false;
+
     for seed in 0..SEEDS {
         let mut rng = Rng::new(seed);
         let mut book = OrderBook::new();
@@ -545,6 +549,11 @@ fn randomized_limit_book_matches_reference_model() {
             let op = next_op(&mut rng, &model);
             let context = format!("seed {seed} step {step} op {op:?}");
             apply_op(&mut book, &mut model, &op, &context);
+            match op {
+                Op::Place { .. } => saw_place = true,
+                Op::Cancel { .. } => saw_cancel = true,
+                Op::Amend { .. } => saw_amend = true,
+            }
             ops.push(op);
         }
 
@@ -562,6 +571,14 @@ fn randomized_limit_book_matches_reference_model() {
             "seed {seed}: replay diverged"
         );
     }
+
+    // The oracle must actually exercise every operation it claims to cover;
+    // otherwise a generator change could silently reduce the differential test
+    // to places only.
+    assert!(
+        saw_place && saw_cancel && saw_amend,
+        "reference-model operation coverage regressed"
+    );
 }
 
 // ---------------------------------------------------------------------------
