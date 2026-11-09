@@ -138,6 +138,58 @@ The JSONL log is node-local and debug-only (it duplicates lines when the engine
 replays entries after a restart); the assembler dedupes by
 `(stream, market_seq, sub_seq)` and a body-flagged reset rewinds state.
 
+## Archive and replay
+
+`--archive-dir <dir>` records every message the service consumes to
+`<dir>/<symbol>.jsonl`. The file uses the engine's JSONL shape, so it can be
+inspected with the existing tooling and replayed without a media driver:
+
+```shell
+# record while serving a live Aeron or JSONL source
+cargo run --manifest-path demos/market_data_system/Cargo.toml --features aeron -- \
+  --addr 127.0.0.1:24700 \
+  --aeron-channel 'aeron:ipc' \
+  --symbol eurusd:0:EUR:USD \
+  --archive-dir /var/lib/market-data/archive
+
+# replay the archive; no --aeron-channel or --market-data-log
+cargo run --manifest-path demos/market_data_system/Cargo.toml -- \
+  --addr 127.0.0.1:24700 \
+  --symbol eurusd:0:EUR:USD \
+  --replay-dir /var/lib/market-data/archive
+```
+
+Archives are append-only per symbol. Each line is flushed before the message is
+served, so a crash leaves a complete prefix; use a fresh directory per capture
+or truncate the old file before reusing a path. `--archive-dir` and
+`--replay-dir` are mutually exclusive, and replay cannot be combined with a
+live source.
+
+### External media driver
+
+For a supervised driver instead of `--aeron-embedded-driver`:
+
+```shell
+# terminal 1: driver
+AERON_DIR=/dev/shm/aeron-$USER aeronmd
+
+# terminal 2: engine and service; the same directory is used on both sides
+AERON_DIR=/dev/shm/aeron-$USER cargo run --release --features market-data-aeron -- \
+  --id 1 --http-addr 127.0.0.1:21001 \
+  --market-data-aeron-channel 'aeron:ipc' \
+  --market-data-aeron-dir /dev/shm/aeron-$USER
+
+AERON_DIR=/dev/shm/aeron-$USER cargo run --manifest-path demos/market_data_system/Cargo.toml \
+  --features aeron -- \
+  --addr 127.0.0.1:24700 --aeron-channel 'aeron:ipc' \
+  --aeron-dir /dev/shm/aeron-$USER --symbol eurusd:0:EUR:USD
+```
+
+For multicast, use one `aeron:udp?endpoint=<group>:<port>|interface=<nic>`
+channel per symbol on the engine and the matching channel on every service
+instance. Each instance receives the same frames independently; no service
+state is shared.
+
 ## Streams
 
 | Stream | Payload |
@@ -187,6 +239,8 @@ even when entries in between did not touch the book.
 |---|---|---|
 | `--addr` | `127.0.0.1:24700` | HTTP/WebSocket listener |
 | `--market-data-log` | unset | JSONL feed (fallback transport); repeat per symbol |
+| `--archive-dir` | unset | record consumed messages to `<dir>/<symbol>.jsonl` |
+| `--replay-dir` | unset | replay `<dir>/<symbol>.jsonl`; excludes live sources |
 | `--aeron-channel` | unset | Aeron feed (requires `--features aeron`); repeat per symbol |
 | `--aeron-stream-base` | `2001` | first stream id (shared by all symbols) |
 | `--aeron-dir` | `AERON_DIR` | media-driver directory; repeat per symbol |
@@ -220,10 +274,12 @@ cargo clippy --manifest-path demos/market_data_system/Cargo.toml --all-targets -
 ```
 
 The default suite covers stream parsing, kline intervals, payloads, WebSocket
-snapshots/conflation/combined streams, control errors, and two-symbol tests:
+snapshots/conflation/combined streams, control errors, two-symbol tests, and
+archive record-then-replay:
 one holds both symbols on a single connection, the other switches
 `UNSUBSCRIBE`/`SUBSCRIBE` and verifies `LIST_SUBSCRIPTIONS` and the
-per-connection metrics. The `aeron` feature adds an
+per-connection metrics; `tests/archive.rs` records a channel source and re-reads
+the same messages through `jsonl_source`. The `aeron` feature adds an
 embedded-driver test that publishes engine wire frames over IPC and asserts they
 reach the WebSocket client; the engine has a matching `market_data::aeron` test
 behind `--features market-data-aeron`.

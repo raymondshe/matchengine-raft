@@ -8,6 +8,7 @@
 
 #[cfg(feature = "aeron")]
 pub mod aeron_source;
+pub mod archive;
 pub mod config;
 pub mod feed;
 pub mod protocol;
@@ -17,6 +18,8 @@ pub mod source;
 
 #[cfg(feature = "aeron")]
 pub use aeron_source::aeron_source;
+pub use archive::archive_path;
+pub use archive::archive_source;
 pub use config::AeronSpec;
 pub use config::Config;
 pub use config::SymbolSpec;

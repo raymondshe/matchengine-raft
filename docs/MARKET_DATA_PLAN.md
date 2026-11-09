@@ -340,7 +340,8 @@ CI is green including the new crate.
 - `GET /marketdata/depth` REST snapshot endpoint (REST+WS sync parity).
 - Per-IP connection throttling in-process (option); fleet autoscaling runbook.
 - Multi-symbol routing by `symbol_id`; per-DC relays; the Kafka/NATS bridge variant.
-- From U7: Archive recording/replay and the snapshot-request stream 2010.
+- From U7: the snapshot-request stream 2010. Archive recording/replay is implemented in the
+  reference service with `--archive-dir`/`--replay-dir` and `tests/archive.rs`.
 
 ### Test matrix additions (U9–U15)
 
@@ -404,13 +405,13 @@ PARTIAL_BAR|BAR_CLOSE`; bit 4 reserved), `market_seq`, `log_index`, `ordinal`, b
 | U6 | **done** | README/README_CN/AGENTS/TODO/AERON updates; bench `rest 1k bids + journal` |
 | U8 | **done** | deterministic `(market_seq, sub_seq)` across replicas; all mutations sequenced; auto GTD purge; one TRADE per taker; wire v6 encoder + reference decoder |
 | U9 | **partial** | `start_with_sink` seam done; per-entry empty depth deltas and bar quote volume still open (the service derives contiguity and kline `q`) |
-| U10 | **partial** | `AeronSink` (rusteron 0.2.13, embedded/external driver, one publication per stream, blocking publisher task, periodic reset snapshot) done; idle heartbeat and leadership-scoped publication lifecycle still open |
+| U10 | **partial** | `AeronSink` (rusteron 0.2.13, embedded/external driver, one publication per stream, blocking publisher task, periodic reset snapshot) and the external-driver runbook are done; idle heartbeat, multicast fan-out validation and leadership-scoped publication lifecycle still open |
 | U11 | **done (demo)** | `demos/market_data_system/`: `FrameSource` (JSONL + Aeron + channel), per-symbol feeds, assembler, dedupe/watermark/gap policy, caches |
 | U12 | **done (demo)** | shared WS hub: serialize-once broadcast, 100/1000 ms conflation, snapshot-on-subscribe, Binance payloads, multi-symbol keys |
 | U13 | **done (demo)** | Binance client protocol: raw/combined endpoints, live `SUBSCRIBE`/`UNSUBSCRIBE` across symbols on one connection, 1024-stream cap, ping/pong, 24 h rotation |
 | U14 | **partial** | health/readiness, metrics, graceful shutdown, stateless multi-instance design; per-instance parity test and `/metrics` runbook still open |
 | U15 | **partial** | engine→Aeron→service→WS end-to-end test and crate README done; `ws_fanout` benchmark and performance numbers still open |
-| U7 | deferred | Archive replay and the snapshot-request stream; multi-symbol is deployment-level. The Aeron adapter moved to U10 |
+| U7 | **partial** | Archive recording/replay is done in the reference service (`--archive-dir`/`--replay-dir`, `tests/archive.rs`); the snapshot-request stream remains. Multi-symbol is deployment-level. The Aeron adapter moved to U10 |
 
 ## Verification (2026-10-28)
 
@@ -461,7 +462,7 @@ Messages are identified by `(symbol_id, stream_id, market_seq, sub_seq)`:
    state-machine lock, opening the gate only afterwards, and gating the tap at the source so
    follower frames never queue ahead of a takeover snapshot.
 
-U1–U6 acceptance criteria are met. U7 (Aeron adapter, Archive replay, multi-symbol deployment) remains
-deferred. The header epoch is the current Raft term and `leader_id` is the known leader (0 when
-none); the leader watcher updates both on every metrics change, so reset snapshots and following
-frames carry the current leadership generation.
+U1–U6 acceptance criteria are met. U7 archive recording/replay is implemented; the
+snapshot-request stream and multi-symbol deployment remain. The header epoch is the current Raft
+term and `leader_id` is the known leader (0 when none); the leader watcher updates both on every
+metrics change, so reset snapshots and following frames carry the current leadership generation.

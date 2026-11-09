@@ -9,6 +9,8 @@ use matchengine_marketdata::AeronSpec;
 use matchengine_marketdata::BoxedSource;
 use matchengine_marketdata::Config;
 use matchengine_marketdata::SymbolSpec;
+use matchengine_marketdata::archive_path;
+use matchengine_marketdata::archive_source;
 use matchengine_marketdata::jsonl_source;
 use matchengine_marketdata::start;
 
@@ -26,6 +28,14 @@ struct Opt {
     /// Engine market-data JSONL file, repeatable and aligned with --symbol.
     #[clap(long, env = "MARKET_DATA_LOG")]
     market_data_log: Vec<PathBuf>,
+
+    /// Record every consumed message to `<dir>/<symbol>.jsonl`.
+    #[clap(long, env = "MARKET_DATA_ARCHIVE_DIR")]
+    archive_dir: Option<PathBuf>,
+
+    /// Replay `<dir>/<symbol>.jsonl` instead of a live source.
+    #[clap(long, env = "MARKET_DATA_REPLAY_DIR")]
+    replay_dir: Option<PathBuf>,
 
     /// Aeron channel per symbol (one value is reused for every symbol).
     #[clap(long, env = "AERON_CHANNEL")]
@@ -89,6 +99,14 @@ fn parse_symbol(raw: &str) -> Result<SymbolSpec, String> {
     if symbol.is_empty() {
         return Err("--symbol name must not be empty".to_string());
     }
+    if !symbol
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+    {
+        return Err(format!(
+            "--symbol name must contain only ASCII letters, digits, '_' or '-' (got {symbol})"
+        ));
+    }
     let symbol_id = parts[1]
         .parse()
         .map_err(|_| format!("invalid symbol id in --symbol {raw}"))?;
@@ -139,7 +157,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     config.snapshot_levels = opt.snapshot_levels.max(1);
 
-    let sources: Vec<(SymbolSpec, BoxedSource)> = if !opt.market_data_log.is_empty() {
+    if opt.replay_dir.is_some()
+        && (!opt.market_data_log.is_empty() || !opt.aeron_channel.is_empty())
+    {
+        return Err(
+            "--replay-dir cannot be combined with --market-data-log or --aeron-channel".into(),
+        );
+    }
+    if opt.replay_dir.is_some() && opt.archive_dir.is_some() {
+        return Err("--archive-dir cannot be combined with --replay-dir".into());
+    }
+
+    let mut sources: Vec<(SymbolSpec, BoxedSource)> = if let Some(dir) = &opt.replay_dir {
+        for spec in &symbols {
+            let path = archive_path(dir, &spec.symbol);
+            if !path.exists() {
+                return Err(format!("replay file does not exist: {}", path.display()).into());
+            }
+        }
+        symbols
+            .iter()
+            .map(|spec| (spec.clone(), jsonl_source(archive_path(dir, &spec.symbol))))
+            .collect()
+    } else if !opt.market_data_log.is_empty() {
         if opt.market_data_log.len() != symbols.len() {
             return Err("--market-data-log must be repeated once per --symbol".into());
         }
@@ -176,8 +216,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         sources
     } else {
-        return Err("--market-data-log or --aeron-channel is required".into());
+        return Err("--market-data-log, --aeron-channel or --replay-dir is required".into());
     };
+
+    if let Some(dir) = &opt.archive_dir {
+        sources = sources
+            .into_iter()
+            .map(|(spec, source)| {
+                let path = archive_path(dir, &spec.symbol);
+                println!("  archive:         {} -> {}", spec.symbol, path.display());
+                (spec, archive_source(source, path))
+            })
+            .collect();
+    }
 
     let running = start(config, sources).await?;
     println!("market-data system: ws://{}/ws", running.addr);
@@ -213,4 +264,18 @@ async fn aeron_source_for(aeron: &AeronSpec) -> Result<BoxedSource, Box<dyn std:
 #[cfg(not(feature = "aeron"))]
 async fn aeron_source_for(_aeron: &AeronSpec) -> Result<BoxedSource, Box<dyn std::error::Error>> {
     Err("--aeron-channel requires building with --features aeron".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_symbol;
+
+    #[test]
+    fn symbol_names_are_safe_for_archive_paths() {
+        assert!(parse_symbol("EURUSD:0:EUR:USD").is_ok());
+        assert!(parse_symbol("btc_usdt:1:BTC:USDT").is_ok());
+        assert!(parse_symbol("btc-usdt:1:BTC:USDT").is_ok());
+        assert!(parse_symbol("../escape:0:EUR:USD").is_err());
+        assert!(parse_symbol("a/b:0:EUR:USD").is_err());
+    }
 }

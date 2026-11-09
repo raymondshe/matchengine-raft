@@ -49,9 +49,10 @@ exact `apply_path` allocation ceilings plus loose `book_replay`/`replay_mix` p50
 a manual Linux workflow for the pinned-core `e2e` pass (§8). The four-voter no-fsync contract now
 has a real-process leader-kill test: three survivors commit, and the restarted node catches up
 after losing a truncated WAL tail (§7). Parked stops now accept direct trigger/limit/volume
-amendments and icebergs accept total-open-volume amendments with priority rules (§5). The measured
-baselines, write/lease decisions, async-WAL numbers and upstream OpenRaft comparison are in
-[`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md).
+amendments and icebergs accept total-open-volume amendments with priority rules (§5). The
+market-data service records and replays per-symbol JSONL archives through the normal feed path
+(§6). The measured baselines, write/lease decisions, async-WAL numbers and upstream OpenRaft
+comparison are in [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md).
 
 The upstream OpenRaft minimal benchmark (three in-process nodes, in-memory log/state machine,
 function-call network, empty requests) reports 33k put/s with one client and 3.5M put/s with 4,096,
@@ -76,10 +77,10 @@ The next work, in order (re-prioritised 2026-11-09 after the public-suite review
    dispatch the manual `Linux benchmark` workflow (or run the same commands on deployment
    hardware) to separate scheduler noise from the fsync cost and record the pinned short and
    sustained rows.
-2. **Feature and extension work.** Port the remaining order types (§5), Aeron hardening and
-   market-data archive/replay (§6), and the error-null/mixed-unit/fee-token decisions (§13). The
-   optional apply-path and per-level-bucket work in §8 is last because the measured wins are small
-   or split.
+2. **Feature and extension work.** Port the remaining order types (§5), finish Aeron operation
+   hardening and the snapshot-request stream (§6), and the error-null/mixed-unit/fee-token
+   decisions (§13). The optional apply-path and per-level-bucket work in §8 is last because the
+   measured wins are small or split.
 
 The earlier measurement work is done: `book_replay` and `level_book` report warm p50/p99 plus an
 interleaved cold pass, `replay_mix` replays a 100,000-operation fixture with fees, the 4-node
@@ -319,9 +320,14 @@ Done:
 
 Remaining:
 
-- [ ] **P2** Aeron production hardening: external-driver runbook, multicast/fan-out validation,
-  idle heartbeat, and the `ws_fanout` benchmark/performance numbers for the market-data service.
-- [ ] **P2** Archive recording/replay and the snapshot-request stream (2003/2010).
+- [x] **P2** Archive recording/replay. Done: `--archive-dir` records every consumed
+  message to `<dir>/<symbol>.jsonl` with the engine's JSONL shape, and `--replay-dir` feeds those
+  files through the normal assembler/WebSocket path without a media driver. A dedicated archive
+  task flushes each line before yielding; `tests/archive.rs` proves record-then-replay equality.
+- [ ] **P2** Aeron operation hardening: run the documented external-driver/multicast fan-out
+  validation on Linux, add an idle heartbeat, and publish `ws_fanout` benchmark numbers. The
+  external-driver runbook is now in `demos/market_data_system/README.md`.
+- [ ] **P2** Add the snapshot-request stream (2003/2010).
 
 ## 7. Tests and CI
 
