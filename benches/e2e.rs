@@ -9,10 +9,23 @@
 //! process on Linux (`sched_setaffinity`) to remove scheduler noise. The
 //! order-book-only costs are measured by `cargo bench --bench matchengine`.
 //!
+//! For sustained CPU profiling, `--duration <seconds>` keeps `--clients <n>`
+//! closed-loop `/write` clients running and reports process CPU alongside
+//! throughput and latency:
+//!
+//! ```text
+//! cargo bench --bench e2e -- --duration 60 --clients 500
+//! ```
+//!
+//! The sustained mode uses IOC orders so the book stays bounded; it profiles
+//! the HTTP/Raft/WAL/apply/event path rather than deep matching sweeps. CPU is
+//! the whole process (in-process node plus load generator).
+//!
 //! `MATCHENGINE_ASYNC_WAL=1` with `--features async-wal` and `RAFT_WAL_FSYNC_MS=0`
 //! selects the prototype async WAL for the same suite.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 use std::time::SystemTime;
@@ -27,8 +40,10 @@ use matchengine_raft::client::MatchEngineClient;
 use matchengine_raft::default_raft_config;
 use matchengine_raft::order_book::Order;
 use matchengine_raft::order_book::OrderSide;
+use matchengine_raft::order_book::TimeInForce;
 use matchengine_raft::store::MatchEngineRequest;
 use openraft::type_config::TypeConfigExt;
+use tokio::sync::Barrier;
 
 type C = MatchEngineTypeConfig;
 
@@ -61,6 +76,34 @@ fn temp_dir(label: &str) -> PathBuf {
 fn percentile(sorted: &[Duration], percentile: f64) -> Duration {
     let index = ((sorted.len() - 1) as f64 * percentile).round() as usize;
     sorted[index]
+}
+
+/// Process CPU time in seconds, including all threads. `None` on platforms
+/// without `getrusage`.
+#[cfg(unix)]
+fn process_cpu_seconds() -> Option<f64> {
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) };
+    if rc != 0 {
+        return None;
+    }
+    Some(
+        usage.ru_utime.tv_sec as f64
+            + usage.ru_utime.tv_usec as f64 / 1_000_000.0
+            + usage.ru_stime.tv_sec as f64
+            + usage.ru_stime.tv_usec as f64 / 1_000_000.0,
+    )
+}
+
+#[cfg(not(unix))]
+fn process_cpu_seconds() -> Option<f64> {
+    None
+}
+
+fn logical_cores() -> usize {
+    std::thread::available_parallelism()
+        .map(|cores| cores.get())
+        .unwrap_or(1)
 }
 
 /// Pins the process to one CPU before the runtimes start. Threads created
@@ -117,6 +160,14 @@ fn write_request(index: usize) -> MatchEngineRequest {
         (OrderSide::Sell, 101.0)
     };
     MatchEngineRequest::place(Order::new(side, price, 1.0, 0))
+}
+
+fn sustained_write_request() -> MatchEngineRequest {
+    // IOC against an empty book cancels immediately, so a multi-minute run
+    // does not grow the resting book or turn into a cancel benchmark.
+    let mut order = Order::new(OrderSide::Buy, 100.0, 1.0, 0);
+    order.tif = TimeInForce::Ioc;
+    MatchEngineRequest::place(order)
 }
 
 fn async_wal_from_env() -> bool {
@@ -293,6 +344,176 @@ async fn concurrent_throughput(addr: &str, runtime: &str) -> anyhow::Result<()> 
     Ok(())
 }
 
+async fn sustained_load(
+    addr: &str,
+    runtime: &str,
+    clients: usize,
+    duration: Duration,
+) -> anyhow::Result<()> {
+    let body = serde_json::to_vec(&sustained_write_request())?;
+    let http = reqwest::Client::builder()
+        .no_proxy()
+        .pool_max_idle_per_host(clients)
+        .timeout(Duration::from_secs(10))
+        .build()?;
+    let url = format!("http://{addr}/write");
+    println!("sustained writes ({runtime}): {clients} clients for {duration:?}");
+
+    // Establish one keep-alive connection per client before the timed phase,
+    // so connection setup does not hide the real in-flight concurrency.
+    let preconnect_started = Instant::now();
+    let health_url = format!("http://{addr}/health");
+    let preconnect = (0..clients).map(|_| {
+        let http = http.clone();
+        let health_url = health_url.clone();
+        async move {
+            let response = http.get(&health_url).send().await?;
+            let _ = response.bytes().await?;
+            Ok::<_, anyhow::Error>(())
+        }
+    });
+    for result in join_all(preconnect).await {
+        result?;
+    }
+    println!(
+        "  pre-connected {clients} keep-alive connections in {:?}",
+        preconnect_started.elapsed()
+    );
+
+    let deadline = Instant::now() + duration;
+    let barrier = Arc::new(Barrier::new(clients + 1));
+    let mut handles = Vec::with_capacity(clients);
+    for _ in 0..clients {
+        let http = http.clone();
+        let url = url.clone();
+        let body = body.clone();
+        let barrier = barrier.clone();
+        handles.push(tokio::spawn(async move {
+            barrier.wait().await;
+            let mut latencies = Vec::new();
+            let mut rejected = 0usize;
+            let mut failed = 0usize;
+            while Instant::now() < deadline {
+                let started = Instant::now();
+                match http
+                    .post(&url)
+                    .header(reqwest::header::CONTENT_TYPE, "application/json")
+                    .body(body.clone())
+                    .send()
+                    .await
+                {
+                    Ok(response) => {
+                        let status = response.status();
+                        if response.bytes().await.is_err() {
+                            failed += 1;
+                            continue;
+                        }
+                        if status.is_success() {
+                            latencies.push(started.elapsed());
+                        } else if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                            rejected += 1;
+                        } else {
+                            failed += 1;
+                        }
+                    }
+                    Err(_) => {
+                        failed += 1;
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                }
+            }
+            Ok::<_, anyhow::Error>((latencies, rejected, failed))
+        }));
+    }
+
+    let cpu_start = process_cpu_seconds();
+    let wall_start = Instant::now();
+    barrier.wait().await;
+
+    let mut last_cpu = cpu_start;
+    let mut last_wall = wall_start;
+    while Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        tokio::time::sleep(remaining.min(Duration::from_secs(1))).await;
+        let now = Instant::now();
+        if let (Some(start), Some(cpu), Some(previous_cpu)) =
+            (cpu_start, process_cpu_seconds(), last_cpu)
+        {
+            let interval = now.duration_since(last_wall).as_secs_f64();
+            if interval > 0.0 {
+                let elapsed = wall_start.elapsed().as_secs_f64();
+                println!(
+                    "  [cpu] t={:>5.1}s interval={:>5.2} cores cumulative={:>5.2} cores",
+                    elapsed,
+                    (cpu - previous_cpu) / interval,
+                    (cpu - start) / elapsed.max(f64::EPSILON)
+                );
+                last_cpu = Some(cpu);
+                last_wall = now;
+            }
+        }
+    }
+
+    let mut latencies = Vec::new();
+    let mut rejected = 0usize;
+    let mut failed = 0usize;
+    for result in join_all(handles).await {
+        let (mut client_latencies, client_rejected, client_failed) = result??;
+        latencies.append(&mut client_latencies);
+        rejected += client_rejected;
+        failed += client_failed;
+    }
+    let elapsed = wall_start.elapsed();
+    let cpu_used = match (cpu_start, process_cpu_seconds()) {
+        (Some(start), Some(end)) => Some(end - start),
+        _ => None,
+    };
+
+    let accepted = latencies.len();
+    println!("  wall:       {:>10.2}s", elapsed.as_secs_f64());
+    println!("  accepted:   {accepted}");
+    println!("  rejected:   {rejected}");
+    println!("  failed:     {failed}");
+    println!(
+        "  throughput: {:>10.0} writes/s",
+        accepted as f64 / elapsed.as_secs_f64().max(f64::EPSILON)
+    );
+    if accepted > 0 {
+        latencies.sort_unstable();
+        println!(
+            "  p50/p95/p99: {:?} / {:?} / {:?}",
+            percentile(&latencies, 0.50),
+            percentile(&latencies, 0.95),
+            percentile(&latencies, 0.99)
+        );
+    }
+    if let Some(cpu) = cpu_used {
+        let cores = cpu / elapsed.as_secs_f64().max(f64::EPSILON);
+        let logical = logical_cores();
+        println!(
+            "  CPU:        {cpu:>10.2}s = {cores:.2} cores ({:.1}% of {logical} logical cores; node + load generator)",
+            cores / logical as f64 * 100.0
+        );
+    } else {
+        println!("  CPU:        process CPU not available on this platform");
+    }
+    Ok(())
+}
+
+async fn run_sustained_suite(
+    runtime: &str,
+    addr: &str,
+    clients: usize,
+    duration: Duration,
+) -> anyhow::Result<()> {
+    println!("\n=== {runtime} runtime, sustained ===");
+    let (node, _client, dir) = start_node(addr, runtime).await?;
+    sustained_load(addr, runtime, clients, duration).await?;
+    node.shutdown().await?;
+    let _ = std::fs::remove_dir_all(dir);
+    Ok(())
+}
+
 async fn run_suite(runtime: &str, addr: &str) -> anyhow::Result<()> {
     println!("\n=== {runtime} runtime ===");
     let (node, client, dir) = start_node(addr, runtime).await?;
@@ -311,6 +532,9 @@ fn main() -> anyhow::Result<()> {
     println!("end-to-end write benchmark (single node, HTTP + WAL + apply)");
     let mut selection = String::new();
     let mut pin = None;
+    let mut duration = None;
+    let mut clients = 64usize;
+    let mut clients_set = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -324,10 +548,49 @@ fn main() -> anyhow::Result<()> {
             other if other.starts_with("--pin=") => {
                 pin = Some(other["--pin=".len()..].parse::<usize>()?);
             }
+            "--duration" => {
+                let seconds = args.next().context("--duration needs seconds")?;
+                duration =
+                    Some(Duration::from_secs(seconds.parse().context(
+                        "--duration must be a positive number of seconds",
+                    )?));
+            }
+            other if other.starts_with("--duration=") => {
+                duration = Some(Duration::from_secs(
+                    other["--duration=".len()..]
+                        .parse()
+                        .context("--duration must be a positive number of seconds")?,
+                ));
+            }
+            "--clients" => {
+                clients = args
+                    .next()
+                    .context("--clients needs a number")?
+                    .parse()
+                    .context("--clients must be a positive number")?;
+                clients_set = true;
+            }
+            other if other.starts_with("--clients=") => {
+                clients = other["--clients=".len()..]
+                    .parse()
+                    .context("--clients must be a positive number")?;
+                clients_set = true;
+            }
             other => {
-                anyhow::bail!("unknown argument {other:?}; expected current|both|--pin <cpu>")
+                anyhow::bail!(
+                    "unknown argument {other:?}; expected current|both|--pin <cpu>|--duration <seconds>|--clients <n>"
+                )
             }
         }
+    }
+    if duration == Some(Duration::ZERO) {
+        anyhow::bail!("--duration must be at least one second");
+    }
+    if clients == 0 {
+        anyhow::bail!("--clients must be at least one");
+    }
+    if clients_set && duration.is_none() {
+        anyhow::bail!("--clients needs --duration <seconds>");
     }
     if let Some(cpu) = pin {
         pin_to_cpu(cpu)?;
@@ -349,13 +612,29 @@ fn main() -> anyhow::Result<()> {
         let current = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
-        current.block_on(run_suite("current_thread", CURRENT_THREAD_ADDR))?;
+        match duration {
+            Some(duration) => current.block_on(run_sustained_suite(
+                "current_thread",
+                CURRENT_THREAD_ADDR,
+                clients,
+                duration,
+            ))?,
+            None => current.block_on(run_suite("current_thread", CURRENT_THREAD_ADDR))?,
+        }
     }
     if run_multi {
         let multi = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?;
-        multi.block_on(run_suite("multi_thread", MULTI_THREAD_ADDR))?;
+        match duration {
+            Some(duration) => multi.block_on(run_sustained_suite(
+                "multi_thread",
+                MULTI_THREAD_ADDR,
+                clients,
+                duration,
+            ))?,
+            None => multi.block_on(run_suite("multi_thread", MULTI_THREAD_ADDR))?,
+        }
     }
     Ok(())
 }

@@ -1,6 +1,6 @@
 # Performance measurements
 
-Measured on **2026-10-30** (runtime flavor A/B and P0 offloads: **2026-10-31**; measurement scope and RSS: **2026-11-01**; book p50/p99 and the pinned-core approximation: **2026-11-04**; end-to-end/storage rerun with the OpenRaft quick wins: **2026-11-06**; realistic-mix replay: **2026-11-06**; dedicated Raft runtime: **2026-11-06**; WAL fsync Tokio rerun: **2026-11-07**; four-node no-fsync cluster: **2026-11-07**; write concurrency/batching sweep: **2026-11-08**; async WAL prototype: **2026-11-08**; production configuration decisions: **2026-11-08**; write admission control: **2026-11-09**; pre-connected write concurrency: **2026-11-09**; read-path benchmark: **2026-11-08**; OpenRaft minimal-benchmark comparison: **2026-11-08**) on the reference development machine:
+Measured on **2026-10-30** (runtime flavor A/B and P0 offloads: **2026-10-31**; measurement scope and RSS: **2026-11-01**; book p50/p99 and the pinned-core approximation: **2026-11-04**; end-to-end/storage rerun with the OpenRaft quick wins: **2026-11-06**; realistic-mix replay: **2026-11-06**; dedicated Raft runtime: **2026-11-06**; WAL fsync Tokio rerun: **2026-11-07**; four-node no-fsync cluster: **2026-11-07**; write concurrency/batching sweep: **2026-11-08**; async WAL prototype: **2026-11-08**; production configuration decisions: **2026-11-08**; write admission control: **2026-11-09**; pre-connected write concurrency: **2026-11-09**; sustained single-node CPU profile: **2026-11-09**; read-path benchmark: **2026-11-08**; OpenRaft minimal-benchmark comparison: **2026-11-08**) on the reference development machine:
 
 - Apple M4 (`arm64`)
 - Rust `1.93.1`
@@ -15,6 +15,7 @@ on the deployment hardware before using the numbers for sizing.
 ```shell
 cargo bench --bench matchengine   # order-book microbenchmarks
 cargo bench --bench e2e           # submit -> commit -> apply -> response (multi-thread; -- current|both for A/B, --pin <cpu> on Linux)
+cargo bench --bench e2e -- --duration 60 --clients 500  # sustained closed-loop load with process CPU and one-second samples
 RAFT_WAL_FSYNC_MS=0 MATCHENGINE_ASYNC_WAL=1 cargo bench --features async-wal --bench e2e -- both  # prototype async WAL A/B
 cargo bench --bench cluster_e2e -- --rounds 3  # four in-process no-fsync voters, leader-direct writes and batches
 cargo bench --bench cluster_e2e -- --rounds 2 --concurrency-only  # 1/8/64/256/1024/4096-client sweep
@@ -415,6 +416,74 @@ the [four-node no-fsync cluster](#four-node-no-fsync-cluster-2026-11-07) section
 measures the quorum cost, while the WAL fsync amortization is unchanged. Keep
 batches within the 128-request cap: `apply` holds the state-machine lock for the
 whole batch.
+
+### Sustained CPU profile (2026-11-09)
+
+The short suite above lasts about 0.4 s warm, so instantaneous CPU bursts are easy
+to miss in a dashboard or a lifetime-average `ps %cpu`, and a cold run averages
+under 3% of a 10-core host. `--duration <seconds>` replaces the short suite with a
+closed-loop sustained write load. `--clients <n>` sets the number of clients
+(default 64) and requires `--duration`:
+
+```text
+cargo bench --bench e2e -- --duration 60 --clients 500
+```
+
+The mode pre-connects one keep-alive connection per client, then has every client
+send one `/write` at a time until the deadline. It reports accepted/rejected/failed
+counts, throughput, p50/p95/p99 and **process** CPU from `getrusage` (in-process
+node plus load generator), both as a whole-run average and as one-second interval
+samples. The workload places IOC Buy orders at 100.0 against an empty book, so no
+order rests or fills and the book stays empty; it profiles the HTTP decode, Raft
+propose/commit, WAL append, apply and event/response path, not matching sweeps.
+WAL fsync is disabled, admission is unbounded and the snapshot timer is disabled,
+but the default `LogsSinceLast(100_000)` policy still snapshots about every 100k
+entries.
+
+Apple M4 (10 logical cores: 4 performance + 6 efficiency), 25 GB RAM, macOS,
+bench profile, one fresh run:
+
+| Measurement | Result |
+|---|---:|
+| Clients | 500 pre-connected keep-alive connections |
+| Duration | 60.01 s |
+| Accepted / rejected / failed | 6,647,163 / 0 / 0 |
+| Throughput | **110,760 writes/s** |
+| p50 / p95 / p99 | 4.33 ms / 7.03 ms / 8.83 ms |
+| Process CPU | **502.89 s = 8.38 cores** |
+| Share of 10 logical cores | **83.8%** |
+
+The one-second samples stayed between 7.48 and 8.71 cores after the first second,
+with cumulative CPU settling at 8.38 cores and no downward trend over the run.
+The dips (t=1 s, 7 s, 48 s, 53 s) are scheduler noise and snapshot/compaction
+work, not a throughput collapse; the completed-run average is 110.8k writes/s.
+
+An independent check against a **standalone release server** (port 24972, driven
+by `ab -k -n 7000000 -c 500`) measured **80,466 writes/s**, p50 6 ms / p99 11 ms,
+and **3.99 cores in the server process alone** (39.9% of 10 logical cores). The
+`ab` process runs separately and is not included in that figure, so this is the
+closest node-only measurement here. It used `RAFT_WAL_FSYNC_MS=1000` because the
+binary sets `min_voters = 4` when the variable is unset; the single-node `/init`
+therefore needs a non-default fsync mode to form a one-voter cluster. The
+in-process run above additionally includes its own load generator, which explains
+the higher 8.38-core figure.
+
+CPU accounting for this benchmark:
+
+- The node runs **inside the bench process** on `127.0.0.1:24002`. A separately
+  started `matchengine-raft` binary receives no requests; monitoring it shows only
+  idle CPU. Monitor the `e2e-*` bench process (or run the standalone server and
+  drive it with an external load generator).
+- `getrusage(RUSAGE_SELF)` covers every thread of the bench process, so the 8.38
+  cores include the HTTP clients as well as the node. It is not an isolated
+  node-only figure; compare it with the four-node `cluster_e2e` CPU runs, which
+  also include all in-process nodes and clients.
+- A percentage is only meaningful with its denominator: 8.38 cores is 83.8% of
+  this 10-core host, but 13% of a 64-core host. Check whether the monitoring tool
+  reports percent-of-one-core or percent-of-all-cores.
+- `-- current` still selects the single-thread runtime. Sustained CPU on that path
+  is bounded by one worker and is not comparable with the default multi-thread
+  runtime.
 
 ### Four-node no-fsync cluster (2026-11-07)
 
