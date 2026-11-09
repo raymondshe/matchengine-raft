@@ -4,9 +4,12 @@
 //! through `/write` and checks the event kinds the engine returns.
 //! `event_lifecycle_reconstructs_state` follows one order through rest, amend,
 //! fill and cancel, then checks expiry and stop events are explicit rather than
-//! overloaded rejections. `negative_api_inputs_are_rejected` covers malformed
-//! bodies and unknown read keys.
+//! overloaded rejections. `event_stream_reconstructs_visible_book` replays the
+//! replicated `/events` log into a mirror of the visible book.
+//! `negative_api_inputs_are_rejected` covers malformed bodies and unknown read
+//! keys.
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -18,6 +21,7 @@ use matchengine_raft::client::MatchEngineClient;
 use matchengine_raft::default_raft_config;
 use matchengine_raft::match_result::MatchEvent;
 use matchengine_raft::match_result::MatchEventKind;
+use matchengine_raft::network::api::EventsRequest;
 use matchengine_raft::order_book::Fixed;
 use matchengine_raft::order_book::Order;
 use matchengine_raft::order_book::OrderSide;
@@ -32,6 +36,14 @@ use reqwest::StatusCode;
 use crate::common::TempDir;
 
 type C = MatchEngineTypeConfig;
+
+/// The visible state of one resting order, reconstructed from events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VisibleOrder {
+    side: OrderSide,
+    price: Fixed,
+    volume: Fixed,
+}
 
 async fn start_node(addr: &str, label: &str) -> (MatchEngineNode, MatchEngineClient<C>, TempDir) {
     let temp = TempDir::new(label);
@@ -460,6 +472,239 @@ fn event_lifecycle_reconstructs_state() {
             Some(RejectReason::StopWouldTrigger),
             response.events[0].reason
         );
+
+        node.shutdown().await.unwrap();
+    });
+}
+
+#[test]
+fn event_stream_reconstructs_visible_book() {
+    C::run(async {
+        let (node, client, _temp) = start_node("127.0.0.1:21934", "event-reconstruct").await;
+
+        // seq 0: a resting bid; seq 1: an ask well away from it.
+        let response = apply(&client, place(limit(OrderSide::Buy, 100.0, 10.0))).await;
+        assert_eq!(Some(0), response.sequence);
+        assert_eq!(vec![MatchEventKind::Rested], kinds(&response.events));
+
+        let response = apply(&client, place(limit(OrderSide::Sell, 110.0, 4.0))).await;
+        assert_eq!(Some(1), response.sequence);
+        assert_eq!(vec![MatchEventKind::Rested], kinds(&response.events));
+
+        // seq 2: an IOC sell. It fills the bid and cancels its remainder.
+        let mut ioc = limit(OrderSide::Sell, 100.0, 12.0);
+        ioc.tif = TimeInForce::Ioc;
+        let response = apply(&client, place(ioc)).await;
+        assert_eq!(Some(2), response.sequence);
+        assert_eq!(
+            vec![MatchEventKind::Fill, MatchEventKind::Cancelled],
+            kinds(&response.events)
+        );
+        assert_eq!(Some(0), response.events[0].counterparty_sequence);
+        assert_eq!(Fixed::from(10), response.events[0].volume);
+        assert_eq!(Fixed::from(2), response.events[1].volume);
+
+        // seq 3: with no bids left, the FOK is rejected without moving the book.
+        let mut fok = limit(OrderSide::Sell, 100.0, 5.0);
+        fok.tif = TimeInForce::Fok;
+        let response = apply(&client, place(fok)).await;
+        assert_eq!(Some(3), response.sequence);
+        assert_eq!(vec![MatchEventKind::Rejected], kinds(&response.events));
+        assert_eq!(Some(RejectReason::FokUnfillable), response.events[0].reason);
+        assert_eq!(Fixed::from(5), response.events[0].volume);
+
+        // seq 4-5: a bid, then a market sell that fills it and cancels 2.
+        let response = apply(&client, place(limit(OrderSide::Buy, 99.0, 5.0))).await;
+        assert_eq!(Some(4), response.sequence);
+        assert_eq!(vec![MatchEventKind::Rested], kinds(&response.events));
+        let response = apply(&client, place(market(OrderSide::Sell, 7.0))).await;
+        assert_eq!(Some(5), response.sequence);
+        assert_eq!(
+            vec![MatchEventKind::Fill, MatchEventKind::Cancelled],
+            kinds(&response.events)
+        );
+        assert_eq!(Some(4), response.events[0].counterparty_sequence);
+        assert_eq!(Fixed::from(5), response.events[0].volume);
+        assert_eq!(Fixed::from(2), response.events[1].volume);
+
+        // seq 6-8: a bid at 95, a parked stop at 95, and a trade that elects it.
+        let response = apply(&client, place(limit(OrderSide::Buy, 95.0, 3.0))).await;
+        assert_eq!(Some(6), response.sequence);
+        assert_eq!(vec![MatchEventKind::Rested], kinds(&response.events));
+        let response = apply(&client, place(stop_market(OrderSide::Sell, 95.0, 10.0))).await;
+        assert_eq!(Some(7), response.sequence);
+        assert!(
+            response.events.is_empty(),
+            "a parked stop is not in the visible event stream yet"
+        );
+        let response = apply(&client, place(limit(OrderSide::Sell, 95.0, 2.0))).await;
+        assert_eq!(Some(8), response.sequence);
+        assert_eq!(
+            vec![
+                MatchEventKind::Fill,
+                MatchEventKind::Triggered,
+                MatchEventKind::Fill,
+                MatchEventKind::Cancelled,
+            ],
+            kinds(&response.events)
+        );
+        assert_eq!(Fixed::from(2), response.events[0].volume);
+        assert_eq!(Fixed::from(10), response.events[1].volume);
+        assert_eq!(Fixed::from(1), response.events[2].volume);
+        assert_eq!(Fixed::from(9), response.events[3].volume);
+
+        // seq 9: leave one resting order on each side so the mirror has to
+        // preserve side, price and volume, not just a count.
+        let response = apply(&client, place(limit(OrderSide::Buy, 90.0, 5.0))).await;
+        assert_eq!(Some(9), response.sequence);
+        assert_eq!(vec![MatchEventKind::Rested], kinds(&response.events));
+
+        // Read the replicated log back in small pages. No event may be
+        // duplicated or lost at a page boundary.
+        let mut events: Vec<MatchEvent> = Vec::new();
+        let mut after = None;
+        let mut pages = 0;
+        loop {
+            let page = client
+                .events(&EventsRequest {
+                    after,
+                    limit: Some(5),
+                    wait_ms: None,
+                })
+                .await
+                .unwrap()
+                .unwrap();
+            pages += 1;
+            for event in &page.events {
+                if let Some(previous) = events.last() {
+                    assert!(
+                        event.event_id > previous.event_id,
+                        "events must arrive in log order"
+                    );
+                }
+                events.push(*event);
+            }
+            if !page.has_more {
+                break;
+            }
+            after = page.next_after;
+            assert!(after.is_some(), "a non-final page must offer a cursor");
+        }
+        assert_eq!(3, pages, "14 events at five per page is three pages");
+        assert_eq!(14, events.len());
+        assert!(
+            events
+                .iter()
+                .filter(|event| event.kind == MatchEventKind::Rejected)
+                .all(|event| event.reason == Some(RejectReason::FokUnfillable))
+        );
+
+        // Replay the log into a mirror of the visible resting book. Parked
+        // stops and iceberg reserves are deliberately out of scope: a parked
+        // stop emits nothing until triggered, and an iceberg's Rested event
+        // carries only its visible tranche.
+        let mut mirror = BTreeMap::<u64, VisibleOrder>::new();
+        let mut rejected_fok_seen = false;
+        for event in &events {
+            match event.kind {
+                MatchEventKind::Rested => {
+                    let inserted = mirror.insert(
+                        event.order_sequence,
+                        VisibleOrder {
+                            side: event.side,
+                            price: event.price,
+                            volume: event.volume,
+                        },
+                    );
+                    assert!(inserted.is_none(), "an order may rest only once");
+                }
+                MatchEventKind::Fill => {
+                    let maker = event
+                        .counterparty_sequence
+                        .expect("every fill names its resting counterparty");
+                    let resting = mirror
+                        .get_mut(&maker)
+                        .expect("the maker must already be in the mirror");
+                    assert_eq!(resting.price, event.price);
+                    resting.volume -= event.volume;
+                    if resting.volume == Fixed::ZERO {
+                        mirror.remove(&maker);
+                    }
+                }
+                MatchEventKind::Cancelled | MatchEventKind::Expired => {
+                    mirror.remove(&event.order_sequence);
+                }
+                MatchEventKind::Triggered => {}
+                MatchEventKind::Rejected => {
+                    assert_eq!(3, event.order_sequence);
+                    assert_eq!(Some(RejectReason::FokUnfillable), event.reason);
+                    rejected_fok_seen = true;
+                }
+                MatchEventKind::Amended => panic!("this scenario has no amendments"),
+            }
+        }
+        assert!(rejected_fok_seen, "the rejected FOK must stay in the log");
+
+        // The stop's trigger, child fill and cancellation all carry its
+        // sequence. Nothing before the trigger mentions the parked stop.
+        assert_eq!(
+            vec![
+                MatchEventKind::Triggered,
+                MatchEventKind::Fill,
+                MatchEventKind::Cancelled,
+            ],
+            events
+                .iter()
+                .filter(|event| event.order_sequence == 7)
+                .map(|event| event.kind)
+                .collect::<Vec<_>>()
+        );
+
+        let orders: Vec<Order> =
+            serde_json::from_str(&client.read(&"orderbook_orders".to_string()).await.unwrap())
+                .expect("orders json");
+        let actual = orders
+            .iter()
+            .map(|order| {
+                (
+                    order.sequence,
+                    VisibleOrder {
+                        side: order.side,
+                        price: order.price,
+                        volume: order.volume,
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(mirror, actual, "event replay must match the visible book");
+        assert_eq!(
+            Some(&VisibleOrder {
+                side: OrderSide::Sell,
+                price: Fixed::from(110),
+                volume: Fixed::from(4),
+            }),
+            actual.get(&1)
+        );
+        assert_eq!(
+            Some(&VisibleOrder {
+                side: OrderSide::Buy,
+                price: Fixed::from(90),
+                volume: Fixed::from(5),
+            }),
+            actual.get(&9)
+        );
+
+        assert_eq!(
+            "10",
+            client
+                .read(&"orderbook_sequence".to_string())
+                .await
+                .unwrap()
+        );
+        let stops: Vec<Order> =
+            serde_json::from_str(&client.read(&"orderbook_stops".to_string()).await.unwrap())
+                .expect("stops json");
+        assert!(stops.is_empty(), "the cascade removed the parked stop");
 
         node.shutdown().await.unwrap();
     });

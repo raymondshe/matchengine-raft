@@ -133,6 +133,231 @@ fn gtd_and_day_parked_stops_expire_before_triggering() {
 }
 
 #[test]
+fn rejected_fok_is_atomic_but_consumes_one_sequence() {
+    let mut book = OrderBook::new();
+    let mut bid = Order::new(OrderSide::Buy, 99.0, 4.0, 0);
+    let mut ask = Order::new(OrderSide::Sell, 100.0, 6.0, 0);
+    let mut deeper_ask = Order::new(OrderSide::Sell, 101.0, 5.0, 0);
+    let mut stop = order_with(OrderSide::Sell, 0.0, 2.0, |order| {
+        order.live = OrderType::Market;
+        order.stop_price = Fixed::from(90);
+    });
+    book.execute_order(&mut bid);
+    book.execute_order(&mut ask);
+    book.execute_order(&mut deeper_ask);
+    assert!(book.execute_order(&mut stop).parked);
+    assert_eq!(4, book.sequence, "four submissions consumed four sequences");
+
+    let bids = book.bids.values().copied().collect::<Vec<_>>();
+    let asks = book.asks.values().copied().collect::<Vec<_>>();
+    let stops = book.stops.clone();
+    let last_trade_price = book.last_trade_price;
+
+    // Only 6 are reachable at 100, so a 7-lot FOK must not execute anything.
+    let mut fok = order_with(OrderSide::Buy, 100.0, 7.0, |order| {
+        order.tif = TimeInForce::Fok
+    });
+    let outcome = book.execute_order(&mut fok);
+
+    assert_eq!(Some(RejectReason::FokUnfillable), outcome.rejected);
+    assert_eq!(4, outcome.market_seq);
+    assert_eq!(4, fok.sequence, "the rejected taker still gets a sequence");
+    assert_eq!(
+        5, book.sequence,
+        "a rejection consumes exactly one sequence"
+    );
+    assert!(outcome.fills.is_empty());
+    assert_eq!(None, outcome.resting);
+    assert_eq!(None, outcome.cancelled);
+    assert!(outcome.expired.is_empty());
+    assert!(!outcome.parked);
+    assert!(outcome.triggers.is_empty());
+    assert_eq!(bids, book.bids.values().copied().collect::<Vec<_>>());
+    assert_eq!(asks, book.asks.values().copied().collect::<Vec<_>>());
+    assert_eq!(stops, book.stops);
+    assert_eq!(last_trade_price, book.last_trade_price);
+}
+
+#[test]
+fn iceberg_partial_fill_and_cancel_conserve_volume() {
+    let mut book = OrderBook::new();
+    let mut iceberg = order_with(OrderSide::Sell, 100.0, 10.0, |order| {
+        order.display_volume = Fixed::from(4);
+    });
+    assert_eq!(
+        Some(Fixed::from(4)),
+        book.execute_order(&mut iceberg).resting
+    );
+    let iceberg_sequence = iceberg.sequence;
+
+    let mut taker = Order::new(OrderSide::Buy, 100.0, 1.0, 0);
+    let outcome = book.execute_order(&mut taker);
+    assert_eq!(1, outcome.fills.len());
+    assert_eq!(Fixed::from(1), outcome.fills[0].matches);
+    assert_eq!(iceberg_sequence, outcome.fills[0].maker.sequence);
+
+    // A partial fill shrinks only the visible tranche; it does not draw from
+    // the reserve until the tranche is fully consumed.
+    let resting = book.best_ask().expect("the iceberg still rests");
+    assert_eq!(iceberg_sequence, resting.sequence);
+    assert_eq!(Fixed::from(3), resting.volume);
+    assert_eq!(Fixed::from(6), resting.hidden_volume);
+    assert_eq!(Fixed::from(9), resting.open_volume());
+
+    let removed = book.cancel(&iceberg).expect("the iceberg is resting");
+    assert_eq!(Fixed::from(3), removed.volume);
+    assert_eq!(Fixed::from(6), removed.hidden_volume);
+    assert_eq!(Fixed::from(9), removed.open_volume());
+    assert_eq!(
+        Fixed::from(10),
+        outcome.fills[0].matches + removed.open_volume(),
+        "the fill plus the cancellation must account for the submission"
+    );
+    assert!(book.asks.is_empty());
+}
+
+#[test]
+fn iceberg_refill_keeps_identity_and_queue_priority() {
+    let mut book = OrderBook::new();
+    let mut first = order_with(OrderSide::Sell, 100.0, 10.0, |order| {
+        order.display_volume = Fixed::from(4);
+    });
+    let mut second = order_with(OrderSide::Sell, 100.0, 4.0, |order| {
+        order.display_volume = Fixed::from(4);
+    });
+    book.execute_order(&mut first);
+    book.execute_order(&mut second);
+    let first_sequence = first.sequence;
+    let second_sequence = second.sequence;
+
+    // The taker consumes A's first tranche, A refills, and the taker takes two
+    // more from A. B never trades because A keeps its original queue position.
+    let mut taker = Order::new(OrderSide::Buy, 100.0, 6.0, 0);
+    let outcome = book.execute_order(&mut taker);
+    assert_eq!(
+        vec![
+            (Fixed::from(4), first_sequence),
+            (Fixed::from(2), first_sequence)
+        ],
+        outcome
+            .fills
+            .iter()
+            .map(|fill| (fill.matches, fill.maker.sequence))
+            .collect::<Vec<_>>()
+    );
+
+    let (best_key, best) = book.asks.first_key_value().expect("two icebergs rest");
+    assert_eq!(first_sequence, best_key.sequence);
+    assert_eq!(Fixed::from(2), best.volume);
+    assert_eq!(Fixed::from(2), best.hidden_volume);
+    assert_eq!(2, book.asks.len());
+    assert_eq!(Some(Fixed::from(4)), book.resting_volume(&second));
+
+    // The next taker finishes A (visible, refill, visible) before B is reached.
+    let mut taker = Order::new(OrderSide::Buy, 100.0, 4.0, 0);
+    let outcome = book.execute_order(&mut taker);
+    assert_eq!(
+        vec![
+            (Fixed::from(2), first_sequence),
+            (Fixed::from(2), first_sequence)
+        ],
+        outcome
+            .fills
+            .iter()
+            .map(|fill| (fill.matches, fill.maker.sequence))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(1, book.asks.len());
+    let (best_key, best) = book.asks.first_key_value().expect("B still rests");
+    assert_eq!(second_sequence, best_key.sequence);
+    assert_eq!(Fixed::from(4), best.volume);
+    assert_eq!(Fixed::ZERO, best.hidden_volume);
+    assert_eq!(Some(Fixed::from(4)), book.resting_volume(&second));
+}
+
+#[test]
+fn stop_cascade_conserves_each_child_and_never_rests_one() {
+    let mut book = OrderBook::new();
+    let mut first_bid = Order::new(OrderSide::Buy, 100.0, 4.0, 0);
+    let mut second_bid = Order::new(OrderSide::Buy, 90.0, 3.0, 0);
+    let mut third_bid = Order::new(OrderSide::Buy, 80.0, 2.0, 0);
+    book.execute_order(&mut first_bid);
+    book.execute_order(&mut second_bid);
+    book.execute_order(&mut third_bid);
+
+    // Sell stop-limit at 80 (triggered at 100) and sell stop-market at 90.
+    let mut stop_limit = order_with(OrderSide::Sell, 80.0, 6.0, |order| {
+        order.stop_price = Fixed::from(100);
+    });
+    let mut stop_market = order_with(OrderSide::Sell, 0.0, 10.0, |order| {
+        order.live = OrderType::Market;
+        order.stop_price = Fixed::from(90);
+    });
+    assert!(book.execute_order(&mut stop_limit).parked);
+    assert!(book.execute_order(&mut stop_market).parked);
+    let stop_limit_sequence = stop_limit.sequence;
+    let stop_market_sequence = stop_market.sequence;
+    assert_eq!(2, book.stops.len());
+
+    let mut trigger = Order::new(OrderSide::Sell, 100.0, 4.0, 0);
+    let outcome = book.execute_order(&mut trigger);
+    assert_eq!(
+        vec![Fixed::from(4)],
+        outcome
+            .fills
+            .iter()
+            .map(|fill| fill.matches)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(2, outcome.triggers.len(), "the cascade must run both stops");
+
+    let first = &outcome.triggers[0];
+    assert_eq!(stop_limit_sequence, first.stop.sequence);
+    assert_eq!(Fixed::from(100), first.trigger_price);
+    assert_eq!(
+        vec![
+            (Fixed::from(3), Fixed::from(90)),
+            (Fixed::from(2), Fixed::from(80))
+        ],
+        first
+            .fills
+            .iter()
+            .map(|fill| (fill.matches, fill.maker.price))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(Some(Fixed::from(1)), first.cancelled);
+    assert_eq!(
+        first.stop.open_volume(),
+        first
+            .fills
+            .iter()
+            .map(|fill| fill.matches)
+            .fold(Fixed::ZERO, |total, volume| total + volume)
+            + first.cancelled.unwrap_or(Fixed::ZERO),
+        "the first child must fill or cancel every unit"
+    );
+
+    let second = &outcome.triggers[1];
+    assert_eq!(stop_market_sequence, second.stop.sequence);
+    assert_eq!(
+        Fixed::from(80),
+        second.trigger_price,
+        "the first child moved the last trade price"
+    );
+    assert!(second.fills.is_empty(), "the book is empty by now");
+    assert_eq!(Some(Fixed::from(10)), second.cancelled);
+    assert_eq!(
+        second.stop.open_volume(),
+        second.cancelled.unwrap_or(Fixed::ZERO)
+    );
+
+    assert!(book.bids.is_empty());
+    assert!(book.asks.is_empty());
+    assert!(book.stops.is_empty(), "no stop may survive its election");
+    assert_eq!(Some(Fixed::from(80)), book.last_trade_price);
+}
+
+#[test]
 fn fees_are_reported_on_market_ioc_and_stop_child_fills() {
     let mut book = OrderBook::new();
     let mut maker =
