@@ -101,6 +101,64 @@ fn health_reports_grpc_leadership_and_storage() {
     });
 }
 
+#[test]
+fn metrics_exposes_data_server_and_runtime_stats() {
+    C::run(async {
+        let addr = "127.0.0.1:21935";
+        let temp = TempDir::new("metrics-observability");
+        let storage = StorageConfig::new(temp.path()).with_instance_prefix("metrics-observability");
+        let node = build_match_engine_node(1, addr.to_string(), default_raft_config(), storage)
+            .await
+            .unwrap();
+
+        let client = MatchEngineClient::<C>::new(1, addr.to_string());
+        client.init().await.unwrap().unwrap();
+        wait_for_leader(&client).await;
+
+        client
+            .write(&MatchEngineRequest::place(Order::new(
+                OrderSide::Buy,
+                100.0,
+                1.0,
+                0,
+            )))
+            .await
+            .unwrap()
+            .unwrap();
+
+        let http = reqwest::Client::builder().no_proxy().build().unwrap();
+        let (status, body) = get_json(&http, &format!("http://{addr}/metrics")).await;
+        assert_eq!(StatusCode::OK, status);
+        let metrics = &body["Ok"];
+        assert_eq!(1, metrics["current_leader"]);
+        assert!(
+            metrics["data_metrics"]["last_log"]["index"]
+                .as_u64()
+                .unwrap()
+                >= 1
+        );
+        assert_eq!(1, metrics["server_metrics"]["id"]);
+        assert!(metrics["server_metrics"]["state"].is_string());
+
+        #[cfg(feature = "profiling")]
+        {
+            let stats = metrics["runtime_stats"]
+                .as_str()
+                .expect("profiling builds expose runtime stats");
+            assert!(stats.contains("RuntimeStats"), "unexpected stats: {stats}");
+        }
+        #[cfg(not(feature = "profiling"))]
+        assert!(metrics["runtime_stats"].is_null());
+
+        // The typed client keeps deserializing only the flattened Raft fields.
+        let raft = client.metrics().await.unwrap();
+        assert_eq!(Some(1), raft.current_leader);
+        assert!(raft.last_applied.is_some());
+
+        node.shutdown().await.unwrap();
+    });
+}
+
 async fn get_json(http: &reqwest::Client, url: &str) -> (StatusCode, Value) {
     let response = http.get(url).send().await.unwrap();
     let status = response.status();

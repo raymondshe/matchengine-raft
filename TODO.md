@@ -42,8 +42,15 @@ from 256 to 1,024 requests. The public matching-engine test-suite inventory and 
 batches landed too: FOK atomicity, iceberg conservation/refill priority, stop-cascade conservation,
 event-stream reconstruction, event-cursor survival across snapshot/restart and retention eviction,
 GTD purge idempotence, post-only/amend interactions, fee conservation and the modify-priority
-matrix (§17). The measured baselines,
-write/lease decisions, async-WAL numbers and upstream OpenRaft comparison are in
+matrix (§17). OpenRaft observability now exposes `data_metrics`/`server_metrics`/`runtime_stats`
+through `/metrics`, uses explicit heartbeat/snapshot channel profiles, and documents flamegraph
+and tokio-console use in `cluster_e2e` (§16). The benchmark regression gate now runs in CI:
+exact `apply_path` allocation ceilings plus loose `book_replay`/`replay_mix` p50/p99 bounds, with
+a manual Linux workflow for the pinned-core `e2e` pass (§8). The four-voter no-fsync contract now
+has a real-process leader-kill test: three survivors commit, and the restarted node catches up
+after losing a truncated WAL tail (§7). Parked stops now accept direct trigger/limit/volume
+amendments and icebergs accept total-open-volume amendments with priority rules (§5). The measured
+baselines, write/lease decisions, async-WAL numbers and upstream OpenRaft comparison are in
 [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md).
 
 The upstream OpenRaft minimal benchmark (three in-process nodes, in-memory log/state machine,
@@ -65,21 +72,14 @@ configured size and readiness waits for recovery. The remaining P2/P3 items are 
 
 The next work, in order (re-prioritised 2026-11-09 after the public-suite review):
 
-1. **Add OpenRaft observability, profiling and transport hygiene (§16, P2).** Expose
-   `data_metrics`, `server_metrics` and `runtime_stats`; enable `runtime-stats` in profiling
-   builds; make heartbeat/snapshot channel profiles explicit; add flamegraph/tokio-console
-   guidance to `cluster_e2e`. This is the prerequisite for attributing the gap between our 5,039
-   sequential writes/s and the 33k one-client upstream floor.
-2. **Benchmark regression gate and measurement hygiene (§8, P2).** Gate CI on deterministic
-   `apply_path` allocs/entry plus loose p50/p99 thresholds; run the Linux pinned-core `e2e` pass.
-   Add the 4-node, write-sweep, read-path and async-WAL rows once their variance settles.
-3. **Prove the four-voter no-fsync contract under failure (§7, P2).** The voter guard is tested;
-   add a four-voter SIGKILL/failover case that proves the surviving cluster still commits and the
-   restarted node catches up after one node loses its unsynced tail.
-4. **Feature and extension work.** Amend parked stops/icebergs and port the missing order types
-   (§5), Aeron hardening and market-data archive/replay (§6), and the error-null/mixed-unit/
-   fee-token decisions (§13). The optional apply-path and per-level-bucket work in §8 is last
-   because the measured wins are small or split.
+1. **Run the Linux pinned-core `e2e` pass (§8, P2).** The CI regression gate is now in place;
+   dispatch the manual `Linux benchmark` workflow (or run the same commands on deployment
+   hardware) to separate scheduler noise from the fsync cost and record the pinned short and
+   sustained rows.
+2. **Feature and extension work.** Port the remaining order types (§5), Aeron hardening and
+   market-data archive/replay (§6), and the error-null/mixed-unit/fee-token decisions (§13). The
+   optional apply-path and per-level-bucket work in §8 is last because the measured wins are small
+   or split.
 
 The earlier measurement work is done: `book_replay` and `level_book` report warm p50/p99 plus an
 interleaved cold pass, `replay_mix` replays a 100,000-operation fixture with fees, the 4-node
@@ -253,8 +253,10 @@ Done:
 - [x] GTC, IOC, FOK, GTD, Day, post-only, iceberg, market, stop-market and stop-limit.
 - [x] Deterministic GTD purge on every admissible mutation; stops elected by replicated
   `last_trade_price`; `triggered`, `expired` and `rejected` events.
-- [x] `Amend` for plain resting limit orders; same-price reductions keep priority, price/size
-  changes re-insert under a new sequence; crossing amendments are refused.
+- [x] `Amend` for plain resting limit orders, icebergs and parked stops; same-price reductions keep
+  priority, price/size changes re-insert under a new sequence, iceberg amendments preserve the
+  display tranche, and stop amendments update trigger/limit/volume while keeping the stop sequence.
+  Crossing amendments are refused.
 - [x] `spread`, `mid_price` and `depth` views plus `orderbook_depth`/`orderbook_spread` read keys.
 - [x] Randomized differential/property tests against a small reference model: visible book,
   fills, price-time priority, no crossed book, volume conservation, sequence/last-trade state and
@@ -276,9 +278,6 @@ Done:
 
 Remaining:
 
-- [ ] **P2** Amend parked stops (trigger price/volume) and icebergs (tranche semantics); consider
-  a sequence → location index for cancel/amend by sequence alone, with index maintenance or
-  tombstones.
 - [ ] **P2** Port the missing OrderBook-rs types: trailing stops, pegged orders, custom reserve
   replenishment, stop-protection collars, market-to-limit and self-trade prevention.
 - [x] **P2** Phase 4 of match-result delivery: long-poll `/events` (`wait_ms`), gRPC
@@ -409,9 +408,11 @@ Completed follow-ups:
 
 Remaining (the public-suite follow-ups are tracked in §17):
 
-- [ ] **P2** Add a four-voter no-fsync failover test: kill one voter during a write stream,
-  restart it, and prove the surviving cluster still commits and the restarted node catches up.
-  `test_min_voters.rs` covers only the voter-count guard.
+- [x] **P2** Add a four-voter no-fsync failover test. Done:
+  `four_voter_no_fsync_survives_leader_kill_and_tail_loss` runs four real binary nodes without
+  WAL fsync, kills the leader, truncates the last three WAL records to model an unsynced tail
+  loss, proves the remaining three voters commit and replicate three more orders, then restarts
+  the killed node and waits for it to catch up and accept a post-restart write.
 - [ ] **P2** Parameterize the fixed test ports; `test_cluster.rs` still binds 21001–21003.
 - [ ] **P2** Keep `AGENTS.md` and this file in sync after code changes; both are maintained by
   hand.
@@ -504,14 +505,20 @@ Remaining (the public-suite follow-ups are tracked in §17):
   `docs/PERFORMANCE.md`.
 - [ ] **P3** Evaluate bounded waiting/backpressure as an alternative to immediate `429` when
   clients cannot retry promptly; keep the current fail-fast gate as the default until measured.
-- [ ] **P2** Add a benchmark regression gate (threshold or recorded baseline) to CI: start with
-  deterministic `apply_path` allocs/entry and loose p50/p99 bounds for `book_replay` and
-  `replay_mix`; add the stable fsync rows (every append and disabled) and the 4-node cluster rows
-  after the client/payload sweep settles.
+- [x] **P2** Add a benchmark regression gate (threshold or recorded baseline) to CI. Done:
+  `cargo bench --bench apply_path -- --check` enforces exact allocation ceilings for blank, rest,
+  cancel, fill and batch workloads (plus a small requested-bytes allowance);
+  `book_replay --check` and `replay_mix --check` enforce loose warm p50/p99 bounds at least an
+  order of magnitude above the recorded host baseline. The `bench-regression` CI job runs all
+  three. The 4-node/write-sweep/read-path/async-WAL rows are already recorded in
+  `docs/PERFORMANCE.md`; the stable fsync/cluster rows stay informational until their variance
+  settles.
 - [ ] **P2** Run `cargo bench --bench e2e -- --pin <cpu>` on a Linux host once, to separate
-  scheduler noise from the fsync cost that dominates the current p99. The flag is implemented; this
-  macOS host has no core-pinning API, so the recorded 2026-11-04 approximation is the
+  scheduler noise from the fsync cost that dominates the current p99. The flag is implemented;
+  this macOS host has no core-pinning API, so the recorded 2026-11-04 approximation is the
   current-thread runtime (p50 3.95ms / p99 5.22ms vs 3.93ms / 5.10ms multi-thread, i.e. no change).
+  A manual `Linux benchmark` workflow (`.github/workflows/bench-linux.yml`) now runs the pinned
+  short and sustained e2e suites on `workflow_dispatch`; it has not been dispatched yet.
 - [x] **P2** Decide the periodic-fsync tail. Decision: production uses either disabled fsync
   with at least four voters (maximum throughput) or every-append fsync (durable writes). The 10 ms
   mode is dominated: 7,374 writes/s and a 2.2-3.0 ms p99. The 100 ms mode is within noise of
@@ -758,7 +765,7 @@ Open follow-ups:
   add/cancel/amend/stop/iceberg/taker fixture with maker/taker fees and reports whole-replay
   warm/cold p50/p99 plus per-operation p50/p99/max; results are in `docs/PERFORMANCE.md`.
 - [ ] **P2** Run the Linux pinned-core `e2e` pass; the `--pin` flag exists and this macOS host
-  cannot pin (tracked in §8).
+  cannot pin (tracked in §8). The manual `Linux benchmark` workflow is ready to dispatch.
 - [ ] **P2** Evaluate a binary order-entry path (gRPC/protobuf or compact codec) and feature-gated
   latency histograms only if a latency target requires them.
 - [ ] **P2** Evaluate real ITCH-style replay data and custom MPMC/SIMD/io_uring work only after a
@@ -796,6 +803,11 @@ Guardrails / what not to copy:
 - [x] **P1** SIGKILL during a learner snapshot install: `test_failure.rs` pauses the install after
   the first chunk with a debug-only delay, kills the learner, asserts no `current.snap` was written,
   restarts it, and proves the full snapshot is retried and installed.
+- [x] **P1** Four-voter no-fsync leader kill with an unsynced tail:
+  `test_failure.rs::four_voter_no_fsync_survives_leader_kill_and_tail_loss` runs four real binary
+  nodes without WAL fsync, kills the leader, drops three complete tail records from its last WAL
+  segment, and proves the remaining three voters commit and replicate new writes. The killed node
+  restarts from its truncated prefix, catches up, and accepts a subsequent write.
 
 ## 16. OpenRaft utilization review (2026-11-06)
 
@@ -803,8 +815,9 @@ The full review is in [`RAFT_REVIEW.md`](./docs/RAFT_REVIEW.md). The transport a
 `RaftNetworkV2::stream_append` for replication and heartbeats and `full_snapshot` for snapshots;
 these follow-ups are about aligning OpenRaft 0.10 configuration with this workload and reducing
 storage/transport overhead. Re-prioritised 2026-11-08 after the upstream minimal-benchmark
-comparison: the read path, payload/purge sweeps, admission control and async-WAL prototype are
-complete; observability is next, then async-WAL productionization and optional APIs.
+comparison: the read path, payload/purge sweeps, admission control, async-WAL prototype and
+observability are complete; next are the before/after measurements, async-WAL productionization
+and optional APIs.
 
 **Read path**
 
@@ -832,21 +845,25 @@ complete; observability is next, then async-WAL productionization and optional A
 - [x] **P1** Enable `heartbeat_min_interval` so sustained replication suppresses redundant
   heartbeat `AppendStream` sessions. Done: 500 ms, with
   `heartbeat_interval = 500` and `election_timeout_min = 1500`.
-- [x] **P1** Tune HTTP/2 flow control and keepalive. Done: client and server use 1 MiB stream /
-  4 MiB connection windows and 5 s / 3 s keepalive; the server now has
-  keepalive enabled.
+- [x] **P1** Tune HTTP/2 flow control and keepalive. Done: the server uses 1 MiB stream /
+  4 MiB connection windows and 5 s / 3 s keepalive; the client uses explicit replication,
+  heartbeat and snapshot profiles (see the P2 item below).
 - [x] **P1** Honor `RPCOption::snapshot_chunk_size()` in `full_snapshot`. Done: chunks follow
   OpenRaft's configured size (3 MiB by default) capped at 8 MiB; `install_snapshot_timeout`
   remains intentionally unused by `full_snapshot`, which is bounded by cancellation and HTTP/2
   keepalive.
-- [ ] **P2** Enable OpenRaft's `runtime-stats` feature in a profiling build and expose
-  `raft.runtime_stats()`, `data_metrics()` and `server_metrics()` in `/metrics` (the current
-  handler only returns `RaftMetrics`); optionally install a `MetricsRecorder` for
-  append/replication histograms. Add flamegraph/tokio-console guidance to `cluster_e2e`.
-- [ ] **P2** Override `new_heartbeat_client` and `new_snapshot_client` explicitly with
-  role-specific channel profiles. The current separate channels are correct but rely on the
-  default factory delegation; make the isolation intentional before adding channel pooling or
-  preconnect.
+- [x] **P2** Enable OpenRaft's `runtime-stats` feature in a profiling build and expose
+  `raft.runtime_stats()`, `data_metrics()` and `server_metrics()` in `/metrics`. Done:
+  `--features profiling` enables the feature and `/metrics` returns `data_metrics`,
+  `server_metrics` and the compact `runtime_stats` string (null without the feature); existing
+  `RaftMetrics` consumers still deserialize the flattened fields. The optional `MetricsRecorder`
+  was not installed: the runtime histograms already expose append/replication/apply batches.
+  Flamegraph and tokio-console guidance is in `benches/cluster_e2e.rs` and `--help`.
+- [x] **P2** Override `new_heartbeat_client` and `new_snapshot_client` explicitly with
+  role-specific channel profiles. Done: `GrpcNetworkFactory` selects replication, heartbeat or
+  snapshot profiles; heartbeat uses smaller windows and snapshot uses a longer connect/keepalive
+  profile, while each network still owns its lazy channel. The unit test asserts the factory
+  returns the expected role for each method.
 - [ ] **P2** Record before/after measurements for heartbeat `AppendStream` count under sustained
   writes and snapshot transfer time. The post-change e2e/storage baseline is now in
   [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md); use it to confirm the 1 MiB / 4 MiB HTTP/2

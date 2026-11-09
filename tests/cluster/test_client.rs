@@ -220,7 +220,13 @@ fn client_forwards_after_leader_failover() {
         // A follower forwards the first write to the leader.
         let follower = if leader == 1 { 2 } else { 1 };
         let follower_client = MatchEngineClient::<C>::new(follower, addr(follower));
-        let first = follower_client.write(&place()).await.unwrap().unwrap();
+        let idempotent = || {
+            MatchEngineRequest::place_with_client_id(
+                Order::new(OrderSide::Buy, 100.0, 1.0, 0),
+                "failover-idempotent",
+            )
+        };
+        let first = follower_client.write(&idempotent()).await.unwrap().unwrap();
         assert_eq!(Some(0), first.data.sequence);
 
         // Kill the leader and wait for a survivor to take over.
@@ -253,8 +259,25 @@ fn client_forwards_after_leader_failover() {
                 ..ClientConfig::default()
             },
         );
+
+        // The idempotency map is part of replicated state, so retrying the
+        // same submission through the new leader must not place a second order.
+        let duplicate = client.write(&idempotent()).await.unwrap().unwrap();
+        assert_eq!(Some(0), duplicate.data.sequence);
+        let orders: Vec<Order> =
+            serde_json::from_str(&client.read(&"orderbook_orders".to_string()).await.unwrap())
+                .unwrap();
+        assert_eq!(1, orders.len(), "the retry duplicated the order");
+
         let response = client.write(&place()).await.unwrap().unwrap();
         assert_eq!(Some(1), response.data.sequence);
+        assert_eq!(
+            "2",
+            client
+                .read(&"orderbook_sequence".to_string())
+                .await
+                .unwrap()
+        );
 
         for node in nodes.into_iter().flatten() {
             node.shutdown().await.unwrap();

@@ -24,6 +24,30 @@
 //! CARGO_PROFILE_BENCH_LTO=thin CARGO_PROFILE_BENCH_CODEGEN_UNITS=1 \
 //!   cargo bench --bench cluster_e2e -- --concurrency-only
 //! ```
+//!
+//! # Profiling
+//!
+//! CPU flamegraph on Linux (requires `cargo-flamegraph` and perf permissions):
+//!
+//! ```text
+//! cargo flamegraph --bench cluster_e2e -- --concurrency-only --clients 64 --rounds 1
+//! ```
+//!
+//! OpenRaft runtime histograms are compiled only with the `profiling` feature.
+//! The leader's `/metrics` response then carries a `runtime_stats` string:
+//!
+//! ```text
+//! cargo bench --features profiling --bench cluster_e2e -- --concurrency-only --clients 64
+//! for port in 25101 25102 25103 25104; do
+//!   curl -s "http://127.0.0.1:$port/metrics" | jq '.Ok.runtime_stats'
+//! done
+//! ```
+//!
+//! Tokio console is not linked by default. For a one-off runtime inspection,
+//! add `console-subscriber` as a dev-dependency, initialize it in `main` before
+//! the benchmark runtimes start, build with
+//! `RUSTFLAGS="--cfg tokio_unstable"`, and connect `tokio-console` to the
+//! default `127.0.0.1:6669` endpoint.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -742,6 +766,33 @@ fn parse_clients(value: &str) -> anyhow::Result<Vec<usize>> {
     Ok(clients)
 }
 
+fn print_help() {
+    println!("four-node no-fsync cluster benchmark");
+    println!("usage: cluster_e2e [options]");
+    println!("  --rounds <n>                 fresh clusters to run (default 3)");
+    println!("  --clients <a,b,...>          concurrency sweep values");
+    println!("  --concurrency-only           skip the sequential/batch suites");
+    println!("  --preconnect                 preconnect one keep-alive connection per client");
+    println!("  --max-inflight-writes <n>    admission limit (0 = unbounded)");
+    println!("  --max-payload-entries <n>    OpenRaft payload batch cap");
+    println!("  --purge-batch-size <n>        OpenRaft purge batch size");
+    println!("  --api-batch-linger-ms <n>    OpenRaft client batch linger");
+    println!("  --snapshot-logs <n>          snapshot every n log entries");
+    println!();
+    println!("profiling:");
+    println!(
+        "  cargo flamegraph --bench cluster_e2e -- --concurrency-only --clients 64 --rounds 1"
+    );
+    println!(
+        "  cargo bench --features profiling --bench cluster_e2e -- --concurrency-only --clients 64"
+    );
+    println!("  curl -s http://127.0.0.1:25101/metrics | jq '.Ok.runtime_stats'");
+    println!(
+        "  Tokio console: add console-subscriber, initialize it in main, build with \
+         RUSTFLAGS=\"--cfg tokio_unstable\""
+    );
+}
+
 fn parse_args() -> anyhow::Result<Args> {
     let mut args = Args::default();
     let mut iter = std::env::args().skip(1);
@@ -806,6 +857,10 @@ fn parse_args() -> anyhow::Result<Args> {
 }
 
 fn main() -> anyhow::Result<()> {
+    if std::env::args().any(|arg| arg == "--help" || arg == "-h") {
+        print_help();
+        return Ok(());
+    }
     let args = parse_args()?;
     println!("four-node no-fsync cluster benchmark ({NODE_COUNT} voters, quorum 3/4, loopback)");
     println!("all nodes run in one process; each has its own storage, HTTP and gRPC listener");

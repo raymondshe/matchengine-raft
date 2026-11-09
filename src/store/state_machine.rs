@@ -569,11 +569,14 @@ impl<C: RaftTypeConfig> StateMachineStoreInner<C> {
             value.has_at_most_decimals(config.price_decimals)
                 && value.is_multiple_of(config.price_tick)
         });
+        let stop_price_ok = order.stop_price == Fixed::ZERO
+            || (order.stop_price.has_at_most_decimals(config.price_decimals)
+                && order.stop_price.is_multiple_of(config.price_tick));
         let volume_ok = volume.is_none_or(|value| {
             value.has_at_most_decimals(config.base_asset.decimals)
                 && value.is_multiple_of(config.base_lot)
         });
-        if price_ok && volume_ok {
+        if price_ok && stop_price_ok && volume_ok {
             Ok(config)
         } else {
             Err(RejectReason::InvalidOrder)

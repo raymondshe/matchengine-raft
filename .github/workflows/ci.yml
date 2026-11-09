@@ -47,6 +47,32 @@ jobs:
       - name: Async WAL crash recovery
         run: cargo test --features async-wal --test cluster async_wal --locked
 
+  profiling:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Profiling clippy
+        run: cargo clippy --all-targets --features profiling -- -D warnings
+      - name: Runtime metrics test
+        run: cargo test --features profiling --test cluster metrics_exposes_data_server_and_runtime_stats --locked
+
+  bench-regression:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Apply-path allocation gate
+        run: cargo bench --locked --bench apply_path -- --check
+      - name: Book replay latency gate
+        run: cargo bench --locked --bench book_replay -- --check
+      - name: Replay-mix latency gate
+        run: cargo bench --locked --bench replay_mix -- --check
+
   marketdata-aeron:
     runs-on: ubuntu-latest
     steps:

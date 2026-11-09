@@ -489,6 +489,175 @@ fn amend_priority_matrix_matches_price_time_rules() {
 }
 
 #[test]
+fn amend_parked_stop_updates_trigger_limit_and_volume() {
+    let mut book = OrderBook::new();
+    let mut stop = order_with(OrderSide::Sell, 94.0, 5.0, |order| {
+        order.stop_price = Fixed::from(95);
+    });
+    assert!(book.execute_order(&mut stop).parked);
+    let sequence = stop.sequence;
+
+    // The key carries the new trigger; `price` and `volume` are the new child
+    // limit and open volume. The stop keeps its sequence and stays parked.
+    let mut key = stop;
+    key.stop_price = Fixed::from(96);
+    let amended = book
+        .amend(&key, Some(Fixed::from(93)), Some(Fixed::from(7)))
+        .expect("parked stop is amendable");
+
+    assert_eq!(sequence, amended.order.sequence);
+    assert_eq!(sequence, amended.previous_sequence);
+    assert_eq!(Fixed::from(94), amended.previous_price);
+    assert_eq!(Fixed::from(5), amended.previous_volume);
+    assert_eq!(Fixed::from(96), amended.order.stop_price);
+    assert_eq!(Fixed::from(93), amended.order.price);
+    assert_eq!(Fixed::from(7), amended.order.volume);
+    assert_eq!(1, book.stops.len());
+    assert_eq!(Fixed::from(96), book.stops[0].stop_price);
+    assert_eq!(Fixed::from(93), book.stops[0].price);
+    assert_eq!(Fixed::from(7), book.stops[0].volume);
+    assert!(book.bids.is_empty() && book.asks.is_empty());
+}
+
+#[test]
+fn amend_parked_stop_rejects_an_already_crossed_trigger() {
+    let mut book = OrderBook::new();
+    let mut bid = Order::new(OrderSide::Buy, 95.0, 1.0, 0);
+    let mut ask = Order::new(OrderSide::Sell, 95.0, 1.0, 0);
+    book.execute_order(&mut bid);
+    book.execute_order(&mut ask);
+    assert_eq!(Some(Fixed::from(95)), book.last_trade_price);
+
+    let mut stop = order_with(OrderSide::Sell, 0.0, 5.0, |order| {
+        order.live = OrderType::Market;
+        order.stop_price = Fixed::from(90);
+    });
+    assert!(book.execute_order(&mut stop).parked);
+    let original = book.stops[0];
+
+    let mut key = stop;
+    key.stop_price = Fixed::from(96);
+    assert_eq!(
+        AmendError::StopWouldTrigger,
+        book.amend(&key, None, Some(Fixed::from(2))).unwrap_err()
+    );
+    assert_eq!(
+        original.stop_price, book.stops[0].stop_price,
+        "a refused amend must not move the stop"
+    );
+    assert_eq!(original.volume, book.stops[0].volume);
+
+    // Zero in the key's stop_price means "keep the trigger", so a volume-only
+    // amend still succeeds.
+    let amended = book
+        .amend(&stop, None, Some(Fixed::from(2)))
+        .expect("volume-only stop amend");
+    assert_eq!(Fixed::from(90), amended.order.stop_price);
+    assert_eq!(Fixed::from(2), amended.order.volume);
+}
+
+#[test]
+fn amend_stop_market_rejects_a_limit_price() {
+    let mut book = OrderBook::new();
+    let mut stop = order_with(OrderSide::Sell, 0.0, 5.0, |order| {
+        order.live = OrderType::Market;
+        order.stop_price = Fixed::from(95);
+    });
+    assert!(book.execute_order(&mut stop).parked);
+
+    assert_eq!(
+        AmendError::UnsupportedType,
+        book.amend(&stop, Some(Fixed::from(94)), None).unwrap_err()
+    );
+    assert_eq!(Fixed::from(5), book.stops[0].volume);
+}
+
+#[test]
+fn amend_iceberg_reduction_keeps_priority_and_reserve() {
+    let mut book = OrderBook::new();
+    let mut first = order_with(OrderSide::Sell, 100.0, 10.0, |order| {
+        order.display_volume = Fixed::from(4);
+    });
+    let mut second = Order::new(OrderSide::Sell, 100.0, 5.0, 0);
+    book.execute_order(&mut first);
+    book.execute_order(&mut second);
+    let sequence = first.sequence;
+
+    let amended = book
+        .amend(&first, None, Some(Fixed::from(6)))
+        .expect("iceberg reduction");
+    assert_eq!(sequence, amended.order.sequence);
+    assert_eq!(Fixed::from(4), amended.order.volume);
+    assert_eq!(Fixed::from(2), amended.order.hidden_volume);
+    assert_eq!(Fixed::from(10), amended.previous_volume);
+    let (best_key, best) = book.asks.first_key_value().expect("two asks");
+    assert_eq!(
+        sequence, best_key.sequence,
+        "the iceberg kept time priority"
+    );
+    assert_eq!(Fixed::from(4), best.volume);
+    assert_eq!(Fixed::from(2), best.hidden_volume);
+
+    // Shrinking below the display tranche moves the reserve into the visible
+    // part without changing the sequence.
+    let amended = book
+        .amend(&first, None, Some(Fixed::from(2)))
+        .expect("iceberg shrink below display");
+    assert_eq!(sequence, amended.order.sequence);
+    assert_eq!(Fixed::from(2), amended.order.volume);
+    assert_eq!(Fixed::ZERO, amended.order.hidden_volume);
+    assert_eq!(Fixed::from(6), amended.previous_volume);
+}
+
+#[test]
+fn amend_iceberg_increase_reinserts_with_a_new_sequence() {
+    let mut book = OrderBook::new();
+    let mut first = order_with(OrderSide::Sell, 100.0, 10.0, |order| {
+        order.display_volume = Fixed::from(4);
+    });
+    let mut second = Order::new(OrderSide::Sell, 100.0, 5.0, 0);
+    book.execute_order(&mut first);
+    book.execute_order(&mut second);
+    let old_sequence = first.sequence;
+
+    let amended = book
+        .amend(&first, None, Some(Fixed::from(12)))
+        .expect("iceberg increase");
+    assert_ne!(old_sequence, amended.order.sequence);
+    assert_eq!(old_sequence, amended.previous_sequence);
+    assert_eq!(Fixed::from(10), amended.previous_volume);
+    assert_eq!(Fixed::from(4), amended.order.volume);
+    assert_eq!(Fixed::from(8), amended.order.hidden_volume);
+    let sequences = book.asks.keys().map(|key| key.sequence).collect::<Vec<_>>();
+    assert_eq!(vec![second.sequence, amended.order.sequence], sequences);
+
+    // A price move re-inserts the iceberg again and preserves the display.
+    let amended = book
+        .amend(&amended.order, Some(Fixed::from(99)), None)
+        .expect("iceberg price move");
+    assert_eq!(2, book.asks.len());
+    let (best_key, best) = book.asks.first_key_value().expect("two asks");
+    assert_eq!(amended.order.sequence, best_key.sequence);
+    assert_eq!(Fixed::from(99), best.price);
+    assert_eq!(Fixed::from(4), best.volume);
+    assert_eq!(Fixed::from(8), best.hidden_volume);
+}
+
+#[test]
+fn amend_plain_order_rejects_a_stop_trigger() {
+    let mut book = OrderBook::new();
+    let mut bid = Order::new(OrderSide::Buy, 100.0, 5.0, 0);
+    book.execute_order(&mut bid);
+    let mut key = bid;
+    key.stop_price = Fixed::from(95);
+    assert_eq!(
+        AmendError::UnsupportedType,
+        book.amend(&key, None, Some(Fixed::from(1))).unwrap_err()
+    );
+    assert_eq!(Fixed::from(5), book.best_bid().unwrap().volume);
+}
+
+#[test]
 fn fees_are_reported_on_market_ioc_and_stop_child_fills() {
     let mut book = OrderBook::new();
     let mut maker =

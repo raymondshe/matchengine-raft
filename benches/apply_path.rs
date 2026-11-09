@@ -9,12 +9,17 @@
 //! The global allocator counts calls, not live bytes: `allocs/entry` is heap
 //! churn, and `bytes/entry` is the sum of requested sizes (including reallocs),
 //! not a memory high-water mark.
+//!
+//! `--check` turns the measured 2026-11-09 totals into CI ceilings: allocation
+//! calls may not increase, and requested bytes get a small allowance. The
+//! `bench-regression` CI job runs this mode.
 
 use std::alloc::GlobalAlloc;
 use std::alloc::Layout;
 use std::alloc::System;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -46,6 +51,25 @@ const ENTRY_WINDOW: usize = 4_096;
 const MEASURED_ENTRIES: usize = 50_000;
 const BATCH_SIZE: usize = 128;
 const MEASURED_BATCHES: usize = 1_000;
+
+/// Exact allocation ceilings for `--check`. They are the measured 2026-11-09
+/// totals: a regression may not increase heap churn, while a reduction passes.
+const REST_MAX_CALLS: usize = 208_335;
+const CANCEL_MAX_CALLS: usize = 200_000;
+const FILL_MAX_CALLS: usize = 250_000;
+const BATCH_BLANK_MAX_CALLS: usize = 130_000;
+const BATCH_REST_MAX_CALLS: usize = 536_336;
+
+/// Requested bytes get a small allowance because capacity choices can change
+/// without increasing the allocation count.
+const REST_MAX_BYTES: usize = 31_250_000;
+const CANCEL_MAX_BYTES: usize = 8_200_000;
+const FILL_MAX_BYTES: usize = 105_700_000;
+const BATCH_BLANK_MAX_BYTES: usize = 51_300_000;
+const BATCH_REST_MAX_BYTES: usize = 227_600_000;
+
+static CHECK_MODE: AtomicBool = AtomicBool::new(false);
+static CHECK_FAILED: AtomicBool = AtomicBool::new(false);
 
 static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
 static ALLOCATED_BYTES: AtomicUsize = AtomicUsize::new(0);
@@ -154,13 +178,29 @@ async fn apply_rests(store: &mut StateMachineStore<C>, first: u64, count: usize)
     }
 }
 
-fn report(label: &str, entries: usize, elapsed: Duration, alloc: AllocSnapshot) {
+fn report(
+    label: &str,
+    entries: usize,
+    elapsed: Duration,
+    alloc: AllocSnapshot,
+    max_calls: usize,
+    max_bytes: usize,
+) {
     let per_entry = alloc.calls as f64 / entries as f64;
     let bytes_per_entry = alloc.bytes as f64 / entries as f64;
     let micros = elapsed.as_secs_f64() * 1_000_000.0 / entries as f64;
     println!(
-        "{label:24} entries={entries:>7} {micros:>8.3} us/entry  {per_entry:>7.2} allocs/entry  {bytes_per_entry:>9.1} bytes/entry"
+        "{label:24} entries={entries:>7} {micros:>8.3} us/entry  {per_entry:>7.2} allocs/entry  {bytes_per_entry:>9.1} bytes/entry  calls={} bytes={}",
+        alloc.calls, alloc.bytes
     );
+
+    if CHECK_MODE.load(Ordering::Relaxed) && (alloc.calls > max_calls || alloc.bytes > max_bytes) {
+        eprintln!(
+            "CHECK FAIL {label}: calls {}/{} bytes {}/{}",
+            alloc.calls, max_calls, alloc.bytes, max_bytes
+        );
+        CHECK_FAILED.store(true, Ordering::Relaxed);
+    }
 }
 
 async fn blank_workload() -> anyhow::Result<()> {
@@ -174,7 +214,7 @@ async fn blank_workload() -> anyhow::Result<()> {
     }
     let elapsed = started.elapsed();
     let alloc = allocation_snapshot();
-    report("blank", MEASURED_ENTRIES, elapsed, alloc);
+    report("blank", MEASURED_ENTRIES, elapsed, alloc, 0, 0);
 
     std::fs::remove_dir_all(&dir).ok();
     Ok(())
@@ -202,7 +242,14 @@ async fn rest_workload() -> anyhow::Result<()> {
     }
     let elapsed = started.elapsed();
     let alloc = allocation_snapshot();
-    report("rest (1 event)", MEASURED_ENTRIES, elapsed, alloc);
+    report(
+        "rest (1 event)",
+        MEASURED_ENTRIES,
+        elapsed,
+        alloc,
+        REST_MAX_CALLS,
+        REST_MAX_BYTES,
+    );
 
     std::fs::remove_dir_all(&dir).ok();
     Ok(())
@@ -228,7 +275,14 @@ async fn cancel_workload() -> anyhow::Result<()> {
     }
     let elapsed = started.elapsed();
     let alloc = allocation_snapshot();
-    report("cancel (1 event)", MEASURED_ENTRIES, elapsed, alloc);
+    report(
+        "cancel (1 event)",
+        MEASURED_ENTRIES,
+        elapsed,
+        alloc,
+        CANCEL_MAX_CALLS,
+        CANCEL_MAX_BYTES,
+    );
 
     std::fs::remove_dir_all(&dir).ok();
     Ok(())
@@ -269,7 +323,14 @@ async fn fill_workload() -> anyhow::Result<()> {
     }
     let elapsed = started.elapsed();
     let alloc = allocation_snapshot();
-    report("fill (1 event)", MEASURED_ENTRIES, elapsed, alloc);
+    report(
+        "fill (1 event)",
+        MEASURED_ENTRIES,
+        elapsed,
+        alloc,
+        FILL_MAX_CALLS,
+        FILL_MAX_BYTES,
+    );
 
     std::fs::remove_dir_all(&dir).ok();
     Ok(())
@@ -290,7 +351,12 @@ fn batch_requests(size: usize, rest: bool) -> Vec<MatchEngineRequest> {
         .collect()
 }
 
-async fn batch_workload(label: &str, rest: bool) -> anyhow::Result<()> {
+async fn batch_workload(
+    label: &str,
+    rest: bool,
+    max_calls: usize,
+    max_bytes: usize,
+) -> anyhow::Result<()> {
     let (mut store, dir) = open_store(label)?;
     if rest {
         apply_rests(&mut store, 1, ENTRY_WINDOW).await;
@@ -308,7 +374,14 @@ async fn batch_workload(label: &str, rest: bool) -> anyhow::Result<()> {
     }
     let elapsed = started.elapsed();
     let alloc = allocation_snapshot();
-    report(label, MEASURED_BATCHES * BATCH_SIZE, elapsed, alloc);
+    report(
+        label,
+        MEASURED_BATCHES * BATCH_SIZE,
+        elapsed,
+        alloc,
+        max_calls,
+        max_bytes,
+    );
 
     std::fs::remove_dir_all(&dir).ok();
     Ok(())
@@ -316,15 +389,42 @@ async fn batch_workload(label: &str, rest: bool) -> anyhow::Result<()> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let check = std::env::args().any(|arg| arg == "--check");
+    CHECK_MODE.store(check, Ordering::Relaxed);
+
     println!("apply-path allocation benchmark (direct StateMachineStore::apply)");
-    println!("counts are heap allocations, not live bytes; bytes include realloc churn\n");
+    println!("counts are heap allocations, not live bytes; bytes include realloc churn");
+    if check {
+        println!("check mode: allocation ceilings are enforced\n");
+    } else {
+        println!();
+    }
 
     blank_workload().await?;
     rest_workload().await?;
     cancel_workload().await?;
     fill_workload().await?;
-    batch_workload("batch blank", false).await?;
-    batch_workload("batch rest (1 event each)", true).await?;
+    batch_workload(
+        "batch blank",
+        false,
+        BATCH_BLANK_MAX_CALLS,
+        BATCH_BLANK_MAX_BYTES,
+    )
+    .await?;
+    batch_workload(
+        "batch rest (1 event each)",
+        true,
+        BATCH_REST_MAX_CALLS,
+        BATCH_REST_MAX_BYTES,
+    )
+    .await?;
+
+    if check {
+        if CHECK_FAILED.load(Ordering::Relaxed) {
+            anyhow::bail!("apply-path allocation regression");
+        }
+        println!("\nallocation regression check passed");
+    }
 
     Ok(())
 }

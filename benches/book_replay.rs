@@ -7,15 +7,53 @@
 //! p50/p99 over all per-round samples, and a cold pass that evicts the caches
 //! (64 MiB read-modify-write sweep) between the clone and the timed op, so warm
 //! and cold behaviour are reported separately. See `benches/bench_support`.
+//!
+//! `--check` enforces the loose warm p50/p99 CI bounds from
+//! `docs/PERFORMANCE.md`; cold passes stay informational.
 
 #[path = "bench_support/mod.rs"]
 mod bench_support;
 
 use std::hint::black_box;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use matchengine_raft::order_book::Order;
 use matchengine_raft::order_book::OrderBook;
 use matchengine_raft::order_book::OrderSide;
+
+/// Loose CI bounds for the warm p50/p99. They are deliberately at least an
+/// order of magnitude above the recorded host baseline so a shared CI runner
+/// does not fail on scheduling noise, while a real algorithmic regression does.
+#[derive(Clone, Copy)]
+struct Bounds {
+    p50: Duration,
+    p99: Duration,
+}
+
+const CHECK_SWEEP_1K: Bounds = Bounds {
+    p50: Duration::from_millis(1),
+    p99: Duration::from_millis(5),
+};
+const CHECK_SWEEP_20K: Bounds = Bounds {
+    p50: Duration::from_millis(20),
+    p99: Duration::from_millis(100),
+};
+const CHECK_CANCEL: Bounds = Bounds {
+    p50: Duration::from_millis(5),
+    p99: Duration::from_millis(20),
+};
+const CHECK_BBO_ADVANCE: Bounds = Bounds {
+    p50: Duration::from_millis(2),
+    p99: Duration::from_millis(10),
+};
+const CHECK_BBO_QUERY: Bounds = Bounds {
+    p50: Duration::from_millis(50),
+    p99: Duration::from_millis(100),
+};
+
+static CHECK_FAILED: AtomicBool = AtomicBool::new(false);
 
 fn resting(side: OrderSide, price: f64, volume: f64) -> Order {
     Order::new(side, price, volume, 0)
@@ -85,14 +123,15 @@ fn bench_clone<T>(
     clone: impl FnMut(&T) -> T,
     op: impl FnMut(&mut T) -> usize,
     unit: &str,
+    check: Option<Bounds>,
 ) {
     let samples = bench_support::run(bench_support::Config::default(), rounds, base, clone, op);
     let best = samples.warm_best(rounds);
     let rate = samples.units_per_second(best);
+    let p50 = samples.warm_p50();
+    let p99 = samples.warm_p99();
     println!(
-        "{name:38} warm  best {best:>10?} p50 {:>10?} p99 {:>10?} n={:>4} {rate:>12.0} {unit}/s",
-        samples.warm_p50(),
-        samples.warm_p99(),
+        "{name:38} warm  best {best:>10?} p50 {p50:>10?} p99 {p99:>10?} n={:>4} {rate:>12.0} {unit}/s",
         samples.warm.len(),
     );
     println!(
@@ -102,12 +141,28 @@ fn bench_clone<T>(
         samples.cold_p99(),
         samples.cold.len(),
     );
+
+    if let Some(bounds) = check
+        && (p50 > bounds.p50 || p99 > bounds.p99)
+    {
+        eprintln!(
+            "CHECK FAIL {name}: warm p50 {p50:?}/{p99:?} exceeds {:?}/{:?}",
+            bounds.p50, bounds.p99
+        );
+        CHECK_FAILED.store(true, Ordering::Relaxed);
+    }
 }
 
 fn main() {
+    let check = std::env::args().any(|arg| arg == "--check");
     println!("book-only replay benchmark (no HTTP, Raft, WAL or feed)");
     println!("warm = clone immediately before the timed op; cold = 64 MiB eviction sweep first");
-    println!("best = best mean-of-rounds over 5 repeats; p50/p99 = nearest-rank per round\n");
+    println!("best = best mean-of-rounds over 5 repeats; p50/p99 = nearest-rank per round");
+    if check {
+        println!("check mode: warm p50/p99 CI bounds are enforced\n");
+    } else {
+        println!();
+    }
 
     let (wide, wide_taker) = sweep_book(100, 10);
     bench_clone(
@@ -122,6 +177,7 @@ fn main() {
             fills
         },
         "fills",
+        check.then_some(CHECK_SWEEP_1K),
     );
 
     let (deep, deep_taker) = sweep_book(1, 20_000);
@@ -137,6 +193,7 @@ fn main() {
             fills
         },
         "fills",
+        check.then_some(CHECK_SWEEP_20K),
     );
 
     let (cancelled_book, deep_orders) = cancel_book(100, 100);
@@ -156,6 +213,7 @@ fn main() {
             cancelled
         },
         "cancels",
+        check.then_some(CHECK_CANCEL),
     );
 
     let (advancing_book, bids, asks) = bbo_book(1_000);
@@ -179,6 +237,7 @@ fn main() {
             advances
         },
         "advances",
+        check.then_some(CHECK_BBO_ADVANCE),
     );
 
     let (static_book, _, _) = bbo_book(1_000);
@@ -194,5 +253,13 @@ fn main() {
             1_000_000
         },
         "queries",
+        check.then_some(CHECK_BBO_QUERY),
     );
+
+    if check {
+        if CHECK_FAILED.load(Ordering::Relaxed) {
+            std::process::exit(1);
+        }
+        println!("\nbook replay latency check passed");
+    }
 }

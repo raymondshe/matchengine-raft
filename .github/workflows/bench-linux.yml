@@ -1,0 +1,19 @@
+name: Linux benchmark
+
+on:
+  workflow_dispatch:
+
+jobs:
+  pinned-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Select a valid CPU
+        run: echo "BENCH_CPU=$(( $(nproc) - 1 ))" >> "$GITHUB_ENV"
+      - name: Pinned short e2e
+        run: cargo bench --locked --bench e2e -- --pin "$BENCH_CPU"
+      - name: Pinned sustained e2e
+        run: cargo bench --locked --bench e2e -- --pin "$BENCH_CPU" --duration 60 --clients 500

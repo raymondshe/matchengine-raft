@@ -411,7 +411,7 @@ impl MatchEvent {
             counterparty_sequence: None,
             previous_sequence: Some(amendment.previous_sequence),
             price: amendment.order.price,
-            volume: amendment.order.volume,
+            volume: amendment.order.open_volume(),
             quote_volume: Fixed::ZERO,
             volume_unit: amendment.order.volume_unit,
             taker_fee_asset: None,

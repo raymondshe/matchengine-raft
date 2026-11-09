@@ -31,7 +31,10 @@ OpenRaft-configured chunks (3 MiB default, 8 MiB cap), and both message directio
 - When `RAFT_WAL_FSYNC_MS` is unset, the binary requires at least four voters: `/init` and
   `/change-membership` reject smaller sets, and `/write`/`/write_batch` return `503` until four
   voters exist.
-- `GET /metrics` - Get Raft metrics
+- `GET /metrics` - Raft metrics plus OpenRaft `data_metrics` and `server_metrics`. With
+  `--features profiling`, `runtime_stats` carries the compact runtime histogram summary; without
+  it the field is `null`. The existing `RaftMetrics` fields stay flattened at the top level inside
+  the usual `{"Ok": ...}` envelope.
 - `POST /get_linearizer` - Fetch a read linearizer from the leader (used by `/follower_read`)
 
 ### Operational APIs

@@ -878,10 +878,11 @@ pub struct Amendment {
 pub enum AmendError {
     /// No resting order matches the key (side + current price + sequence).
     NotFound,
-    /// The order does not rest on the book (a parked stop or a market order).
+    /// The order does not rest on the book (a market order or a non-stop
+    /// passed to a stop-only path).
     NotResting,
-    /// Icebergs are not amendable: their hidden reserve has no well-defined
-    /// meaning for a replacement volume.
+    /// The order type cannot be amended this way (a stop-market given a limit
+    /// price, or a plain order given a stop trigger).
     UnsupportedType,
     /// The new price is not a positive finite number.
     InvalidPrice,
@@ -889,6 +890,8 @@ pub enum AmendError {
     InvalidVolume,
     /// The new price would cross the opposite side.
     WouldCross,
+    /// The new stop trigger is already elected by the last trade price.
+    StopWouldTrigger,
 }
 
 impl AmendError {
@@ -899,6 +902,7 @@ impl AmendError {
             AmendError::NotResting | AmendError::UnsupportedType => RejectReason::UnsupportedOrder,
             AmendError::InvalidPrice | AmendError::InvalidVolume => RejectReason::InvalidOrder,
             AmendError::WouldCross => RejectReason::AmendWouldCross,
+            AmendError::StopWouldTrigger => RejectReason::StopWouldTrigger,
         }
     }
 }
@@ -1403,25 +1407,30 @@ impl OrderBook {
         removed
     }
 
-    /// Amends the price and/or open volume of a resting limit order.
+    /// Amends the price, open volume and/or stop trigger of a resting order.
     ///
-    /// The key identifies the order exactly like [`OrderBook::cancel`]: side,
-    /// current price and sequence. `price` and `volume` are the new values;
-    /// `None` leaves a field unchanged.
+    /// The key identifies the order exactly like [`OrderBook::cancel`]: side +
+    /// current price + sequence for a book order, or side + sequence for a
+    /// parked stop. `price`, `volume` and the key's `stop_price` are the new
+    /// values; `None` (and `stop_price == 0`) leaves a field unchanged.
     ///
-    /// Priority follows the usual exchange rule:
+    /// Priority follows the usual exchange rule for book orders:
     ///
-    /// - same price and a volume that does not grow: the order keeps its
+    /// - same price and an open volume that does not grow: the order keeps its
     ///   sequence, so it keeps time priority and is updated in place;
-    /// - a new price or a larger volume: the order is re-inserted with a new
-    ///   sequence, so it loses time priority. The returned [`Amendment`]
+    /// - a new price or a larger open volume: the order is re-inserted with a
+    ///   new sequence, so it loses time priority. The returned [`Amendment`]
     ///   carries the identity to use from now on.
+    ///
+    /// Icebergs keep their display tranche: the amended volume is the new
+    /// **open** volume, split into `min(display_volume, volume)` visible and
+    /// the rest hidden. A parked stop keeps its sequence and remains parked;
+    /// changing its trigger to one the last trade already crosses is refused
+    /// ([`AmendError::StopWouldTrigger`]).
     ///
     /// An amendment whose new price would cross the opposite side is refused
     /// ([`AmendError::WouldCross`]): a resting book must never cross, so taking
-    /// liquidity is cancel + place. Icebergs, parked stops and market orders are
-    /// not amendable ([`AmendError::UnsupportedType`] /
-    /// [`AmendError::NotResting`]).
+    /// liquidity is cancel + place.
     pub fn amend(
         &mut self,
         key: &Order,
@@ -1454,8 +1463,58 @@ impl OrderBook {
         {
             return Err(AmendError::InvalidVolume);
         }
-        if key.is_stop() {
-            return Err(AmendError::NotResting);
+        if !key.stop_price.is_finite() || key.stop_price < Fixed::ZERO {
+            return Err(AmendError::InvalidPrice);
+        }
+
+        // A parked stop is identified by side + sequence and keeps that
+        // identity through an amendment. `key.stop_price > 0` carries the new
+        // trigger; zero means "leave the trigger unchanged".
+        if let Some(index) = self
+            .stops
+            .iter()
+            .position(|stop| stop.side == key.side && stop.sequence == key.sequence)
+        {
+            let stop = self.stops[index];
+            if stop.live == OrderType::Market && price.is_some() {
+                return Err(AmendError::UnsupportedType);
+            }
+            let new_stop_price = if key.stop_price > Fixed::ZERO {
+                key.stop_price
+            } else {
+                stop.stop_price
+            };
+            if let Some(last) = self.last_trade_price {
+                let elected = match stop.side {
+                    OrderSide::Buy => last >= new_stop_price,
+                    OrderSide::Sell => last <= new_stop_price,
+                };
+                if elected {
+                    return Err(AmendError::StopWouldTrigger);
+                }
+            }
+
+            let mut updated = stop;
+            updated.stop_price = new_stop_price;
+            if stop.live == OrderType::Limit {
+                updated.price = price.unwrap_or(stop.price);
+            }
+            updated.volume = volume.unwrap_or(stop.volume);
+            self.stops[index] = updated;
+
+            return Ok(Amendment {
+                market_seq,
+                order: updated,
+                previous_sequence: stop.sequence,
+                previous_price: stop.price,
+                previous_volume: stop.open_volume(),
+            });
+        }
+
+        // A stop trigger on a key that did not match a parked stop would
+        // silently turn a book order into a stop; refuse it.
+        if key.stop_price > Fixed::ZERO {
+            return Err(AmendError::UnsupportedType);
         }
 
         let stored = match key.side {
@@ -1478,12 +1537,9 @@ impl OrderBook {
         if stored.live != OrderType::Limit {
             return Err(AmendError::NotResting);
         }
-        if stored.display_volume > Fixed::ZERO {
-            return Err(AmendError::UnsupportedType);
-        }
 
         let new_price = price.unwrap_or(stored.price);
-        let new_volume = volume.unwrap_or(stored.volume);
+        let new_open_volume = volume.unwrap_or(stored.open_volume());
 
         if new_price != stored.price {
             let would_cross = match key.side {
@@ -1495,6 +1551,7 @@ impl OrderBook {
             }
         }
 
+        let previous_visible = stored.volume;
         let (amendment, reinserted) = match key.side {
             OrderSide::Buy => amend_in_map(
                 &mut self.bids,
@@ -1504,7 +1561,7 @@ impl OrderBook {
                 },
                 stored,
                 new_price,
-                new_volume,
+                new_open_volume,
                 market_seq,
                 |price, sequence| BidKey { price, sequence },
             ),
@@ -1516,24 +1573,19 @@ impl OrderBook {
                 },
                 stored,
                 new_price,
-                new_volume,
+                new_open_volume,
                 market_seq,
                 |price, sequence| AskKey { price, sequence },
             ),
         };
         if reinserted {
-            self.record_depth_change(
-                key.side,
-                amendment.previous_price,
-                -amendment.previous_volume,
-                -1,
-            );
+            self.record_depth_change(key.side, amendment.previous_price, -previous_visible, -1);
             self.record_depth_change(key.side, amendment.order.price, amendment.order.volume, 1);
-        } else if amendment.order.volume != amendment.previous_volume {
+        } else if amendment.order.volume != previous_visible {
             self.record_depth_change(
                 key.side,
                 amendment.order.price,
-                amendment.order.volume - amendment.previous_volume,
+                amendment.order.volume - previous_visible,
                 0,
             );
         }
@@ -1971,18 +2023,25 @@ fn amend_in_map<K: Ord>(
     key: K,
     stored: Order,
     new_price: Fixed,
-    new_volume: Fixed,
+    new_open_volume: Fixed,
     market_seq: u64,
     make_key: impl Fn(Fixed, u64) -> K,
 ) -> (Amendment, bool) {
     let previous_sequence = stored.sequence;
     let previous_price = stored.price;
-    let previous_volume = stored.volume;
+    let previous_volume = stored.open_volume();
+    let (visible, hidden) = if stored.display_volume > Fixed::ZERO {
+        let visible = stored.display_volume.min(new_open_volume);
+        (visible, new_open_volume - visible)
+    } else {
+        (new_open_volume, Fixed::ZERO)
+    };
 
-    if new_price == stored.price && new_volume <= stored.volume {
+    if new_price == stored.price && new_open_volume <= previous_volume {
         // A same-price reduction keeps time priority, so the key survives.
         let entry = map.get_mut(&key).expect("the caller looked the key up");
-        entry.volume = new_volume;
+        entry.volume = visible;
+        entry.hidden_volume = hidden;
         return (
             Amendment {
                 market_seq,
@@ -2000,7 +2059,8 @@ fn amend_in_map<K: Ord>(
     map.remove(&key).expect("the caller looked the key up");
     let mut updated = stored;
     updated.price = new_price;
-    updated.volume = new_volume;
+    updated.volume = visible;
+    updated.hidden_volume = hidden;
     updated.sequence = market_seq;
     map.insert(make_key(new_price, market_seq), updated);
 

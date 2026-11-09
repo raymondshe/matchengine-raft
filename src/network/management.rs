@@ -12,6 +12,8 @@ use openraft::alias::LogIdOf;
 use openraft::async_runtime::WatchReceiver;
 use openraft::errors::Infallible;
 use openraft::errors::decompose::DecomposeResult;
+use openraft::metrics::RaftDataMetrics;
+use openraft::metrics::RaftServerMetrics;
 use openraft::raft::linearizable_read::ReadLogId;
 use serde::Deserialize;
 use serde::Serialize;
@@ -29,6 +31,21 @@ pub struct LinearizerData {
     /// Serializes transparently as a `LogId`.
     pub read_log_id: ReadLogId<MatchEngineTypeConfig>,
     pub applied: Option<LogIdOf<MatchEngineTypeConfig>>,
+}
+
+/// Extended `/metrics` payload: Raft metrics plus OpenRaft's data/server
+/// counters and, in `profiling` builds, the runtime histogram summary.
+///
+/// The Raft fields stay flattened at the top level so existing consumers of
+/// `GET /metrics` keep deserializing `RaftMetrics` unchanged. `runtime_stats`
+/// is `null` unless the crate is built with `--features profiling`.
+#[derive(Debug, Serialize)]
+pub struct MetricsResponse {
+    #[serde(flatten)]
+    pub raft: RaftMetrics<MatchEngineTypeConfig>,
+    pub data_metrics: RaftDataMetrics<MatchEngineTypeConfig>,
+    pub server_metrics: RaftServerMetrics<MatchEngineTypeConfig>,
+    pub runtime_stats: Option<String>,
 }
 
 // --- Cluster management
@@ -140,11 +157,33 @@ pub async fn admission_status(app: Data<MatchEngineApp>) -> actix_web::Result<im
 }
 
 /// Get the latest metrics of the cluster
+///
+/// Returns the existing `RaftMetrics` fields at the top level, plus
+/// `data_metrics`, `server_metrics` and (with `--features profiling`)
+/// `runtime_stats`. The response keeps the `{"Ok": ...}` envelope used by the
+/// other management endpoints.
 #[get("/metrics")]
 pub async fn metrics(app: Data<MatchEngineApp>) -> actix_web::Result<impl Responder> {
-    let metrics = app.raft.metrics().borrow_watched().clone();
+    let raft = app.raft.metrics().borrow_watched().clone();
+    let data_metrics = app.raft.data_metrics().borrow_watched().clone();
+    let server_metrics = app.raft.server_metrics().borrow_watched().clone();
 
-    let res: Result<RaftMetrics<MatchEngineTypeConfig>, Infallible> = Ok(metrics);
+    #[cfg(feature = "profiling")]
+    let runtime_stats = app
+        .raft
+        .runtime_stats()
+        .await
+        .ok()
+        .map(|stats| stats.display().to_string());
+    #[cfg(not(feature = "profiling"))]
+    let runtime_stats: Option<String> = None;
+
+    let res: Result<MetricsResponse, Infallible> = Ok(MetricsResponse {
+        raft,
+        data_metrics,
+        server_metrics,
+        runtime_stats,
+    });
     Ok(Json(res))
 }
 

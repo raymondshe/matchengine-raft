@@ -102,6 +102,10 @@ docinclude = [] # Used only for activating `doc(include="...")` on nightly.
 async-wal = []
 # Publishes the market-data feed to Aeron channels (one publication per stream).
 market-data-aeron = ["dep:rusteron-client", "dep:rusteron-media-driver"]
+# Profiling builds: enable OpenRaft runtime histograms and expose them through
+# `/metrics` as `runtime_stats`. Off by default because the tabled histograms
+# add build time and per-run bookkeeping.
+profiling = ["openraft/runtime-stats"]
 
 [package.metadata.docs.rs]
 features = ["docinclude"] # Activate `docinclude` during docs.rs build.

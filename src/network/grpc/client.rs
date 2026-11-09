@@ -65,9 +65,70 @@ where
 {
     local_id: C::NodeId,
     target: C::NodeId,
+    role: GrpcChannelRole,
     /// `Err` carries a configuration error; every RPC reports it as unreachable.
     channel: Result<Channel, String>,
     _p: PhantomData<C>,
+}
+
+/// The three Raft connections OpenRaft asks the factory for.
+///
+/// Keeping the role explicit makes the connection isolation intentional: each
+/// peer gets a separate lazy channel, and heartbeat/snapshot traffic cannot be
+/// head-of-line blocked by replication. The profiles only tune connection
+/// setup and HTTP/2 windows; RPC deadlines still come from `RPCOption`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GrpcChannelRole {
+    Replication,
+    Heartbeat,
+    Snapshot,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ChannelProfile {
+    connect_timeout: Duration,
+    stream_window: u32,
+    connection_window: u32,
+    keepalive_interval: Duration,
+    keepalive_timeout: Duration,
+}
+
+const REPLICATION_PROFILE: ChannelProfile = ChannelProfile {
+    connect_timeout: Duration::from_secs(2),
+    stream_window: HTTP2_STREAM_WINDOW,
+    connection_window: HTTP2_CONNECTION_WINDOW,
+    keepalive_interval: HTTP2_KEEPALIVE_INTERVAL,
+    keepalive_timeout: HTTP2_KEEPALIVE_TIMEOUT,
+};
+
+// Heartbeats carry tiny probes. A smaller window keeps per-peer memory bounded
+// while preserving the same liveness timers as replication.
+const HEARTBEAT_PROFILE: ChannelProfile = ChannelProfile {
+    connect_timeout: Duration::from_secs(2),
+    stream_window: 256 * 1024,
+    connection_window: 1024 * 1024,
+    keepalive_interval: HTTP2_KEEPALIVE_INTERVAL,
+    keepalive_timeout: HTTP2_KEEPALIVE_TIMEOUT,
+};
+
+// A legitimate snapshot can outlive a heartbeat interval, so its channel is
+// deliberately more tolerant of idle gaps and a slower connect.
+const SNAPSHOT_PROFILE: ChannelProfile = ChannelProfile {
+    connect_timeout: Duration::from_secs(5),
+    stream_window: HTTP2_STREAM_WINDOW,
+    connection_window: HTTP2_CONNECTION_WINDOW,
+    keepalive_interval: Duration::from_secs(10),
+    keepalive_timeout: Duration::from_secs(5),
+};
+
+impl GrpcChannelRole {
+    fn profile(self) -> ChannelProfile {
+        match self {
+            Self::Replication => REPLICATION_PROFILE,
+            Self::Heartbeat => HEARTBEAT_PROFILE,
+            Self::Snapshot => SNAPSHOT_PROFILE,
+        }
+    }
 }
 
 impl<C> GrpcNetwork<C>
@@ -75,25 +136,36 @@ where
     C: RaftTypeConfig<Node = BasicNode>,
 {
     pub fn new(local_id: C::NodeId, target: C::NodeId, api_addr: &str) -> Self {
+        Self::new_with_role(local_id, target, api_addr, GrpcChannelRole::Replication)
+    }
+
+    fn new_with_role(
+        local_id: C::NodeId,
+        target: C::NodeId,
+        api_addr: &str,
+        role: GrpcChannelRole,
+    ) -> Self {
         let (raft_addr, channel) = match raft_addr_from_http(api_addr) {
             Ok(addr) => {
-                let channel = make_channel(&addr);
+                let channel = make_channel(&addr, role.profile());
                 (addr, channel)
             }
             Err(e) => (api_addr.to_string(), Err(e)),
         };
 
-        tracing::debug!(%raft_addr, %target, "gRPC Raft client created");
+        tracing::debug!(%raft_addr, %target, ?role, "gRPC Raft client created");
 
         Self {
             local_id,
             target,
+            role,
             channel,
             _p: PhantomData,
         }
     }
 
     fn client(&self) -> Result<RaftServiceClient<Channel>, RPCError<C>> {
+        tracing::trace!(role = ?self.role, target = %self.target, "opening gRPC Raft client");
         let channel = self
             .channel
             .clone()
@@ -134,15 +206,15 @@ where
     }
 }
 
-fn make_channel(addr: &str) -> Result<Channel, String> {
+fn make_channel(addr: &str, profile: ChannelProfile) -> Result<Channel, String> {
     let endpoint = Endpoint::from_shared(format!("http://{addr}"))
         .map_err(|e| format!("invalid gRPC endpoint for `{addr}`: {e}"))?
-        .connect_timeout(Duration::from_secs(2))
+        .connect_timeout(profile.connect_timeout)
         .tcp_nodelay(true)
-        .initial_stream_window_size(HTTP2_STREAM_WINDOW)
-        .initial_connection_window_size(HTTP2_CONNECTION_WINDOW)
-        .http2_keep_alive_interval(HTTP2_KEEPALIVE_INTERVAL)
-        .keep_alive_timeout(HTTP2_KEEPALIVE_TIMEOUT)
+        .initial_stream_window_size(profile.stream_window)
+        .initial_connection_window_size(profile.connection_window)
+        .http2_keep_alive_interval(profile.keepalive_interval)
+        .keep_alive_timeout(profile.keepalive_timeout)
         .keep_alive_while_idle(true);
     Ok(endpoint.connect_lazy())
 }
@@ -515,6 +587,57 @@ impl openraft::network::RaftNetworkFactory<crate::MatchEngineTypeConfig> for Grp
         target: crate::MatchEngineNodeId,
         node: &BasicNode,
     ) -> Self::Network {
-        GrpcNetwork::new(self.local_id, target, &node.addr)
+        GrpcNetwork::new_with_role(
+            self.local_id,
+            target,
+            &node.addr,
+            GrpcChannelRole::Replication,
+        )
+    }
+
+    async fn new_heartbeat_client(
+        &mut self,
+        target: crate::MatchEngineNodeId,
+        node: &BasicNode,
+    ) -> Self::Network {
+        GrpcNetwork::new_with_role(
+            self.local_id,
+            target,
+            &node.addr,
+            GrpcChannelRole::Heartbeat,
+        )
+    }
+
+    async fn new_snapshot_client(
+        &mut self,
+        target: crate::MatchEngineNodeId,
+        node: &BasicNode,
+    ) -> Self::Network {
+        GrpcNetwork::new_with_role(self.local_id, target, &node.addr, GrpcChannelRole::Snapshot)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use openraft::network::RaftNetworkFactory;
+
+    #[tokio::test]
+    async fn factory_uses_role_specific_channel_profiles() {
+        let mut factory = GrpcNetworkFactory::new(1);
+        let node = BasicNode::new("127.0.0.1:21001");
+
+        assert_eq!(
+            GrpcChannelRole::Replication,
+            factory.new_client(2, &node).await.role
+        );
+        assert_eq!(
+            GrpcChannelRole::Heartbeat,
+            factory.new_heartbeat_client(2, &node).await.role
+        );
+        assert_eq!(
+            GrpcChannelRole::Snapshot,
+            factory.new_snapshot_client(2, &node).await.role
+        );
     }
 }

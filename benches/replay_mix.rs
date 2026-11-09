@@ -5,6 +5,9 @@
 //! amendments, and market takers, with maker/taker fees on every order. It
 //! exercises `OrderBook` directly (no HTTP, Raft, WAL, snapshots or feed) and
 //! reports whole-replay percentiles plus per-operation percentiles by kind.
+//!
+//! `--check` enforces the loose whole-replay warm p50/p99 CI bounds from
+//! `docs/PERFORMANCE.md`; cold passes stay informational.
 
 #[path = "bench_support/mod.rs"]
 mod bench_support;
@@ -25,6 +28,11 @@ use matchengine_raft::order_book::Outcome;
 const OPS: usize = 100_000;
 const MAKER_FEE: f64 = 0.0002;
 const TAKER_FEE: f64 = 0.0005;
+/// Loose CI bounds for the whole warm replay. The recorded host baseline is
+/// ~107 ms p50 / ~109 ms p99, so these only catch an order-of-magnitude
+/// regression on a noisy shared runner.
+const CHECK_P50: Duration = Duration::from_secs(1);
+const CHECK_P99: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy, Debug)]
 enum Op {
@@ -441,6 +449,7 @@ fn print_percentiles(label: &str, samples: &[Duration]) {
 }
 
 fn main() {
+    let check = std::env::args().any(|arg| arg == "--check");
     let fixture = fixture();
     println!("realistic-mix replay benchmark (100k operations, OrderBook only)");
     println!(
@@ -453,8 +462,13 @@ fn main() {
         count_kind(&fixture, Kind::Taker),
     );
     println!(
-        "fees: maker {MAKER_FEE}, taker {TAKER_FEE}; 20 warm + 20 interleaved cold rounds; warm = clone immediately before replay, cold = 64 MiB eviction first\n"
+        "fees: maker {MAKER_FEE}, taker {TAKER_FEE}; 20 warm + 20 interleaved cold rounds; warm = clone immediately before replay, cold = 64 MiB eviction first"
     );
+    if check {
+        println!("check mode: whole-replay warm p50/p99 CI bounds are enforced\n");
+    } else {
+        println!();
+    }
 
     let config = bench_support::Config {
         repeats: 20,
@@ -468,10 +482,10 @@ fn main() {
         |fixture| black_box(replay(fixture, None, None)),
     );
     let best = samples.warm_best(1);
+    let p50 = samples.warm_p50();
+    let p99 = samples.warm_p99();
     println!(
-        "whole replay  warm best {best:>10?} p50 {:>10?} p99 {:>10?} {:>10.0} ops/s",
-        samples.warm_p50(),
-        samples.warm_p99(),
+        "whole replay  warm best {best:>10?} p50 {p50:>10?} p99 {p99:>10?} {:>10.0} ops/s",
         samples.units_per_second(best),
     );
     println!(
@@ -481,6 +495,13 @@ fn main() {
         samples.cold_p99(),
         samples.cold.len(),
     );
+
+    if check && (p50 > CHECK_P50 || p99 > CHECK_P99) {
+        eprintln!(
+            "CHECK FAIL whole replay: warm p50 {p50:?}/{p99:?} exceeds {CHECK_P50:?}/{CHECK_P99:?}"
+        );
+        std::process::exit(1);
+    }
 
     let mut stats = Stats::default();
     replay(&fixture, None, Some(&mut stats));
@@ -502,5 +523,9 @@ fn main() {
     print_percentiles("all", &timings.all);
     for kind in KINDS {
         print_percentiles(kind.label(), &timings.by_kind[kind as usize]);
+    }
+
+    if check {
+        println!("\nreplay-mix latency check passed");
     }
 }

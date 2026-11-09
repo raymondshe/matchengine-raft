@@ -43,21 +43,27 @@ a `rejected` event carrying the reason.
 
 ## Order amendment
 
-`Amend` changes the price and/or open volume of a resting limit order. The request identifies the
-order exactly like `Cancel` — side, current price and sequence — and each new field is optional:
+`Amend` changes the price, open volume and/or stop trigger of a resting order. A book order is
+identified exactly like `Cancel` — side, current price and sequence; a parked stop is identified by
+side and sequence. Each new field is optional:
 
 ```json
 {"Amend": {"order": {"live": "Limit", "side": "Buy", "price": 4000.0, "volume": 4.4, "id": 1, "sequence": 7}, "price": 4002.0, "volume": 3.0}}
 ```
 
-- A same-price reduction keeps the order's sequence, so it keeps time priority.
-- A new price or a larger volume re-inserts the order with a new sequence (it loses priority); the
-  `/write` response carries the sequence to use from then on.
+- A same-price open-volume reduction keeps the order's sequence, so it keeps time priority.
+- A new price or a larger open volume re-inserts the order with a new sequence (it loses priority);
+  the `/write` response carries the sequence to use from then on.
+- An iceberg's `volume` is its new **total open** volume. The display tranche is preserved:
+  `min(display_volume, volume)` stays visible and the rest moves into the hidden reserve.
+- A parked stop keeps its sequence and stays parked. `order.stop_price > 0` supplies the new trigger
+  (`0` keeps the current one); `price` updates a stop-limit's limit price and is refused for a
+  stop-market (`unsupported_order`). A trigger the last trade already crosses is refused
+  (`stop_would_trigger`).
 - An amendment whose new price would cross the opposite side is refused (`amend_would_cross`): a
   resting book never crosses, so taking liquidity is still cancel + place.
-- Icebergs, parked stops and market orders are not amendable (`unsupported_order`); cancel and
-  re-place them instead.
+- Market orders are not amendable (`unsupported_order`); cancel and re-place them instead.
 - A successful amendment emits an `amended` event carrying both the previous and the new order
-  sequence; the `/write` response is the amendment's `market_seq` (the new order sequence when the
-  order was re-inserted). A refused amendment still consumes a sequence and publishes a `rejected`
-  event with the reason.
+  sequence and the new open volume; the `/write` response is the amendment's `market_seq` (the new
+  order sequence when the order was re-inserted). A refused amendment still consumes a sequence and
+  publishes a `rejected` event with the reason.

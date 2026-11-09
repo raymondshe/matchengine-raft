@@ -1,6 +1,6 @@
 # Performance measurements
 
-Measured on **2026-10-30** (runtime flavor A/B and P0 offloads: **2026-10-31**; measurement scope and RSS: **2026-11-01**; book p50/p99 and the pinned-core approximation: **2026-11-04**; end-to-end/storage rerun with the OpenRaft quick wins: **2026-11-06**; realistic-mix replay: **2026-11-06**; dedicated Raft runtime: **2026-11-06**; WAL fsync Tokio rerun: **2026-11-07**; four-node no-fsync cluster: **2026-11-07**; write concurrency/batching sweep: **2026-11-08**; async WAL prototype: **2026-11-08**; production configuration decisions: **2026-11-08**; write admission control: **2026-11-09**; pre-connected write concurrency: **2026-11-09**; sustained single-node CPU profile: **2026-11-09**; read-path benchmark: **2026-11-08**; OpenRaft minimal-benchmark comparison: **2026-11-08**) on the reference development machine:
+Measured on **2026-10-30** (runtime flavor A/B and P0 offloads: **2026-10-31**; measurement scope and RSS: **2026-11-01**; book p50/p99 and the pinned-core approximation: **2026-11-04**; end-to-end/storage rerun with the OpenRaft quick wins: **2026-11-06**; realistic-mix replay: **2026-11-06**; dedicated Raft runtime: **2026-11-06**; WAL fsync Tokio rerun: **2026-11-07**; four-node no-fsync cluster: **2026-11-07**; write concurrency/batching sweep: **2026-11-08**; async WAL prototype: **2026-11-08**; production configuration decisions: **2026-11-08**; write admission control: **2026-11-09**; pre-connected write concurrency: **2026-11-09**; sustained single-node CPU profile: **2026-11-09**; benchmark regression gate: **2026-11-09**; read-path benchmark: **2026-11-08**; OpenRaft minimal-benchmark comparison: **2026-11-08**) on the reference development machine:
 
 - Apple M4 (`arm64`)
 - Rust `1.93.1`
@@ -29,6 +29,9 @@ cargo bench --bench book_replay   # book-only sweeps, deep cancels and BBO advan
 cargo bench --bench replay_mix    # realistic add/cancel/amend/stop/iceberg replay with per-op percentiles
 cargo bench --bench level_book    # per-level bucket prototype vs the current book
 cargo bench --bench apply_path    # apply-path heap allocations per applied entry
+cargo bench --bench apply_path -- --check   # exact allocation regression gate
+cargo bench --bench book_replay -- --check  # loose warm p50/p99 gate
+cargo bench --bench replay_mix -- --check   # loose whole-replay p50/p99 gate
 ```
 
 Set `RAFT_CORE_WORKERS` to a positive worker count to run Raft on a dedicated runtime; unset or `0` uses the shared runtime.
@@ -99,6 +102,9 @@ when the deployment cannot guarantee bounded clock drift.
 Profile A is **lossy on an unclean crash**. The four-voter floor protects against one node losing
 its unsynced tail; it does not protect against simultaneous failures or host power loss. Use
 Profile B when acknowledged writes must survive those cases.
+`test_failure.rs::four_voter_no_fsync_survives_leader_kill_and_tail_loss` exercises that contract
+with real processes: it kills the leader, removes three tail records from its WAL, proves the
+remaining three voters still commit, and waits for the restarted node to catch up.
 
 Measured envelope: the four-node no-fsync cluster does **5,039 sequential writes/s**,
 **114,484 writes/s at 512 pre-connected in-flight** (p99 5.76 ms), **99,330 writes/s at 1,024**
@@ -349,6 +355,35 @@ Remaining allocations are the `BTreeMap` node on a rest, the response `events` `
 change the public `MatchEngineResponse.events` type; avoiding the `MatchResult` `Vec` would change
 `Outcome.fills`. The market-data tap path still copies events into `TapFrame.events` when the tap is
 enabled, and is not covered by this no-tap benchmark.
+
+## Benchmark regression gate (2026-11-09)
+
+CI job `bench-regression` runs three no-framework benchmarks in check mode. It is a regression
+gate, not a capacity target: CI uses loose upper bounds so a shared runner does not fail on
+scheduling noise, while a real algorithmic regression or an allocation-count increase fails.
+
+`cargo bench --bench apply_path -- --check` enforces the measured 2026-11-09 allocation ceilings
+for 50,000 single-entry applications or 1,000 128-request batches:
+
+| Workload | Max allocation calls | Max requested bytes |
+|---|---:|---:|
+| Blank | 0 | 0 |
+| Rest, 1 event | 208,335 | 31,250,000 |
+| Cancel, 1 event | 200,000 | 8,200,000 |
+| Fill, 1 event | 250,000 | 105,700,000 |
+| Batch blank, 128 requests | 130,000 | 51,300,000 |
+| Batch rest, 128 x 1 event | 536,336 | 227,600,000 |
+
+The call ceilings are exact totals: fewer allocations pass, more fail. Requested bytes get a
+small allowance for capacity choices. `book_replay --check` enforces warm p50/p99 bounds from
+1 ms/5 ms (1k sweep) to 50 ms/100 ms (1M BBO queries), and `replay_mix --check` enforces
+1 s/2 s for the whole warm replay. Those are roughly an order of magnitude above the recorded
+M4 baseline. Cold passes remain reported but are not gated.
+
+The pinned-core `e2e` pass is a separate, manual Linux run. `.github/workflows/bench-linux.yml`
+(`Linux benchmark`, `workflow_dispatch`) selects the last available CPU, runs the short e2e suite
+with `--pin`, then the 60 s / 500-client sustained pass. It has not been dispatched on this macOS
+development host.
 
 ## End-to-end write path
 
@@ -729,8 +764,11 @@ What transfers:
 - **Instrumentation and build settings.** The upstream harness uses `runtime-stats`, flamegraph,
   tokio-console and a profile binary that measures startup memory, write allocations, latency and
   snapshot cost; it also builds with thin LTO and `codegen-units = 1`. The local thin-LTO A/B was
-  within host spread and did not beat the default profile. Exposing
-  `data_metrics`/`server_metrics`/`runtime_stats` remains open.
+  within host spread and did not beat the default profile. `/metrics` now exposes
+  `data_metrics`, `server_metrics` and (with `--features profiling`) the compact `runtime_stats`
+  histograms; `cluster_e2e --help` documents the flamegraph and tokio-console setup. The
+  remaining step is to record the before/after benchmark rows with those histograms enabled
+  (`TODO.md` §16).
 - **Follower-read cache is a later step.** The leader's lease read makes `/get_linearizer`
   cheaper, but a follower still pays one leader HTTP hop per read. A short-TTL linearizer cache
   bounded by the leader lease could remove it; it needs a safety analysis and is not a first move.
@@ -743,11 +781,14 @@ attribution, not deployment sizing.
 
 The 2026-11-06 rerun includes the P1 OpenRaft utilization changes:
 `replication_lag_threshold = 150_000`, `heartbeat_min_interval = 500 ms`,
-1 MiB HTTP/2 stream / 4 MiB connection windows with 5 s / 3 s keepalive on both
-sides, snapshot chunks from `RPCOption::snapshot_chunk_size()` (3 MiB default,
-8 MiB cap), and `/ready` gated on `Raft::wait_for_recovery`. The e2e and storage
-tables above are the post-change baseline. A dedicated heartbeat-stream-count
-and snapshot-transfer-time measurement is still a P2 follow-up (`TODO.md` §16).
+server-side 1 MiB HTTP/2 stream / 4 MiB connection windows with 5 s / 3 s keepalive,
+snapshot chunks from `RPCOption::snapshot_chunk_size()` (3 MiB default,
+8 MiB cap), and `/ready` gated on `Raft::wait_for_recovery`. The client factory now
+selects explicit replication (1 MiB / 4 MiB, 5 s / 3 s), heartbeat (256 KiB / 1 MiB,
+5 s / 3 s) and snapshot (1 MiB / 4 MiB, 5 s connect, 10 s / 5 s keepalive) profiles.
+The e2e and storage tables above are the post-change baseline. A dedicated
+heartbeat-stream-count and snapshot-transfer-time measurement is still a P2
+follow-up (`TODO.md` §16).
 
 ### Runtime flavor A/B (2026-10-31)
 

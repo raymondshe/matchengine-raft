@@ -1411,7 +1411,7 @@ fn amend_price_moves_the_order_and_keeps_its_fields() {
 }
 
 #[test]
-fn amend_refuses_unknown_crossing_and_unsupported_orders() {
+fn amend_refuses_unknown_crossing_and_invalid_values() {
     let mut ob = OrderBook::new();
     let mut ask = resting_order(OrderSide::Sell, 100.0, 5.0, 1);
     ob.place_order(&mut ask);
@@ -1439,26 +1439,28 @@ fn amend_refuses_unknown_crossing_and_unsupported_orders() {
         ob.amend(&bid, Some(Fixed::from(-1.0)), None).map(|_| ())
     );
 
-    // Stops park off the book and cannot be amended.
+    // A parked stop keeps its sequence and can change its volume/trigger.
     let mut stop = order_with(OrderSide::Sell, 0.0, 5.0, 3, |o| {
         o.live = OrderType::Market;
         o.stop_price = 95.0.into();
     });
     ob.execute_order(&mut stop);
-    assert_eq!(
-        Err(AmendError::NotResting),
-        ob.amend(&stop, None, Some(1.0.into())).map(|_| ())
-    );
+    let amended = ob.amend(&stop, None, Some(1.0.into())).expect("stop amend");
+    assert_eq!(stop.sequence, amended.order.sequence);
+    assert_eq!(Fixed::from(1), amended.order.volume);
+    assert_eq!(Fixed::from(95), amended.order.stop_price);
 
-    // Icebergs have no well-defined replacement volume here.
+    // An iceberg amend is its new total open volume; the display tranche stays.
     let mut iceberg = order_with(OrderSide::Sell, 103.0, 10.0, 4, |o| {
         o.display_volume = 4.0.into()
     });
     ob.place_order(&mut iceberg);
-    assert_eq!(
-        Err(AmendError::UnsupportedType),
-        ob.amend(&iceberg, None, Some(9.0.into())).map(|_| ())
-    );
+    let amended = ob
+        .amend(&iceberg, None, Some(9.0.into()))
+        .expect("iceberg amend");
+    assert_eq!(iceberg.sequence, amended.order.sequence);
+    assert_eq!(Fixed::from(4), amended.order.volume);
+    assert_eq!(Fixed::from(5), amended.order.hidden_volume);
 }
 
 // --- Depth and spread

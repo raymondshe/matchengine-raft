@@ -6,9 +6,9 @@ use matchengine_raft::StorageConfig;
 use matchengine_raft::build_match_engine_node;
 use matchengine_raft::client::MatchEngineClient;
 use matchengine_raft::default_raft_config;
+use matchengine_raft::match_result::MatchEventKind;
 use matchengine_raft::order_book::Order;
 use matchengine_raft::order_book::OrderSide;
-use matchengine_raft::start_match_engine_node_with_storage;
 use matchengine_raft::store::MatchEngineRequest;
 use openraft::SnapshotPolicy;
 use openraft::type_config::TypeConfigExt;
@@ -40,35 +40,8 @@ async fn test_grpc_snapshot_install_inner() -> anyhow::Result<()> {
     let temp = crate::common::TempDir::new("snapshot");
     let storage = StorageConfig::new(temp.path()).with_instance_prefix("snapshot");
 
-    let _h1 = {
-        let storage = storage.clone();
-        tokio::spawn(async move {
-            let x = start_match_engine_node_with_storage(
-                1,
-                "127.0.0.1:21101".to_string(),
-                config(),
-                storage,
-            )
-            .await;
-            println!("node1: {:?}", x);
-        })
-    };
-
-    let _h2 = {
-        let storage = storage.clone();
-        tokio::spawn(async move {
-            let x = start_match_engine_node_with_storage(
-                2,
-                "127.0.0.1:21102".to_string(),
-                config(),
-                storage,
-            )
-            .await;
-            println!("node2: {:?}", x);
-        })
-    };
-
-    MatchEngineTypeConfig::sleep(Duration::from_millis(300)).await;
+    let node1 = build_match_engine_node(1, addr1.clone(), config(), storage.clone()).await?;
+    let node2 = build_match_engine_node(2, addr2.clone(), config(), storage.clone()).await?;
 
     let client1 = MatchEngineClient::<MatchEngineTypeConfig>::new(1, addr1);
     client1.init().await??;
@@ -148,6 +121,25 @@ async fn test_grpc_snapshot_install_inner() -> anyhow::Result<()> {
     let orders: Vec<Order> =
         serde_json::from_str(&client2.read(&"orderbook_orders".to_string()).await?)?;
     assert_eq!(30, orders.len());
+
+    // The snapshot also carries the retained event window. Inspect node 2's
+    // local state machine, not the leader's.
+    let (events, _, _) = node2
+        .state_machine
+        .inner()
+        .lock()
+        .await
+        .events_since(None, 100);
+    assert_eq!(30, events.len(), "snapshot lost the retained event window");
+    assert!(
+        events
+            .iter()
+            .all(|event| event.kind == MatchEventKind::Rested),
+        "unexpected events after snapshot install: {events:?}"
+    );
+
+    node1.shutdown().await?;
+    node2.shutdown().await?;
 
     Ok(())
 }

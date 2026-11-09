@@ -1230,6 +1230,104 @@ async fn gtd_purge_is_idempotent_and_auto_expiry_keeps_place_ordinals() {
     assert_eq!(Fixed::from(1), events[4].volume);
 }
 
+#[tokio::test]
+async fn apply_amends_parked_stop_and_iceberg() {
+    use crate::match_result::MatchEventKind;
+    use crate::match_result::MemorySink;
+    use crate::order_book::Fixed;
+    use crate::order_book::Order;
+    use crate::order_book::OrderSide;
+    use openraft::alias::EntryOf;
+
+    fn entry(
+        index: u64,
+        payload: EntryPayloadOf<MatchEngineTypeConfig>,
+    ) -> EntryOf<MatchEngineTypeConfig> {
+        Entry {
+            log_id: log_id(1, index),
+            payload,
+        }
+    }
+
+    let dir = tempdir();
+    let sink = Arc::new(MemorySink::new());
+    let mut store =
+        StateMachineStore::<MatchEngineTypeConfig>::open_with_sink(dir.path(), sink.clone())
+            .unwrap();
+
+    let mut stop = Order::new(OrderSide::Sell, 94.0, 5.0, 0);
+    stop.stop_price = Fixed::from(95);
+    let mut stop_key = stop;
+    stop_key.stop_price = Fixed::from(96);
+
+    let mut iceberg = Order::new(OrderSide::Sell, 100.0, 10.0, 0);
+    iceberg.display_volume = Fixed::from(4);
+    let mut iceberg_key = iceberg;
+    iceberg_key.sequence = 2; // assigned by the place applied above
+
+    let entries = futures::stream::iter(vec![
+        Ok((
+            entry(1, EntryPayload::Normal(MatchEngineRequest::place(stop))),
+            None,
+        )),
+        Ok((
+            entry(
+                2,
+                EntryPayload::Normal(MatchEngineRequest::Amend {
+                    order: stop_key,
+                    price: Some(93.0.into()),
+                    volume: Some(7.0.into()),
+                }),
+            ),
+            None,
+        )),
+        Ok((
+            entry(3, EntryPayload::Normal(MatchEngineRequest::place(iceberg))),
+            None,
+        )),
+        Ok((
+            entry(
+                4,
+                EntryPayload::Normal(MatchEngineRequest::Amend {
+                    order: iceberg_key,
+                    price: None,
+                    volume: Some(12.0.into()),
+                }),
+            ),
+            None,
+        )),
+    ]);
+    store.apply(entries).await.unwrap();
+
+    let events = sink.events();
+    assert_eq!(3, events.len(), "unexpected events: {events:?}");
+    assert_eq!(MatchEventKind::Amended, events[0].kind);
+    assert_eq!(0, events[0].order_sequence);
+    assert_eq!(Some(0), events[0].previous_sequence);
+    assert_eq!(Fixed::from(93), events[0].price);
+    assert_eq!(Fixed::from(7), events[0].volume);
+
+    assert_eq!(MatchEventKind::Rested, events[1].kind);
+    assert_eq!(Fixed::from(4), events[1].volume);
+    assert_eq!(MatchEventKind::Amended, events[2].kind);
+    assert_eq!(3, events[2].order_sequence, "unexpected events: {events:?}");
+    assert_eq!(Some(2), events[2].previous_sequence);
+    assert_eq!(
+        Fixed::from(12),
+        events[2].volume,
+        "the event reports the iceberg's new open volume"
+    );
+
+    let inner = store.inner().lock().await;
+    assert_eq!(1, inner.orderbook.stops.len());
+    assert_eq!(Fixed::from(96), inner.orderbook.stops[0].stop_price);
+    assert_eq!(Fixed::from(93), inner.orderbook.stops[0].price);
+    assert_eq!(Fixed::from(7), inner.orderbook.stops[0].volume);
+    let best = inner.orderbook.best_ask().expect("the iceberg rests");
+    assert_eq!(Fixed::from(4), best.volume);
+    assert_eq!(Fixed::from(8), best.hidden_volume);
+}
+
 /// Amendment goes through `apply`: the event carries both identities and the
 /// book keeps the new size; a failed amend publishes a rejection.
 #[tokio::test]

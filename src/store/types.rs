@@ -36,9 +36,15 @@ pub enum MatchEngineRequest {
     },
     /// Cancel an existing order from the matching engine.
     Cancel { order: Order },
-    /// Amend a resting limit order. `order` identifies it exactly like `Cancel`
-    /// (side + current price + sequence); `price` and `volume` are the new
-    /// values, and `None` leaves a field unchanged.
+    /// Amend a resting limit order, iceberg or parked stop.
+    ///
+    /// A book order is identified exactly like `Cancel` (side + current price +
+    /// sequence); a parked stop by side + sequence. `price` and `volume` are
+    /// the new values and `None` leaves a field unchanged. For a parked stop,
+    /// `order.stop_price > 0` is the new trigger price (`0` keeps the current
+    /// trigger); `price` updates a stop-limit's limit and is rejected for a
+    /// stop-market. For an iceberg, `volume` is the new total open volume and
+    /// the display tranche is preserved.
     Amend {
         order: Order,
         /// New price; omitted/`null` keeps the current one.

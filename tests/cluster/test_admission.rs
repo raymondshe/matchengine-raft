@@ -165,6 +165,21 @@ fn admission_limit_rejects_excess_writes_and_reports_counters() {
         assert_eq!(rejected as u64 + rejected_batches as u64, status.rejected);
         assert_eq!(1, status.peak);
 
+        // Every admitted request was applied: one order per admitted /write,
+        // two per admitted /write_batch.
+        let expected_orders = accepted + accepted_batches * 2;
+        assert_eq!(
+            expected_orders.to_string(),
+            client
+                .read(&"orderbook_sequence".to_string())
+                .await
+                .unwrap()
+        );
+        let orders: Vec<Order> =
+            serde_json::from_str(&client.read(&"orderbook_orders".to_string()).await.unwrap())
+                .unwrap();
+        assert_eq!(expected_orders, orders.len());
+
         node.shutdown().await.unwrap();
     });
 }

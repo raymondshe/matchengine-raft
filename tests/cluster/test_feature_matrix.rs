@@ -6,8 +6,9 @@
 //! fill and cancel, then checks expiry and stop events are explicit rather than
 //! overloaded rejections. `event_stream_reconstructs_visible_book` replays the
 //! replicated `/events` log into a mirror of the visible book.
-//! `negative_api_inputs_are_rejected` covers malformed bodies and unknown read
-//! keys.
+//! `amend_supports_parked_stops_and_icebergs` covers the extended amendment
+//! paths. `negative_api_inputs_are_rejected` covers malformed bodies and unknown
+//! read keys.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -705,6 +706,103 @@ fn event_stream_reconstructs_visible_book() {
             serde_json::from_str(&client.read(&"orderbook_stops".to_string()).await.unwrap())
                 .expect("stops json");
         assert!(stops.is_empty(), "the cascade removed the parked stop");
+
+        node.shutdown().await.unwrap();
+    });
+}
+
+#[test]
+fn amend_supports_parked_stops_and_icebergs() {
+    C::run(async {
+        let (node, client, _temp) = start_node("127.0.0.1:21936", "amend-extended").await;
+
+        // Park a sell stop-limit: trigger 95, child limit 94, 5 units.
+        let response = apply(&client, place(stop_limit(OrderSide::Sell, 94.0, 95.0, 5.0))).await;
+        assert_eq!(Some(0), response.sequence);
+        assert!(response.events.is_empty(), "a parked stop emits no event");
+
+        // The key carries the new trigger (96); `price` and `volume` update the
+        // child limit and open volume. The stop keeps sequence 0.
+        let mut stop_key = limit(OrderSide::Sell, 94.0, 5.0);
+        stop_key.sequence = 0;
+        stop_key.stop_price = Fixed::from(96);
+        let response = apply(
+            &client,
+            MatchEngineRequest::Amend {
+                order: stop_key,
+                price: Some(Fixed::from(93)),
+                volume: Some(Fixed::from(7)),
+            },
+        )
+        .await;
+        assert_eq!(vec![MatchEventKind::Amended], kinds(&response.events));
+        assert_eq!(0, response.events[0].order_sequence);
+        assert_eq!(Some(0), response.events[0].previous_sequence);
+        assert_eq!(Fixed::from(93), response.events[0].price);
+        assert_eq!(Fixed::from(7), response.events[0].volume);
+
+        let stops: Vec<Order> =
+            serde_json::from_str(&client.read(&"orderbook_stops".to_string()).await.unwrap())
+                .unwrap();
+        assert_eq!(1, stops.len());
+        assert_eq!(Fixed::from(96), stops[0].stop_price);
+        assert_eq!(Fixed::from(93), stops[0].price);
+        assert_eq!(Fixed::from(7), stops[0].volume);
+
+        // An iceberg amend takes the new total open volume and preserves the
+        // display tranche. Sequence 1 was the stop amendment, so the iceberg is
+        // sequence 2.
+        let mut iceberg = limit(OrderSide::Sell, 100.0, 10.0);
+        iceberg.display_volume = Fixed::from(4);
+        let response = apply(&client, place(iceberg)).await;
+        assert_eq!(Some(2), response.sequence);
+        assert_eq!(vec![MatchEventKind::Rested], kinds(&response.events));
+
+        let mut iceberg_key = limit(OrderSide::Sell, 100.0, 10.0);
+        iceberg_key.sequence = 2;
+        let response = apply(
+            &client,
+            MatchEngineRequest::Amend {
+                order: iceberg_key,
+                price: None,
+                volume: Some(Fixed::from(6)),
+            },
+        )
+        .await;
+        assert_eq!(vec![MatchEventKind::Amended], kinds(&response.events));
+        assert_eq!(2, response.events[0].order_sequence, "priority is kept");
+        assert_eq!(Some(2), response.events[0].previous_sequence);
+        assert_eq!(Fixed::from(6), response.events[0].volume);
+
+        let orders: Vec<Order> =
+            serde_json::from_str(&client.read(&"orderbook_orders".to_string()).await.unwrap())
+                .unwrap();
+        assert_eq!(1, orders.len());
+        assert_eq!(Fixed::from(4), orders[0].volume);
+        assert_eq!(Fixed::from(2), orders[0].hidden_volume);
+
+        // Growing the reserve re-inserts under a new sequence; the event
+        // reports the new total open volume.
+        let response = apply(
+            &client,
+            MatchEngineRequest::Amend {
+                order: iceberg_key,
+                price: None,
+                volume: Some(Fixed::from(12)),
+            },
+        )
+        .await;
+        assert_eq!(vec![MatchEventKind::Amended], kinds(&response.events));
+        assert_eq!(4, response.events[0].order_sequence);
+        assert_eq!(Some(2), response.events[0].previous_sequence);
+        assert_eq!(Fixed::from(12), response.events[0].volume);
+
+        let orders: Vec<Order> =
+            serde_json::from_str(&client.read(&"orderbook_orders".to_string()).await.unwrap())
+                .unwrap();
+        assert_eq!(1, orders.len());
+        assert_eq!(Fixed::from(4), orders[0].volume);
+        assert_eq!(Fixed::from(8), orders[0].hidden_volume);
 
         node.shutdown().await.unwrap();
     });
