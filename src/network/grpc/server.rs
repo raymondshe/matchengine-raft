@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
+use std::time::Instant;
 
 use futures::Stream;
 use futures::StreamExt;
@@ -37,6 +38,7 @@ use crate::network::MAX_SNAPSHOT_BYTES;
 use crate::network::grpc::STREAM_APPEND_CHANNEL_SIZE;
 use crate::network::grpc::decode;
 use crate::network::grpc::encode;
+use crate::network::grpc::metrics::TransportMetrics;
 use crate::network::grpc::pb::AppendRequest;
 use crate::network::grpc::pb::AppendResponse;
 use crate::network::grpc::pb::SnapshotChunk;
@@ -53,13 +55,19 @@ pub struct RaftGrpcService {
     raft: MatchEngineRaft,
     /// Directory for snapshot bodies received from the leader.
     snapshot_staging_dir: PathBuf,
+    transport: Arc<TransportMetrics>,
 }
 
 impl RaftGrpcService {
-    pub fn new(raft: MatchEngineRaft, snapshot_staging_dir: impl Into<PathBuf>) -> Self {
+    pub fn new(
+        raft: MatchEngineRaft,
+        snapshot_staging_dir: impl Into<PathBuf>,
+        transport: Arc<TransportMetrics>,
+    ) -> Self {
         Self {
             raft,
             snapshot_staging_dir: snapshot_staging_dir.into(),
+            transport,
         }
     }
 }
@@ -247,6 +255,7 @@ impl RaftService for RaftGrpcService {
         &self,
         request: Request<Streaming<SnapshotChunk>>,
     ) -> Result<Response<crate::network::grpc::pb::SnapshotResponse>, Status> {
+        let started = Instant::now();
         let mut stream = request.into_inner();
 
         let mut staging = SnapshotStaging::create(&self.snapshot_staging_dir).await?;
@@ -303,6 +312,7 @@ impl RaftService for RaftGrpcService {
         };
 
         let staged = staging.finish().await?;
+        let snapshot_bytes = staged.len() as usize;
         let snapshot = SnapshotOf::<MatchEngineTypeConfig, SnapshotData> {
             meta,
             snapshot: SnapshotData::Staged(Arc::new(staged)),
@@ -315,6 +325,8 @@ impl RaftService for RaftGrpcService {
             Ok(resp) => Ok(resp),
             Err(e) => Err(StreamingError::Network(NetworkError::new(&e))),
         };
+        self.transport
+            .record_snapshot_received(started.elapsed(), snapshot_bytes, result.is_ok());
 
         let payload = encode(&result)
             .map_err(|e| Status::internal(format!("encode snapshot response: {e}")))?;

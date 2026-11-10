@@ -46,8 +46,11 @@ batches landed too: FOK atomicity, iceberg conservation/refill priority, stop-ca
 event-stream reconstruction, event-cursor survival across snapshot/restart and retention eviction,
 GTD purge idempotence, post-only/amend interactions, fee conservation and the modify-priority
 matrix (§17). OpenRaft observability now exposes `data_metrics`/`server_metrics`/`runtime_stats`
-through `/metrics`, uses explicit heartbeat/snapshot channel profiles, and documents flamegraph
-and tokio-console use in `cluster_e2e` (§16). The benchmark regression gate now runs in CI:
+plus process-local `transport_metrics` (heartbeat/replication `AppendStream` streams and requests,
+snapshot send/receive time) through `/metrics`, uses explicit heartbeat/snapshot channel profiles,
+and documents flamegraph and tokio-console use in `cluster_e2e` (§16). The console gained guarded
+`purge-log` and `runtime-config` actions alongside transfer/election/snapshot. The benchmark
+regression gate now runs in CI:
 exact `apply_path` allocation ceilings plus loose `book_replay`/`replay_mix` p50/p99 bounds, with
 a manual Linux workflow for the pinned-core `e2e` pass (§8). The four-voter no-fsync contract now
 has a real-process leader-kill test: three survivors commit, and the restarted node catches up
@@ -92,12 +95,10 @@ The next work, in order (re-prioritised 2026-11-10 after the Aeron heartbeat/req
    external-driver plus multicast fan-out checklist in
    [`demos/market_data_system/README.md`](./demos/market_data_system/README.md). Both remain blocked
    on a Linux host; `gh` authentication is also needed for the workflow.
-2. **Observability measurements and console actions (§16, P2).** Record heartbeat/`AppendStream`
-   counts and snapshot-transfer time, and add guarded purge-log/runtime-config console actions.
-3. **Benchmark P2 follow-ups (P2, §17).** Add the open-loop latency run (or the coordinated-omission
+2. **Benchmark P2 follow-ups (P2, §17).** Add the open-loop latency run (or the coordinated-omission
    caveat), re-pin the benchmark to current `HEAD`, and evaluate a treap/sorted-vector/heap hybrid
    only as a book-only A/B.
-4. **Last: apply-path and per-level-bucket experiments (§8, P3).** Reserve known apply-path
+3. **Last: apply-path and per-level-bucket experiments (§8, P3).** Reserve known apply-path
    lengths, evaluate apply-thread affinity and adopt per-level buckets only if a sparse-level fast
    path or new measurements justify them; the measured wins are small or split.
 
@@ -918,9 +919,14 @@ and optional APIs.
   snapshot profiles; heartbeat uses smaller windows and snapshot uses a longer connect/keepalive
   profile, while each network still owns its lazy channel. The unit test asserts the factory
   returns the expected role for each method.
-- [ ] **P2** Record before/after measurements for heartbeat `AppendStream` count under sustained
-  writes and snapshot transfer time. The post-change e2e/storage baseline is now in
-  [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md); use it to confirm the 1 MiB / 4 MiB HTTP/2
+- [x] **P2** Record before/after measurements for heartbeat `AppendStream` count under sustained
+  writes and snapshot transfer time. Done: `/metrics.transport_metrics` counts heartbeat and
+  replication streams/requests plus snapshot send/receive count, bytes, average and max; the
+  four-node startup shows 2/2 heartbeat and 6/12 replication streams/requests, the 64-client
+  sustained sweep shows 0/0 heartbeat and 8/640 replication (the intended
+  `heartbeat_min_interval` suppression), and the snapshot test measures 2 sends averaging
+  34.4 ms (max 39.9 ms) with 2 receives averaging 33.7 ms. Numbers are in
+  [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md); use them to confirm the 1 MiB / 4 MiB HTTP/2
   window choice before tuning further.
 - [x] **P2** Benchmark `max_payload_entries` (300 vs 1,024), `purge_batch_size` (1 vs 1,024)
   and `api_batch_linger_ms` under the 4-node cluster and a client sweep. Done: max_payload 1,024
@@ -931,8 +937,13 @@ and optional APIs.
   keep linger at 0 unless measurements justify the latency tradeoff.
 - [ ] **P3** Benchmark `STREAM_APPEND_CHANNEL_SIZE` separately; it is a compile-time transport
   constant, so the runtime sweep above does not cover it.
-- [ ] **P2** Add guarded console actions for `raft.trigger().purge_log()` and supported
-  `raft.runtime_config()` changes after a snapshot; document the safety constraints.
+- [x] **P2** Add guarded console actions for `raft.trigger().purge_log()` and supported
+  `raft.runtime_config()` changes after a snapshot; document the safety constraints. Done:
+  `POST /console/api/actions/purge-log` defaults to the current snapshot index, rejects indices
+  above the snapshot, and is local to the serving node. `POST
+  /console/api/actions/runtime-config` toggles `tick`/`heartbeat`/`elect`/`pre_vote`, requires at
+  least one field, and is refused on the leader. Both use the existing action header/lock/history
+  guard; `test_console` covers the rejection and acceptance paths.
 
 **Storage**
 

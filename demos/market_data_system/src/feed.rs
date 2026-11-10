@@ -325,9 +325,7 @@ impl Feed {
         let depth = self.snapshot_levels.clamp(1, usize::from(u16::MAX)) as u16;
         let sent = requester.request(depth);
         if sent {
-            self.stats
-                .snapshot_requests
-                .fetch_add(1, Ordering::Relaxed);
+            self.stats.snapshot_requests.fetch_add(1, Ordering::Relaxed);
             tracing::debug!(%reason, depth, "requested fresh market-data snapshot");
         } else {
             tracing::warn!(%reason, "snapshot request queue full or transport stopped");
@@ -359,8 +357,7 @@ impl Feed {
         // Idle heartbeats intentionally repeat the same `(market_seq, sub_seq)`
         // key while the book is quiet; they are liveness/diagnostic frames, not
         // deterministic tape entries, so let every one through.
-        let heartbeat =
-            message.stream == STREAM_STATUS && message.sub_seq == HEARTBEAT_SUB_SEQ;
+        let heartbeat = message.stream == STREAM_STATUS && message.sub_seq == HEARTBEAT_SUB_SEQ;
         if !heartbeat {
             // Dedupe replayed JSONL lines and duplicate feeds by stream position.
             let position = (message.market_seq, message.sub_seq);
@@ -381,8 +378,7 @@ impl Feed {
             state.last_ts_ms = message.ts_ms;
             state.epoch = message.epoch;
             state.leader_id = message.leader_id;
-            state.heartbeat_deadline =
-                Some(std::time::Instant::now() + self.heartbeat_timeout);
+            state.heartbeat_deadline = Some(std::time::Instant::now() + self.heartbeat_timeout);
         }
 
         match &message.body {

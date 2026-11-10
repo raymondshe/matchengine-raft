@@ -190,14 +190,7 @@ fn setup(
     let request_stream = stream_base
         .checked_add(request::STREAM_OFFSET)
         .ok_or_else(|| io::Error::other("Aeron request stream id overflow"))?;
-    Ok((
-        driver,
-        aeron,
-        subscriptions,
-        tx,
-        channel,
-        request_stream,
-    ))
+    Ok((driver, aeron, subscriptions, tx, channel, request_stream))
 }
 
 fn poll_loop(
@@ -213,10 +206,7 @@ fn poll_loop(
         while let Ok(request) = request_rx.try_recv() {
             if request_publication.is_none() {
                 let publication = aeron
-                    .async_add_exclusive_publication(
-                        channel.as_c_str(),
-                        i32::from(request_stream),
-                    )
+                    .async_add_exclusive_publication(channel.as_c_str(), i32::from(request_stream))
                     .and_then(|poller| poller.poll_blocking(Duration::from_secs(5)));
                 match publication {
                     Ok(publication) => request_publication = Some(publication),

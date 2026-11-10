@@ -33,6 +33,7 @@ use tokio::sync::MutexGuard;
 use crate::MatchEngineNodeId;
 use crate::app::MatchEngineApp;
 use crate::match_result::EventId;
+use crate::network::grpc::metrics::TransportMetricsSnapshot;
 use crate::network::health;
 use crate::network::health::LeadershipHealth;
 use crate::network::health::StorageHealth;
@@ -122,6 +123,8 @@ pub struct ActionRecord {
     pub target: Option<MatchEngineNodeId>,
     pub result: String,
     pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 /// Stable node snapshot served by `GET /console/api/node`.
@@ -139,6 +142,7 @@ pub struct NodeSnapshot {
     pub leadership: LeadershipHealth,
     pub storage: StorageHealth,
     pub raft: RaftSnapshot,
+    pub transport: TransportMetricsSnapshot,
     pub events: EventsSnapshot,
     pub market_data: Option<MarketDataSnapshot>,
     pub orderbook: OrderbookSnapshot,
@@ -249,6 +253,59 @@ pub struct ActionResponse {
 #[derive(Debug, Deserialize)]
 pub struct TransferLeaderAction {
     pub target: MatchEngineNodeId,
+}
+
+/// Purge this node's local log up to a snapshot-covered index.
+///
+/// `upto` defaults to the current snapshot index. OpenRaft clamps and may delay
+/// the purge while replication is in flight.
+#[derive(Debug, Deserialize)]
+pub struct PurgeLogAction {
+    #[serde(default)]
+    pub upto: Option<u64>,
+}
+
+/// Node-local OpenRaft runtime switches.
+///
+/// All fields are optional; at least one must be present. The action is refused
+/// on the leader so a maintenance toggle cannot break heartbeats/leases for the
+/// whole cluster.
+#[derive(Debug, Default, Deserialize)]
+pub struct RuntimeConfigAction {
+    #[serde(default)]
+    pub tick: Option<bool>,
+    #[serde(default)]
+    pub heartbeat: Option<bool>,
+    #[serde(default)]
+    pub elect: Option<bool>,
+    #[serde(default)]
+    pub pre_vote: Option<bool>,
+}
+
+impl RuntimeConfigAction {
+    fn is_empty(&self) -> bool {
+        self.tick.is_none()
+            && self.heartbeat.is_none()
+            && self.elect.is_none()
+            && self.pre_vote.is_none()
+    }
+
+    fn description(&self) -> String {
+        let mut changes = Vec::new();
+        if let Some(value) = self.tick {
+            changes.push(format!("tick={value}"));
+        }
+        if let Some(value) = self.heartbeat {
+            changes.push(format!("heartbeat={value}"));
+        }
+        if let Some(value) = self.elect {
+            changes.push(format!("elect={value}"));
+        }
+        if let Some(value) = self.pre_vote {
+            changes.push(format!("pre_vote={value}"));
+        }
+        changes.join(", ")
+    }
 }
 
 /// Redirects `/console` to `/console/` so relative asset paths are stable.
@@ -516,6 +573,7 @@ pub async fn transfer_leader(
         target: Some(target),
         result: if accepted { "accepted" } else { "failed" }.to_string(),
         error: (!accepted).then(|| message.clone()),
+        detail: None,
     });
     drop(guard);
 
@@ -578,6 +636,7 @@ pub async fn elect(app: Data<MatchEngineApp>, request: HttpRequest) -> HttpRespo
         target: Some(app.id),
         result: if accepted { "accepted" } else { "failed" }.to_string(),
         error: (!accepted).then(|| message.clone()),
+        detail: None,
     });
     drop(guard);
 
@@ -629,6 +688,7 @@ pub async fn snapshot(app: Data<MatchEngineApp>, request: HttpRequest) -> HttpRe
         target: None,
         result: if accepted { "accepted" } else { "failed" }.to_string(),
         error: (!accepted).then(|| message.clone()),
+        detail: None,
     });
     drop(guard);
 
@@ -646,6 +706,168 @@ pub async fn snapshot(app: Data<MatchEngineApp>, request: HttpRequest) -> HttpRe
     } else {
         HttpResponse::ServiceUnavailable().json(response)
     }
+}
+
+/// Purges this node's local Raft log up to a snapshot-covered index.
+///
+/// The action is local: it never changes another node's log. OpenRaft refuses
+/// to purge entries not covered by a snapshot and may delay the purge while a
+/// replication task is still reading those entries.
+#[post("/console/api/actions/purge-log")]
+pub async fn purge_log(
+    app: Data<MatchEngineApp>,
+    request: HttpRequest,
+    body: Json<PurgeLogAction>,
+) -> HttpResponse {
+    if !action_headers_ok(&request) {
+        return action_error(
+            StatusCode::BAD_REQUEST,
+            "missing X-Console-Action header or cross-origin request",
+        );
+    }
+
+    let metrics = app.raft.metrics().borrow_watched().clone();
+    let Some(snapshot_log) = metrics.snapshot else {
+        return action_error(
+            StatusCode::CONFLICT,
+            "no snapshot exists; trigger a snapshot and wait for it to complete before purging",
+        );
+    };
+    let upto = body.upto.unwrap_or(snapshot_log.index);
+    if upto == 0 {
+        return action_error(StatusCode::BAD_REQUEST, "purge index must be positive");
+    }
+    if upto > snapshot_log.index {
+        return action_error(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "cannot purge index {upto}: the current snapshot only covers {}",
+                snapshot_log.index
+            ),
+        );
+    }
+
+    let guard = match app.console.action_guard().await {
+        Ok(guard) => guard,
+        Err(()) => {
+            return action_error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "another console action is in progress",
+            );
+        }
+    };
+    let result = app.raft.trigger().purge_log(upto).await;
+    let (accepted, message) = match &result {
+        Ok(()) => (
+            true,
+            format!(
+                "purge scheduled up to {upto} on this node; OpenRaft may delay it while replication is in flight"
+            ),
+        ),
+        Err(error) => (false, format!("purge request failed: {error}")),
+    };
+    app.console.record(ActionRecord {
+        at_ms: now_ms(),
+        action: "purge-log".to_string(),
+        target: None,
+        result: if accepted { "accepted" } else { "failed" }.to_string(),
+        error: (!accepted).then(|| message.clone()),
+        detail: Some(format!("upto={upto}; snapshot={}", snapshot_log.index)),
+    });
+    drop(guard);
+
+    let response = ActionResponse {
+        accepted,
+        action: "purge-log".to_string(),
+        target: None,
+        node_id: app.id,
+        leader_id: metrics.current_leader,
+        term: metrics.current_term,
+        message,
+    };
+    if accepted {
+        HttpResponse::Accepted().json(response)
+    } else {
+        HttpResponse::ServiceUnavailable().json(response)
+    }
+}
+
+/// Applies node-local OpenRaft runtime switches.
+///
+/// This is deliberately refused on the leader: disabling `tick` or `heartbeat`
+/// on the leader can stop leases and replication for the whole cluster. Use the
+/// transfer-leader action first, then tune the follower.
+#[post("/console/api/actions/runtime-config")]
+pub async fn runtime_config(
+    app: Data<MatchEngineApp>,
+    request: HttpRequest,
+    body: Json<RuntimeConfigAction>,
+) -> HttpResponse {
+    if !action_headers_ok(&request) {
+        return action_error(
+            StatusCode::BAD_REQUEST,
+            "missing X-Console-Action header or cross-origin request",
+        );
+    }
+    if body.is_empty() {
+        return action_error(
+            StatusCode::BAD_REQUEST,
+            "runtime-config needs at least one of tick/heartbeat/elect/pre_vote",
+        );
+    }
+
+    let metrics = app.raft.metrics().borrow_watched().clone();
+    if metrics.current_leader == Some(app.id) {
+        return action_error(
+            StatusCode::CONFLICT,
+            "runtime config is node-local and is refused on the leader; transfer leadership first",
+        );
+    }
+
+    let guard = match app.console.action_guard().await {
+        Ok(guard) => guard,
+        Err(()) => {
+            return action_error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "another console action is in progress",
+            );
+        }
+    };
+    let runtime = app.raft.runtime_config();
+    if let Some(value) = body.tick {
+        runtime.tick(value);
+    }
+    if let Some(value) = body.heartbeat {
+        runtime.heartbeat(value);
+    }
+    if let Some(value) = body.elect {
+        runtime.elect(value);
+    }
+    if let Some(value) = body.pre_vote {
+        runtime.pre_vote(value);
+    }
+    let detail = body.description();
+    let message = format!("applied node-local runtime config: {detail}");
+    app.console.record(ActionRecord {
+        at_ms: now_ms(),
+        action: "runtime-config".to_string(),
+        target: Some(app.id),
+        result: "accepted".to_string(),
+        error: None,
+        detail: Some(detail.clone()),
+    });
+    drop(guard);
+
+    let response = ActionResponse {
+        accepted: true,
+        action: "runtime-config".to_string(),
+        target: Some(app.id),
+        node_id: app.id,
+        leader_id: metrics.current_leader,
+        term: metrics.current_term,
+        message,
+    };
+    HttpResponse::Accepted().json(response)
 }
 
 async fn collect_node_snapshot(app: &MatchEngineApp) -> NodeSnapshot {
@@ -745,10 +967,16 @@ async fn collect_node_snapshot(app: &MatchEngineApp) -> NodeSnapshot {
             learners,
             replication,
         },
+        transport: app.transport.snapshot(),
         events,
         market_data,
         orderbook,
-        capabilities: vec!["console_v1".to_string(), "transfer_leader".to_string()],
+        capabilities: vec![
+            "console_v1".to_string(),
+            "transfer_leader".to_string(),
+            "purge_log".to_string(),
+            "runtime_config".to_string(),
+        ],
         errors: health.errors.clone(),
     }
 }
@@ -825,6 +1053,7 @@ mod tests {
                 target: None,
                 result: "accepted".to_string(),
                 error: None,
+                detail: None,
             });
         }
         let recent = state.recent();

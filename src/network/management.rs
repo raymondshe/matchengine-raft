@@ -22,6 +22,7 @@ use crate::MatchEngineNodeId;
 use crate::MatchEngineTypeConfig;
 use crate::app::MatchEngineApp;
 use crate::network::admission::AdmissionStatus;
+use crate::network::grpc::metrics::TransportMetricsSnapshot;
 use crate::network::read_policy::ReadPath;
 
 /// Serializable representation of linearizer data for follower reads
@@ -45,6 +46,7 @@ pub struct MetricsResponse {
     pub raft: RaftMetrics<MatchEngineTypeConfig>,
     pub data_metrics: RaftDataMetrics<MatchEngineTypeConfig>,
     pub server_metrics: RaftServerMetrics<MatchEngineTypeConfig>,
+    pub transport_metrics: TransportMetricsSnapshot,
     pub runtime_stats: Option<String>,
 }
 
@@ -182,6 +184,7 @@ pub async fn metrics(app: Data<MatchEngineApp>) -> actix_web::Result<impl Respon
         raft,
         data_metrics,
         server_metrics,
+        transport_metrics: app.transport.snapshot(),
         runtime_stats,
     });
     Ok(Json(res))

@@ -38,6 +38,7 @@ use crate::network::grpc::HTTP2_STREAM_WINDOW;
 use crate::network::grpc::MAX_MESSAGE_SIZE;
 use crate::network::grpc::client::GrpcNetworkFactory;
 use crate::network::grpc::events::EventStreamService;
+use crate::network::grpc::metrics::TransportMetrics;
 use crate::network::grpc::pb::event_service_server::EventServiceServer;
 use crate::network::grpc::pb::raft_service_server::RaftServiceServer;
 use crate::network::grpc::server::RaftGrpcService;
@@ -620,7 +621,8 @@ pub async fn build_match_engine_node(
 
     // Create the network layer that will connect and communicate the raft instances and
     // will be used in conjunction with the store created above.
-    let network = GrpcNetworkFactory::new(node_id);
+    let transport_metrics = TransportMetrics::shared();
+    let network = GrpcNetworkFactory::with_metrics(node_id, transport_metrics.clone());
 
     // A positive RAFT_CORE_WORKERS isolates OpenRaft on its own runtime so
     // RaftCore and the state-machine worker do not share workers with HTTP,
@@ -694,7 +696,11 @@ pub async fn build_match_engine_node(
     // Serve the gRPC transport. The listener is already bound, so peers can
     // connect as soon as this node is initialized.
     let read_policy = ReadPolicyRuntime::new(storage.read_policy);
-    let grpc_service = RaftGrpcService::new(raft.clone(), storage.snapshot_dir(node_id));
+    let grpc_service = RaftGrpcService::new(
+        raft.clone(),
+        storage.snapshot_dir(node_id),
+        transport_metrics.clone(),
+    );
     let event_service = EventStreamService::new(
         raft.clone(),
         state_machine_store.clone(),
@@ -753,6 +759,7 @@ pub async fn build_match_engine_node(
         min_voters: storage.min_voters,
         read_policy,
         admission,
+        transport: transport_metrics,
         console: console::ConsoleState::new(),
     });
 
@@ -780,6 +787,8 @@ pub async fn build_match_engine_node(
             .service(console::transfer_leader)
             .service(console::elect)
             .service(console::snapshot)
+            .service(console::purge_log)
+            .service(console::runtime_config)
             // admin API
             .service(management::init)
             .service(management::add_learner)

@@ -1,10 +1,10 @@
 # Operational console (WebUI) design
 
 Status: **implemented** — the embedded `/console/` UI, node/cluster APIs, guarded
-transfer/election/snapshot actions and the gRPC `TransferLeader` RPC are in place. Streaming
-updates, sparklines and guarded membership/bootstrap actions remain future work.
+transfer/election/snapshot/purge/runtime-config actions and the gRPC `TransferLeader` RPC are in
+place. Streaming updates, sparklines and guarded membership/bootstrap actions remain future work.
 
-Last updated: 2026-11-02.
+Last updated: 2026-11-10.
 
 Related documents: [`AGENTS.md`](../AGENTS.md), [`docs/PERFORMANCE.md`](./PERFORMANCE.md),
 [`docs/MATCH_RESULTS.md`](./MATCH_RESULTS.md), [`docs/MARKET_DATA_PLAN.md`](./MARKET_DATA_PLAN.md).
@@ -54,8 +54,8 @@ console inherits that contract and must not be exposed directly to an untrusted 
   operational view; it does not retain history.
 - Multi-cluster management. One process/cluster trades one symbol; the console manages the cluster
   that served it. A gateway can link to several consoles.
-- Membership changes, log purging, node shutdown or destructive storage actions in the first
-  version. These are high-risk and need a separate design.
+- Membership changes, node shutdown or arbitrary destructive storage actions in the first
+  version. `purge-log` is the one local log-deletion action and is guarded by a snapshot boundary.
 - A JavaScript framework or a frontend build pipeline in the first version.
 
 ## 3. Constraints and current state
@@ -119,6 +119,8 @@ Primary flow:
 - Membership table: voters, learners, node addresses.
 - Leader-only replication table: per-node matched index, lag, last heartbeat age.
 - Log frontier: last log, local committed, cluster committed, last applied, snapshot, purged.
+- Process-local transport counters: heartbeat/replication `AppendStream` streams and requests,
+  snapshot send/receive count with average and max transfer time.
 - Recent leadership/election state transitions if the UI keeps a short client-side history
   (optional; not persisted).
 
@@ -151,12 +153,19 @@ First version:
 - **Request election on this node** using OpenRaft Pre-Vote. Best-effort fallback; useful when
   graceful transfer is unavailable or the operator explicitly wants a specific node to campaign.
 - **Trigger snapshot** on this node. Low-risk diagnostic/maintenance action; still confirmed.
-- Action history (last N actions) with timestamp, action, target, result and error. This can start
-  as an in-memory ring buffer and is not durable.
+- **Purge this node's log**. Requires an existing snapshot and an index at or below the snapshot
+  boundary (blank defaults to the snapshot index). The action is local to the serving node;
+  OpenRaft clamps to the snapshot and may delay the purge while a replication task is reading the
+  entries. It never purges another node's log.
+- **Runtime switches**. Node-local OpenRaft `tick`, `heartbeat`, `elect` and `pre_vote` toggles.
+  Refused on the leader so a maintenance toggle cannot stop leases/heartbeats for the cluster;
+  transfer leadership first. Every field is optional and at least one is required.
+- Action history (last N actions) with timestamp, action, target, result, detail and error. This
+  starts as an in-memory ring buffer and is not durable.
 
 Later, with a separate design:
 
-- Add learner, change membership, initialize cluster, purge logs, download diagnostics bundles.
+- Add learner, change membership, initialize cluster, download diagnostics bundles.
 
 ### 5.6 Diagnostics
 
@@ -179,6 +188,8 @@ Later, with a separate design:
 | `POST` | `/console/api/actions/transfer-leader` | Graceful leadership transfer |
 | `POST` | `/console/api/actions/elect` | Request a local election with Pre-Vote |
 | `POST` | `/console/api/actions/snapshot` | Trigger a local snapshot |
+| `POST` | `/console/api/actions/purge-log` | Purge local log up to a snapshot-covered index |
+| `POST` | `/console/api/actions/runtime-config` | Node-local OpenRaft runtime switches |
 | `GET` | `/console/api/actions` | Recent in-memory action records |
 
 The console routes live under `/console` so a gateway can expose or block the whole surface with
@@ -226,6 +237,18 @@ Module layout:
       { "node_id": 2, "matched_index": 42, "lag": 0, "last_ack_ms_ago": 18 }
     ]
   },
+  "transport": {
+    "heartbeat_streams": 2,
+    "heartbeat_requests": 8,
+    "replication_streams": 6,
+    "replication_requests": 120,
+    "snapshot_sent": 1,
+    "snapshot_sent_bytes": 4096,
+    "snapshot_sent_avg_micros": 34418,
+    "snapshot_sent_max_micros": 39963,
+    "snapshot_received": 0,
+    "snapshot_received_avg_micros": 0
+  },
   "storage": {
     "wal_last_index": 42,
     "wal_last_purged_index": 10,
@@ -244,7 +267,7 @@ Module layout:
     "leader_gate_open": true,
     "last_market_seq": 42
   },
-  "capabilities": ["console_v1", "transfer_leader"],
+  "capabilities": ["console_v1", "transfer_leader", "purge_log", "runtime_config"],
   "errors": []
 }
 ```
@@ -380,6 +403,22 @@ message TransferLeaderResponse { bytes payload = 1; }
 - The console is not a new trust boundary. Existing `/init` and `/change-membership` are equally
   powerful, so the gateway must already protect the whole HTTP listener.
 
+#### Purge-log and runtime-config constraints
+
+- `purge-log` is local maintenance, not a cluster mutation: it calls
+  `raft.trigger().purge_log(upto)` on the serving node only. It requires a completed snapshot and
+  rejects `upto` above `RaftMetrics::snapshot.index` with `400`; a missing snapshot is `409`.
+  Blank `upto` uses the snapshot index. OpenRaft clamps the request and may delay the purge while
+  a replication task still reads the entries, so the action only schedules the purge.
+- `runtime-config` toggles OpenRaft's `tick`, `heartbeat`, `elect` and `pre_vote` switches on the
+  serving node. At least one field is required (`400` otherwise). It is refused with `409` when
+  this node is the leader: disabling ticks or heartbeats on the leader would stop leases and
+  replication for the whole cluster. Transfer leadership first, then tune the follower. These
+  switches are in-memory and reset on restart.
+- Both actions use the same `X-Console-Action`/origin check, process-wide action lock and action
+  history as transfer/election/snapshot; the history records the purge index or the exact runtime
+  changes in `detail`.
+
 ### 6.6 Static assets
 
 - Store assets in `web/console/index.html`, `web/console/app.js`, `web/console/app.css` and embed
@@ -445,6 +484,14 @@ and no JavaScript; it is a visual reference for the implementation, not producti
   - Explain that a healthy leader may reject the request.
 - Snapshot:
   - Show the current snapshot/applied indices before and after.
+- Purge:
+  - Show the current snapshot and purged indices, and default the input to the snapshot index.
+  - Require an explicit checkbox; explain that only local log entries covered by the snapshot are
+    deleted and that OpenRaft may delay the purge while replication is in flight.
+- Runtime config:
+  - Disable submission while this node is the leader and explain that leadership must move first.
+  - Each switch is "unchanged/enable/disable"; require a checkbox and show the exact changes in
+    the result line.
 - Disable actions when the node is unhealthy, not a voter, not the leader (for transfer), or the
   required capability is missing.
 
@@ -457,6 +504,7 @@ and no JavaScript; it is a visual reference for the implementation, not producti
 | Log/applied/committed/snapshot/purged | `RaftMetrics` + `LogStore`/state-machine state |
 | Membership voters/learners | `RaftMetrics::membership_config` |
 | Replication lag/heartbeat | leader `RaftMetrics::replication` / `heartbeat` |
+| Transport streams, requests, snapshot timing | `GET /metrics.transport_metrics` (also `NodeSnapshot.transport`) |
 | Event retention | `GET /events/status` |
 | Market-data gate/counters | `POST /read` with `"marketdata_status"` |
 | Order-book sequence/spread/last trade | `POST /read` with scalar keys |
@@ -637,5 +685,7 @@ Still open:
   writes continue.
 - Invalid actions (non-leader, learner, self, unknown target, missing action header) are rejected
   without changing Raft state.
+- Purge-log rejects a missing snapshot or an index above the snapshot and accepts the snapshot
+  index; runtime-config is refused on the leader and accepted on a follower.
 - Existing `/health`, `/ready`, `/metrics`, `/write`, `/read` and `/events` behavior is unchanged.
 - Tests cover action validation, transfer success and security headers.

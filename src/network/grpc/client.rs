@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
+use std::time::Instant;
 
 use futures::Future;
 use futures::Stream;
@@ -51,6 +52,7 @@ use crate::network::grpc::SNAPSHOT_CHUNK_SIZE_MAX;
 use crate::network::grpc::STREAM_APPEND_CHANNEL_SIZE;
 use crate::network::grpc::decode;
 use crate::network::grpc::encode;
+use crate::network::grpc::metrics::TransportMetrics;
 use crate::network::grpc::pb::AppendRequest;
 use crate::network::grpc::pb::SnapshotChunk;
 use crate::network::grpc::pb::SnapshotResponse as PbSnapshotResponse;
@@ -67,6 +69,8 @@ where
     local_id: C::NodeId,
     target: C::NodeId,
     role: GrpcChannelRole,
+    /// Process-local transport counters.
+    metrics: Arc<TransportMetrics>,
     /// `Err` carries a configuration error; every RPC reports it as unreachable.
     channel: Result<Channel, String>,
     _p: PhantomData<C>,
@@ -137,7 +141,13 @@ where
     C: RaftTypeConfig<Node = BasicNode>,
 {
     pub fn new(local_id: C::NodeId, target: C::NodeId, api_addr: &str) -> Self {
-        Self::new_with_role(local_id, target, api_addr, GrpcChannelRole::Replication)
+        Self::new_with_role(
+            local_id,
+            target,
+            api_addr,
+            GrpcChannelRole::Replication,
+            TransportMetrics::shared(),
+        )
     }
 
     fn new_with_role(
@@ -145,6 +155,7 @@ where
         target: C::NodeId,
         api_addr: &str,
         role: GrpcChannelRole,
+        metrics: Arc<TransportMetrics>,
     ) -> Self {
         let (raft_addr, channel) = match raft_addr_from_http(api_addr) {
             Ok(addr) => {
@@ -160,6 +171,7 @@ where
             local_id,
             target,
             role,
+            metrics,
             channel,
             _p: PhantomData,
         }
@@ -357,6 +369,8 @@ where
         cancel: impl Future<Output = ReplicationClosed> + OptionalSend + 'static,
         option: RPCOption,
     ) -> Result<SnapshotResponse<C>, StreamingError<C>> {
+        let started = Instant::now();
+        let metrics = self.metrics.clone();
         let mut client = self.client().map_err(StreamingError::from)?;
         let ttl = option.soft_ttl();
         let chunk_size = option
@@ -376,6 +390,7 @@ where
                     .into()
             }
         };
+        let snapshot_bytes = data.len();
         let vote = encode(&vote).map_err(|e| StreamingError::Network(NetworkError::new(&e)))?;
         let meta = encode(&meta).map_err(|e| StreamingError::Network(NetworkError::new(&e)))?;
 
@@ -432,10 +447,12 @@ where
             result
         };
 
-        tokio::select! {
+        let result = tokio::select! {
             closed = cancel => Err(StreamingError::Closed(closed)),
             result = call => result,
-        }
+        };
+        metrics.record_snapshot_sent(started.elapsed(), snapshot_bytes, result.is_ok());
+        result
     }
 
     /// Pipelined AppendEntries over one bidirectional gRPC stream.
@@ -455,6 +472,9 @@ where
             let ttl = option.soft_ttl();
             let local_id = self.local_id.clone();
             let target = self.target.clone();
+            let heartbeat = self.role == GrpcChannelRole::Heartbeat;
+            self.metrics.record_stream(heartbeat);
+            let metrics = self.metrics.clone();
 
             let (tx, rx) = mpsc::channel::<AppendRequest>(STREAM_APPEND_CHANNEL_SIZE);
 
@@ -474,6 +494,7 @@ where
                     match encode(&req) {
                         Ok(payload) => {
                             inflight_feed.fetch_add(1, Ordering::SeqCst);
+                            metrics.record_append_request(heartbeat);
                             if tx.send(AppendRequest { payload }).await.is_err() {
                                 inflight_feed.fetch_sub(1, Ordering::SeqCst);
                                 break;
@@ -581,12 +602,24 @@ fn decrement_inflight(inflight: &AtomicUsize) {
 /// Factory for the gRPC-only Raft network.
 pub struct GrpcNetworkFactory {
     local_id: crate::MatchEngineNodeId,
+    metrics: Arc<TransportMetrics>,
 }
 
 impl GrpcNetworkFactory {
     /// Creates a factory for connections originating at `local_id`.
     pub fn new(local_id: crate::MatchEngineNodeId) -> Self {
-        Self { local_id }
+        Self {
+            local_id,
+            metrics: TransportMetrics::shared(),
+        }
+    }
+
+    /// Creates a factory sharing the node's transport counters.
+    pub fn with_metrics(
+        local_id: crate::MatchEngineNodeId,
+        metrics: Arc<TransportMetrics>,
+    ) -> Self {
+        Self { local_id, metrics }
     }
 }
 
@@ -603,6 +636,7 @@ impl openraft::network::RaftNetworkFactory<crate::MatchEngineTypeConfig> for Grp
             target,
             &node.addr,
             GrpcChannelRole::Replication,
+            self.metrics.clone(),
         )
     }
 
@@ -616,6 +650,7 @@ impl openraft::network::RaftNetworkFactory<crate::MatchEngineTypeConfig> for Grp
             target,
             &node.addr,
             GrpcChannelRole::Heartbeat,
+            self.metrics.clone(),
         )
     }
 
@@ -624,7 +659,13 @@ impl openraft::network::RaftNetworkFactory<crate::MatchEngineTypeConfig> for Grp
         target: crate::MatchEngineNodeId,
         node: &BasicNode,
     ) -> Self::Network {
-        GrpcNetwork::new_with_role(self.local_id, target, &node.addr, GrpcChannelRole::Snapshot)
+        GrpcNetwork::new_with_role(
+            self.local_id,
+            target,
+            &node.addr,
+            GrpcChannelRole::Snapshot,
+            self.metrics.clone(),
+        )
     }
 }
 

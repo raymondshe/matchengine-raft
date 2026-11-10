@@ -12,6 +12,8 @@ use matchengine_raft::order_book::OrderSide;
 use matchengine_raft::store::MatchEngineRequest;
 use openraft::SnapshotPolicy;
 use openraft::type_config::TypeConfigExt;
+use reqwest::StatusCode;
+use serde_json::Value;
 
 use crate::common::TestAddr;
 
@@ -139,6 +141,36 @@ async fn test_grpc_snapshot_install_inner() -> anyhow::Result<()> {
             .all(|event| event.kind == MatchEventKind::Rested),
         "unexpected events after snapshot install: {events:?}"
     );
+
+    // The leader measured the send and the learner measured the receive.
+    let http = reqwest::Client::builder().no_proxy().build()?;
+    for (label, addr, sent) in [("leader", addr1, true), ("learner", addr2, false)] {
+        let response = http.get(format!("http://{addr}/metrics")).send().await?;
+        assert_eq!(StatusCode::OK, response.status());
+        let body: Value = response.json().await?;
+        let transport = &body["Ok"]["transport_metrics"];
+        println!("{label} transport: {transport}");
+        let count = if sent {
+            transport["snapshot_sent"].as_u64().unwrap_or(0)
+        } else {
+            transport["snapshot_received"].as_u64().unwrap_or(0)
+        };
+        assert!(count >= 1, "{label} snapshot counter: {transport}");
+        let bytes = if sent {
+            transport["snapshot_sent_bytes"].as_u64().unwrap_or(0)
+        } else {
+            transport["snapshot_received_bytes"].as_u64().unwrap_or(0)
+        };
+        assert!(bytes > 0, "{label} snapshot bytes: {transport}");
+        let average = if sent {
+            transport["snapshot_sent_avg_micros"].as_u64().unwrap_or(0)
+        } else {
+            transport["snapshot_received_avg_micros"]
+                .as_u64()
+                .unwrap_or(0)
+        };
+        assert!(average > 0, "{label} snapshot average: {transport}");
+    }
 
     node1.shutdown().await?;
     node2.shutdown().await?;

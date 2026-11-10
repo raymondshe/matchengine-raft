@@ -271,14 +271,10 @@ fn subscribe(
             _ => false,
         }
     };
-    if needs_snapshot
-        && let Some(requester) = &runtime.snapshot_requester
-    {
+    if needs_snapshot && let Some(requester) = &runtime.snapshot_requester {
         let depth = ctx.config.snapshot_levels.clamp(1, usize::from(u16::MAX)) as u16;
         if requester.request(depth) {
-            ctx.stats
-                .snapshot_requests
-                .fetch_add(1, Ordering::Relaxed);
+            ctx.stats.snapshot_requests.fetch_add(1, Ordering::Relaxed);
         }
     }
 

@@ -176,9 +176,7 @@ async fn main() {
         "ws_fanout: {} clients, {} updates, {:?}, offered {:.0}/s",
         options.clients, options.updates, elapsed, offered
     );
-    println!(
-        "  received {received} frames ({per_client:.1}/client), {frame_rate:.0} frames/s"
-    );
+    println!("  received {received} frames ({per_client:.1}/client), {frame_rate:.0} frames/s");
 
     running.shutdown().await;
 }

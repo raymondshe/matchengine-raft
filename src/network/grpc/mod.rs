@@ -8,6 +8,7 @@ use std::time::Duration;
 
 pub mod client;
 pub mod events;
+pub mod metrics;
 pub mod server;
 
 pub mod pb {

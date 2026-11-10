@@ -955,6 +955,31 @@ every offered update reaches every client. The service remains bounded by the pe
 queue and closes a consumer with `1013` when it falls too far behind. These are local
 macOS/loopback numbers and exclude Aeron ingestion and JSON encoding changes under load.
 
+### Transport observability (2026-11-10)
+
+`GET /metrics` now includes `transport_metrics` (also embedded in
+`GET /console/api/node` as `transport`):
+
+- `heartbeat_streams` / `heartbeat_requests` and `replication_streams` /
+  `replication_requests` count the gRPC `AppendStream` sessions and requests opened by this process.
+- `snapshot_sent` / `snapshot_received`, bytes, average and max microseconds count every completed
+  snapshot send and receive/install.
+
+Measured on the reference host:
+
+| Scenario | Heartbeat streams / reqs | Replication streams / reqs | Snapshot |
+|---|---:|---:|---:|
+| 4-node startup + membership | 2 / 2 | 6 / 12 | — |
+| 64-client sustained write sweep, `--snapshot-logs 200` | 0 / 0 | 8 / 640 | — |
+| Snapshot install test (tiny 4,104-byte snapshot) | — | — | leader sent 2, avg 34.4 ms, max 39.9 ms; learner received 2, avg 33.7 ms, max 39.3 ms |
+
+The zero heartbeat streams under sustained replication are the intended
+suppression: `heartbeat_min_interval` avoids opening a heartbeat stream while a
+replication response was just acknowledged. Startup/idle periods still show the
+heartbeat streams. Counts are process-local and reset on restart; the snapshot
+numbers use a deliberately tiny book and are a measurement sanity check, not a
+capacity result.
+
 ## Storage benchmark
 
 `cargo bench --bench storage` writes 20,000 real `MatchEngineRequest::place`

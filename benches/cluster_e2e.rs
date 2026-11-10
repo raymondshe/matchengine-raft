@@ -65,6 +65,7 @@ use matchengine_raft::StorageConfig;
 use matchengine_raft::build_match_engine_node;
 use matchengine_raft::client::MatchEngineClient;
 use matchengine_raft::default_raft_config;
+use matchengine_raft::network::grpc::metrics::TransportMetricsSnapshot;
 use matchengine_raft::order_book::Order;
 use matchengine_raft::order_book::OrderSide;
 use matchengine_raft::store::MatchEngineRequest;
@@ -150,6 +151,7 @@ struct RoundSummary {
     concurrent_batches_p50: Option<Duration>,
     concurrent_batches_p99: Option<Duration>,
     concurrency: Vec<ConcurrencyRow>,
+    transport: TransportMetricsSnapshot,
 }
 
 struct Cluster {
@@ -591,7 +593,21 @@ async fn run_workloads(
         concurrent_batches_p50: concurrent_batches.map(|(_, p50, _)| p50),
         concurrent_batches_p99: concurrent_batches.map(|(_, _, p99)| p99),
         concurrency,
+        transport: TransportMetricsSnapshot::default(),
     })
+}
+
+async fn fetch_transport(addr: &str) -> anyhow::Result<TransportMetricsSnapshot> {
+    let response = reqwest::Client::builder()
+        .no_proxy()
+        .build()?
+        .get(format!("http://{addr}/metrics"))
+        .send()
+        .await?;
+    let body: serde_json::Value = response.json().await?;
+    Ok(serde_json::from_value(
+        body["Ok"]["transport_metrics"].clone(),
+    )?)
 }
 
 fn run_round(round: usize, rounds: usize, args: &Args) -> anyhow::Result<RoundSummary> {
@@ -616,11 +632,33 @@ fn run_round(round: usize, rounds: usize, args: &Args) -> anyhow::Result<RoundSu
         .thread_name("cluster-bench-client")
         .build()?;
     let result = client_rt.block_on(run_workloads(&cluster, leader_index, args));
+    let transport = server_rt
+        .block_on(fetch_transport(&leader_addr))
+        .unwrap_or_default();
     let shutdown = server_rt.block_on(cluster.shutdown());
-    let summary = result?;
+    let mut summary = result?;
+    summary.transport = transport;
     shutdown?;
     // Give the fixed loopback ports a moment to be released.
     std::thread::sleep(Duration::from_millis(100));
+    println!(
+        "transport: heartbeat {} streams / {} reqs, replication {} streams / {} reqs",
+        summary.transport.heartbeat_streams,
+        summary.transport.heartbeat_requests,
+        summary.transport.replication_streams,
+        summary.transport.replication_requests
+    );
+    println!(
+        "transport snapshots: sent {} ({} bytes, avg {} µs, max {} µs), received {} ({} bytes, avg {} µs, max {} µs)",
+        summary.transport.snapshot_sent,
+        summary.transport.snapshot_sent_bytes,
+        summary.transport.snapshot_sent_avg_micros,
+        summary.transport.snapshot_sent_max_micros,
+        summary.transport.snapshot_received,
+        summary.transport.snapshot_received_bytes,
+        summary.transport.snapshot_received_avg_micros,
+        summary.transport.snapshot_received_max_micros,
+    );
     Ok(summary)
 }
 

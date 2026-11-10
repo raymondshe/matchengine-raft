@@ -133,6 +133,10 @@
             <div class="kv"><span>Last applied</span><span id="raft-applied">—</span></div>
             <div class="kv"><span>Snapshot</span><span id="raft-snapshot">—</span></div>
             <div class="kv"><span>Purged</span><span id="raft-purged">—</span></div>
+            <div class="kv"><span>Heartbeat streams / reqs</span><span id="transport-heartbeat">—</span></div>
+            <div class="kv"><span>Replication streams / reqs</span><span id="transport-replication">—</span></div>
+            <div class="kv"><span>Snapshot sent</span><span id="transport-snapshot-sent">—</span></div>
+            <div class="kv"><span>Snapshot received</span><span id="transport-snapshot-received">—</span></div>
           </div>
           <div class="panel-body">
             <span class="badge" id="raft-voters">voters —</span>
@@ -304,6 +308,60 @@
             <strong>Trigger snapshot</strong>
             <p>Ask this node to build a snapshot now. The periodic timer and log-count policy remain active.</p>
             <button class="btn" id="snapshot-button" type="button">Trigger snapshot</button>
+          </div>
+          <div class="action-card">
+            <strong>Purge this node's log</strong>
+            <p>Local maintenance only. Requires a snapshot that covers the requested index; OpenRaft may delay it while replication is in flight.</p>
+            <form class="action-form" id="purge-form">
+              <label>
+                Up to index (blank = current snapshot)
+                <input id="purge-upto" type="number" min="1" placeholder="snapshot index">
+              </label>
+              <label class="check">
+                <input type="checkbox" id="purge-confirm">
+                I understand this permanently deletes local log entries covered by the snapshot.
+              </label>
+              <button class="btn" id="purge-button" type="submit" disabled>Purge log</button>
+            </form>
+          </div>
+          <div class="action-card">
+            <strong>Runtime switches</strong>
+            <p>Node-local OpenRaft switches. Refused on the leader so leases and replication are not disrupted; transfer leadership first.</p>
+            <form class="action-form" id="runtime-form">
+              <label>Tick
+                <select id="runtime-tick">
+                  <option value="">unchanged</option>
+                  <option value="true">enable</option>
+                  <option value="false">disable</option>
+                </select>
+              </label>
+              <label>Heartbeat
+                <select id="runtime-heartbeat">
+                  <option value="">unchanged</option>
+                  <option value="true">enable</option>
+                  <option value="false">disable</option>
+                </select>
+              </label>
+              <label>Election
+                <select id="runtime-elect">
+                  <option value="">unchanged</option>
+                  <option value="true">enable</option>
+                  <option value="false">disable</option>
+                </select>
+              </label>
+              <label>Pre-Vote
+                <select id="runtime-pre-vote">
+                  <option value="">unchanged</option>
+                  <option value="true">enable</option>
+                  <option value="false">disable</option>
+                </select>
+              </label>
+              <label class="check">
+                <input type="checkbox" id="runtime-confirm">
+                I understand these are node-local and change Raft liveness/election behavior.
+              </label>
+              <button class="btn" id="runtime-button" type="submit" disabled>Apply runtime config</button>
+            </form>
           </div>
         </section>
       </div>

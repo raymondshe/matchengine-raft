@@ -12,10 +12,10 @@ use matchengine_marketdata::channel_source;
 use matchengine_marketdata::start;
 use matchengine_raft::market_data::BboRecord;
 use matchengine_raft::market_data::DepthSnapshotRecord;
+use matchengine_raft::market_data::HEARTBEAT_SUB_SEQ;
 use matchengine_raft::market_data::LevelUpdate;
 use matchengine_raft::market_data::MarketMessage;
 use matchengine_raft::market_data::MessageBody;
-use matchengine_raft::market_data::HEARTBEAT_SUB_SEQ;
 use matchengine_raft::market_data::STREAM_BBO;
 use matchengine_raft::market_data::STREAM_DEPTH_DELTA;
 use matchengine_raft::market_data::STREAM_DEPTH_SNAPSHOT;
@@ -552,7 +552,10 @@ async fn readiness_requires_a_fresh_frame_or_heartbeat() {
     tokio::time::sleep(Duration::from_millis(250)).await;
     let (status, body) = http_get(&running.addr, "/ready").await;
     assert_eq!(503, status, "stale heartbeat: {body}");
-    assert_eq!(false, serde_json::from_str::<Value>(&body).unwrap()["symbols"]["eurusd"]["heartbeat_fresh"]);
+    assert_eq!(
+        false,
+        serde_json::from_str::<Value>(&body).unwrap()["symbols"]["eurusd"]["heartbeat_fresh"]
+    );
 
     // The next frame (including an idle STATUS heartbeat) restores readiness.
     tx.send(Ok(bbo(1))).await.unwrap();

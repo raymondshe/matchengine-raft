@@ -151,6 +151,20 @@ fn metrics_exposes_data_server_and_runtime_stats() {
         #[cfg(not(feature = "profiling"))]
         assert!(metrics["runtime_stats"].is_null());
 
+        // Process-local transport counters are present even when this node has
+        // not opened any peer stream yet.
+        assert!(metrics["transport_metrics"].is_object());
+        assert!(
+            metrics["transport_metrics"]["heartbeat_streams"]
+                .as_u64()
+                .is_some()
+        );
+        assert!(
+            metrics["transport_metrics"]["snapshot_sent"]
+                .as_u64()
+                .is_some()
+        );
+
         // The typed client keeps deserializing only the flattened Raft fields.
         let raft = client.metrics().await.unwrap();
         assert_eq!(Some(1), raft.current_leader);

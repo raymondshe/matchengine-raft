@@ -267,6 +267,27 @@
     text("raft-applied", raft.last_applied_index);
     text("raft-snapshot", raft.snapshot_index);
     text("raft-purged", raft.purged_index);
+    const transport = node.transport || {};
+    text(
+      "transport-heartbeat",
+      `${fmt(transport.heartbeat_streams)} / ${fmt(transport.heartbeat_requests)}`,
+    );
+    text(
+      "transport-replication",
+      `${fmt(transport.replication_streams)} / ${fmt(transport.replication_requests)}`,
+    );
+    text(
+      "transport-snapshot-sent",
+      transport.snapshot_sent
+        ? `${transport.snapshot_sent} · ${fmtAge(transport.snapshot_sent_avg_micros / 1000)} avg`
+        : "—",
+    );
+    text(
+      "transport-snapshot-received",
+      transport.snapshot_received
+        ? `${transport.snapshot_received} · ${fmtAge(transport.snapshot_received_avg_micros / 1000)} avg`
+        : "—",
+    );
     text("raft-voters", `voters ${raft.voters.length ? raft.voters.join(", ") : "—"}`);
     text("raft-learners", `learners ${raft.learners.length ? raft.learners.join(", ") : "—"}`);
     setBadge("replication-scope", leadership.is_leader ? "leader only" : "leader view unavailable", leadership.is_leader ? "leader" : "neutral");
@@ -394,6 +415,22 @@
     const elect = $("elect-button");
     elect.disabled = !(node.raft.voters || []).includes(node.node_id);
     $("snapshot-button").disabled = false;
+
+    const purgeConfirm = $("purge-confirm");
+    const purgeButton = $("purge-button");
+    const updatePurge = () => {
+      purgeButton.disabled = !purgeConfirm.checked;
+    };
+    purgeConfirm.onchange = updatePurge;
+    updatePurge();
+
+    const runtimeConfirm = $("runtime-confirm");
+    const runtimeButton = $("runtime-button");
+    const updateRuntime = () => {
+      runtimeButton.disabled = !runtimeConfirm.checked || isLeader;
+    };
+    runtimeConfirm.onchange = updateRuntime;
+    updateRuntime();
   }
 
   function renderMetadata(node) {
@@ -559,6 +596,27 @@
   });
   $("elect-button").addEventListener("click", () => postAction("/console/api/actions/elect", {}));
   $("snapshot-button").addEventListener("click", () => postAction("/console/api/actions/snapshot", {}));
+  $("purge-form").addEventListener("submit", (event) => {
+    event.preventDefault();
+    if (!$("purge-confirm").checked) return;
+    const raw = $("purge-upto").value;
+    postAction("/console/api/actions/purge-log", raw ? { upto: Number(raw) } : {});
+  });
+  $("runtime-form").addEventListener("submit", (event) => {
+    event.preventDefault();
+    if (!$("runtime-confirm").checked) return;
+    const body = {};
+    for (const [field, id] of [
+      ["tick", "runtime-tick"],
+      ["heartbeat", "runtime-heartbeat"],
+      ["elect", "runtime-elect"],
+      ["pre_vote", "runtime-pre-vote"],
+    ]) {
+      const value = $(id).value;
+      if (value !== "") body[field] = value === "true";
+    }
+    postAction("/console/api/actions/runtime-config", body);
+  });
   $("events-pause").addEventListener("click", () => {
     state.eventsPaused = !state.eventsPaused;
     $("events-pause").textContent = state.eventsPaused ? "Resume" : "Pause";

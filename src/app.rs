@@ -7,6 +7,7 @@ use crate::MatchEngineRaft;
 use crate::StateMachineStore;
 use crate::network::admission::AdmissionControl;
 use crate::network::console::ConsoleState;
+use crate::network::grpc::metrics::TransportMetrics;
 use crate::network::health::GrpcListenerHealth;
 use crate::network::read_policy::ReadPolicyRuntime;
 
@@ -66,6 +67,9 @@ pub struct MatchEngineApp {
 
     /// Bounded in-flight admission for `/write` and `/write_batch`.
     pub admission: AdmissionControl,
+
+    /// Process-local gRPC transport counters (streams and snapshot transfers).
+    pub transport: Arc<TransportMetrics>,
 
     /// Operational-console state: action lock and recent action history.
     pub console: ConsoleState,

@@ -79,9 +79,10 @@ fn console_reports_cluster_and_transfers_leader() {
             .unwrap();
         wait_for_leader(&client, 1).await;
         wait_for_replication(&client, &[2, 3]).await;
-
         let http = reqwest::Client::builder().no_proxy().build().unwrap();
         let base = format!("http://{}", ADDRS[0]);
+        wait_for_transport(&http, &base, "heartbeat_streams").await;
+        wait_for_transport(&http, &base, "replication_streams").await;
 
         let response = http.get(format!("{base}/console/")).send().await.unwrap();
         assert_eq!(StatusCode::OK, response.status());
@@ -96,6 +97,15 @@ fn console_reports_cluster_and_transfers_leader() {
         assert_eq!(node["schema_version"], 1);
         assert!(node["raft"]["voters"].as_array().unwrap().len() >= 3);
         assert!(node["storage"]["wal"].is_object());
+        assert!(
+            node["transport"]["heartbeat_streams"].as_u64().unwrap() >= 1,
+            "heartbeat streams are counted: {node}"
+        );
+        assert!(
+            node["transport"]["replication_streams"].as_u64().unwrap() >= 1,
+            "replication streams are counted: {node}"
+        );
+        println!("console transport: {}", node["transport"]);
 
         let (status, cluster) = get_json(&http, &format!("{base}/console/api/cluster")).await;
         assert_eq!(StatusCode::OK, status);
@@ -124,9 +134,45 @@ fn console_reports_cluster_and_transfers_leader() {
         let response = post_action(&http, &base, "transfer-leader", json!({ "target": 99 })).await;
         assert_eq!(StatusCode::CONFLICT, response.status());
 
+        // Purge needs a snapshot that covers the requested index.
+        let response = post_action(&http, &base, "purge-log", json!({})).await;
+        assert_eq!(StatusCode::CONFLICT, response.status());
+
+        let response = post_action(&http, &base, "snapshot", json!({})).await;
+        assert_eq!(StatusCode::ACCEPTED, response.status());
+        let snapshot_index = wait_for_snapshot(&client).await;
+        let response =
+            post_action(&http, &base, "purge-log", json!({ "upto": snapshot_index })).await;
+        assert_eq!(StatusCode::ACCEPTED, response.status());
+        let response = post_action(
+            &http,
+            &base,
+            "purge-log",
+            json!({ "upto": snapshot_index + 1 }),
+        )
+        .await;
+        assert_eq!(StatusCode::BAD_REQUEST, response.status());
+
+        // Runtime config is node-local and refused on the leader.
+        let response =
+            post_action(&http, &base, "runtime-config", json!({ "pre_vote": false })).await;
+        assert_eq!(StatusCode::CONFLICT, response.status());
+
         let response = post_action(&http, &base, "transfer-leader", json!({ "target": 2 })).await;
         assert_eq!(StatusCode::ACCEPTED, response.status());
         wait_for_leader(&client, 2).await;
+
+        // The old leader is now a follower and may tune its own runtime config.
+        for enabled in [false, true] {
+            let response = post_action(
+                &http,
+                &base,
+                "runtime-config",
+                json!({ "pre_vote": enabled }),
+            )
+            .await;
+            assert_eq!(StatusCode::ACCEPTED, response.status());
+        }
 
         // The old leader is no longer allowed to transfer.
         let response = post_action(&http, &base, "transfer-leader", json!({ "target": 3 })).await;
@@ -160,6 +206,20 @@ fn console_reports_cluster_and_transfers_leader() {
                 .unwrap()
                 .iter()
                 .any(|action| action["action"] == "transfer-leader")
+        );
+        assert!(
+            actions
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|action| action["action"] == "purge-log")
+        );
+        assert!(
+            actions
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|action| action["action"] == "runtime-config")
         );
 
         // Stop the leader first so its replication streams close before the
@@ -228,6 +288,38 @@ async fn wait_for_replication(client: &MatchEngineClient<C>, targets: &[u64]) {
             Instant::now() <= deadline,
             "replication targets {targets:?} did not catch up"
         );
+        C::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+async fn wait_for_transport(http: &reqwest::Client, base: &str, field: &str) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let (status, body) = get_json(http, &format!("{base}/metrics")).await;
+        if status == StatusCode::OK
+            && body["Ok"]["transport_metrics"][field]
+                .as_u64()
+                .is_some_and(|value| value >= 1)
+        {
+            return;
+        }
+        assert!(
+            Instant::now() <= deadline,
+            "transport metric {field} never advanced: {body}"
+        );
+        C::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+async fn wait_for_snapshot(client: &MatchEngineClient<C>) -> u64 {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if let Ok(metrics) = client.metrics().await
+            && let Some(snapshot) = metrics.snapshot
+        {
+            return snapshot.index;
+        }
+        assert!(Instant::now() <= deadline, "snapshot was never built");
         C::sleep(Duration::from_millis(100)).await;
     }
 }
