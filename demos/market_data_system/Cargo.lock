@@ -1873,7 +1873,7 @@ dependencies = [
 
 [[package]]
 name = "matchengine-raft"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "actix-web",
  "async-stream",
