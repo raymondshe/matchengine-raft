@@ -1,6 +1,6 @@
 # TODO
 
-Last reviewed: 2026-11-09. This is the working roadmap; see `AGENTS.md` for commands and the
+Last reviewed: 2026-11-10. This is the working roadmap; see `AGENTS.md` for commands and the
 current branch state.
 
 **Current baseline:** the OpenRaft 0.10 port, durable WAL/snapshot storage and exact scale-18
@@ -16,19 +16,20 @@ four-voter floor, `0` = every append, `N > 0` = periodic), OpenRaft can run on a
 explicit OS thread. Edge request/snapshot limits and the loopback/private-network contract are in
 place. The 4-node no-fsync cluster benchmark and the 2026-11-08 OpenRaft minimal-benchmark
 comparison are in [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md); Raft is below the application path
-as the current bottleneck. The remaining work is performance evidence, OpenRaft utilization
-follow-ups (§16) and feature extensions (§5, §6, §13); TLS/authentication stays at the gateway and
-is out of scope for this process.
+as the current bottleneck. The remaining work is benchmark-derived correctness and measurement,
+performance evidence, OpenRaft utilization follow-ups (§16) and feature extensions (§5, §6, §13);
+TLS/authentication stays at the gateway and is out of scope for this process.
 
-Priority key: **P0** = correctness/security, do next; **P1** = production readiness; **P2** =
-important but not blocking; **P3** = later/optional.
+Priority key: **P0** = known correctness/security defect, do next; **P1** = correctness coverage,
+measurement and production readiness; **P2** = important but not blocking; **P3** = later/optional.
 
 ## Top priorities
 
-No P0 or P1 work remains. The remaining performance, feature and conditional conformance items
-are P2/P3, ordered below by production value.
+No P0 work remains. The FlashOne benchmark review (2026-11-10) opened four P1 correctness and
+measurement items; those go first, then the P2 production, feature and validation work, then P3
+experiments.
 
-**Recently completed (2026-11-06/09):** configurable WAL fsync with a measured A/B matrix,
+**Recently completed (2026-11-06/10):** configurable WAL fsync with a measured A/B matrix,
 best-effort WAL recovery, the four-voter no-fsync floor (`test_min_voters.rs`), the optional
 dedicated OpenRaft runtime (`RAFT_CORE_WORKERS`), the thread/lock audit (blocking sinks and startup
 recovery on `spawn_blocking`, async JSONL sink/events bridge, Aeron publisher/source blocking
@@ -54,7 +55,10 @@ market-data service records and replays per-symbol JSONL archives through the no
 (§6). The §13 external contract is settled: zero-plus-`MatchErrors` remains for v10/v6 with exact
 accessors, quote iceberg/FOK stay rejected, and fee tokens stay outside the engine. The measured
 baselines, write/lease decisions, async-WAL numbers and upstream OpenRaft comparison are in
-[`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md).
+[`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md). The 249-engine FlashOne benchmark survey is
+reviewed in [`docs/THIRD_PARTY_INVESTIGATION.md`](./docs/THIRD_PARTY_INVESTIGATION.md) Part IV; it
+confirms the 7.20 M/s book-only B-tree result and the phantom-fill issue fixed in `a44d9ae`, and
+opened the P1 follow-ups in §17.
 
 The upstream OpenRaft minimal benchmark (three in-process nodes, in-memory log/state machine,
 function-call network, empty requests) reports 33k put/s with one client and 3.5M put/s with 4,096,
@@ -73,37 +77,50 @@ implemented: the replication lag threshold now sits above the 100k snapshot poli
 suppression is enabled, HTTP/2 windows/keepalive are tuned, snapshot chunks follow OpenRaft's
 configured size and readiness waits for recovery. The remaining P2/P3 items are tracked in §16.
 
-The next work, in order (re-prioritised 2026-11-09 after the archive and external-contract slices):
+The next work, in order (re-prioritised 2026-11-10 after the benchmark review):
 
-1. **Run the Linux pinned-core `e2e` pass (§8, P2).** Dispatch the manual `Linux benchmark`
+1. **Close the benchmark-derived correctness gaps first (P1, §17).** Make the benchmark's hard
+   invariants explicit: cancel head/middle/scattered and shared-level siblings, both-direction
+   maker price, stale cancel/modify after a full fill, multi-level IOC, marketable-limit residual,
+   cancel-best-level BBO, a 5,000-fill same-price sweep and a near-limit in-domain price. Decide
+   the unknown-cancel contract, document `id`/`sequence`/`client_order_id`, and add a
+   deterministic random-point book-state audit.
+2. **Add the benchmark measurement envelope (P1, §8/§17).** Add a `static`/`normal`/wide-swing/
+   flash-crash scenario matrix to `book_replay`/`replay_mix`, record average/peak resting orders
+   and levels, and report the worst-case median-of-10 with variance.
+3. **Run the Linux pinned-core `e2e` pass (P2, §8).** Dispatch the manual `Linux benchmark`
    workflow (or run the same commands on deployment hardware) and record the pinned short and
-   sustained rows.
-2. **Plan one schema-v11 order-type batch (§5, P2).** Add market-to-limit, trailing stops, pegged
+   sustained rows. This remains blocked on a Linux host and `gh` authentication.
+4. **Plan one schema-v11 order-type batch (§5, P2).** Add market-to-limit, trailing stops, pegged
    orders and self-trade prevention together so the snapshot/wire migration and conformance batch
    are paid once. Custom reserve replenishment and stop-protection collars stay P3 and
    product-conditional.
-3. **Aeron operation hardening and the snapshot-request stream (§6, P2).** Run external-driver
+5. **Aeron operation hardening and the snapshot-request stream (§6, P2).** Run external-driver
    and multicast fan-out validation on Linux, add the idle heartbeat and publish `ws_fanout`
    numbers; then add the late-joiner snapshot-request stream (2010).
-4. **Storage, transport and dependency hygiene (§4/§16, P2).** Bound WAL append size by bytes,
+6. **Storage, transport and dependency hygiene (§4/§16, P2).** Bound WAL append size by bytes,
    move snapshot data to `Arc<[u8]>`, stream snapshot receive instead of buffering the whole body,
    and move off `openraft` 0.10.0-alpha when a stable 0.10 release exists.
-5. **Observability measurements and console actions (§16, P2).** Record heartbeat/`AppendStream`
+7. **Observability measurements and console actions (§16, P2).** Record heartbeat/`AppendStream`
    counts and snapshot-transfer time, and add guarded purge-log/runtime-config console actions.
-6. **Provisioning and test hygiene (§2/§7, P2).** Add the `ConfigureSymbol` provisioning
+8. **Provisioning and test hygiene (§2/§7, P2).** Add the `ConfigureSymbol` provisioning
    helper/pre-trade readiness check, parameterize fixed test ports, and keep docs in sync.
-7. **Last: apply-path and per-level-bucket experiments (§8, P3).** Reserve known apply-path
-   lengths, evaluate apply-thread affinity and adopt per-level buckets only if a sparse-level fast
-   path or new measurements justify them; the measured wins are small or split.
+9. **Benchmark P2 follow-ups (P2, §17).** Add the open-loop latency run (or the coordinated-omission
+   caveat), re-pin the benchmark to current `HEAD`, and evaluate a treap/sorted-vector/heap hybrid
+   only as a book-only A/B.
+10. **Last: apply-path and per-level-bucket experiments (§8, P3).** Reserve known apply-path
+    lengths, evaluate apply-thread affinity and adopt per-level buckets only if a sparse-level fast
+    path or new measurements justify them; the measured wins are small or split.
 
 The earlier measurement work is done: `book_replay` and `level_book` report warm p50/p99 plus an
 interleaved cold pass, `replay_mix` replays a 100,000-operation fixture with fees, the 4-node
 no-fsync cluster, the write concurrency/batching sweep, the read-path/lease results, the async-WAL
 prototype and the upstream OpenRaft comparison are recorded in `PERFORMANCE.md`, and the `Order`
-identity/optional-sequence/BTC-USDT/overflow-case quick wins landed. The third-party follow-ups are P2/P3 (§14); measurement scope, peak RSS, the fuzz targets, health/readiness and the
-operational console are in place. Equity/ETF sessions, holidays, auctions, T+1/T+2 settlement,
-corporate actions and fixed/regulatory/minimum/tax fees are owned by the external order system
-(§13).
+identity/optional-sequence/BTC-USDT/overflow-case quick wins landed. The earlier third-party
+follow-ups are P2/P3 (§14); the new benchmark-derived follow-ups are P1/P2 (§17). Measurement
+scope, peak RSS, the fuzz targets, health/readiness and the operational console are in place.
+Equity/ETF sessions, holidays, auctions, T+1/T+2 settlement, corporate actions and
+fixed/regulatory/minimum/tax fees are owned by the external order system (§13).
 
 ## 1. Exact fixed-point end-to-end — done
 
@@ -789,8 +806,6 @@ Open follow-ups:
   Done: `cargo bench --bench replay_mix` replays a deterministic 100,000-operation
   add/cancel/amend/stop/iceberg/taker fixture with maker/taker fees and reports whole-replay
   warm/cold p50/p99 plus per-operation p50/p99/max; results are in `docs/PERFORMANCE.md`.
-- [ ] **P2** Run the Linux pinned-core `e2e` pass; the `--pin` flag exists and this macOS host
-  cannot pin (tracked in §8). The manual `Linux benchmark` workflow is ready to dispatch.
 - [ ] **P3** Evaluate a binary order-entry path (gRPC/protobuf or compact codec) and feature-gated
   latency histograms only if a latency target requires them.
 - [ ] **P3** Evaluate real ITCH-style replay data and custom MPMC/SIMD/io_uring work only after a
@@ -944,7 +959,7 @@ and optional APIs.
   replication sessions are not possible without changing the OpenRaft contract; heartbeat
   suppression is the practical way to reduce stream churn.
 
-## 17. Public matching-engine test suites (2026-11-09)
+## 17. Public matching-engine test suites (2026-11-09, updated 2026-11-10)
 
 Inventory, licence notes, coverage matrix and the full rationale:
 [`docs/MATCHING_ENGINE_TEST_SUITES.md`](./docs/MATCHING_ENGINE_TEST_SUITES.md). No public suite
@@ -994,11 +1009,6 @@ Already covered before these batches (not backlog):
 - Fee assets, maker rebates and exact/overflow fee ordering (`test_fees.rs`,
   `test_fee_assets.rs`, the replay matrix and `conformance_tests.rs`).
 
-Remaining:
-
-- [ ] **P3** Add AON, self-trade-prevention/order-mask and multi-symbol isolation cases only when
-  the product adds those behaviours; multi-symbol remains deployment-level isolation (§2).
-
 ### FlashOne benchmark follow-ups (2026-11-10)
 
 The 249-engine survey pinned this repository at `5597532` (before the phantom-fill fix) and
@@ -1009,16 +1019,21 @@ reported 7.20 M/s book-only; the full review and competitor taxonomy are in
   and shared-level sibling survival; both-direction maker-price fills; stale cancel and modify
   after a full fill; multi-level IOC; marketable-limit residual at its own limit; cancel-best-level
   BBO with no follow-on sweep; a 5,000-fill same-price sweep; and a near-limit in-domain price.
+- [ ] **P1** Decide whether a non-resting cancel emits `Rejected`/4xx or stays a no-op, test it,
+  and document `Order.id` vs `sequence` vs `client_order_id` with duplicate-id and retention cases.
+- [ ] **P1** Add a deterministic random-point book-state audit (best bid/ask/depth) to the
+  reference-model tests, not only final-state comparison.
 - [ ] **P1** Add a `book_replay`/`replay_mix` scenario matrix (`static`, `normal`, wide-swing,
   flash-crash), record average/peak resting orders and levels, and report the worst-case
   median-of-10 with variance.
-- [ ] **P1** Add a deterministic random-point book-state audit (best bid/ask/depth) to the
-  reference-model tests, not only final-state comparison.
-- [ ] **P1** Decide whether a non-resting cancel emits `Rejected`/4xx or stays a no-op, test it,
-  and document `Order.id` vs `sequence` vs `client_order_id` with duplicate-id and retention cases.
 - [ ] **P2** Add a paced/open-loop latency run, or state the coordinated-omission caveat for the
   closed-loop tails.
 - [ ] **P2** Re-pin the benchmark to current `HEAD`, record the book-only result and scope in
   `docs/PERFORMANCE.md`, and publish the adapter only if it can be maintained.
 - [ ] **P2** Evaluate a treap, sorted vector or heap hybrid only as a book-only A/B; do not switch
   on the external leaderboard alone.
+
+### Remaining feature work
+
+- [ ] **P3** Add AON, self-trade-prevention/order-mask and multi-symbol isolation cases only when
+  the product adds those behaviours; multi-symbol remains deployment-level isolation (§2).
