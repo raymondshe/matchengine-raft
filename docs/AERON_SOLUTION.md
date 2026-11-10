@@ -10,7 +10,7 @@ JSONL sink are implemented in `src/market_data/`; the Aeron adapter and Archive 
 Both parts record what was verified, what the integration would look like,
 and what should happen before anyone commits to it.
 
-Date: 2026-10-30 · Reviewed 2026-11-04 · Baseline: `openraft` 0.10.0-alpha.37, gRPC/tonic-only Raft transport, segmented
+Date: 2026-10-30 · Reviewed 2026-11-04 · Baseline: `openraft` 0.10.0-alpha.37 (now stable 0.10.0), gRPC/tonic-only Raft transport, segmented
 WAL + atomic snapshots.
 
 > **Update after this investigation:** two of the prerequisites below have since landed. Peer-to-peer

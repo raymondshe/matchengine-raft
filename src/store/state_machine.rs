@@ -565,7 +565,7 @@ impl<C: RaftTypeConfig> StateMachineStoreInner<C> {
 
     /// Events retained for the entry that produced `record`, capped at the
     /// response limit. The boolean is true when the response is incomplete.
-    fn submission_events(&self, record: &SubmissionRecord) -> (Vec<MatchEvent>, bool) {
+    fn submission_events(&self, record: &SubmissionRecord) -> (SmallVec<[MatchEvent; 1]>, bool) {
         let cap = MatchEngineResponse::MAX_EVENTS;
         // Events are ordered by (log_index, ordinal), so jump to the entry and
         // copy only the submission's ordinal range instead of scanning the
@@ -580,7 +580,7 @@ impl<C: RaftTypeConfig> StateMachineStoreInner<C> {
             .partition_point(|event| event.event_id < start_id);
         let end = first.saturating_add(record.event_count);
 
-        let mut events = Vec::new();
+        let mut events = SmallVec::new();
         let mut total = 0u32;
         for event in self.events.range(start..) {
             if event.event_id.log_index != record.log_index {

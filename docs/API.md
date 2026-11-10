@@ -91,19 +91,23 @@ the internal-only HTTP contract; TLS and operator authentication stay at the gat
 #### Read consistency and lease reads
 
 `POST /read` is a local, possibly stale read and is not affected by the read policy. The
-leader-consistent paths use `ReadPolicy::LeaseRead` by default: `/linearizable_read`, `/events`, the
-gRPC `StreamEvents` anchor and `/get_linearizer` (used by `/follower_read`). A lease read reuses a
-recent quorum acknowledgement and avoids the fresh round while the leader lease is valid. If the
-lease is stale, the node falls back to `ReadIndex`; if quorum is available the read succeeds at
-fallback latency, otherwise it returns the Raft read error.
+leader-consistent paths default to `local_lease`: `/linearizable_read`, `/events`, the gRPC
+`StreamEvents` anchor and `/get_linearizer` (used by `/follower_read`) use OpenRaft's caller-side
+lease cache, then the core `ReadPolicy::LeaseRead` path. A lease read reuses a recent quorum
+acknowledgement and avoids the fresh round while the leader lease is valid. If the lease is stale,
+the node falls back to `ReadIndex`; if quorum is available the read succeeds at fallback latency,
+otherwise it returns the Raft read error.
 
 Start the node with `--read-policy read_index` (env `MATCHENGINE_READ_POLICY=read_index`) to force a
-fresh quorum round on every read instead of using the default lease.
+fresh quorum round on every read, or `--read-policy lease` to keep the core lease path without the
+caller-side cache. The local path measured 11-36% higher read throughput and ~40% lower 64-reader
+p50/p99 on the 4-node benchmark.
 
-Lease reads assume **bounded clock drift** between nodes. Use NTP or PTP; set
+Lease and local-lease reads assume **bounded clock drift** between nodes. Use NTP or PTP; set
 `--read-policy read_index` unless the deployment guarantees that the leader's lease cannot outlive
-its actual leadership. The status endpoint reports the mode and, per path, `lease_attempts`,
-`lease_hits`, `lease_fallbacks`, `lease_failures`, `read_index_attempts` and
+its actual leadership. A local-lease cache hit can overtake an unfinished write; await the write
+response before a read that must observe it. The status endpoint reports the mode and, per path,
+`lease_attempts`, `lease_hits`, `lease_fallbacks`, `lease_failures`, `read_index_attempts` and
 `read_index_failures`.
 
 The Rust request/response types behind `/write` are:
@@ -121,7 +125,7 @@ pub enum MatchEngineRequest {
 pub struct MatchEngineResponse {
     pub value: Option<String>,        // sequence string for compatibility
     pub sequence: Option<u64>,        // assigned market_seq
-    pub events: Vec<MatchEvent>,      // first 512 events of the entry
+    pub events: SmallVec<[MatchEvent; 1]>, // first 512 events; one inline, serializes as an array
     pub events_truncated: bool,       // true when more events exist
     pub error: Option<String>,        // non-fatal application error
     pub batch: Vec<MatchEngineResponse>, // per-request responses for /write_batch

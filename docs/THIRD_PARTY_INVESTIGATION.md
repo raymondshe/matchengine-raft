@@ -460,8 +460,11 @@ the taker-exhaustion guard plus explicit regressions in `src/order_book/tests.rs
 `exact_fill_does_not_emit_phantom_or_corrupt_bystander_ask`,
 `exact_fill_stops_before_deeper_levels` and
 `full_sweep_leaves_book_empty_without_phantom_trades`. The benchmark label describes the old pin,
-not current code; a re-pin should clear the "with fix" flag, but that is the benchmark maintainer's
-call. The pinned commit declared `MIT/Apache-2.0`; the current repository is MIT.
+not current code; clearing the "with fix" label is the benchmark maintainer's call. Our own
+current-HEAD re-pin at `ee07ba0` measured a **3.62-4.23 M ops/s** worst-case `static` median
+(median 3.68) with `book_replay --matrix`; the local scope and the adapter decision are recorded
+in [`docs/PERFORMANCE.md`](./PERFORMANCE.md#current-head-book-only-re-pin-2026-11-10). The pinned
+commit declared `MIT/Apache-2.0`; the current repository is MIT.
 
 The 7.20 M/s figure measures the order-book core only. The C ABI has no Raft, HTTP, WAL, snapshot,
 replicated event window, fee/asset accounting, stops, icebergs, multi-symbol routing or risk. It is
@@ -484,8 +487,9 @@ path, which our own e2e and cluster suites cover.
 | Separate edge-case battery | 34 hard-invariant cases outside the timed workload | `src/order_book/conformance_tests.rs` plus cluster/replay suites | Mapped; the missing hard invariants are now explicit in the benchmark conformance batch (see §5) |
 | Held-out seeds | 10,000 precomputed seeds; private seeds for adversarial runs | Property tests use seeds and print failures; replay cases are fixed | Add a seed-sweep regression (e.g. 100 seeds) and keep a private-seed path for external validation |
 | Report transport and pipeline barrier | Includes the matcher-to-publisher hand-off and `engine_flush()` inside the timed window | `e2e` includes HTTP, Raft, apply and response; book benches exclude events/feed | Keep the two scopes separate and label them; do not compare a book-only number with e2e |
-| Open-loop latency under load | The paper reports latency-under-load; the harness itself measures throughput | Our sustained e2e is closed-loop | Add a paced/open-loop latency run, or state the coordinated-omission caveat where only closed-loop tails are reported |
+| Open-loop latency under load | The paper reports latency-under-load; the harness itself measures throughput | `e2e --rate` adds a fixed-rate open-loop schedule with scheduled-send, dispatch-lag and service percentiles; the closed-loop run is still reported | Done: 64-client rows at 10k/30k/50k/80k offered writes/s plus the coordinated-omission caveat in `docs/PERFORMANCE.md` |
 | Adapter faithfulness | Book queries must come from the engine's real state | `/read` reads the real book; no shadow | Keep it that way; never let a test adapter synthesize a cleaner book |
+| External adapter publication | The benchmark expects a maintained engine adapter | No FlashOne adapter is published; the local `book_replay --matrix` baseline is maintained and reads the real `OrderBook` | Do not publish an adapter unless the semantic translation (client-id cancel+reinsert `modify`, ABI, queries) can be maintained externally |
 
 What not to copy: the in-process C ABI, one-message dispatch, prebuild hook and audit machinery are
 benchmark-specific. The benchmark's `modify` is **cancel + reinsert**, not our `Amend`; its cancel
@@ -606,16 +610,21 @@ correctness and measurement improvements land before any structural experiment.
 **P2 - measurement and structure**
 
 1. Add a paced/open-loop latency-under-load run to `e2e` or `cluster_e2e`, or state explicitly in
-   `PERFORMANCE.md` that closed-loop tails understate queueing. The benchmark's worst-case
-   throughput argument needs a latency companion.
-2. Evaluate a treap, sorted vector or heap hybrid only as a book-only A/B on our workloads. The
-   external gap to `lcv3` is 22%, but `level_book` already showed that per-level buckets trade
-   wins and losses; do not switch on a single external leaderboard.
+   `PERFORMANCE.md` that closed-loop tails understate queueing. Done: `e2e --rate` reports
+   scheduled-send, dispatch-lag and service percentiles, and the 10k/30k/50k/80k rows plus the
+   caveat are in [`docs/PERFORMANCE.md`](./PERFORMANCE.md#open-loop-write-latency-2026-11-10).
+2. Evaluate a treap, sorted vector or heap hybrid only as a book-only A/B on our workloads. Done:
+   `benches/sorted_book.rs` compares a sorted-vector ladder; it wins match/cancel/amend-volume but
+   loses price-move amend and BBO advance, so it is not adopted. A tree/heap hybrid remains a
+   book-only option only if a sparse-level fast path is measured.
 3. Re-pin the benchmark to current `HEAD` and, if the adapter can be published, ship the
-   reproduction. Run a held-out seed and the 10,000-seed `validate_seeds.py` path only if we are
-   prepared to maintain the C ABI adapter as a separate artifact.
+   reproduction. Done: the local book-only re-pin is `ee07ba0` (see
+   [`docs/PERFORMANCE.md`](./PERFORMANCE.md#current-head-book-only-re-pin-2026-11-10)). No FlashOne
+   adapter is published because it would need external maintenance and semantic translation.
 4. Add a "benchmark scope" paragraph to `PERFORMANCE.md` that records the 7.20 M/s book-only result,
-   the pin, the fixed issue and the non-comparability with e2e. Link back to this part.
+   the pin, the fixed issue and the non-comparability with e2e. Done: the scope and re-pin
+   subsections carry the 7.20 M/s external pin, the local 3.62-4.23 M ops/s re-pin, the fixed
+   phantom-fill issue and the e2e non-comparability.
 
 **P3 - do not chase**
 
@@ -634,7 +643,8 @@ replication and exact-fee semantics that distinguish this project.
 The highest-value transfer is therefore **methodology**, not code: worst-case scenario reporting,
 median-of-10 with variance, a calibrated order flow, random-point state audits, and a separate
 edge-case battery. The benchmark-derived correctness and occupancy envelope are now in place; the
-remaining measurement work is open-loop latency and structural experiments, not a new data
+open-loop latency and sorted-vector experiments are also recorded. The remaining work is optional
+external-adapter publication and the manual Linux pinned/Aeron validation, not a new data
 structure.
 
 ## Part V - Comparison with matchengine-raft
@@ -690,9 +700,9 @@ does not exercise FOK, stops, icebergs, fees, persistence or consensus.
 7. **Unknown-cancel and identity semantics (benchmark-derived).** Done: a cancel miss publishes
    `Rejected(OrderNotFound)` and still consumes one sequence; `docs/API.md`, `docs/MATCH_RESULTS.md`
    and `AGENTS.md` document `Order.id`, `sequence` and `client_order_id`; duplicate ids are tested.
-8. **Open-loop latency (benchmark-derived).** Add a paced/open-loop latency run, or state the
-   coordinated-omission caveat where only closed-loop tails are reported. Worst-case throughput
-   needs a latency companion.
+8. **Open-loop latency (benchmark-derived).** Done: `e2e --rate` adds the paced run and reports
+   scheduled-send, dispatch-lag and service percentiles; `docs/PERFORMANCE.md` records the
+   coordinated-omission caveat and the 80k/s generator-bound tail.
 9. **Preallocation, cache layout and allocation accounting.** `apply_path --check` enforces the
    allocation ceilings and `level_book` measured the per-level prototype. Keep structural changes
    conditional on a book-only A/B.
@@ -702,11 +712,14 @@ does not exercise FOK, stops, icebergs, fees, persistence or consensus.
 ### Adapt / evaluate later
 
 - A treap, sorted-vector or heap-hybrid price ladder, only after a book-only A/B on our workloads.
-  The external gap to `lcv3` is 22%, but `level_book` already showed the per-level prototype trading
-  match/cancel wins for sparse-amend/BBO losses.
+  Done for the sorted vector: `benches/sorted_book.rs` shows level-grouping wins but loses on
+  price-move amend and BBO advancement, so it is not adopted. A tree/heap hybrid remains a
+  book-only option only if a sparse-level fast path is measured; the external `lcv3` treap lead is
+  not sufficient evidence on its own.
 - Re-pin the FlashOne benchmark to current `HEAD` and publish the adapter/reproduction if the C ABI
-  can be maintained as a separate artifact. Held-out seeds and `validate_seeds.py` are optional
-  external validation, not a CI dependency.
+  can be maintained as a separate artifact. Done locally at `ee07ba0`; no external adapter is
+  published. Held-out seeds and `validate_seeds.py` remain optional external validation, not a CI
+  dependency.
 - A binary order-entry path (gRPC/protobuf or compact codec) separate from HTTP admin/reads, only if
   latency requirements justify it.
 - Feature-gated latency histograms, off by default.

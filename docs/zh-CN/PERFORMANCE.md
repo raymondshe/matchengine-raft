@@ -10,7 +10,7 @@
 |---|---|
 | WAL 持久化 | 保持 `RAFT_WAL_FSYNC_MS` 未设置（不 fsync） |
 | 投票者 | 至少 4 个；无 fsync 时二进制强制 |
-| 读策略 | lease（默认）；NTP/PTP 时钟漂移有界且 `/read-policy/status` 显示 lease 命中时保留，否则设置 `--read-policy read_index` |
+| 读策略 | `local_lease`（默认）使用 OpenRaft 调用侧 lease 缓存；NTP/PTP 时钟漂移有界且 `/read-policy/status` 显示 lease 命中时保留，否则设置 `--read-policy read_index`；核心 `lease` 路径保留用于对比 |
 | Raft 运行时 | `RAFT_CORE_WORKERS` 未设置或 0（共享运行时） |
 | OpenRaft 批处理 | 默认 `max_payload_entries=300`、`purge_batch_size=1`、`api_batch_linger_ms=0` |
 | 写入准入 | 每节点 1,024 个并发 `/write` 或 `/write_batch` 请求；超出返回 `429`；`512` 为更紧尾延迟选项，`--max-inflight-writes 0` 关闭 |
@@ -19,7 +19,7 @@
 | 构建 | 默认 release profile，无需 LTO |
 | 行情 | 8,192 帧队列、默认 leader-only、生产使用外部 sink |
 
-二进制默认值已经实现该方案，包括默认 lease read；无法保证时钟漂移有界时设置
+二进制默认值已经实现该方案，包括默认 local-lease read；无法保证时钟漂移有界时设置
 `--read-policy read_index`。
 
 方案 A 在非正常崩溃时**会丢失数据**。四投票者保护的是单个节点丢失未 fsync 尾部的情况，不保护
@@ -268,8 +268,9 @@ CPU 统计口径：
 两轮 lease 命中率均为 **100%**：1 读者每路径 2,000/2,000，64 读者 128,000/128,000，无回退。
 四个节点在同一主机，lease 一直新鲜，回退分支未被触发；计数器已实现并有单元测试，真实跨主机
 时钟漂移部署应观察 `/read-policy/status` 的 fallback 计数。收益小于上游 90.4x/3.9x 的本地
-lease 结果，因为 alpha.37 的 `ReadPolicy::LeaseRead` 仍经过 RaftCore；上游的
-`enable_local_lease_read` 本地缓存路径更新。lease 现在是默认；设置 `--read-policy read_index`
+lease 结果，因为原始 alpha.37 `ReadPolicy::LeaseRead` 基线仍经过 RaftCore；稳定版 0.10.0 已提供
+`enable_local_lease_read`/`get_local_read_linearizer`，下方 `local_lease` 实验测得线性一致读吞吐
+提升 11-36%，64 读者 p50/p99 降低约 40%。local-lease 现在是默认；设置 `--read-policy read_index`
 可强制新的 quorum 往返。
 
 ## 上游 OpenRaft minimal 基准对比（2026-11-08）
@@ -282,8 +283,8 @@ lease 结果，因为 alpha.37 的 `ReadPolicy::LeaseRead` 仍经过 RaftCore；
 执行结果与后续项（详见英文 [PERFORMANCE.md](../PERFORMANCE.md)）：
 
 - 读取路径：`/linearizable_read`、`/events` 和 gRPC `StreamEvents` 默认使用
-  `ReadPolicy::LeaseRead`，并回退到 `ReadIndex`；alpha.37 没有 `enable_local_lease_read`，
-  完整的本地缓存路径需要升级 OpenRaft。基准已完成：lease 在 1/64 读者下提升 2.17x/1.71x；
+  `local_lease`（OpenRaft 0.10 的调用侧 lease 缓存，回退到核心 lease 与 `ReadIndex`）；实测
+  线性一致读吞吐提升 11-36%，64 读者 p50/p99 降低约 40%。核心 `lease` 路径保留用于对比；
   时钟漂移无界时用 `--read-policy read_index` 强制新的 quorum 往返。
 - 写入/批处理：预连接 sweep 在 512 在途达到 114,484 writes/s、1,024 在途 99,330 writes/s；
   旧的 256 在途峰值和 1,024/4,096 下降是 TCP 建连造成的假象。默认准入上限提高到 1,024，

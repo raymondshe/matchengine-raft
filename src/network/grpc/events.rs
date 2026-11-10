@@ -9,7 +9,8 @@
 //! share the documented schema.
 //!
 //! The stream is anchored with one leader-consistent read when it opens
-//! (`lease` by default, falling back to `ReadIndex`), so the serving node must
+//! (`local_lease` by default, falling back to the core lease path and
+//! `ReadIndex`), so the serving node must
 //! be the leader at that point. Every later page reads
 //! locally applied events, which are committed by definition; this avoids a
 //! quorum round-trip per page. If leadership moves, the stream keeps delivering

@@ -4,7 +4,7 @@ Status: **gRPC only.** The HTTP/JSON Raft transport and the `--transport` switch
 2026-10-30. The HTTP listener remains dedicated to the application and management API; peer-to-peer
 Raft RPCs use gRPC on the same host at `http_addr` port + 1000.
 
-Date: 2026-10-30 · Baseline: `openraft` 0.10.0-alpha.37, `tonic` gRPC, segmented WAL + atomic
+Date: 2026-10-30 · Baseline: `openraft` 0.10.0-alpha.37 (now stable 0.10.0), `tonic` gRPC, segmented WAL + atomic
 snapshots.
 
 ## Current implementation

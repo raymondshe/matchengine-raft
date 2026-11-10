@@ -36,11 +36,12 @@ pub struct Opt {
     #[clap(long, env = "MAX_EVENTS", default_value_t = DEFAULT_MAX_EVENTS)]
     pub max_events: usize,
 
-    /// Leader-consistent read policy: `lease` (default) or `read_index`.
+    /// Leader-consistent read policy: `local_lease` (default), `lease` or `read_index`.
     ///
-    /// Lease reads reuse a recent quorum acknowledgement and fall back to
-    /// ReadIndex when the lease is stale. They assume bounded clock drift.
-    #[clap(long, env = "MATCHENGINE_READ_POLICY", default_value = "lease")]
+    /// Local lease reads use OpenRaft's caller-side lease cache before the core
+    /// lease path and fall back to `ReadIndex` when the lease is stale. The core
+    /// `lease` mode is kept for comparison. Both assume bounded clock drift.
+    #[clap(long, env = "MATCHENGINE_READ_POLICY", default_value = "local_lease")]
     pub read_policy: ReadPolicyMode,
 
     /// Maximum concurrent `/write` and `/write_batch` requests per node.
@@ -165,7 +166,10 @@ async fn main() -> std::io::Result<()> {
 
     match options.read_policy {
         ReadPolicyMode::Lease => tracing::warn!(
-            "leader-consistent reads use lease mode by default; this requires bounded clock drift (NTP/PTP). Use --read-policy read_index when that is not guaranteed"
+            "leader-consistent reads use the core lease path; this requires bounded clock drift (NTP/PTP)"
+        ),
+        ReadPolicyMode::LocalLease => tracing::warn!(
+            "leader-consistent reads use the caller-side local lease cache by default; this requires bounded clock drift (NTP/PTP). Use --read-policy read_index when that is not guaranteed"
         ),
         ReadPolicyMode::ReadIndex => tracing::info!("leader-consistent reads use ReadIndex"),
     }

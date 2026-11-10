@@ -18,6 +18,7 @@ use openraft::alias::SnapshotOf;
 use openraft::alias::VoteOf;
 use openraft::base::BoxFuture;
 use openraft::base::BoxStream;
+use openraft::entry::RaftEntry;
 use openraft::errors::NetworkError;
 use openraft::errors::RPCError;
 use openraft::errors::ReplicationClosed;
@@ -28,6 +29,8 @@ use openraft::network::RPCOption;
 use openraft::network::RPCTypes;
 use openraft::raft::AppendEntriesRequest;
 use openraft::raft::AppendEntriesResponse;
+use openraft::raft::AppendError;
+use openraft::raft::AppendResult;
 use openraft::raft::SnapshotResponse;
 use openraft::raft::StreamAppendResult;
 use openraft::raft::TransferLeaderRequest;
@@ -268,7 +271,7 @@ where
         &mut self,
         req: AppendEntriesRequest<C>,
         option: RPCOption,
-    ) -> Result<AppendEntriesResponse<C>, RPCError<C>> {
+    ) -> Result<AppendResult<C>, RPCError<C>> {
         let payload = encode(&req).map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
         let mut client = self.client()?;
         let ttl = option.soft_ttl();
@@ -283,7 +286,18 @@ where
 
         let result: Result<AppendEntriesResponse<C>, openraft::errors::RaftError<C>> =
             decode(&resp.payload).map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
-        result.map_err(|e| RPCError::Network(NetworkError::new(&e)))
+        let prev_log_id = req.prev_log_id;
+        let last_log_id = req
+            .entries
+            .last()
+            .map(|entry| {
+                let (leader_id, index) = entry.log_id_parts();
+                openraft::LogId::new(leader_id.clone(), index)
+            })
+            .or_else(|| prev_log_id.clone());
+        result
+            .map(|response| response.into_append_result(prev_log_id, last_log_id))
+            .map_err(|e| RPCError::Network(NetworkError::new(&e)))
     }
 
     #[tracing::instrument(level = "debug", skip_all, err(Debug))]
@@ -463,7 +477,7 @@ where
         &'s mut self,
         input: S,
         option: RPCOption,
-    ) -> BoxFuture<'s, Result<BoxStream<'s, Result<StreamAppendResult<C>, RPCError<C>>>, RPCError<C>>>
+    ) -> BoxFuture<'s, Result<BoxStream<'s, Result<AppendResult<C>, RPCError<C>>>, RPCError<C>>>
     where
         S: Stream<Item = AppendEntriesRequest<C>> + OptionalSend + Unpin + 'static,
     {
@@ -567,7 +581,7 @@ where
                             let result: Result<StreamAppendResult<C>, RPCError<C>> = decode(&msg.payload)
                                 .map_err(|e| RPCError::Network(NetworkError::new(&e)));
                             match result {
-                                Ok(result) => yield Ok(result),
+                                Ok(result) => yield Ok(result.map_err(AppendError::from)),
                                 Err(e) => {
                                     yield Err(e);
                                     break;
@@ -578,7 +592,7 @@ where
                 }
             };
 
-            let out: BoxStream<'s, Result<StreamAppendResult<C>, RPCError<C>>> = Box::pin(out);
+            let out: BoxStream<'s, Result<AppendResult<C>, RPCError<C>>> = Box::pin(out);
             Ok(out)
         })
     }

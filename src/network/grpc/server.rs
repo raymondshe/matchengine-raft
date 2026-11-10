@@ -21,7 +21,10 @@ use openraft::alias::VoteOf;
 use openraft::errors::NetworkError;
 use openraft::errors::StreamingError;
 use openraft::raft::AppendEntriesRequest;
+use openraft::raft::AppendEntriesResponse;
 use openraft::raft::SnapshotResponse;
+use openraft::raft::StreamAppendError;
+use openraft::raft::StreamAppendResult;
 use openraft::raft::TransferLeaderRequest;
 use openraft::raft::VoteRequest;
 use tokio::io::AsyncWriteExt;
@@ -201,7 +204,11 @@ impl RaftService for RaftGrpcService {
             decode(&request.into_inner().payload)
                 .map_err(|e| Status::invalid_argument(format!("decode AppendEntries: {e}")))?;
 
-        let result = self.raft.append_entries(req).await;
+        let result = self
+            .raft
+            .append_entries(req)
+            .await
+            .map(AppendEntriesResponse::from);
         let payload = encode(&result)
             .map_err(|e| Status::internal(format!("encode AppendEntries response: {e}")))?;
 
@@ -377,12 +384,16 @@ impl RaftService for RaftGrpcService {
 
             while let Some(item) = results.next().await {
                 let out = match item {
-                    Ok(result) => match encode(&result) {
-                        Ok(payload) => Ok(AppendResponse { payload }),
-                        Err(e) => Err(Status::internal(format!(
-                            "encode streamed AppendEntries response: {e}"
-                        ))),
-                    },
+                    Ok(result) => {
+                        let wire: StreamAppendResult<MatchEngineTypeConfig> =
+                            result.map_err(StreamAppendError::from);
+                        match encode(&wire) {
+                            Ok(payload) => Ok(AppendResponse { payload }),
+                            Err(e) => Err(Status::internal(format!(
+                                "encode streamed AppendEntries response: {e}"
+                            ))),
+                        }
+                    }
                     Err(fatal) => Err(Status::internal(format!(
                         "raft stream append failed: {fatal}"
                     ))),

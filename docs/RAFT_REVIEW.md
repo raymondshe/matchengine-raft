@@ -3,15 +3,18 @@
 Date: 2026-11-06
 Scope: OpenRaft storage and transport usage, plus adjacent OpenRaft 0.10 APIs that are
 currently unused.
-Version reviewed: `openraft 0.10.0-alpha.37`.
+Version reviewed: `openraft 0.10.0-alpha.37` (the dependency is now on stable `0.10.0`; the
+transport-specific findings still apply, and the `AppendResult` conversion is documented in
+`AGENTS.md`).
 
 This document records the review and its priorities. The P1 quick wins were implemented on
 2026-11-06; the remaining follow-ups are tracked in [`TODO.md`](../TODO.md) §16.
 
 **Status 2026-11-10:** S4 (WAL byte cap) and the snapshot-transfer recommendations are
 implemented: `--max-wal-append-bytes` splits append writes under one lock/fsync, cached snapshot
-data is `Arc<[u8]>`, and received snapshots stage to a validated file. The `openraft` pin stays at
-`0.10.0-alpha.37`; the newest published 0.10 release is still `0.10.0-alpha.38`.
+data is `Arc<[u8]>`, and received snapshots stage to a validated file. The dependency is on stable
+`openraft 0.10.0`; the transport converts its non-serde `AppendResult` to the existing postcard
+payloads.
 
 ## Executive summary
 

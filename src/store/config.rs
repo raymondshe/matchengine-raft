@@ -111,9 +111,10 @@ pub struct StorageConfig {
     /// default to 1.
     pub min_voters: usize,
 
-    /// Leader-consistent read policy. `Lease` is the default and falls back to
-    /// `ReadIndex` when the lease is stale; set `ReadIndex` explicitly when
-    /// bounded clock drift is not guaranteed.
+    /// Leader-consistent read policy. `LocalLease` is the default and uses
+    /// OpenRaft's caller-side lease cache before falling back to the core lease
+    /// path and `ReadIndex`; `Lease` keeps the core path, and `ReadIndex` forces
+    /// a fresh quorum round when bounded clock drift is not guaranteed.
     pub read_policy: ReadPolicyMode,
 
     /// Maximum concurrent `/write` and `/write_batch` requests per node.
@@ -412,15 +413,21 @@ mod tests {
     }
 
     #[test]
-    fn read_policy_defaults_to_lease_and_is_configurable() {
+    fn read_policy_defaults_to_local_lease_and_is_configurable() {
         assert_eq!(
-            ReadPolicyMode::Lease,
+            ReadPolicyMode::LocalLease,
             StorageConfig::new("/data").read_policy
         );
         assert_eq!(
             ReadPolicyMode::ReadIndex,
             StorageConfig::new("/data")
                 .with_read_policy(ReadPolicyMode::ReadIndex)
+                .read_policy
+        );
+        assert_eq!(
+            ReadPolicyMode::LocalLease,
+            StorageConfig::new("/data")
+                .with_read_policy(ReadPolicyMode::LocalLease)
                 .read_policy
         );
     }

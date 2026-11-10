@@ -1,11 +1,12 @@
 //! Lease reads by default, with a ReadIndex fallback.
 //!
-//! `LeaseRead` is the default: it reuses a recent quorum acknowledgement and
-//! avoids a fresh quorum round while the leader's lease is valid. It assumes
-//! bounded clock drift between nodes; if the lease is stale, this runtime falls
-//! back to `ReadIndex` instead of failing immediately (a ReadIndex failure is
-//! still returned to the caller). Set `--read-policy read_index` to force a
-//! fresh quorum round on every read when clock discipline is not guaranteed.
+//! `LocalLease` is the default: it uses OpenRaft's caller-side lease cache and
+//! falls back to the core `LeaseRead` path on a cache miss, then to `ReadIndex`
+//! if the lease is stale. It assumes bounded clock drift between nodes. A
+//! caller-side cache hit can overtake an unfinished write; a client that must
+//! observe a write should await its response first. `Lease` keeps the core
+//! `ReadPolicy::LeaseRead` path for comparison; set `--read-policy read_index`
+//! to force a fresh quorum round when clock discipline is not guaranteed.
 //!
 //! `/read` stays a local, possibly stale read and is intentionally not routed
 //! through this policy.
@@ -37,9 +38,13 @@ pub const READ_POLICY_ENV: &str = "MATCHENGINE_READ_POLICY";
 pub enum ReadPolicyMode {
     /// Confirm leadership with a fresh quorum round on every read.
     ReadIndex,
-    /// Try a recent quorum acknowledgement first and fall back to `ReadIndex`.
-    #[default]
+    /// Try a recent quorum acknowledgement through OpenRaft's core path and
+    /// fall back to `ReadIndex`.
     Lease,
+    /// Try OpenRaft's caller-side local lease cache first, falling back to the
+    /// core lease path and then `ReadIndex` on a miss or stale lease.
+    #[default]
+    LocalLease,
 }
 
 impl ReadPolicyMode {
@@ -48,6 +53,7 @@ impl ReadPolicyMode {
         match self {
             Self::ReadIndex => "read_index",
             Self::Lease => "lease",
+            Self::LocalLease => "local_lease",
         }
     }
 }
@@ -65,8 +71,9 @@ impl FromStr for ReadPolicyMode {
         match value.trim().to_ascii_lowercase().as_str() {
             "read_index" | "read-index" | "readindex" | "index" => Ok(Self::ReadIndex),
             "lease" | "lease_read" | "lease-read" => Ok(Self::Lease),
+            "local_lease" | "local-lease" | "locallease" => Ok(Self::LocalLease),
             other => Err(format!(
-                "unknown read policy {other:?}; expected read_index or lease"
+                "unknown read policy {other:?}; expected read_index, lease or local_lease"
             )),
         }
     }
@@ -160,7 +167,7 @@ impl ReadPathMetrics {
 /// Snapshot returned by `GET /read-policy/status`.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ReadPolicyStatus {
-    /// `"read_index"` or `"lease"`.
+    /// `"read_index"`, `"lease"` or `"local_lease"`.
     pub mode: String,
     /// `/linearizable_read`.
     pub linearizable_read: ReadPathMetrics,
@@ -243,11 +250,16 @@ impl ReadPolicyRuntime {
         }
 
         counters.lease_attempts.fetch_add(1, Ordering::Relaxed);
-        match raft
-            .get_read_linearizer(ReadPolicy::LeaseRead)
-            .await
-            .decompose()
-        {
+        let lease = if self.mode == ReadPolicyMode::LocalLease {
+            raft.get_local_read_linearizer(ReadPolicy::LeaseRead)
+                .await
+                .decompose()
+        } else {
+            raft.get_read_linearizer(ReadPolicy::LeaseRead)
+                .await
+                .decompose()
+        };
+        match lease {
             Ok(Ok(linearizer)) => {
                 counters.lease_hits.fetch_add(1, Ordering::Relaxed);
                 Ok(Ok(linearizer))
@@ -282,9 +294,12 @@ mod tests {
         assert_eq!(ReadPolicyMode::ReadIndex, "read-index".parse().unwrap());
         assert_eq!(ReadPolicyMode::Lease, "lease".parse().unwrap());
         assert_eq!(ReadPolicyMode::Lease, "lease_read".parse().unwrap());
+        assert_eq!(ReadPolicyMode::LocalLease, "local_lease".parse().unwrap());
+        assert_eq!(ReadPolicyMode::LocalLease, "local-lease".parse().unwrap());
         assert!("sticky".parse::<ReadPolicyMode>().is_err());
         assert_eq!("lease", ReadPolicyMode::Lease.to_string());
-        assert_eq!(ReadPolicyMode::Lease, ReadPolicyMode::default());
+        assert_eq!("local_lease", ReadPolicyMode::LocalLease.to_string());
+        assert_eq!(ReadPolicyMode::LocalLease, ReadPolicyMode::default());
     }
 
     #[test]

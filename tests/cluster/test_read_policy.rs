@@ -23,10 +23,20 @@ type C = MatchEngineTypeConfig;
 
 const LEASE_ADDR: TestAddr = TestAddr::new(21930);
 const READ_INDEX_ADDR: TestAddr = TestAddr::new(21932);
+const LOCAL_LEASE_ADDR: TestAddr = TestAddr::new(21938);
 
 #[test]
-fn default_lease_reads_serve_leader_reads_and_report_hits() {
-    C::run(run_policy_case(LEASE_ADDR, None, "lease"));
+fn default_local_lease_reads_serve_leader_reads_and_report_hits() {
+    C::run(run_policy_case(LEASE_ADDR, None, "local_lease"));
+}
+
+#[test]
+fn local_lease_reads_use_the_caller_side_cache() {
+    C::run(run_policy_case(
+        LOCAL_LEASE_ADDR,
+        Some(ReadPolicyMode::LocalLease),
+        "local_lease",
+    ));
 }
 
 #[test]
@@ -102,7 +112,11 @@ async fn run_policy_case(
     assert_eq!(expected_mode, status.mode);
     assert_eq!(0, status.get_linearizer.lease_attempts);
 
-    if expected_mode == "lease" {
+    if expected_mode == "read_index" {
+        assert_eq!(0, status.totals.lease_attempts);
+        assert_eq!(2, status.totals.read_index_attempts);
+        assert_eq!(0, status.totals.read_index_failures);
+    } else {
         assert_eq!(1, status.linearizable_read.lease_attempts);
         assert_eq!(1, status.events.lease_attempts);
         for metrics in [status.linearizable_read, status.events] {
@@ -117,10 +131,6 @@ async fn run_policy_case(
             2, status.totals.lease_hits,
             "single-node lease reads should not need a ReadIndex fallback"
         );
-    } else {
-        assert_eq!(0, status.totals.lease_attempts);
-        assert_eq!(2, status.totals.read_index_attempts);
-        assert_eq!(0, status.totals.read_index_failures);
     }
 
     node.shutdown().await.unwrap();

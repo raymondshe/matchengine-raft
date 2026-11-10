@@ -288,7 +288,7 @@ deserialize:
 pub struct MatchEngineResponse {
     pub value: Option<String>,        // existing: sequence string
     pub sequence: Option<u64>,        // explicit taker sequence
-    pub events: Vec<MatchEvent>,      // first 512 events of the entry
+    pub events: SmallVec<[MatchEvent; 1]>, // first 512 events; one inline, serializes as an array
     pub events_truncated: bool,       // true when the entry produced more
 }
 ```
@@ -419,7 +419,7 @@ message StreamEventsPage { bytes payload = 1; }  // JSON EventsResponse
   `MatchEvent` omits absent optional fields with `skip_serializing_if`, which positional formats
   such as postcard cannot deserialize reliably, and a JSON page lets non-Rust consumers share the
   documented schema.
-- The stream is anchored with one leader-consistent read (lease by default, `ReadIndex` fallback)
+- The stream is anchored with one leader-consistent read (`local_lease` by default, falling back to the core lease path and `ReadIndex`)
   when it opens, so the serving node must be the leader at that point (`FAILED_PRECONDITION` with
   the leader error otherwise). Later pages read locally applied committed events with no per-page
   quorum round-trip.

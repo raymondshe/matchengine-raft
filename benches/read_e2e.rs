@@ -9,7 +9,7 @@
 //! Run with:
 //!
 //! ```text
-//! cargo bench --bench read_e2e -- [--policy read_index|lease|both]
+//! cargo bench --bench read_e2e -- [--policy read_index|lease|local_lease|both]
 //! ```
 
 use std::path::PathBuf;
@@ -593,7 +593,7 @@ fn print_comparison(read_index: &PolicyResult, lease: &PolicyResult) {
 }
 
 fn main() -> anyhow::Result<()> {
-    let mut policies = vec![ReadPolicyMode::ReadIndex, ReadPolicyMode::Lease];
+    let mut policies = vec![ReadPolicyMode::ReadIndex, ReadPolicyMode::LocalLease];
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -601,14 +601,16 @@ fn main() -> anyhow::Result<()> {
             "--policy" => {
                 let value = args.next().context("--policy needs a value")?;
                 policies = if value.eq_ignore_ascii_case("both") {
-                    vec![ReadPolicyMode::ReadIndex, ReadPolicyMode::Lease]
+                    vec![ReadPolicyMode::ReadIndex, ReadPolicyMode::LocalLease]
                 } else {
                     let mode =
                         ReadPolicyMode::from_str(&value).map_err(|error| anyhow::anyhow!(error))?;
                     vec![mode]
                 };
             }
-            other => bail!("unknown argument {other:?}; expected --policy <read_index|lease|both>"),
+            other => bail!(
+                "unknown argument {other:?}; expected --policy <read_index|lease|local_lease|both>"
+            ),
         }
     }
 

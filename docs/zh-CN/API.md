@@ -72,17 +72,19 @@ Raft 节点间 RPC 仅由 `--http-addr` 端口 + 1000 上的 gRPC 提供；HTTP 
 #### 读一致性与 lease read
 
 `POST /read` 是本地读，可能过期，不受读策略影响。需要 leader 一致性的路径默认使用
-`ReadPolicy::LeaseRead`：`/linearizable_read`、`/events`、gRPC `StreamEvents` 锚点，以及
-`/follower_read` 使用的 `/get_linearizer`。在 leader lease 有效时复用最近的 quorum 确认，
-省去新的往返；lease 过期时自动回退到 `ReadIndex`，quorum 可用时承担回退延迟后成功，否则返回
-Raft 读错误。
+`local_lease`：`/linearizable_read`、`/events`、gRPC `StreamEvents` 锚点，以及
+`/follower_read` 使用的 `/get_linearizer` 先使用 OpenRaft 的调用侧 lease 缓存，再走核心
+`ReadPolicy::LeaseRead`。在 leader lease 有效时复用最近的 quorum 确认，省去新的往返；lease
+过期时自动回退到 `ReadIndex`，quorum 可用时承担回退延迟后成功，否则返回 Raft 读错误。
 
 启动参数 `--read-policy read_index`（环境变量 `MATCHENGINE_READ_POLICY=read_index`）可强制每次
-读都使用新的 quorum 往返，而不是默认 lease。
+读都使用新的 quorum 往返；`--read-policy lease` 保留不带调用侧缓存的核心路径。本地缓存路径在
+4 节点基准中读吞吐提升 11-36%，64 读者 p50/p99 降低约 40%。
 
-Lease read 假设节点间**时钟漂移有界**。使用 NTP 或 PTP；除非部署能保证 leader lease 不会
-超过实际领导权，否则设置 `--read-policy read_index`。状态端点按读路径报告 `lease_attempts`、
-`lease_hits`、`lease_fallbacks`、`lease_failures`、`read_index_attempts` 和
+Lease 与 local-lease read 假设节点间**时钟漂移有界**。使用 NTP 或 PTP；除非部署能保证 leader
+lease 不会超过实际领导权，否则设置 `--read-policy read_index`。local-lease 缓存命中可能越过尚未
+完成的写请求；需要读到某次写结果的客户端应先等待写响应。状态端点按读路径报告
+`lease_attempts`、`lease_hits`、`lease_fallbacks`、`lease_failures`、`read_index_attempts` 和
 `read_index_failures`。
 - gRPC `EventService.StreamEvents` - 在 gRPC 监听器上按同一游标流式推送 JSON 事件页，支持 `wait_ms` 和 `max_pages`
 - `GET /events/status` - 保留事件窗口、淘汰计数和保留上限
@@ -102,7 +104,7 @@ pub enum MatchEngineRequest {
 pub struct MatchEngineResponse {
     pub value: Option<String>,        // 兼容旧调用：序列号字符串
     pub sequence: Option<u64>,        // 分配的 market_seq
-    pub events: Vec<MatchEvent>,      // 本条目的前 512 个事件
+    pub events: SmallVec<[MatchEvent; 1]>, // 本条目的前 512 个事件；一个内联，序列化为数组
     pub events_truncated: bool,       // 还有更多事件时为 true
     pub error: Option<String>,        // 非致命的应用层错误
     pub batch: Vec<MatchEngineResponse>, // /write_batch 的逐项响应

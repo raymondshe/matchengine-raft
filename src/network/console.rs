@@ -875,7 +875,7 @@ async fn collect_node_snapshot(app: &MatchEngineApp) -> NodeSnapshot {
     let metrics = app.raft.metrics().borrow_watched().clone();
     let membership = metrics.membership_config.membership();
     let voters = membership.voter_ids().collect::<Vec<_>>();
-    let learners = membership.learner_ids().collect::<Vec<_>>();
+    let learners = membership.non_write_voter_ids().collect::<Vec<_>>();
     let replication = metrics
         .replication
         .as_ref()

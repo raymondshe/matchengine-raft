@@ -634,7 +634,7 @@ fn order_result(response: ClientWriteResponse<C>, product: Product) -> OrderResu
         product,
         sequence: response.data.sequence,
         log_index: response.log_id.index,
-        events: response.data.events,
+        events: response.data.events.to_vec(),
         events_truncated: response.data.events_truncated,
         error: response.data.error,
     }

@@ -37,7 +37,7 @@ dedicated OpenRaft runtime (`RAFT_CORE_WORKERS`), the thread/lock audit (blockin
 recovery on `spawn_blocking`, async JSONL sink/events bridge, Aeron publisher/source blocking
 tasks, a Tokio WAL fsync worker; only the env-controlled `RaftThread` remains), the realistic-mix
 replay benchmark, the four-node no-fsync cluster benchmark (`cluster_e2e`), the write
-concurrency/batching sweep, the read-path benchmark plus lease reads (now the default; `read_e2e`), and the
+concurrency/batching sweep, the read-path benchmark plus local-lease reads (now the default; `read_e2e`), and the
 feature-gated async WAL prototype with crash-recovery tests, the production configuration
 decision record (two durability profiles and rejected options), the server-side write admission
 control with `/admission/status`, and the pre-connected concurrency sweep that raised the default
@@ -49,8 +49,10 @@ matrix (§17). OpenRaft observability now exposes `data_metrics`/`server_metrics
 plus process-local `transport_metrics` (heartbeat/replication `AppendStream` streams and requests,
 snapshot send/receive time) through `/metrics`, uses explicit heartbeat/snapshot channel profiles,
 and documents flamegraph and tokio-console use in `cluster_e2e` (§16). The console gained guarded
-`purge-log` and `runtime-config` actions alongside transfer/election/snapshot. The benchmark
-regression gate now runs in CI:
+`purge-log` and `runtime-config` actions alongside transfer/election/snapshot. The benchmark now
+has an open-loop `e2e --rate` mode with scheduled/service/dispatch latency, a current-HEAD
+book-only re-pin, and a sorted-vector book-only A/B (§17). The benchmark regression gate now runs
+in CI:
 exact `apply_path` allocation ceilings plus loose `book_replay`/`replay_mix` p50/p99 bounds, with
 a manual Linux workflow for the pinned-core `e2e` pass (§8). The four-voter no-fsync contract now
 has a real-process leader-kill test: three survivors commit, and the restarted node catches up
@@ -67,7 +69,9 @@ opened the P1 follow-ups in §17. The benchmark correctness batch is implemented
 conformance cases, `order_not_found` for cancel misses, the identity documentation and the
 random-point state audit (§17). The occupancy envelope is also in place:
 `cargo bench --bench book_replay -- --matrix` reports the four standing-book shapes and the
-worst-case median-of-10 (§8). The schema-v11 order-type batch is implemented: snapshot v11,
+worst-case median-of-10 (§8), and `cargo bench --bench sorted_book` records the book-only
+sorted-vector A/B without adopting it. The `e2e --rate` open-loop mode and the coordinated-omission
+caveat are recorded too. The schema-v11 order-type batch is implemented: snapshot v11,
 market-data wire v7, market-to-limit, trailing stops, pegged orders and self-trade prevention
 (§5).
 
@@ -88,25 +92,21 @@ implemented: the replication lag threshold now sits above the 100k snapshot poli
 suppression is enabled, HTTP/2 windows/keepalive are tuned, snapshot chunks follow OpenRaft's
 configured size and readiness waits for recovery. The remaining P2/P3 items are tracked in §16.
 
-The next work, in order (re-prioritised 2026-11-10 after the Aeron heartbeat/request batch):
+The next work, in order (re-prioritised 2026-11-10 after the local-lease default):
 
 1. **Run the Linux pinned-core `e2e` pass and Linux Aeron validation (P2, §8/§6).**
    Dispatch the manual `Linux benchmark` workflow for the pinned short/sustained rows and run the
    external-driver plus multicast fan-out checklist in
    [`demos/market_data_system/README.md`](./demos/market_data_system/README.md). Both remain blocked
    on a Linux host; `gh` authentication is also needed for the workflow.
-2. **Benchmark P2 follow-ups (P2, §17).** Add the open-loop latency run (or the coordinated-omission
-   caveat), re-pin the benchmark to current `HEAD`, and evaluate a treap/sorted-vector/heap hybrid
-   only as a book-only A/B.
-3. **Last: apply-path and per-level-bucket experiments (§8, P3).** Reserve known apply-path
-   lengths, evaluate apply-thread affinity and adopt per-level buckets only if a sparse-level fast
-   path or new measurements justify them; the measured wins are small or split.
 
 The earlier measurement work is done: `book_replay` and `level_book` report warm p50/p99 plus an
 interleaved cold pass, `replay_mix` replays a 100,000-operation fixture with fees, the 4-node
 no-fsync cluster, the write concurrency/batching sweep, the read-path/lease results, the async-WAL
 prototype and the upstream OpenRaft comparison are recorded in `PERFORMANCE.md`, and the `Order`
-identity/optional-sequence/BTC-USDT/overflow-case quick wins landed. The earlier third-party
+identity/optional-sequence/BTC-USDT/overflow-case quick wins landed. The apply-path allocation
+leftovers are inline now, apply-thread affinity is measured and stays on the shared runtime, and
+the per-level bucket/sorted-vector A/Bs are recorded without adoption. The earlier third-party
 follow-ups are P2/P3 (§14); the new benchmark-derived follow-ups are P1/P2 (§17). Measurement
 scope, peak RSS, the fuzz targets, health/readiness and the operational console are in place.
 Equity/ETF sessions, holidays, auctions, T+1/T+2 settlement, corporate actions and
@@ -263,8 +263,9 @@ Remaining:
   Done: `SnapshotData` carries a staged snapshot received as chunks; the state machine validates
   its length/CRC and writes the durable snapshot atomically. `Arc<[u8]>` carries locally built
   snapshots and `get_current_snapshot` no longer copies the body.
-- [ ] **P2** Move off `openraft` 0.10.0-alpha once a stable 0.10 release exists; the latest
-  published release is still `0.10.0-alpha.38` (checked 2026-11-10).
+- [x] **P2** Move off `openraft` 0.10.0-alpha once a stable 0.10 release exists. Done:
+  `openraft` is on stable `0.10.0`; the transport converts `AppendResult` to the existing
+  `AppendEntriesResponse`/`StreamAppendResult` postcard payloads, so the wire shapes stay stable.
 - [ ] **P3** The Aeron **Raft transport** remains gated on a measured bottleneck; the market-data
   Aeron egress is implemented (§6).
 
@@ -297,11 +298,10 @@ Done:
   iceberg refill identity/queue priority and stop-cascade conservation (§17).
 - [x] Prototyped per-price-level buckets (`BTreeMap<price, Vec<Order>>` + `head` cursor +
   sequence index + cached BBO) in `benches/level_book.rs`; the benchmark verifies the prototype
-  against `OrderBook` before timing. Results are in `docs/PERFORMANCE.md`: match 1.76–2.15x,
-  deep cancel 3.34–3.37x, same-price amend 1.70–1.75x, dense re-queue 2.58–2.62x and BBO query
-  4.5–6.2x faster; sparse one-order-per-level re-queue 0.64–0.65x and BBO advance 0.87–0.90x
-  slower; depth neutral. Full adoption remains P2 and is not justified without a sparse-level
-  fast path.
+  against `OrderBook` before timing. The 2026-11-10 rerun is in `docs/PERFORMANCE.md`: match
+  2.00x, deep cancel 3.27x, same-price amend 2.28x, dense re-queue 2.74x, BBO query 6.09x, BBO
+  advance 1.04x; sparse one-order-per-level re-queue 0.88x and depth 0.94x. Not adopted: the
+  sparse case still loses, the prototype is plain-limit only, and no 3-node/real-sink run exists.
 
 Remaining:
 
@@ -426,7 +426,7 @@ Current coverage:
 - `test_failure.rs`: fail-stop when the Raft core stops, injected WAL `ENOSPC`/`EIO`, `SIGKILL`
   during a write stream and `SIGKILL` during a learner snapshot install.
 - `test_min_voters.rs`: the four-voter no-fsync guard on `/init`, `/change-membership` and writes.
-- `test_read_policy.rs`: default lease reads and explicit `read_index` reads serve `/linearizable_read` and `/events`, local `/read`
+- `test_read_policy.rs`: default local-lease reads and explicit `read_index` reads serve `/linearizable_read` and `/events`, local `/read`
   bypasses the policy, and `/read-policy/status` reports lease hits and fallbacks.
 - `tests/replay/`: shell-driven replay matrix for GTC, IOC, FOK, GTD, Day, market, post-only,
   iceberg, stop-market, stop-limit, amend, cancel, default-policy maker/taker fees, quote-asset fees
@@ -492,7 +492,8 @@ Remaining (the public-suite follow-ups are tracked in §17):
   four standing-book shapes calibrated to the FlashOne seed-23 averages (static 20.9k/60 down to
   flash-crash 240/210), a 50k-op steady-state mix, occupancy sampled every 64 ops, and 10
   whole-replay trials reporting median/stddev/CV plus the worst-case scenario. The macOS baseline
-  is in `docs/PERFORMANCE.md`; static is the worst case at 4.66-5.00 M ops/s.
+  is in `docs/PERFORMANCE.md`; the current-HEAD re-pin puts static at 3.62-4.23 M ops/s (median
+  3.68). The earlier 4.66-5.00 M ops/s run remains historical host variance.
 - [x] **P1** Add an apply-path allocation benchmark (`cargo bench --bench apply_path`) and reduce
   the common event path with inline `SmallVec` buffers: rest 7.17→4.17, cancel 6.00→4.00, fill
   8.00→5.00 allocs/entry; batch rest 6.23→4.19 allocs/entry. Requested bytes/entry fell from
@@ -581,16 +582,31 @@ Remaining (the public-suite follow-ups are tracked in §17):
   default; use it only with four voters and an accepted 100 ms loss window. The FD-clone fsync
   removed the disk-lock stall; the remaining tail is filesystem-level. See the production
   configuration section in `docs/PERFORMANCE.md`.
-- [ ] **P3** Reserve the known lengths for the remaining apply-path allocations (response `events`
+- [x] **P3** Reserve the known lengths for the remaining apply-path allocations (response `events`
   `Vec`, fill `MatchResult` `Vec`) where the shape is fixed; they are the `apply_path` leftovers.
-- [ ] **P3** Decide whether strict apply-thread affinity is worth the cost: the single-worker
-  dedicated runtime keeps apply on one thread but measured ~7% lower concurrent writes; a batched
-  apply actor is the alternative.
-- [ ] **P3** Adopt per-level buckets or a compact resting record only if the P1 prototype and
-  new 3-node or real-sink measurements justify the complexity. The 2026-11-04 run wins 1.84x
-  match, 3.31x cancel, 1.75x/2.59x amend and 4.90x BBO query, but loses 0.75x sparse amend, 0.87x
-  BBO advance and 0.96x depth; full adoption is not justified yet, and a hybrid or sparse-level
-  fast path is the next experiment.
+  Done: response events use `SmallVec<[MatchEvent; 1]>`, so the common one-event case is inline.
+  `apply_path` went from 4.17/4.00/5.00 to 3.17/3.00/4.00 allocs/entry for rest/cancel/fill; fill
+  bytes rose slightly from ~2,012 to ~2,380 B/entry because its `Vec` remains, while rest/cancel
+  bytes fell. Batch-rest calls fell from 536,336 to 408,336. A `FillBuffer` inline attempt was
+  reverted: it removed the fill allocation but enlarged every `Outcome`/`place_order` return and
+  slowed the book-only `replay_mix` replay from ~107 ms to ~185 ms, far outweighing the one-call
+  save. Batch-blank bytes rose from 381 to 597 B/entry because every response now carries the
+  inline event slot; that is the deliberate trade, and the `--check` ceilings were re-pinned to the
+  2026-11-10 totals.
+- [x] **P3** Decide whether strict apply-thread affinity is worth the cost: the single-worker
+  dedicated runtime keeps apply on one thread, but an earlier run measured ~7% lower concurrent
+  writes; a batched apply actor is the alternative. Done: the 2026-11-10 A/B with pre-connected 256
+  clients was within noise (76,990 vs 75,416 writes/s, p99 parity), and the three-round 1,024
+  burst was also within noise (41,221 vs 40,449 writes/s, p50 16.34 vs 16.86 ms, p99 19.16 vs
+  18.68 ms). Keep the shared runtime; no apply actor without a new tail win. The dedicated runtime
+  remains an isolation option, not an affinity win.
+- [x] **P3** Adopt per-level buckets or a compact resting record only if the P1 prototype and
+  new 3-node or real-sink measurements justify the complexity. Done: the 2026-11-10 rerun still
+  shows large wins (2.00x match, 3.27x cancel, 2.28x/2.74x amend, 6.09x BBO query, 1.04x BBO
+  advance) but a 0.88x sparse amend and 0.94x depth loss; the prototype excludes stops, icebergs,
+  GTD, pegged orders, the depth journal and events. No sparse-level fast path or 3-node/real-sink
+  run exists, so the current `BTreeMap` stays; the sorted-vector A/B (0.14x price amend, 0.35x
+  BBO advance) confirms that a pure level layout is not a universal win.
 
 ## 9. Client library [done]
 
@@ -886,9 +902,12 @@ and optional APIs.
   metrics. Done: `--read-policy lease` / `MATCHENGINE_READ_POLICY=lease`, `GET
   /read-policy/status`, per-path counters, `test_read_policy.rs`, and the bounded-clock-drift
   contract in `docs/API.md`. Both benchmark runs had 100% lease hits and no fallbacks on one host.
-- [ ] **P3** Upgrade OpenRaft for `enable_local_lease_read`/`get_local_read_linearizer` and measure
-  the full local-read path; the API is not in alpha.37. The current LeaseRead still passes through
-  RaftCore and delivered 2.17x/1.71x linearizable-read throughput, not the upstream 90.4x/3.9x.
+- [x] **P3** Use OpenRaft's `enable_local_lease_read`/`get_local_read_linearizer` and measure the
+  full local-read path; stable `0.10.0` now provides the API. Done: `local_lease` is the default
+  read policy; on the 4-node read benchmark it improved linearizable reads by 11-36% (64-reader
+  p50 53.5-53.8 µs vs 88.4-92.1 µs, p99 0.64-0.69 ms vs 1.17-1.19 ms) and `/events` by 8-16%,
+  with write throughput within noise. The core `lease` mode remains available for comparison.
+  Details in `docs/PERFORMANCE.md`.
 - [ ] **P3** Cache follower-read linearizers for a short TTL bounded by the leader lease, or add a
   lease-based `/get_linearizer` mode; measure the per-read leader hop.
 
@@ -1073,12 +1092,32 @@ reported 7.20 M/s book-only; the full review and competitor taxonomy are in
   calibrated shapes, samples occupancy every 64 ops in an untimed pass, and reports median,
   population stddev, CV and the worst-case scenario; the local baseline is in
   [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md).
-- [ ] **P2** Add a paced/open-loop latency run, or state the coordinated-omission caveat for the
-  closed-loop tails.
-- [ ] **P2** Re-pin the benchmark to current `HEAD`, record the book-only result and scope in
-  `docs/PERFORMANCE.md`, and publish the adapter only if it can be maintained.
-- [ ] **P2** Evaluate a treap, sorted vector or heap hybrid only as a book-only A/B; do not switch
-  on the external leaderboard alone.
+- [x] **P2** Add a paced/open-loop latency run, or state the coordinated-omission caveat for the
+  closed-loop tails. Done: `cargo bench --bench e2e -- --duration <s> --clients <n> --rate <req/s>`
+  keeps an absolute per-client send schedule and reports scheduled-send, dispatch-lag and service
+  percentiles. At 64 clients, 10k offered gave 9,993 writes/s with scheduled p50/p99
+  3.49/5.87 ms; 50k gave 49,975/s with 1.51/3.02 ms; 80k gave 79,952/s with 1.39/11.73 ms but
+  service p99 was 1.12 ms and dispatch-lag p99 10.9 ms, so the 80k tail is the generator, not the
+  server. The closed-loop 64-client run reached 89,714 writes/s at p99 1.33 ms. `PERFORMANCE.md`
+  records both views plus the caveat that closed-loop tails hide queueing and open-loop tails can
+  include generator scheduling.
+- [x] **P2** Re-pin the benchmark to current `HEAD`, record the book-only result and scope in
+  `docs/PERFORMANCE.md`, and publish the adapter only if it can be maintained. Done: the
+  production code under test is `ee07ba0` (later lock-file, benchmark and documentation commits
+  add no `OrderBook` changes); three clean
+  `book_replay --matrix` runs put the worst-case `static` shape at 3.62-4.23 M ops/s (median
+  3.68), with normal 5.91-6.02, wide-swing 6.14-6.28 and flash-crash 6.77-6.85 M ops/s. The
+  scope is a local 50k-operation occupancy envelope, not the external 2M-message flow. No FlashOne
+  adapter is published: it would need external maintenance to translate their client-id
+  cancel+reinsert `modify` and their ABI, and the local matrix is the maintained baseline.
+- [x] **P2** Evaluate a treap, sorted vector or heap hybrid only as a book-only A/B; do not switch
+  on the external leaderboard alone. Done: `benches/sorted_book.rs` compares a sorted-vector price
+  ladder with the current per-order `BTreeMap` on plain limits. It wins match (1.73-2.07x), cancel
+  (2.24-2.36x), same-price amend (2.07-2.46x) and depth (1.20-1.23x), but loses price amend
+  (0.14-0.15x) and BBO advance (0.34-0.35x) because level re-insert/removal is O(n); its
+  BBO-query win (10-12x) is a cached BBO versus a tree read. Not adopted: the structural losses
+  rule out a pure vector, and a tree/heap hybrid remains a book-only option only if a sparse-level
+  fast path is measured.
 
 ### Remaining feature work
 

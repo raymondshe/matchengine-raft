@@ -2,6 +2,7 @@ use std::fmt;
 
 use serde::Deserialize;
 use serde::Serialize;
+use smallvec::SmallVec;
 
 use crate::match_result::MatchEvent;
 use crate::order_book::Fixed;
@@ -150,8 +151,11 @@ pub struct MatchEngineResponse {
     pub sequence: Option<u64>,
     /// Events produced by this entry, capped at [`Self::MAX_EVENTS`]. The full
     /// set is in the replicated event log served by `POST /events`.
+    ///
+    /// One event is stored inline: the common rest/cancel/fill response does
+    /// not allocate a heap vector. Larger responses spill to the heap.
     #[serde(default)]
-    pub events: Vec<MatchEvent>,
+    pub events: SmallVec<[MatchEvent; 1]>,
     /// True when `events` holds only the first [`Self::MAX_EVENTS`] records.
     #[serde(default)]
     pub events_truncated: bool,
@@ -178,10 +182,12 @@ impl MatchEngineResponse {
     /// A mutating response carrying the assigned sequence and its events.
     pub fn applied(sequence: u64, events: &[MatchEvent]) -> Self {
         let truncated = events.len() > Self::MAX_EVENTS;
+        let mut response_events = SmallVec::with_capacity(events.len().min(Self::MAX_EVENTS));
+        response_events.extend(events.iter().take(Self::MAX_EVENTS).copied());
         Self {
             value: Some(sequence.to_string()),
             sequence: Some(sequence),
-            events: events.iter().take(Self::MAX_EVENTS).copied().collect(),
+            events: response_events,
             events_truncated: truncated,
             error: None,
             batch: Vec::new(),
@@ -190,7 +196,7 @@ impl MatchEngineResponse {
 
     /// A duplicate submission's response: the original sequence and whatever
     /// remains of its events in the retained window.
-    pub fn duplicate(sequence: u64, events: Vec<MatchEvent>, truncated: bool) -> Self {
+    pub fn duplicate(sequence: u64, events: SmallVec<[MatchEvent; 1]>, truncated: bool) -> Self {
         Self {
             value: Some(sequence.to_string()),
             sequence: Some(sequence),

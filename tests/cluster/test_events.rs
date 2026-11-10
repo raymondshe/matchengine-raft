@@ -66,7 +66,7 @@ fn events_are_returned_deduped_paged_and_bounded() {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(placed.data.events, page.events);
+        assert_eq!(placed.data.events.as_slice(), page.events.as_slice());
         assert!(!page.has_more);
         assert_eq!(page.events[0].event_id, page.oldest_event_id.unwrap());
         assert_eq!(page.events[0].event_id, page.last_event_id.unwrap());

@@ -94,7 +94,7 @@ struct Args {
     concurrency_only: bool,
     max_payload_entries: u64,
     purge_batch_size: u64,
-    api_batch_linger_ms: u64,
+    api_batch_linger_ms: Option<u64>,
     snapshot_logs: Option<u64>,
     max_inflight_writes: usize,
     preconnect: bool,
@@ -108,7 +108,7 @@ impl Default for Args {
             concurrency_only: false,
             max_payload_entries: 300,
             purge_batch_size: 1,
-            api_batch_linger_ms: 0,
+            api_batch_linger_ms: Some(0),
             snapshot_logs: None,
             max_inflight_writes: 0,
             preconnect: false,
@@ -218,12 +218,18 @@ impl Cluster {
 
         for id in 1..=NODE_COUNT {
             let addr = http_addr(id);
+            let read_policy =
+                std::env::var(matchengine_raft::network::read_policy::READ_POLICY_ENV)
+                    .ok()
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or_default();
             let storage = StorageConfig::new(root.clone())
                 .with_instance_prefix("cluster-e2e")
                 .with_snapshot_interval(Duration::ZERO)
                 .with_wal_fsync(None)
                 .with_min_voters(NODE_COUNT as usize)
-                .with_max_inflight_writes(max_inflight_writes);
+                .with_max_inflight_writes(max_inflight_writes)
+                .with_read_policy(read_policy);
             let node = build_match_engine_node(id, addr.clone(), config.clone(), storage).await?;
             nodes.push(node);
             clients.push(Arc::new(MatchEngineClient::new(id, addr.clone())));
@@ -755,7 +761,7 @@ fn print_summary(rounds: &[RoundSummary], args: &Args) {
     }
 
     println!(
-        "concurrency sweep: clients={:?}, preconnect={}, max_inflight_writes={}, max_payload_entries={}, purge_batch_size={}, api_batch_linger_ms={}, snapshot_logs={:?}, RAFT_CORE_WORKERS={}",
+        "concurrency sweep: clients={:?}, preconnect={}, max_inflight_writes={}, max_payload_entries={}, purge_batch_size={}, api_batch_linger_ms={:?}, snapshot_logs={:?}, RAFT_CORE_WORKERS={}",
         args.clients,
         args.preconnect,
         args.max_inflight_writes,
@@ -863,11 +869,12 @@ fn parse_args() -> anyhow::Result<Args> {
                     .context("--purge-batch-size must be a number")?;
             }
             "--api-batch-linger-ms" => {
-                args.api_batch_linger_ms = iter
-                    .next()
-                    .context("--api-batch-linger-ms needs a value")?
-                    .parse()
-                    .context("--api-batch-linger-ms must be a number")?;
+                args.api_batch_linger_ms = Some(
+                    iter.next()
+                        .context("--api-batch-linger-ms needs a value")?
+                        .parse()
+                        .context("--api-batch-linger-ms must be a number")?,
+                );
             }
             "--snapshot-logs" => {
                 args.snapshot_logs = Some(
@@ -904,7 +911,7 @@ fn main() -> anyhow::Result<()> {
     println!("all nodes run in one process; each has its own storage, HTTP and gRPC listener");
     println!("WAL fsync disabled; {WARMUP_WRITES} warm-up writes per round are excluded");
     println!(
-        "config: clients={:?}, preconnect={}, max_inflight_writes={}, max_payload_entries={}, purge_batch_size={}, api_batch_linger_ms={}, snapshot_logs={:?}, RAFT_CORE_WORKERS={}",
+        "config: clients={:?}, preconnect={}, max_inflight_writes={}, max_payload_entries={}, purge_batch_size={}, api_batch_linger_ms={:?}, snapshot_logs={:?}, RAFT_CORE_WORKERS={}",
         args.clients,
         args.preconnect,
         args.max_inflight_writes,

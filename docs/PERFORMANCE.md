@@ -1,6 +1,6 @@
 # Performance measurements
 
-Measured on **2026-10-30** (runtime flavor A/B and P0 offloads: **2026-10-31**; measurement scope and RSS: **2026-11-01**; book p50/p99 and the pinned-core approximation: **2026-11-04**; end-to-end/storage rerun with the OpenRaft quick wins: **2026-11-06**; realistic-mix replay: **2026-11-06**; dedicated Raft runtime: **2026-11-06**; WAL fsync Tokio rerun: **2026-11-07**; four-node no-fsync cluster: **2026-11-07**; write concurrency/batching sweep: **2026-11-08**; async WAL prototype: **2026-11-08**; production configuration decisions: **2026-11-08**; write admission control: **2026-11-09**; pre-connected write concurrency: **2026-11-09**; sustained single-node CPU profile: **2026-11-09**; benchmark regression gate: **2026-11-09**; read-path benchmark: **2026-11-08**; OpenRaft minimal-benchmark comparison: **2026-11-08**; WebSocket fan-out: **2026-11-10**) on the reference development machine:
+Measured on **2026-10-30** (runtime flavor A/B and P0 offloads: **2026-10-31**; measurement scope and RSS: **2026-11-01**; book p50/p99 and the pinned-core approximation: **2026-11-04**; end-to-end/storage rerun with the OpenRaft quick wins: **2026-11-06**; realistic-mix replay: **2026-11-06**; dedicated Raft runtime: **2026-11-06**; WAL fsync Tokio rerun: **2026-11-07**; four-node no-fsync cluster: **2026-11-07**; write concurrency/batching sweep: **2026-11-08**; async WAL prototype: **2026-11-08**; production configuration decisions: **2026-11-08**; write admission control: **2026-11-09**; pre-connected write concurrency: **2026-11-09**; sustained single-node CPU profile: **2026-11-09**; benchmark regression gate: **2026-11-09**; read-path benchmark: **2026-11-08**; OpenRaft minimal-benchmark comparison: **2026-11-08**; WebSocket fan-out: **2026-11-10**; open-loop e2e, current-HEAD book re-pin and sorted-vector A/B: **2026-11-10**; apply-path inline buffers, affinity A/B and per-level rerun: **2026-11-10**; local lease-read experiment and dependency upgrade: **2026-11-10**) on the reference development machine:
 
 - Apple M4 (`arm64`)
 - Rust `1.93.1`
@@ -16,11 +16,12 @@ on the deployment hardware before using the numbers for sizing.
 cargo bench --bench matchengine   # order-book microbenchmarks
 cargo bench --bench e2e           # submit -> commit -> apply -> response (multi-thread; -- current|both for A/B, --pin <cpu> on Linux)
 cargo bench --bench e2e -- --duration 60 --clients 500  # sustained closed-loop load with process CPU and one-second samples
+cargo bench --bench e2e -- --duration 10 --clients 64 --rate 50000  # fixed-rate open-loop: scheduled, dispatch and service latency
 RAFT_WAL_FSYNC_MS=0 MATCHENGINE_ASYNC_WAL=1 cargo bench --features async-wal --bench e2e -- both  # prototype async WAL A/B
 cargo bench --bench cluster_e2e -- --rounds 3  # four in-process no-fsync voters, leader-direct writes and batches
 cargo bench --bench cluster_e2e -- --rounds 2 --concurrency-only  # 1/8/64/256/1024/4096-client sweep
 cargo bench --bench cluster_e2e -- --rounds 4 --concurrency-only --clients 256,512,1024,2048 --max-inflight-writes 1024 --preconnect  # pre-connected admission sweep
-cargo bench --bench read_e2e -- --policy both  # local /read, /linearizable_read and /events; ReadIndex vs lease
+cargo bench --bench read_e2e -- --policy both  # local /read, /linearizable_read and /events; ReadIndex vs local_lease (or --policy local_lease)
 cargo bench --bench feed_load     # market-data feed at 50k/500k fills/s
 cargo bench --manifest-path demos/market_data_system/Cargo.toml --bench ws_fanout -- --clients 64 --updates 10000 --rate 20000  # WebSocket fan-out
 cargo bench --bench storage       # WAL append/read/recovery
@@ -30,6 +31,7 @@ cargo bench --bench book_replay   # book-only sweeps, deep cancels and BBO advan
 cargo bench --bench book_replay -- --matrix  # occupancy scenario matrix: static/normal/wide-swing/flash-crash
 cargo bench --bench replay_mix    # realistic add/cancel/amend/stop/iceberg replay with per-op percentiles
 cargo bench --bench level_book    # per-level bucket prototype vs the current book
+cargo bench --bench sorted_book   # sorted-vector price ladder vs the current book (book-only)
 cargo bench --bench apply_path    # apply-path heap allocations per applied entry
 cargo bench --bench apply_path -- --check   # exact allocation regression gate
 cargo bench --bench book_replay -- --check  # loose warm p50/p99 gate
@@ -52,14 +54,15 @@ its scope.
 |---|---|---|---|---|---|
 | `matchengine` | Order-book operations: sweep, rest, partial fill, IOC cancel, iceberg refill, amend, cancel; optional depth journal | HTTP, Raft, WAL, snapshots, market-data encoding/sink | Closed-loop, in-process | `Instant`, best-of-5 per round | Best-of-5 only; not a tail study |
 | `book_replay` | `OrderBook` only: 100-level and single-level sweeps, deep cancels, BBO advancement and static BBO queries; clone/eviction outside the timed window | HTTP, Raft, WAL/snapshots, market-data feed, event construction, fees | Closed-loop, in-process; one pristine book per round | `Instant` per round; best-of-5 repeats, warm p50/p99, interleaved cold p50/p99 after a 64 MiB eviction sweep | 5-14% run-to-run; cold adds ~8-22%; 1k/20k cases differ in tree depth, not just order count |
-| `book_replay --matrix` | Four calibrated standing-book shapes (static 20.9k orders/60 levels to flash-crash 240/210) with a 50k-op steady-state mix: 45% add, 43% cancel, 10% amend, 2% taker | HTTP, Raft, WAL/snapshots, market-data feed, event construction, fees, occupancy sampling in the timed pass | Closed-loop, in-process; 10 whole-replay trials per shape; initial book and fixture cloned outside the timer | `Instant` per whole replay; median, population stddev and CV; occupancy sampled every 64 ops in a separate untimed pass | Static CV 6-7% on this host; the other shapes are below 2%; not the external 2M-message flow |
+| `book_replay --matrix` | Four calibrated standing-book shapes (static 20.9k orders/60 levels to flash-crash 240/210) with a 50k-op steady-state mix: 45% add, 43% cancel, 10% amend, 2% taker | HTTP, Raft, WAL/snapshots, market-data feed, event construction, fees, occupancy sampling in the timed pass | Closed-loop, in-process; 10 whole-replay trials per shape; initial book and fixture cloned outside the timer | `Instant` per whole replay; median, population stddev and CV; occupancy sampled every 64 ops in a separate untimed pass | Static CV 2-7% across runs; the other shapes are below 3%; not the external 2M-message flow |
 | `replay_mix` | Deterministic 100,000-operation `OrderBook` stream: limit adds, icebergs, parked stops, cancels, amendments and market takers, with maker/taker fees on every order; whole-replay and per-operation timings | HTTP, Raft, WAL/snapshots, market-data feed, event construction, symbol/tick validation | Closed-loop, in-process; fixture generated at startup, book rebuilt per round | `Instant` per operation for the per-kind table; 20 whole-replay warm rounds plus 20 interleaved cold rounds after a 64 MiB eviction sweep | Four runs; whole-replay warm p50 within 5%, per-operation p50 within ~30%; p99 and max are host-noise sensitive |
 | `level_book` | Prototype per-level buckets plus the current `OrderBook`: match sweeps, deep cancels, sparse/dense amends, depth, BBO queries and BBO advancement; plain limit orders only; clone/eviction outside the timed window | Stops, icebergs, GTD expiry, validation, events, depth journal, market-data feed, fees beyond `MatchResult` construction | Closed-loop, in-process; paired current/prototype books | `Instant` per round; best-of-5 repeats, warm p50/p99, interleaved cold p50/p99 after a 64 MiB eviction sweep | 5-10% run-to-run, BBO-query ratio 4.9-5.6x; sparse one-order-per-level cases are the prototype's worst case |
+| `sorted_book` | Bench-only sorted-vector price ladder plus the current `OrderBook`: match sweeps, deep cancels, same-price/price-move amends, depth, BBO queries and BBO advancement; plain limit orders only; clone/eviction outside the timed window | Stops, icebergs, GTD expiry, validation, events, depth journal, market-data feed, fees beyond `MatchResult` construction; no production adoption | Closed-loop, in-process; paired current/sorted books | `Instant` per round; best-of-5 repeats, warm p50/p99, interleaved cold p50/p99 after a 64 MiB eviction sweep | Four runs: match/cancel/amend-volume wins stable in direction but 2.24-2.46x on cancel/amend; price-move amend and BBO advance regress consistently; BBO-query win reflects the prototype's cached BBO |
 | `apply_path` | `StateMachineStore::apply` only: blank, rest, cancel, fill and 128-request batch workloads; a counting global allocator reports heap calls and requested bytes | HTTP, Raft, WAL, snapshots, market-data tap, event-log reads, response serialization | Closed-loop, direct apply; 50k entries or 1k batches per workload | Counting allocator; per-entry averages | Requested bytes include realloc churn and are not a live-memory high-water mark |
-| `e2e` `/write` | HTTP decode/validation, Raft proposal/commit, WAL append + `sync_data`, apply, response serialization | Cross-node replication, external client network beyond loopback | Sequential is closed-loop; concurrent is a 1,000-request burst | `Instant` per request; p50/p95/p99/max | Medians/percentiles; runtime A/B uses four alternating runs, the 2026-11-06 rerun uses three |
+| `e2e` `/write` | HTTP decode/validation, Raft proposal/commit, WAL append + `sync_data`, apply, response serialization | Cross-node replication, external client network beyond loopback | Sequential and concurrent bursts are closed-loop; `--duration --clients` is closed-loop; `--rate` is fixed-rate open-loop with an absolute schedule | `Instant` per request; p50/p95/p99/max; open-loop also reports dispatch lag and service latency | Medians/percentiles; runtime A/B uses four alternating runs, the 2026-11-06 rerun uses three; open-loop tails include generator scheduling |
 | `e2e` `/write_batch` | Same as `/write`, with 1–128 requests per Raft entry and one WAL fsync per entry | Same as `/write` | 200 sequential batches per size; 100 concurrent 32-order batches | `Instant` per batch | Medians of three runs per size; batch latency includes payload/apply growth |
 | `cluster_e2e` | Four in-process loopback voters with a separate client runtime; HTTP `/write`/`/write_batch`, Raft 3/4 quorum replication over gRPC, WAL append without fsync, apply and response; optional client-count, write-admission and OpenRaft config sweeps | Cross-host network latency, independent machines, disk contention between nodes | 50 warm-up writes; 500 sequential, 200 batches/size, 100×32 concurrent batches, and a 1/8/64/256/1024/4096-client sweep; fresh rounds | `Instant` per request/batch; p50/p95/p99 and medians | Two or three fresh rounds; high-concurrency tail is host-sensitive |
-| `read_e2e` | Four in-process loopback voters with a separate client runtime; local `/read`, `/linearizable_read` and `/events`; ReadIndex and lease policies; 1/64 readers; read-only and mixed with an offered 2,000 writes/s | Cross-host network and clock skew; independent machines | 100 warm-up reads per endpoint; 2,000 reads/reader per case; 100-event pages; depth-20 local reads; two runs per policy | `Instant` per request; p50/p95/p99 and throughput | Two runs; read-only rows are stable, mixed rows depend on writer pacing |
+| `read_e2e` | Four in-process loopback voters with a separate client runtime; local `/read`, `/linearizable_read` and `/events`; ReadIndex, core lease and local-lease policies; 1/64 readers; read-only and mixed with an offered 2,000 writes/s | Cross-host network and clock skew; independent machines | 100 warm-up reads per endpoint; 2,000 reads/reader per case; 100-event pages; depth-20 local reads; two runs per policy | `Instant` per request; p50/p95/p99 and throughput | Two runs; read-only rows are stable, mixed rows depend on writer pacing |
 | `feed_load` | Tokio tap, bounded queue, shadow book, wire encoding and processor drain with a null sink | JSONL/network sink I/O, Raft, HTTP | Offered-load generator at 50k/500k/2M fills/s | `Instant`; queue/drain counters | One run per target; no p99 table |
 | `storage` | WAL append/read/reopen with 20k real order entries and 512 KiB segments; optional `async-wal` prototype | State machine, Raft, HTTP | Closed-loop, 100-entry batches | `Instant` | Five runs per mode; no tail study; async variance is high |
 | `p0_bench duplicate` | State-machine duplicate-retry lookup over a 262k-event window | HTTP, Raft, WAL | 200 retries after one setup | `Instant`; mean/p50/p99/max | Single run; a single scheduling outlier moves the mean |
@@ -71,7 +74,7 @@ Loopback HTTP and local disk are part of the measured path where stated. Run-to-
 not a confidence interval; the e2e runtime A/B uses four alternating runs, and the four-node
 cluster section reports three fresh rounds.
 
-The two book benches share `benches/bench_support`: each round clones the state before
+The book benches share `benches/bench_support`: each round clones the state before
 `Instant::now()` and drops the mutated state after the duration is recorded, so setup and teardown
 are outside the timer. "Warm" means the clone immediately precedes the timed operation; "cold"
 means a 64 MiB read-modify-write sweep runs between the clone and the timed operation. Warm and
@@ -90,7 +93,7 @@ with a single-voter deployment. The four-voter floor is part of the no-fsync con
 |---|---|
 | WAL durability | leave `RAFT_WAL_FSYNC_MS` unset (no fsync) |
 | Voters | at least 4; the binary enforces this when fsync is disabled |
-| Read policy | lease (the default); keep it when NTP/PTP keeps clock drift bounded and `/read-policy/status` shows lease hits, otherwise set `--read-policy read_index` |
+| Read policy | `local_lease` (the default) uses OpenRaft's caller-side lease cache; keep it when NTP/PTP keeps clock drift bounded and `/read-policy/status` shows lease hits, otherwise set `--read-policy read_index`. The core `lease` path remains available for comparison |
 | Raft runtime | `RAFT_CORE_WORKERS` unset or `0` (shared runtime) |
 | OpenRaft batching | defaults: `max_payload_entries=300`, `purge_batch_size=1`, `api_batch_linger_ms=0` |
 | Write admission | 1,024 concurrent `/write` or `/write_batch` requests per node; `429` overflow; `512` is the tighter-tail option and `--max-inflight-writes 0` disables |
@@ -99,7 +102,7 @@ with a single-voter deployment. The four-voter floor is part of the no-fsync con
 | Build | default release profile; no LTO requirement |
 | Market data | 8,192-frame queue, leader-only default, external sink for production |
 
-The binary defaults implement this profile, including lease reads. Set `--read-policy read_index`
+The binary defaults implement this profile, including local-lease reads. Set `--read-policy read_index`
 when the deployment cannot guarantee bounded clock drift.
 
 Profile A is **lossy on an unclean crash**. The four-voter floor protects against one node losing
@@ -139,12 +142,12 @@ round trip plus follower fsyncs to reduce these numbers.
 | `max_payload_entries=1,024` | 66.0k vs 90.6k writes/s at 256 | keep 300 |
 | `purge_batch_size=1,024` with snapshots every 1,000 | 58.3k writes/s; snapshot-heavy control 60.3k | keep 1 and the 100k snapshot policy |
 | `api_batch_linger_ms=1` | 37.4k writes/s, p99 19.75 ms | keep 0 |
-| `RAFT_CORE_WORKERS=2` | 65.7k vs 90.6k at 256; paired A/B within noise; one worker is ~7% lower | keep shared; use 2 only for isolation |
+| `RAFT_CORE_WORKERS=2` | 65.7k vs 90.6k at 256; paired A/B within noise; the 2026-11-10 single-worker A/B was also within noise | keep shared; use 2 only for isolation |
 | Thin LTO + `codegen-units=1` | 77.8k vs 74.1k paired control, within host spread | keep the default profile |
 | Async WAL | storage 6.6x, but e2e 18.3k vs 17.3k writes/s (noise) | keep off; not a request-path win |
 | Fsync every 10 ms | 7,374 writes/s and 2.2-3.0 ms p99 | reject: dominated by both alternatives |
 | Fsync every 100 ms | 9,495 writes/s vs 9,648 disabled; still lossy and no four-voter guard | not selected; use only with four voters and an accepted 100 ms loss window |
-| Per-level bucket book | 1.84x sweep/3.31x cancel but 0.75x sparse amend/0.87x BBO advance | keep the current book; prototype only |
+| Per-level bucket book | 2.00x sweep/3.27x cancel, but 0.88x sparse amend and 0.94x depth; BBO advance 1.04x | keep the current book; prototype only, no sparse fast path |
 | Arena allocator (`bumpalo`) | 79-88% worse single-operation latency in the external review | keep inline buffers; do not adopt |
 | Full-book `/read orderbook_orders` under load | p99 134 ms, 1.49 GiB peak RSS | use `orderbook_depth:N`; keep full-book reads off the hot path |
 | Unbounded market-data queue | the 2M fills/s overload test relies on drops + `GAP` | keep the bounded 8,192 queue |
@@ -280,6 +283,32 @@ The manual Linux benchmark workflow (`.github/workflows/bench-linux.yml`) runs t
 sustained e2e passes and then the occupancy matrix, so a pinned-host envelope is captured without a
 separate command. The regular `--check` mode still runs only the five case-level gates above.
 
+### Current-HEAD book-only re-pin (2026-11-10)
+
+The production code under test is `ee07ba0`; the later lock-file and benchmark/documentation
+commits add no `OrderBook` changes. Three clean `book_replay --matrix` runs with no other
+local nodes running gave:
+
+| Scenario | Median | M ops/s (median) | Range M ops/s | CV |
+|---|---:|---:|---:|---:|
+| `static` | 13.58 ms | **3.68** | 3.62-4.23 | 2.0-5.5% |
+| `normal` | 8.46 ms | 5.91 | 5.91-6.02 | 0.8-1.2% |
+| `wide-swing` | 8.10 ms | 6.18 | 6.14-6.28 | 0.7-0.9% |
+| `flash-crash` | 7.38 ms | 6.78 | 6.77-6.85 | 0.8-2.6% |
+
+The worst-case `static` shape is **3.62-4.23 M ops/s** across runs (median 3.68), which is the
+current-HEAD local re-pin. The earlier 4.66-5.00 M ops/s run above remains historical; the spread
+is host/run variance, not a code change. The scope is a local 50k-operation occupancy envelope,
+not the external 2M-message flow. The FlashOne survey still pins this repository at `5597532` and
+reports 7.20 M ops/s; that number is not comparable to this matrix (different hardware, workload
+and operation mix).
+
+**Adapter decision: not published.** A FlashOne adapter would need to translate their client-id
+cancel+reinsert `modify` (not our `Amend`), their ABI and their book-query semantics, and it would
+need external maintenance in another repository. The maintained local baseline stays
+`book_replay --matrix`, which reads the real `OrderBook` and is already run by the manual Linux
+workflow. A third-party re-pin is the benchmark maintainer's call.
+
 ## Realistic-mix replay benchmark (2026-11-06)
 
 `cargo bench --bench replay_mix` is the load analogue of `tests/replay`: it replays a deterministic
@@ -317,7 +346,7 @@ operation kinds across runs); p99 is the useful tail. Market takers have the wid
 (~4.8x) because each taker may sweep several price levels and elect stop children, while parked
 stops and amendments are single tree insertions and stay sub-microsecond at p99.
 
-## Per-level bucket prototype (2026-11-04)
+## Per-level bucket prototype (2026-11-04, rerun 2026-11-10)
 
 `cargo bench --bench level_book` compares a bench-only prototype with `OrderBook` on the same
 workloads. The prototype keeps one `Vec<Option<Order>>` per price level, a `head` cursor for the
@@ -333,70 +362,110 @@ that compares BBO, depth, fills, cancels and amendments against `OrderBook`; it 
 
 | Case | Current warm p50 | Prototype warm p50 | Speedup (p50) | Speedup (best-of-5) |
 |---|---:|---:|---:|---:|
-| Match 1k asks / 100 levels | 84.8 µs | 46.1 µs | 1.84x | 1.82x |
-| Match 20k asks / 1 level | 2.316 ms | 1.830 ms | 1.27x | 1.27x |
-| Cancel 5k at depth / 50 levels | 262.4 µs | 79.3 µs | 3.31x | 3.21x |
-| Amend volume 5k (same price) | 182.7 µs | 104.5 µs | 1.75x | 1.72x |
-| Amend price 1k sparse (1 order/level) | 72.3 µs | 96.0 µs | 0.75x | 0.75x |
-| Amend price 5k dense (50 orders/level) | 634.1 µs | 244.8 µs | 2.59x | 2.58x |
-| Depth 10 levels, 100k queries | 6.408 ms | 6.660 ms | 0.96x | 0.96x |
-| BBO query 1k levels, 1M calls | 2.233 ms | 0.456 ms | 4.90x | 5.18x |
-| BBO advance 1k levels x 2 sides | 103.0 µs | 118.4 µs | 0.87x | 0.88x |
+| Match 1k asks / 100 levels | 108.6 µs | 54.3 µs | 2.00x | 2.01x |
+| Match 20k asks / 1 level | 3.332 ms | 1.849 ms | 1.80x | 1.91x |
+| Cancel 5k at depth / 50 levels | 324.8 µs | 99.5 µs | 3.27x | 3.17x |
+| Amend volume 5k (same price) | 264.8 µs | 116.2 µs | 2.28x | 2.33x |
+| Amend price 1k sparse (1 order/level) | 97.0 µs | 110.4 µs | 0.88x | 0.88x |
+| Amend price 5k dense (50 orders/level) | 785.8 µs | 286.4 µs | 2.74x | 2.70x |
+| Depth 10 levels, 100k queries | 6.631 ms | 7.075 ms | 0.94x | 0.94x |
+| BBO query 1k levels, 1M calls | 2.971 ms | 0.488 ms | 6.09x | 5.62x |
+| BBO advance 1k levels x 2 sides | 129.6 µs | 125.0 µs | 1.04x | 1.04x |
 
-The prototype wins where a level is populated: a sweep consumes a contiguous vector and advances
-`head` instead of removing every order from the tree, deep cancels amortize the level lookup, a
-same-price reduction is an in-place update, a dense re-queue leaves the old level alive and cached
-BBO reads are a couple of field loads. The losses are the sparse worst case: with one order per
-level, the sequence lookup, level indirection and level creation/removal cost more than a single
-`BTreeMap` remove/insert. BBO advancement has the same shape because every cancellation removes a
-level. Depth is effectively unchanged.
+This is the 2026-11-10 rerun at current `HEAD`; the 2026-11-04 table had smaller wins (1.84x match,
+3.31x cancel, 1.75x/2.59x amend, 4.90x BBO query) and a BBO-advance loss, so the direction is
+stable but the host spread is material. The prototype wins where a level is populated: a sweep
+consumes a contiguous vector and advances `head` instead of removing every order from the tree,
+deep cancels amortize the level lookup, a same-price reduction is an in-place update, and a dense
+re-queue leaves the old level alive. The losses are the sparse case: with one order per level, the
+sequence lookup, level indirection and level creation/removal cost more than a single `BTreeMap`
+remove/insert, and depth has to walk and sum level vectors.
 
-The cold pass does not change the ranking: cancel is 303.4 µs cold for the current book vs 86.4 µs
-for the prototype, sparse amend is 84.9 µs vs 128.5 µs, and BBO query is 2.808 ms vs 0.453 ms.
-One case moves: BBO advancement is a warm loss (0.87x) but cold parity (115.2 µs vs 117.5 µs), so
-the cached best index pays off mainly while the book is cache-resident. The layout conclusion is
-therefore not an artifact of warm caches.
+The cold pass does not change the ranking: cancel is 382.6 µs cold for the current book vs
+103.1 µs for the prototype, sparse amend is 120.8 µs vs 201.0 µs, and BBO query is 3.000 ms vs
+0.486 ms. BBO advancement is a small warm/cold win on this run (151.0 µs vs 132.0 µs cold), so the
+cached best index pays off at both temperatures.
 
-Full adoption is therefore **not** justified by this prototype; the P2 adoption item remains.
-A follow-up would need a single-order-level fast path (or a hybrid that keeps tree keys for sparse
-levels), a memory A/B in separate processes, and a 3-node or real-sink run. The benchmark is
-closed-loop; repeated mutation runs vary by roughly 5-10%, while the BBO-query ratio moved between
-4.90x and 5.57x across runs and the 1k match between 1.84x and 1.99x, so treat the ratios as
-directional. The 2026-11-02 table quoted best-of-5 only; the numbers above are the same workloads
-with warm p50 as the headline and best-of-5 kept for continuity.
+Full adoption is still **not** justified: the prototype is plain-limit only and excludes stops,
+icebergs, GTD, pegged orders, the depth journal and event construction, while the sparse amend
+path remains 12% slower and depth 6% slower. The next experiment would have to be a sparse-level
+fast path (or a hybrid that keeps tree keys for one-order levels) plus a 3-node/real-sink run;
+neither exists, so the production `BTreeMap` stays. The sorted-vector A/B above reinforces that
+every price-ladder layout trades wins for structural losses; do not switch on the external
+leaderboard alone.
 
-## Apply-path allocation benchmark (2026-11-02)
+## Sorted-vector price ladder A/B (2026-11-10)
+
+`cargo bench --bench sorted_book` is a second **book-only prototype** experiment. It keeps price
+levels in a sorted `Vec<(price, Level)>`, uses binary search for lookup and `Vec::insert` /
+`Vec::remove` for level creation/removal, and caches the BBO. The per-level order vector, sequence
+index and verification workload match the per-level bucket prototype, so this isolates the price
+ladder. It covers plain limit orders only and is not production code.
+
+| Case | Current warm p50 | Sorted-vector warm p50 | Speedup (p50) |
+|---|---:|---:|---:|
+| Match 1k asks / 100 levels | 105-109 µs | 52-56 µs | 1.93-2.07x |
+| Match 20k asks / 1 level | 3.11-3.33 ms | 1.77-1.85 ms | 1.73-1.84x |
+| Cancel 5k at depth / 50 levels | 316-339 µs | 137-151 µs | 2.24-2.36x |
+| Amend volume 5k (same price) | 218-265 µs | 105-116 µs | 2.07-2.46x |
+| Amend price 1k sparse (1 order/level) | 90.4-97.0 µs | 642-645 µs | **0.14-0.15x** |
+| Depth 10 levels, 100k queries | 6.55-6.75 ms | 5.42-5.60 ms | 1.20-1.23x |
+| BBO query 1k levels, 1M calls | 2.43-2.97 ms | 0.234-0.247 ms | 10.1-12.0x |
+| BBO advance 1k levels x 2 sides | 129.4-129.8 µs | 373-375 µs | **0.34-0.35x** |
+
+The wins are real for this workload: grouping orders by level cuts the number of tree entries, a
+sweep/cancel walks a contiguous level vector, and a same-price amendment updates in place. The
+losses are structural: a price move removes and re-inserts a level in the sorted `Vec` (O(n)
+shifts), and BBO advancement removes the first/last level on every cancellation, so a wide ladder
+pays O(n) per advance. The BBO-query win is not a pure price-ladder result; the prototype caches
+best bid/ask while the current `OrderBook::spread` reads the tree edge. Across four runs the
+cancel ratio moved 2.24-2.36x and same-price amend 2.07-2.46x, so treat the ratios as directional.
+
+Conclusion: **do not adopt a pure sorted vector.** It is a useful small-book/level-grouping
+signal, not a universal replacement. A tree/heap hybrid that keeps sorted levels with O(log n)
+level removal is the only follow-up worth measuring, and only if a sparse-level fast path is
+needed; the external survey's treap/heap leaderboard numbers are not sufficient evidence on
+their own. The cold pass preserves the ranking.
+
+## Apply-path allocation benchmark (2026-11-10)
 
 `cargo bench --bench apply_path` drives `StateMachineStore::apply` directly with a counting global
 allocator. It covers blank entries, one-event rest/cancel/fill entries, and 128-request batches;
 the blank and batch-blank cases isolate the harness and response allocations. Counts are heap
 allocation calls per applied entry; bytes are the sum of requested sizes **including realloc
-churn**, not live memory.
+churn**, not live memory. The timer is not the gate here: the per-entry async apply harness
+dominates it, so read the allocation columns.
 
-Before this change, the per-entry event path allocated a temporary `Vec` for event construction,
-another `Vec` for the request's events, a `Vec` for the response events and a `Vec` for the
-per-entry publish list. The change writes fills/rests directly into an inline
-`SmallVec<[MatchEvent; 4]>` and uses an inline publish list for the common single-request entry.
-The retained event window and the public response still own `Vec`s.
+The event path previously wrote fills/rests into an inline `SmallVec<[MatchEvent; 4]>`, but the
+response then copied one event into a `Vec`. The 2026-11-10 change keeps one response event
+(`SmallVec<[MatchEvent; 1]>`) inline; larger responses spill exactly like a `Vec`. The retained
+event window, the per-request batch wrappers and the fill `Vec` still allocate.
+
+We also tried `FillBuffer = SmallVec<[MatchResult; 1]>` for the sweep. It removed the fill
+allocation, but enlarging `Outcome` and every `place_order` return by one `MatchResult` slowed the
+book-only `replay_mix` whole replay from ~107 ms to ~185 ms (and was not worth it for apply_path).
+It was reverted; the fill `Vec` stays.
 
 | Workload | Before allocs/entry | After allocs/entry | Before bytes/entry | After bytes/entry |
 |---|---:|---:|---:|---:|
 | Blank | 0.00 | 0.00 | 0.0 | 0.0 |
-| Rest, 1 event | 7.17 | 4.17 | 2,323 | 595 |
-| Cancel, 1 event | 6.00 | 4.00 | 1,308 | 156 |
-| Fill, 1 event | 8.00 | 5.00 | 3,308 | 2,012 |
-| Batch blank, 128 requests | 1.02 | 1.02 | 381 | 381 |
-| Batch rest, 128 x 1 event | 6.23 | 4.19 | 2,393 | 1,693 |
+| Rest, 1 event | 4.17 | 3.17 | 595 | 568.5 |
+| Cancel, 1 event | 4.00 | 3.00 | 156 | 12.1 |
+| Fill, 1 event | 5.00 | 4.00 | 2,012 | 2,380.1 |
+| Batch blank, 128 requests | 1.02 | 1.02 | 381 | 597.1 |
+| Batch rest, 128 x 1 event | 4.19 | 3.19 | 1,693 | 1,882.4 |
 
-The single-entry rest/cancel/fill times were 0.61/0.30/0.40 µs before and 0.55/0.30/0.38 µs after;
-these are within the benchmark's noise. The batch-rest time was 0.27 µs/entry both before and
-after. The batch bytes also fell because the publish list is reserved once and the per-request
-event buffers stay inline; an all-`PurgeExpired` batch avoids the reserve entirely.
+The single-entry rest/cancel rows drop one allocation per entry and the response bytes fall; the
+fill row drops one allocation but its bytes rise slightly because the fill `Vec` still allocates
+and the response header is larger. The batch rows keep the same shape but pay a larger
+per-response header: each `MatchEngineResponse` now reserves room for one inline event even in an
+all-blank batch, so the requested bytes rise. The allocation calls still fall for batch rest
+(536,336 to 408,336), and the larger header is the deliberate trade for the cheaper common
+single-event response.
 
-Remaining allocations are the `BTreeMap` node on a rest, the response `events` `Vec`, the legacy
-`value` sequence `String`, and the `MatchResult` `Vec` on a fill. Avoiding the response `Vec` would
-change the public `MatchEngineResponse.events` type; avoiding the `MatchResult` `Vec` would change
-`Outcome.fills`. The market-data tap path still copies events into `TapFrame.events` when the tap is
+Remaining allocations are the `BTreeMap` node on a rest, the fill `Vec` on a match, the
+retained-event window growth, the legacy `value` sequence `String`, and harness/book-keeping
+allocations. The market-data tap path still copies events into `TapFrame.events` when the tap is
 enabled, and is not covered by this no-tap benchmark.
 
 ## Benchmark regression gate (2026-11-09)
@@ -405,17 +474,17 @@ CI job `bench-regression` runs three no-framework benchmarks in check mode. It i
 gate, not a capacity target: CI uses loose upper bounds so a shared runner does not fail on
 scheduling noise, while a real algorithmic regression or an allocation-count increase fails.
 
-`cargo bench --bench apply_path -- --check` enforces the measured 2026-11-09 allocation ceilings
+`cargo bench --bench apply_path -- --check` enforces the measured 2026-11-10 allocation ceilings
 for 50,000 single-entry applications or 1,000 128-request batches:
 
 | Workload | Max allocation calls | Max requested bytes |
 |---|---:|---:|
 | Blank | 0 | 0 |
-| Rest, 1 event | 208,335 | 31,250,000 |
-| Cancel, 1 event | 200,000 | 8,200,000 |
-| Fill, 1 event | 250,000 | 105,700,000 |
-| Batch blank, 128 requests | 130,000 | 51,300,000 |
-| Batch rest, 128 x 1 event | 536,336 | 227,600,000 |
+| Rest, 1 event | 158,335 | 30,000,000 |
+| Cancel, 1 event | 150,000 | 1,000,000 |
+| Fill, 1 event | 200,000 | 120,000,000 |
+| Batch blank, 128 requests | 130,000 | 80,000,000 |
+| Batch rest, 128 x 1 event | 408,336 | 250,000,000 |
 
 The call ceilings are exact totals: fewer allocations pass, more fail. Requested bytes get a
 small allowance for capacity choices. `book_replay --check` enforces warm p50/p99 bounds from
@@ -562,6 +631,50 @@ CPU accounting for this benchmark:
 - `-- current` still selects the single-thread runtime. Sustained CPU on that path
   is bounded by one worker and is not comparable with the default multi-thread
   runtime.
+
+### Open-loop write latency (2026-11-10)
+
+`--rate <requests/s>` switches the sustained suite from closed-loop clients to a fixed-rate
+open-loop schedule:
+
+```text
+cargo bench --bench e2e -- --duration 10 --clients 64 --rate 50000
+```
+
+Each client keeps an absolute per-client send schedule (`clients / rate` interval) and measures
+latency from the **scheduled** send time, so queueing and generator lateness are not hidden. The
+output separates three views:
+
+- **open-loop**: completion minus scheduled send (the client-observed latency);
+- **dispatch lag**: actual send minus scheduled send (the generator's scheduling error);
+- **service**: completion minus actual send (the request path itself).
+
+64 pre-connected clients, 10 s per row, WAL fsync disabled, one fresh node per row:
+
+| Offered writes/s | Achieved writes/s | Open-loop p50 / p99 | Dispatch lag p99 | Service p50 / p99 | Process CPU |
+|---:|---:|---:|---:|---:|---:|
+| 10,000 | 9,993 | 3.49 / 5.87 ms | 2.93 ms | 1.82 / 3.70 ms | 1.44 cores |
+| 30,000 | 29,987 | 1.63 / 3.25 ms | 2.31 ms | 0.55 / 1.24 ms | 3.01 cores |
+| 50,000 | 49,975 | 1.51 / 3.02 ms | 2.33 ms | 0.57 / 0.97 ms | 3.98 cores |
+| 80,000 | 79,952 | 1.39 / 11.73 ms | 10.93 ms | 0.63 / 1.12 ms | 6.58 cores |
+
+The same 64-client **closed-loop** run for 10 s reached 89,714 writes/s at p50 693 µs / p99
+1.33 ms and 7.33 cores. It offers more load than the 80k open-loop row because the server can
+sustain it.
+
+Repeat runs move the generator tail: one earlier 30k run showed a 29 ms scheduled p99 before the
+next settled at 3.25 ms, and two 80k runs measured 11.73/11.21 ms, while the service p99 stayed
+near 1.1 ms. Treat the open-loop tail as a load-generator observation unless a separate generator
+process reproduces it.
+
+**Coordinated-omission caveat.** Closed-loop tails hide queueing: when the server slows down, a
+closed-loop client also sends less, so slow periods contribute fewer samples. The open-loop rows
+fix the offered rate, but at 80k/s the p99 is dominated by **dispatch lag** (10.93 ms) while the
+service p99 stays at 1.12 ms; the load generator, not the server, misses its schedule. macOS timer
+granularity and the per-client catch-up loop contribute to that lag. Treat the open-loop number as
+a client-observed envelope and the service columns as the server-path view; do not compare a
+closed-loop p99 with an open-loop p99 without stating which one it is. A sustained tail study
+should use a separate load-generator process (or host) before drawing server-capacity conclusions.
 
 ### Four-node no-fsync cluster (2026-11-07)
 
@@ -744,12 +857,50 @@ nodes on one host, so the lease remained fresh and the fallback branch was not e
 counters are implemented and unit-tested; a real deployment with clock drift should exercise the
 fallback and report it through `GET /read-policy/status`.
 
-These gains are smaller than the upstream 90.4x/3.9x local-lease result because alpha.37's
-`ReadPolicy::LeaseRead` still goes through RaftCore; the benchmark's `enable_local_lease_read`
-local-cache path is newer. The gain is still material: **2.17x** for one linearizable reader,
-**1.71x** at 64 readers, with p50/p99 reduced by 2-3x. Lease reads are now the default; set
-`--read-policy read_index` to force a fresh quorum round. The contract and fallback are documented
-in `docs/API.md`.
+These gains are smaller than the upstream 90.4x/3.9x local-lease result because the original
+alpha.37 `ReadPolicy::LeaseRead` baseline still went through RaftCore; the benchmark's
+`enable_local_lease_read` local-cache path is newer. Stable `0.10.0` provides that API, and the
+`local_lease` experiment below measured 11-36% higher linearizable-read throughput with
+~40% lower 64-reader p50/p99. The original lease gain is still material: **2.17x** for one
+linearizable reader, **1.71x** at 64 readers, with p50/p99 reduced by 2-3x. Local-lease reads are
+now the default; set `--read-policy read_index` to force a fresh quorum round. The contract and
+fallback are documented in `docs/API.md`.
+
+### Local lease-read experiment (2026-11-10)
+
+Stable OpenRaft 0.10 adds `Config::enable_local_lease_read` and
+`Raft::get_local_read_linearizer`. With the config enabled, a valid caller-side lease snapshot
+authorizes the read without entering RaftCore's API queue; a cache miss or stale lease falls back
+to the core lease path. `--read-policy local_lease` is now the default; the core `lease` mode
+remains available for comparison.
+
+`cargo bench --bench read_e2e -- --policy lease|local_lease` on the same four-node no-fsync
+cluster (2,000 reads/reader, 100 warm-up, depth-20 key, events page 100), two runs per policy:
+
+| Read-only case | Core `lease` | `local_lease` | Change |
+|---|---:|---:|---:|
+| `/linearizable_read`, 1 reader | 17.5-20.1k reads/s | 21.1-27.4k | +20-36% |
+| `/linearizable_read`, 1 reader p50 / p99 | 47.8-55.8 / 72.7-74.8 µs | 34.8-47.3 / 61.5-65.9 µs | p50 down 15-38% |
+| `/linearizable_read`, 64 readers | 49.4-51.1k reads/s | 56.6-56.9k | +11-15% |
+| `/linearizable_read`, 64 readers p50 / p99 | 88.4-92.1 µs / 1.17-1.19 ms | 53.5-53.8 µs / 0.64-0.69 ms | p50 ~40%, p99 ~42-45% lower |
+| `/events`, 1 reader | 7.3-7.4k reads/s, p50 134-138 µs | 8.1-8.2k, p50 119-120 µs | +11%, p50 down ~13% |
+| `/events`, 64 readers | 38.9-40.8k reads/s | 44.0-45.2k | +8-16% |
+| `/events`, 64 readers p99 | 3.67-3.73 ms | 3.21-3.39 ms | down 8-14% |
+
+The mixed read/write rows point the same way: linearizable reads at 64 readers measured
+41.3-42.6k/s local vs 33.2-33.6k/s core, and `/events` at 64 readers 39.3-40.3k vs 35.0-37.6k.
+Local `/read` is not routed through the policy and stayed in its normal range, as expected.
+
+Write-side cost was within noise. A single-node 64-client sustained `/write` run measured
+87.5/87.7k writes/s on core lease vs 86.3/87.6k on local lease (p50 ~709/710 µs; process CPU
+7.30 vs 7.27-7.33 cores). A 4-node 256-preconnected-client burst measured 77.5/82.7k core vs
+84.6/81.3k local, also within the host's round-to-round spread.
+
+Caveats: the cache rebuilds the leader snapshot after notifications/command batches, so a
+read-heavy leader may pay CPU that these mixed rows do not isolate; a local lease hit can overtake
+an unfinished write, so clients must await the write response before a read that must observe it;
+and the same bounded-clock-drift contract applies. The local path is now the default; the core
+`lease` mode remains available for comparison and for deployments that prefer the core queue order.
 
 ### OpenRaft minimal benchmark comparison (2026-11-08)
 
@@ -780,12 +931,14 @@ What transfers:
 - **Lease reads are the largest read-side lever.** Our `/linearizable_read` and `/events` use
   the configured read policy (`src/network/api.rs`); the gRPC `StreamEvents` stream anchors once
   per stream (`src/network/grpc/events.rs`), and follower reads fetch a leader linearizer through
-  `src/network/management.rs`. `LeaseRead` is now the default and avoids the heartbeat round while
-  the lease is valid; a stale lease falls back to `ReadIndex`, which pays the quorum round trip.
-  The upstream benchmark reports 90.4x/3.9x for its local lease path. Our pinned
-  `openraft 0.10.0-alpha.37` has `ReadPolicy::LeaseRead` but not
-  `enable_local_lease_read`/`get_local_read_linearizer`; the full local-cache path needs a newer
-  OpenRaft. Use `--read-policy read_index` when clock drift is not bounded.
+  `src/network/management.rs`. Lease reads (the caller-side local cache by default) avoid the
+  heartbeat round while the lease is valid; a stale lease falls back to `ReadIndex`, which pays the
+  quorum round trip.
+  The upstream benchmark reports 90.4x/3.9x for its local lease path. Stable
+  `openraft 0.10.0` has `enable_local_lease_read`/`get_local_read_linearizer`, and the default
+  `local_lease` mode measured 11-36% higher linearizable-read throughput with ~40% lower 64-reader
+  p50/p99; the core `lease` path remains available. Use `--read-policy read_index` when clock
+  drift is not bounded.
 - **Batch and concurrency tuning still has headroom.** Our `/write_batch` 128-order path reaches
   227,319 orders/s versus 5,039 sequential writes/s, so application batching is already the main
   throughput lever. For independent clients, sweep client count and the server-side batch knobs:
@@ -1131,8 +1284,10 @@ truncate, snapshot install/reopen and 20k-record recovery.
 - **Streamed snapshot receive.** `InstallSnapshot` writes chunks to a `snapshot-staging-*` file
   with a running CRC and the 256 MiB cap. The state machine verifies length/CRC/postcard before the
   atomic durable write; staging files are removed on success, failure and startup.
-- **OpenRaft pin.** Checked 2026-11-10: the newest published 0.10 release is still
-  `0.10.0-alpha.38`, so the dependency stays at `0.10.0-alpha.37` until a stable 0.10 exists.
+- **OpenRaft version.** `openraft` is on stable `0.10.0` (upgraded from `0.10.0-alpha.37` on
+  2026-11-10). The network API returns `AppendResult`; the gRPC transport converts to the existing
+  serializable payloads. Stable 0.10 also adds `enable_local_lease_read`/
+  `get_local_read_linearizer`, which is an unmeasured read-path follow-up.
 
 The default 8 MiB cap does not split the 100-entry `storage` benchmark batches; its append rate
 stayed within the existing run-to-run spread (1.26M-3.30M entries/s over two local runs versus the
@@ -1265,11 +1420,20 @@ prototype run saw 19.3-20.2k concurrent writes/s, but the final implementation d
 that consistently.
 
 The dedicated runtime does **not** pin apply to one thread: with 2 workers, apply still moved
-between `raft-worker` threads. A single-worker variant kept apply on one thread but lowered the
-concurrent-write burst to 15.3-16.6k/s (about 7% below the shared runtime). Three workers measured
-15.6-18.1k/s and four workers were mixed; none was consistently better than two. If strict
-one-thread affinity is required, the options are the single-worker variant or a dedicated apply
-actor with batching; otherwise `RAFT_CORE_WORKERS=2` is the practical compromise.
+between `raft-worker` threads. A single-worker variant keeps apply on one thread but has never
+shown a consistent win. The 2026-11-10 rerun used two fresh four-node rounds per config:
+
+| Run | 256 pre-connected clients | 1,024 burst clients (no preconnect) |
+|---|---:|---:|
+| Shared node runtime | 75,416 writes/s, p50 3.20 ms, p99 5.19 ms | 40,449 writes/s, p50 16.86 ms, p99 18.68 ms |
+| `RAFT_CORE_WORKERS=1` | 76,990 writes/s, p50 3.13 ms, p99 5.18 ms | 41,221 writes/s, p50 16.34 ms, p99 19.16 ms |
+
+The 256-client row is a two-round median and the 1,024 row is a three-round median. Both are within
+run noise (2% throughput; p99 within ~3%), and the earlier sustained sweeps found the same
+direction. Strict single-thread affinity therefore does not justify the extra runtime or an apply
+actor: keep `RAFT_CORE_WORKERS` unset (shared) by default, and use a dedicated runtime only for
+isolation or when a deployment measures a benefit. A batched apply actor remains an option only
+with a new measurement showing a tail win.
 
 ### Prioritized opportunities
 
@@ -1409,14 +1573,14 @@ already covered by design, two are traps, and the measurement discipline transfe
 
 | Their optimization | Their measurement | Our status | Verdict |
 |---|---|---|---|
-| Flat array + bitmap instead of `BTreeMap` | 7.8x-318x at depth 100-1000 | Already prototyped as per-level buckets (`level_book`): 1.84x sweep, 3.31x deep cancel, 1.75x/2.59x amend, but 0.75x sparse amend and 0.87x BBO advance | Keep as the P2 hybrid with a sparse-level fast path; do not adopt wholesale (it needs a bounded cent price range) |
-| Cached best-bid/ask index | `bbo` 354 ns -> 0.88 ns | BBO already reads the tree edges: 434M queries/s, ~2.3 ns per call; the prototype's cached BBO is 4.9x against that and loses on advance (0.87x) | Skip |
+| Flat array + bitmap instead of `BTreeMap` | 7.8x-318x at depth 100-1000 | Prototyped as per-level buckets (`level_book`): 2.00x sweep, 3.27x deep cancel, 2.28x/2.74x amend, 6.09x BBO query, 1.04x BBO advance; 0.88x sparse amend and 0.94x depth | Do not adopt wholesale: the sparse case still loses, the prototype is plain-limit only, and no 3-node/real-sink run exists |
+| Cached best-bid/ask index | `bbo` 354 ns -> 0.88 ns | BBO already reads the tree edges: ~3.0 ms per 1M queries; the prototype's cached BBO is 6.1x against that and 1.04x on advance | Skip the production change; the prototype keeps the cache only |
 | `Vec` order index keyed by per-book sequential ids | 1.7-1.8x after removing SipHash | No secondary index exists here: a resting order is identified by `(side, price, sequence)`, which is also its tree key, and the sequence is dense and per book by construction | Already better; no action |
 | Store the index-in-level so cancel needs no intra-level scan | Their stated next win | No intra-level `Vec` to scan; cancel is one tree remove | Already better; a prerequisite only if the bucket layout lands |
-| `active` flag + `head_idx` instead of `retain()`/`pop_front()` | Qualitative | A partially filled maker is updated in place, so only fully consumed makers are removed; the prototype's `head` cursor is the analogue (1.84x sweep) | Part of the layout item; nothing to do today |
-| Bitmap `top_n_levels` (`trailing_zeros`/`leading_zeros`) | 53 µs -> 794 ns | The depth walk already visits active levels only and is capped at 200; prototype depth was 0.96x | Skip - empty slots are never visited |
-| Arena allocator (`bumpalo`) | **Regression**: single-operation latency 79-88% worse; removed again in their Optimization 9 | Inline buffers are the adopted approach (`apply_path`: 4-5 allocs/entry after the `SmallVec` change) | Do not adopt; it would also complicate `to_content` and snapshot serialization |
-| Pre-allocated collections (`with_capacity`, `next_power_of_two`) | Small, qualitative | Event window, per-entry event buffer and publish list are preallocated/inline; the response `events` `Vec`, the legacy `value` `String` and the fill `MatchResult` `Vec` still allocate | P2 micro: reserve the known lengths where the shape is fixed |
+| `active` flag + `head_idx` instead of `retain()`/`pop_front()` | Qualitative | A partially filled maker is updated in place, so only fully consumed makers are removed; the prototype's `head` cursor is the analogue (1.99x sweep) | Part of the layout item; nothing to do today |
+| Bitmap `top_n_levels` (`trailing_zeros`/`leading_zeros`) | 53 µs -> 794 ns | The depth walk already visits active levels only and is capped at 200; prototype depth was 0.94x | Skip - empty slots are never visited |
+| Arena allocator (`bumpalo`) | **Regression**: single-operation latency 79-88% worse; removed again in their Optimization 9 | Inline buffers are the adopted approach (`apply_path`: 3.17/3.00/4.00 allocs/entry for rest/cancel/fill after the response inline change) | Do not adopt; it would also complicate `to_content` and snapshot serialization |
+| Pre-allocated collections (`with_capacity`, `next_power_of_two`) | Small, qualitative | Event window, per-entry event buffer, publish list and one response event are preallocated/inline; the fill `Vec`, legacy `value` `String` and retained event window still allocate | Done for response events; a fill `FillBuffer` was reverted after it slowed the book-only replay |
 | Response slot pool replacing `oneshot::channel()` | Removes one allocation per request | One `/write` costs ~4 ms and is fsync-bound; their pool (256 slots) also caps in-flight requests, which conflicts with the ~19k concurrent writes already sustained here | Skip; not the bottleneck |
 | N-thread sharding, one owner per symbol | Their 132M/s is multi-threaded (~33M/s per thread); remaining single-thread gap ~3x | One symbol per process is deliberate and apply must be serial for determinism; parallelism already exists across processes and across HTTP workers plus the blocking pool | Skip; keep the multi-thread caveat in mind when comparing numbers |
 | SIMD slot scan, `mmap` | They judged SIMD marginal over the bitmap and mmap inapplicable | Agreed | Skip |
@@ -1465,9 +1629,10 @@ The measurement rules transferred regardless of layout and are now implemented:
   book-level work.
 - Lease reads (the default) remove the fresh quorum round on leader reads and produced
   2.17x/1.71x throughput and 2.18x/3.46x p50 gains for `/linearizable_read` at 1/64 readers in the
-  4-node loopback benchmark; `/events` gained 1.46x/1.18x. Set `--read-policy read_index` when
-  bounded clock drift is not guaranteed; the fallback path is unit-tested but should be monitored
-  on multi-host clocks.
+  4-node loopback benchmark; `/events` gained 1.46x/1.18x. The default `local_lease` mode adds
+  OpenRaft's caller-side cache and measured another 11-36% linearizable-read throughput with
+  ~40% lower 64-reader p50/p99. Set `--read-policy read_index` when bounded clock drift is not
+  guaranteed; the fallback path is unit-tested but should be monitored on multi-host clocks.
 - With pre-connected clients the write path sustains 116.9k writes/s at 512 in flight (p99
   5.76 ms) and 99.3k at 1,024 (p99 8.74 ms); at 2,048 the unbounded path reaches 107.4k but p99
   rises to 17.46 ms. The earlier "knee at 256" was a TCP-setup artifact. The default 1,024 gate
@@ -1491,11 +1656,13 @@ The measurement rules transferred regardless of layout and are now implemented:
   workers, sequential p50/p99 were unchanged and concurrent single writes stayed within the
   host's noise (17.0/14.8k/s dedicated vs 17.8/19.2k/s shared in the final pairs), so the win is
   isolation rather than throughput. Apply can still migrate between the two `raft-worker`
-  threads; the single-worker variant gives strict affinity at ~7% lower concurrent throughput.
+  threads; the single-worker variant gives strict affinity but the 2026-11-10 A/B was within
+  noise (75.4-77.0k/s at 256 pre-connected clients; 40.4-41.2k/s at 1,024 burst clients), so it is
+  not adopted as a throughput choice.
 - The per-level bucket prototype wins match, deep-cancel, dense-amend and
-  BBO-query workloads but loses sparse one-order-per-level re-queue and BBO
-  advance. Full adoption still needs a sparse-level fast path (or a hybrid) and
-  a 3-node/real-sink run; see the prototype section above.
+  BBO-query workloads, is roughly parity on BBO advance, and loses sparse
+  one-order-per-level re-queue and depth. Full adoption still needs a sparse-level fast path (or a
+  hybrid) and a 3-node/real-sink run; see the prototype section above.
 - The external optimization-notes review (2026-11-04) transfers measurement discipline, not
   layout: the per-level bucket prototype already covers the one applicable layout idea, the
   secondary-order-index and cached-BBO wins are already covered by the `(side, price, sequence)`

@@ -52,21 +52,23 @@ const MEASURED_ENTRIES: usize = 50_000;
 const BATCH_SIZE: usize = 128;
 const MEASURED_BATCHES: usize = 1_000;
 
-/// Exact allocation ceilings for `--check`. They are the measured 2026-11-09
-/// totals: a regression may not increase heap churn, while a reduction passes.
-const REST_MAX_CALLS: usize = 208_335;
-const CANCEL_MAX_CALLS: usize = 200_000;
-const FILL_MAX_CALLS: usize = 250_000;
+/// Exact allocation ceilings for `--check`. They are the measured 2026-11-10
+/// totals after inlining one response event: allocation calls may not increase,
+/// while a reduction passes.
+const REST_MAX_CALLS: usize = 158_335;
+const CANCEL_MAX_CALLS: usize = 150_000;
+const FILL_MAX_CALLS: usize = 200_000;
 const BATCH_BLANK_MAX_CALLS: usize = 130_000;
-const BATCH_REST_MAX_CALLS: usize = 536_336;
+const BATCH_REST_MAX_CALLS: usize = 408_336;
 
 /// Requested bytes get a small allowance because capacity choices can change
-/// without increasing the allocation count.
-const REST_MAX_BYTES: usize = 31_250_000;
-const CANCEL_MAX_BYTES: usize = 8_200_000;
-const FILL_MAX_BYTES: usize = 105_700_000;
-const BATCH_BLANK_MAX_BYTES: usize = 51_300_000;
-const BATCH_REST_MAX_BYTES: usize = 227_600_000;
+/// without increasing the allocation count. The batch rows include the larger
+/// inline response header; the hot single-request rows are much smaller now.
+const REST_MAX_BYTES: usize = 30_000_000;
+const CANCEL_MAX_BYTES: usize = 1_000_000;
+const FILL_MAX_BYTES: usize = 120_000_000;
+const BATCH_BLANK_MAX_BYTES: usize = 80_000_000;
+const BATCH_REST_MAX_BYTES: usize = 250_000_000;
 
 static CHECK_MODE: AtomicBool = AtomicBool::new(false);
 static CHECK_FAILED: AtomicBool = AtomicBool::new(false);

@@ -15,7 +15,13 @@
 //!
 //! ```text
 //! cargo bench --bench e2e -- --duration 60 --clients 500
+//! cargo bench --bench e2e -- --duration 60 --clients 500 --rate 10000
 //! ```
+//!
+//! `--rate <requests/s>` switches to a fixed-rate open-loop schedule: each
+//! client keeps an absolute send schedule and latency is measured from the
+//! scheduled send time, so queueing/overload delay is included instead of being
+//! hidden by a closed loop. Without `--rate` the clients remain closed-loop.
 //!
 //! The sustained mode uses IOC orders so the book stays bounded; it profiles
 //! the HTTP/Raft/WAL/apply/event path rather than deep matching sweeps. CPU is
@@ -175,6 +181,13 @@ fn async_wal_from_env() -> bool {
         .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
 }
 
+fn read_policy_from_env() -> matchengine_raft::network::read_policy::ReadPolicyMode {
+    std::env::var(matchengine_raft::network::read_policy::READ_POLICY_ENV)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_default()
+}
+
 async fn start_node(
     addr: &str,
     runtime: &str,
@@ -182,6 +195,7 @@ async fn start_node(
     let dir = temp_dir(runtime);
     let fsync = matchengine_raft::store::config::wal_fsync_from_env();
     let async_wal = async_wal_from_env();
+    let read_policy = read_policy_from_env();
     if async_wal {
         #[cfg(not(feature = "async-wal"))]
         anyhow::bail!("MATCHENGINE_ASYNC_WAL requires --features async-wal");
@@ -194,11 +208,13 @@ async fn start_node(
         .with_instance_prefix(format!("e2e-{runtime}"))
         .with_snapshot_interval(Duration::ZERO)
         .with_wal_fsync(fsync)
+        .with_read_policy(read_policy)
         // This bench measures the unbounded write path; admission control is
         // measured by `cluster_e2e --max-inflight-writes`.
         .with_max_inflight_writes(0)
         .with_async_wal(async_wal);
     let node = build_match_engine_node(1, addr.to_string(), default_raft_config(), storage).await?;
+    println!("read policy: {read_policy}");
     let client = MatchEngineClient::<C>::new(1, addr.to_string());
     client.init().await??;
     wait_for_leader(&client).await?;
@@ -344,11 +360,33 @@ async fn concurrent_throughput(addr: &str, runtime: &str) -> anyhow::Result<()> 
     Ok(())
 }
 
+/// Sends one sustained `/write` and drains the body, returning the status.
+///
+/// The caller times the call itself: closed-loop latency starts at send time,
+/// while open-loop latency starts at the scheduled send time.
+async fn sustained_send(
+    http: &reqwest::Client,
+    url: &str,
+    body: &[u8],
+) -> Result<reqwest::StatusCode, ()> {
+    let response = http
+        .post(url)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(body.to_vec())
+        .send()
+        .await
+        .map_err(|_| ())?;
+    let status = response.status();
+    response.bytes().await.map_err(|_| ())?;
+    Ok(status)
+}
+
 async fn sustained_load(
     addr: &str,
     runtime: &str,
     clients: usize,
     duration: Duration,
+    rate: Option<u64>,
 ) -> anyhow::Result<()> {
     let body = serde_json::to_vec(&sustained_write_request())?;
     let http = reqwest::Client::builder()
@@ -357,7 +395,12 @@ async fn sustained_load(
         .timeout(Duration::from_secs(10))
         .build()?;
     let url = format!("http://{addr}/write");
-    println!("sustained writes ({runtime}): {clients} clients for {duration:?}");
+    match rate {
+        Some(rate) => println!(
+            "sustained writes ({runtime}): {clients} clients for {duration:?}, open-loop {rate} writes/s"
+        ),
+        None => println!("sustained writes ({runtime}): {clients} clients for {duration:?}"),
+    }
 
     // Establish one keep-alive connection per client before the timed phase,
     // so connection setup does not hide the real in-flight concurrency.
@@ -388,41 +431,71 @@ async fn sustained_load(
         let url = url.clone();
         let body = body.clone();
         let barrier = barrier.clone();
+        // Open-loop clients keep an absolute schedule; the interval is the
+        // share of the total offered rate assigned to this client.
+        let interval = rate.map(|rate| {
+            Duration::from_secs_f64(clients as f64 / rate as f64).max(Duration::from_nanos(1))
+        });
         handles.push(tokio::spawn(async move {
             barrier.wait().await;
             let mut latencies = Vec::new();
+            let mut service_latencies = Vec::new();
+            let mut dispatch_lags = Vec::new();
             let mut rejected = 0usize;
             let mut failed = 0usize;
-            while Instant::now() < deadline {
-                let started = Instant::now();
-                match http
-                    .post(&url)
-                    .header(reqwest::header::CONTENT_TYPE, "application/json")
-                    .body(body.clone())
-                    .send()
-                    .await
-                {
-                    Ok(response) => {
-                        let status = response.status();
-                        if response.bytes().await.is_err() {
-                            failed += 1;
-                            continue;
+            let mut sent = 0usize;
+            match interval {
+                Some(interval) => {
+                    let mut scheduled = Instant::now() + interval;
+                    while scheduled < deadline {
+                        let now = Instant::now();
+                        if scheduled > now {
+                            tokio::time::sleep(scheduled - now).await;
                         }
-                        if status.is_success() {
-                            latencies.push(started.elapsed());
-                        } else if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                            rejected += 1;
-                        } else {
-                            failed += 1;
+                        let started = Instant::now();
+                        let dispatch_lag = started.saturating_duration_since(scheduled);
+                        let result = sustained_send(&http, &url, &body).await;
+                        let completed = Instant::now();
+                        sent += 1;
+                        match result {
+                            Ok(status) if status.is_success() => {
+                                latencies.push(completed.saturating_duration_since(scheduled));
+                                service_latencies
+                                    .push(completed.saturating_duration_since(started));
+                                dispatch_lags.push(dispatch_lag);
+                            }
+                            Ok(status) if status == reqwest::StatusCode::TOO_MANY_REQUESTS => {
+                                rejected += 1;
+                            }
+                            Ok(_) | Err(()) => failed += 1,
                         }
+                        scheduled += interval;
                     }
-                    Err(_) => {
-                        failed += 1;
-                        tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+                None => {
+                    while Instant::now() < deadline {
+                        let started = Instant::now();
+                        sent += 1;
+                        match sustained_send(&http, &url, &body).await {
+                            Ok(status) if status.is_success() => {
+                                latencies.push(started.elapsed());
+                            }
+                            Ok(status) if status == reqwest::StatusCode::TOO_MANY_REQUESTS => {
+                                rejected += 1;
+                            }
+                            Ok(_) | Err(()) => failed += 1,
+                        }
                     }
                 }
             }
-            Ok::<_, anyhow::Error>((latencies, rejected, failed))
+            Ok::<_, anyhow::Error>((
+                latencies,
+                service_latencies,
+                dispatch_lags,
+                rejected,
+                failed,
+                sent,
+            ))
         }));
     }
 
@@ -455,13 +528,26 @@ async fn sustained_load(
     }
 
     let mut latencies = Vec::new();
+    let mut service_latencies = Vec::new();
+    let mut dispatch_lags = Vec::new();
     let mut rejected = 0usize;
     let mut failed = 0usize;
+    let mut sent = 0usize;
     for result in join_all(handles).await {
-        let (mut client_latencies, client_rejected, client_failed) = result??;
+        let (
+            mut client_latencies,
+            mut client_service_latencies,
+            mut client_dispatch_lags,
+            client_rejected,
+            client_failed,
+            client_sent,
+        ) = result??;
         latencies.append(&mut client_latencies);
+        service_latencies.append(&mut client_service_latencies);
+        dispatch_lags.append(&mut client_dispatch_lags);
         rejected += client_rejected;
         failed += client_failed;
+        sent += client_sent;
     }
     let elapsed = wall_start.elapsed();
     let cpu_used = match (cpu_start, process_cpu_seconds()) {
@@ -471,6 +557,17 @@ async fn sustained_load(
 
     let accepted = latencies.len();
     println!("  wall:       {:>10.2}s", elapsed.as_secs_f64());
+    if let Some(rate) = rate {
+        let offered = rate as f64 * elapsed.as_secs_f64();
+        println!(
+            "  offered:    {rate} writes/s (~{offered:.0} requests); sent {sent} ({:.1}%)",
+            if offered > 0.0 {
+                sent as f64 / offered * 100.0
+            } else {
+                0.0
+            }
+        );
+    }
     println!("  accepted:   {accepted}");
     println!("  rejected:   {rejected}");
     println!("  failed:     {failed}");
@@ -480,11 +577,39 @@ async fn sustained_load(
     );
     if accepted > 0 {
         latencies.sort_unstable();
+        if rate.is_some() {
+            println!(
+                "  open-loop p50/p95/p99/max: {:?} / {:?} / {:?} / {:?} (completion - scheduled send)",
+                percentile(&latencies, 0.50),
+                percentile(&latencies, 0.95),
+                percentile(&latencies, 0.99),
+                latencies.last().copied().unwrap_or_default()
+            );
+        } else {
+            println!(
+                "  p50/p95/p99: {:?} / {:?} / {:?}",
+                percentile(&latencies, 0.50),
+                percentile(&latencies, 0.95),
+                percentile(&latencies, 0.99)
+            );
+        }
+    }
+    if rate.is_some() && !dispatch_lags.is_empty() {
+        dispatch_lags.sort_unstable();
         println!(
-            "  p50/p95/p99: {:?} / {:?} / {:?}",
-            percentile(&latencies, 0.50),
-            percentile(&latencies, 0.95),
-            percentile(&latencies, 0.99)
+            "  dispatch lag p50/p95/p99/max: {:?} / {:?} / {:?} / {:?}",
+            percentile(&dispatch_lags, 0.50),
+            percentile(&dispatch_lags, 0.95),
+            percentile(&dispatch_lags, 0.99),
+            dispatch_lags.last().copied().unwrap_or_default()
+        );
+        service_latencies.sort_unstable();
+        println!(
+            "  service p50/p95/p99/max: {:?} / {:?} / {:?} / {:?} (completion - actual send)",
+            percentile(&service_latencies, 0.50),
+            percentile(&service_latencies, 0.95),
+            percentile(&service_latencies, 0.99),
+            service_latencies.last().copied().unwrap_or_default()
         );
     }
     if let Some(cpu) = cpu_used {
@@ -505,10 +630,11 @@ async fn run_sustained_suite(
     addr: &str,
     clients: usize,
     duration: Duration,
+    rate: Option<u64>,
 ) -> anyhow::Result<()> {
     println!("\n=== {runtime} runtime, sustained ===");
     let (node, _client, dir) = start_node(addr, runtime).await?;
-    sustained_load(addr, runtime, clients, duration).await?;
+    sustained_load(addr, runtime, clients, duration, rate).await?;
     node.shutdown().await?;
     let _ = std::fs::remove_dir_all(dir);
     Ok(())
@@ -535,6 +661,7 @@ fn main() -> anyhow::Result<()> {
     let mut duration = None;
     let mut clients = 64usize;
     let mut clients_set = false;
+    let mut rate = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -576,9 +703,24 @@ fn main() -> anyhow::Result<()> {
                     .context("--clients must be a positive number")?;
                 clients_set = true;
             }
+            "--rate" => {
+                rate = Some(
+                    args.next()
+                        .context("--rate needs requests per second")?
+                        .parse()
+                        .context("--rate must be a positive integer")?,
+                );
+            }
+            other if other.starts_with("--rate=") => {
+                rate = Some(
+                    other["--rate=".len()..]
+                        .parse()
+                        .context("--rate must be a positive integer")?,
+                );
+            }
             other => {
                 anyhow::bail!(
-                    "unknown argument {other:?}; expected current|both|--pin <cpu>|--duration <seconds>|--clients <n>"
+                    "unknown argument {other:?}; expected current|both|--pin <cpu>|--duration <seconds>|--clients <n>|--rate <requests/s>"
                 )
             }
         }
@@ -591,6 +733,12 @@ fn main() -> anyhow::Result<()> {
     }
     if clients_set && duration.is_none() {
         anyhow::bail!("--clients needs --duration <seconds>");
+    }
+    if rate == Some(0) {
+        anyhow::bail!("--rate must be at least one request per second");
+    }
+    if rate.is_some() && duration.is_none() {
+        anyhow::bail!("--rate needs --duration <seconds>");
     }
     if let Some(cpu) = pin {
         pin_to_cpu(cpu)?;
@@ -618,6 +766,7 @@ fn main() -> anyhow::Result<()> {
                 CURRENT_THREAD_ADDR,
                 clients,
                 duration,
+                rate,
             ))?,
             None => current.block_on(run_suite("current_thread", CURRENT_THREAD_ADDR))?,
         }
@@ -632,6 +781,7 @@ fn main() -> anyhow::Result<()> {
                 MULTI_THREAD_ADDR,
                 clients,
                 duration,
+                rate,
             ))?,
             None => multi.block_on(run_suite("multi_thread", MULTI_THREAD_ADDR))?,
         }

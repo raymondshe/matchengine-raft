@@ -342,7 +342,7 @@ pub fn default_raft_config() -> Config {
         // 1 ms linger all regressed throughput or tail latency.
         max_payload_entries: 300,
         purge_batch_size: 1,
-        api_batch_linger_ms: 0,
+        api_batch_linger_ms: Some(0),
         // Ask peers before campaigning so a restarted or partitioned node cannot
         // inflate the term and depose a healthy leader. The gRPC transport
         // implements `RaftNetworkV2::pre_vote`; openraft's default grants
@@ -503,6 +503,12 @@ pub async fn build_match_engine_node(
     let grpc_health = GrpcListenerHealth::new(raft_addr.to_string());
     tracing::info!(%raft_addr, "Raft gRPC transport listening");
 
+    // The caller-side local lease cache costs leader work, so enable it only
+    // when the read policy actually uses it; core LeaseRead stays unchanged.
+    let mut config = config;
+    if storage.read_policy == crate::network::read_policy::ReadPolicyMode::LocalLease {
+        config.enable_local_lease_read = Some(true);
+    }
     let config = Arc::new(
         config
             .validate()
@@ -946,7 +952,7 @@ mod tests {
         assert!(config.replication_lag_threshold > DEFAULT_SNAPSHOT_LOG_THRESHOLD);
         assert_eq!(300, config.max_payload_entries);
         assert_eq!(1, config.purge_batch_size);
-        assert_eq!(0, config.api_batch_linger_ms);
+        assert_eq!(Some(0), config.api_batch_linger_ms);
         config
             .validate()
             .expect("default Raft config must validate");
