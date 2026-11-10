@@ -220,3 +220,18 @@ Every other order-type field (`tif`, `post_only`, `stop_price`, `display_volume`
 The matching engine overwrites `sequence` when it applies the order, and the receiving leader
 stamps `timestamp` at intake, so both values clients send are ignored (`0` is the conventional
 placeholder). `sequence` is optional and defaults to `0`.
+
+Order identity has three separate fields:
+
+- `id` is client-supplied metadata. It is not a book key, is not checked for uniqueness, and
+  duplicate `id`s are allowed.
+- `sequence` is assigned by the engine on apply; use the returned sequence to key a later
+  cancel/amend. A book order is identified by `(side, current price, sequence)`; a parked stop by
+  `(side, sequence)`. A client-sent `sequence` on `Place` is ignored.
+- `client_order_id` is a `Place`-only idempotency key, retained for the last 262,144 submissions.
+  A retry inside that window returns the original sequence and events; after eviction it is a new
+  order. It never identifies a resting order for cancel/amend.
+
+A `Cancel` or `Amend` whose key does not match a resting order still consumes one `market_seq` and
+publishes a `Rejected` event with reason `order_not_found`. `/write` returns `200` because the
+request is committed; the event, not the HTTP status, is the authoritative result.

@@ -124,7 +124,7 @@ pub enum RejectReason {
     StopWouldTrigger,
     /// Good-'til-date: the expiry is not after the order's own timestamp.
     GtdAlreadyExpired,
-    /// Amend: no resting order matches the supplied key.
+    /// Cancel or amend: no resting order matches the supplied key.
     OrderNotFound,
     /// Amend: the order cannot be amended (a stop or a market order, which do
     /// not rest on the book).

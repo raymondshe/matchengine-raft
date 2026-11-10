@@ -15,8 +15,10 @@ use matchengine_raft::StorageConfig;
 use matchengine_raft::build_match_engine_node;
 use matchengine_raft::client::MatchEngineClient;
 use matchengine_raft::default_raft_config;
+use matchengine_raft::match_result::MatchEventKind;
 use matchengine_raft::order_book::Order;
 use matchengine_raft::order_book::OrderSide;
+use matchengine_raft::order_book::RejectReason;
 use matchengine_raft::store::MatchEngineRequest;
 use openraft::type_config::TypeConfigExt;
 
@@ -113,6 +115,33 @@ fn file_sink_records_rests_fills_and_cancels() {
         // The order book is empty: the cancel removed the only remaining order.
         let orders = client.read(&"orderbook_orders".to_string()).await.unwrap();
         assert_eq!("[]", orders);
+
+        // A cancel of the order that was just cancelled is an explicit
+        // rejection, not a silent acknowledgement. Both the /write response
+        // and the file sink carry it.
+        let response = client
+            .write(&MatchEngineRequest::Cancel {
+                order: Order::new(OrderSide::Buy, 100.0, 6.0, 0),
+            })
+            .await
+            .unwrap()
+            .unwrap()
+            .data;
+        assert_eq!(
+            vec![MatchEventKind::Rejected],
+            response
+                .events
+                .iter()
+                .map(|event| event.kind)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(Some(RejectReason::OrderNotFound), response.events[0].reason);
+
+        let events = wait_for_events(&event_log, 4).await;
+        let rejected = &events[3];
+        assert_eq!("rejected", rejected["kind"]);
+        assert_eq!("order_not_found", rejected["reason"]);
+        assert_eq!(0, rejected["order_sequence"]);
 
         node.shutdown().await.unwrap();
     });

@@ -41,6 +41,14 @@ Unsupported combinations (a stop that is also post-only or an iceberg, a post-on
 zero/negative size or price, a GTD deadline not after the order's own `timestamp`) are refused with
 a `rejected` event carrying the reason.
 
+## Cancel
+
+`Cancel` identifies a book order by side, current price and sequence; a parked stop is identified
+by side and sequence. `Order.id` is client metadata and is not the key. A cancel of a non-resting
+order is not silently acknowledged: it consumes one market sequence and publishes a `rejected`
+event with reason `order_not_found`. The successful form publishes a `cancelled` event carrying the
+volume that was still open in the book.
+
 ## Order amendment
 
 `Amend` changes the price, open volume and/or stop trigger of a resting order. A book order is

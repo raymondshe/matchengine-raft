@@ -533,6 +533,99 @@ fn assert_priority(orders: impl Iterator<Item = (Fixed, u64)>, side: OrderSide, 
     }
 }
 
+/// Aggregated visible depth from the reference model, matching
+/// `OrderBook::depth` for the plain limit orders the generator emits.
+fn model_depth(model: &RefBook, side: OrderSide, levels: usize) -> Vec<DepthLevel> {
+    let mut depth: Vec<DepthLevel> = Vec::new();
+    for order in model.orders(side) {
+        if let Some(level) = depth.last_mut()
+            && level.price == order.price
+        {
+            level.volume += order.volume;
+            level.orders += 1;
+            continue;
+        }
+        if depth.len() == levels {
+            break;
+        }
+        depth.push(DepthLevel {
+            price: order.price,
+            volume: order.volume,
+            orders: 1,
+        });
+    }
+    depth
+}
+
+/// Compares the public query surface (BBO and depth) with the model. The
+/// internal maps are already checked after every operation; this makes the
+/// same invariant explicit through the API a consumer would use.
+fn assert_public_book_state(book: &OrderBook, model: &RefBook, context: &str) {
+    assert_eq!(
+        book.best_bid()
+            .map(|order| (order.sequence, order.price, order.volume)),
+        model
+            .best_bid()
+            .map(|order| (order.sequence, order.price, order.volume)),
+        "{context}: best bid"
+    );
+    assert_eq!(
+        book.best_ask()
+            .map(|order| (order.sequence, order.price, order.volume)),
+        model
+            .best_ask()
+            .map(|order| (order.sequence, order.price, order.volume)),
+        "{context}: best ask"
+    );
+    for side in [OrderSide::Buy, OrderSide::Sell] {
+        assert_eq!(
+            book.depth(side, 8),
+            model_depth(model, side, 8),
+            "{context}: {side:?} depth"
+        );
+    }
+}
+
+/// The benchmark's random-point book-state audit: replay a deterministic
+/// workload, then compare BBO and depth at unpredictable message indices.
+/// Choosing 64 indices out of 512 without replacement makes the audit
+/// reproducible while still avoiding a fixed, easily special-cased sample.
+#[test]
+fn random_point_book_state_audit_matches_reference_model() {
+    const AUDIT_SEEDS: u64 = 8;
+    const AUDIT_OPS: usize = 512;
+    const PROBES: usize = 64;
+
+    for seed in 0..AUDIT_SEEDS {
+        let mut probe_rng = Rng::new(seed ^ 0xA5A5_5A5A_C3C3_3C3C);
+        let mut candidates: Vec<usize> = (0..AUDIT_OPS).collect();
+        for index in 0..PROBES {
+            let swap = index + probe_rng.below((AUDIT_OPS - index) as u64) as usize;
+            candidates.swap(index, swap);
+        }
+        let mut probe_steps = candidates[..PROBES].to_vec();
+        probe_steps.sort_unstable();
+
+        let mut rng = Rng::new(seed);
+        let mut book = OrderBook::new();
+        let mut model = RefBook::default();
+        let mut next_probe = probe_steps.iter().copied().peekable();
+        let mut checked = 0usize;
+
+        for step in 0..AUDIT_OPS {
+            let op = next_op(&mut rng, &model);
+            let context = format!("audit seed {seed} step {step} op {op:?}");
+            apply_op(&mut book, &mut model, &op, &context);
+            if next_probe.peek() == Some(&step) {
+                assert_public_book_state(&book, &model, &context);
+                next_probe.next();
+                checked += 1;
+            }
+        }
+        assert_eq!(PROBES, checked, "seed {seed}: every probe must run");
+    }
+}
+
 #[test]
 fn randomized_limit_book_matches_reference_model() {
     let mut saw_place = false;

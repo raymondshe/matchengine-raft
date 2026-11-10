@@ -1173,12 +1173,18 @@ where
                     ));
                 }
                 if inner.configured_symbol_for(order).is_ok() {
-                    if let Some(cancelled) = inner.orderbook.cancel(order) {
-                        events.push(MatchEvent::for_cancel_at(
+                    match inner.orderbook.cancel(order) {
+                        Some(cancelled) => events.push(MatchEvent::for_cancel_at(
                             log_index,
                             first_ordinal + events.len() as u32,
                             &cancelled,
-                        ));
+                        )),
+                        None => events.push(MatchEvent::for_rejected(
+                            log_index,
+                            first_ordinal + events.len() as u32,
+                            order,
+                            RejectReason::OrderNotFound,
+                        )),
                     }
                 } else {
                     events.push(MatchEvent::for_rejected(

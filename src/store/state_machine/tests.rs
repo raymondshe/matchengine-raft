@@ -313,7 +313,8 @@ async fn apply_publishes_rests_fills_and_cancels_to_the_sink() {
     assert_eq!(3.0, cancelled.volume);
     assert_eq!(3, cancelled.event_id.log_index);
 
-    // A cancel of something that is not in the book publishes nothing.
+    // A cancel of something that is not in the book is an explicit rejection,
+    // not a silent acknowledgement.
     let entries = futures::stream::iter(vec![Ok((
         entry(
             4,
@@ -324,7 +325,96 @@ async fn apply_publishes_rests_fills_and_cancels_to_the_sink() {
         None,
     ))]);
     store.apply(entries).await.unwrap();
-    assert_eq!(4, sink.len());
+    let events = sink.events();
+    assert_eq!(5, events.len());
+    let rejected = &events[4];
+    assert_eq!(MatchEventKind::Rejected, rejected.kind);
+    assert_eq!(Some(RejectReason::OrderNotFound), rejected.reason);
+    assert_eq!(1, rejected.order_sequence);
+    assert_eq!(4, rejected.event_id.log_index);
+}
+
+/// A cancel or amend of a fully filled order is rejected, not silently
+/// acknowledged, and each rejection still consumes one market sequence.
+#[tokio::test]
+async fn apply_rejects_cancel_and_amend_of_a_fully_filled_order() {
+    use crate::match_result::MatchEventKind;
+    use crate::match_result::MemorySink;
+    use crate::order_book::Order;
+    use crate::order_book::OrderSide;
+    use crate::order_book::RejectReason;
+    use openraft::alias::EntryOf;
+
+    fn entry(
+        index: u64,
+        payload: EntryPayloadOf<MatchEngineTypeConfig>,
+    ) -> EntryOf<MatchEngineTypeConfig> {
+        Entry {
+            log_id: log_id(1, index),
+            payload,
+        }
+    }
+
+    let dir = tempdir();
+    let sink = Arc::new(MemorySink::new());
+    let mut store =
+        StateMachineStore::<MatchEngineTypeConfig>::open_with_sink(dir.path(), sink.clone())
+            .unwrap();
+
+    let bid = Order::new(OrderSide::Buy, 100.0, 1.0, 0);
+    let ask = Order::new(OrderSide::Sell, 100.0, 1.0, 0);
+    let entries = futures::stream::iter(vec![
+        Ok((
+            entry(1, EntryPayload::Normal(MatchEngineRequest::place(bid))),
+            None,
+        )),
+        Ok((
+            entry(2, EntryPayload::Normal(MatchEngineRequest::place(ask))),
+            None,
+        )),
+    ]);
+    store.apply(entries).await.unwrap();
+
+    let events = sink.events();
+    assert_eq!(2, events.len(), "rest + fill: {events:?}");
+    assert_eq!(MatchEventKind::Rested, events[0].kind);
+    assert_eq!(MatchEventKind::Fill, events[1].kind);
+
+    let entries = futures::stream::iter(vec![
+        Ok((
+            entry(
+                3,
+                EntryPayload::Normal(MatchEngineRequest::Cancel { order: bid }),
+            ),
+            None,
+        )),
+        Ok((
+            entry(
+                4,
+                EntryPayload::Normal(MatchEngineRequest::Amend {
+                    order: bid,
+                    price: Some(99.0.into()),
+                    volume: None,
+                }),
+            ),
+            None,
+        )),
+    ]);
+    store.apply(entries).await.unwrap();
+
+    let events = sink.events();
+    assert_eq!(4, events.len(), "unexpected events: {events:?}");
+    for event in &events[2..] {
+        assert_eq!(MatchEventKind::Rejected, event.kind);
+        assert_eq!(Some(RejectReason::OrderNotFound), event.reason);
+        assert_eq!(0, event.order_sequence);
+    }
+
+    let inner = store.inner().lock().await;
+    assert_eq!(
+        4, inner.orderbook.sequence,
+        "both rejected requests consumed one sequence"
+    );
 }
 
 /// A batch applies every sub-request in one entry, with continuous event
@@ -1652,10 +1742,16 @@ async fn cancel_and_amend_consume_sequences_and_purge_due_gtd() {
     store.apply(entries).await.unwrap();
 
     let events = sink.events();
-    assert_eq!(2, events.len(), "rest then expiry: {events:?}");
+    assert_eq!(
+        3,
+        events.len(),
+        "rest, expiry, then rejected cancel: {events:?}"
+    );
     assert_eq!(MatchEventKind::Rested, events[0].kind);
     assert_eq!(MatchEventKind::Expired, events[1].kind);
     assert_eq!(5.0, events[1].volume);
+    assert_eq!(MatchEventKind::Rejected, events[2].kind);
+    assert_eq!(Some(RejectReason::OrderNotFound), events[2].reason);
     assert!(
         store.inner().lock().await.orderbook.bids.is_empty(),
         "the expired bid is gone and the cancel found nothing"

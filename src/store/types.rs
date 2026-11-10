@@ -35,6 +35,12 @@ pub enum MatchEngineRequest {
         client_order_id: Option<String>,
     },
     /// Cancel an existing order from the matching engine.
+    ///
+    /// The key is side + current price + sequence for a book order, or side +
+    /// sequence for a parked stop. A key that does not match a resting order
+    /// still consumes one market sequence and publishes a `Rejected` event
+    /// with `order_not_found`; it is not silently acknowledged and it is not
+    /// an HTTP error, because the request is already committed.
     Cancel { order: Order },
     /// Amend a resting limit order, iceberg or parked stop.
     ///

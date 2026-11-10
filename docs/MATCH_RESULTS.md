@@ -224,6 +224,9 @@ Notes:
   derivable from the taker order.
 - `Cancelled` carries the volume that was still open in the book, not the volume originally
   submitted.
+- A `Cancel` of a non-resting order is not silently dropped: it publishes `Rejected` with
+  `reason: "order_not_found"` and consumes one sequence. `Amend` does the same, so a consumer can
+  distinguish a successful cancel from a stale one.
 - Fill events carry exact `taker_fee`/`maker_fee`. The taker uses its taker rate, the resting
   maker uses its maker rate; positive = charge, negative = rebate. `error` is an ordered set of codes for a fill whose notional or a fee fell outside the
   scale-18 range. Only the affected dependent fields are zero: a base-denominated fee can remain
@@ -460,7 +463,9 @@ Returning events does not by itself make retries safe. Two independent dedupe la
   `MAX_SUBMISSIONS` constant (independent of `--max-events`, because dedupe affects matching).
   Keeping the key on the request (not `Order`) preserves `Order: Copy` in the matching loop.
   The edge validates the key before proposing: 1–128 bytes from `[A-Za-z0-9._:-]`, with empty
-  strings rejected (omit the field to disable idempotency).
+  strings rejected (omit the field to disable idempotency). The map is bounded: once a record is
+  evicted, a retry with that key is a new order; `GET /events/status` exposes
+  `submission_evictions_total`. Idempotency is bounded, not permanent.
 - **Consumption:** dedupe on `event_id` as above.
 
 Without the first layer, an HTTP timeout after commit produces two orders that genuinely trade

@@ -1,6 +1,6 @@
 # Public matching-engine test suites: inventory and port backlog
 
-Date: 2026-11-09 · Baseline: `417e095` (sustained CPU profiling in the e2e benchmark)
+Date: 2026-11-10 · Baseline: `master` at the benchmark conformance batch
 
 This document records the public matching-engine test suites reviewed for this
 project, what they actually cover, which behaviours are worth porting, and the
@@ -103,10 +103,10 @@ After both batches in section 5:
 
 | Layer | Count | What it proves |
 |---|---:|---|
-| `src/` unit tests | 176 | Order-book algorithms, fees, property traces, protocol/storage units |
-| `tests/cluster/` integration tests | 64 | Raft, HTTP/gRPC, persistence, events, failover, market data |
+| `src/` unit tests | 198 | Order-book algorithms, fees, property traces, protocol/storage units |
+| `tests/cluster/` integration tests | 67 | Raft, HTTP/gRPC, persistence, events, failover, market data |
 | `tests/replay/` cases | 16 | End-to-end order-type lifecycles against checked-in expected events |
-| `src/order_book/conformance_tests.rs` | 11 | Explicit edge cases the randomized suite should not have to rediscover |
+| `src/order_book/conformance_tests.rs` | 27 | Explicit edge cases the randomized suite should not have to rediscover |
 
 The replay matrix already covers limit, market, IOC, FOK, GTD, Day, post-only,
 iceberg, stop-market, stop-limit, amend, cancel, default fees, quote-asset fees
@@ -118,7 +118,12 @@ Existing conformance cases cover: market FOK all-or-nothing, rejected-FOK
 atomicity, empty-book market cancellation, hidden iceberg volume on
 cancel/expiry, iceberg partial-fill conservation, refill queue priority,
 stop-cascade conservation, GTD/Day stop expiry, post-only amendment and the
-modify-priority matrix, plus fees on market/IOC/stop-child fills.
+modify-priority matrix, plus fees on market/IOC/stop-child fills. The FlashOne
+benchmark batch adds FIFO cancel head/middle/scattered, best-level BBO
+reseating, both-direction maker price, multi-level IOC, marketable-limit
+residual, a 5,000-fill sweep, near-limit prices and metadata-only duplicate
+`Order.id`. The reference-model suite also runs a deterministic random-point
+BBO/depth audit.
 
 ## 4. What no public suite covers
 
@@ -238,6 +243,17 @@ Known limits of event reconstruction, recorded by the test:
   - The independent reference model already covers place/cancel/amend and
     deterministic replay; the mixed test covers IOC. A new operation-coverage
     guard prevents the generator from silently dropping place/cancel/amend.
+
+### Third batch: benchmark-derived invariants
+
+- **`src/order_book/conformance_tests.rs`**: FIFO cancel head/middle/scattered, best-level BBO
+  reseating, both-direction maker price, multi-level IOC, marketable-limit residual, a 5,000-fill
+  same-price sweep, near-limit prices and metadata-only duplicate `Order.id`.
+- **`src/order_book/property_tests.rs`**: `random_point_book_state_audit_matches_reference_model`
+  probes best bid/ask/depth at 64 deterministic indices per seed.
+- **`src/store/state_machine/tests.rs`** and **`tests/cluster/test_match_results.rs`**: a cancel
+  or amend of a non-resting order publishes `Rejected` with `order_not_found` and consumes one
+  sequence.
 
 ## 6. Follow-up status
 

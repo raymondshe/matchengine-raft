@@ -25,9 +25,8 @@ measurement and production readiness; **P2** = important but not blocking; **P3*
 
 ## Top priorities
 
-No P0 work remains. The FlashOne benchmark review (2026-11-10) opened four P1 correctness and
-measurement items; those go first, then the P2 production, feature and validation work, then P3
-experiments.
+No P0 work remains. The benchmark correctness batch landed on 2026-11-10; one P1 measurement item
+remains, then the P2 production, feature and validation work, then P3 experiments.
 
 **Recently completed (2026-11-06/10):** configurable WAL fsync with a measured A/B matrix,
 best-effort WAL recovery, the four-voter no-fsync floor (`test_min_voters.rs`), the optional
@@ -58,7 +57,9 @@ baselines, write/lease decisions, async-WAL numbers and upstream OpenRaft compar
 [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md). The 249-engine FlashOne benchmark survey is
 reviewed in [`docs/THIRD_PARTY_INVESTIGATION.md`](./docs/THIRD_PARTY_INVESTIGATION.md) Part IV; it
 confirms the 7.20 M/s book-only B-tree result and the phantom-fill issue fixed in `a44d9ae`, and
-opened the P1 follow-ups in §17.
+opened the P1 follow-ups in §17. The benchmark correctness batch is implemented: explicit
+conformance cases, `order_not_found` for cancel misses, the identity documentation and the
+random-point state audit (§17).
 
 The upstream OpenRaft minimal benchmark (three in-process nodes, in-memory log/state machine,
 function-call network, empty requests) reports 33k put/s with one client and 3.5M put/s with 4,096,
@@ -77,40 +78,34 @@ implemented: the replication lag threshold now sits above the 100k snapshot poli
 suppression is enabled, HTTP/2 windows/keepalive are tuned, snapshot chunks follow OpenRaft's
 configured size and readiness waits for recovery. The remaining P2/P3 items are tracked in §16.
 
-The next work, in order (re-prioritised 2026-11-10 after the benchmark review):
+The next work, in order (re-prioritised 2026-11-10 after the benchmark correctness batch):
 
-1. **Close the benchmark-derived correctness gaps first (P1, §17).** Make the benchmark's hard
-   invariants explicit: cancel head/middle/scattered and shared-level siblings, both-direction
-   maker price, stale cancel/modify after a full fill, multi-level IOC, marketable-limit residual,
-   cancel-best-level BBO, a 5,000-fill same-price sweep and a near-limit in-domain price. Decide
-   the unknown-cancel contract, document `id`/`sequence`/`client_order_id`, and add a
-   deterministic random-point book-state audit.
-2. **Add the benchmark measurement envelope (P1, §8/§17).** Add a `static`/`normal`/wide-swing/
+1. **Add the benchmark measurement envelope (P1, §8/§17).** Add a `static`/`normal`/wide-swing/
    flash-crash scenario matrix to `book_replay`/`replay_mix`, record average/peak resting orders
    and levels, and report the worst-case median-of-10 with variance.
-3. **Run the Linux pinned-core `e2e` pass (P2, §8).** Dispatch the manual `Linux benchmark`
+2. **Run the Linux pinned-core `e2e` pass (P2, §8).** Dispatch the manual `Linux benchmark`
    workflow (or run the same commands on deployment hardware) and record the pinned short and
    sustained rows. This remains blocked on a Linux host and `gh` authentication.
-4. **Plan one schema-v11 order-type batch (§5, P2).** Add market-to-limit, trailing stops, pegged
+3. **Plan one schema-v11 order-type batch (§5, P2).** Add market-to-limit, trailing stops, pegged
    orders and self-trade prevention together so the snapshot/wire migration and conformance batch
    are paid once. Custom reserve replenishment and stop-protection collars stay P3 and
    product-conditional.
-5. **Aeron operation hardening and the snapshot-request stream (§6, P2).** Run external-driver
+4. **Aeron operation hardening and the snapshot-request stream (§6, P2).** Run external-driver
    and multicast fan-out validation on Linux, add the idle heartbeat and publish `ws_fanout`
    numbers; then add the late-joiner snapshot-request stream (2010).
-6. **Storage, transport and dependency hygiene (§4/§16, P2).** Bound WAL append size by bytes,
+5. **Storage, transport and dependency hygiene (§4/§16, P2).** Bound WAL append size by bytes,
    move snapshot data to `Arc<[u8]>`, stream snapshot receive instead of buffering the whole body,
    and move off `openraft` 0.10.0-alpha when a stable 0.10 release exists.
-7. **Observability measurements and console actions (§16, P2).** Record heartbeat/`AppendStream`
+6. **Observability measurements and console actions (§16, P2).** Record heartbeat/`AppendStream`
    counts and snapshot-transfer time, and add guarded purge-log/runtime-config console actions.
-8. **Provisioning and test hygiene (§2/§7, P2).** Add the `ConfigureSymbol` provisioning
+7. **Provisioning and test hygiene (§2/§7, P2).** Add the `ConfigureSymbol` provisioning
    helper/pre-trade readiness check, parameterize fixed test ports, and keep docs in sync.
-9. **Benchmark P2 follow-ups (P2, §17).** Add the open-loop latency run (or the coordinated-omission
+8. **Benchmark P2 follow-ups (P2, §17).** Add the open-loop latency run (or the coordinated-omission
    caveat), re-pin the benchmark to current `HEAD`, and evaluate a treap/sorted-vector/heap hybrid
    only as a book-only A/B.
-10. **Last: apply-path and per-level-bucket experiments (§8, P3).** Reserve known apply-path
-    lengths, evaluate apply-thread affinity and adopt per-level buckets only if a sparse-level fast
-    path or new measurements justify them; the measured wins are small or split.
+9. **Last: apply-path and per-level-bucket experiments (§8, P3).** Reserve known apply-path
+   lengths, evaluate apply-thread affinity and adopt per-level buckets only if a sparse-level fast
+   path or new measurements justify them; the measured wins are small or split.
 
 The earlier measurement work is done: `book_replay` and `level_book` report warm p50/p99 plus an
 interleaved cold pass, `replay_mix` replays a 100,000-operation fixture with fees, the 4-node
@@ -1015,14 +1010,27 @@ The 249-engine survey pinned this repository at `5597532` (before the phantom-fi
 reported 7.20 M/s book-only; the full review and competitor taxonomy are in
 [`docs/THIRD_PARTY_INVESTIGATION.md`](./docs/THIRD_PARTY_INVESTIGATION.md) Part IV.
 
-- [ ] **P1** Add the explicit benchmark-derived conformance cases: cancel head/middle/scattered
-  and shared-level sibling survival; both-direction maker-price fills; stale cancel and modify
-  after a full fill; multi-level IOC; marketable-limit residual at its own limit; cancel-best-level
-  BBO with no follow-on sweep; a 5,000-fill same-price sweep; and a near-limit in-domain price.
-- [ ] **P1** Decide whether a non-resting cancel emits `Rejected`/4xx or stays a no-op, test it,
-  and document `Order.id` vs `sequence` vs `client_order_id` with duplicate-id and retention cases.
-- [ ] **P1** Add a deterministic random-point book-state audit (best bid/ask/depth) to the
-  reference-model tests, not only final-state comparison.
+- [x] **P1** Add the explicit benchmark-derived conformance cases. Done:
+  `cancel_head_middle_and_scattered_orders_preserve_fifo`,
+  `cancel_best_level_updates_bbo_without_a_follow_on_sweep`,
+  `fills_print_at_the_maker_price_in_both_directions`,
+  `multi_level_ioc_fills_best_price_first_and_cancels_remainder`,
+  `marketable_limit_residual_rests_at_its_limit`,
+  `deep_same_price_sweep_conserves_every_fill`,
+  `near_limit_prices_rest_and_cancel`, and
+  `cancel_and_amend_of_a_filled_order_are_rejected` in `src/order_book/conformance_tests.rs`.
+- [x] **P1** Decide whether a non-resting cancel emits `Rejected`/4xx or stays a no-op, test it,
+  and document `Order.id` vs `sequence` vs `client_order_id`. Done: `apply` now publishes
+  `Rejected` with `OrderNotFound` for a cancel miss (and still consumes one sequence);
+  `apply_rejects_cancel_and_amend_of_a_fully_filled_order` and the updated GTD/cancel test cover
+  it, and `docs/API.md`, `docs/MATCH_RESULTS.md` and `AGENTS.md` document the identity and
+  rejection contract. Duplicate client ids are metadata-only
+  (`order_id_is_client_metadata_not_a_book_key`); submission-map eviction is already covered by
+  `event_log_retains_pages_and_dedupes_submissions`.
+- [x] **P1** Add a deterministic random-point book-state audit (best bid/ask/depth) to the
+  reference-model tests. Done:
+  `random_point_book_state_audit_matches_reference_model` probes 64 deterministic indices per
+  seed against the reference model.
 - [ ] **P1** Add a `book_replay`/`replay_mix` scenario matrix (`static`, `normal`, wide-swing,
   flash-crash), record average/peak resting orders and levels, and report the worst-case
   median-of-10 with variance.

@@ -356,8 +356,8 @@ Notes:
 
 Validation is convenience only; the engine remains authoritative and may return a `rejected`
 event (`fok_unfillable`, `post_only_would_cross`, `stop_would_trigger`, `gtd_already_expired`,
-`invalid_order`). The result panel shows the write response and the returned events, including
-sequence and `log_id.index`.
+`order_not_found`, `invalid_order`). The result panel shows the write response and the returned
+events, including sequence and `log_id.index`.
 
 The submit button is disabled while a write is in flight. A successful write immediately triggers:
 state refresh, event-feed poll with the current cursor, and a flash on the affected order/event.

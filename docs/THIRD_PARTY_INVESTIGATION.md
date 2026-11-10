@@ -480,8 +480,8 @@ path, which our own e2e and cluster suites cover.
 | Calibrated order flow | 95% cancel, 15% IOC, 20% modify, ~2% duplicate cancels/modifies, realistic depth | `replay_mix` is a deterministic 100k mixed fixture with fees, stops and icebergs, not calibrated to a market mix | Add a benchmark fixture with these ratios and duplicate/stale requests; keep the existing mixed fixture |
 | Standing-book occupancy | Records average/peak resting orders and levels per scenario (~20.9k/41.8k in `static`) | `book_replay` has 1k/20k depth cases, but occupancy is not the headline variable | Record average/peak resting orders and levels per benchmark case; add a deep-static case |
 | Median of many runs | 10 perf runs, median and standard deviation | Best-of-5 for microbenchmarks; medians of 2-5 for e2e | Adopt median-of-10 plus variance for the regression-gated book benches; keep p50/p99 |
-| Full output hash plus state audit | Hashes every report and probes 192 random book states | Replay fixtures compare full event streams; property tests compare a reference model; cluster tests read `/read` | Add a deterministic long-run **random-point state audit** against the reference model, not only final-state comparison |
-| Separate edge-case battery | 34 hard-invariant cases outside the timed workload | `src/order_book/conformance_tests.rs` plus cluster/replay suites | Map the benchmark's cases to ours and make the missing hard invariants explicit (see §5) |
+| Full output hash plus state audit | Hashes every report and probes 192 random book states | Replay fixtures compare full event streams; property tests compare a reference model; cluster tests read `/read` | Done: `random_point_book_state_audit_matches_reference_model` compares BBO/depth at deterministic random indices |
+| Separate edge-case battery | 34 hard-invariant cases outside the timed workload | `src/order_book/conformance_tests.rs` plus cluster/replay suites | Mapped; the missing hard invariants are now explicit in the benchmark conformance batch (see §5) |
 | Held-out seeds | 10,000 precomputed seeds; private seeds for adversarial runs | Property tests use seeds and print failures; replay cases are fixed | Add a seed-sweep regression (e.g. 100 seeds) and keep a private-seed path for external validation |
 | Report transport and pipeline barrier | Includes the matcher-to-publisher hand-off and `engine_flush()` inside the timed window | `e2e` includes HTTP, Raft, apply and response; book benches exclude events/feed | Keep the two scopes separate and label them; do not compare a book-only number with e2e |
 | Open-loop latency under load | The paper reports latency-under-load; the harness itself measures throughput | Our sustained e2e is closed-loop | Add a paced/open-loop latency run, or state the coordinated-omission caveat where only closed-loop tails are reported |
@@ -546,16 +546,16 @@ Each row is a bug class that appeared in at least one competitor at its pinned c
 
 | Failure class | Representative findings | Our guard | Remaining action |
 |---|---|---|---|
-| FIFO/time-priority loss | `swap_remove` cancel (`pyrsquant`), LIFO insertion (`amer`, `hillside6`), unstable sort (`nirvanasu`, `thelilypad`), `Dictionary` order (`StockSharp`), shared-level sibling loss (`shaunlwm`) | `BTreeMap` keyed by `(price, sequence)`; property model; amend-priority matrix | Add explicit cancel-head/middle/scattered and shared-level-sibling cases |
-| Wrong execution price | Aggressor price (`e820`, `jiker_burce`, `apex`, `robaho`, `kodoh`, `shal`), midpoint (`fmstephe`), sell-side-only price (`dx1ngy`) | Fills use the maker price; the reference model asserts `fill.maker.price` | Add an explicit two-direction maker-price conformance case |
+| FIFO/time-priority loss | `swap_remove` cancel (`pyrsquant`), LIFO insertion (`amer`, `hillside6`), unstable sort (`nirvanasu`, `thelilypad`), `Dictionary` order (`StockSharp`), shared-level sibling loss (`shaunlwm`) | `BTreeMap` keyed by `(price, sequence)`; property model; amend-priority matrix | Covered by `cancel_head_middle_and_scattered_orders_preserve_fifo` |
+| Wrong execution price | Aggressor price (`e820`, `jiker_burce`, `apex`, `robaho`, `kodoh`, `shal`), midpoint (`fmstephe`), sell-side-only price (`dx1ngy`) | Fills use the maker price; the reference model asserts `fill.maker.price` | Covered by `fills_print_at_the_maker_price_in_both_directions` |
 | Phantom zero-quantity fill / bystander mutation | This repository (#1), `matchina`, `amansardana`, `aas2015001`, `zorrofix` | Taker-exhaustion guard; exact-fill and full-sweep regression tests | None; keep the regression pinned |
-| Stale/phantom best price or level | `osmosis`, `robdev`, `mmrath`, `cjboxing`, `mercury` | No cached BBO: `best_bid`/`best_ask` read the tree; `basic_best_*` and the model | Add an explicit cancel-best-level/expiry BBO case with no follow-on sweep |
+| Stale/phantom best price or level | `osmosis`, `robdev`, `mmrath`, `cjboxing`, `mercury` | No cached BBO: `best_bid`/`best_ask` read the tree; `basic_best_*` and the model | Covered by `cancel_best_level_updates_bbo_without_a_follow_on_sweep` |
 | Partial-fill non-conservation / over-match | `limitbook`, `cltwski`, `opexdev`, `pyme` | `partial_fill_preserves_maker_identity`, `resting_volume`, property model | Add a repeated partial-fill-across-calls case |
-| IOC/marketable residual mishandled | `robdev` (IOC residual rests), `qa-rs` (market remainder rests), `knocte` (crossed book), `sadhbh` (exact touch) | `ioc_cancels_its_remainder`, market tests, `exact_fill_stops_before_deeper_levels` | Add multi-level IOC and marketable-limit residual-at-limit cases |
-| Stale cancel/modify acked | `cjboxing`, `mercury`, `robdev`, `gotrader`, `gavincyi` | `Amend` returns `NotFound` and emits `Rejected`; `cancel` of a non-resting order currently no-ops | Decide whether unknown cancel should emit `Rejected`/4xx, then test both cancel and modify after a full fill |
-| Duplicate id / id reuse / capacity drop | `Kautenja`, `qa-rs`, `tembolo`, `onewhitedevil` | Primary key is `sequence`, not `Order.id`; `client_order_id` dedupe; no fixed order-id table | Document `id` vs `sequence` vs `client_order_id`; add duplicate-id and near-capacity tests |
-| Bounded price domain | `asthamishra` (fixed), `mtengine`, `femto_go`, `zackienzle`, `Clober`, `DeepBook` caps | Full-range `Fixed` plus sparse `BTreeMap` | Add a near-limit in-domain price case; document any representational limit |
-| Empty-book / deep-sweep crash | `dylanlott`, `laffini`, `raunakchopra`, `zorrofix` | Empty-book, market-without-liquidity and property tests | Add a deep 5,000-fill same-price sweep case |
+| IOC/marketable residual mishandled | `robdev` (IOC residual rests), `qa-rs` (market remainder rests), `knocte` (crossed book), `sadhbh` (exact touch) | `ioc_cancels_its_remainder`, market tests, `exact_fill_stops_before_deeper_levels` | Covered by `multi_level_ioc_fills_best_price_first_and_cancels_remainder` and `marketable_limit_residual_rests_at_its_limit` |
+| Stale cancel/modify acked | `cjboxing`, `mercury`, `robdev`, `gotrader`, `gavincyi` | `Amend` returns `NotFound`; `Cancel` now also publishes `Rejected(OrderNotFound)` | Covered by `cancel_and_amend_of_a_filled_order_are_rejected`, `apply_rejects_cancel_and_amend_of_a_fully_filled_order` and the updated GTD/cancel test |
+| Duplicate id / id reuse / capacity drop | `Kautenja`, `qa-rs`, `tembolo`, `onewhitedevil` | Primary key is `sequence`, not `Order.id`; `client_order_id` dedupe; no fixed order-id table | `order_id_is_client_metadata_not_a_book_key` tests duplicate ids; submission-map eviction is covered by `event_log_retains_pages_and_dedupes_submissions` |
+| Bounded price domain | `asthamishra` (fixed), `mtengine`, `femto_go`, `zackienzle`, `Clober`, `DeepBook` caps | Full-range `Fixed` plus sparse `BTreeMap` | Covered by `near_limit_prices_rest_and_cancel` |
+| Empty-book / deep-sweep crash | `dylanlott`, `laffini`, `raunakchopra`, `zorrofix` | Empty-book, market-without-liquidity and property tests | Covered by `deep_same_price_sweep_conserves_every_fill` |
 | O(n)/O(n²) cancel or scan | `afterworkguinness` (whole-book string), `mattdavey` (rescan), `redisexchange` (never stops), `liqian` (domain scan) | `BTreeMap` O(log n); `book_replay` deep cancels | None for now; keep the benchmark |
 | Expired maker still trades | `realyarilabs`; llc-993's `AdvancedOrderBook` | GTD purge before matching; `a_place_purges_due_gtd_before_matching` asserts `fills.is_empty()` when the maker expires | Covered; keep the explicit expiry-before-match assertion |
 | Async/non-deterministic matcher | `luminengine` | `apply` is serial and deterministic; replay/restart/cluster tests | None |
@@ -583,44 +583,46 @@ Each row is a bug class that appeared in at least one competitor at its pinned c
 The following are the concrete changes this review supports. They are ordered so the cheap
 correctness and measurement improvements land before any structural experiment.
 
-**P1 - correctness and measurement**
+**Completed 2026-11-10**
 
-1. Add explicit conformance cases for the hard invariants the benchmark's 34-case gate exposes:
-   cancel-head/middle/scattered and shared-level sibling survival; both-direction maker-price
-   fills; stale cancel and modify after a full fill; multi-level IOC; marketable-limit residual at
-   its own limit; cancel-best-level BBO with no follow-on sweep; a 5,000-fill same-price sweep; and
-   a near-limit in-domain price. Some are covered indirectly by the property model; make them
-   explicit so a failure is diagnosable from the test name.
-2. Add a `book_replay`/`replay_mix` scenario matrix with `static`, `normal`, wide-swing and
+- **Explicit conformance cases.** `src/order_book/conformance_tests.rs` now covers FIFO cancel
+  head/middle/scattered, best-level BBO reseating, both-direction maker price, multi-level IOC,
+  marketable-limit residual, a 5,000-fill sweep and near-limit prices.
+- **Unknown-cancel contract.** `apply` now publishes `Rejected` with `OrderNotFound` for a cancel
+  miss (and still consumes one sequence). `apply_rejects_cancel_and_amend_of_a_fully_filled_order`,
+  `cancel_and_amend_of_a_filled_order_are_rejected` and the file-sink cluster test cover it;
+  `docs/API.md`, `docs/MATCH_RESULTS.md` and `AGENTS.md` document the contract.
+- **Identity documentation.** `Order.id` is client metadata, `sequence` is the book key and
+  `client_order_id` is a bounded `Place`-only idempotency key; duplicate ids are tested in
+  `order_id_is_client_metadata_not_a_book_key`.
+- **Random-point state audit.** `random_point_book_state_audit_matches_reference_model` compares
+  best bid, best ask and depth at 64 deterministic indices per seed.
+
+**P1 - measurement**
+
+1. Add a `book_replay`/`replay_mix` scenario matrix with `static`, `normal`, wide-swing and
    flash-crash shapes; record average/peak resting orders and levels per case; report the
    worst-case median-of-10 with variance, alongside the existing p50/p99.
-3. Add a deterministic random-point state audit to the reference-model tests: compare best bid,
-   best ask and depth at unpredictable message indices, not only the final book.
-4. Decide and document the unknown-cancel contract. Today `cancel` of a non-resting order consumes
-   a sequence and emits no event, while `Amend` emits `Rejected`. Add tests for both, then either
-   make cancel rejection explicit or state that absence of a `cancelled` event is the contract.
-5. Document `Order.id` (client metadata), `sequence` (the engine key) and `client_order_id`
-   (idempotency key) separately; add duplicate-`id` and post-retention `client_order_id` cases.
 
 **P2 - measurement and structure**
 
-6. Add a paced/open-loop latency-under-load run to `e2e` or `cluster_e2e`, or state explicitly in
+2. Add a paced/open-loop latency-under-load run to `e2e` or `cluster_e2e`, or state explicitly in
    `PERFORMANCE.md` that closed-loop tails understate queueing. The benchmark's worst-case
    throughput argument needs a latency companion.
-7. Evaluate a treap, sorted vector or heap hybrid only as a book-only A/B on our workloads. The
+3. Evaluate a treap, sorted vector or heap hybrid only as a book-only A/B on our workloads. The
    external gap to `lcv3` is 22%, but `level_book` already showed that per-level buckets trade
    wins and losses; do not switch on a single external leaderboard.
-8. Re-pin the benchmark to current `HEAD` and, if the adapter can be published, ship the
+4. Re-pin the benchmark to current `HEAD` and, if the adapter can be published, ship the
    reproduction. Run a held-out seed and the 10,000-seed `validate_seeds.py` path only if we are
    prepared to maintain the C ABI adapter as a separate artifact.
-9. Add a "benchmark scope" paragraph to `PERFORMANCE.md` that records the 7.20 M/s book-only result,
+5. Add a "benchmark scope" paragraph to `PERFORMANCE.md` that records the 7.20 M/s book-only result,
    the pin, the fixed issue and the non-comparability with e2e. Link back to this part.
 
 **P3 - do not chase**
 
-10. The benchmark has no FOK, stop, iceberg, post-only, GTD, fee, asset, persistence, consensus or
-    multi-symbol coverage. Those remain covered by our own conformance, property, replay and
-    cluster suites; do not weaken them to match a simpler ABI.
+6. The benchmark has no FOK, stop, iceberg, post-only, GTD, fee, asset, persistence, consensus or
+   multi-symbol coverage. Those remain covered by our own conformance, property, replay and
+   cluster suites; do not weaken them to match a simpler ABI.
 
 ### 8. Verdict
 
@@ -632,8 +634,8 @@ replication and exact-fee semantics that distinguish this project.
 
 The highest-value transfer is therefore **methodology**, not code: worst-case scenario reporting,
 median-of-10 with variance, a calibrated order flow, random-point state audits, and a separate
-edge-case battery. The highest-value concrete gaps are the explicit benchmark-derived conformance
-cases and the unknown-cancel semantics. Neither requires a new data structure.
+edge-case battery. The benchmark-derived correctness gaps are now closed; the remaining
+high-value work is the measurement envelope, not a new data structure.
 
 ## Part V - Comparison with matchengine-raft
 
@@ -679,18 +681,15 @@ does not exercise FOK, stops, icebergs, fees, persistence or consensus.
 4. **Worst-case scenario matrix (benchmark-derived).** Add `static`, `normal`, wide-swing and
    flash-crash shapes to the book benchmarks and report the worst-case median-of-10 with variance,
    alongside p50/p99. The current cases vary depth, not market regime.
-5. **Random-point state audit (benchmark-derived).** Compare best bid, best ask and depth at
-   unpredictable message indices against the reference model, not only the final book. A trade-only
-   hash cannot catch a stale level that self-heals before the next fill.
-6. **Explicit benchmark-derived conformance cases.** Make the hard invariants diagnosable by name:
-   cancel-head/middle/scattered and shared-level sibling survival; both-direction maker-price
-   fills; stale cancel and modify after a full fill; multi-level IOC; marketable-limit residual at
-   its own limit; cancel-best-level BBO with no follow-on sweep; a 5,000-fill same-price sweep; and
-   a near-limit in-domain price.
-7. **Unknown-cancel and identity semantics (benchmark-derived).** Decide whether a non-resting
-   cancel should emit `Rejected`/4xx or remain a no-op, then test it. Document `Order.id` (client
-   metadata), `sequence` (the engine key) and `client_order_id` (idempotency) separately; add
-   duplicate-`id` and post-retention `client_order_id` cases.
+5. **Random-point state audit (benchmark-derived).** Done:
+   `random_point_book_state_audit_matches_reference_model` compares best bid, best ask and depth
+   at deterministic random indices against the reference model.
+6. **Explicit benchmark-derived conformance cases.** Done: `src/order_book/conformance_tests.rs`
+   covers FIFO cancel head/middle/scattered, best-level BBO reseating, both-direction maker price,
+   multi-level IOC, marketable-limit residual, a 5,000-fill sweep and near-limit prices.
+7. **Unknown-cancel and identity semantics (benchmark-derived).** Done: a cancel miss publishes
+   `Rejected(OrderNotFound)` and still consumes one sequence; `docs/API.md`, `docs/MATCH_RESULTS.md`
+   and `AGENTS.md` document `Order.id`, `sequence` and `client_order_id`; duplicate ids are tested.
 8. **Open-loop latency (benchmark-derived).** Add a paced/open-loop latency run, or state the
    coordinated-omission caveat where only closed-loop tails are reported. Worst-case throughput
    needs a latency companion.
@@ -748,28 +747,22 @@ does not exercise FOK, stops, icebergs, fees, persistence or consensus.
 
 ### Prioritized plan
 
-**P1 - correctness and measurement**
+**P1 - measurement**
 
-1. Add the explicit benchmark-derived conformance cases from Part IV §5 and §7: cancel
-   head/middle/scattered and shared-level siblings, both-direction maker price, stale
-   cancel/modify, multi-level IOC, marketable-limit residual, cancel-best-level BBO, 5,000-fill
-   sweep and near-limit price.
-2. Add the scenario matrix, standing-book occupancy reporting and worst-case median-of-10 to
+1. Add the scenario matrix, standing-book occupancy reporting and worst-case median-of-10 to
    `book_replay`/`replay_mix`.
-3. Add the random-point book-state audit to the reference-model tests.
-4. Decide and document the unknown-cancel contract; document `id`/`sequence`/`client_order_id`.
 
 **P2 - measurement and structure**
 
-5. Add a paced/open-loop latency run, or document the closed-loop caveat in `PERFORMANCE.md`.
-6. Evaluate a treap, sorted vector or heap hybrid only as a book-only A/B; do not switch on the
+2. Add a paced/open-loop latency run, or document the closed-loop caveat in `PERFORMANCE.md`.
+3. Evaluate a treap, sorted vector or heap hybrid only as a book-only A/B; do not switch on the
    external leaderboard alone.
-7. Re-pin the FlashOne benchmark and record the book-only result, pin and scope in
+4. Re-pin the FlashOne benchmark and record the book-only result, pin and scope in
    `PERFORMANCE.md`; publish the adapter only if it can be maintained.
 
 **P3 - optional platform work**
 
-8. Real-data replay, custom MPMC/SIMD/io_uring, binary order entry and feature-gated histograms,
+5. Real-data replay, custom MPMC/SIMD/io_uring, binary order entry and feature-gated histograms,
    only after a measured bottleneck and a deployment decision.
 
 **Non-negotiable foundations:** Raft consensus, WAL/snapshot durability, deterministic event ids,

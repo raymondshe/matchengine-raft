@@ -26,8 +26,10 @@ POST /write { Place | Cancel | Amend | PurgeExpired | ConfigureSymbol }
 ```
 
 `Place` 支持可选的 `client_order_id`；用同一个 id 重试会返回原序列号和事件，而不会重复下单。
-事件窗口由 `--max-events`（环境变量 `MAX_EVENTS`，默认 262144）限制；提交去重表另有固定的
-262144 条上限，避免重试结果依赖节点本地参数。两者都包含在快照 v10 中。
+`Cancel`/`Amend` 找不到挂单时仍会消耗一个序列号，并产生 `rejected`（`order_not_found`）事件，
+不会静默确认。事件窗口由 `--max-events`（环境变量 `MAX_EVENTS`，默认 262144）限制；提交去重表另有固定的
+262144 条上限，避免重试结果依赖节点本地参数。两者都包含在快照 v10 中。去重表淘汰后，同一
+`client_order_id` 的重试会成为新订单。
 `GET /events/status` 报告最旧/最新保留 id 和淘汰计数；消费者从 `next_after` 继续，并按 `event_id`
 去重。
 
