@@ -65,6 +65,8 @@ async-stream = "0.3.6"
 clap = { version = "4.6.7", features = ["derive", "env"] }
 crc32fast = "1.5.3"
 env_logger = "0.11.11"
+# No stable 0.10 release exists as of 2026-11-10; the newest published is
+# 0.10.0-alpha.38. Keep this pin until upstream publishes a stable 0.10.
 openraft = { version = "0.10.0-alpha.37", features = ["serde", "type-alias"] }
 futures = "0.3.34"
 i256 = "0.2.5"

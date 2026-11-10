@@ -513,8 +513,15 @@ pub async fn build_match_engine_node(
     let log_dir = storage.log_dir(node_id);
     let wal_fsync = storage.wal_fsync;
     let async_wal = storage.async_wal;
+    let max_wal_append_bytes = storage.max_wal_append_bytes;
     let log_store = tokio::task::spawn_blocking(move || {
-        LogStore::open_with_fsync_and_async_wal(log_dir, wal_fsync, async_wal)
+        LogStore::open_with_segment_size_fsync_async_wal_and_cap(
+            log_dir,
+            crate::store::log_store::DEFAULT_SEGMENT_SIZE,
+            wal_fsync,
+            async_wal,
+            max_wal_append_bytes,
+        )
     })
     .await
     .map_err(|error| std::io::Error::other(format!("WAL open task failed: {error}")))??;
@@ -641,7 +648,7 @@ pub async fn build_match_engine_node(
     // Serve the gRPC transport. The listener is already bound, so peers can
     // connect as soon as this node is initialized.
     let read_policy = ReadPolicyRuntime::new(storage.read_policy);
-    let grpc_service = RaftGrpcService::new(raft.clone());
+    let grpc_service = RaftGrpcService::new(raft.clone(), storage.snapshot_dir(node_id));
     let event_service = EventStreamService::new(
         raft.clone(),
         state_machine_store.clone(),

@@ -10,7 +10,7 @@
 | `src/order_book/conformance_tests.rs` | 市价 FOK、无流动性市价单、冰山隐藏量与撤单/过期、挂起止损的 GTD/Day 过期，以及市价/IOC/止损子单成交的费用报告 |
 | `tests/cluster/test_cluster.rs` | 3 节点 gRPC 集群：初始化、学习者、成员变更、读写、线性一致性读、领导者转发、缩容；测试持有并在成功或 panic 时关闭所有节点 |
 | `tests/cluster/test_snapshot.rs` | 快照生成、日志 purge、学习者通过 gRPC 快照流安装已 purge 的状态，以及关闭日志计数策略时的周期快照定时器 |
-| `tests/cluster/test_storage.rs` | WAL 帧格式、撕裂尾部截断、分段轮转、2 万条跨段日志重开、跨段 truncate/purge、vote/committed 持久化、快照构建/安装/重开、损坏文件拒绝 |
+| `tests/cluster/test_storage.rs` | WAL 帧格式、撕裂尾部截断、分段轮转、按字节切分的追加与批次内轮转及失败回滚、暂存快照校验/清理、2 万条跨段日志重开、跨段 truncate/purge、vote/committed 持久化、快照构建/安装/重开、损坏文件拒绝 |
 | `tests/cluster/test_restart.rs` | 完整节点重启后通过日志重放恢复，以及通过快照 + 更新的 WAL 尾部恢复订单簿、序列号、事件窗口和幂等表；另含 2000 单大日志重放和多分块（约 120 KB）快照启动 |
 | `tests/cluster/test_match_results.rs` | 以 `--match-event-log` 启动的节点按日志顺序记录 rest/fill/cancel 事件，同时 `/write` 响应保持不变；第二个节点验证止损触发、GTD 过期和新增的 `/read` 键 |
 | `tests/cluster/test_market_data.rs` | 以 `--market-data-log` 启动的节点发布重置快照、每个 taker 一条成交消息、BBO、批后深度总量和一根已收盘 K 线；断言同时检查 `market_seq` 锚点与 `/read marketdata_status` 计数器 |
@@ -18,7 +18,7 @@
 | `tests/cluster/test_events.rs` | `/write` 返回事件、`/events` 游标分页、`client_order_id` 重试不重复下单、`--max-events` 淘汰与 `/events/status` 计数、长轮询在并发写入时唤醒或在超时后返回空页、gRPC `StreamEvents` 推送成交与空闲心跳、bridge sidecar 发布事件并记录游标 |
 | `tests/cluster/test_membership.rs` | 杀掉当前领导者：存活的投票节点接管已提交订单簿并接受新写入；写入后加入的学习者通过普通日志复制追赶、晋升成员并从自己的节点写入 |
 | `tests/cluster/test_late_join.rs` | 带过期快照/WAL 的节点被移出集群、错过 40 次写入（期间领导者生成快照并 purge），再以学习者身份重新加入并从活动集群追赶 |
-| `tests/cluster/test_exactness.rs` | 18 位小数的价格/数量经 `/write`、`/read`、`/events`、JSONL 行情、快照 v10 和重启后仍然精确，全程不经过 `f64` |
+| `tests/cluster/test_exactness.rs` | 18 位小数的价格/数量经 `/write`、`/read`、`/events`、JSONL 行情、快照 v11 和重启后仍然精确，全程不经过 `f64` |
 | `tests/cluster/test_symbols.rs` | HTTP 入口在进入 Raft 前以 `400` 拒绝错误标的的 `Place`/`Cancel`/`Amend` 和整个批次，并校验序列号/订单簿未变化；同一 entry 中先 `ConfigureSymbol` 再下单的批次仍可工作。另覆盖精度拒绝、配置锁定和快照重启 |
 | `tests/cluster/test_fees.rs` | 吃单/挂单费率产生精确的成交费用，经 `/write`、`/events`、文件 sink 和行情 feed 输出，并在快照重启后保留 |
 | `tests/cluster/test_fee_assets.rs` | QQQ/USD ETF/法币与 BTC/USDT 加密/稳定币元数据、tick/lot、quote 数量限价单归一化，以及 quote 资产和 received 资产扣费 |

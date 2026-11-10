@@ -7,8 +7,12 @@ Raft log entries are appended to `log/NNNNNNNNNN.wal` segment files:
 - Each record is framed as `[len: u32 LE][crc32: u32 LE][postcard payload]`. On open, recovery walks
   every segment and truncates a torn or corrupt tail instead of parsing it as a valid entry; it
   also rejects an index gap, because openraft requires a hole-free log.
-- `append()` writes the whole openraft batch with a single `write_all` followed by a single
-  `sync_data`, so N entries replicated in one AppendEntries RPC cost one fsync.
+- `append()` encodes the openraft batch into byte-bounded chunks
+  (`StorageConfig::max_wal_append_bytes`, default 8 MiB) and writes them under one disk lock with
+  one `sync_data`, so N entries replicated in one AppendEntries RPC cost one fsync. Entries are
+  never split; one entry larger than the cap is written alone. A failed chunk rolls the active
+  segment back and removes any segment the failed batch created, so recovery never sees a partial
+  batch. `0` disables chunking.
 - Reads use `pread` (`read_at`) against cached file handles, so replication can read while an
   append is in flight and no lock is held during disk IO.
 - All blocking IO runs on `spawn_blocking`; the async runtime only encodes and decodes.
@@ -23,6 +27,22 @@ file that is rewritten atomically (temp file → fsync → rename → directory 
 log id is appended to the WAL without its own fsync: every-append mode makes it durable with the
 next append, periodic mode on the next tick, and no-fsync mode not at all. This avoids a second
 fsync per batch.
+
+### WAL append byte cap
+
+OpenRaft limits a batch by entry count (`max_payload_entries = 300`), not bytes. The log store also
+caps each encoded write:
+
+- `--max-wal-append-bytes` (env `MATCHENGINE_MAX_WAL_APPEND_BYTES`) defaults to
+  `DEFAULT_MAX_WAL_APPEND_BYTES` (8 MiB); `0` writes the whole batch in one call.
+- A larger apply batch is split into whole-record chunks. Chunking holds the disk lock and performs
+  one fsync for the batch; rotation may happen between chunks, and each rotated segment is synced
+  before the switch when fsync is enabled.
+- A partial write or fsync failure truncates the pre-batch segment back to its original length and
+  deletes segments created by the failed batch. The index is only updated after every chunk is
+  written, so a failed append leaves no visible entries.
+- `--max-wal-append-bytes` does not split an individual entry; one oversized entry may exceed the
+  bound and is written alone.
 
 ### WAL durability and recovery from peers
 
@@ -99,6 +119,15 @@ map) stays in memory so applying entries is fast. Snapshot v11 is written as
 `snapshot/current.snap` using the same atomic temp-file/rename protocol; `install_snapshot`
 validates the incoming bytes before replacing the durable copy, so a bad snapshot cannot destroy a
 good one.
+
+A built or cached snapshot is held as `Arc<[u8]>` (`StoredSnapshot::data`,
+`SnapshotData::Memory`), so `build_snapshot` and `get_current_snapshot` share the encoded body
+instead of copying it. The gRPC receiver does not accumulate the body in memory: it streams chunks
+into a `snapshot-staging-*` file under the snapshot directory, tracking the total length against
+`MAX_SNAPSHOT_BYTES` and a running CRC32. `install_snapshot` reads the staged file, verifies its
+length and CRC, decodes the postcard body, and only then writes the durable snapshot. A staging
+file is removed on success, on rejection, or when the value is dropped; startup also deletes stale
+`snapshot-staging-*` files. A completed install stores the body back as `Arc<[u8]>`.
 
 The snapshot payload is postcard-encoded `StateMachineData`:
 

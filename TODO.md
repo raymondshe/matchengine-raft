@@ -11,13 +11,15 @@ fill-level `error` code set, owner identity, market-to-limit/trailing/peg state 
 One process/cluster trades exactly one symbol; multi-symbol is isolated by running one process per
 symbol. Base/quote volume and asset-aware fee deduction are done, and the market-data processor
 runs as a tokio task. WAL durability is configurable (`RAFT_WAL_FSYNC_MS`: unset = no fsync with a
-four-voter floor, `0` = every append, `N > 0` = periodic), OpenRaft can run on a dedicated runtime
-(`RAFT_CORE_WORKERS`), and the thread/lock audit leaves only that env-controlled `RaftThread` as an
-explicit OS thread. Edge request/snapshot limits and the loopback/private-network contract are in
-place. The 4-node no-fsync cluster benchmark and the 2026-11-08 OpenRaft minimal-benchmark
-comparison are in [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md); Raft is below the application path
-as the current bottleneck. The remaining work is benchmark-derived correctness and measurement,
-performance evidence, OpenRaft utilization follow-ups (§16) and feature extensions (§5, §6, §13);
+four-voter floor, `0` = every append, `N > 0` = periodic), append writes are byte-bounded
+(`--max-wal-append-bytes`), OpenRaft can run on a dedicated runtime (`RAFT_CORE_WORKERS`), and the
+thread/lock audit leaves only that env-controlled `RaftThread` as an explicit OS thread. Snapshot
+bodies are shared as `Arc<[u8]>` and a received snapshot stages to a validated file. Edge
+request/snapshot limits and the loopback/private-network contract are in place. The 4-node no-fsync
+cluster benchmark and the 2026-11-08 OpenRaft minimal-benchmark comparison are in
+[`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md); Raft is below the application path as the current
+bottleneck. The remaining work is benchmark-derived correctness and measurement, performance
+evidence, OpenRaft utilization follow-ups (§16) and feature extensions (§5, §6, §13);
 TLS/authentication stays at the gateway and is out of scope for this process.
 
 Priority key: **P0** = known correctness/security defect, do next; **P1** = correctness coverage,
@@ -83,7 +85,7 @@ implemented: the replication lag threshold now sits above the 100k snapshot poli
 suppression is enabled, HTTP/2 windows/keepalive are tuned, snapshot chunks follow OpenRaft's
 configured size and readiness waits for recovery. The remaining P2/P3 items are tracked in §16.
 
-The next work, in order (re-prioritised 2026-11-10 after the schema-v11 batch):
+The next work, in order (re-prioritised 2026-11-10 after the storage/transport hygiene batch):
 
 1. **Run the Linux pinned-core `e2e` pass (P2, §8).** Dispatch the manual `Linux benchmark`
    workflow (or run the same commands on deployment hardware) and record the pinned short and
@@ -91,17 +93,14 @@ The next work, in order (re-prioritised 2026-11-10 after the schema-v11 batch):
 2. **Aeron operation hardening and the snapshot-request stream (§6, P2).** Run external-driver
    and multicast fan-out validation on Linux, add the idle heartbeat and publish `ws_fanout`
    numbers; then add the late-joiner snapshot-request stream (2010).
-3. **Storage, transport and dependency hygiene (§4/§16, P2).** Bound WAL append size by bytes,
-   move snapshot data to `Arc<[u8]>`, stream snapshot receive instead of buffering the whole body,
-   and move off `openraft` 0.10.0-alpha when a stable 0.10 release exists.
-4. **Observability measurements and console actions (§16, P2).** Record heartbeat/`AppendStream`
+3. **Observability measurements and console actions (§16, P2).** Record heartbeat/`AppendStream`
    counts and snapshot-transfer time, and add guarded purge-log/runtime-config console actions.
-5. **Provisioning and test hygiene (§2/§7, P2).** Add the `ConfigureSymbol` provisioning
+4. **Provisioning and test hygiene (§2/§7, P2).** Add the `ConfigureSymbol` provisioning
    helper/pre-trade readiness check, parameterize fixed test ports, and keep docs in sync.
-6. **Benchmark P2 follow-ups (P2, §17).** Add the open-loop latency run (or the coordinated-omission
+5. **Benchmark P2 follow-ups (P2, §17).** Add the open-loop latency run (or the coordinated-omission
    caveat), re-pin the benchmark to current `HEAD`, and evaluate a treap/sorted-vector/heap hybrid
    only as a book-only A/B.
-7. **Last: apply-path and per-level-bucket experiments (§8, P3).** Reserve known apply-path
+6. **Last: apply-path and per-level-bucket experiments (§8, P3).** Reserve known apply-path
    lengths, evaluate apply-thread affinity and adopt per-level buckets only if a sparse-level fast
    path or new measurements justify them; the measured wins are small or split.
 
@@ -258,11 +257,12 @@ Transport decisions:
 
 Remaining:
 
-- [ ] **P2** Consider streaming snapshot bytes into the state machine or a temp file instead of
-  buffering the whole snapshot. The current API needs a contiguous buffer, but the receiver's
-  total allocation still needs a policy (see §3).
-- [ ] **P2** Move off `openraft` 0.10.0-alpha once a stable 0.10 release exists; latest published
-  is still `0.10.0-alpha.37`.
+- [x] **P2** Stream snapshot receive into a staging file instead of buffering the whole body.
+  Done: `SnapshotData` carries a staged snapshot received as chunks; the state machine validates
+  its length/CRC and writes the durable snapshot atomically. `Arc<[u8]>` carries locally built
+  snapshots and `get_current_snapshot` no longer copies the body.
+- [ ] **P2** Move off `openraft` 0.10.0-alpha once a stable 0.10 release exists; the latest
+  published release is still `0.10.0-alpha.38` (checked 2026-11-10).
 - [ ] **P3** The Aeron **Raft transport** remains gated on a measured bottleneck; the market-data
   Aeron egress is implemented (§6).
 
@@ -933,12 +933,18 @@ and optional APIs.
   non-fsynced, but `/ready` now requires `Raft::wait_for_recovery` to confirm the state machine
   applied the cluster commit covering the durable log tail. `/health` exposes the `recovered`
   flag for diagnostics.
-- [ ] **P2** Bound WAL append size by bytes, not only by OpenRaft's `max_append_entries`
-  (default 4,096). A merged append can contain many 128-request batches; add a byte cap or lower
-  `max_append_entries` and measure throughput.
-- [ ] **P2** Change snapshot data from `Cursor<Vec<u8>>` to `Cursor<Arc<[u8]>>` (or a
-  `Bytes`-backed reader) so `get_current_snapshot` and `build_snapshot` do not copy the whole
-  snapshot under the state-machine lock.
+- [x] **P2** Bound WAL append size by bytes, not only by OpenRaft's `max_payload_entries`.
+  Done: `StorageConfig::max_wal_append_bytes` / `--max-wal-append-bytes` /
+  `MATCHENGINE_MAX_WAL_APPEND_BYTES` (default 8 MiB; `0` disables chunking). One apply batch is
+  split into size-bounded writes under one disk lock and one fsync; a failed chunk rolls the
+  active segment back and removes segments created by the failed batch. Entries are never split.
+- [x] **P2** Move snapshot data to an `Arc<[u8]>`-backed representation so
+  `get_current_snapshot` and `build_snapshot` do not copy the whole body. Done: `StoredSnapshot`
+  and `SnapshotData::Memory` hold `Arc<[u8]>`; the cached snapshot is shared by reference.
+- [x] **P2** Stream snapshot receive instead of buffering the whole body. Done: the gRPC server
+  writes chunks to a `snapshot-staging-*` file under the snapshot directory with a running CRC and
+  size cap; `install_snapshot` verifies length/CRC and postcard content before the atomic durable
+  write. Stale staging files are removed on open.
 - [x] **P2** Prototype an asynchronous WAL append: insert into a pending-entry cache, write/fsync
   on a background task and call `IOFlushed` only when durable. Done: `async-wal` Cargo feature,
   `--async-wal`/`MATCHENGINE_ASYNC_WAL`, pending-entry reads, `truncate_after`/`purge` flush.

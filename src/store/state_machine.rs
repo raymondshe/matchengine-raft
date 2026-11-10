@@ -11,7 +11,6 @@ use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::fmt;
 use std::io;
-use std::io::Cursor;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -65,6 +64,8 @@ use crate::store::types::MatchEngineResponse;
 
 /// Name of the durable snapshot file inside the snapshot directory.
 const SNAPSHOT_FILE: &str = "current.snap";
+/// Prefix of transport staging files; never selected as a durable snapshot.
+pub const STAGING_FILE_PREFIX: &str = "snapshot-staging-";
 /// Magic prefix of a snapshot file.
 const SNAPSHOT_MAGIC: &[u8; 7] = b"MRFSNAP";
 /// Snapshot file format version.
@@ -91,7 +92,113 @@ pub struct StoredSnapshot<C: RaftTypeConfig> {
     pub meta: SnapshotMetaOf<C>,
 
     /// The postcard-encoded [`StateMachineData`] at the time of this snapshot.
-    pub data: Vec<u8>,
+    pub data: Arc<[u8]>,
+}
+
+/// A snapshot body as it moves through Raft.
+///
+/// Snapshots built locally or restored from the durable file are held as
+/// `Arc<[u8]>`, so handing one to multiple peers and caching the current
+/// snapshot do not copy the body. A snapshot received over gRPC is staged in a
+/// temporary file by the transport and installed from that file, so the
+/// receiver never grows an unbounded in-memory buffer.
+#[derive(Debug, Clone)]
+pub enum SnapshotData {
+    /// An in-memory snapshot body.
+    Memory(Arc<[u8]>),
+    /// A received snapshot body staged in a temporary file.
+    ///
+    /// The file holds the raw postcard-encoded [`StateMachineData`] body (not
+    /// the `current.snap` framing); the state machine validates its length,
+    /// CRC and postcard content before writing the durable snapshot.
+    Staged(Arc<StagedSnapshot>),
+}
+
+impl SnapshotData {
+    /// Wraps an encoded state-machine body.
+    pub fn memory(data: impl Into<Arc<[u8]>>) -> Self {
+        Self::Memory(data.into())
+    }
+
+    /// Returns the encoded body, reading a staged file if necessary.
+    pub fn into_bytes(self) -> io::Result<Arc<[u8]>> {
+        match self {
+            Self::Memory(data) => Ok(data),
+            Self::Staged(staged) => Ok(Arc::from(staged.read_verified()?)),
+        }
+    }
+}
+
+/// A snapshot body received over the network and written to a staging file.
+///
+/// The file is removed when the last reference is dropped, whether the install
+/// succeeds, fails or the process replaces the value. It is never the durable
+/// `current.snap`; the state machine validates it first and then writes the
+/// atomic durable snapshot.
+#[derive(Debug)]
+pub struct StagedSnapshot {
+    path: PathBuf,
+    len: u64,
+    crc32: u32,
+}
+
+impl StagedSnapshot {
+    /// Registers a complete staging file with its byte length and CRC32.
+    pub fn new(path: impl Into<PathBuf>, len: u64, crc32: u32) -> Self {
+        Self {
+            path: path.into(),
+            len,
+            crc32,
+        }
+    }
+
+    /// Path of the staging file.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Number of bytes written to the staging file.
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+
+    /// Whether the staged body is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// CRC32 of the staging file's body.
+    pub fn crc32(&self) -> u32 {
+        self.crc32
+    }
+
+    /// Reads the staging file, verifying its length and CRC before decode.
+    pub fn read_verified(&self) -> io::Result<Vec<u8>> {
+        let bytes = std::fs::read(&self.path)?;
+        if bytes.len() as u64 != self.len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "staged snapshot has {} bytes, expected {}",
+                    bytes.len(),
+                    self.len
+                ),
+            ));
+        }
+        if crc32fast::hash(&bytes) != self.crc32 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "staged snapshot has a checksum mismatch",
+            ));
+        }
+        Ok(bytes)
+    }
+}
+
+impl Drop for StagedSnapshot {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
 }
 
 /// On-disk snapshot body: metadata plus the encoded state machine content.
@@ -796,6 +903,7 @@ impl<C: RaftTypeConfig> StateMachineStore<C> {
     ) -> io::Result<Self> {
         let dir = dir.into();
         std::fs::create_dir_all(&dir)?;
+        remove_stale_staging_files(&dir);
 
         let mut inner = StateMachineStoreInner::<C> {
             max_events,
@@ -803,6 +911,7 @@ impl<C: RaftTypeConfig> StateMachineStore<C> {
         };
 
         if let Some((meta, data)) = read_snapshot_file::<C>(&dir)? {
+            let data: Arc<[u8]> = Arc::from(data);
             let content = decode_content(&data)?;
             let snapshot_last_log_id = meta.last_log_id.clone();
             let snapshot_events = content.events.len();
@@ -1074,10 +1183,10 @@ impl<C> RaftSnapshotBuilder<C> for StateMachineStore<C>
 where
     C: RaftTypeConfig<D = MatchEngineRequest, R = MatchEngineResponse>,
 {
-    type SnapshotData = Cursor<Vec<u8>>;
+    type SnapshotData = SnapshotData;
 
     #[tracing::instrument(level = "trace", skip(self))]
-    async fn build_snapshot(&mut self) -> Result<SnapshotOf<C, Cursor<Vec<u8>>>, io::Error> {
+    async fn build_snapshot(&mut self) -> Result<SnapshotOf<C, SnapshotData>, io::Error> {
         // Capture a consistent image under the lock, then encode and write it
         // without blocking apply. The snapshot still corresponds to exactly one
         // applied log id captured above.
@@ -1096,7 +1205,7 @@ where
         let data = blocking(move || {
             let data = encode_content(&content)?;
             write_snapshot_file::<C>(&dir, &write_meta, &data)?;
-            Ok::<_, io::Error>(data)
+            Ok::<_, io::Error>(Arc::<[u8]>::from(data))
         })
         .await?;
 
@@ -1108,9 +1217,9 @@ where
             });
         }
 
-        Ok(SnapshotOf::<C, Cursor<Vec<u8>>> {
+        Ok(SnapshotOf::<C, SnapshotData> {
             meta,
-            snapshot: Cursor::new(data),
+            snapshot: SnapshotData::Memory(data),
         })
     }
 }
@@ -1435,7 +1544,7 @@ where
             Entry = Entry<CommittedLeaderIdOf<C>, EntryPayloadOf<C>>,
         >,
 {
-    type SnapshotData = Cursor<Vec<u8>>;
+    type SnapshotData = SnapshotData;
     type SnapshotBuilder = Self;
 
     async fn applied_state(
@@ -1533,18 +1642,33 @@ where
         meta: &SnapshotMetaOf<C>,
         snapshot: Self::SnapshotData,
     ) -> Result<(), io::Error> {
-        let data = snapshot.into_inner();
-        tracing::info!({ snapshot_size = data.len() }, "installing snapshot");
-
         let dir = self.dir.clone();
         let write_meta = meta.clone();
         // Decode and validate on the blocking pool, before touching the durable copy.
-        let (content, data) = blocking(move || {
-            let content = decode_content(&data)?;
-            write_snapshot_file::<C>(&dir, &write_meta, &data)?;
-            Ok::<_, io::Error>((content, data))
-        })
-        .await?;
+        let (content, data) = match snapshot {
+            SnapshotData::Memory(data) => {
+                tracing::info!({ snapshot_size = data.len() }, "installing snapshot");
+                blocking(move || {
+                    let content = decode_content(&data)?;
+                    write_snapshot_file::<C>(&dir, &write_meta, &data)?;
+                    Ok::<_, io::Error>((content, data))
+                })
+                .await?
+            }
+            SnapshotData::Staged(staged) => {
+                tracing::info!(
+                    { snapshot_size = staged.len(), path = %staged.path().display() },
+                    "installing staged snapshot"
+                );
+                blocking(move || {
+                    let bytes = staged.read_verified()?;
+                    let content = decode_content(&bytes)?;
+                    write_snapshot_file::<C>(&dir, &write_meta, &bytes)?;
+                    Ok::<_, io::Error>((content, Arc::<[u8]>::from(bytes)))
+                })
+                .await?
+            }
+        };
 
         let last_event = {
             let mut inner = self.inner.lock().await;
@@ -1566,12 +1690,12 @@ where
     #[allow(clippy::type_complexity)]
     async fn get_current_snapshot(
         &mut self,
-    ) -> Result<Option<SnapshotOf<C, Cursor<Vec<u8>>>>, io::Error> {
+    ) -> Result<Option<SnapshotOf<C, SnapshotData>>, io::Error> {
         let inner = self.inner.lock().await;
         match &inner.current_snapshot {
-            Some(snapshot) => Ok(Some(SnapshotOf::<C, Cursor<Vec<u8>>> {
+            Some(snapshot) => Ok(Some(SnapshotOf::<C, SnapshotData> {
                 meta: snapshot.meta.clone(),
-                snapshot: Cursor::new(snapshot.data.clone()),
+                snapshot: SnapshotData::Memory(snapshot.data.clone()),
             })),
             None => Ok(None),
         }
@@ -1583,6 +1707,22 @@ where
 }
 
 // --- File format helpers
+
+/// Removes staging files left by a process killed during snapshot receive.
+///
+/// Only the durable `current.snap` (and its atomic `.tmp`) matter on restart;
+/// a staging file is never selected, so deleting stale ones is safe.
+fn remove_stale_staging_files(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let name = entry.file_name();
+        if name.to_string_lossy().starts_with(STAGING_FILE_PREFIX) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
 
 fn encode_content(content: &StateMachineData) -> io::Result<Vec<u8>> {
     postcard::to_allocvec(content).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))

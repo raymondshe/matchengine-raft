@@ -30,7 +30,7 @@
 **为什么选择它**
 
 - **确定性执行** — 价格-时间优先撮合，`apply` 不读墙上时钟；重放日志可以精确复现订单簿。
-- **可配置持久化** — 自研分段 WAL（fsync 策略可选）、原子快照和“快照 + WAL 尾部”恢复，均由重启和故障测试覆盖。
+- **可配置持久化** — 自研分段 WAL（fsync 策略可选，`--max-wal-append-bytes` 按字节切分单次追加）、原子快照和“快照 + WAL 尾部”恢复，均由重启和故障测试覆盖。
 - **Raft 原生** — OpenRaft 0.10 + gRPC，支持 Pre-Vote、领导权转移、学习者追赶和分块快照安装。
 - **18 位定点数** — 撮合路径不使用 `f64`；价格、数量和费用在 API、事件、快照和 feed 中全程精确。
 - **实时行情** — 确定性 feed 通过 Aeron 发布（每个流一个独占 publication），再由 Binance 风格 WebSocket 服务分发，支持 100/1000 ms 深度合并和水平扩展。
@@ -263,7 +263,7 @@ HTTP API 与 gRPC Raft 监听端口（HTTP 端口 + 1000）**按设计就是明�
 | `/events` 长轮询等待 | 0–1000 ms（`wait_ms`） |
 | `/write_batch` | 1–128 个非嵌套请求，`client_order_id` 不得重复 |
 | gRPC Raft 消息 | 64 MiB（`MAX_MESSAGE_SIZE`） |
-| gRPC 快照流 | 总量 256 MiB（`MAX_SNAPSHOT_BYTES`），在追加每个 chunk 前检查 |
+| gRPC 快照流 | 总量 256 MiB（`MAX_SNAPSHOT_BYTES`），在写入每个 chunk 的暂存文件前检查 |
 
 畸形 JSON 和非法字段返回 `400`；超大请求体返回 `413`。复制的 `client_order_id` 去重表最多保留
 262,144 条记录，因此键长度限制也限制了该表的内存占用。
@@ -329,7 +329,8 @@ HTTP 应用/管理 API 和 gRPC Raft 服务见 [API 参考](./docs/zh-CN/API.md)
 超过默认配置。详见[生产配置决策](./docs/zh-CN/PERFORMANCE.md#生产配置决策2026-11-08)。
 
 WAL fsync 由 `RAFT_WAL_FSYNC_MS` 控制：未设置 = 不 fsync（默认；要求至少 4 个投票成员），`0` = 每次
-追加，`N > 0` = 周期 fsync。持久性契约见[存储](./docs/zh-CN/STORAGE.md)，权衡见
+追加，`N > 0` = 周期 fsync。`--max-wal-append-bytes`（默认 8 MiB）把一次 apply 批次切成按字节有界的
+写入，仍共用一次磁盘锁和一次 fsync。持久性契约见[存储](./docs/zh-CN/STORAGE.md)，权衡见
 [生产配置决策](./docs/zh-CN/PERFORMANCE.md#生产配置决策2026-11-08)。
 
 完整基准方法、存储路径细节和优化历史见 [性能细节](./docs/zh-CN/PERFORMANCE.md)。快照 **v11** 和

@@ -4,10 +4,13 @@
 //! `Raft` API the HTTP handlers call, and encodes the result. Consensus
 //! semantics stay in openraft.
 
-use std::io::Cursor;
+use std::path::Path;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
 use futures::Stream;
 use futures::StreamExt;
@@ -20,6 +23,7 @@ use openraft::raft::AppendEntriesRequest;
 use openraft::raft::SnapshotResponse;
 use openraft::raft::TransferLeaderRequest;
 use openraft::raft::VoteRequest;
+use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::Request;
@@ -41,37 +45,120 @@ use crate::network::grpc::pb::TransferLeaderResponse as PbTransferLeaderResponse
 use crate::network::grpc::pb::VoteCallRequest;
 use crate::network::grpc::pb::VoteCallResponse;
 use crate::network::grpc::pb::raft_service_server::RaftService;
+use crate::store::state_machine::STAGING_FILE_PREFIX;
+use crate::store::state_machine::SnapshotData;
+use crate::store::state_machine::StagedSnapshot;
 
 pub struct RaftGrpcService {
     raft: MatchEngineRaft,
+    /// Directory for snapshot bodies received from the leader.
+    snapshot_staging_dir: PathBuf,
 }
 
 impl RaftGrpcService {
-    pub fn new(raft: MatchEngineRaft) -> Self {
-        Self { raft }
+    pub fn new(raft: MatchEngineRaft, snapshot_staging_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            raft,
+            snapshot_staging_dir: snapshot_staging_dir.into(),
+        }
     }
 }
 
-/// Appends one snapshot chunk while enforcing the total receive budget.
-///
-/// The state machine needs a contiguous buffer, so the cap must be checked
-/// before extending: an offset-bearing peer could otherwise stream forever.
-fn append_snapshot_data(
-    data: &mut Vec<u8>,
-    received: &mut u64,
-    chunk: &[u8],
-) -> Result<(), Status> {
+/// Checks the next received snapshot size against the transport cap.
+fn next_snapshot_len(received: u64, chunk_len: usize) -> Result<u64, Status> {
     let next = received
-        .checked_add(chunk.len() as u64)
+        .checked_add(chunk_len as u64)
         .ok_or_else(|| Status::resource_exhausted("snapshot size overflow"))?;
     if next > MAX_SNAPSHOT_BYTES as u64 {
         return Err(Status::resource_exhausted(format!(
             "snapshot exceeds {MAX_SNAPSHOT_BYTES} bytes"
         )));
     }
-    data.extend_from_slice(chunk);
-    *received = next;
-    Ok(())
+    Ok(next)
+}
+
+static NEXT_STAGING_FILE: AtomicU64 = AtomicU64::new(0);
+
+/// Streams received snapshot chunks into a staging file.
+///
+/// The file is created with `create_new` under the state machine's snapshot
+/// directory and removed on drop unless [`SnapshotStaging::finish`] hands it to
+/// a [`StagedSnapshot`] for installation.
+struct SnapshotStaging {
+    path: PathBuf,
+    file: Option<tokio::fs::File>,
+    len: u64,
+    hasher: crc32fast::Hasher,
+    keep: bool,
+}
+
+impl SnapshotStaging {
+    async fn create(dir: &Path) -> Result<Self, Status> {
+        tokio::fs::create_dir_all(dir)
+            .await
+            .map_err(|e| Status::internal(format!("create snapshot staging directory: {e}")))?;
+        let sequence = NEXT_STAGING_FILE.fetch_add(1, Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or_default();
+        let path = dir.join(format!(
+            "{STAGING_FILE_PREFIX}{}-{sequence}-{nanos}.tmp",
+            std::process::id()
+        ));
+        let file = tokio::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&path)
+            .await
+            .map_err(|e| Status::internal(format!("create snapshot staging file: {e}")))?;
+        Ok(Self {
+            path,
+            file: Some(file),
+            len: 0,
+            hasher: crc32fast::Hasher::new(),
+            keep: false,
+        })
+    }
+
+    async fn push(&mut self, chunk: &[u8]) -> Result<(), Status> {
+        let next = next_snapshot_len(self.len, chunk.len())?;
+        let file = self
+            .file
+            .as_mut()
+            .expect("snapshot staging file is open until finish");
+        file.write_all(chunk)
+            .await
+            .map_err(|e| Status::internal(format!("write staged snapshot: {e}")))?;
+        self.hasher.update(chunk);
+        self.len = next;
+        Ok(())
+    }
+
+    async fn finish(mut self) -> Result<StagedSnapshot, Status> {
+        let mut file = self
+            .file
+            .take()
+            .expect("snapshot staging file is open until finish");
+        file.flush()
+            .await
+            .map_err(|e| Status::internal(format!("flush staged snapshot: {e}")))?;
+        drop(file);
+        self.keep = true;
+        Ok(StagedSnapshot::new(
+            self.path.clone(),
+            self.len,
+            self.hasher.clone().finalize(),
+        ))
+    }
+}
+
+impl Drop for SnapshotStaging {
+    fn drop(&mut self) {
+        if !self.keep {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
 }
 
 /// Test-only pause after a snapshot chunk is received.
@@ -162,10 +249,9 @@ impl RaftService for RaftGrpcService {
     ) -> Result<Response<crate::network::grpc::pb::SnapshotResponse>, Status> {
         let mut stream = request.into_inner();
 
+        let mut staging = SnapshotStaging::create(&self.snapshot_staging_dir).await?;
         let mut vote: Option<VoteOf<MatchEngineTypeConfig>> = None;
         let mut meta: Option<SnapshotMetaOf<MatchEngineTypeConfig>> = None;
-        let mut data = Vec::new();
-        let mut received = 0u64;
         let mut complete = false;
 
         while let Some(chunk) = stream.message().await? {
@@ -181,15 +267,15 @@ impl RaftService for RaftGrpcService {
                         Status::invalid_argument(format!("decode snapshot meta: {e}"))
                     })?);
             }
-            if chunk.offset != received {
+            if chunk.offset != staging.len {
                 return Err(Status::invalid_argument(format!(
                     "snapshot chunk offset {}, expected {}",
-                    chunk.offset, received
+                    chunk.offset, staging.len
                 )));
             }
 
             if !chunk.data.is_empty() {
-                append_snapshot_data(&mut data, &mut received, &chunk.data)?;
+                staging.push(&chunk.data).await?;
             }
 
             #[cfg(debug_assertions)]
@@ -216,9 +302,10 @@ impl RaftService for RaftGrpcService {
             }
         };
 
-        let snapshot = SnapshotOf::<MatchEngineTypeConfig, Cursor<Vec<u8>>> {
+        let staged = staging.finish().await?;
+        let snapshot = SnapshotOf::<MatchEngineTypeConfig, SnapshotData> {
             meta,
-            snapshot: Cursor::new(data),
+            snapshot: SnapshotData::Staged(Arc::new(staged)),
         };
 
         let result: Result<
@@ -310,23 +397,59 @@ mod tests {
     use super::*;
 
     #[test]
-    fn snapshot_data_is_capped_before_allocation() {
-        let mut data = Vec::new();
-        let mut received = 0;
-        append_snapshot_data(&mut data, &mut received, b"1234").unwrap();
-        assert_eq!(4, received);
-        assert_eq!(b"1234", data.as_slice());
+    fn snapshot_size_is_capped_before_writing() {
+        assert_eq!(4, next_snapshot_len(0, 4).unwrap());
+        assert_eq!(
+            MAX_SNAPSHOT_BYTES as u64,
+            next_snapshot_len(MAX_SNAPSHOT_BYTES as u64 - 1, 1).unwrap()
+        );
+        assert!(next_snapshot_len(MAX_SNAPSHOT_BYTES as u64, 1).is_err());
+        assert!(next_snapshot_len(u64::MAX, 1).is_err());
+    }
 
-        let mut at_limit = Vec::new();
-        let mut received = MAX_SNAPSHOT_BYTES as u64 - 1;
-        append_snapshot_data(&mut at_limit, &mut received, b"x").unwrap();
-        assert_eq!(MAX_SNAPSHOT_BYTES as u64, received);
-        assert!(append_snapshot_data(&mut at_limit, &mut received, b"x").is_err());
-        assert_eq!(1, at_limit.len());
+    #[tokio::test]
+    async fn snapshot_chunks_are_streamed_to_a_verified_staging_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "matchengine-snapshot-staging-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
 
-        let mut overflow = Vec::new();
-        let mut received = u64::MAX;
-        assert!(append_snapshot_data(&mut overflow, &mut received, b"x").is_err());
-        assert!(overflow.is_empty());
+        let mut staging = SnapshotStaging::create(&dir).await.unwrap();
+        staging.push(b"hello ").await.unwrap();
+        staging.push(b"world").await.unwrap();
+        let staged = staging.finish().await.unwrap();
+
+        assert_eq!(11, staged.len());
+        assert_eq!(b"hello world".as_slice(), staged.read_verified().unwrap());
+        assert_eq!(
+            crc32fast::hash(b"hello world"),
+            staged.crc32(),
+            "the staged body carries its checksum"
+        );
+
+        let path = staged.path().to_path_buf();
+        drop(staged);
+        assert!(!path.exists(), "the staging file is removed on drop");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_partial_receive_removes_its_staging_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "matchengine-snapshot-staging-partial-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let path = {
+            let mut staging = SnapshotStaging::create(&dir).await.unwrap();
+            staging.push(b"partial").await.unwrap();
+            let path = staging.path.clone();
+            drop(staging);
+            path
+        };
+        assert!(!path.exists(), "an incomplete receive leaves no file");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

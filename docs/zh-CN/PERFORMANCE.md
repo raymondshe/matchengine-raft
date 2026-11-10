@@ -69,7 +69,7 @@
 ## 已实现的性能设计
 
 - 每节点写入准入默认限制 1,024 个并发 `/write` 和 `/write_batch` 请求，超出返回 `429`，并在 `/admission/status` 暴露上限、在途、峰值、准入和拒绝计数；512 为更紧尾延迟选项，0 关闭拒绝。
-- 每个复制追加批次一次 `write_all`；fsync 由 `RAFT_WAL_FSYNC_MS` 控制（未设置 = 不 fsync，`0` = 每次追加，`N` = 每 N ms 周期）。
+- 每个复制追加批次按 `--max-wal-append-bytes`（默认 8 MiB）切成按字节有界的写入，但仍共用一次磁盘锁和一次 fsync；fsync 由 `RAFT_WAL_FSYNC_MS` 控制（未设置 = 不 fsync，`0` = 每次追加，`N` = 每 N ms 周期）。默认 8 MiB 不会切分 100 条的 storage 基准批次，追加速率保持在既有运行波动范围内（两次本机运行 1.26M–3.30M 条/s，既有基线 2.15M）。
 - `pread` 读取配缓存文件句柄，追加与复制读取互不阻塞。
 - 订单簿、事件窗口和去重表常驻内存，`apply` 不做磁盘 IO。
 - gRPC 使用双向 `AppendStream` 流水线复制，并为每个对端维护独立的复制、心跳、快照连接和调优的
@@ -297,7 +297,7 @@ lease 结果，因为 alpha.37 的 `ReadPolicy::LeaseRead` 仍经过 RaftCore；
 ## 当前限制与已知差距
 
 - TLS/mTLS 与 API 认证由前置网关负责；本进程是内部服务。
-- 快照安装需要一块连续缓冲区，单个快照上限为 256 MiB。
+- 快照安装不再在内存中缓冲整个接收体：chunk 写入快照目录下的 `snapshot-staging-*`，受 256 MiB 的 `MAX_SNAPSHOT_BYTES` 限制，并在安装前校验长度/CRC。postcard 解码仍需要一块连续体和内存中的状态机。
 - 一个进程/集群只交易一个标的；多标的需要横向部署多个实例。
 
 ## 数据格式`Order` 的价格/数量、`last_trade_price`、撮合事件、深度/BBO/spread、JSONL 行情和 wire v6 均使用精确的 18 位定点整数。快照 **v10** 和 wire **v6** 是相对旧版本的破坏性变更，升级时请重建数据目录。每个进程/集群只支持一个标的，`SymbolConfig` 已复制并在交易开始后锁定。18 位 BTC 分析、微基准和迁移记录见

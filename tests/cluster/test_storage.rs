@@ -4,6 +4,7 @@
 
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::SystemTime;
@@ -18,6 +19,7 @@ use matchengine_raft::store::StateMachineData;
 use matchengine_raft::store::log_store::WalRecord;
 use matchengine_raft::store::log_store::read_wal_bytes;
 use matchengine_raft::store::log_store::read_wal_file;
+use matchengine_raft::store::state_machine::SnapshotData;
 use matchengine_raft::store::state_machine::read_snapshot_bytes;
 use matchengine_raft::store::state_machine::read_snapshot_file;
 use openraft::Entry;
@@ -663,7 +665,10 @@ fn build_snapshot_is_served_and_persisted() {
             .unwrap()
             .expect("snapshot is cached in memory");
         assert_eq!(built.meta.last_log_id, current.meta.last_log_id);
-        assert_eq!(built.snapshot.into_inner(), current.snapshot.into_inner());
+        assert_eq!(
+            built.snapshot.into_bytes().unwrap(),
+            current.snapshot.into_bytes().unwrap()
+        );
     });
 
     block_on(async {
@@ -718,7 +723,10 @@ fn invalid_snapshot_is_rejected_without_clobbering_state() {
         sm.persist_snapshot().await.unwrap();
 
         let err = sm
-            .install_snapshot(&meta, std::io::Cursor::new(vec![0xff, 0xff, 0xff]))
+            .install_snapshot(
+                &meta,
+                SnapshotData::memory(Arc::<[u8]>::from(vec![0xff, 0xff, 0xff])),
+            )
             .await
             .unwrap_err();
         assert_eq!(std::io::ErrorKind::InvalidData, err.kind());
@@ -842,4 +850,110 @@ fn dump_helpers_read_wal_records_and_snapshot_content() {
     let content: StateMachineData = postcard::from_bytes(&data).unwrap();
     assert!(meta.last_log_id.is_none());
     assert!(content.orders.is_empty());
+}
+
+#[test]
+fn entries_survive_chunked_append_and_mid_batch_rotation() {
+    let dir = TempDir::new("chunked-append");
+
+    block_on(async {
+        let store =
+            Store::open_with_segment_size_fsync_async_wal_and_cap(dir.path(), 160, None, false, 1)
+                .unwrap();
+        // A one-byte cap puts one entry in each write, forcing both chunking
+        // and segment rotation inside one openraft append batch.
+        append(&store, (0..40).map(blank).collect()).await;
+
+        assert_eq!(
+            (0..40).collect::<Vec<_>>(),
+            indexes(&read(&store, 0..100).await)
+        );
+        assert_eq!(Some(log_id(1, 39)), log_state(&store).await.last_log_id);
+        assert!(
+            wal_files(dir.path()).len() > 1,
+            "the batch crossed segments"
+        );
+        drop(store);
+    });
+
+    block_on(async {
+        let store = Store::open(dir.path()).unwrap();
+        assert_eq!(
+            (0..40).collect::<Vec<_>>(),
+            indexes(&read(&store, 0..100).await)
+        );
+
+        // Recovery can continue appending after a chunked batch.
+        append(&store, vec![blank(40)]).await;
+        assert_eq!(
+            (0..41).collect::<Vec<_>>(),
+            indexes(&read(&store, 0..100).await)
+        );
+    });
+}
+
+#[test]
+fn zero_wal_append_cap_writes_the_whole_batch() {
+    let dir = TempDir::new("uncapped-append");
+
+    block_on(async {
+        let store = Store::open_with_segment_size_fsync_async_wal_and_cap(
+            dir.path(),
+            64 * 1024,
+            None,
+            false,
+            0,
+        )
+        .unwrap();
+        append(&store, (0..10).map(blank).collect()).await;
+        assert_eq!(
+            (0..10).collect::<Vec<_>>(),
+            indexes(&read(&store, 0..20).await)
+        );
+    });
+}
+
+#[test]
+fn a_mid_batch_append_failure_rolls_back_every_chunk() {
+    let dir = TempDir::new("chunked-rollback");
+
+    block_on(async {
+        let store =
+            Store::open_with_segment_size_fsync_async_wal_and_cap(dir.path(), 160, None, false, 1)
+                .unwrap();
+
+        // Fail after three chunks have been written; with a one-byte cap each
+        // chunk is one entry, and the tiny segment size forces rotation too.
+        store.inject_append_error_after_chunks(3);
+        let mut writer = store.clone();
+        let error = writer
+            .append((0..10).map(blank).collect::<Vec<_>>(), IOFlushed::noop())
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("injected"),
+            "unexpected error: {error}"
+        );
+
+        // No entry is visible and the log state did not advance.
+        assert!(read(&store, 0..100).await.is_empty());
+        assert_eq!(None, log_state(&store).await.last_log_id);
+
+        // The retry succeeds and writes the whole batch.
+        append(&store, (0..10).map(blank).collect()).await;
+        assert_eq!(
+            (0..10).collect::<Vec<_>>(),
+            indexes(&read(&store, 0..100).await)
+        );
+        assert_eq!(Some(log_id(1, 9)), log_state(&store).await.last_log_id);
+        drop(store);
+    });
+
+    block_on(async {
+        let store = Store::open(dir.path()).unwrap();
+        assert_eq!(
+            (0..10).collect::<Vec<_>>(),
+            indexes(&read(&store, 0..100).await)
+        );
+    });
 }

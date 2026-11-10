@@ -66,6 +66,18 @@ pub struct Opt {
     )]
     pub async_wal: bool,
 
+    /// Maximum encoded bytes written by one WAL append call.
+    ///
+    /// A larger OpenRaft apply batch is split into multiple writes while
+    /// sharing one disk lock and one fsync. Set 0 to write the whole batch at
+    /// once. An individual entry is never split.
+    #[clap(
+        long,
+        env = "MATCHENGINE_MAX_WAL_APPEND_BYTES",
+        default_value_t = matchengine_raft::store::config::DEFAULT_MAX_WAL_APPEND_BYTES
+    )]
+    pub max_wal_append_bytes: usize,
+
     /// Periodic snapshot interval in milliseconds (0 disables the timer).
     ///
     /// The default asks Raft for a snapshot every 30 minutes when new entries
@@ -183,6 +195,7 @@ async fn main() -> std::io::Result<()> {
         .with_max_events(options.max_events)
         .with_snapshot_interval(Duration::from_millis(options.snapshot_interval_ms))
         .with_wal_fsync(wal_fsync)
+        .with_max_wal_append_bytes(options.max_wal_append_bytes)
         .with_min_voters(min_voters)
         .with_read_policy(options.read_policy)
         .with_max_inflight_writes(options.max_inflight_writes)

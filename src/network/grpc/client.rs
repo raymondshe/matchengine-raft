@@ -58,6 +58,7 @@ use crate::network::grpc::pb::TransferLeaderCall;
 use crate::network::grpc::pb::VoteCallRequest;
 use crate::network::grpc::pb::raft_service_client::RaftServiceClient;
 use crate::network::raft_addr_from_http;
+use crate::store::state_machine::SnapshotData;
 
 pub struct GrpcNetwork<C>
 where
@@ -245,9 +246,10 @@ impl<C> RaftNetworkV2<C> for GrpcNetwork<C>
 where
     C: RaftTypeConfig<Node = BasicNode>,
 {
-    /// Snapshots are streamed as chunks and reassembled by the follower, but the
-    /// state machine still installs a contiguous buffer.
-    type SnapshotData = std::io::Cursor<Vec<u8>>;
+    /// Snapshots stream as chunks and the follower writes them to a staging
+    /// file; the shared [`SnapshotData`] type also carries locally built
+    /// snapshots as an `Arc<[u8]>`.
+    type SnapshotData = SnapshotData;
 
     #[tracing::instrument(level = "debug", skip_all, err(Debug))]
     async fn append_entries(
@@ -364,7 +366,16 @@ where
             .min(SNAPSHOT_CHUNK_SIZE_MAX);
 
         let meta = snapshot.meta;
-        let data = snapshot.snapshot.into_inner();
+        let data: Arc<[u8]> = match snapshot.snapshot {
+            SnapshotData::Memory(data) => data,
+            SnapshotData::Staged(staged) => {
+                tokio::task::spawn_blocking(move || staged.read_verified())
+                    .await
+                    .map_err(|e| StreamingError::Network(NetworkError::new(&e)))?
+                    .map_err(|e| StreamingError::Network(NetworkError::new(&e)))?
+                    .into()
+            }
+        };
         let vote = encode(&vote).map_err(|e| StreamingError::Network(NetworkError::new(&e)))?;
         let meta = encode(&meta).map_err(|e| StreamingError::Network(NetworkError::new(&e)))?;
 

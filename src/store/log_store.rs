@@ -4,9 +4,11 @@
 //!
 //! - Records are framed as `[len: u32 LE][crc32: u32 LE][postcard payload]`, so a torn or corrupt
 //!   record is detected and dropped instead of being parsed as garbage.
-//! - `append()` writes the whole openraft batch with **one** `write_all` and **one** `sync_data`.
-//!   openraft batches entries per AppendEntries RPC, which makes that group commit at the Raft
-//!   layer: N client requests replicated in one RPC cost one fsync.
+//! - `append()` splits one openraft batch into writes bounded by
+//!   `--max-wal-append-bytes` (default 8 MiB), holds one disk lock and performs **one** `sync_data`
+//!   for the batch. openraft batches entries per AppendEntries RPC, which makes that group commit at
+//!   the Raft layer: N client requests replicated in one RPC cost one fsync. A failed chunk rolls
+//!   the batch back before the index is updated.
 //! - `open_with_fsync(..., None)` (the default, and `RAFT_WAL_FSYNC_MS` unset) skips append and
 //!   rotation fsyncs. `Some(Duration::ZERO)` fsyncs every append; `Some(interval)` fsyncs the
 //!   active segment every `interval` on a Tokio task. Without fsync a crash can lose
@@ -229,10 +231,18 @@ impl<C: RaftTypeConfig> Disk<C> {
             .read(true)
             .append(true)
             .open(&path)?;
-        file.write_all(&segment_header())?;
-        if fsync.enabled() {
-            file.sync_data()?;
-            sync_dir(dir)?;
+        let initialized = (|| -> io::Result<()> {
+            file.write_all(&segment_header())?;
+            if fsync.enabled() {
+                file.sync_data()?;
+                sync_dir(dir)?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = initialized {
+            drop(file);
+            let _ = std::fs::remove_file(&path);
+            return Err(error);
         }
 
         self.writer = file;
@@ -265,11 +275,44 @@ impl<C: RaftTypeConfig> Disk<C> {
         self.readers.remove(&seq);
         Ok(())
     }
+
+    /// Restores the active segment to `(seq, len)`, deleting any segment this
+    /// append created after it.
+    ///
+    /// A failed chunked append must not leave a partial batch visible: the
+    /// index is still at the pre-append position, so recovery would otherwise
+    /// see frames it cannot place. Rotation during an append only ever moves
+    /// forward, so all later segments belong to the failed batch.
+    fn rollback_to(
+        &mut self,
+        dir: &Path,
+        seq: u32,
+        len: u64,
+        fsync: FsyncPolicy,
+    ) -> io::Result<()> {
+        let later: Vec<u32> = self
+            .segments
+            .iter()
+            .filter(|segment| segment.seq > seq)
+            .map(|segment| segment.seq)
+            .collect();
+        for later_seq in &later {
+            if let Some(segment) = self.segments.iter().find(|s| s.seq == *later_seq) {
+                let _ = std::fs::remove_file(&segment.path);
+            }
+            self.readers.remove(later_seq);
+        }
+        self.segments.retain(|segment| segment.seq <= seq);
+        self.reopen(seq, len, fsync)?;
+        sync_dir(dir)
+    }
 }
 
 struct Inner<C: RaftTypeConfig> {
     dir: PathBuf,
     segment_size: u64,
+    /// Maximum encoded bytes in one `write_all` call; 0 disables chunking.
+    max_append_bytes: usize,
     /// How appended data is fsynced.
     fsync: FsyncPolicy,
     /// Set after a write that is not yet known to be durable.
@@ -300,6 +343,9 @@ struct Inner<C: RaftTypeConfig> {
     /// One-shot fault injection for tests: 0 = off, 1 = ENOSPC, 2 = EIO.
     #[cfg(debug_assertions)]
     append_fault: AtomicU8,
+    /// One-shot test fault: fail after this many decoded chunks; 0 = off.
+    #[cfg(debug_assertions)]
+    append_fault_after_chunks: std::sync::atomic::AtomicUsize,
 }
 
 impl<C: RaftTypeConfig> Drop for Inner<C> {
@@ -338,6 +384,24 @@ impl<C: RaftTypeConfig> Inner<C> {
         }
     }
 
+    /// Consumes one count from the mid-batch failure hook.
+    #[cfg(debug_assertions)]
+    fn take_injected_chunk_error(&self) -> io::Result<()> {
+        if self.append_fault_after_chunks.load(Ordering::SeqCst) == 0 {
+            return Ok(());
+        }
+        if self
+            .append_fault_after_chunks
+            .fetch_sub(1, Ordering::SeqCst)
+            == 1
+        {
+            return Err(io::Error::other(
+                "injected WAL append failure after a chunk",
+            ));
+        }
+        Ok(())
+    }
+
     fn append_blocking(&self, entries: Vec<C::Entry>) -> io::Result<()>
     where
         C::Entry: Clone,
@@ -365,65 +429,84 @@ impl<C: RaftTypeConfig> Inner<C> {
         self.take_injected_append_error()?;
 
         let last_log_id = entries.last().map(|e| e.log_id().clone());
-        let first_index = entries.first().map(|e| e.log_id().index);
-        let (buf, locs) = encode_entries::<C>(&entries)?;
+        let mut chunks = encode_entries::<C>(&entries, self.max_append_bytes)?;
 
         let mut disk = self.disk.write().unwrap();
+        let rollback_seq = disk.writer_seq;
+        let rollback_len = disk.writer_len;
+        // Rotation during this batch only moves forward, but a successful chunk
+        // before a failure may already have advanced the initial segment's
+        // index range. Restore it with the length.
+        let rollback_indexes = disk
+            .segment(rollback_seq)
+            .map(|segment| (segment.first_index, segment.last_index));
 
-        if disk.writer_len > SEGMENT_HEADER_LEN
-            && disk.writer_len + buf.len() as u64 > self.segment_size
-        {
-            disk.rotate(&self.dir, self.fsync)?;
-        }
+        let write_result = (|| -> io::Result<()> {
+            for chunk in &mut chunks {
+                if disk.writer_len > SEGMENT_HEADER_LEN
+                    && disk.writer_len + chunk.bytes.len() as u64 > self.segment_size
+                {
+                    disk.rotate(&self.dir, self.fsync)?;
+                }
 
-        let seq = disk.writer_seq;
-        let base = disk.writer_len;
+                let seq = disk.writer_seq;
+                let base = disk.writer_len;
+                disk.writer.write_all(&chunk.bytes)?;
+                self.dirty.store(true, Ordering::Release);
+                if let Some(segment) = disk.segment(seq) {
+                    if segment.first_index.is_none() {
+                        segment.first_index = chunk.first_index;
+                    }
+                    segment.last_index = chunk.last_index;
+                }
+                for entry in &mut chunk.entries {
+                    entry.seq = seq;
+                    entry.base = base;
+                }
+                disk.writer_len = base + chunk.bytes.len() as u64;
 
-        if let Err(e) = disk.writer.write_all(&buf) {
-            // Undo a partial write: a hole in the log is much worse than losing the batch.
-            let _ = disk.writer.set_len(base);
-            if self.fsync.enabled() {
-                let _ = disk.writer.sync_data();
+                #[cfg(debug_assertions)]
+                self.take_injected_chunk_error()?;
             }
-            disk.writer_len = base;
-            return Err(e);
-        }
-        self.dirty.store(true, Ordering::Release);
-        if self.fsync == FsyncPolicy::EveryAppend
-            && !defer_fsync
-            && let Err(e) = disk.writer.sync_data()
-        {
-            // The bytes may or may not be durable; drop them so the retry starts at `base`.
-            let _ = disk.writer.set_len(base);
-            let _ = disk.writer.sync_data();
-            disk.writer_len = base;
-            return Err(e);
+
+            if self.fsync == FsyncPolicy::EveryAppend
+                && !defer_fsync
+                && let Err(e) = disk.writer.sync_data()
+            {
+                return Err(e);
+            }
+            Ok(())
+        })();
+
+        if let Err(error) = write_result {
+            let _ = disk.rollback_to(&self.dir, rollback_seq, rollback_len, self.fsync);
+            if let Some((first_index, last_index)) = rollback_indexes
+                && let Some(segment) = disk.segment(rollback_seq)
+            {
+                segment.first_index = first_index;
+                segment.last_index = last_index;
+            }
+            return Err(error);
         }
         if self.fsync == FsyncPolicy::EveryAppend && !defer_fsync {
             self.dirty.store(false, Ordering::Release);
-        }
-        disk.writer_len = base + buf.len() as u64;
-
-        if let Some(segment) = disk.segment(seq) {
-            if segment.first_index.is_none() {
-                segment.first_index = first_index;
-            }
-            segment.last_index = last_log_id.as_ref().map(|l| l.index);
         }
         drop(disk);
 
         {
             let mut index = self.index.write().unwrap();
-            for (index_value, offset, len) in locs {
-                // `offset` is relative to the batch buffer; shift it onto the segment.
-                index.insert(
-                    index_value,
-                    RecordLoc {
-                        seq,
-                        offset: base + offset,
-                        len,
-                    },
-                );
+            for chunk in &chunks {
+                // `base` is the chunk's segment offset at write time.
+                for entry in &chunk.entries {
+                    index.insert(
+                        entry.index,
+                        RecordLoc {
+                            seq: entry.seq,
+                            offset: entry.base + entry.offset,
+                            len: entry.len,
+                        },
+                    );
+                }
             }
         }
 
@@ -793,6 +876,27 @@ impl<C: RaftTypeConfig> LogStore<C> {
         fsync: Option<Duration>,
         async_wal: bool,
     ) -> io::Result<Self> {
+        Self::open_with_segment_size_fsync_async_wal_and_cap(
+            dir,
+            segment_size,
+            fsync,
+            async_wal,
+            crate::store::config::DEFAULT_MAX_WAL_APPEND_BYTES,
+        )
+    }
+
+    /// Same as [`Self::open_with_segment_size_fsync_and_async_wal`] with an
+    /// explicit maximum encoded bytes per append write.
+    ///
+    /// A batch larger than `max_append_bytes` is split into multiple writes
+    /// under one disk lock and one fsync. `0` disables chunking.
+    pub fn open_with_segment_size_fsync_async_wal_and_cap(
+        dir: impl Into<PathBuf>,
+        segment_size: u64,
+        fsync: Option<Duration>,
+        async_wal: bool,
+        max_append_bytes: usize,
+    ) -> io::Result<Self> {
         let dir = dir.into();
         std::fs::create_dir_all(&dir)?;
 
@@ -859,6 +963,7 @@ impl<C: RaftTypeConfig> LogStore<C> {
         let inner = Arc::new(Inner {
             dir,
             segment_size,
+            max_append_bytes,
             fsync,
             // Recovered data may still be unsynced; the periodic task should
             // flush it on its first tick.
@@ -890,6 +995,8 @@ impl<C: RaftTypeConfig> LogStore<C> {
             write_order: tokio::sync::Mutex::new(()),
             #[cfg(debug_assertions)]
             append_fault: AtomicU8::new(0),
+            #[cfg(debug_assertions)]
+            append_fault_after_chunks: std::sync::atomic::AtomicUsize::new(0),
         });
 
         Ok(Self { inner })
@@ -1021,6 +1128,18 @@ impl<C: RaftTypeConfig> LogStore<C> {
         self.inner
             .append_fault
             .store(if storage_full { 1 } else { 2 }, Ordering::SeqCst);
+    }
+
+    /// Test-only mid-batch failure: fail after `chunks` successful chunk writes.
+    ///
+    /// Debug builds only. This exercises the rollback path when a chunked
+    /// append fails after rotation or after some chunks are already on disk.
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn inject_append_error_after_chunks(&self, chunks: usize) {
+        self.inner
+            .append_fault_after_chunks
+            .store(chunks, Ordering::SeqCst);
     }
 
     #[cfg(feature = "async-wal")]
@@ -1367,27 +1486,85 @@ pub fn read_wal_file<C: RaftTypeConfig>(path: &Path) -> io::Result<Vec<(u64, Wal
     decode_wal_bytes::<C>(&bytes, &path.display().to_string())
 }
 
-/// `(log index, offset within the batch buffer, payload length)`.
-type EncodedLocs = Vec<(u64, u64, u32)>;
+/// One encoded WAL write, with the per-entry locations it will occupy once
+/// written to a segment.
+struct EncodedChunk {
+    bytes: Vec<u8>,
+    first_index: Option<u64>,
+    last_index: Option<u64>,
+    entries: Vec<EncodedEntry>,
+}
 
-/// Encodes a batch into one buffer, returning each entry's offset and payload length.
-fn encode_entries<C: RaftTypeConfig>(entries: &[C::Entry]) -> io::Result<(Vec<u8>, EncodedLocs)>
+/// Location of one entry inside an [`EncodedChunk`].
+struct EncodedEntry {
+    index: u64,
+    /// Filled in when the chunk is written to a segment.
+    seq: u32,
+    /// Filled in when the chunk is written to a segment.
+    base: u64,
+    /// Payload offset relative to `base`.
+    offset: u64,
+    /// Payload length, excluding the frame header.
+    len: u32,
+}
+
+/// Encodes one append batch into byte-bounded chunks.
+///
+/// A chunk contains whole frames only. When `max_bytes` is zero, or one entry
+/// alone is larger than the bound, the chunk may exceed `max_bytes`.
+fn encode_entries<C: RaftTypeConfig>(
+    entries: &[C::Entry],
+    max_bytes: usize,
+) -> io::Result<Vec<EncodedChunk>>
 where
     C::Entry: Clone,
 {
-    let mut buf = Vec::with_capacity(entries.len() * 128);
-    let mut locs = Vec::with_capacity(entries.len());
+    let mut chunks = Vec::new();
+    let mut bytes = Vec::with_capacity(max_bytes.clamp(128, 64 * 1024));
+    let mut locs = Vec::new();
+    let mut first_index = None;
+    let mut last_index = None;
 
     for entry in entries {
         let payload = postcard::to_allocvec(&WalRecordRef::<C>::Entry(entry))
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        let offset = buf.len() as u64;
-        buf.extend_from_slice(&Disk::<C>::frame(&payload));
-        buf.extend_from_slice(&payload);
-        locs.push((entry.log_id().index, offset, payload.len() as u32));
+        let frame_len = RECORD_HEADER_LEN as usize + payload.len();
+
+        if max_bytes > 0 && !bytes.is_empty() && bytes.len() + frame_len > max_bytes {
+            chunks.push(EncodedChunk {
+                bytes: std::mem::take(&mut bytes),
+                first_index,
+                last_index,
+                entries: std::mem::take(&mut locs),
+            });
+            first_index = None;
+        }
+
+        let index = entry.log_id().index;
+        let offset = bytes.len() as u64;
+        bytes.extend_from_slice(&Disk::<C>::frame(&payload));
+        bytes.extend_from_slice(&payload);
+        locs.push(EncodedEntry {
+            index,
+            seq: 0,
+            base: 0,
+            offset,
+            len: payload.len() as u32,
+        });
+        first_index.get_or_insert(index);
+        last_index = Some(index);
     }
 
-    Ok((buf, locs))
+    if !bytes.is_empty() {
+        chunks.push(EncodedChunk {
+            bytes,
+            first_index,
+            last_index,
+            entries: locs,
+        });
+    }
+
+    Ok(chunks)
 }
 
 /// Rebuilds the index and hard state from every segment, truncating a torn tail in the last one.

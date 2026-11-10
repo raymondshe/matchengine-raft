@@ -1071,6 +1071,25 @@ The 2026-10-30 audit removed several avoidable copies and stalls from the storag
 The storage integration suite (`test_storage`) still covers framing, torn tails, rotation, purge,
 truncate, snapshot install/reopen and 20k-record recovery.
 
+### 2026-11-10 storage/transport hygiene
+
+- **WAL byte cap.** `--max-wal-append-bytes` (default 8 MiB, `0` disables) splits one openraft
+  apply batch into whole-record chunks under one disk lock and one fsync. A failed chunk rolls the
+  active segment back and removes segments created by the batch; the index is updated only after
+  every chunk is written.
+- **Shared snapshot body.** `StoredSnapshot::data` and `SnapshotData::Memory` hold `Arc<[u8]>`;
+  `build_snapshot` and `get_current_snapshot` share the encoded body instead of copying it.
+- **Streamed snapshot receive.** `InstallSnapshot` writes chunks to a `snapshot-staging-*` file
+  with a running CRC and the 256 MiB cap. The state machine verifies length/CRC/postcard before the
+  atomic durable write; staging files are removed on success, failure and startup.
+- **OpenRaft pin.** Checked 2026-11-10: the newest published 0.10 release is still
+  `0.10.0-alpha.38`, so the dependency stays at `0.10.0-alpha.37` until a stable 0.10 exists.
+
+The default 8 MiB cap does not split the 100-entry `storage` benchmark batches; its append rate
+stayed within the existing run-to-run spread (1.26M-3.30M entries/s over two local runs versus the
+2.15M baseline). The cap is a latency/memory bound for unusually large merged appends, not a
+change to the common path.
+
 ## Thread and task audit: optimization opportunities
 
 This audit looks at where work runs, not just how much work there is. The goal is
@@ -1445,8 +1464,9 @@ The measurement rules transferred regardless of layout and are now implemented:
 - Per-node write admission caps concurrent `/write` and `/write_batch` requests at 1,024 by
   default, returns `429` on overflow and exposes limit/in-flight/peak/admitted/rejected counters
   at `/admission/status`. Lower it to 512 for a tighter tail; 0 disables rejection.
-- In every-append mode, one `write_all` + one `sync_data` per replicated append batch, so N
-  entries in one AppendEntries RPC cost one fsync; the default no-fsync mode skips the `sync_data`.
+- In every-append mode, one `sync_data` per replicated append batch (split into
+  `--max-wal-append-bytes`-bounded writes under the same disk lock), so N entries in one
+  AppendEntries RPC cost one fsync; the default no-fsync mode skips the `sync_data`.
 - `pread` reads against cached file handles, so replication can read while an append is in flight.
 - The order book, event window and dedupe map stay in memory; `apply` does no disk IO.
 - gRPC uses bidirectional `AppendStream` for pipelined replication, separate replication,
@@ -1455,13 +1475,16 @@ The measurement rules transferred regardless of layout and are now implemented:
   `snapshot/current.snap` are replaced atomically.
 - The event window is bounded by `--max-events` and paged through `/events`; `/read
   orderbook_orders` does not clone it.
-- WAL appends avoid per-entry clones, recovery scans segments sequentially, contiguous log reads share one `pread`, snapshot encoding/writing runs outside the state-machine lock, and snapshot bodies stream to disk through an incremental CRC writer.
+- WAL appends avoid per-entry clones, split writes at `--max-wal-append-bytes` under one disk lock and one fsync, recovery scans segments sequentially, contiguous log reads share one `pread`, snapshot encoding/writing runs outside the state-machine lock, and snapshot bodies stream to disk through an incremental CRC writer.
 - A gRPC server failure is fatal to `run()`: HTTP is stopped, background tasks are joined and Raft is shut down before the error is returned. HTTP requests are logged once per request.
 
 ### Current limits and known gaps
 
 - TLS/mTLS and API authentication are intentionally gateway responsibilities; this process is an internal service.
-- Snapshot installation needs one contiguous buffer, bounded by 256 MiB per snapshot.
+- Snapshot installation no longer buffers the received body in memory: chunks are staged to a
+  `snapshot-staging-*` file under the snapshot directory, checked against the 256 MiB
+  `MAX_SNAPSHOT_BYTES` limit, and verified by length/CRC before install. Decoding the postcard
+  state still needs one contiguous body plus the in-memory state machine.
 - One process/cluster trades one symbol; run one deployment per symbol to scale.
 
 ### Data format `Order` prices/quantities, `last_trade_price`, match events, depth/BBO/spread, the

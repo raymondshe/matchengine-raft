@@ -8,6 +8,11 @@ Version reviewed: `openraft 0.10.0-alpha.37`.
 This document records the review and its priorities. The P1 quick wins were implemented on
 2026-11-06; the remaining follow-ups are tracked in [`TODO.md`](../TODO.md) §16.
 
+**Status 2026-11-10:** S4 (WAL byte cap) and the snapshot-transfer recommendations are
+implemented: `--max-wal-append-bytes` splits append writes under one lock/fsync, cached snapshot
+data is `Arc<[u8]>`, and received snapshots stage to a validated file. The `openraft` pin stays at
+`0.10.0-alpha.37`; the newest published 0.10 release is still `0.10.0-alpha.38`.
+
 ## Executive summary
 
 The transport is already on OpenRaft's modern replication path:

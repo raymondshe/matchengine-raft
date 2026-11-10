@@ -78,10 +78,10 @@ Everything below is implemented in this repository and exercised by tests; the l
 
 **Durability and recovery**
 - **Raft-replicated state machine** with durable membership and application state; WAL fsync is configurable.
-- **Segmented, checksummed WAL** with `RAFT_WAL_FSYNC_MS`: unset = no fsync (default; requires at least 4 voters), `0` = every append, `N > 0` = periodic every N ms; torn-tail recovery.
+- **Segmented, checksummed WAL** with `RAFT_WAL_FSYNC_MS`: unset = no fsync (default; requires at least 4 voters), `0` = every append, `N > 0` = periodic every N ms; torn-tail recovery. `--max-wal-append-bytes` (default 8 MiB) splits one apply batch into byte-bounded writes under one disk lock and one fsync.
 - **Prototype async WAL** (feature-gated, off by default): `append` defers fsync to a Tokio worker and fires `IOFlushed` only when durable; includes pending-entry reads and crash-recovery tests. Build with `--features async-wal`; run with `--async-wal` and `RAFT_WAL_FSYNC_MS=0`.
 - **Four-voter no-fsync floor**: `/init` and `/change-membership` reject fewer than four voters, and writes return `503` until four voters exist, so a committed entry stays on at least three nodes.
-- **Atomic snapshots** written by temp file → fsync → rename → directory fsync, with checksum validation before install.
+- **Atomic snapshots** written by temp file → fsync → rename → directory fsync, with checksum validation before install. Cached snapshot bytes are shared as `Arc<[u8]>`, and a received snapshot streams into a validated staging file instead of an unbounded memory buffer.
 - **Snapshot policy for real workloads**: every 100,000 applied entries or 30 minutes when newer entries exist, configurable with `--snapshot-interval-ms`.
 - **Snapshot + WAL-tail recovery** that restores the latest snapshot, event window and idempotency map, then replays only newer log entries.
 - **gRPC replication** with bidirectional `stream_append`, chunked snapshot transfer, Pre-Vote elections, leadership transfer and independent per-peer channels.
@@ -282,7 +282,7 @@ the edge, before Raft proposes anything:
 | `/events` long-poll wait | 0–1000 ms (`wait_ms`) |
 | `/write_batch` | 1–128 non-nested requests, unique `client_order_id`s |
 | gRPC Raft message | 64 MiB (`MAX_MESSAGE_SIZE`) |
-| gRPC snapshot stream | 256 MiB total (`MAX_SNAPSHOT_BYTES`), checked before each chunk is appended |
+| gRPC snapshot stream | 256 MiB total (`MAX_SNAPSHOT_BYTES`), checked before each chunk is staged |
 
 Malformed JSON and invalid fields return `400`; oversized bodies return `413`. The replicated
 `client_order_id` dedupe map retains at most 262,144 records, so the key bound also bounds its

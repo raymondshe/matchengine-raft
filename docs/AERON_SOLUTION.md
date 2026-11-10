@@ -276,8 +276,10 @@ same lookup.
 
 ### 5.6 Snapshot transfer
 
-`full_snapshot` receives the entire `Cursor<Vec<u8>>` and a cancel future. Chunking is internal to
-the network implementation:
+`full_snapshot` receives the entire snapshot body and a cancel future. The current gRPC
+implementation holds locally built snapshots as `Arc<[u8]>` and stages received chunks to a file;
+the Aeron sketch below assumes an in-memory body. Chunking is internal to the network
+implementation:
 
 1. Split `data` into `chunk = publication.max_payload_length() - HEADER` slices (typically ~1 MiB
    with a 16 MiB term).
@@ -323,7 +325,7 @@ A single-stream-per-peer design divides this by six but reintroduces head-of-lin
 ```rust
 // PSEUDOCODE — the real impl must respect the trait's exact signatures (openraft 0.10).
 impl<C: RaftTypeConfig<Node = BasicNode>> RaftNetworkV2<C> for Network<C> {
-    type SnapshotData = Cursor<Vec<u8>>;
+    type SnapshotData = Arc<[u8]>; // the current gRPC type also supports a staged file
 
     async fn append_entries(&mut self, rpc: AppendEntriesRequest<C>, opt: RPCOption)
         -> Result<AppendEntriesResponse<C>, RPCError<C>>

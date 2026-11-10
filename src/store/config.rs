@@ -40,6 +40,9 @@ pub const SNAPSHOT_INTERVAL_MS_ENV: &str = "SNAPSHOT_INTERVAL_MS";
 /// Unset means no fsync; `0` fsyncs every append; `N > 0` fsyncs every N ms.
 pub const WAL_FSYNC_MS_ENV: &str = "RAFT_WAL_FSYNC_MS";
 
+/// Environment variable for the maximum bytes written by one WAL append call.
+pub const MAX_WAL_APPEND_BYTES_ENV: &str = "MATCHENGINE_MAX_WAL_APPEND_BYTES";
+
 /// Default root directory for node data.
 pub const DEFAULT_DATA_DIR: &str = "/tmp/matchengine-raft";
 /// Default prefix used when naming a node directory.
@@ -49,6 +52,14 @@ pub const DEFAULT_INSTANCE_PREFIX: &str = "matchengine";
 /// Four voters put a committed entry on at least three nodes, so one node
 /// losing its unsynced tail still leaves at least two copies.
 pub const NO_FSYNC_MIN_VOTERS: usize = 4;
+
+/// Default maximum encoded bytes in one WAL append write.
+///
+/// OpenRaft may hand the log store a batch of up to 300 entries. A single
+/// `write` of every encoded entry is bounded here so a large batch cannot
+/// create an unbounded write stall. Entries are never split: one entry larger
+/// than this bound is written alone and may exceed it.
+pub const DEFAULT_MAX_WAL_APPEND_BYTES: usize = 8 * 1024 * 1024;
 
 /// Where a node keeps its durable state.
 #[derive(Clone, Debug)]
@@ -86,6 +97,14 @@ pub struct StorageConfig {
     /// `None` disables fsync, `Some(Duration::ZERO)` fsyncs every append, and
     /// `Some(interval)` fsyncs the active segment every `interval`.
     pub wal_fsync: Option<Duration>,
+
+    /// Maximum encoded bytes written by one WAL append call.
+    ///
+    /// One OpenRaft apply batch is split into chunks of at most this many
+    /// bytes while still sharing one disk lock and one fsync. An individual
+    /// entry is never split, so an entry larger than this value is written
+    /// alone. `0` disables chunking and writes the whole batch in one call.
+    pub max_wal_append_bytes: usize,
 
     /// Minimum voter count required for initialization, membership changes and
     /// writes. The binary sets 4 when WAL fsync is disabled; library callers
@@ -126,6 +145,22 @@ pub fn wal_fsync_from_env() -> Option<Duration> {
     }
 }
 
+/// Reads the WAL append byte cap from `MATCHENGINE_MAX_WAL_APPEND_BYTES`.
+///
+/// Unset means [`DEFAULT_MAX_WAL_APPEND_BYTES`]; `0` disables chunking.
+pub fn max_wal_append_bytes_from_env() -> usize {
+    match std::env::var(MAX_WAL_APPEND_BYTES_ENV) {
+        Ok(value) => value.parse().unwrap_or_else(|_| {
+            tracing::warn!(
+                value,
+                "MATCHENGINE_MAX_WAL_APPEND_BYTES must be a non-negative integer; using the default"
+            );
+            DEFAULT_MAX_WAL_APPEND_BYTES
+        }),
+        Err(_) => DEFAULT_MAX_WAL_APPEND_BYTES,
+    }
+}
+
 impl Default for StorageConfig {
     fn default() -> Self {
         let data_dir = std::env::var_os(DATA_DIR_ENV)
@@ -161,6 +196,7 @@ impl Default for StorageConfig {
             max_events,
             snapshot_interval,
             wal_fsync,
+            max_wal_append_bytes: max_wal_append_bytes_from_env(),
             min_voters,
             read_policy: ReadPolicyMode::default(),
             max_inflight_writes: DEFAULT_MAX_INFLIGHT_WRITES,
@@ -180,6 +216,7 @@ impl StorageConfig {
             max_events: DEFAULT_MAX_EVENTS,
             snapshot_interval: DEFAULT_SNAPSHOT_INTERVAL,
             wal_fsync: None,
+            max_wal_append_bytes: DEFAULT_MAX_WAL_APPEND_BYTES,
             min_voters: 1,
             read_policy: ReadPolicyMode::default(),
             max_inflight_writes: DEFAULT_MAX_INFLIGHT_WRITES,
@@ -223,6 +260,15 @@ impl StorageConfig {
     /// `Some(interval)` fsyncs the active segment every `interval`.
     pub fn with_wal_fsync(mut self, fsync: Option<Duration>) -> Self {
         self.wal_fsync = fsync;
+        self
+    }
+
+    /// Sets the maximum encoded bytes written by one WAL append call.
+    ///
+    /// `0` disables chunking and writes the whole batch in one call. Entries
+    /// are never split, so one oversized entry may exceed the bound.
+    pub fn with_max_wal_append_bytes(mut self, max_wal_append_bytes: usize) -> Self {
+        self.max_wal_append_bytes = max_wal_append_bytes;
         self
     }
 
@@ -343,6 +389,26 @@ mod tests {
     fn async_wal_defaults_to_disabled_and_is_configurable() {
         assert!(!StorageConfig::new("/data").async_wal);
         assert!(StorageConfig::new("/data").with_async_wal(true).async_wal);
+    }
+
+    #[test]
+    fn wal_append_cap_defaults_to_eight_mib_and_is_configurable() {
+        assert_eq!(
+            DEFAULT_MAX_WAL_APPEND_BYTES,
+            StorageConfig::new("/data").max_wal_append_bytes
+        );
+        assert_eq!(
+            4_096,
+            StorageConfig::new("/data")
+                .with_max_wal_append_bytes(4_096)
+                .max_wal_append_bytes
+        );
+        assert_eq!(
+            0,
+            StorageConfig::new("/data")
+                .with_max_wal_append_bytes(0)
+                .max_wal_append_bytes
+        );
     }
 
     #[test]

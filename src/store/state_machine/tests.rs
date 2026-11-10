@@ -2250,3 +2250,98 @@ async fn old_snapshot_version_is_rejected() {
         "unexpected error: {err}"
     );
 }
+
+#[tokio::test]
+async fn staged_snapshot_installs_and_removes_its_staging_file() {
+    use crate::store::state_machine::STAGING_FILE_PREFIX;
+
+    let source_dir = tempdir();
+    let target_dir = tempdir();
+
+    let snapshot = {
+        let mut store =
+            StateMachineStore::<MatchEngineTypeConfig>::open(source_dir.path()).unwrap();
+        {
+            let mut inner = store.inner().lock().await;
+            inner.orderbook.place_order(&mut Order::new(
+                crate::order_book::OrderSide::Buy,
+                10.0,
+                2.0,
+                0,
+            ));
+            inner.last_applied_log = Some(log_id(1, 3));
+        }
+        store.build_snapshot().await.unwrap()
+    };
+    let bytes = snapshot.snapshot.clone().into_bytes().unwrap();
+    let mut target = StateMachineStore::<MatchEngineTypeConfig>::open(target_dir.path()).unwrap();
+    let staging_path = target_dir
+        .path()
+        .join(format!("{STAGING_FILE_PREFIX}test.tmp"));
+    std::fs::write(&staging_path, &bytes).unwrap();
+    let staged = StagedSnapshot::new(&staging_path, bytes.len() as u64, crc32fast::hash(&bytes));
+
+    target
+        .install_snapshot(&snapshot.meta, SnapshotData::Staged(Arc::new(staged)))
+        .await
+        .unwrap();
+
+    let content = target.to_content().await;
+    assert_eq!(1, content.orders.len());
+    let (applied, _) = target.clone().applied_state().await.unwrap();
+    assert_eq!(Some(log_id(1, 3)), applied);
+    assert!(
+        !staging_path.exists(),
+        "a completed install removes its staging file"
+    );
+}
+
+#[tokio::test]
+async fn staged_snapshot_with_a_bad_checksum_is_rejected() {
+    use crate::store::state_machine::STAGING_FILE_PREFIX;
+
+    let dir = tempdir();
+    let mut store = StateMachineStore::<MatchEngineTypeConfig>::open(dir.path()).unwrap();
+    {
+        let mut inner = store.inner().lock().await;
+        inner.orderbook.place_order(&mut Order::new(
+            crate::order_book::OrderSide::Buy,
+            10.0,
+            2.0,
+            0,
+        ));
+        inner.last_applied_log = Some(log_id(1, 3));
+    }
+    store.persist_snapshot().await.unwrap();
+
+    let staging_path = dir.path().join(format!("{STAGING_FILE_PREFIX}bad.tmp"));
+    std::fs::write(&staging_path, b"corrupt staged body").unwrap();
+    let staged = StagedSnapshot::new(&staging_path, 19, 0);
+    let meta = SnapshotMetaOf::<MatchEngineTypeConfig> {
+        last_log_id: Some(log_id(2, 99)),
+        last_membership: Default::default(),
+    };
+
+    let err = store
+        .install_snapshot(&meta, SnapshotData::Staged(Arc::new(staged)))
+        .await
+        .unwrap_err();
+    assert_eq!(io::ErrorKind::InvalidData, err.kind());
+    assert_eq!(1, store.to_content().await.orders.len());
+    assert!(
+        !staging_path.exists(),
+        "a rejected install still removes its staging file"
+    );
+}
+
+#[tokio::test]
+async fn stale_staging_files_are_removed_on_open() {
+    use crate::store::state_machine::STAGING_FILE_PREFIX;
+
+    let dir = tempdir();
+    let stale = dir.path().join(format!("{STAGING_FILE_PREFIX}stale.tmp"));
+    std::fs::write(&stale, b"left by a killed process").unwrap();
+
+    let _store = StateMachineStore::<MatchEngineTypeConfig>::open(dir.path()).unwrap();
+    assert!(!stale.exists(), "startup clears transport staging files");
+}

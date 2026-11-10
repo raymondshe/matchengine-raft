@@ -12,9 +12,9 @@ pub const RAFT_PORT_OFFSET: u16 = 1000;
 
 /// Maximum snapshot size accepted by the gRPC transport.
 ///
-/// The state machine still installs one contiguous buffer, so the receiver
-/// enforces a hard total before allocating. This is large enough for the
-/// retained event window and order book while bounding a hostile peer.
+/// The receiver streams chunks into a staging file and checks the running
+/// total before each write, so a peer cannot grow memory without bound. The
+/// staged file is validated before the state machine installs it.
 pub const MAX_SNAPSHOT_BYTES: usize = 256 * 1024 * 1024;
 
 /// Derives the Raft transport address from the public API address.

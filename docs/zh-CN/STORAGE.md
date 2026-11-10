@@ -5,7 +5,7 @@
 Raft 日志追加写入 `log/NNNNNNNNNN.wal` 分段文件：
 
 - 每条记录格式为 `[len: u32 LE][crc32: u32 LE][postcard 负载]`；启动时逐段扫描，遇到撕裂或校验失败的尾部直接截断，而不是当作有效记录解析。
-- `append()` 用一次 `write_all` 写入整个 openraft 批次；fsync 由 `RAFT_WAL_FSYNC_MS` 控制：未设置 = 不 fsync（默认），`0` = 每次追加 fsync，`N > 0` = 每 N ms 周期 fsync。
+- `append()` 把 openraft 批次编码为按字节有界的多个 chunk（`StorageConfig::max_wal_append_bytes`，默认 8 MiB）并在一次磁盘锁内写入、共用一次 fsync；条目本身不会被拆分，单个超大条目会单独写入。某个 chunk 写入或 fsync 失败时，活跃分段回滚到批次开始位置，并删除该失败批次新建的分段，恢复不会看到半个批次。`0` 表示禁用切分。fsync 由 `RAFT_WAL_FSYNC_MS` 控制：未设置 = 不 fsync（默认），`0` = 每次追加 fsync，`N > 0` = 每 N ms 周期 fsync。
 - 读取使用 `pread`（`read_at`）和缓存的文件句柄，复制任务可以在追加进行时并发读取，磁盘 IO 期间不持有全局锁。
 - 所有阻塞 IO 都放在 `spawn_blocking` 中执行，异步运行时只负责编解码。
 - 分段默认 64 MiB；只有被 purge 完全覆盖的分段才会删除，删除前先轮转活跃分段，保证日志不出现空洞。
@@ -14,6 +14,16 @@ Raft 日志追加写入 `log/NNNNNNNNNN.wal` 分段文件：
   `truncate_after`、`purge`、`get_log_reader`）。
 
 投票和最后一次 purge 的日志 id 属于安全关键且低频的状态，单独存放在 `log/state` 文件中，采用原子重写（临时文件 → fsync → rename → 目录 fsync）。committed 日志 id 追加到 WAL 尾部但不单独 fsync：每次追加模式下随下一次 append 持久化，周期模式在下一次 tick 持久化，不 fsync 模式则不保证持久化；这样避免每批次多一次 fsync。
+
+### WAL 追加字节上限
+
+OpenRaft 只按条目数限制批次（`max_payload_entries = 300`），不按字节。日志存储还会限制每次编码写入：
+
+- `--max-wal-append-bytes`（环境变量 `MATCHENGINE_MAX_WAL_APPEND_BYTES`）默认
+  `DEFAULT_MAX_WAL_APPEND_BYTES`（8 MiB）；`0` 表示整批一次写入。
+- 更大的 apply 批次按完整记录切分；切分期间持有磁盘锁，整批只做一次 fsync。chunk 之间可以轮转分段，启用 fsync 时轮转前会同步旧分段。
+- 写入或 fsync 失败会把批次开始前的活跃分段截断回原长度，并删除该批次新建的分段；索引只在全部 chunk 写完后更新，失败批次不会留下可见条目。
+- 单个条目不会被拆分；超过上限的条目会单独写入并可能超过该上限。
 
 ### WAL 持久性与从 peer 恢复
 
@@ -67,7 +77,9 @@ p99 2.2-3.0ms），不作为生产选择。详见 [`PERFORMANCE.md`](./PERFORMAN
 
 ## 快照（`src/store/state_machine.rs`）
 
-状态机（订单簿 + 序列号 + 保留的撮合事件窗口 + 提交去重表）常驻内存以保证 apply 速度。快照 v10 写入 `snapshot/current.snap`，通过临时文件 → fsync → rename → 目录 fsync 原子替换；`install_snapshot` 会先校验收到的数据再替换磁盘副本，坏快照不会破坏已有的好快照。
+状态机（订单簿 + 序列号 + 保留的撮合事件窗口 + 提交去重表）常驻内存以保证 apply 速度。快照 v11 写入 `snapshot/current.snap`，通过临时文件 → fsync → rename → 目录 fsync 原子替换；`install_snapshot` 会先校验收到的数据再替换磁盘副本，坏快照不会破坏已有的好快照。
+
+本地构建或缓存的快照体保存在 `Arc<[u8]>` 中（`StoredSnapshot::data`、`SnapshotData::Memory`），`build_snapshot` 和 `get_current_snapshot` 共享同一份编码数据而不再复制。gRPC 接收端不会在内存里累积整个快照：chunk 直接写入快照目录下的 `snapshot-staging-*` 文件，同时累计长度（受 `MAX_SNAPSHOT_BYTES` 限制）和 CRC32。`install_snapshot` 读取暂存文件，校验长度、CRC 和 postcard 内容后才写入持久快照；成功、拒绝或值被丢弃时都会删除暂存文件，启动时也会清理残留的 `snapshot-staging-*`。安装完成后的快照体同样以 `Arc<[u8]>` 保存。
 
 快照负载是 postcard 编码的 `StateMachineData`：
 
