@@ -27,9 +27,51 @@ measurement and production readiness; **P2** = important but not blocking; **P3*
 
 ## Top priorities
 
-No P0 or P1 work remains. The benchmark correctness/occupancy envelope and the schema-v11
-order-type batch landed on 2026-11-10; the remaining P2 production, feature and validation work is
-next, then P3 experiments.
+Last prioritised 2026-11-10. There are no known P0 defects. One P1 production-readiness gate
+remains: the new `local_lease` default was adopted from single-host measurements and needs
+multi-host/clock-skew validation before it is treated as a production default.
+
+**P1 - production readiness**
+
+1. **Validate the default `local_lease` path (§16).** Rerun the read and write A/B on a second
+   host and a Linux multi-host four-voter cluster, and exercise a stale lease / forced cache miss
+   so the `ReadIndex` fallback and `/read-policy/status` counters are observed under clock skew.
+   The local-cache win is 11-36% on this host; the remaining risk is multi-host correctness and
+   tail behavior.
+
+**P2 - evidence and operational follow-ups**
+
+2. **Run the Linux pinned-core `e2e` pass (§8).** Dispatch the manual `Linux benchmark` workflow
+   for the pinned short/sustained rows.
+3. **Run the Linux Aeron external-driver and multicast validation (§6).** Use the checklist in
+   [`demos/market_data_system/README.md`](./demos/market_data_system/README.md).
+4. **Measure follower-read linearizer caching (§16).** A short TTL bounded by the leader lease, or
+   a lease-based `/get_linearizer`, is the remaining read-path optimization after local lease.
+5. **Keep docs synchronized (§10).** This is an ongoing gate: `AGENTS.md`, READMEs,
+   `docs/PERFORMANCE.md`, `docs/API.md` and this file must move with storage/wire/read-policy
+   changes.
+
+**P3 - later, in impact order**
+
+6. Expose `purge_batch_size` and `max_in_snapshot_log_to_keep` with the snapshot policy (§16).
+7. Evaluate bounded admission waiting/backpressure against the current fail-fast `429` (§8).
+8. Benchmark `STREAM_APPEND_CHANNEL_SIZE` as a standalone transport constant (§16).
+9. Replace market-data leader-watcher metrics polling with OpenRaft `on_leader_change` callbacks
+   (§16).
+10. Optional transport work: peer preconnect, larger HTTP/2 frames and snapshot compression (§16).
+11. Productionize async WAL only after a Linux multi-node A/B and pipelining work (§16).
+12. Evaluate a binary order-entry path (§14).
+13. Evaluate real ITCH-style replay data and custom MPMC/SIMD/io_uring work (§14).
+14. Evaluate the Aeron Raft transport only if a measured transport bottleneck appears (§4).
+15. Engine-level derivative support (instrument kind, leverage/margin fields) (§13).
+16. Custom reserve replenishment and stop-protection collars when the product requires them (§5).
+17. Consider protobuf/Avro on the public HTTP API; Raft RPCs stay postcard (§5).
+18. Decide whether to rename the remaining mixed-style modules before 1.0 (§10).
+19. Add AON, self-trade-prevention/order-mask and multi-symbol isolation conformance cases only
+    when those product behaviours land (§17).
+
+The detailed checkboxes and evidence for each item remain in the sections below. The earlier
+"recently completed" summary is kept for context.
 
 **Recently completed (2026-11-06/10):** configurable WAL fsync with a measured A/B matrix,
 best-effort WAL recovery, the four-voter no-fsync floor (`test_min_voters.rs`), the optional
@@ -90,26 +132,19 @@ An OpenRaft utilization review (2026-11-06, [`RAFT_REVIEW.md`](./docs/RAFT_REVIE
 transport already uses `stream_append` and streamed snapshots correctly. Its P1 quick wins are
 implemented: the replication lag threshold now sits above the 100k snapshot policy, heartbeat
 suppression is enabled, HTTP/2 windows/keepalive are tuned, snapshot chunks follow OpenRaft's
-configured size and readiness waits for recovery. The remaining P2/P3 items are tracked in §16.
+configured size and readiness waits for recovery. The remaining P1/P2/P3 items are tracked in §16.
 
-The next work, in order (re-prioritised 2026-11-10 after the local-lease default):
-
-1. **Run the Linux pinned-core `e2e` pass and Linux Aeron validation (P2, §8/§6).**
-   Dispatch the manual `Linux benchmark` workflow for the pinned short/sustained rows and run the
-   external-driver plus multicast fan-out checklist in
-   [`demos/market_data_system/README.md`](./demos/market_data_system/README.md). Both remain blocked
-   on a Linux host; `gh` authentication is also needed for the workflow.
-
-The earlier measurement work is done: `book_replay` and `level_book` report warm p50/p99 plus an
+The next work is the ordered list above; it replaces the previous single-item queue. The earlier
+measurement work is done: `book_replay` and `level_book` report warm p50/p99 plus an
 interleaved cold pass, `replay_mix` replays a 100,000-operation fixture with fees, the 4-node
-no-fsync cluster, the write concurrency/batching sweep, the read-path/lease results, the async-WAL
-prototype and the upstream OpenRaft comparison are recorded in `PERFORMANCE.md`, and the `Order`
-identity/optional-sequence/BTC-USDT/overflow-case quick wins landed. The apply-path allocation
-leftovers are inline now, apply-thread affinity is measured and stays on the shared runtime, and
-the per-level bucket/sorted-vector A/Bs are recorded without adoption. The earlier third-party
-follow-ups are P2/P3 (§14); the new benchmark-derived follow-ups are P1/P2 (§17). Measurement
-scope, peak RSS, the fuzz targets, health/readiness and the operational console are in place.
-Equity/ETF sessions, holidays, auctions, T+1/T+2 settlement, corporate actions and
+no-fsync cluster, the write concurrency/batching sweep, the read-path/local-lease results, the
+async-WAL prototype and the upstream OpenRaft comparison are recorded in `PERFORMANCE.md`, and the
+`Order` identity/optional-sequence/BTC-USDT/overflow-case quick wins landed. The apply-path
+allocation leftovers are inline now, apply-thread affinity is measured and stays on the shared
+runtime, and the per-level bucket/sorted-vector A/Bs are recorded without adoption. The earlier
+third-party follow-ups are P2/P3 (§14); the new benchmark-derived follow-ups are P1/P2 (§17).
+Measurement scope, peak RSS, the fuzz targets, health/readiness and the operational console are in
+place. Equity/ETF sessions, holidays, auctions, T+1/T+2 settlement, corporate actions and
 fixed/regulatory/minimum/tax fees are owned by the external order system (§13).
 
 ## 1. Exact fixed-point end-to-end — done
@@ -908,7 +943,12 @@ and optional APIs.
   p50 53.5-53.8 µs vs 88.4-92.1 µs, p99 0.64-0.69 ms vs 1.17-1.19 ms) and `/events` by 8-16%,
   with write throughput within noise. The core `lease` mode remains available for comparison.
   Details in `docs/PERFORMANCE.md`.
-- [ ] **P3** Cache follower-read linearizers for a short TTL bounded by the leader lease, or add a
+- [ ] **P1** Validate the default `local_lease` path on a second host and a Linux multi-host
+  four-voter cluster: rerun `read_e2e --policy lease|local_lease` plus the e2e/cluster write A/B,
+  exercise a stale lease or forced cache miss so the `ReadIndex` fallback is observed, and check
+  `/read-policy/status` counters under bounded clock skew. The single-host win is 11-36%; this is
+  the remaining production-readiness gate for making it the default.
+- [ ] **P2** Cache follower-read linearizers for a short TTL bounded by the leader lease, or add a
   lease-based `/get_linearizer` mode; measure the per-read leader hop.
 
 **Configuration, transport and observability**
