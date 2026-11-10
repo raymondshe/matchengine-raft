@@ -295,9 +295,10 @@ The first two batches in section 5 are implemented. [`TODO.md`](../TODO.md)
 
 ### Out of scope for now
 
-Auctions, pro-rata, price bands, pegged/trailing stops, OCO/OTO/OUO, sessions,
-margin/risk and clearing. These belong to the order system or to a product
-decision, not to a matching-core conformance batch.
+Auctions, pro-rata, price bands, OCO/OTO/OUO, sessions, margin/risk and clearing.
+Market-to-limit, trailing stops, pegged orders and self-trade prevention are
+planned as one schema-v11 batch in
+[`docs/ORDER_TYPES_V11.md`](./ORDER_TYPES_V11.md); they are not implemented yet.
 
 ## 7. Licence and attribution rules
 

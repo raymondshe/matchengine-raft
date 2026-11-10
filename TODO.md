@@ -61,7 +61,8 @@ opened the P1 follow-ups in §17. The benchmark correctness batch is implemented
 conformance cases, `order_not_found` for cancel misses, the identity documentation and the
 random-point state audit (§17). The occupancy envelope is also in place:
 `cargo bench --bench book_replay -- --matrix` reports the four standing-book shapes and the
-worst-case median-of-10 (§8).
+worst-case median-of-10 (§8). The schema-v11 order-type batch is planned in
+[`docs/ORDER_TYPES_V11.md`](./docs/ORDER_TYPES_V11.md); implementation is the next P2 step.
 
 The upstream OpenRaft minimal benchmark (three in-process nodes, in-memory log/state machine,
 function-call network, empty requests) reports 33k put/s with one client and 3.5M put/s with 4,096,
@@ -85,10 +86,10 @@ The next work, in order (re-prioritised 2026-11-10 after the benchmark correctne
 1. **Run the Linux pinned-core `e2e` pass (P2, §8).** Dispatch the manual `Linux benchmark`
    workflow (or run the same commands on deployment hardware) and record the pinned short and
    sustained rows. This remains blocked on a Linux host and `gh` authentication.
-2. **Plan one schema-v11 order-type batch (§5, P2).** Add market-to-limit, trailing stops, pegged
-   orders and self-trade prevention together so the snapshot/wire migration and conformance batch
-   are paid once. Custom reserve replenishment and stop-protection collars stay P3 and
-   product-conditional.
+2. **Implement the planned schema-v11 order-type batch (P2, §5).** The plan is in
+   [`docs/ORDER_TYPES_V11.md`](./docs/ORDER_TYPES_V11.md): market-to-limit, trailing stops, pegged
+   orders and STP share snapshot v11, wire v7 and one conformance/replay batch. Custom reserve
+   replenishment and stop-protection collars stay P3 and product-conditional.
 3. **Aeron operation hardening and the snapshot-request stream (§6, P2).** Run external-driver
    and multicast fan-out validation on Linux, add the idle heartbeat and publish `ws_fanout`
    numbers; then add the late-joiner snapshot-request stream (2010).
@@ -304,9 +305,15 @@ Done:
 
 Remaining:
 
-- [ ] **P2** Add one schema-v11 order-type batch: market-to-limit, trailing stops, pegged orders
-  and self-trade prevention. Pay the snapshot/wire migration and conformance batch once; define
-  the owner identity required by STP before adding it.
+- [x] **P2** Plan one schema-v11 order-type batch: market-to-limit, trailing stops, pegged orders
+  and self-trade prevention. Done: [`docs/ORDER_TYPES_V11.md`](./docs/ORDER_TYPES_V11.md) fixes the
+  data model, semantics, apply order, snapshot v10 -> v11, wire v6 -> v7 and the conformance/replay
+  matrix. STP identity is `Order.owner_id: Option<u64>` plus `SymbolConfig.stp`, default `Off`;
+  pegs reference non-pegged liquidity to make the reprice pass deterministic.
+- [ ] **P2** Implement the planned schema-v11 batch in one migration. Follow the delivery sequence
+  in [`docs/ORDER_TYPES_V11.md`](./docs/ORDER_TYPES_V11.md): data model + snapshot v11, MTL,
+  trailing stops, STP, pegged orders, wire v7, then the conformance/replay/docs batch. Do not land
+  the features separately; the snapshot and wire bumps are paid once.
 - [ ] **P3** Add custom reserve replenishment and stop-protection collars only if the product
   requires them; the current iceberg display tranche covers the existing reserve behaviour.
 - [x] **P2** Phase 4 of match-result delivery: long-poll `/events` (`wait_ms`), gRPC
