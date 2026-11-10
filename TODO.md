@@ -998,3 +998,27 @@ Remaining:
 
 - [ ] **P3** Add AON, self-trade-prevention/order-mask and multi-symbol isolation cases only when
   the product adds those behaviours; multi-symbol remains deployment-level isolation (§2).
+
+### FlashOne benchmark follow-ups (2026-11-10)
+
+The 249-engine survey pinned this repository at `5597532` (before the phantom-fill fix) and
+reported 7.20 M/s book-only; the full review and competitor taxonomy are in
+[`docs/THIRD_PARTY_INVESTIGATION.md`](./docs/THIRD_PARTY_INVESTIGATION.md) Part IV.
+
+- [ ] **P1** Add the explicit benchmark-derived conformance cases: cancel head/middle/scattered
+  and shared-level sibling survival; both-direction maker-price fills; stale cancel and modify
+  after a full fill; multi-level IOC; marketable-limit residual at its own limit; cancel-best-level
+  BBO with no follow-on sweep; a 5,000-fill same-price sweep; and a near-limit in-domain price.
+- [ ] **P1** Add a `book_replay`/`replay_mix` scenario matrix (`static`, `normal`, wide-swing,
+  flash-crash), record average/peak resting orders and levels, and report the worst-case
+  median-of-10 with variance.
+- [ ] **P1** Add a deterministic random-point book-state audit (best bid/ask/depth) to the
+  reference-model tests, not only final-state comparison.
+- [ ] **P1** Decide whether a non-resting cancel emits `Rejected`/4xx or stays a no-op, test it,
+  and document `Order.id` vs `sequence` vs `client_order_id` with duplicate-id and retention cases.
+- [ ] **P2** Add a paced/open-loop latency run, or state the coordinated-omission caveat for the
+  closed-loop tails.
+- [ ] **P2** Re-pin the benchmark to current `HEAD`, record the book-only result and scope in
+  `docs/PERFORMANCE.md`, and publish the adapter only if it can be maintained.
+- [ ] **P2** Evaluate a treap, sorted vector or heap hybrid only as a book-only A/B; do not switch
+  on the external leaderboard alone.

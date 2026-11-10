@@ -1,6 +1,6 @@
 # Third-party matching-engine investigations
 
-Three external matching-engine projects were reviewed for design ideas, benchmark methodology and
+Four external matching-engine projects were reviewed for design ideas, benchmark methodology and
 failure modes. This document consolidates the separate reports into one reference.
 
 | Project | Revision | License | Primary value to us |
@@ -8,13 +8,15 @@ failure modes. This document consolidates the separate reports into one referenc
 | [AsthaMishra/matching-engine](https://github.com/AsthaMishra/matching-engine) | `2a74c3f` (2026-08-14) | No license file exposed | Hot-path order-book layout, binary gateway, measurement discipline |
 | [wasif-exe/wire](https://github.com/wasif-exe/wire) | `abd2bf2` (2026-10-19) | MIT | Low-level layout/allocator/MPMC ideas and a cautionary benchmark case |
 | [llc-993/matching-core](https://github.com/llc-993/matching-core) | `2cb21c0` (2026-01-03) | No license file exposed | Feature breadth, WAL/snapshot attempt, integration/benchmark caution |
+| [flash1-dev/matching-engine-benchmark](https://github.com/flash1-dev/matching-engine-benchmark) | `424e4e5` (2026-10-16) | MIT (vendored parts have their own licenses) | 249-engine differential benchmark, consensus oracle, conformance battery, worst-case methodology |
 
-Review date: 2026-11-01, re-reviewed 2026-11-04. The review used the public READMEs, `PLAN.md`
-and the key source files listed in the references; the 2026-11-04 pass added AsthaMishra's
-`matching-core/optimization_notes.md` to Part I. Tests were not executed here. No code was copied;
-all three projects are reference material only. The performance-specific verdicts (what transfers to
-matchengine-raft and what does not) live in
-[`docs/PERFORMANCE.md`](./PERFORMANCE.md) ("External optimization notes").
+Review date: 2026-11-01, re-reviewed 2026-11-04, benchmark review added 2026-11-10. The review used
+the public READMEs, `PLAN.md`, the benchmark's reports and the key source files listed in the
+references; the 2026-11-04 pass added AsthaMishra's `matching-core/optimization_notes.md`, and the
+2026-11-10 pass added Part IV. Tests were not executed here. No code was copied; all four projects
+are reference material only. The performance-specific verdicts (what transfers to matchengine-raft
+and what does not) live in [`docs/PERFORMANCE.md`](./PERFORMANCE.md) ("External optimization
+notes").
 
 ## Part I - AsthaMishra/matching-engine
 
@@ -97,6 +99,12 @@ replay as the only production-like signal (AAPL, 1.94M ops: p50 100 ns, p99 1.8 
 mechanics: `iter_batched` timed the book's O(MAX_PRICE) drop and produced ~960 us uniformly until
 they moved it outside the timer with `iter_custom`, and they separate warm-cache throughput from
 cold-cache per-operation numbers.
+
+The FlashOne survey (Part IV) later measured this engine at **5.60 M/s worst-case** (`flash-crash`)
+after a one-line bounds-check fix. That result is consistent with §2: the direct-indexed array is
+fast in its 100k-tick domain, but the bounded domain drops orders once the price path leaves it.
+The benchmark classifies it as the representative of the 14 flat-array engines; the category's
+ceiling is well below the tree-based leaders.
 
 ### 5. Findings and risks
 
@@ -360,6 +368,12 @@ The README's 7.2M TPS / 3.6M QPS / memory table come from
   balance is drained and later iterations exercise the insufficient-funds path, not the success
   path.
 
+The FlashOne survey (Part IV) pinned the same `2cb21c0` commit and measured **7.14 M/s**, conforming
+as shipped on its new/cancel/modify ABI. That is not a contradiction: the ABI does not exercise the
+advanced order book, risk engine, WAL, snapshot or exchange pipeline that are the subject of §2–§4.
+It is a useful example of why a matching-only conformance result is not a product-path
+certification.
+
 ### 6. Strengths and lessons
 
 Strengths: broad feature ambition, examples for advanced orders, several book implementations, a
@@ -380,7 +394,248 @@ Lessons for matchengine-raft:
   queries/s.
 - Avoid unintegrated "optimized" implementations whose state serialization loses data.
 
-## Part IV - Comparison with matchengine-raft
+## Part IV - flash1-dev/matching-engine-benchmark (249-engine survey)
+
+### 1. What it is
+
+A benchmark and correctness oracle, not a matching engine. At `424e4e5` (2026-10-16) the repository
+reports **249 engines** across 20+ languages: **162** reproduce a byte-identical report-stream
+consensus (111 of them only after the benchmark's documented fix), and **87** diverge, exceed the
+2M-message budget, crash, or are domain-incompatible. The README reports **183 upstream issues**
+filed from the survey; the resolved-findings roster tracks fixes separately. The accompanying paper
+is [arXiv:2606.01183](https://arxiv.org/abs/2606.01183) (Flash One Technologies, 2026).
+
+The harness drives one symbol through a C ABI, one message at a time by default: 1,000,000 new
+orders expand to roughly 2,000,000 new/cancel/modify messages. Five scenarios (`static`, `normal`,
+`swing-25`, `swing-40`, `flash-crash`) vary the mid-price path and the standing book. The
+definitional result is **worst-case throughput**: the lowest of the five scenario medians, not the
+best or the average. A full challenge is **10 perf runs + 1 audit run per scenario**; each scenario
+reports the median of its ten perf runs, and the engine's result is the lowest of the five medians.
+Correctness is the SHA-256 of the full report stream (`OrderAck`,
+`Trade`, `CancelAck`, `ModifyAck`, `CancelReject`, `ModifyReject`) against a consensus first
+established by three independent engines (Liquibook, QuantCup, Exchange-core), plus **192
+book-state probes** (64 indices × best bid/best ask/depth) at unpredictable points. A pre-run gate
+adds **34 hand-crafted hard-invariant cases**, and 10,000 precomputed seeds support CI.
+
+The workload is calibrated rather than synthetic-uniform: 15% of new orders are IOC; of the
+non-IOC orders, 20% get a modify and 95% are eventually cancelled; ~2% of cancels and of
+modified-then-cancelled orders arrive twice; the quantity range is 1-100, depth follows a
+power-law profile, and the mid follows a GBM path. The
+standing book is a property of the seed's realisation, not a constant: at the canonical seed 23 it
+averages/peaks at roughly **20,900/41,800 orders in `static`**, **2,700/5,500 in `normal`**,
+**1,300/2,600 in `swing-25`**, **700/1,400 in `swing-40`** and **240/500 in `flash-crash`**. That
+is the survey's most transferable measurement insight: the price structure pays for occupancy, not
+only for message dispatch, and a matcher must be judged in the regime it handles worst.
+
+The anti-cheat design is unusually careful and worth reading in full:
+
+- Perf and audit are separate passes, but **every** run probes the same random book points, so an
+  engine cannot tell whether it is being measured.
+- The optional prebuild hook may translate/reserve only; the book must be empty before the clock
+  starts, and a shadow pre-matcher is caught by a prebuild/timed ratio.
+- The probe window is excluded from throughput but capped at 25% of the raw timed window, so an
+  engine cannot move its matcher into `engine_query_*`.
+- Each run is a fresh process with a regenerated workload; the host fingerprint and seed are
+  recorded, so a third party can reproduce the claim.
+- Adapters must answer `engine_query_*` from the engine's own book, never a shadow; the benchmark
+  demonstrates a case where a faithful forwarding change exposed a real phantom-level bug that a
+  rebuilt shadow had hidden.
+
+One caveat: the repository's own counts drift between documents (at this revision, 28 vs 18 fixed
+issues and 42 vs 40 shipped adapters). Use the per-engine issue links and the pinned commits in
+`SNAPSHOTS.md` as the authority; the summary tables are snapshots, not a live database. That is the
+same docs-vs-code discipline this project applies to its own documentation.
+
+### 2. This project in the roster
+
+`raymondshe/matchengine-raft` is pinned at `5597532` (2026-03-04) and classified as the
+**B-tree/B+tree representative**: Rust, **7.20 M/s worst-case**, the fastest of the 27 B-tree
+engines. The roster marks it **"with fix"** for issue #1 ([link](https://github.com/raymondshe/matchengine-raft/issues/1)): a
+phantom zero-quantity fill that re-stored the next resting order through `Order::new`, resetting
+its `id` to `0` and its side to the taker's. The finding is valid for that commit.
+
+The fix landed in `a44d9ae` (2026-10-27), and issue #1 was closed the same day. Current `HEAD` has
+the taker-exhaustion guard plus explicit regressions in `src/order_book/tests.rs`:
+`exact_fill_does_not_emit_phantom_or_corrupt_bystander_bid`,
+`exact_fill_does_not_emit_phantom_or_corrupt_bystander_ask`,
+`exact_fill_stops_before_deeper_levels` and
+`full_sweep_leaves_book_empty_without_phantom_trades`. The benchmark label describes the old pin,
+not current code; a re-pin should clear the "with fix" flag, but that is the benchmark maintainer's
+call. The pinned commit declared `MIT/Apache-2.0`; the current repository is MIT.
+
+The 7.20 M/s figure measures the order-book core only. The C ABI has no Raft, HTTP, WAL, snapshot,
+replicated event window, fee/asset accounting, stops, icebergs, multi-symbol routing or risk. It is
+therefore not comparable to the four-node **227k orders/s** `/write_batch` result or the **~969k
+ops/s** `replay_mix` whole-replay result in [`docs/PERFORMANCE.md`](./PERFORMANCE.md): the workload,
+hardware and scope all differ. The defensible claim is narrower: the `BTreeMap` core is the fastest
+B-tree implementation in this survey, within about 8% of the fastest Rust engine (`melin`, 7.86) and
+about 22% of the fastest open engine (`lcv3`, 9.25). It says nothing about the replicated product
+path, which our own e2e and cluster suites cover.
+
+### 3. Methodology worth borrowing
+
+| Practice | What the benchmark does | Our current state | Recommendation |
+|---|---|---|---|
+| Worst-case across regimes | Lowest of five scenario medians, with the scenario named | `book_replay`/`replay_mix` report per-case best-of-5 and warm p50/p99; `e2e`/`cluster_e2e` vary client load, not market regime | Add an order-book scenario matrix (`static` deep book, `normal`, wide-swing, flash-crash) and report the worst case |
+| Calibrated order flow | 95% cancel, 15% IOC, 20% modify, ~2% duplicate cancels/modifies, realistic depth | `replay_mix` is a deterministic 100k mixed fixture with fees, stops and icebergs, not calibrated to a market mix | Add a benchmark fixture with these ratios and duplicate/stale requests; keep the existing mixed fixture |
+| Standing-book occupancy | Records average/peak resting orders and levels per scenario (~20.9k/41.8k in `static`) | `book_replay` has 1k/20k depth cases, but occupancy is not the headline variable | Record average/peak resting orders and levels per benchmark case; add a deep-static case |
+| Median of many runs | 10 perf runs, median and standard deviation | Best-of-5 for microbenchmarks; medians of 2-5 for e2e | Adopt median-of-10 plus variance for the regression-gated book benches; keep p50/p99 |
+| Full output hash plus state audit | Hashes every report and probes 192 random book states | Replay fixtures compare full event streams; property tests compare a reference model; cluster tests read `/read` | Add a deterministic long-run **random-point state audit** against the reference model, not only final-state comparison |
+| Separate edge-case battery | 34 hard-invariant cases outside the timed workload | `src/order_book/conformance_tests.rs` plus cluster/replay suites | Map the benchmark's cases to ours and make the missing hard invariants explicit (see §5) |
+| Held-out seeds | 10,000 precomputed seeds; private seeds for adversarial runs | Property tests use seeds and print failures; replay cases are fixed | Add a seed-sweep regression (e.g. 100 seeds) and keep a private-seed path for external validation |
+| Report transport and pipeline barrier | Includes the matcher-to-publisher hand-off and `engine_flush()` inside the timed window | `e2e` includes HTTP, Raft, apply and response; book benches exclude events/feed | Keep the two scopes separate and label them; do not compare a book-only number with e2e |
+| Open-loop latency under load | The paper reports latency-under-load; the harness itself measures throughput | Our sustained e2e is closed-loop | Add a paced/open-loop latency run, or state the coordinated-omission caveat where only closed-loop tails are reported |
+| Adapter faithfulness | Book queries must come from the engine's real state | `/read` reads the real book; no shadow | Keep it that way; never let a test adapter synthesize a cleaner book |
+
+What not to copy: the in-process C ABI, one-message dispatch, prebuild hook and audit machinery are
+benchmark-specific. The benchmark's `modify` is **cancel + reinsert**, not our `Amend`; its cancel
+and modify identity is a client order id, not our side + price + sequence. A future adapter must
+translate those semantics rather than map `Modify` directly to `Amend`. The benchmark deliberately
+leaves modify-priority conventions unspecified; our priority rules are ours and are already
+documented.
+
+### 4. What the competitor field says about book design
+
+The survey's book-structure table is the clearest external evidence we have about the price ladder.
+The figures are the benchmark's seed-23 worst-case throughput on Graviton4/Neoverse-V2 with
+`-O3 -march=native`, median of 10 trials; they are not measurements on this host.
+
+| Price structure | Best worst-case M/s | Engines | Representative | Relevance to us |
+|---|---:|---:|---|---|
+| Proprietary (paper) | 103.39 | - | FlashOne | Not an open implementation; a different algorithm, not a micro-optimization |
+| Treap | 9.25 | 1 | `lcv3` | Fastest open structure; intrusive FIFO and fixed pools |
+| Binary heap / priority queue | 8.19 | 14 | `e820` | Hybrid price-indexed arena plus heaps |
+| Red-black tree / ordered map | 7.94 | 59 | `geseq/cpp-orderbook` | The field default (37% of engines) |
+| Sorted vector | 7.86 | 17 | `melin` | Competitive without pointer-chasing |
+| AVL tree | 7.26 | 5 | `CppTrader` | Balanced BST, close to us |
+| **B-tree / B+tree** | **7.20** | **27** | **`raymondshe` (us)** | The common Rust default; category leader |
+| Plain BST (unbalanced) | 6.88 | 1 | `Kautenja` | Fragile under adversarial insert order |
+| Flat direct-indexed array (+ bitmap) | 5.60 | 14 | `asthamishra` | O(1) by tick but cache-thrashes a wide domain |
+| Adaptive-radix / crit-bit | 2.625 | 3 | `serum` | Pointer-chasing dominates |
+| Linked-list price levels | 1.97 | 2 | `coralme` | O(n) level lookup |
+| Skip-list | 1.62 | 8 | `apex` | Pointer-chasing and lock-free overhead |
+| Hash map + best-price rescan | 0.11 | 5 | `dydx` | O(all levels) best-price lookup |
+
+Observations:
+
+- **All open engines top out at 9.25 M/s**, while FlashOne reports 103.39. The ~94 M/s gap is an
+  algorithmic difference, not a compiler-flag difference; do not expect a 10x win from a better
+  `BTreeMap` constant.
+- **Structure is not destiny.** The red-black tree is the default and tops at 7.94; the treap is
+  represented by one engine and tops the open field at 9.25. Our `BTreeMap` beats every other
+  B-tree and sits within 8-22% of the open leaders, so a structure swap is a measured experiment,
+  not an obvious win.
+- **Flat arrays lose on wide domains.** The 14 flat-array engines peak at 5.60, and the benchmark's
+  non-conforming roster includes bounded-domain engines that drop orders or crash on
+  `swing-40`/`flash-crash` (`mtengine`, `femto_go`, `zackienzle`). Our 18-decimal `Fixed` range and
+  sparse `BTreeMap` are a correctness advantage; do not trade them for a tick-indexed array without
+  a bounded-domain contract.
+- **Implementation quality dominates structure.** The survey's 74 industry-authored engines include
+  26 that need a fix and 28 that diverge, time out or crash. A 10,236-star vendor engine
+  (`StockSharp`) broke FIFO through `Dictionary` enumeration, and a plain BST with a duplicate-id
+  path caused a use-after-free (`Kautenja`). Seniority and stars are not correctness evidence.
+- **Our own per-level prototype remains the right comparison.** `level_book` already showed mixed
+  results (1.84x match, 3.31x cancel, but 0.75x sparse amend and 0.87x BBO advance). The external
+  result does not overturn that; a treap, sorted vector or heap hybrid is worth a book-only A/B only
+  if it wins on our workloads too.
+
+### 5. Competitor failure taxonomy and our guards
+
+The survey's most useful output for us is not the leaderboard; it is the recurring failure classes.
+Each row is a bug class that appeared in at least one competitor at its pinned commit.
+
+| Failure class | Representative findings | Our guard | Remaining action |
+|---|---|---|---|
+| FIFO/time-priority loss | `swap_remove` cancel (`pyrsquant`), LIFO insertion (`amer`, `hillside6`), unstable sort (`nirvanasu`, `thelilypad`), `Dictionary` order (`StockSharp`), shared-level sibling loss (`shaunlwm`) | `BTreeMap` keyed by `(price, sequence)`; property model; amend-priority matrix | Add explicit cancel-head/middle/scattered and shared-level-sibling cases |
+| Wrong execution price | Aggressor price (`e820`, `jiker_burce`, `apex`, `robaho`, `kodoh`, `shal`), midpoint (`fmstephe`), sell-side-only price (`dx1ngy`) | Fills use the maker price; the reference model asserts `fill.maker.price` | Add an explicit two-direction maker-price conformance case |
+| Phantom zero-quantity fill / bystander mutation | This repository (#1), `matchina`, `amansardana`, `aas2015001`, `zorrofix` | Taker-exhaustion guard; exact-fill and full-sweep regression tests | None; keep the regression pinned |
+| Stale/phantom best price or level | `osmosis`, `robdev`, `mmrath`, `cjboxing`, `mercury` | No cached BBO: `best_bid`/`best_ask` read the tree; `basic_best_*` and the model | Add an explicit cancel-best-level/expiry BBO case with no follow-on sweep |
+| Partial-fill non-conservation / over-match | `limitbook`, `cltwski`, `opexdev`, `pyme` | `partial_fill_preserves_maker_identity`, `resting_volume`, property model | Add a repeated partial-fill-across-calls case |
+| IOC/marketable residual mishandled | `robdev` (IOC residual rests), `qa-rs` (market remainder rests), `knocte` (crossed book), `sadhbh` (exact touch) | `ioc_cancels_its_remainder`, market tests, `exact_fill_stops_before_deeper_levels` | Add multi-level IOC and marketable-limit residual-at-limit cases |
+| Stale cancel/modify acked | `cjboxing`, `mercury`, `robdev`, `gotrader`, `gavincyi` | `Amend` returns `NotFound` and emits `Rejected`; `cancel` of a non-resting order currently no-ops | Decide whether unknown cancel should emit `Rejected`/4xx, then test both cancel and modify after a full fill |
+| Duplicate id / id reuse / capacity drop | `Kautenja`, `qa-rs`, `tembolo`, `onewhitedevil` | Primary key is `sequence`, not `Order.id`; `client_order_id` dedupe; no fixed order-id table | Document `id` vs `sequence` vs `client_order_id`; add duplicate-id and near-capacity tests |
+| Bounded price domain | `asthamishra` (fixed), `mtengine`, `femto_go`, `zackienzle`, `Clober`, `DeepBook` caps | Full-range `Fixed` plus sparse `BTreeMap` | Add a near-limit in-domain price case; document any representational limit |
+| Empty-book / deep-sweep crash | `dylanlott`, `laffini`, `raunakchopra`, `zorrofix` | Empty-book, market-without-liquidity and property tests | Add a deep 5,000-fill same-price sweep case |
+| O(n)/O(n²) cancel or scan | `afterworkguinness` (whole-book string), `mattdavey` (rescan), `redisexchange` (never stops), `liqian` (domain scan) | `BTreeMap` O(log n); `book_replay` deep cancels | None for now; keep the benchmark |
+| Expired maker still trades | `realyarilabs`; llc-993's `AdvancedOrderBook` | GTD purge before matching; `a_place_purges_due_gtd_before_matching` asserts `fills.is_empty()` when the maker expires | Covered; keep the explicit expiry-before-match assertion |
+| Async/non-deterministic matcher | `luminengine` | `apply` is serial and deterministic; replay/restart/cluster tests | None |
+| Modify semantics ambiguity | Benchmark leaves priority unspecified; our `Amend` refuses crossing, while the benchmark's `modify` is cancel + reinsert | Explicit priority matrix and `AmendError::WouldCross`; documented in `AGENTS.md` | Keep the divergence documented; never map benchmark `Modify` directly to `Amend` |
+
+### 6. Selected competitor notes
+
+| Engine | Structure / result | Benchmark finding | Lesson |
+|---|---|---|---|
+| `lcv3` | Treap + intrusive FIFO; 9.25 M/s; clean | Fastest open engine; author-permitted license | The treap is the external benchmark's best open ladder; the license is not a code source |
+| `e820` | Price-indexed arena + heaps; 8.19 M/s | Singly-linked orphan and aggressor-price bugs fixed | Hybrid structures can beat trees, but FIFO/price invariants still decide correctness |
+| `geseq/cpp-orderbook` | RB tree; 7.94 M/s; clean | Near-top with the field's default structure | A clean RB implementation is competitive; structure alone is not the differentiator |
+| `melin` | Sorted vector; 7.86 M/s | Stop-cascade single-pass bug fixed | Sorted vectors are competitive; stop cascades need explicit re-evaluation tests |
+| `CppTrader` | AVL + pools; 7.26 M/s | Off-path FOK/AON pricing bugs | Feature breadth needs tests outside the canonical workload |
+| `raymondshe` (us) | B-tree; 7.20 M/s | Phantom zero-qty/bystander bug; fixed at `a44d9ae` | The external oracle found a real bug our own tests then pinned; keep the regression |
+| `llc993` | B-tree + slab + intrusive time queue; 7.14 M/s; clean | Conforms on the new/cancel/modify ABI | Benchmark conformance does not cover its advanced book, risk, WAL or snapshot gaps (Part III) |
+| `asthamishra` | Flat array + bitmap; 5.60 M/s | Bounded 100k-tick domain; fixed by a bounds check | Flat arrays lose on wide swings; consistent with Part I |
+| `matchcore` | Rust; 6.58 M/s | Marketable limit passed `None` and swept like a market order | Enforce the limit on every cross, including the modify path |
+| `matchina` | Rust; 1.60 M/s | Same phantom zero-quantity class as our #1 | Our bug was not unique; a taker-exhaustion guard is a standard invariant |
+| `Kautenja` | Plain BST; 6.88 M/s | Duplicate live order id caused a use-after-free | The id table needs duplicate/reuse semantics, not only a tree |
+| `StockSharp` | C#; 1.64 M/s | `Dictionary` enumeration broke same-price FIFO | Stars and vendor status are not a FIFO proof |
+
+### 7. Benchmark-derived backlog
+
+The following are the concrete changes this review supports. They are ordered so the cheap
+correctness and measurement improvements land before any structural experiment.
+
+**P1 - correctness and measurement**
+
+1. Add explicit conformance cases for the hard invariants the benchmark's 34-case gate exposes:
+   cancel-head/middle/scattered and shared-level sibling survival; both-direction maker-price
+   fills; stale cancel and modify after a full fill; multi-level IOC; marketable-limit residual at
+   its own limit; cancel-best-level BBO with no follow-on sweep; a 5,000-fill same-price sweep; and
+   a near-limit in-domain price. Some are covered indirectly by the property model; make them
+   explicit so a failure is diagnosable from the test name.
+2. Add a `book_replay`/`replay_mix` scenario matrix with `static`, `normal`, wide-swing and
+   flash-crash shapes; record average/peak resting orders and levels per case; report the
+   worst-case median-of-10 with variance, alongside the existing p50/p99.
+3. Add a deterministic random-point state audit to the reference-model tests: compare best bid,
+   best ask and depth at unpredictable message indices, not only the final book.
+4. Decide and document the unknown-cancel contract. Today `cancel` of a non-resting order consumes
+   a sequence and emits no event, while `Amend` emits `Rejected`. Add tests for both, then either
+   make cancel rejection explicit or state that absence of a `cancelled` event is the contract.
+5. Document `Order.id` (client metadata), `sequence` (the engine key) and `client_order_id`
+   (idempotency key) separately; add duplicate-`id` and post-retention `client_order_id` cases.
+
+**P2 - measurement and structure**
+
+6. Add a paced/open-loop latency-under-load run to `e2e` or `cluster_e2e`, or state explicitly in
+   `PERFORMANCE.md` that closed-loop tails understate queueing. The benchmark's worst-case
+   throughput argument needs a latency companion.
+7. Evaluate a treap, sorted vector or heap hybrid only as a book-only A/B on our workloads. The
+   external gap to `lcv3` is 22%, but `level_book` already showed that per-level buckets trade
+   wins and losses; do not switch on a single external leaderboard.
+8. Re-pin the benchmark to current `HEAD` and, if the adapter can be published, ship the
+   reproduction. Run a held-out seed and the 10,000-seed `validate_seeds.py` path only if we are
+   prepared to maintain the C ABI adapter as a separate artifact.
+9. Add a "benchmark scope" paragraph to `PERFORMANCE.md` that records the 7.20 M/s book-only result,
+   the pin, the fixed issue and the non-comparability with e2e. Link back to this part.
+
+**P3 - do not chase**
+
+10. The benchmark has no FOK, stop, iceberg, post-only, GTD, fee, asset, persistence, consensus or
+    multi-symbol coverage. Those remain covered by our own conformance, property, replay and
+    cluster suites; do not weaken them to match a simpler ABI.
+
+### 8. Verdict
+
+The benchmark validates two things: our `BTreeMap` price ladder is a credible top-tier open
+structure, and an independent differential oracle can find a real correctness bug that normal
+happy-path tests miss. It also demonstrates the limit of that validation: 7.20 M/s is a
+matching-only number, and the survey's 34 cases do not exercise the order types, durability,
+replication and exact-fee semantics that distinguish this project.
+
+The highest-value transfer is therefore **methodology**, not code: worst-case scenario reporting,
+median-of-10 with variance, a calibrated order flow, random-point state audits, and a separate
+edge-case battery. The highest-value concrete gaps are the explicit benchmark-derived conformance
+cases and the unknown-cancel semantics. Neither requires a new data structure.
+
+## Part V - Comparison with matchengine-raft
 
 | Dimension | AsthaMishra | Wire v9 | llc-993/matching-core | matchengine-raft |
 |---|---|---|---|---|
@@ -395,6 +650,7 @@ Lessons for matchengine-raft:
 | Protocol | OUCH/ITCH + REST | No integrated order entry | Library only | HTTP JSON + gRPC Raft |
 | Tests | Unit/proptest/fuzz (stale target) | Unit per kernel; no v9 integration | Tests present; no pipeline/consensus integration observed | Unit/property/conformance/integration/restart/snapshot/fees |
 | Benchmarks | Criterion/ITCH/tail | Pinned-core microbenchmarks | AdvancedOrderBook TPS; estimated memory; flawed Criterion cases | e2e/batch/feed/storage/P0 benchmarks |
+| FlashOne survey (Part IV) | 5.60 M/s, with fix; bounded-domain flat array | Not listed in the roster | 7.14 M/s, as shipped; new/cancel/modify ABI only | 7.20 M/s, fastest B-tree; "with fix" at the old pin, fixed at `HEAD` |
 
 Our engine is stronger on semantics, durability, exactness and recovery. Astha is stronger on
 single-node hot-path layout, binary gateway work and measurement scope. Wire is stronger on
@@ -403,27 +659,55 @@ narrower than its name suggests. llc-993 is the broadest feature skeleton, but i
 types are not wired into the exchange, its WAL/snapshot is not crash-safe, and its benchmark numbers
 measure a separate `AdvancedOrderBook`, not the product pipeline.
 
-## Part V - Consolidated takeaways
+On the FlashOne benchmark's matching-only ABI, our `BTreeMap` core is the fastest B-tree entry and
+within about 8% of the fastest Rust engine. That is a useful external validation of the price ladder
+and the basic FIFO loop; it is not a validation of the replicated product path. The benchmark's
+`modify` is cancel + reinsert and its identity is a client order id, so a direct mapping to our
+`Amend` would be wrong. Its "conforming" verdict is scoped to limit new/cancel/modify and IOC; it
+does not exercise FOK, stops, icebergs, fees, persistence or consensus.
+
+## Part VI - Consolidated takeaways
 
 ### Adopt
 
-1. **Measurement-scope discipline.** Add a table to `docs/PERFORMANCE.md` stating what each
-   benchmark includes/excludes, whether it is closed-loop, and whether it measures TSC ticks, wall
-   time or system latency.
-2. **A pure order-book replay benchmark.** Keep the existing end-to-end `replay_orders` test, but
-   add a book-only benchmark with deep sweeps, cancel-at-depth and BBO-advance cases. Do not mix
-   Raft/HTTP into that number.
-3. **Fuzzing.** Add `cargo-fuzz` targets for `OrderBook::execute_order` and snapshot/WAL decoding;
-   keep the targets buildable. Astha's stale fuzz target is a warning.
-4. **Preallocation and cache-layout experiments.** Try a per-level `Vec` + `head_idx` + order index
-   and a cached BBO in a branch; measure before committing. Do not copy the fixed 65k flat array.
-5. **Allocation accounting.** Measure apply-path allocations and consider a scratch event buffer,
-   `Arc<[MatchEvent]>` sharing or `SmallVec` for common cases.
-6. **A reusable MPMC reference.** If we ever need a custom bounded queue, the Vyukov pattern is a
-   useful reference; Tokio `mpsc` remains the default.
+1. **Measurement-scope discipline.** Done: `docs/PERFORMANCE.md` has the benchmark-scope table,
+   closed-loop/timer notes and warm/cold p50/p99 reporting.
+2. **A pure order-book replay benchmark.** Done: `book_replay`, `replay_mix` and `level_book` keep
+   Raft/HTTP out of the book-only numbers.
+3. **Fuzzing.** Done: `fuzz/` builds targets for the order book, WAL, snapshot and wire decoders;
+   keep them buildable.
+4. **Worst-case scenario matrix (benchmark-derived).** Add `static`, `normal`, wide-swing and
+   flash-crash shapes to the book benchmarks and report the worst-case median-of-10 with variance,
+   alongside p50/p99. The current cases vary depth, not market regime.
+5. **Random-point state audit (benchmark-derived).** Compare best bid, best ask and depth at
+   unpredictable message indices against the reference model, not only the final book. A trade-only
+   hash cannot catch a stale level that self-heals before the next fill.
+6. **Explicit benchmark-derived conformance cases.** Make the hard invariants diagnosable by name:
+   cancel-head/middle/scattered and shared-level sibling survival; both-direction maker-price
+   fills; stale cancel and modify after a full fill; multi-level IOC; marketable-limit residual at
+   its own limit; cancel-best-level BBO with no follow-on sweep; a 5,000-fill same-price sweep; and
+   a near-limit in-domain price.
+7. **Unknown-cancel and identity semantics (benchmark-derived).** Decide whether a non-resting
+   cancel should emit `Rejected`/4xx or remain a no-op, then test it. Document `Order.id` (client
+   metadata), `sequence` (the engine key) and `client_order_id` (idempotency) separately; add
+   duplicate-`id` and post-retention `client_order_id` cases.
+8. **Open-loop latency (benchmark-derived).** Add a paced/open-loop latency run, or state the
+   coordinated-omission caveat where only closed-loop tails are reported. Worst-case throughput
+   needs a latency companion.
+9. **Preallocation, cache layout and allocation accounting.** `apply_path --check` enforces the
+   allocation ceilings and `level_book` measured the per-level prototype. Keep structural changes
+   conditional on a book-only A/B.
+10. **A reusable MPMC reference.** If we ever need a custom bounded queue, the Vyukov pattern is a
+    useful reference; Tokio `mpsc` remains the default.
 
 ### Adapt / evaluate later
 
+- A treap, sorted-vector or heap-hybrid price ladder, only after a book-only A/B on our workloads.
+  The external gap to `lcv3` is 22%, but `level_book` already showed the per-level prototype trading
+  match/cancel wins for sparse-amend/BBO losses.
+- Re-pin the FlashOne benchmark to current `HEAD` and publish the adapter/reproduction if the C ABI
+  can be maintained as a separate artifact. Held-out seeds and `validate_seeds.py` are optional
+  external validation, not a CI dependency.
 - A binary order-entry path (gRPC/protobuf or compact codec) separate from HTTP admin/reads, only if
   latency requirements justify it.
 - Feature-gated latency histograms, off by default.
@@ -464,23 +748,29 @@ measure a separate `AdvancedOrderBook`, not the product pipeline.
 
 ### Prioritized plan
 
-**P0 - documentation, benchmarks, tests**
+**P1 - correctness and measurement**
 
-1. Add the measurement-scope table and closed-loop/timer caveats to `docs/PERFORMANCE.md`.
-2. Add `benches/book_replay.rs` for book-only replay with deep sweeps, cancel-at-depth and BBO
-   advancement.
-3. Add `cargo-fuzz` targets for matching and snapshot/WAL decoding.
+1. Add the explicit benchmark-derived conformance cases from Part IV §5 and §7: cancel
+   head/middle/scattered and shared-level siblings, both-direction maker price, stale
+   cancel/modify, multi-level IOC, marketable-limit residual, cancel-best-level BBO, 5,000-fill
+   sweep and near-limit price.
+2. Add the scenario matrix, standing-book occupancy reporting and worst-case median-of-10 to
+   `book_replay`/`replay_mix`.
+3. Add the random-point book-state audit to the reference-model tests.
+4. Decide and document the unknown-cancel contract; document `id`/`sequence`/`client_order_id`.
 
-**P1 - measured data-structure and allocation work**
+**P2 - measurement and structure**
 
-4. Prototype a per-price-level `Vec` + `head_idx` + order index + cached BBO; benchmark cancel,
-   match, amend and depth before merging.
-5. Measure and reduce apply-path allocations.
-6. Evaluate a binary order-entry path or feature-gated metrics only if a target requires it.
+5. Add a paced/open-loop latency run, or document the closed-loop caveat in `PERFORMANCE.md`.
+6. Evaluate a treap, sorted vector or heap hybrid only as a book-only A/B; do not switch on the
+   external leaderboard alone.
+7. Re-pin the FlashOne benchmark and record the book-only result, pin and scope in
+   `PERFORMANCE.md`; publish the adapter only if it can be maintained.
 
-**P2 - optional platform work**
+**P3 - optional platform work**
 
-7. Real-data replay and custom MPMC/SIMD/io_uring experiments, only after a measured bottleneck.
+8. Real-data replay, custom MPMC/SIMD/io_uring, binary order entry and feature-gated histograms,
+   only after a measured bottleneck and a deployment decision.
 
 **Non-negotiable foundations:** Raft consensus, WAL/snapshot durability, deterministic event ids,
 exact 18-decimal values, fees/assets and the existing property/conformance/integration suites.
@@ -522,3 +812,20 @@ exact 18-decimal values, fees/assets and the existing property/conformance/integ
 - <https://github.com/wasif-exe/wire/blob/main/wire-exchange/src/simd_cancel.rs>
 - <https://github.com/wasif-exe/wire/blob/main/wire-alloc/src/lib.rs>
 - <https://github.com/wasif-exe/wire/blob/main/wire-mpmc/src/lib.rs>
+
+### flash1-dev/matching-engine-benchmark
+
+- <https://github.com/flash1-dev/matching-engine-benchmark>
+- <https://github.com/flash1-dev/matching-engine-benchmark/blob/main/README.md>
+- <https://github.com/flash1-dev/matching-engine-benchmark/blob/main/docs/METHODOLOGY.md>
+- <https://github.com/flash1-dev/matching-engine-benchmark/blob/main/docs/ANTI_CHEAT.md>
+- <https://github.com/flash1-dev/matching-engine-benchmark/blob/main/docs/CONFORMANCE.md>
+- <https://github.com/flash1-dev/matching-engine-benchmark/blob/main/docs/INTEGRATION.md>
+- <https://github.com/flash1-dev/matching-engine-benchmark/blob/main/CONSENSUS_CONFORMING_ENGINES.md>
+- <https://github.com/flash1-dev/matching-engine-benchmark/blob/main/NON_CONFORMING_ENGINES.md>
+- <https://github.com/flash1-dev/matching-engine-benchmark/blob/main/INDUSTRY_AUTHORED_ENGINES.md>
+- <https://github.com/flash1-dev/matching-engine-benchmark/blob/main/CORRECTNESS_FINDINGS.md>
+- <https://github.com/flash1-dev/matching-engine-benchmark/blob/main/SNAPSHOTS.md>
+- <https://github.com/flash1-dev/matching-engine-benchmark/blob/main/workload/scenarios.json>
+- <https://arxiv.org/abs/2606.01183>
+- This project's finding: <https://github.com/raymondshe/matchengine-raft/issues/1>
