@@ -7,7 +7,8 @@
 //! reports whole-replay percentiles plus per-operation percentiles by kind.
 //!
 //! `--check` enforces the loose whole-replay warm p50/p99 CI bounds from
-//! `docs/PERFORMANCE.md`; cold passes stay informational.
+//! `docs/PERFORMANCE.md`; cold passes stay informational. The occupancy
+//! scenario matrix is `cargo bench --bench book_replay -- --matrix`.
 
 #[path = "bench_support/mod.rs"]
 mod bench_support;

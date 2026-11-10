@@ -476,10 +476,10 @@ path, which our own e2e and cluster suites cover.
 
 | Practice | What the benchmark does | Our current state | Recommendation |
 |---|---|---|---|
-| Worst-case across regimes | Lowest of five scenario medians, with the scenario named | `book_replay`/`replay_mix` report per-case best-of-5 and warm p50/p99; `e2e`/`cluster_e2e` vary client load, not market regime | Add an order-book scenario matrix (`static` deep book, `normal`, wide-swing, flash-crash) and report the worst case |
+| Worst-case across regimes | Lowest of five scenario medians, with the scenario named | `book_replay`/`replay_mix` report per-case best-of-5 and warm p50/p99; `e2e`/`cluster_e2e` vary client load, not market regime | Done: `book_replay -- --matrix` reports the worst-case median-of-10 across four occupancy shapes |
 | Calibrated order flow | 95% cancel, 15% IOC, 20% modify, ~2% duplicate cancels/modifies, realistic depth | `replay_mix` is a deterministic 100k mixed fixture with fees, stops and icebergs, not calibrated to a market mix | Add a benchmark fixture with these ratios and duplicate/stale requests; keep the existing mixed fixture |
-| Standing-book occupancy | Records average/peak resting orders and levels per scenario (~20.9k/41.8k in `static`) | `book_replay` has 1k/20k depth cases, but occupancy is not the headline variable | Record average/peak resting orders and levels per benchmark case; add a deep-static case |
-| Median of many runs | 10 perf runs, median and standard deviation | Best-of-5 for microbenchmarks; medians of 2-5 for e2e | Adopt median-of-10 plus variance for the regression-gated book benches; keep p50/p99 |
+| Standing-book occupancy | Records average/peak resting orders and levels per scenario (~20.9k/41.8k in `static`) | `book_replay` has 1k/20k depth cases, but occupancy is not the headline variable | Done: the `--matrix` mode samples average/peak orders and levels for four calibrated shapes |
+| Median of many runs | 10 perf runs, median and standard deviation | Best-of-5 for microbenchmarks; medians of 2-5 for e2e | Done for the matrix: 10 whole-replay trials with median, population stddev and CV; keep p50/p99 for the case-level benches |
 | Full output hash plus state audit | Hashes every report and probes 192 random book states | Replay fixtures compare full event streams; property tests compare a reference model; cluster tests read `/read` | Done: `random_point_book_state_audit_matches_reference_model` compares BBO/depth at deterministic random indices |
 | Separate edge-case battery | 34 hard-invariant cases outside the timed workload | `src/order_book/conformance_tests.rs` plus cluster/replay suites | Mapped; the missing hard invariants are now explicit in the benchmark conformance batch (see §5) |
 | Held-out seeds | 10,000 precomputed seeds; private seeds for adversarial runs | Property tests use seeds and print failures; replay cases are fixed | Add a seed-sweep regression (e.g. 100 seeds) and keep a private-seed path for external validation |
@@ -597,30 +597,29 @@ correctness and measurement improvements land before any structural experiment.
   `order_id_is_client_metadata_not_a_book_key`.
 - **Random-point state audit.** `random_point_book_state_audit_matches_reference_model` compares
   best bid, best ask and depth at 64 deterministic indices per seed.
-
-**P1 - measurement**
-
-1. Add a `book_replay`/`replay_mix` scenario matrix with `static`, `normal`, wide-swing and
-   flash-crash shapes; record average/peak resting orders and levels per case; report the
-   worst-case median-of-10 with variance, alongside the existing p50/p99.
+- **Occupancy scenario matrix.** `cargo bench --bench book_replay -- --matrix` builds four
+  standing-book shapes calibrated to the survey's seed-23 averages (static 20.9k/60 down to
+  flash-crash 240/210), samples average/peak orders and levels, and reports the worst-case
+  median-of-10 with standard deviation and CV. The recorded macOS result is in
+  [`docs/PERFORMANCE.md`](./PERFORMANCE.md).
 
 **P2 - measurement and structure**
 
-2. Add a paced/open-loop latency-under-load run to `e2e` or `cluster_e2e`, or state explicitly in
+1. Add a paced/open-loop latency-under-load run to `e2e` or `cluster_e2e`, or state explicitly in
    `PERFORMANCE.md` that closed-loop tails understate queueing. The benchmark's worst-case
    throughput argument needs a latency companion.
-3. Evaluate a treap, sorted vector or heap hybrid only as a book-only A/B on our workloads. The
+2. Evaluate a treap, sorted vector or heap hybrid only as a book-only A/B on our workloads. The
    external gap to `lcv3` is 22%, but `level_book` already showed that per-level buckets trade
    wins and losses; do not switch on a single external leaderboard.
-4. Re-pin the benchmark to current `HEAD` and, if the adapter can be published, ship the
+3. Re-pin the benchmark to current `HEAD` and, if the adapter can be published, ship the
    reproduction. Run a held-out seed and the 10,000-seed `validate_seeds.py` path only if we are
    prepared to maintain the C ABI adapter as a separate artifact.
-5. Add a "benchmark scope" paragraph to `PERFORMANCE.md` that records the 7.20 M/s book-only result,
+4. Add a "benchmark scope" paragraph to `PERFORMANCE.md` that records the 7.20 M/s book-only result,
    the pin, the fixed issue and the non-comparability with e2e. Link back to this part.
 
 **P3 - do not chase**
 
-6. The benchmark has no FOK, stop, iceberg, post-only, GTD, fee, asset, persistence, consensus or
+5. The benchmark has no FOK, stop, iceberg, post-only, GTD, fee, asset, persistence, consensus or
    multi-symbol coverage. Those remain covered by our own conformance, property, replay and
    cluster suites; do not weaken them to match a simpler ABI.
 
@@ -634,8 +633,9 @@ replication and exact-fee semantics that distinguish this project.
 
 The highest-value transfer is therefore **methodology**, not code: worst-case scenario reporting,
 median-of-10 with variance, a calibrated order flow, random-point state audits, and a separate
-edge-case battery. The benchmark-derived correctness gaps are now closed; the remaining
-high-value work is the measurement envelope, not a new data structure.
+edge-case battery. The benchmark-derived correctness and occupancy envelope are now in place; the
+remaining measurement work is open-loop latency and structural experiments, not a new data
+structure.
 
 ## Part V - Comparison with matchengine-raft
 
@@ -678,9 +678,9 @@ does not exercise FOK, stops, icebergs, fees, persistence or consensus.
    Raft/HTTP out of the book-only numbers.
 3. **Fuzzing.** Done: `fuzz/` builds targets for the order book, WAL, snapshot and wire decoders;
    keep them buildable.
-4. **Worst-case scenario matrix (benchmark-derived).** Add `static`, `normal`, wide-swing and
-   flash-crash shapes to the book benchmarks and report the worst-case median-of-10 with variance,
-   alongside p50/p99. The current cases vary depth, not market regime.
+4. **Worst-case scenario matrix (benchmark-derived).** Done:
+   `cargo bench --bench book_replay -- --matrix` builds the four calibrated shapes, samples
+   average/peak orders and levels, and reports the worst-case median-of-10 with stddev/CV.
 5. **Random-point state audit (benchmark-derived).** Done:
    `random_point_book_state_audit_matches_reference_model` compares best bid, best ask and depth
    at deterministic random indices against the reference model.
@@ -747,10 +747,11 @@ does not exercise FOK, stops, icebergs, fees, persistence or consensus.
 
 ### Prioritized plan
 
-**P1 - measurement**
+**Completed 2026-11-10**
 
-1. Add the scenario matrix, standing-book occupancy reporting and worst-case median-of-10 to
-   `book_replay`/`replay_mix`.
+1. Occupancy scenario matrix. Done: `cargo bench --bench book_replay -- --matrix` reports the four
+   standing-book shapes, average/peak orders and levels, and the worst-case median-of-10 with
+   stddev/CV; the baseline is in `docs/PERFORMANCE.md`.
 
 **P2 - measurement and structure**
 

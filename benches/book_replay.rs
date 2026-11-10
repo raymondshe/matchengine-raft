@@ -9,10 +9,15 @@
 //! and cold behaviour are reported separately. See `benches/bench_support`.
 //!
 //! `--check` enforces the loose warm p50/p99 CI bounds from
-//! `docs/PERFORMANCE.md`; cold passes stay informational.
+//! `docs/PERFORMANCE.md`; cold passes stay informational. `--matrix` instead
+//! runs the opt-in occupancy scenario matrix (static, normal, wide-swing and
+//! flash-crash), reporting average/peak resting orders and levels plus the
+//! worst-case median-of-10 throughput with variance.
 
 #[path = "bench_support/mod.rs"]
 mod bench_support;
+#[path = "bench_support/scenario.rs"]
+mod scenario;
 
 use std::hint::black_box;
 use std::sync::atomic::AtomicBool;
@@ -154,6 +159,11 @@ fn bench_clone<T>(
 }
 
 fn main() {
+    let matrix = std::env::args().any(|arg| arg == "--matrix");
+    if matrix {
+        scenario::run();
+        return;
+    }
     let check = std::env::args().any(|arg| arg == "--check");
     println!("book-only replay benchmark (no HTTP, Raft, WAL or feed)");
     println!("warm = clone immediately before the timed op; cold = 64 MiB eviction sweep first");

@@ -26,6 +26,7 @@ cargo bench --bench storage       # WAL append/read/recovery
 RAFT_WAL_FSYNC_MS=0 MATCHENGINE_ASYNC_WAL=1 cargo bench --features async-wal --bench storage  # prototype async WAL
 cargo bench --bench p0_bench -- duplicate|read|snapshot  # P0 lock/scan A/B
 cargo bench --bench book_replay   # book-only sweeps, deep cancels and BBO advances
+cargo bench --bench book_replay -- --matrix  # occupancy scenario matrix: static/normal/wide-swing/flash-crash
 cargo bench --bench replay_mix    # realistic add/cancel/amend/stop/iceberg replay with per-op percentiles
 cargo bench --bench level_book    # per-level bucket prototype vs the current book
 cargo bench --bench apply_path    # apply-path heap allocations per applied entry
@@ -50,6 +51,7 @@ its scope.
 |---|---|---|---|---|---|
 | `matchengine` | Order-book operations: sweep, rest, partial fill, IOC cancel, iceberg refill, amend, cancel; optional depth journal | HTTP, Raft, WAL, snapshots, market-data encoding/sink | Closed-loop, in-process | `Instant`, best-of-5 per round | Best-of-5 only; not a tail study |
 | `book_replay` | `OrderBook` only: 100-level and single-level sweeps, deep cancels, BBO advancement and static BBO queries; clone/eviction outside the timed window | HTTP, Raft, WAL/snapshots, market-data feed, event construction, fees | Closed-loop, in-process; one pristine book per round | `Instant` per round; best-of-5 repeats, warm p50/p99, interleaved cold p50/p99 after a 64 MiB eviction sweep | 5-14% run-to-run; cold adds ~8-22%; 1k/20k cases differ in tree depth, not just order count |
+| `book_replay --matrix` | Four calibrated standing-book shapes (static 20.9k orders/60 levels to flash-crash 240/210) with a 50k-op steady-state mix: 45% add, 43% cancel, 10% amend, 2% taker | HTTP, Raft, WAL/snapshots, market-data feed, event construction, fees, occupancy sampling in the timed pass | Closed-loop, in-process; 10 whole-replay trials per shape; initial book and fixture cloned outside the timer | `Instant` per whole replay; median, population stddev and CV; occupancy sampled every 64 ops in a separate untimed pass | Static CV 6-7% on this host; the other shapes are below 2%; not the external 2M-message flow |
 | `replay_mix` | Deterministic 100,000-operation `OrderBook` stream: limit adds, icebergs, parked stops, cancels, amendments and market takers, with maker/taker fees on every order; whole-replay and per-operation timings | HTTP, Raft, WAL/snapshots, market-data feed, event construction, symbol/tick validation | Closed-loop, in-process; fixture generated at startup, book rebuilt per round | `Instant` per operation for the per-kind table; 20 whole-replay warm rounds plus 20 interleaved cold rounds after a 64 MiB eviction sweep | Four runs; whole-replay warm p50 within 5%, per-operation p50 within ~30%; p99 and max are host-noise sensitive |
 | `level_book` | Prototype per-level buckets plus the current `OrderBook`: match sweeps, deep cancels, sparse/dense amends, depth, BBO queries and BBO advancement; plain limit orders only; clone/eviction outside the timed window | Stops, icebergs, GTD expiry, validation, events, depth journal, market-data feed, fees beyond `MatchResult` construction | Closed-loop, in-process; paired current/prototype books | `Instant` per round; best-of-5 repeats, warm p50/p99, interleaved cold p50/p99 after a 64 MiB eviction sweep | 5-10% run-to-run, BBO-query ratio 4.9-5.6x; sparse one-order-per-level cases are the prototype's worst case |
 | `apply_path` | `StateMachineStore::apply` only: blank, rest, cancel, fill and 128-request batch workloads; a counting global allocator reports heap calls and requested bytes | HTTP, Raft, WAL, snapshots, market-data tap, event-log reads, response serialization | Closed-loop, direct apply; 50k entries or 1k batches per workload | Counting allocator; per-entry averages | Requested bytes include realloc churn and are not a live-memory high-water mark |
@@ -236,6 +238,46 @@ the 100-level sweep, 2.26-2.50 ms / 2.32-2.49 ms for the single-level sweep, 255
 257-271 µs for the deep cancels, 98-108 µs / 98-107 µs for BBO advancement and 2.30-2.59 ms /
 2.49-2.85 ms for the 1M-query loop. Treat these as order-of-magnitude baselines, not exact
 constants.
+
+## Book occupancy scenario matrix (2026-11-10)
+
+`cargo bench --bench book_replay -- --matrix` is the measurement envelope inspired by the 249-engine
+FlashOne survey. It builds one `OrderBook` per regime from the survey's canonical seed-23 average
+standing book, then replays a deterministic 50,000-operation steady-state mix over it:
+
+| Scenario | Initial orders/levels | Mix | Purpose |
+|---|---:|---|---|
+| `static` | 20,900 / 60 | 45% add, 43% cancel, 10% amend, 2% taker | Deep book with many orders per level; nothing sweeps the tail |
+| `normal` | 2,700 / 290 | same | Routine book with moderate depth |
+| `wide-swing` | 1,300 / 830 | same | Many levels, one or two orders per level |
+| `flash-crash` | 240 / 210 | same | Sparse book after a dislocation |
+
+The mix is a book-only stress mix, not the survey's 2M-message flow: it keeps the order count
+roughly constant so the four shapes stay comparable. Occupancy is sampled every 64 operations in a
+separate untimed pass; the timed pass excludes fixture generation, the initial-book clone, occupancy
+sampling and teardown. Each scenario runs 10 whole-replay trials and reports the median, population
+standard deviation and coefficient of variation; the lowest median throughput is the worst case.
+
+One representative run on this macOS host gave:
+
+| Scenario | Avg orders/levels | Peak orders/levels | Median | Stddev | CV | Median M ops/s |
+|---|---:|---:|---:|---:|---:|---:|
+| `static` | 20,917 / 59.4 | 21,226 / 60 | 10.73 ms | 658 µs | 6.1% | 4.66 |
+| `normal` | 3,090 / 282.1 | 3,558 / 290 | 7.33 ms | 123 µs | 1.7% | 6.82 |
+| `wide-swing` | 1,771 / 711.5 | 2,180 / 830 | 7.07 ms | 108 µs | 1.5% | 7.07 |
+| `flash-crash` | 432 / 176.1 | 621 / 210 | 6.34 ms | 75 µs | 1.2% | 7.88 |
+
+The worst case is `static` at **4.66-5.00 M ops/s** across three runs (normal 6.82-7.01,
+wide-swing 7.07-7.21, flash-crash 7.87-7.88). That is the expected direction:
+the 20.9k-order book pays for the deep, dense level set on every cancel, amend and match, while the
+sparse flash-crash shape runs about 1.7x faster. The external survey's 7.20 M/s result for this
+repository is not directly comparable: it is a different workload, hardware and operation mix, and
+this matrix deliberately isolates the price ladder rather than reproducing the full message flow.
+The central number to compare over time is the worst-case median and its CV, not the leaderboard.
+
+The manual Linux benchmark workflow (`.github/workflows/bench-linux.yml`) runs the pinned short and
+sustained e2e passes and then the occupancy matrix, so a pinned-host envelope is captured without a
+separate command. The regular `--check` mode still runs only the five case-level gates above.
 
 ## Realistic-mix replay benchmark (2026-11-06)
 

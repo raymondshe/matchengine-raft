@@ -17,3 +17,5 @@ jobs:
         run: cargo bench --locked --bench e2e -- --pin "$BENCH_CPU"
       - name: Pinned sustained e2e
         run: cargo bench --locked --bench e2e -- --pin "$BENCH_CPU" --duration 60 --clients 500
+      - name: Book occupancy scenario matrix
+        run: cargo bench --locked --bench book_replay -- --matrix

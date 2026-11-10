@@ -25,8 +25,8 @@ measurement and production readiness; **P2** = important but not blocking; **P3*
 
 ## Top priorities
 
-No P0 work remains. The benchmark correctness batch landed on 2026-11-10; one P1 measurement item
-remains, then the P2 production, feature and validation work, then P3 experiments.
+No P0 or P1 work remains. The benchmark correctness and occupancy envelope landed on 2026-11-10;
+the remaining P2 production, feature and validation work is next, then P3 experiments.
 
 **Recently completed (2026-11-06/10):** configurable WAL fsync with a measured A/B matrix,
 best-effort WAL recovery, the four-voter no-fsync floor (`test_min_voters.rs`), the optional
@@ -59,7 +59,9 @@ reviewed in [`docs/THIRD_PARTY_INVESTIGATION.md`](./docs/THIRD_PARTY_INVESTIGATI
 confirms the 7.20 M/s book-only B-tree result and the phantom-fill issue fixed in `a44d9ae`, and
 opened the P1 follow-ups in §17. The benchmark correctness batch is implemented: explicit
 conformance cases, `order_not_found` for cancel misses, the identity documentation and the
-random-point state audit (§17).
+random-point state audit (§17). The occupancy envelope is also in place:
+`cargo bench --bench book_replay -- --matrix` reports the four standing-book shapes and the
+worst-case median-of-10 (§8).
 
 The upstream OpenRaft minimal benchmark (three in-process nodes, in-memory log/state machine,
 function-call network, empty requests) reports 33k put/s with one client and 3.5M put/s with 4,096,
@@ -78,32 +80,29 @@ implemented: the replication lag threshold now sits above the 100k snapshot poli
 suppression is enabled, HTTP/2 windows/keepalive are tuned, snapshot chunks follow OpenRaft's
 configured size and readiness waits for recovery. The remaining P2/P3 items are tracked in §16.
 
-The next work, in order (re-prioritised 2026-11-10 after the benchmark correctness batch):
+The next work, in order (re-prioritised 2026-11-10 after the benchmark correctness and occupancy batch):
 
-1. **Add the benchmark measurement envelope (P1, §8/§17).** Add a `static`/`normal`/wide-swing/
-   flash-crash scenario matrix to `book_replay`/`replay_mix`, record average/peak resting orders
-   and levels, and report the worst-case median-of-10 with variance.
-2. **Run the Linux pinned-core `e2e` pass (P2, §8).** Dispatch the manual `Linux benchmark`
+1. **Run the Linux pinned-core `e2e` pass (P2, §8).** Dispatch the manual `Linux benchmark`
    workflow (or run the same commands on deployment hardware) and record the pinned short and
    sustained rows. This remains blocked on a Linux host and `gh` authentication.
-3. **Plan one schema-v11 order-type batch (§5, P2).** Add market-to-limit, trailing stops, pegged
+2. **Plan one schema-v11 order-type batch (§5, P2).** Add market-to-limit, trailing stops, pegged
    orders and self-trade prevention together so the snapshot/wire migration and conformance batch
    are paid once. Custom reserve replenishment and stop-protection collars stay P3 and
    product-conditional.
-4. **Aeron operation hardening and the snapshot-request stream (§6, P2).** Run external-driver
+3. **Aeron operation hardening and the snapshot-request stream (§6, P2).** Run external-driver
    and multicast fan-out validation on Linux, add the idle heartbeat and publish `ws_fanout`
    numbers; then add the late-joiner snapshot-request stream (2010).
-5. **Storage, transport and dependency hygiene (§4/§16, P2).** Bound WAL append size by bytes,
+4. **Storage, transport and dependency hygiene (§4/§16, P2).** Bound WAL append size by bytes,
    move snapshot data to `Arc<[u8]>`, stream snapshot receive instead of buffering the whole body,
    and move off `openraft` 0.10.0-alpha when a stable 0.10 release exists.
-6. **Observability measurements and console actions (§16, P2).** Record heartbeat/`AppendStream`
+5. **Observability measurements and console actions (§16, P2).** Record heartbeat/`AppendStream`
    counts and snapshot-transfer time, and add guarded purge-log/runtime-config console actions.
-7. **Provisioning and test hygiene (§2/§7, P2).** Add the `ConfigureSymbol` provisioning
+6. **Provisioning and test hygiene (§2/§7, P2).** Add the `ConfigureSymbol` provisioning
    helper/pre-trade readiness check, parameterize fixed test ports, and keep docs in sync.
-8. **Benchmark P2 follow-ups (P2, §17).** Add the open-loop latency run (or the coordinated-omission
+7. **Benchmark P2 follow-ups (P2, §17).** Add the open-loop latency run (or the coordinated-omission
    caveat), re-pin the benchmark to current `HEAD`, and evaluate a treap/sorted-vector/heap hybrid
    only as a book-only A/B.
-9. **Last: apply-path and per-level-bucket experiments (§8, P3).** Reserve known apply-path
+8. **Last: apply-path and per-level-bucket experiments (§8, P3).** Reserve known apply-path
    lengths, evaluate apply-thread affinity and adopt per-level buckets only if a sparse-level fast
    path or new measurements justify them; the measured wins are small or split.
 
@@ -473,6 +472,11 @@ Remaining (the public-suite follow-ups are tracked in §17):
   sweep 85.7µs warm p50 (11.66M fills/s), 20k/1-level sweep 2.319ms (8.86M fills/s), 5k deep
   cancels 256.7µs (19.63M cancels/s), 1k-level BBO advance 97.5µs (20.37M advances/s), 1M BBO
   queries 2.492ms (434M queries/s).
+- [x] **P1** Add the occupancy scenario matrix (`cargo bench --bench book_replay -- --matrix`):
+  four standing-book shapes calibrated to the FlashOne seed-23 averages (static 20.9k/60 down to
+  flash-crash 240/210), a 50k-op steady-state mix, occupancy sampled every 64 ops, and 10
+  whole-replay trials reporting median/stddev/CV plus the worst-case scenario. The macOS baseline
+  is in `docs/PERFORMANCE.md`; static is the worst case at 4.66-5.00 M ops/s.
 - [x] **P1** Add an apply-path allocation benchmark (`cargo bench --bench apply_path`) and reduce
   the common event path with inline `SmallVec` buffers: rest 7.17→4.17, cancel 6.00→4.00, fill
   8.00→5.00 allocs/entry; batch rest 6.23→4.19 allocs/entry. Requested bytes/entry fell from
@@ -1031,9 +1035,12 @@ reported 7.20 M/s book-only; the full review and competitor taxonomy are in
   reference-model tests. Done:
   `random_point_book_state_audit_matches_reference_model` probes 64 deterministic indices per
   seed against the reference model.
-- [ ] **P1** Add a `book_replay`/`replay_mix` scenario matrix (`static`, `normal`, wide-swing,
+- [x] **P1** Add a `book_replay`/`replay_mix` scenario matrix (`static`, `normal`, wide-swing,
   flash-crash), record average/peak resting orders and levels, and report the worst-case
-  median-of-10 with variance.
+  median-of-10 with variance. Done: `cargo bench --bench book_replay -- --matrix` builds the four
+  calibrated shapes, samples occupancy every 64 ops in an untimed pass, and reports median,
+  population stddev, CV and the worst-case scenario; the local baseline is in
+  [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md).
 - [ ] **P2** Add a paced/open-loop latency run, or state the coordinated-omission caveat for the
   closed-loop tails.
 - [ ] **P2** Re-pin the benchmark to current `HEAD`, record the book-only result and scope in
