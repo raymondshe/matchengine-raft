@@ -1084,3 +1084,238 @@ fn randomized_order_types_and_fee_styles_preserve_invariants() {
     }
     coverage.assert_complete();
 }
+
+#[derive(Clone, Copy, Debug)]
+enum V11Op {
+    Limit {
+        side: OrderSide,
+        price: Fixed,
+        volume: Fixed,
+        owner: Option<u64>,
+    },
+    Market {
+        side: OrderSide,
+        volume: Fixed,
+        owner: Option<u64>,
+    },
+    MarketToLimit {
+        side: OrderSide,
+        volume: Fixed,
+        owner: Option<u64>,
+    },
+    TrailingStop {
+        side: OrderSide,
+        offset: Fixed,
+        volume: Fixed,
+        owner: Option<u64>,
+    },
+    Peg {
+        side: OrderSide,
+        peg: PegReference,
+        offset: Fixed,
+        volume: Fixed,
+    },
+    CancelRandom,
+    Reprice,
+}
+
+fn v11_op(rng: &mut Rng) -> V11Op {
+    let side = if rng.below(2) == 0 {
+        OrderSide::Buy
+    } else {
+        OrderSide::Sell
+    };
+    let volume = Fixed::from_units(1 + rng.below(5) as i128);
+    let owner = if rng.below(5) == 0 {
+        None
+    } else {
+        Some(rng.below(4))
+    };
+    match rng.below(100) {
+        0..=39 => V11Op::Limit {
+            side,
+            price: Fixed::from_units(90 + rng.below(21) as i128),
+            volume,
+            owner,
+        },
+        40..=54 => V11Op::Market {
+            side,
+            volume,
+            owner,
+        },
+        55..=64 => V11Op::MarketToLimit {
+            side,
+            volume,
+            owner,
+        },
+        65..=74 => V11Op::TrailingStop {
+            side,
+            offset: Fixed::from_units(1 + rng.below(5) as i128),
+            volume,
+            owner,
+        },
+        75..=84 => V11Op::Peg {
+            side,
+            peg: match rng.below(3) {
+                0 => PegReference::Primary,
+                1 => PegReference::Midpoint,
+                _ => PegReference::LastTrade,
+            },
+            offset: Fixed::from_units(rng.below(5) as i128 - 2),
+            volume,
+        },
+        85..=94 => V11Op::CancelRandom,
+        _ => V11Op::Reprice,
+    }
+}
+
+fn apply_v11_op(book: &mut OrderBook, config: &SymbolConfig, op: V11Op, cursor: usize) -> Outcome {
+    match op {
+        V11Op::Limit {
+            side,
+            price,
+            volume,
+            owner,
+        } => {
+            let mut order = Order::new(side, price, volume, 0);
+            order.owner_id = owner;
+            book.execute_order_with_symbol(&mut order, config.clone())
+        }
+        V11Op::Market {
+            side,
+            volume,
+            owner,
+        } => {
+            let mut order = Order::new(side, 0.0, volume, 0);
+            order.live = OrderType::Market;
+            order.owner_id = owner;
+            book.execute_order_with_symbol(&mut order, config.clone())
+        }
+        V11Op::MarketToLimit {
+            side,
+            volume,
+            owner,
+        } => {
+            let mut order = Order::new(side, 0.0, volume, 0);
+            order.live = OrderType::Market;
+            order.market_to_limit = true;
+            order.owner_id = owner;
+            book.execute_order_with_symbol(&mut order, config.clone())
+        }
+        V11Op::TrailingStop {
+            side,
+            offset,
+            volume,
+            owner,
+        } => {
+            let price = match side {
+                OrderSide::Buy => Fixed::from(110),
+                OrderSide::Sell => Fixed::from(90),
+            };
+            let mut order = Order::new(side, price, volume, 0);
+            order.trail_offset = offset;
+            order.owner_id = owner;
+            book.execute_order_with_symbol(&mut order, config.clone())
+        }
+        V11Op::Peg {
+            side,
+            peg,
+            offset,
+            volume,
+        } => {
+            let mut order = Order::new(side, 0.0, volume, 0);
+            order.peg = Some(peg);
+            order.peg_offset = offset;
+            book.execute_order_with_symbol(&mut order, config.clone())
+        }
+        V11Op::CancelRandom => {
+            let orders: Vec<Order> = match cursor % 2 {
+                0 => book.bids.values().copied().collect(),
+                _ => book.asks.values().copied().collect(),
+            };
+            if !orders.is_empty() {
+                let order = orders[cursor % orders.len()];
+                let _ = book.cancel(&order);
+            }
+            Outcome::default()
+        }
+        V11Op::Reprice => {
+            let _ = book.reprice_pegged();
+            Outcome::default()
+        }
+    }
+}
+
+fn assert_v11_invariants(
+    book: &OrderBook,
+    config: &SymbolConfig,
+    outcome: &Outcome,
+    context: &str,
+) {
+    if let (Some(bid), Some(ask)) = (book.best_bid(), book.best_ask()) {
+        assert!(bid.price < ask.price, "{context}: crossed book");
+    }
+    for order in book.bids.values().chain(book.asks.values()) {
+        assert!(order.volume > Fixed::ZERO, "{context}: empty order");
+        assert!(order.price > Fixed::ZERO, "{context}: non-positive price");
+    }
+    if config.stp != StpMode::Off {
+        let check = |taker: &Order, maker: &Order| {
+            assert!(
+                !same_owner(taker, maker),
+                "{context}: STP let a same-owner fill through"
+            );
+        };
+        for fill in &outcome.fills {
+            check(&fill.taker, &fill.maker);
+        }
+        for trigger in &outcome.triggers {
+            for fill in &trigger.fills {
+                check(&fill.taker, &fill.maker);
+            }
+        }
+    }
+}
+
+#[test]
+fn schema_v11_order_types_preserve_invariants_and_replay() {
+    for seed in 0..16u64 {
+        let mut rng = Rng::new(seed ^ 0x11_11_11_11);
+        let config = SymbolConfig::new(0, 2, 8)
+            .unwrap()
+            .with_stp(match seed % 4 {
+                0 => StpMode::Off,
+                1 => StpMode::CancelResting,
+                2 => StpMode::CancelAggressor,
+                _ => StpMode::CancelBoth,
+            });
+        let ops: Vec<V11Op> = (0..256).map(|_| v11_op(&mut rng)).collect();
+
+        let mut book = OrderBook::new();
+        for (cursor, op) in ops.iter().copied().enumerate() {
+            let outcome = apply_v11_op(&mut book, &config, op, cursor);
+            assert_v11_invariants(
+                &book,
+                &config,
+                &outcome,
+                &format!("seed {seed} op {cursor}"),
+            );
+        }
+
+        let mut replay = OrderBook::new();
+        for (cursor, op) in ops.iter().copied().enumerate() {
+            let outcome = apply_v11_op(&mut replay, &config, op, cursor);
+            assert_v11_invariants(
+                &replay,
+                &config,
+                &outcome,
+                &format!("replay seed {seed} op {cursor}"),
+            );
+        }
+        assert_eq!(
+            serde_json::to_value(&book).unwrap(),
+            serde_json::to_value(&replay).unwrap(),
+            "seed {seed}: v11 replay diverged"
+        );
+    }
+}

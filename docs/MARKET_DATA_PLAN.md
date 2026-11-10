@@ -390,8 +390,9 @@ PARTIAL_BAR|BAR_CLOSE`; bit 4 reserved), `market_seq`, `log_index`, `ordinal`, b
   adds the separate `marketdata/` crate (`rusteron-client`, `actix-ws`, with `tokio-tungstenite`
   as a dev-dependency), which never touches the engine binary.
 - The feed state (journal, shadow book, bars) is transient and absent from snapshots. U1–U6 kept
-  `SNAPSHOT_VERSION` 3; later exactness/symbol/fee work bumped it to 10 for the replicated
-  order/event fields, single-symbol precision configuration and fee data, not for feed state.
+  `SNAPSHOT_VERSION` 3; later exactness/symbol/fee work bumped it to 11 for the replicated
+  order/event fields, single-symbol precision configuration, fee data and schema-v11 order types,
+  not for feed state.
 
 ## Progress
 
@@ -403,7 +404,7 @@ PARTIAL_BAR|BAR_CLOSE`; bit 4 reserved), `market_seq`, `log_index`, `ordinal`, b
 | U4 | **done** | `open_with_sinks`, tap frames, `capture_market_data_snapshot`, `marketdata_status`, status assertion |
 | U5 | **done** | `MarketDataConfig` on `StorageConfig`, all CLI flags (incl. `--market-data-leader-only`), leader watcher, source-gated tap, end-to-end test on 21303 |
 | U6 | **done** | README/README_CN/AGENTS/TODO/AERON updates; bench `rest 1k bids + journal` |
-| U8 | **done** | deterministic `(market_seq, sub_seq)` across replicas; all mutations sequenced; auto GTD purge; one TRADE per taker; wire v6 encoder + reference decoder |
+| U8 | **done** | deterministic `(market_seq, sub_seq)` across replicas; all mutations sequenced; auto GTD purge; one TRADE per taker; wire v7 encoder + reference decoder |
 | U9 | **partial** | `start_with_sink` seam done; per-entry empty depth deltas and bar quote volume still open (the service derives contiguity and kline `q`) |
 | U10 | **partial** | `AeronSink` (rusteron 0.2.13, embedded/external driver, one publication per stream, blocking publisher task, periodic reset snapshot) and the external-driver runbook are done; idle heartbeat, multicast fan-out validation and leadership-scoped publication lifecycle still open |
 | U11 | **done (demo)** | `demos/market_data_system/`: `FrameSource` (JSONL + Aeron + channel), per-symbol feeds, assembler, dedupe/watermark/gap policy, caches |
@@ -420,10 +421,10 @@ PARTIAL_BAR|BAR_CLOSE`; bit 4 reserved), `market_seq`, `log_index`, `ordinal`, b
 | `cargo test` | **155 unit + 52 integration** tests pass (2026-11-04; includes exactness, symbol-config, fee, quote-volume, fee-asset and periodic-snapshot tests) |
 | `cargo check --all-targets` | **0 warnings** |
 | `cargo test --test cluster test_market_data` | passed; checks `market_seq` anchors for place/amend/cancel and the uncapped trade message |
-| U8 determinism | two processors fed identical frames emit identical messages; a takeover snapshot continues the same keys; wire v6 golden tests (scale-18 `i128`) |
+| U8 determinism | two processors fed identical frames emit identical messages; a takeover snapshot continues the same keys; wire v7 golden tests (scale-18 `i128`) |
 | automatic purge | `Place`/`Cancel`/`Amend` purge due GTD at intake time; `Day` only via `PurgeExpired`; guarded by the earliest-expiry index (no scan without GTD) |
 | `matchengine-raft --help` | all feed flags present, including `--market-data-status-every` and `--market-data-leader-only` |
-| Snapshot/log formats | U8 itself kept `SNAPSHOT_VERSION` 3; later work bumped it to 4 (event window + dedupe map), 5 (fixed-point order prices/quantities), 6 (last trade + match events fixed-point), 7 (single-symbol precision configuration), 8 (maker/taker fee rates and fill fees), 9 (asset metadata, tick/lot, volume units and fee assets) and 10 (`MatchErrors` replacing the boolean fee-overflow flag). `market_seq` lives in the existing `OrderBook::sequence` |
+| Snapshot/log formats | U8 itself kept `SNAPSHOT_VERSION` 3; later work bumped it to 4 (event window + dedupe map), 5 (fixed-point order prices/quantities), 6 (last trade + match events fixed-point), 7 (single-symbol precision configuration), 8 (maker/taker fee rates and fill fees), 9 (asset metadata, tick/lot, volume units and fee assets), 10 (`MatchErrors` replacing the boolean fee-overflow flag) and 11 (owner identity, market-to-limit, trailing stops, pegs and STP). `market_seq` lives in the existing `OrderBook::sequence` |
 | Dependencies | `i256 0.2.5` added for exact notional multiplication; no other dependencies |
 
 Bench (best-of-5 per round, after the earliest-expiry guard): rest 1k bids **40.1 µs**, rest 1k +

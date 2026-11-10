@@ -16,8 +16,8 @@
 [![CI](https://github.com/raymondshe/matchengine-raft/actions/workflows/ci.yml/badge.svg)](https://github.com/raymondshe/matchengine-raft/actions/workflows/ci.yml)
 [![Rust](https://img.shields.io/badge/rust-%E2%89%A5%201.89-orange.svg)](https://www.rust-lang.org)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
-[![快照 v10](https://img.shields.io/badge/%E5%BF%AB%E7%85%A7-v10-blue.svg)](./docs)
-[![行情线格式 v6](https://img.shields.io/badge/%E8%A1%8C%E6%83%85%20wire-v6-blue.svg)](./docs/MARKET_DATA_PLAN.md)
+[![快照 v11](https://img.shields.io/badge/%E5%BF%AB%E7%85%A7-v11-blue.svg)](./docs)
+[![行情线格式 v7](https://img.shields.io/badge/%E8%A1%8C%E6%83%85%20wire-v7-blue.svg)](./docs/MARKET_DATA_PLAN.md)
 [![WAL fsync: 可配置](https://img.shields.io/badge/WAL%20fsync-%E5%8F%AF%E9%85%8D%E7%BD%AE-blue.svg)](./docs/zh-CN/STORAGE.md)
 
 一个用 Rust 构建、基于 Raft 复制的撮合引擎，面向需要确定性执行、可靠恢复和实时行情链路的团队——而不是把撮合引擎当成黑盒。
@@ -69,7 +69,7 @@
 以下能力均已实现并有测试覆盖，链接指向对应代码。
 
 **撮合引擎**
-- **价格-时间优先订单簿**，支持 GTC、IOC、FOK、GTD、Day、市价、Post-Only、冰山单、止损市价单和止损限价单。
+- **价格-时间优先订单簿**，支持 GTC、IOC、FOK、GTD、Day、市价、市价转限价、Post-Only、冰山单、止损市价单、止损限价单、移动止损和 Peg 订单，以及自成交防护。
 - **改单与撤单**遵循确定性优先级：同价减量保留时间优先；改价或增量会以新序列号重新排队。
 - **按资产扣费**，支持 maker/taker 费率、返佣和精确名义金额计算；加密货币/FX 默认收到资产扣费，ETF/股票始终以 quote 资产结算。
 - **Base 或 quote 数量**，支持 tick/lot 校验、quote 限价单归一化和 quote 预算市价扫描。
@@ -139,7 +139,7 @@ Leader 一致读默认使用 lease：`/linearizable_read`、`/events`、gRPC `St
 往返。lease read 要求节点间时钟漂移有界；`/read` 仍是本地、可能过期的读。
 
 行情输出不参与共识：tap 使用有界 `try_send`，因此慢订阅者永远不会阻塞 `apply`。feature 门控的
-`AeronSink` 由专用发布线程把同样的线格式 v6 消息发布到 2001–2007 流，每个流一个独占 publication；
+`AeronSink` 由专用发布线程把同样的线格式 v7 消息发布到 2001–2007 流，每个流一个独占 publication；
 JSONL sink 继续用于调试。
 
 ### 核心组件
@@ -156,14 +156,14 @@ JSONL sink 继续用于调试。
 
 3. **撮合引擎** ([`order_book/`](./src/order_book/))
    - 价格-时间优先的订单簿（买单与卖单）
-   - 订单类型：GTC、IOC、FOK、GTD、Day、Post-Only、冰山单、止损市价单、止损限价单
+   - 订单类型：GTC、IOC、FOK、GTD、Day、市价转限价、Post-Only、冰山单、止损市价单、止损限价单、移动止损和 Peg 订单；支持 STP 模式
    - 确定性过期（`PurgeExpired` 通过日志携带时间戳）与基于复制的最后成交价触发止损
    - 订单簿就是被复制的状态机：`apply` 确定性执行，不读时钟
    - `OrderBook::execute_order` 是完整生命周期，`place_order` 是只返回成交的兼容包装
 
 4. **行情数据出口** ([`market_data/`](./src/market_data/))
    - `apply` 将撮合事件和深度日志交给有界 tap（`try_send`，撮合路径永不等待）
-   - 仅领导者发布的任务维护影子订单簿、生成 BBO/OHLC K 线并编码线格式 v6
+   - 仅领导者发布的任务维护影子订单簿、生成 BBO/OHLC K 线并编码线格式 v7
    - 消息键为 `(symbol_id, stream_id, market_seq, sub_seq)`；每个 taker 一条不设上限的 `TRADE`
    - JSONL sink 用于调试；feature 门控的 `AeronSink` 通过 2001–2007 流发布，每个流一个独占 publication
 
@@ -332,8 +332,8 @@ WAL fsync 由 `RAFT_WAL_FSYNC_MS` 控制：未设置 = 不 fsync（默认；要�
 追加，`N > 0` = 周期 fsync。持久性契约见[存储](./docs/zh-CN/STORAGE.md)，权衡见
 [生产配置决策](./docs/zh-CN/PERFORMANCE.md#生产配置决策2026-11-08)。
 
-完整基准方法、存储路径细节和优化历史见 [性能细节](./docs/zh-CN/PERFORMANCE.md)。快照 **v10** 和
-wire **v6** 是破坏性变更，见 [DECIMAL.md](./docs/DECIMAL.md)。已知差距和路线图见
+完整基准方法、存储路径细节和优化历史见 [性能细节](./docs/zh-CN/PERFORMANCE.md)。快照 **v11** 和
+wire **v7** 是破坏性变更，见 [DECIMAL.md](./docs/DECIMAL.md)。已知差距和路线图见
 [TODO.md](./TODO.md)。
 
 ## 联系方式

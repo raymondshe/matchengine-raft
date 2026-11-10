@@ -1465,7 +1465,7 @@ The measurement rules transferred regardless of layout and are now implemented:
 - One process/cluster trades one symbol; run one deployment per symbol to scale.
 
 ### Data format `Order` prices/quantities, `last_trade_price`, match events, depth/BBO/spread, the
-JSONL feed and wire v6 use exact 18-scale fixed-point integers. Snapshot **v10** and wire **v6** are
+JSONL feed and wire v7 use exact 18-scale fixed-point integers. Snapshot **v11** and wire **v7** are
 breaking changes from earlier builds, so recreate data directories when upgrading. See
 [`docs/DECIMAL.md`](./DECIMAL.md).
 

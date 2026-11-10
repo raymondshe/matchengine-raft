@@ -48,7 +48,7 @@ use crate::order_book::VolumeUnit;
 /// Magic bytes at the start of every message.
 pub const MAGIC: [u8; 4] = *b"AMKT";
 /// Current schema version.
-pub const VERSION: u8 = 6;
+pub const VERSION: u8 = 7;
 /// Header length in bytes.
 pub const HEADER_LEN: usize = 64;
 
@@ -341,6 +341,9 @@ fn reason_code(reason: Option<RejectReason>) -> u8 {
         Some(RejectReason::UnsupportedOrder) => 6,
         Some(RejectReason::AmendWouldCross) => 7,
         Some(RejectReason::InvalidOrder) => 8,
+        Some(RejectReason::SelfTradePrevented) => 9,
+        Some(RejectReason::PegWouldCross) => 10,
+        Some(RejectReason::PegReferenceUnavailable) => 11,
     }
 }
 
@@ -819,6 +822,9 @@ fn decode_reason(code: u8) -> Result<Option<RejectReason>, WireError> {
         6 => Ok(Some(RejectReason::UnsupportedOrder)),
         7 => Ok(Some(RejectReason::AmendWouldCross)),
         8 => Ok(Some(RejectReason::InvalidOrder)),
+        9 => Ok(Some(RejectReason::SelfTradePrevented)),
+        10 => Ok(Some(RejectReason::PegWouldCross)),
+        11 => Ok(Some(RejectReason::PegReferenceUnavailable)),
         _ => Err(WireError::InvalidCode {
             field: "lifecycle.reason",
             code,
@@ -1199,14 +1205,14 @@ mod tests {
     }
 
     #[test]
-    fn wire_version_is_v6() {
-        assert_eq!(6, VERSION);
+    fn wire_version_is_v7() {
+        assert_eq!(7, VERSION);
         let bytes = encode(&message(MessageBody::Gap(GapRecord {
             last_good_log_index: 0,
             last_good_ordinal: 0,
             dropped: 0,
         })));
-        assert_eq!(6, bytes[4]);
+        assert_eq!(7, bytes[4]);
     }
 
     fn sample_trade() -> TradeRecord {
@@ -1332,7 +1338,7 @@ mod tests {
         assert_round_trip(MessageBody::Bar(sample_bar()));
     }
 
-    const GOLDEN_GAP_HEX: &str = "414d4b5406070c0007000000000000002a000000000000000300000010000000090000000000000001000000000000000068e5cf8b010000000000000300000029000000000000000200000001000000";
+    const GOLDEN_GAP_HEX: &str = "414d4b5407070c0007000000000000002a000000000000000300000010000000090000000000000001000000000000000068e5cf8b010000000000000300000029000000000000000200000001000000";
 
     fn hex_bytes(hex: &str) -> Vec<u8> {
         assert_eq!(0, hex.len() % 2, "hex must have complete bytes");
@@ -1390,6 +1396,13 @@ mod tests {
         assert!(matches!(
             decode(&bad),
             Err(WireError::UnsupportedVersion(4))
+        ));
+
+        let mut bad = golden.clone();
+        bad[4] = 6;
+        assert!(matches!(
+            decode(&bad),
+            Err(WireError::UnsupportedVersion(6))
         ));
 
         let mut bad = golden.clone();
@@ -1467,5 +1480,22 @@ mod tests {
                 code: 2
             })
         ));
+    }
+}
+
+#[cfg(test)]
+mod schema_v11_reason_tests {
+    use super::*;
+
+    #[test]
+    fn new_reason_codes_round_trip() {
+        for (reason, code) in [
+            (RejectReason::SelfTradePrevented, 9),
+            (RejectReason::PegWouldCross, 10),
+            (RejectReason::PegReferenceUnavailable, 11),
+        ] {
+            assert_eq!(code, reason_code(Some(reason)));
+            assert_eq!(Some(reason), decode_reason(code).unwrap());
+        }
     }
 }

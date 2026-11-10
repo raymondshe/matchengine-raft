@@ -194,3 +194,18 @@ ETF/股票 base 的费用始终以 quote 资产结算；加密货币和法币对
 
 `Cancel` 或 `Amend` 的键找不到挂单时，仍会消耗一个 `market_seq`，并产生原因为 `order_not_found`
 的 `rejected` 事件。`/write` 仍返回 `200`，因为请求已经提交；权威结果是事件而不是 HTTP 状态码。
+
+### Schema v11 订单类型
+
+- `market_to_limit: true`：市价扫单后，剩余量以最后成交价挂为普通限价单；无成交则整单撤销。
+  与 IOC/FOK、Post-Only、止损、冰山或 quote 数量组合会被拒绝。
+- `trail_offset`：移动止损距离。`stop_price` 入库时必须为 `0`，`trail_reference` 由引擎维护并随
+  快照持久化，当前触发价写入 `stop_price`。
+- `peg`（`primary`/`midpoint`/`last_trade`）+ `peg_offset`：以非 Peg 流动性为参考挂单；参考变化时
+  重新定价并产生 `amended` 事件，新价格会失去时间优先；会穿越时以 `peg_would_cross` 撤销。
+- `owner_id`（可选）：自成交防护身份；`SymbolConfig.stp` 为 `off`（默认）、`cancel_resting`、
+  `cancel_aggressor` 或 `cancel_both`。只有两个非空且相同的 `owner_id` 才会触发 STP。
+
+Peg 订单的 `Amend` 不接受 `price`；非零 `order.peg_offset` 表示新偏移，`0` 表示保持当前偏移
+（要归零请撤单后重下）。移动止损的 `Amend` 用 `order.trail_offset` 表示新偏移；回传当前派生
+`stop_price` 可接受，传入不同的非零触发价会被拒绝。

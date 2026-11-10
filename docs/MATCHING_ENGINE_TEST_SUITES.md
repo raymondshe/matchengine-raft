@@ -1,6 +1,6 @@
 # Public matching-engine test suites: inventory and port backlog
 
-Date: 2026-11-10 · Baseline: `master` at the benchmark conformance batch
+Date: 2026-11-10 · Baseline: `master` at the schema-v11 order-type batch
 
 This document records the public matching-engine test suites reviewed for this
 project, what they actually cover, which behaviours are worth porting, and the
@@ -99,14 +99,14 @@ repository's own cluster and replay suites are for.
 
 ## 3. What this repository covers today
 
-After both batches in section 5:
+After the batches in section 5:
 
 | Layer | Count | What it proves |
 |---|---:|---|
-| `src/` unit tests | 198 | Order-book algorithms, fees, property traces, protocol/storage units |
-| `tests/cluster/` integration tests | 67 | Raft, HTTP/gRPC, persistence, events, failover, market data |
+| `src/` unit tests | 211 | Order-book algorithms, fees, property traces, protocol/storage units |
+| `tests/cluster/` integration tests | 68 | Raft, HTTP/gRPC, persistence, events, failover, market data |
 | `tests/replay/` cases | 16 | End-to-end order-type lifecycles against checked-in expected events |
-| `src/order_book/conformance_tests.rs` | 27 | Explicit edge cases the randomized suite should not have to rediscover |
+| `src/order_book/conformance_tests.rs` | 35 | Explicit edge cases the randomized suite should not have to rediscover |
 
 The replay matrix already covers limit, market, IOC, FOK, GTD, Day, post-only,
 iceberg, stop-market, stop-limit, amend, cancel, default fees, quote-asset fees
@@ -131,11 +131,11 @@ These are venue-policy behaviours rather than matching-core behaviour, and the
 engine either does not implement them or deliberately leaves them to the order
 system:
 
-- AON, stop-trailing, pegged, OCO/OTO/OUO, market-to-limit, reserve orders,
-  reduce-only, price bands/collars, pro-rata allocation, auctions/uncrossing,
-  sessions, multi-book routing and risk/margin.
-- Venue-specific self-trade prevention (STP), mass cancel, order masks and
-  regulatory fee rules.
+- AON, OCO/OTO/OUO, reserve orders, reduce-only, price bands/collars,
+  pro-rata allocation, auctions/uncrossing, sessions, multi-book routing and
+  risk/margin.
+- Venue-specific STP policies beyond the four engine modes, mass cancel, order
+  masks and regulatory fee rules.
 - Cross-node determinism under snapshot install, log truncation and failover.
   This repository covers that in `tests/cluster/`, not in order-book unit tests.
 
@@ -255,6 +255,18 @@ Known limits of event reconstruction, recorded by the test:
   or amend of a non-resting order publishes `Rejected` with `order_not_found` and consumes one
   sequence.
 
+### Fourth batch: schema-v11 order types
+
+- `src/order_book/conformance_tests.rs` covers market-to-limit residuals, trailing-stop reference
+  updates/election, primary/midpoint peg placement and repricing, crossing-target rejection, all
+  three STP modes and the STP-aware FOK preflight.
+- `src/order_book/property_tests.rs` runs randomized MTL/trailing/peg/cancel/STP traces, asserts
+  no crossed book and no same-owner fills, and replays each trace deterministically.
+- `src/store/state_machine/tests.rs` covers STP/peg event ordering and a v11 snapshot reopen with
+  owner ids, trailing state, peg state and the STP policy.
+- `tests/cluster/test_feature_matrix.rs` drives MTL, trailing, peg and STP through `/write`;
+  the schema-v11 cluster test runs on port 21937.
+
 ## 6. Follow-up status
 
 The first two batches in section 5 are implemented. [`TODO.md`](../TODO.md)
@@ -296,9 +308,8 @@ The first two batches in section 5 are implemented. [`TODO.md`](../TODO.md)
 ### Out of scope for now
 
 Auctions, pro-rata, price bands, OCO/OTO/OUO, sessions, margin/risk and clearing.
-Market-to-limit, trailing stops, pegged orders and self-trade prevention are
-planned as one schema-v11 batch in
-[`docs/ORDER_TYPES_V11.md`](./ORDER_TYPES_V11.md); they are not implemented yet.
+The schema-v11 market-to-limit, trailing-stop, pegged-order and STP batch is
+implemented; see [`docs/ORDER_TYPES_V11.md`](./ORDER_TYPES_V11.md).
 
 ## 7. Licence and attribution rules
 

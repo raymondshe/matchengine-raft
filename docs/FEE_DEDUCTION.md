@@ -3,8 +3,9 @@
 Status: **core implemented for cash/spot; equity/ETF and fiat-to-fiat (FX) pairs are covered by the
 same model, while derivatives and margin-asset settlement remain a documented extension.** The
 engine carries base/quote asset metadata, tick/lot rules, `VolumeUnit`, quote-aware sweeps and
-`FeeAssetPolicy`. Snapshot **v9** and wire **v5** introduced those fields; snapshot **v10** and wire
-**v6** replace the boolean fee-overflow flag with the ordered `error`/`MatchErrors` code set.
+`FeeAssetPolicy`. Snapshot **v9** and wire **v5** introduced those fields; snapshot v10 and wire v6 replaced the
+boolean fee-overflow flag with the ordered `error`/`MatchErrors` code set. The current snapshot
+**v11** and wire **v7** keep that contract.
 Derivatives and margin-asset settlement are a documented extension, not implemented; the model is in
 §3.2, the freeze policy is in §6.6.3 and the open items are §13 items 11-13. Sessions, settlement,
 corporate actions and fixed/regulatory/minimum/tax fees are owned by the external order system.
@@ -767,13 +768,13 @@ Use the `MatchResult::exact_notional` / `exact_taker_fee` / `exact_maker_fee`,
 `TradeRecord`/`LifecycleRecord` equivalents in Rust, or cross-check `error` in another language.
 Nullable fields were rejected because they would force a
 snapshot v11/wire v7 migration without adding information beyond the error set; the zero sentinel is
-now part of the v10/v6 contract.
+now part of the v11/v7 contract.
 
 Derivatives make overflow easier to reach because notional includes the contract multiplier and the
 settlement asset may require a conversion. A fill with an overflow code must not be fed into margin,
 PnL or liquidation calculations as if its zero fields were real.
 
-This is a breaking event/wire/snapshot change: snapshot **v10** and wire **v6** carry `MatchErrors`.
+This is a breaking event/wire/snapshot change: snapshot **v11** and wire **v7** carry `MatchErrors`.
 The v9/v5 boolean `fee_overflow` is legacy and is not decoded into the new shape.
 
 ## 8. Impact on order-book execution
@@ -880,7 +881,7 @@ they were base quantities.
 
 The derivatives extension in §3.2 also requires `VolumeUnit::Contract`, the instrument kind,
 contract multiplier and settlement asset in `SymbolConfig`, and `FeeAsset::Settlement`. These are
-wire and snapshot changes: snapshot v10 and wire v6 cannot carry them without another version and
+wire and snapshot changes: snapshot v11 and wire v7 cannot carry them without another version and
 migration.
 
 Freeze metadata is not part of `Order`: balances, reservations and accounts stay in the order
@@ -996,8 +997,8 @@ This was implemented as a breaking storage/wire change:
 - `SymbolConfig` gained base/quote asset metadata and the fee policy.
 - `MatchEvent`/`MatchResult` gained quote notional and fee-asset fields; the boolean
   `fee_overflow` was replaced by the ordered `error`/`MatchErrors` code set.
-- Snapshot version is **v10**.
-- Market-data wire format is **v6**.
+- Snapshot version is **v11**.
+- Market-data wire format is **v7**.
 - Existing snapshots cannot be decoded into the new shape; data directories must be recreated or
   a versioned decoder must be added.
 - `volume_unit` defaults to `Base` and fee policy to `Received` for JSON compatibility, but old
@@ -1091,7 +1092,7 @@ Still open:
 
 Resolved:
 
-14. **Numeric sentinel policy.** Keep zero plus `MatchErrors` for snapshot v10 and wire v6. A zero
+14. **Numeric sentinel policy.** Keep zero plus `MatchErrors` for snapshot v11 and wire v7. A zero
     is authoritative only when its code is absent; `MatchResult` and `MatchEvent` expose
     `exact_notional`/`exact_quote_volume`, `exact_taker_fee` and `exact_maker_fee` accessors, and
     market-data records expose the same helpers. Nullable fields were rejected because they would
@@ -1169,7 +1170,7 @@ Adopt the following default contract:
 - Derivatives funding, liquidation, margin and PnL stay upstream; the engine matches orders and
   reports gross fills, fees and fee assets. A fill with an overflow error code must be quarantined
   rather than treated as zero fee/notional by the risk layer.
-- Snapshot v10 and wire v6 gate the cash/spot change; a derivatives extension needs a new
+- Snapshot v11 and wire v7 gate the cash/spot change; a derivatives extension needs a new
   snapshot/wire version.
 
 This keeps the order book’s price-time priority unchanged while extending the execution path with

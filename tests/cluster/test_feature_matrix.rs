@@ -27,7 +27,10 @@ use matchengine_raft::order_book::Fixed;
 use matchengine_raft::order_book::Order;
 use matchengine_raft::order_book::OrderSide;
 use matchengine_raft::order_book::OrderType;
+use matchengine_raft::order_book::PegReference;
 use matchengine_raft::order_book::RejectReason;
+use matchengine_raft::order_book::StpMode;
+use matchengine_raft::order_book::SymbolConfig;
 use matchengine_raft::order_book::TimeInForce;
 use matchengine_raft::store::MatchEngineRequest;
 use matchengine_raft::store::MatchEngineResponse;
@@ -894,4 +897,106 @@ async fn wait_for_leader(client: &MatchEngineClient<C>) {
         assert!(Instant::now() <= deadline, "node 1 never became leader");
         C::sleep(Duration::from_millis(100)).await;
     }
+}
+
+#[test]
+fn schema_v11_order_types_and_stp_reach_engine() {
+    C::run(async {
+        let (node, client, _temp) = start_node("127.0.0.1:21937", "schema-v11").await;
+        let config = SymbolConfig::new(0, 2, 8)
+            .unwrap()
+            .with_stp(StpMode::CancelResting);
+        apply(&client, MatchEngineRequest::ConfigureSymbol { config }).await;
+
+        // Market-to-limit: sweep two levels, rest the residual at the last fill.
+        apply(&client, place(limit(OrderSide::Sell, 100.0, 2.0))).await;
+        apply(&client, place(limit(OrderSide::Sell, 101.0, 3.0))).await;
+        let mut mtl = limit(OrderSide::Buy, 0.0, 6.0);
+        mtl.live = OrderType::Market;
+        mtl.market_to_limit = true;
+        let response = apply(&client, place(mtl)).await;
+        assert_eq!(
+            vec![
+                MatchEventKind::Fill,
+                MatchEventKind::Fill,
+                MatchEventKind::Rested,
+            ],
+            kinds(&response.events)
+        );
+        let rested = response.events.last().unwrap();
+        assert_eq!(101.0, rested.price.to_f64());
+        assert_eq!(1.0, rested.volume.to_f64());
+
+        // Trailing stop: reference rises with a print, then a retrace elects it.
+        let mut stop = limit(OrderSide::Sell, 100.0, 1.0);
+        stop.trail_offset = Fixed::from(1);
+        let response = apply(&client, place(stop)).await;
+        assert!(response.events.is_empty());
+
+        apply(&client, place(limit(OrderSide::Sell, 105.0, 1.0))).await;
+        let response = apply(&client, place(market(OrderSide::Buy, 1.0))).await;
+        assert_eq!(vec![MatchEventKind::Fill], kinds(&response.events));
+
+        apply(&client, place(limit(OrderSide::Sell, 104.0, 1.0))).await;
+        let response = apply(&client, place(market(OrderSide::Buy, 1.0))).await;
+        assert!(
+            response
+                .events
+                .iter()
+                .any(|event| event.kind == MatchEventKind::Triggered),
+            "the trailing stop must trigger: {:?}",
+            response.events
+        );
+        assert_eq!(
+            2,
+            response
+                .events
+                .iter()
+                .filter(|event| event.kind == MatchEventKind::Fill)
+                .count(),
+            "the taker fill and the stop child fill"
+        );
+
+        // Primary peg: joins the non-pegged bid, then reprices when it improves.
+        apply(&client, place(limit(OrderSide::Buy, 90.0, 1.0))).await;
+        apply(&client, place(limit(OrderSide::Sell, 120.0, 1.0))).await;
+        let mut peg = limit(OrderSide::Buy, 0.0, 1.0);
+        peg.peg = Some(PegReference::Primary);
+        let response = apply(&client, place(peg)).await;
+        assert_eq!(vec![MatchEventKind::Rested], kinds(&response.events));
+        assert_eq!(90.0, response.events[0].price.to_f64());
+
+        let response = apply(&client, place(limit(OrderSide::Buy, 91.0, 1.0))).await;
+        assert_eq!(
+            vec![MatchEventKind::Rested, MatchEventKind::Amended],
+            kinds(&response.events)
+        );
+        assert_eq!(91.0, response.events[1].price.to_f64());
+
+        // Self-trade prevention: cancel the same-owner maker and keep matching.
+        let mut same = limit(OrderSide::Sell, 100.0, 1.0);
+        same.owner_id = Some(1);
+        apply(&client, place(same)).await;
+        let mut other = limit(OrderSide::Sell, 100.0, 1.0);
+        other.owner_id = Some(2);
+        apply(&client, place(other)).await;
+        let mut taker = limit(OrderSide::Buy, 100.0, 2.0);
+        taker.owner_id = Some(1);
+        let response = apply(&client, place(taker)).await;
+        assert_eq!(
+            vec![
+                MatchEventKind::Cancelled,
+                MatchEventKind::Fill,
+                MatchEventKind::Rested,
+                MatchEventKind::Amended,
+            ],
+            kinds(&response.events)
+        );
+        assert_eq!(
+            Some(RejectReason::SelfTradePrevented),
+            response.events[0].reason
+        );
+
+        node.shutdown().await.unwrap();
+    });
 }

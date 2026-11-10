@@ -499,6 +499,29 @@ impl FeeAssetPolicy {
 /// and add integers directly; this configuration validates and formats values
 /// at the API boundary. A symbol may use fewer decimals (for example 2 for an
 /// equity or 8 for native BTC), but never more than 18.
+///
+/// Self-trade prevention policy for a symbol.
+///
+/// STP applies only when both the taker and the maker carry the same
+/// `owner_id`; anonymous orders (`owner_id == None`) never self-trade-prevent.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StpMode {
+    /// No self-trade prevention (the default and the v10 behaviour).
+    #[default]
+    Off,
+    /// Cancel the same-owner maker and continue matching the taker.
+    CancelResting,
+    /// Cancel the taker's remainder at the first same-owner maker.
+    CancelAggressor,
+    /// Cancel both the same-owner maker and the taker remainder.
+    CancelBoth,
+}
+
+/// The one symbol this process/cluster trades, its precision and fee policy.
+///
+/// The configuration is replicated through Raft and locked after the first
+/// accepted order. Multi-symbol means one process/cluster per symbol.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SymbolConfig {
     /// Instrument id (the process/cluster trades one symbol).
@@ -515,6 +538,9 @@ pub struct SymbolConfig {
     pub base_lot: Fixed,
     /// Fee asset policy for this pair.
     pub fee_asset_policy: FeeAssetPolicy,
+    /// Self-trade prevention policy; default off.
+    #[serde(default)]
+    pub stp: StpMode,
 }
 
 fn default_symbol_assets(decimals: u8) -> (AssetId, AssetId) {
@@ -548,6 +574,7 @@ impl Default for SymbolConfig {
             price_tick: Fixed(1),
             base_lot: Fixed(1),
             fee_asset_policy: FeeAssetPolicy::Received,
+            stp: StpMode::Off,
         }
     }
 }
@@ -571,6 +598,7 @@ impl SymbolConfig {
             price_tick: decimal_step(price_decimals),
             base_lot: decimal_step(quantity_decimals),
             fee_asset_policy: FeeAssetPolicy::Received,
+            stp: StpMode::Off,
         })
     }
 
@@ -603,6 +631,12 @@ impl SymbolConfig {
     /// Overrides the fee asset policy.
     pub fn with_fee_asset_policy(mut self, policy: FeeAssetPolicy) -> Self {
         self.fee_asset_policy = policy;
+        self
+    }
+
+    /// Overrides the self-trade prevention policy.
+    pub fn with_stp(mut self, stp: StpMode) -> Self {
+        self.stp = stp;
         self
     }
 

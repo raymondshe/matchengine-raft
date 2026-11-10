@@ -156,9 +156,9 @@ fn maker_and_taker_fees_survive_events_feed_and_snapshot_restart() {
         assert!(snapshot.last_log_id.is_some());
         let bytes = std::fs::read(storage.snapshot_dir(1).join("current.snap")).unwrap();
         assert_eq!(
-            10,
+            11,
             u32::from_le_bytes(bytes[7..11].try_into().unwrap()),
-            "snapshot must be v10"
+            "snapshot must be v11"
         );
 
         node.shutdown().await.unwrap();

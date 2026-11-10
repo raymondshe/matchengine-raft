@@ -124,7 +124,7 @@ Every order/mutation request consumes one `market_seq`; `Place` also uses it as 
 sequence, while `ConfigureSymbol` does not consume one. The response carries at most 512 events;
 the full batch is available from `/events`. Fill events carry
 `quote_volume`, `volume_unit`, `taker_fee`/`taker_fee_asset` and `maker_fee`/`maker_fee_asset`;
-the same fields are on market-data `TRADE` and fill `LIFECYCLE` records (wire v6).
+the same fields are on market-data `TRADE` and fill `LIFECYCLE` records (wire v7).
 `client_order_id` is optional and only affects `Place`: a retry returns the original sequence and
 events instead of placing a second order. It must be 1–128 bytes from
 `[A-Za-z0-9._:-]`; an empty value is rejected, so omit the field to disable idempotency.
@@ -181,14 +181,16 @@ Set this process's symbol, assets and accepted precision before trading:
   "price_decimals": 2,
   "price_tick": "0.01",
   "base_lot": "0.0001",
-  "fee_asset_policy": "quote"
+  "fee_asset_policy": "quote",
+  "stp": "off"
 }}}
 ```
 
 The configuration is replicated and locked once the first order is accepted. Changing it while
 orders are open, or after trading has started, is refused. A successful change on a publishing
 node also queues a market-data reset snapshot for the new symbol. The response uses the optional
-`error` field for this non-fatal case; the write itself is still committed.
+`error` field for this non-fatal case; the write itself is still committed. `stp` defaults to
+`"off"`; when enabled, the gateway must populate `order.owner_id`.
 
 Fee rates (`maker_fee_rate`, `taker_fee_rate`) are signed `Fixed` fractions supplied by the
 gateway from the user level. `"0.001"` means 10 bps and negative values are rebates. They are
@@ -199,7 +201,7 @@ Fees are truncated toward zero at 18 places; a fill carries an ordered `error` s
 the supported fixed-point range. The affected numeric field is `0` when its code is present, so a
 zero is authoritative only when the code is absent; Rust consumers can use the
 `MatchResult`/`MatchEvent` `exact_*` accessors. Nullable fields were rejected to keep the snapshot
-v10/wire v6 contract. The engine records fees but does not move balances: the order
+v11/wire v7 contract. The engine records fees but does not move balances: the order
 system freezes the trading asset and clearing deducts fees from that freeze.
 
 Base/quote volume semantics and asset-aware fee deduction for fiat, stablecoin, crypto, ETF and
@@ -235,3 +237,39 @@ Order identity has three separate fields:
 A `Cancel` or `Amend` whose key does not match a resting order still consumes one `market_seq` and
 publishes a `Rejected` event with reason `order_not_found`. `/write` returns `200` because the
 request is committed; the event, not the HTTP status, is the authoritative result.
+
+### Schema-v11 order types
+
+Snapshot v11/wire v7 add four optional order features. They default off, so an order that omits the
+new fields behaves exactly like v10. The full semantics are in
+[`docs/ORDER_TYPES_V11.md`](./ORDER_TYPES_V11.md); the API fields are:
+
+- `market_to_limit` (`bool`): a `Market` order that sweeps and then rests any remainder at the last
+  fill price. `price` is ignored on entry; the rested remainder becomes an ordinary `Limit` and the
+  flag is cleared. No fill cancels the whole order. IOC/FOK, post-only, stops, icebergs and quote
+  volume are rejected with this flag.
+- `trail_offset` (`Fixed`): a positive trailing distance for a stop. `stop_price` must be `0` on
+  entry; `trail_reference` is engine-managed (client values are overwritten) and persisted for
+  restart. The current derived trigger is reported in `stop_price`.
+- `peg` (`"primary" | "midpoint" | "last_trade"`) and `peg_offset` (signed `Fixed`): a resting
+  limit whose price is derived from non-pegged liquidity. `price` must be sent as `0`. A change in
+  the reference re-prices the order with a new sequence and an `amended` event; a target that would
+  cross is cancelled with `peg_would_cross`; a missing reference is `peg_reference_unavailable`.
+- `owner_id` (`u64`, optional): the trader identity used by self-trade prevention. The symbol's
+  `stp` policy is `off` (default), `cancel_resting`, `cancel_aggressor` or `cancel_both`. STP only
+  matches two non-null owner ids; anonymous orders never self-trade-prevent.
+
+Examples:
+
+```json
+{"Place": {"order": {"live": "Market", "side": "Buy", "volume": "5", "market_to_limit": true, "sequence": 0}}}
+{"Place": {"order": {"live": "Limit", "side": "Sell", "price": "99", "volume": "1", "trail_offset": "1", "sequence": 0}}}
+{"Place": {"order": {"live": "Limit", "side": "Buy", "price": "0", "volume": "2", "peg": "primary", "peg_offset": "0", "sequence": 0}}}
+{"Place": {"order": {"live": "Limit", "side": "Sell", "price": "100", "volume": "1", "owner_id": 42, "sequence": 0}}}
+```
+
+For a pegged `Amend`, `price` is refused because it is derived. A non-zero `order.peg_offset` in the
+amend key changes the offset; `0` keeps the current offset (cancel and place to reset it to zero).
+A trailing-stop amend uses `order.trail_offset` for the new offset; echoing the current derived
+`order.stop_price` is accepted, while a different non-zero trigger is refused because it is derived. Both still consume one market sequence and publish
+`rejected` on refusal.

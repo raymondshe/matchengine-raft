@@ -5,9 +5,9 @@ current branch state.
 
 **Current baseline:** the OpenRaft 0.10 port, durable WAL/snapshot storage and exact scale-18
 `Fixed` migration are done. Order prices/quantities, last trade, match events, depth/BBO, `/read`,
-the market-data feed and wire v6 are exact; snapshot v10 stores fixed-point orders/events, the
-single-symbol precision configuration, asset metadata, volume units, maker/taker fee assets and the
-fill-level `error` code set.
+the market-data feed and wire v7 are exact; snapshot v11 stores fixed-point orders/events, the
+single-symbol precision configuration, asset metadata, volume units, maker/taker fee assets, the
+fill-level `error` code set, owner identity, market-to-limit/trailing/peg state and the STP policy.
 One process/cluster trades exactly one symbol; multi-symbol is isolated by running one process per
 symbol. Base/quote volume and asset-aware fee deduction are done, and the market-data processor
 runs as a tokio task. WAL durability is configurable (`RAFT_WAL_FSYNC_MS`: unset = no fsync with a
@@ -25,8 +25,9 @@ measurement and production readiness; **P2** = important but not blocking; **P3*
 
 ## Top priorities
 
-No P0 or P1 work remains. The benchmark correctness and occupancy envelope landed on 2026-11-10;
-the remaining P2 production, feature and validation work is next, then P3 experiments.
+No P0 or P1 work remains. The benchmark correctness/occupancy envelope and the schema-v11
+order-type batch landed on 2026-11-10; the remaining P2 production, feature and validation work is
+next, then P3 experiments.
 
 **Recently completed (2026-11-06/10):** configurable WAL fsync with a measured A/B matrix,
 best-effort WAL recovery, the four-voter no-fsync floor (`test_min_voters.rs`), the optional
@@ -51,7 +52,7 @@ has a real-process leader-kill test: three survivors commit, and the restarted n
 after losing a truncated WAL tail (§7). Parked stops now accept direct trigger/limit/volume
 amendments and icebergs accept total-open-volume amendments with priority rules (§5). The
 market-data service records and replays per-symbol JSONL archives through the normal feed path
-(§6). The §13 external contract is settled: zero-plus-`MatchErrors` remains for v10/v6 with exact
+(§6). The §13 external contract is settled: zero-plus-`MatchErrors` remains for v11/v7 with exact
 accessors, quote iceberg/FOK stay rejected, and fee tokens stay outside the engine. The measured
 baselines, write/lease decisions, async-WAL numbers and upstream OpenRaft comparison are in
 [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md). The 249-engine FlashOne benchmark survey is
@@ -61,8 +62,9 @@ opened the P1 follow-ups in §17. The benchmark correctness batch is implemented
 conformance cases, `order_not_found` for cancel misses, the identity documentation and the
 random-point state audit (§17). The occupancy envelope is also in place:
 `cargo bench --bench book_replay -- --matrix` reports the four standing-book shapes and the
-worst-case median-of-10 (§8). The schema-v11 order-type batch is planned in
-[`docs/ORDER_TYPES_V11.md`](./docs/ORDER_TYPES_V11.md); implementation is the next P2 step.
+worst-case median-of-10 (§8). The schema-v11 order-type batch is implemented: snapshot v11,
+market-data wire v7, market-to-limit, trailing stops, pegged orders and self-trade prevention
+(§5).
 
 The upstream OpenRaft minimal benchmark (three in-process nodes, in-memory log/state machine,
 function-call network, empty requests) reports 33k put/s with one client and 3.5M put/s with 4,096,
@@ -72,7 +74,7 @@ not the current bottleneck; the application read/write path and benchmark isolat
 Failure behavior is complete (§15): the node fail-stops on WAL `ENOSPC`/`EIO`, recovers from
 `SIGKILL` during writes, keeps snapshot writes atomic, and a learner killed mid-snapshot-install
 restarts without a partial snapshot and retries cleanly. Pre-Vote is enabled with a dedicated gRPC
-RPC (§4), so an isolated node asks before campaigning. The wire v6 reference decoder and golden
+RPC (§4), so an isolated node asks before campaigning. The wire v7 reference decoder and golden
 tests are complete (§6).
 
 An OpenRaft utilization review (2026-11-06, [`RAFT_REVIEW.md`](./docs/RAFT_REVIEW.md)) found the
@@ -81,29 +83,25 @@ implemented: the replication lag threshold now sits above the 100k snapshot poli
 suppression is enabled, HTTP/2 windows/keepalive are tuned, snapshot chunks follow OpenRaft's
 configured size and readiness waits for recovery. The remaining P2/P3 items are tracked in §16.
 
-The next work, in order (re-prioritised 2026-11-10 after the benchmark correctness and occupancy batch):
+The next work, in order (re-prioritised 2026-11-10 after the schema-v11 batch):
 
 1. **Run the Linux pinned-core `e2e` pass (P2, §8).** Dispatch the manual `Linux benchmark`
    workflow (or run the same commands on deployment hardware) and record the pinned short and
    sustained rows. This remains blocked on a Linux host and `gh` authentication.
-2. **Implement the planned schema-v11 order-type batch (P2, §5).** The plan is in
-   [`docs/ORDER_TYPES_V11.md`](./docs/ORDER_TYPES_V11.md): market-to-limit, trailing stops, pegged
-   orders and STP share snapshot v11, wire v7 and one conformance/replay batch. Custom reserve
-   replenishment and stop-protection collars stay P3 and product-conditional.
-3. **Aeron operation hardening and the snapshot-request stream (§6, P2).** Run external-driver
+2. **Aeron operation hardening and the snapshot-request stream (§6, P2).** Run external-driver
    and multicast fan-out validation on Linux, add the idle heartbeat and publish `ws_fanout`
    numbers; then add the late-joiner snapshot-request stream (2010).
-4. **Storage, transport and dependency hygiene (§4/§16, P2).** Bound WAL append size by bytes,
+3. **Storage, transport and dependency hygiene (§4/§16, P2).** Bound WAL append size by bytes,
    move snapshot data to `Arc<[u8]>`, stream snapshot receive instead of buffering the whole body,
    and move off `openraft` 0.10.0-alpha when a stable 0.10 release exists.
-5. **Observability measurements and console actions (§16, P2).** Record heartbeat/`AppendStream`
+4. **Observability measurements and console actions (§16, P2).** Record heartbeat/`AppendStream`
    counts and snapshot-transfer time, and add guarded purge-log/runtime-config console actions.
-6. **Provisioning and test hygiene (§2/§7, P2).** Add the `ConfigureSymbol` provisioning
+5. **Provisioning and test hygiene (§2/§7, P2).** Add the `ConfigureSymbol` provisioning
    helper/pre-trade readiness check, parameterize fixed test ports, and keep docs in sync.
-7. **Benchmark P2 follow-ups (P2, §17).** Add the open-loop latency run (or the coordinated-omission
+6. **Benchmark P2 follow-ups (P2, §17).** Add the open-loop latency run (or the coordinated-omission
    caveat), re-pin the benchmark to current `HEAD`, and evaluate a treap/sorted-vector/heap hybrid
    only as a book-only A/B.
-8. **Last: apply-path and per-level-bucket experiments (§8, P3).** Reserve known apply-path
+7. **Last: apply-path and per-level-bucket experiments (§8, P3).** Reserve known apply-path
    lengths, evaluate apply-thread affinity and adopt per-level buckets only if a sparse-level fast
    path or new measurements justify them; the measured wins are small or split.
 
@@ -310,10 +308,13 @@ Remaining:
   data model, semantics, apply order, snapshot v10 -> v11, wire v6 -> v7 and the conformance/replay
   matrix. STP identity is `Order.owner_id: Option<u64>` plus `SymbolConfig.stp`, default `Off`;
   pegs reference non-pegged liquidity to make the reprice pass deterministic.
-- [ ] **P2** Implement the planned schema-v11 batch in one migration. Follow the delivery sequence
-  in [`docs/ORDER_TYPES_V11.md`](./docs/ORDER_TYPES_V11.md): data model + snapshot v11, MTL,
-  trailing stops, STP, pegged orders, wire v7, then the conformance/replay/docs batch. Do not land
-  the features separately; the snapshot and wire bumps are paid once.
+- [x] **P2** Implement the planned schema-v11 batch in one migration. Done: `Order` gained
+  `owner_id`, `market_to_limit`, `trail_offset`/`trail_reference`, `peg`/`peg_offset`;
+  `SymbolConfig` gained `stp`; `SNAPSHOT_VERSION` is 11 and `market_data::wire::VERSION` is 7.
+  Market-to-limit, trailing stops, deterministic non-pegged peg repricing and all three STP
+  modes are implemented, with conformance/property/snapshot/cluster coverage and docs in
+  [`docs/ORDER_TYPES_V11.md`](./docs/ORDER_TYPES_V11.md), `docs/API.md`, `docs/MATCHING.md` and
+  `docs/MATCH_RESULTS.md`. Custom reserve replenishment and stop-protection collars remain P3.
 - [ ] **P3** Add custom reserve replenishment and stop-protection collars only if the product
   requires them; the current iceberg display tranche covers the existing reserve behaviour.
 - [x] **P2** Phase 4 of match-result delivery: long-poll `/events` (`wait_ms`), gRPC
@@ -610,7 +611,7 @@ Done:
 - [x] The unused `match_engine.png` was removed and `logs/` is gitignored.
 - [x] README/README_CN, AGENTS, TODO, PERFORMANCE, AERON, MATCH_RESULTS, MARKET_DATA_PLAN,
   FEE_DEDUCTION, DECIMAL, DEMO_ORDER_SYSTEM and MATCHING_ENGINE_TEST_SUITES are synced with the
-  WAL + snapshot + gRPC design, snapshot v10 / wire v6 and the implemented demo crate.
+  WAL + snapshot + gRPC design, snapshot v11 / wire v7 and the implemented demo crate.
 - [x] `docs/DECIMAL.md` records the fixed-point research, BTC 18-decimal range analysis,
   microbenchmarks and the completed end-to-end migration.
 - [x] **P3** Renamed `src/matchengine/` to `src/order_book/` (2026-10-29); the public module is now

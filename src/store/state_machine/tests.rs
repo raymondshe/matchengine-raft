@@ -2047,3 +2047,206 @@ async fn apply_wakes_event_waiters_only_when_events_are_appended() {
     assert!(!changed.has_changed().unwrap());
     assert_eq!(watermark, *changed.borrow_and_update());
 }
+
+/// STP maker cancellations are interleaved with fills, and pegged orders are
+/// repriced after the primary request's events.
+#[tokio::test]
+async fn apply_publishes_stp_and_pegged_events() {
+    use crate::match_result::MatchEventKind;
+    use crate::match_result::MemorySink;
+    use crate::order_book::Order;
+    use crate::order_book::OrderSide;
+    use crate::order_book::PegReference;
+    use crate::order_book::RejectReason;
+    use crate::order_book::StpMode;
+    use crate::order_book::SymbolConfig;
+    use openraft::alias::EntryOf;
+
+    fn entry(
+        index: u64,
+        payload: EntryPayloadOf<MatchEngineTypeConfig>,
+    ) -> EntryOf<MatchEngineTypeConfig> {
+        Entry {
+            log_id: log_id(1, index),
+            payload,
+        }
+    }
+
+    let dir = tempdir();
+    let sink = Arc::new(MemorySink::new());
+    let mut store =
+        StateMachineStore::<MatchEngineTypeConfig>::open_with_sink(dir.path(), sink.clone())
+            .unwrap();
+
+    let config = SymbolConfig::new(0, 2, 8)
+        .unwrap()
+        .with_stp(StpMode::CancelResting);
+    let mut same = Order::new(OrderSide::Sell, 100.0, 1.0, 0);
+    same.owner_id = Some(1);
+    let mut other = Order::new(OrderSide::Sell, 100.0, 1.0, 0);
+    other.owner_id = Some(2);
+    let mut taker = Order::new(OrderSide::Buy, 100.0, 2.0, 0);
+    taker.owner_id = Some(1);
+    let entries = futures::stream::iter(vec![
+        Ok((
+            entry(
+                1,
+                EntryPayload::Normal(MatchEngineRequest::ConfigureSymbol { config }),
+            ),
+            None,
+        )),
+        Ok((
+            entry(2, EntryPayload::Normal(MatchEngineRequest::place(same))),
+            None,
+        )),
+        Ok((
+            entry(3, EntryPayload::Normal(MatchEngineRequest::place(other))),
+            None,
+        )),
+        Ok((
+            entry(4, EntryPayload::Normal(MatchEngineRequest::place(taker))),
+            None,
+        )),
+    ]);
+    store.apply(entries).await.unwrap();
+
+    let events = sink.events();
+    assert_eq!(
+        vec![
+            MatchEventKind::Rested,
+            MatchEventKind::Rested,
+            MatchEventKind::Cancelled,
+            MatchEventKind::Fill,
+            MatchEventKind::Rested,
+        ],
+        events.iter().map(|event| event.kind).collect::<Vec<_>>(),
+        "events: {events:?}"
+    );
+    assert_eq!(Some(RejectReason::SelfTradePrevented), events[2].reason);
+    assert_eq!(same.sequence, events[2].order_sequence);
+
+    // A better non-pegged bid reprices the primary peg after the rested event.
+    let bid = Order::new(OrderSide::Buy, 101.0, 1.0, 0);
+    let peg = Order::new(OrderSide::Buy, 0.0, 1.0, 0);
+    let mut peg = peg;
+    peg.peg = Some(PegReference::Primary);
+    let entries = futures::stream::iter(vec![
+        Ok((
+            entry(5, EntryPayload::Normal(MatchEngineRequest::place(bid))),
+            None,
+        )),
+        Ok((
+            entry(6, EntryPayload::Normal(MatchEngineRequest::place(peg))),
+            None,
+        )),
+    ]);
+    store.apply(entries).await.unwrap();
+
+    // The peg is placed after the better bid, so it targets 101 immediately.
+    let events = sink.events();
+    let peg_events = &events[events.len() - 2..];
+    assert_eq!(
+        vec![MatchEventKind::Rested, MatchEventKind::Rested],
+        peg_events
+            .iter()
+            .map(|event| event.kind)
+            .collect::<Vec<_>>()
+    );
+    let peg_sequence = peg_events[1].order_sequence;
+
+    let better = Order::new(OrderSide::Buy, 102.0, 1.0, 0);
+    let entries = futures::stream::iter(vec![Ok((
+        entry(7, EntryPayload::Normal(MatchEngineRequest::place(better))),
+        None,
+    ))]);
+    store.apply(entries).await.unwrap();
+    let events = sink.events();
+    let tail = &events[events.len() - 2..];
+    assert_eq!(
+        vec![MatchEventKind::Rested, MatchEventKind::Amended],
+        tail.iter().map(|event| event.kind).collect::<Vec<_>>()
+    );
+    let amended = &tail[1];
+    assert_eq!(Fixed::from(102), amended.price);
+    assert_eq!(Some(peg_sequence), amended.previous_sequence);
+}
+
+#[tokio::test]
+async fn snapshot_preserves_v11_order_types() {
+    use crate::order_book::Fixed;
+    use crate::order_book::Order;
+    use crate::order_book::OrderSide;
+    use crate::order_book::PegReference;
+    use crate::order_book::StpMode;
+    use crate::order_book::SymbolConfig;
+
+    let dir = tempdir();
+    let store = StateMachineStore::<MatchEngineTypeConfig>::open(dir.path()).unwrap();
+    {
+        let mut inner = store.inner().lock().await;
+        inner
+            .configure_symbol(
+                SymbolConfig::new(0, 2, 8)
+                    .unwrap()
+                    .with_stp(StpMode::CancelBoth),
+            )
+            .unwrap();
+        inner.orderbook.last_trade_price = Some(Fixed::from(100));
+
+        let mut bid = Order::new(OrderSide::Buy, 100.0, 1.0, 0);
+        bid.owner_id = Some(7);
+        inner.orderbook.place_order(&mut bid);
+        let mut ask = Order::new(OrderSide::Sell, 102.0, 1.0, 0);
+        inner.orderbook.place_order(&mut ask);
+
+        let mut peg = Order::new(OrderSide::Buy, 0.0, 1.0, 0);
+        peg.peg = Some(PegReference::Primary);
+        inner.orderbook.place_order(&mut peg);
+
+        let mut trail = Order::new(OrderSide::Sell, 99.0, 1.0, 0);
+        trail.trail_offset = Fixed::from(1);
+        inner.orderbook.place_order(&mut trail);
+
+        inner.last_applied_log = Some(log_id(1, 3));
+    }
+    store.persist_snapshot().await.unwrap();
+
+    let reopened = StateMachineStore::<MatchEngineTypeConfig>::open(dir.path()).unwrap();
+    let content = reopened.to_content().await;
+    assert_eq!(StpMode::CancelBoth, content.symbol_config.stp);
+    assert!(
+        content.orders.iter().any(|order| order.owner_id == Some(7)),
+        "owner identity is persisted"
+    );
+    let peg = content
+        .orders
+        .iter()
+        .find(|order| order.is_pegged())
+        .expect("the peg is persisted");
+    assert_eq!(Some(PegReference::Primary), peg.peg);
+    assert_eq!(Fixed::from(100), peg.price);
+
+    let trailing = content
+        .stops
+        .iter()
+        .find(|order| order.is_trailing_stop())
+        .expect("the trailing stop is persisted");
+    assert_eq!(Fixed::from(100), trailing.trail_reference);
+    assert_eq!(Fixed::from(99), trailing.stop_price);
+}
+
+#[tokio::test]
+async fn old_snapshot_version_is_rejected() {
+    let dir = tempdir();
+    let mut bytes = Vec::from(SNAPSHOT_MAGIC.as_slice());
+    bytes.extend_from_slice(&10u32.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    std::fs::write(dir.path().join(SNAPSHOT_FILE), bytes).unwrap();
+
+    let err = StateMachineStore::<MatchEngineTypeConfig>::open(dir.path()).unwrap_err();
+    assert_eq!(io::ErrorKind::InvalidData, err.kind());
+    assert!(
+        err.to_string().contains("unsupported snapshot version 10"),
+        "unexpected error: {err}"
+    );
+}

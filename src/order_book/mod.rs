@@ -15,6 +15,7 @@ pub use fixed::FeeAssetPolicy;
 pub use fixed::Fixed;
 pub use fixed::MAX_FEE_RATE;
 pub use fixed::MIN_FEE_RATE;
+pub use fixed::StpMode;
 pub use fixed::SymbolConfig;
 pub use fixed::VolumeUnit;
 
@@ -45,6 +46,19 @@ pub enum OrderType {
     Market,
     /// Limit order - executes only at the specified price or better.
     Limit,
+}
+
+/// How a pegged order derives its resting price.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PegReference {
+    /// Own-side best non-pegged quote: a buy joins the best bid, a sell the
+    /// best ask.
+    Primary,
+    /// Midpoint of the non-pegged best bid and best ask.
+    Midpoint,
+    /// Most recent trade price.
+    LastTrade,
 }
 
 /// How long an order stays live: the classic time-in-force policies.
@@ -132,6 +146,12 @@ pub enum RejectReason {
     /// Amend: the new price would cross the opposite side. A resting book must
     /// never cross; cancel and place a new order to take liquidity.
     AmendWouldCross,
+    /// Self-trade prevention cancelled a maker or the taker remainder.
+    SelfTradePrevented,
+    /// A pegged order's target would cross the opposite non-pegged touch.
+    PegWouldCross,
+    /// A peg has no non-pegged BBO or last trade to reference.
+    PegReferenceUnavailable,
     /// Volume, price or an unsupported type combination is out of range.
     InvalidOrder,
 }
@@ -188,6 +208,10 @@ pub struct Order {
     /// level at placement (`"0.001"` = 10 bps; negative = rebate).
     #[serde(default)]
     pub taker_fee_rate: Fixed,
+    /// Trader identity used by self-trade prevention. `None` means the order
+    /// has no identity and never matches another anonymous order for STP.
+    #[serde(default)]
+    pub owner_id: Option<u64>,
 
     /// Unique identifier for the order.
     pub id: u64,
@@ -207,6 +231,25 @@ pub struct Order {
     /// trading; otherwise it rests in full like a GTC limit.
     #[serde(default)]
     pub post_only: bool,
+    /// Market-to-limit: sweep like a market order, then rest any remainder at
+    /// the last fill price as an ordinary limit order. Cleared when the
+    /// remainder rests; no fill cancels the whole order.
+    #[serde(default)]
+    pub market_to_limit: bool,
+    /// Positive trailing distance for a trailing stop; zero means this is not a
+    /// trailing stop. The derived trigger is stored in `stop_price`.
+    #[serde(default)]
+    pub trail_offset: Fixed,
+    /// Engine-managed high/low-water reference for a trailing stop. A client
+    /// value is overwritten at placement; `0` means not initialised yet.
+    #[serde(default)]
+    pub trail_reference: Fixed,
+    /// Peg target for a resting limit order; `None` means a normal order.
+    #[serde(default)]
+    pub peg: Option<PegReference>,
+    /// Signed offset applied to the peg target.
+    #[serde(default)]
+    pub peg_offset: Fixed,
     /// Stop (trigger) price; `0.0` means the order is not a stop. When set,
     /// the order parks off the book until the last trade price elects it
     /// (sell: a trade at or below the stop; buy: a trade at or above it), then
@@ -269,10 +312,16 @@ impl Order {
             requested_volume_unit: VolumeUnit::Base,
             maker_fee_rate: Fixed::ZERO,
             taker_fee_rate: Fixed::ZERO,
+            owner_id: None,
             id: 0,
             sequence,
             tif: TimeInForce::Gtc,
             post_only: false,
+            market_to_limit: false,
+            trail_offset: Fixed::ZERO,
+            trail_reference: Fixed::ZERO,
+            peg: None,
+            peg_offset: Fixed::ZERO,
             stop_price: Fixed::ZERO,
             display_volume: Fixed::ZERO,
             hidden_volume: Fixed::ZERO,
@@ -308,18 +357,52 @@ impl Order {
     }
 
     /// `true` when the order is parked off the book until its stop price
-    /// triggers.
+    /// triggers. This includes fixed stops and trailing stops.
     pub fn is_stop(&self) -> bool {
-        self.stop_price > Fixed::ZERO
+        self.stop_price > Fixed::ZERO || self.trail_offset > Fixed::ZERO
+    }
+
+    /// `true` for a trailing stop (`trail_offset > 0`).
+    pub fn is_trailing_stop(&self) -> bool {
+        self.trail_offset > Fixed::ZERO
+    }
+
+    /// `true` for a pegged resting limit order.
+    pub fn is_pegged(&self) -> bool {
+        self.peg.is_some()
+    }
+
+    /// `true` for a market order whose remainder rests at the last fill price.
+    pub fn is_market_to_limit(&self) -> bool {
+        self.market_to_limit
     }
 
     /// Whether a trade at `last_trade_price` elects this stop order: a sell
     /// stop fires at or below its stop price, a buy stop at or above it.
     fn stop_elected(&self, last_trade_price: Fixed) -> bool {
+        let trigger = if self.is_trailing_stop() {
+            if self.trail_reference <= Fixed::ZERO {
+                return false;
+            }
+            self.trailing_trigger().unwrap_or(Fixed::ZERO)
+        } else {
+            self.stop_price
+        };
         match self.side {
-            OrderSide::Buy => last_trade_price >= self.stop_price,
-            OrderSide::Sell => last_trade_price <= self.stop_price,
+            OrderSide::Buy => last_trade_price >= trigger,
+            OrderSide::Sell => last_trade_price <= trigger,
         }
+    }
+
+    /// The current trailing trigger, if the reference has been initialised.
+    fn trailing_trigger(&self) -> Option<Fixed> {
+        if !self.is_trailing_stop() || self.trail_reference <= Fixed::ZERO {
+            return None;
+        }
+        Some(match self.side {
+            OrderSide::Buy => self.trail_reference + self.trail_offset,
+            OrderSide::Sell => self.trail_reference - self.trail_offset,
+        })
     }
 }
 
@@ -835,6 +918,17 @@ enum SweepMode {
     SellQuote,
 }
 
+/// One maker cancelled by self-trade prevention, with the number of fills that
+/// had already been emitted before the cancellation. The state machine uses
+/// `after_fills` to interleave `Cancelled` events with `Fill` events.
+#[derive(Debug, Clone, Copy)]
+pub struct StpCancel {
+    /// The maker order removed from the book.
+    pub order: Order,
+    /// Number of fills emitted before this cancellation.
+    pub after_fills: usize,
+}
+
 /// Everything one submitted order did to the book: what
 /// [`OrderBook::execute_order`] reports so the state machine can turn it into
 /// events and a response.
@@ -854,6 +948,11 @@ pub struct Outcome {
     /// Volume of the submission that was cancelled without executing (an IOC
     /// remainder, a market remainder, or FOK rounding dust).
     pub cancelled: Option<Fixed>,
+    /// Why the submission's remainder was cancelled; set for an STP aggressor
+    /// cancellation.
+    pub cancel_reason: Option<RejectReason>,
+    /// Same-owner makers cancelled by STP, in match order.
+    pub stp_cancelled: Vec<StpCancel>,
     /// The order was parked off the book as a stop order.
     pub parked: bool,
     /// The order was refused outright; it never entered the book.
@@ -874,6 +973,11 @@ pub struct StopExecution {
     pub fills: Vec<MatchResult>,
     /// Child volume that could not execute; cancelled, never rested.
     pub cancelled: Option<Fixed>,
+    /// Why the child remainder was cancelled; set for an STP aggressor
+    /// cancellation.
+    pub cancel_reason: Option<RejectReason>,
+    /// Same-owner makers cancelled by the child's STP policy.
+    pub stp_cancelled: Vec<StpCancel>,
 }
 
 /// A successful amendment: the order as it now rests, plus where it came from.
@@ -890,6 +994,21 @@ pub struct Amendment {
     pub previous_price: Fixed,
     /// Open volume the order had before the amendment.
     pub previous_volume: Fixed,
+}
+
+/// One pegged-order reprice result. The state machine turns these into
+/// `Amended` or `Cancelled` events after the request's primary events.
+#[derive(Debug, Clone)]
+pub enum PegUpdate {
+    /// The peg's target changed and the order was re-inserted.
+    Amended(Amendment),
+    /// The peg lost its reference or would cross; it was removed.
+    Cancelled {
+        /// The order as it rested before removal.
+        order: Order,
+        /// Why it was cancelled.
+        reason: RejectReason,
+    },
 }
 
 /// Why an amendment was refused. Nothing changes on any of these.
@@ -911,6 +1030,10 @@ pub enum AmendError {
     WouldCross,
     /// The new stop trigger is already elected by the last trade price.
     StopWouldTrigger,
+    /// A pegged order's new target would cross the opposite touch.
+    PegWouldCross,
+    /// A pegged order has no non-pegged reference for its target.
+    PegReferenceUnavailable,
 }
 
 impl AmendError {
@@ -922,6 +1045,8 @@ impl AmendError {
             AmendError::InvalidPrice | AmendError::InvalidVolume => RejectReason::InvalidOrder,
             AmendError::WouldCross => RejectReason::AmendWouldCross,
             AmendError::StopWouldTrigger => RejectReason::StopWouldTrigger,
+            AmendError::PegWouldCross => RejectReason::PegWouldCross,
+            AmendError::PegReferenceUnavailable => RejectReason::PegReferenceUnavailable,
         }
     }
 }
@@ -963,6 +1088,7 @@ struct SweepContext<'a> {
     journal: &'a mut Vec<DepthChange>,
     track_gtd: bool,
     gtd_dirty: &'a mut bool,
+    stp_cancelled: &'a mut Vec<StpCancel>,
 }
 
 impl OrderBook {
@@ -994,6 +1120,38 @@ impl OrderBook {
         let sequence = self.sequence;
         self.sequence += 1;
         sequence
+    }
+
+    /// Records a trade print and advances every parked trailing stop.
+    ///
+    /// The reference is a high-water mark for a sell stop and a low-water mark
+    /// for a buy stop. Updates are internal state (no event); only a later
+    /// election publishes a trigger. Prices are positive, so zero is an
+    /// unambiguous "not initialised" sentinel.
+    fn observe_trade(&mut self, price: Fixed) {
+        self.last_trade_price = Some(price);
+        for stop in &mut self.stops {
+            if !stop.is_trailing_stop() {
+                continue;
+            }
+            if stop.trail_reference <= Fixed::ZERO {
+                stop.trail_reference = price;
+            } else {
+                match stop.side {
+                    OrderSide::Buy => {
+                        if price < stop.trail_reference {
+                            stop.trail_reference = price;
+                        }
+                    }
+                    OrderSide::Sell => {
+                        if price > stop.trail_reference {
+                            stop.trail_reference = price;
+                        }
+                    }
+                }
+            }
+            stop.stop_price = stop.trailing_trigger().unwrap_or(Fixed::ZERO);
+        }
     }
 
     /// Recomputes the earliest GTD deadline after a GTD order left the book.
@@ -1116,6 +1274,164 @@ impl OrderBook {
             (Some(bid), Some(ask)) => bid.price.midpoint(ask.price),
             _ => None,
         }
+    }
+
+    /// Best bid excluding pegged orders.
+    fn best_non_pegged_bid(&self) -> Option<&Order> {
+        self.bids.values().find(|order| !order.is_pegged())
+    }
+
+    /// Best ask excluding pegged orders.
+    fn best_non_pegged_ask(&self) -> Option<&Order> {
+        self.asks.values().find(|order| !order.is_pegged())
+    }
+
+    /// Computes a peg's target price from non-pegged liquidity.
+    fn peg_target(
+        &self,
+        peg: PegReference,
+        offset: Fixed,
+        side: OrderSide,
+    ) -> Result<Fixed, RejectReason> {
+        let bid = self.best_non_pegged_bid();
+        let ask = self.best_non_pegged_ask();
+        let reference = match peg {
+            PegReference::Primary => match side {
+                OrderSide::Buy => bid.map(|order| order.price),
+                OrderSide::Sell => ask.map(|order| order.price),
+            },
+            PegReference::Midpoint => match (bid, ask) {
+                (Some(bid), Some(ask)) => bid.price.midpoint(ask.price),
+                _ => None,
+            },
+            PegReference::LastTrade => self.last_trade_price,
+        };
+        let Some(reference) = reference else {
+            return Err(RejectReason::PegReferenceUnavailable);
+        };
+        let target = reference.saturating_add(offset);
+        if target <= Fixed::ZERO {
+            return Err(RejectReason::InvalidOrder);
+        }
+        let crosses = match side {
+            OrderSide::Buy => self.best_ask().is_some_and(|ask| target >= ask.price),
+            OrderSide::Sell => self.best_bid().is_some_and(|bid| target <= bid.price),
+        };
+        if crosses {
+            return Err(RejectReason::PegWouldCross);
+        }
+        Ok(target)
+    }
+
+    /// Reprices every resting pegged order once against the current non-pegged
+    /// liquidity, in deterministic side/sequence order.
+    ///
+    /// The pass returns the amendments and cancellations for the caller to
+    /// publish. `StateMachineStore::apply` calls it after every mutating
+    /// request; direct `OrderBook` callers can invoke it explicitly.
+    pub fn reprice_pegged(&mut self) -> Vec<PegUpdate> {
+        let bid_keys: Vec<BidKey> = self
+            .bids
+            .iter()
+            .filter(|(_, order)| order.is_pegged())
+            .map(|(key, _)| *key)
+            .collect();
+        let ask_keys: Vec<AskKey> = self
+            .asks
+            .iter()
+            .filter(|(_, order)| order.is_pegged())
+            .map(|(key, _)| *key)
+            .collect();
+
+        let mut updates = Vec::new();
+        for key in bid_keys {
+            self.reprice_one_peg(OrderSide::Buy, key.price, key.sequence, &mut updates);
+        }
+        for key in ask_keys {
+            self.reprice_one_peg(OrderSide::Sell, key.price, key.sequence, &mut updates);
+        }
+        updates
+    }
+
+    fn reprice_one_peg(
+        &mut self,
+        side: OrderSide,
+        price: Fixed,
+        sequence: u64,
+        updates: &mut Vec<PegUpdate>,
+    ) {
+        let order = match side {
+            OrderSide::Buy => self.bids.get(&BidKey { price, sequence }).copied(),
+            OrderSide::Sell => self.asks.get(&AskKey { price, sequence }).copied(),
+        };
+        let Some(order) = order else {
+            return;
+        };
+        let Some(peg) = order.peg else {
+            return;
+        };
+
+        let target = match self.peg_target(peg, order.peg_offset, side) {
+            Ok(target) => target,
+            Err(reason) => {
+                match side {
+                    OrderSide::Buy => self.bids.remove(&BidKey { price, sequence }),
+                    OrderSide::Sell => self.asks.remove(&AskKey { price, sequence }),
+                };
+                if matches!(order.tif, TimeInForce::Gtd(_)) {
+                    self.gtd_scan_dirty = true;
+                }
+                self.record_depth_change(side, order.price, -order.volume, -1);
+                updates.push(PegUpdate::Cancelled { order, reason });
+                return;
+            }
+        };
+        if target == order.price {
+            return;
+        }
+
+        match side {
+            OrderSide::Buy => {
+                self.bids.remove(&BidKey { price, sequence });
+            }
+            OrderSide::Sell => {
+                self.asks.remove(&AskKey { price, sequence });
+            }
+        }
+        self.record_depth_change(side, order.price, -order.volume, -1);
+
+        let market_seq = self.next_market_sequence();
+        let mut updated = order;
+        updated.price = target;
+        updated.sequence = market_seq;
+        match side {
+            OrderSide::Buy => {
+                self.bids.insert(
+                    BidKey {
+                        price: target,
+                        sequence: market_seq,
+                    },
+                    updated,
+                );
+            }
+            OrderSide::Sell => {
+                self.asks.insert(
+                    AskKey {
+                        price: target,
+                        sequence: market_seq,
+                    },
+                    updated,
+                );
+            }
+        }
+        self.record_depth_change(side, target, updated.volume, 1);
+        updates.push(PegUpdate::Amended(Amendment {
+            market_seq,
+            order: updated,
+            previous_sequence: sequence,
+            previous_price: price,
+            previous_volume: order.open_volume(),
+        }));
     }
 
     /// Aggregated visible depth for one side, best price first, up to `levels`
@@ -1307,6 +1623,20 @@ impl OrderBook {
             return outcome;
         }
 
+        if order.is_pegged() {
+            let Some(peg) = order.peg else {
+                outcome.rejected = Some(RejectReason::InvalidOrder);
+                return outcome;
+            };
+            match self.peg_target(peg, order.peg_offset, order.side) {
+                Ok(price) => order.price = price,
+                Err(reason) => {
+                    outcome.rejected = Some(reason);
+                    return outcome;
+                }
+            }
+        }
+
         // Every admissible mutating request advances the GTD clock: the taker's
         // intake timestamp is the trigger time and its sequence anchors the
         // expiry events. `Day` needs a market close, so only the explicit
@@ -1318,6 +1648,11 @@ impl OrderBook {
         // A stop order parks off the book; it is only ever elected by a *new*
         // trade, so one the last trade already crosses is refused on entry.
         if order.is_stop() {
+            if order.is_trailing_stop() {
+                // The client's reference is ignored; it is engine state.
+                order.trail_reference = self.last_trade_price.unwrap_or(Fixed::ZERO);
+                order.stop_price = order.trailing_trigger().unwrap_or(Fixed::ZERO);
+            }
             if self
                 .last_trade_price
                 .is_some_and(|last| order.stop_elected(last))
@@ -1347,7 +1682,7 @@ impl OrderBook {
         }
 
         // Fill-or-kill: the whole quantity must be there, or nothing happens.
-        if order.tif == TimeInForce::Fok && self.fillable_volume(order) < order.volume {
+        if order.tif == TimeInForce::Fok && self.fillable_volume(order, config.stp) < order.volume {
             outcome.rejected = Some(RejectReason::FokUnfillable);
             return outcome;
         }
@@ -1357,25 +1692,40 @@ impl OrderBook {
             OrderType::Market => None,
             OrderType::Limit => Some(order.price),
         };
-        let (fills, remainder) = self.sweep(order, limit, &config);
+        let (fills, remainder, stp_prevented) =
+            self.sweep(order, limit, &config, &mut outcome.stp_cancelled);
         outcome.fills = fills;
+        if stp_prevented {
+            outcome.cancel_reason = Some(RejectReason::SelfTradePrevented);
+        }
+        if order.market_to_limit
+            && remainder > Fixed::ZERO
+            && let Some(print) = outcome.fills.last()
+        {
+            // The market part has consumed every better level. The residual is
+            // now an ordinary limit at the final execution price.
+            order.price = print.maker.price;
+            order.live = OrderType::Limit;
+            order.market_to_limit = false;
+        }
 
         if remainder > Fixed::ZERO {
-            if order.volume_unit == VolumeUnit::Quote
+            if stp_prevented
+                || order.volume_unit == VolumeUnit::Quote
                 || order.tif.is_immediate()
                 || order.live == OrderType::Market
             {
-                // Quote-market leftovers, IOC/FOK remainders and market
-                // remainders are cancelled; they never rest.
+                // Quote-market leftovers, IOC/FOK remainders, STP-stopped
+                // takers and market remainders are cancelled; they never rest.
                 outcome.cancelled = Some(remainder);
             } else {
                 outcome.resting = Some(self.rest(order, remainder));
             }
         }
 
-        // Any trade moves the last trade price, which may elect parked stops.
-        if let Some(print) = outcome.fills.last() {
-            self.last_trade_price = Some(print.maker.price);
+        // Every print advances the last trade price and any trailing stops.
+        for print in &outcome.fills {
+            self.observe_trade(print.maker.price);
         }
         self.run_stops(&mut outcome, &config);
 
@@ -1485,10 +1835,15 @@ impl OrderBook {
         if !key.stop_price.is_finite() || key.stop_price < Fixed::ZERO {
             return Err(AmendError::InvalidPrice);
         }
+        if !key.trail_offset.is_finite() || key.trail_offset < Fixed::ZERO {
+            return Err(AmendError::InvalidPrice);
+        }
 
         // A parked stop is identified by side + sequence and keeps that
         // identity through an amendment. `key.stop_price > 0` carries the new
-        // trigger; zero means "leave the trigger unchanged".
+        // fixed trigger; zero means "leave the trigger unchanged". For a
+        // trailing stop the trigger is derived, so `key.trail_offset > 0`
+        // carries the new offset and `key.stop_price` must stay zero.
         if let Some(index) = self
             .stops
             .iter()
@@ -1498,12 +1853,38 @@ impl OrderBook {
             if stop.live == OrderType::Market && price.is_some() {
                 return Err(AmendError::UnsupportedType);
             }
-            let new_stop_price = if key.stop_price > Fixed::ZERO {
-                key.stop_price
+
+            let new_stop_price = if stop.is_trailing_stop() {
+                if key.stop_price > Fixed::ZERO && key.stop_price != stop.stop_price {
+                    return Err(AmendError::UnsupportedType);
+                }
+                let new_offset = if key.trail_offset > Fixed::ZERO {
+                    key.trail_offset
+                } else {
+                    stop.trail_offset
+                };
+                if stop.trail_reference > Fixed::ZERO {
+                    match stop.side {
+                        OrderSide::Buy => stop.trail_reference + new_offset,
+                        OrderSide::Sell => stop.trail_reference - new_offset,
+                    }
+                } else {
+                    Fixed::ZERO
+                }
             } else {
-                stop.stop_price
+                if key.trail_offset > Fixed::ZERO {
+                    return Err(AmendError::UnsupportedType);
+                }
+                if key.stop_price > Fixed::ZERO {
+                    key.stop_price
+                } else {
+                    stop.stop_price
+                }
             };
-            if let Some(last) = self.last_trade_price {
+
+            if new_stop_price > Fixed::ZERO
+                && let Some(last) = self.last_trade_price
+            {
                 let elected = match stop.side {
                     OrderSide::Buy => last >= new_stop_price,
                     OrderSide::Sell => last <= new_stop_price,
@@ -1515,6 +1896,13 @@ impl OrderBook {
 
             let mut updated = stop;
             updated.stop_price = new_stop_price;
+            if stop.is_trailing_stop() {
+                updated.trail_offset = if key.trail_offset > Fixed::ZERO {
+                    key.trail_offset
+                } else {
+                    stop.trail_offset
+                };
+            }
             if stop.live == OrderType::Limit {
                 updated.price = price.unwrap_or(stop.price);
             }
@@ -1532,7 +1920,7 @@ impl OrderBook {
 
         // A stop trigger on a key that did not match a parked stop would
         // silently turn a book order into a stop; refuse it.
-        if key.stop_price > Fixed::ZERO {
+        if key.stop_price > Fixed::ZERO || key.trail_offset > Fixed::ZERO {
             return Err(AmendError::UnsupportedType);
         }
 
@@ -1556,11 +1944,47 @@ impl OrderBook {
         if stored.live != OrderType::Limit {
             return Err(AmendError::NotResting);
         }
+        if !stored.is_pegged() && (key.peg.is_some() || key.peg_offset != Fixed::ZERO) {
+            return Err(AmendError::UnsupportedType);
+        }
 
-        let new_price = price.unwrap_or(stored.price);
-        let new_open_volume = volume.unwrap_or(stored.open_volume());
+        let new_peg_offset = if stored.is_pegged() {
+            if price.is_some() {
+                return Err(AmendError::UnsupportedType);
+            }
+            if key.peg.is_some() && key.peg != stored.peg {
+                return Err(AmendError::UnsupportedType);
+            }
+            let new_offset = if key.peg_offset != Fixed::ZERO {
+                key.peg_offset
+            } else {
+                stored.peg_offset
+            };
+            let peg = stored.peg.ok_or(AmendError::UnsupportedType)?;
+            let target =
+                self.peg_target(peg, new_offset, key.side)
+                    .map_err(|reason| match reason {
+                        RejectReason::PegWouldCross => AmendError::PegWouldCross,
+                        RejectReason::PegReferenceUnavailable => {
+                            AmendError::PegReferenceUnavailable
+                        }
+                        _ => AmendError::InvalidPrice,
+                    })?;
+            let new_open_volume = volume.unwrap_or(stored.open_volume());
+            if new_open_volume <= Fixed::ZERO {
+                return Err(AmendError::InvalidVolume);
+            }
+            (target, new_open_volume, Some(new_offset))
+        } else {
+            (
+                price.unwrap_or(stored.price),
+                volume.unwrap_or(stored.open_volume()),
+                None,
+            )
+        };
+        let (new_price, new_open_volume, new_peg_offset) = new_peg_offset;
 
-        if new_price != stored.price {
+        if !stored.is_pegged() && new_price != stored.price {
             let would_cross = match key.side {
                 OrderSide::Buy => self.best_ask().is_some_and(|ask| ask.price <= new_price),
                 OrderSide::Sell => self.best_bid().is_some_and(|bid| bid.price >= new_price),
@@ -1579,8 +2003,11 @@ impl OrderBook {
                     sequence: key.sequence,
                 },
                 stored,
-                new_price,
-                new_open_volume,
+                AmendValues {
+                    price: new_price,
+                    open_volume: new_open_volume,
+                    peg_offset: new_peg_offset,
+                },
                 market_seq,
                 |price, sequence| BidKey { price, sequence },
             ),
@@ -1591,8 +2018,11 @@ impl OrderBook {
                     sequence: key.sequence,
                 },
                 stored,
-                new_price,
-                new_open_volume,
+                AmendValues {
+                    price: new_price,
+                    open_volume: new_open_volume,
+                    peg_offset: new_peg_offset,
+                },
                 market_seq,
                 |price, sequence| AskKey { price, sequence },
             ),
@@ -1704,7 +2134,8 @@ impl OrderBook {
         order: &Order,
         limit: Option<Fixed>,
         config: &SymbolConfig,
-    ) -> (Vec<MatchResult>, Fixed) {
+        stp_cancelled: &mut Vec<StpCancel>,
+    ) -> (Vec<MatchResult>, Fixed, bool) {
         // The journal is a separate field, so the resting side and the journal
         // can be borrowed together without a second pass over the map.
         let record = self.record_depth;
@@ -1722,6 +2153,7 @@ impl OrderBook {
                     journal: &mut self.depth_journal,
                     track_gtd,
                     gtd_dirty: &mut gtd_dirty,
+                    stp_cancelled,
                 },
             ),
             OrderSide::Sell => Self::sweep_side(
@@ -1734,6 +2166,7 @@ impl OrderBook {
                     journal: &mut self.depth_journal,
                     track_gtd,
                     gtd_dirty: &mut gtd_dirty,
+                    stp_cancelled,
                 },
             ),
         };
@@ -1750,9 +2183,10 @@ impl OrderBook {
         order: &Order,
         limit: Option<Fixed>,
         context: SweepContext<'_>,
-    ) -> (Vec<MatchResult>, Fixed) {
+    ) -> (Vec<MatchResult>, Fixed, bool) {
         let mut results = Vec::new();
         let mut remaining = order.volume;
+        let mut taker_prevented = false;
         let mode = if order.volume_unit == VolumeUnit::Quote {
             match order.side {
                 OrderSide::Buy => SweepMode::BuyQuote,
@@ -1782,6 +2216,56 @@ impl OrderBook {
                 // The best level is away from the taker's limit: it cannot
                 // trade any further.
                 break;
+            }
+
+            let same_owner = same_owner(order, &maker);
+            if same_owner && context.config.stp != StpMode::Off {
+                match context.config.stp {
+                    StpMode::Off => {}
+                    StpMode::CancelResting => {
+                        best.remove();
+                        if context.track_gtd && matches!(maker.tif, TimeInForce::Gtd(_)) {
+                            *context.gtd_dirty = true;
+                        }
+                        record_depth_change(
+                            context.journal,
+                            context.record,
+                            maker.side,
+                            maker.price,
+                            -maker.volume,
+                            -1,
+                        );
+                        context.stp_cancelled.push(StpCancel {
+                            order: maker,
+                            after_fills: results.len(),
+                        });
+                        continue;
+                    }
+                    StpMode::CancelAggressor => {
+                        taker_prevented = true;
+                        break;
+                    }
+                    StpMode::CancelBoth => {
+                        best.remove();
+                        if context.track_gtd && matches!(maker.tif, TimeInForce::Gtd(_)) {
+                            *context.gtd_dirty = true;
+                        }
+                        record_depth_change(
+                            context.journal,
+                            context.record,
+                            maker.side,
+                            maker.price,
+                            -maker.volume,
+                            -1,
+                        );
+                        context.stp_cancelled.push(StpCancel {
+                            order: maker,
+                            after_fills: results.len(),
+                        });
+                        taker_prevented = true;
+                        break;
+                    }
+                }
             }
 
             let by_base = remaining.min(maker.volume);
@@ -1887,7 +2371,7 @@ impl OrderBook {
             }
         }
 
-        (results, remaining)
+        (results, remaining, taker_prevented)
     }
 
     /// Volume the opposite side could execute for `order` right now: every
@@ -1896,25 +2380,35 @@ impl OrderBook {
     /// Read-only. A fill-or-kill preflight compares this with the order's
     /// volume before anything moves; the sweep then allocates greedily per
     /// level, so an accepted FOK executes its whole quantity and rests nothing.
-    fn fillable_volume(&self, order: &Order) -> Fixed {
+    fn fillable_volume(&self, order: &Order, stp: StpMode) -> Fixed {
         let limit = match order.live {
             OrderType::Market => None,
             OrderType::Limit => Some(order.price),
         };
-        match order.side {
-            OrderSide::Buy => self
-                .asks
-                .values()
-                .take_while(|maker| limit.is_none_or(|limit| maker.price <= limit))
-                .map(Order::open_volume)
-                .fold(Fixed::ZERO, Fixed::saturating_add),
-            OrderSide::Sell => self
-                .bids
-                .values()
-                .take_while(|maker| limit.is_none_or(|limit| maker.price >= limit))
-                .map(Order::open_volume)
-                .fold(Fixed::ZERO, Fixed::saturating_add),
+        let mut total = Fixed::ZERO;
+        let makers: Box<dyn Iterator<Item = &Order>> = match order.side {
+            OrderSide::Buy => Box::new(self.asks.values()),
+            OrderSide::Sell => Box::new(self.bids.values()),
+        };
+        for maker in makers {
+            let crosses = match (limit, order.side) {
+                (Some(limit), OrderSide::Buy) => maker.price <= limit,
+                (Some(limit), OrderSide::Sell) => maker.price >= limit,
+                (None, _) => true,
+            };
+            if !crosses {
+                break;
+            }
+            if same_owner(order, maker) {
+                match stp {
+                    StpMode::Off => {}
+                    StpMode::CancelResting => continue,
+                    StpMode::CancelAggressor | StpMode::CancelBoth => break,
+                }
+            }
+            total = total.saturating_add(maker.open_volume());
         }
+        total
     }
 
     /// Whether `order` at its own price would trade against the book right now.
@@ -1956,9 +2450,11 @@ impl OrderBook {
                 OrderType::Limit => Some(stop.price),
             };
 
-            let (fills, remainder) = self.sweep(&stop, limit, config);
-            if let Some(print) = fills.last() {
-                self.last_trade_price = Some(print.maker.price);
+            let mut stp_cancelled = Vec::new();
+            let (fills, remainder, stp_prevented) =
+                self.sweep(&stop, limit, config, &mut stp_cancelled);
+            for print in &fills {
+                self.observe_trade(print.maker.price);
             }
 
             outcome.triggers.push(StopExecution {
@@ -1966,6 +2462,8 @@ impl OrderBook {
                 trigger_price,
                 fills,
                 cancelled: (remainder > Fixed::ZERO).then_some(remainder),
+                cancel_reason: stp_prevented.then_some(RejectReason::SelfTradePrevented),
+                stp_cancelled,
             });
         }
     }
@@ -2037,15 +2535,24 @@ fn record_depth_change(
 ///
 /// Returns the amendment and whether the order was re-inserted (which costs a
 /// new sequence, so the caller must advance the counter).
+#[derive(Clone, Copy)]
+struct AmendValues {
+    price: Fixed,
+    open_volume: Fixed,
+    peg_offset: Option<Fixed>,
+}
+
 fn amend_in_map<K: Ord>(
     map: &mut BTreeMap<K, Order>,
     key: K,
     stored: Order,
-    new_price: Fixed,
-    new_open_volume: Fixed,
+    values: AmendValues,
     market_seq: u64,
     make_key: impl Fn(Fixed, u64) -> K,
 ) -> (Amendment, bool) {
+    let new_price = values.price;
+    let new_open_volume = values.open_volume;
+    let new_peg_offset = values.peg_offset;
     let previous_sequence = stored.sequence;
     let previous_price = stored.price;
     let previous_volume = stored.open_volume();
@@ -2061,6 +2568,9 @@ fn amend_in_map<K: Ord>(
         let entry = map.get_mut(&key).expect("the caller looked the key up");
         entry.volume = visible;
         entry.hidden_volume = hidden;
+        if let Some(offset) = new_peg_offset {
+            entry.peg_offset = offset;
+        }
         return (
             Amendment {
                 market_seq,
@@ -2081,6 +2591,9 @@ fn amend_in_map<K: Ord>(
     updated.volume = visible;
     updated.hidden_volume = hidden;
     updated.sequence = market_seq;
+    if let Some(offset) = new_peg_offset {
+        updated.peg_offset = offset;
+    }
     map.insert(make_key(new_price, market_seq), updated);
 
     (
@@ -2095,6 +2608,14 @@ fn amend_in_map<K: Ord>(
     )
 }
 
+/// Whether two orders share a non-anonymous owner for STP.
+fn same_owner(taker: &Order, maker: &Order) -> bool {
+    match (taker.owner_id, maker.owner_id) {
+        (Some(taker), Some(maker)) => taker == maker,
+        _ => false,
+    }
+}
+
 /// Checks an order against a symbol's declared decimal precision.
 ///
 /// The order must belong to the configured symbol; otherwise it is refused as
@@ -2106,8 +2627,14 @@ fn validate_order_for_symbol(order: &Order, config: &SymbolConfig) -> Option<Rej
     }
     let price_ok = order.price.has_at_most_decimals(config.price_decimals)
         && order.stop_price.has_at_most_decimals(config.price_decimals)
+        && order
+            .trail_offset
+            .has_at_most_decimals(config.price_decimals)
+        && order.peg_offset.has_at_most_decimals(config.price_decimals)
         && order.price.is_multiple_of(config.price_tick)
-        && order.stop_price.is_multiple_of(config.price_tick);
+        && order.stop_price.is_multiple_of(config.price_tick)
+        && order.trail_offset.is_multiple_of(config.price_tick)
+        && order.peg_offset.is_multiple_of(config.price_tick);
     if !price_ok {
         return Some(RejectReason::InvalidOrder);
     }
@@ -2164,8 +2691,12 @@ fn validate_order(order: &Order) -> Option<RejectReason> {
         return Some(RejectReason::InvalidOrder);
     }
     // A market order ignores its own price; a limit order (including a
-    // stop-limit child) needs a positive one.
-    if order.live == OrderType::Limit && !(order.price.is_finite() && order.price > Fixed::ZERO) {
+    // stop-limit child) needs a positive one. A pegged order supplies `price`
+    // through its reference instead.
+    if order.live == OrderType::Limit
+        && !order.is_pegged()
+        && !(order.price.is_finite() && order.price > Fixed::ZERO)
+    {
         return Some(RejectReason::InvalidOrder);
     }
     // A stop price is a price, not a size: any non-negative finite value is
@@ -2191,6 +2722,57 @@ fn validate_order(order: &Order) -> Option<RejectReason> {
     if order.is_stop()
         && (order.post_only || order.display_volume > Fixed::ZERO || order.tif.is_immediate())
     {
+        return Some(RejectReason::InvalidOrder);
+    }
+
+    // Market-to-limit is a market sweep followed by a limit residual. The
+    // immediate/iceberg/stop/quote combinations have no defined residual.
+    if order.market_to_limit
+        && (order.live != OrderType::Market
+            || order.post_only
+            || order.is_stop()
+            || order.tif.is_immediate()
+            || order.display_volume > Fixed::ZERO
+            || order.hidden_volume > Fixed::ZERO
+            || order.volume_unit == VolumeUnit::Quote)
+    {
+        return Some(RejectReason::InvalidOrder);
+    }
+
+    // A trailing stop uses a positive offset and derives its trigger; a fixed
+    // trigger and a trailing offset are mutually exclusive.
+    if !order.trail_offset.is_finite() || order.trail_offset < Fixed::ZERO {
+        return Some(RejectReason::InvalidOrder);
+    }
+    if order.is_trailing_stop()
+        && (order.stop_price > Fixed::ZERO
+            || order.post_only
+            || order.market_to_limit
+            || order.display_volume > Fixed::ZERO
+            || order.hidden_volume > Fixed::ZERO
+            || order.peg.is_some()
+            || order.volume_unit == VolumeUnit::Quote)
+    {
+        return Some(RejectReason::InvalidOrder);
+    }
+
+    // A pegged order is always a resting base-volume limit; its price is the
+    // engine-computed target, never a client value.
+    if order.is_pegged()
+        && (order.live != OrderType::Limit
+            || order.price != Fixed::ZERO
+            || order.market_to_limit
+            || order.is_trailing_stop()
+            || order.stop_price > Fixed::ZERO
+            || order.post_only
+            || order.display_volume > Fixed::ZERO
+            || order.hidden_volume > Fixed::ZERO
+            || order.tif.is_immediate()
+            || order.volume_unit == VolumeUnit::Quote)
+    {
+        return Some(RejectReason::InvalidOrder);
+    }
+    if order.is_pegged() && !order.peg_offset.is_finite() {
         return Some(RejectReason::InvalidOrder);
     }
 

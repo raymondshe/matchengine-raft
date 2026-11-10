@@ -17,9 +17,13 @@ defaults, so payloads written before they existed still deserialize. The semanti
 | Iceberg | `"display_volume": 100.0` | `volume` is the total; only one display tranche rests. The rest waits in `hidden_volume`, invisible to depth, and is refilled tranche by tranche as the visible part is consumed. |
 | Stop-market | `"live": "Market", "stop_price": 95.0` | Parks off the book until a trade at or through the stop price (sell: `<=` stop, buy: `>=` stop), then sweeps every level. The child never rests: its remainder is cancelled. |
 | Stop-limit | `"live": "Limit", "price": 96.0, "stop_price": 95.0` | Same election, child bounded by `price`; the remainder is cancelled. |
+| Market-to-limit | `"live": "Market", "market_to_limit": true` | Sweeps like a market order, then rests any remainder at the last fill price as an ordinary limit. No fill cancels the whole order. |
+| Trailing stop | `"trail_offset": 1.0` (on a stop-limit or stop-market) | The trigger trails the high-water (sell) or low-water (buy) print; it is elected by a later trade. `stop_price` must be `0` on entry; the derived trigger is reported there. |
+| Pegged | `"peg": "primary" \| "midpoint" \| "last_trade"`, `"peg_offset": "0"` | A resting limit priced from non-pegged liquidity; it reprices with a new sequence when the reference moves. `price` must be `0`. |
 
 Market orders (`"live": "Market"`) ignore their own price, sweep the opposite side and cancel the
-remainder; they never rest.
+remainder; they never rest. The exception is `market_to_limit`, which rests its residual at the last
+fill price as described above.
 
 Expiry is deterministic: `apply` never reads a clock. Every admissible mutating request
 (`Place`, `Cancel`, `Amend`) runs the automatic GTD purge at its intake timestamp before it is
@@ -68,6 +72,14 @@ side and sequence. Each new field is optional:
   (`0` keeps the current one); `price` updates a stop-limit's limit price and is refused for a
   stop-market (`unsupported_order`). A trigger the last trade already crosses is refused
   (`stop_would_trigger`).
+- A trailing stop derives its trigger. `order.trail_offset > 0` supplies the new offset; echoing the
+  current derived `order.stop_price` is accepted, while a different non-zero trigger is refused
+  (`unsupported_order`), and a new trigger already crossed by the last trade is refused
+  (`stop_would_trigger`).
+- A pegged order derives its price, so `price` is refused (`unsupported_order`). A non-zero
+  `order.peg_offset` supplies the new offset; `0` keeps the current offset (cancel and place to
+  reset it to zero). A target that would cross or has no reference is refused
+  (`peg_would_cross` / `peg_reference_unavailable`).
 - An amendment whose new price would cross the opposite side is refused (`amend_would_cross`): a
   resting book never crosses, so taking liquidity is still cancel + place.
 - Market orders are not amendable (`unsupported_order`); cancel and re-place them instead.
@@ -75,3 +87,19 @@ side and sequence. Each new field is optional:
   sequence and the new open volume; the `/write` response is the amendment's `market_seq` (the new
   order sequence when the order was re-inserted). A refused amendment still consumes a sequence and
   publishes a `rejected` event with the reason.
+
+## Self-trade prevention
+
+`SymbolConfig.stp` selects the policy: `off` (default), `cancel_resting`, `cancel_aggressor` or
+`cancel_both`. STP applies only when both orders carry the same non-null `owner_id`; anonymous
+orders never self-trade-prevent.
+
+- `cancel_resting` cancels the same-owner maker (with reason `self_trade_prevented`) and keeps
+  matching the taker.
+- `cancel_aggressor` stops at the first same-owner maker and cancels the taker's remainder.
+- `cancel_both` cancels both and stops.
+
+FOK preflight uses the same policy: `cancel_resting` counts only other owners' reachable volume;
+`cancel_aggressor`/`cancel_both` stop at the first same-owner maker. A stop child inherits its
+parent's owner id. STP cancellations are `cancelled` events with `reason:
+"self_trade_prevented"`, never `rejected` for a taker that already executed part of its quantity.

@@ -304,6 +304,18 @@ impl MatchEvent {
         order: &Order,
         volume: Fixed,
     ) -> MatchEvent {
+        Self::for_cancelled_with_reason(log_index, ordinal, order, volume, None)
+    }
+
+    /// A `Cancelled` event with an explicit reason (STP or a pegged target
+    /// that would cross).
+    pub fn for_cancelled_with_reason(
+        log_index: u64,
+        ordinal: u32,
+        order: &Order,
+        volume: Fixed,
+        reason: Option<RejectReason>,
+    ) -> MatchEvent {
         MatchEvent {
             event_id: EventId { log_index, ordinal },
             kind: MatchEventKind::Cancelled,
@@ -320,7 +332,7 @@ impl MatchEvent {
             taker_fee: Fixed::ZERO,
             maker_fee: Fixed::ZERO,
             error: MatchErrors::NONE,
-            reason: None,
+            reason,
         }
     }
 

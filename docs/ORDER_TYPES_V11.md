@@ -1,6 +1,6 @@
 # Schema v11 order-type batch: plan
 
-Status: **planned, not implemented.** Baseline: snapshot **v10**, market-data wire **v6**.
+Status: **implemented 2026-11-10.** Baseline moved from snapshot v10/wire v6 to **v11/v7**.
 This document fixes the data model, semantics, apply order and migration for one batch adding
 market-to-limit, trailing stops, pegged orders and self-trade prevention. The four features share
 one snapshot migration, one wire-version bump and one conformance batch; do not land them
@@ -87,7 +87,7 @@ behaviour. A deployment enabling STP must set non-`None` owner ids at the gatewa
 Add to `RejectReason`:
 
 - `SelfTradePrevented` - a maker or taker was cancelled by STP.
-- `PegWouldCross` - a pegged order's target would cross the opposite non-pegged touch.
+- `PegWouldCross` - a pegged order's target would cross the opposite touch.
 - `PegReferenceUnavailable` - no non-pegged BBO / last trade exists for the chosen peg.
 
 `Cancelled` events gain a reason only for these cases; an ordinary cancel keeps `reason: None`.
@@ -138,8 +138,9 @@ must move to v7: `reason_code`/`decode_reason` gain codes 9, 10 and 11.
   does not immediately elect the stop. Reference updates are internal and emit no event; only the
   election and its child events are published.
 - Child: the triggered child never rests; whatever it cannot execute is cancelled.
-- Amend: `trail_offset` and volume are amendable. A non-zero `stop_price` on a trailing-stop amend
-  is rejected (`UnsupportedOrder`) because the trigger is derived. Reducing the offset updates the
+- Amend: `trail_offset` and volume are amendable. Echoing the current derived `stop_price` is
+  accepted; a different non-zero `stop_price` is rejected (`UnsupportedOrder`) because the trigger
+  is derived. Reducing the offset updates the
   trigger; if the new trigger is already crossed, the amend is refused (`StopWouldTrigger`).
 - Expiry: GTD/Day apply to the parked trailing stop exactly as they do to a fixed stop.
 - Snapshot: `trail_reference` and the current derived `stop_price` are persisted.
@@ -156,7 +157,7 @@ must move to v7: `reason_code`/`decode_reason` gain codes 9, 10 and 11.
   - `LastTrade`: most recent print.
   - If the reference does not exist, reject at entry (`PegReferenceUnavailable`).
 - Price: `target = reference + peg_offset` for both sides; `peg_offset` is signed. A target that
-  would cross the opposite non-pegged touch is refused at entry (`PegWouldCross`) and cancels a
+  would cross the opposite touch is refused at entry (`PegWouldCross`) and cancels a
   resting peg on reprice with the same reason.
 - Resting and repricing: after every applied entry that can change the non-pegged BBO or last
   trade, reprice every resting pegged order once, in `(side, sequence)` order. A changed target:
@@ -307,12 +308,11 @@ existing model remains a strong baseline.
 
 - `tests/cluster/test_feature_matrix.rs`: one MTL, trailing and peg lifecycle through `/write` and
   `/events`; STP under every mode; event reconstruction of the visible book.
-- `tests/cluster/test_restart.rs` / `test_snapshot.rs`: v11 reopen with trailing reference, peg
-  target, owner ids and STP config; old v10 snapshot rejected.
-- Replay fixtures: `market_to_limit`, `trailing_stop`, `peg_reprice`, `stp_cancel_resting`,
-  `stp_cancel_aggressor`.
+- `src/store/state_machine/tests.rs`: v11 snapshot reopen with trailing reference, peg target,
+  owner ids and STP config; old v10 snapshots are rejected by the version check.
 - Wire v7 golden round-trip for the three new reasons; market-data service decode.
-- `tests/replay/run-all.sh` gets one case per new shape; keep the existing 16 cases unchanged.
+- Replay fixtures for the new shapes remain optional follow-ups; the cluster feature matrix covers
+  the same paths through `/write` end-to-end.
 
 ## 8. Delivery sequence
 
@@ -341,7 +341,26 @@ the snapshot version is bumped once in step 1 and the whole batch lands behind o
 | Wire | v7, new reason codes, strict decoder |
 | Out of scope | custom reserve replenishment, stop-protection collars, fee tokens, derivatives |
 
-## 10. Risks and guardrails
+## 10. Implementation notes (2026-11-10)
+
+All seven delivery steps landed in one change. Notes for maintainers:
+
+- MTL rests the residual on the same order record, preserves GTC/GTD/Day and the taker sequence,
+  and clears `market_to_limit`; a no-fill MTL is an ordinary `Cancelled` with no reason.
+- Trailing references are updated on every fill, including stop-cascade fills. The derived
+  `stop_price` is updated in the same pass; reference updates emit no event.
+- Peg repricing is a single pass over pegged orders in `(side, sequence)` order. Pegs reference
+  non-pegged liquidity only, so the pass cannot chase itself. `OrderBook::reprice_pegged` is public
+  for direct book tests; `apply` calls it after every mutating request.
+- A pegged `Amend` uses a non-zero `order.peg_offset` as the new offset; zero keeps the current one
+  (cancel and place to reset it to zero). `price` on a pegged amend is refused.
+- STP maker cancellations are interleaved with fills using `StpCancel.after_fills`; the taker
+  remainder cancellation follows the fills. `Cancelled` carries `self_trade_prevented`, not
+  `Rejected`.
+- Snapshot v11 and wire v7 are one-way. Old snapshots are rejected; old market-data consumers must
+  be upgraded with the engine.
+
+## 11. Risks and guardrails
 
 - **Peg reference loops**: avoided by excluding pegged orders from the reference. If a future change
   allows peg-to-peg references, it needs a bounded fixed-point iteration and a new conformance

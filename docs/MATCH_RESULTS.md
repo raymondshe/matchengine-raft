@@ -1,7 +1,7 @@
 # Delivering match results to the order / clearing system
 
 Status: **phases 1a–4 implemented.** `apply` turns results into [`MatchEvent`]s, returns the first
-512 in the `/write` response, appends them to a bounded event window that is part of snapshot v10,
+512 in the `/write` response, appends them to a bounded event window that is part of snapshot v11,
 and serves that window through `POST /events` and `GET /events/status`. `client_order_id` makes
 submissions idempotent across retries. `--match-event-log <path>` remains a node-local JSONL
 debugging sink. Phase 4 adds long-poll (`wait_ms`), a gRPC `StreamEvents` stream and a reference
@@ -227,11 +227,14 @@ Notes:
 - A `Cancel` of a non-resting order is not silently dropped: it publishes `Rejected` with
   `reason: "order_not_found"` and consumes one sequence. `Amend` does the same, so a consumer can
   distinguish a successful cancel from a stale one.
+- STP and pegged-order cancellations use `Cancelled` with `reason: "self_trade_prevented"`,
+  `"peg_would_cross"` or `"peg_reference_unavailable"`. They are cancellations, not rejections,
+  because the order may already have executed or rested.
 - Fill events carry exact `taker_fee`/`maker_fee`. The taker uses its taker rate, the resting
   maker uses its maker rate; positive = charge, negative = rebate. `error` is an ordered set of codes for a fill whose notional or a fee fell outside the
   scale-18 range. Only the affected dependent fields are zero: a base-denominated fee can remain
   exact when the quote notional overflowed. A zero whose code is present must not be used as a real
-  value; see `docs/FEE_DEDUCTION.md` §7.1. The zero-plus-`error` sentinel is part of the v10/v6
+  value; see `docs/FEE_DEDUCTION.md` §7.1. The zero-plus-`error` sentinel is part of the v11/v7
   contract: `MatchEvent::exact_quote_volume`/`exact_taker_fee`/`exact_maker_fee`, the
   `MatchResult` equivalents and the market-data `TradeRecord`/`LifecycleRecord` accessors return
   `None` when the field is unavailable, while nullable JSON fields were rejected because they would
@@ -341,12 +344,13 @@ pub struct StateMachineData {
   learner receives only the retained window — that is expected, and the read API advertises
   `oldest_event_id` so consumers can detect the gap.
 
-Snapshot format: `SNAPSHOT_VERSION` is **10**; v10 replaces the boolean fee-overflow flag with
-`MatchErrors`, and v9 added base/quote asset metadata, tick/lot rules,
-volume units, fee assets and the fee policy, v8 adds maker/taker fee rates to orders and fee fields
-to match events, v7 adds the single-symbol precision configuration, v6 stores the last trade price
-and match events as fixed-point values, v5 stored order prices/quantities as fixed-point integers,
-and v4 added the event window and submission map on top of the v3 order/stop fields. Postcard encodes struct fields positionally, so an older decoder
+Snapshot format: `SNAPSHOT_VERSION` is **11**; v11 adds owner identity, market-to-limit,
+trailing-stop state, peg state and the symbol STP policy. v10 replaced the boolean fee-overflow
+flag with `MatchErrors`; v9 added base/quote asset metadata, tick/lot rules, volume units, fee
+assets and the fee policy; v8 added maker/taker fee rates to orders and fee events; v7 added the
+single-symbol precision configuration; v6 stored the last trade price and match events as
+fixed-point values; v5 stored order prices/quantities as fixed-point integers; and v4 added the
+event window and submission map on top of the v3 order/stop fields. Postcard encodes struct fields positionally, so an older decoder
 fails on the missing fields (`postcard::from_bytes` reports an unexpected end of input). Two options:
 
 1. **Reject v2 with a clear error** (simplest; acceptable for a demo, but requires wiping data).
@@ -530,7 +534,7 @@ event rate per apply batch at debug level, consistent with the existing `tracing
 | `StreamEvents` leader steps down | The stream keeps delivering committed applied events from the old leader | Reconnect and re-anchor on the new leader; dedupe on `event_id` |
 | Slow gRPC stream consumer | Pages queue up to the stream channel bound, then HTTP/2 backpressure | The consumer catches up or reconnects; `apply` is unaffected |
 | Bridge crash between publish and checkpoint | The page is replayed | Dedupe on `event_id`; the cursor advances only after the destination acknowledged |
-| Snapshot from an older binary | v9 or earlier payload | Version check rejects it with a clear error; v10 is the current error-aware snapshot |
+| Snapshot from an older binary | v10 or earlier payload | Version check rejects it with a clear error; v11 is the current order-type-aware snapshot |
 
 ---
 
@@ -616,7 +620,7 @@ Still to write (operational tests):
 |---|---|---|
 | 1a ✅ | `MatchEvent` + `EventId`; build events in `apply`; `MatchResultSink` with `Noop`/`Memory`/`File` sinks; `--match-event-log`; unit and end-to-end tests | done |
 | 1b ✅ | Events in `MatchEngineResponse`; 512-event cap with `events_truncated` | done |
-| 2 ✅ | Bounded event window + snapshot v4–v10 + `oldest_event_id`/`last_event_id`; `/events` and `/events/status`; restart/snapshot/retention tests | done |
+| 2 ✅ | Bounded event window + snapshot v4–v11 + `oldest_event_id`/`last_event_id`; `/events` and `/events/status`; restart/snapshot/retention tests | done |
 | 3 ✅ | `client_order_id` submission dedupe with bounded map | done |
 | 4 ✅ | Long-poll `wait_ms` (node-local `watch` wakeup), gRPC `StreamEvents` (JSON pages, heartbeat, `max_pages`) and the reference MQ bridge sidecar (`src/bin/events_bridge.rs`) | done |
 
@@ -661,5 +665,5 @@ and two read endpoints (`/events`, `/events/status`).
    the events, but humans think in `order id`; consider an order-id index as a follow-up.
 6. **Multi-instrument** — one process/cluster per symbol; event ids are per deployment, not per
    book inside one process.
-7. **Snapshot migration** — v10 rejects older snapshots. Add a versioned decoder only if a
+7. **Snapshot migration** — v11 rejects older snapshots. Add a versioned decoder only if a
    deployment has data worth carrying across a future format change.

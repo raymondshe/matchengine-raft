@@ -1,7 +1,7 @@
 # Decimal and fixed-point options for price and volume
 
 Status: **implemented end-to-end.** `Order`, `OrderBook.last_trade_price`, match events,
-depth/BBO/spread, `/read`, the market-data feed, snapshot v10 and wire v6 use 18-scale `Fixed`
+depth/BBO/spread, `/read`, the market-data feed, snapshot v11 and wire v7 use 18-scale `Fixed`
 integers. JSON emits decimal strings and accepts legacy numeric input. One process/cluster trades
 exactly one symbol, whose replicated `SymbolConfig` is enforced and locked after the first order;
 multi-symbol isolation is deployment-level (one process per symbol). This document keeps the
@@ -49,7 +49,7 @@ We considered making the scale follow `SymbolConfig` per symbol and rejected it:
   the apply path is dominated by `BTreeMap` nodes, event construction and response buffers.
 
 If memory or feed bandwidth becomes a measured problem, use a targeted lever: a compact
-market-data wire (v6 is fixed 16 bytes per value), a compact resting record/snapshot encoding, or
+market-data wire (v7 is fixed 16 bytes per value), a compact resting record/snapshot encoding, or
 the measured per-level bucket book. Revisit the scale only with a compile-time prototype and a
 benchmark win, not a runtime per-symbol scale.
 
@@ -243,10 +243,10 @@ Implemented in `src/order_book/fixed.rs`, `Order` and the state machine:
   JSONL file sink emit decimal strings.
 - `DepthLevel`, `DepthChange`, `spread`, `mid_price`, `/read` depth/BBO/spread/last-trade and the
   market-data records are `Fixed`. The shadow book is keyed by `Fixed`, not by `f64` bits.
-- Market-data wire **v6** encodes every price, quantity, quote volume and fee as a little-endian
+- Market-data wire **v7** encodes every price, quantity, quote volume and fee as a little-endian
   scale-18 `i128` (16 bytes), plus the fee asset per side; older frames are not silently
   reinterpreted.
-- Snapshot **v10** stores the last trade price, match events, base/quote asset metadata, tick/lot
+- Snapshot **v11** stores the last trade price, match events, base/quote asset metadata, tick/lot
   rules, maker/taker fee rates, fee assets and fill fees, plus the single-symbol precision
   configuration. Older snapshots are rejected with a clear error.
 - `Fixed::notional(price, quantity)` multiplies through a 256-bit intermediate and truncates toward
@@ -277,7 +277,7 @@ Completed follow-ups:
    gateway routing and isolation remain deployment-level and outside this process.
 2. Matching-loop, feed and end-to-end baselines are recorded in
    [`PERFORMANCE.md`](./PERFORMANCE.md).
-3. The wire v6/snapshot v10 compatibility policy is documented: older wire and snapshot versions
+3. The wire v7/snapshot v11 compatibility policy is documented: older wire and snapshot versions
    are rejected, so existing data directories must be recreated when crossing this change.
 
 Remaining next steps:

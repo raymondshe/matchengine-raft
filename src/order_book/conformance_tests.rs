@@ -1050,3 +1050,320 @@ fn order_id_is_client_metadata_not_a_book_key() {
     assert_eq!(7, remaining.id);
     assert_eq!(second.sequence, remaining.sequence);
 }
+
+#[test]
+fn market_to_limit_rests_the_residual_at_the_last_fill() {
+    let mut book = OrderBook::new();
+    let mut first = Order::new(OrderSide::Sell, 100.0, 2.0, 0);
+    let mut second = Order::new(OrderSide::Sell, 101.0, 3.0, 0);
+    book.execute_order(&mut first);
+    book.execute_order(&mut second);
+
+    let mut mtl = Order::new(OrderSide::Buy, 0.0, 6.0, 0);
+    mtl.live = OrderType::Market;
+    mtl.market_to_limit = true;
+    let outcome = book.execute_order(&mut mtl);
+
+    assert_eq!(None, outcome.rejected);
+    assert_eq!(2, outcome.fills.len());
+    assert_eq!(Some(Fixed::from(1)), outcome.resting);
+    assert_eq!(None, outcome.cancelled);
+    assert_eq!(Fixed::from(101), mtl.price);
+    assert_eq!(OrderType::Limit, mtl.live);
+    assert!(!mtl.market_to_limit);
+    let best = book.best_bid().expect("the MTL residual rests");
+    assert_eq!(Fixed::from(101), best.price);
+    assert_eq!(Fixed::from(1), best.volume);
+
+    // No liquidity means no reference price, so the whole order is cancelled.
+    let mut empty = OrderBook::new();
+    let mut mtl = Order::new(OrderSide::Buy, 0.0, 2.0, 0);
+    mtl.live = OrderType::Market;
+    mtl.market_to_limit = true;
+    let outcome = empty.execute_order(&mut mtl);
+    assert_eq!(None, outcome.rejected);
+    assert_eq!(Some(Fixed::from(2)), outcome.cancelled);
+    assert_eq!(None, outcome.resting);
+
+    // Immediate types have no defined resting residual.
+    let mut invalid = Order::new(OrderSide::Buy, 0.0, 1.0, 0);
+    invalid.live = OrderType::Market;
+    invalid.market_to_limit = true;
+    invalid.tif = TimeInForce::Ioc;
+    assert_eq!(
+        Some(RejectReason::InvalidOrder),
+        OrderBook::new().execute_order(&mut invalid).rejected
+    );
+}
+
+#[test]
+fn trailing_stop_trails_the_print_and_elects_on_a_later_trade() {
+    let mut book = OrderBook::new();
+    let mut ask = Order::new(OrderSide::Sell, 100.0, 1.0, 0);
+    book.execute_order(&mut ask);
+    let mut buy = Order::new(OrderSide::Buy, 0.0, 1.0, 0);
+    buy.live = OrderType::Market;
+    book.execute_order(&mut buy);
+    assert_eq!(Some(Fixed::from(100)), book.last_trade_price);
+
+    let mut stop = Order::new(OrderSide::Sell, 99.0, 1.0, 0);
+    stop.trail_offset = Fixed::from(1);
+    let outcome = book.execute_order(&mut stop);
+    assert!(outcome.parked);
+    let parked = book.stops.first().expect("the trailing stop is parked");
+    assert_eq!(Fixed::from(100), parked.trail_reference);
+    assert_eq!(Fixed::from(99), parked.stop_price);
+
+    // A higher print lifts the reference and trigger but does not elect the stop.
+    let mut ask = Order::new(OrderSide::Sell, 105.0, 1.0, 0);
+    book.execute_order(&mut ask);
+    let mut buy = Order::new(OrderSide::Buy, 0.0, 1.0, 0);
+    buy.live = OrderType::Market;
+    let outcome = book.execute_order(&mut buy);
+    assert!(outcome.triggers.is_empty());
+    let parked = book.stops.first().expect("still parked");
+    assert_eq!(Fixed::from(105), parked.trail_reference);
+    assert_eq!(Fixed::from(104), parked.stop_price);
+
+    // A retrace to the trailing trigger elects it; the child has no bid to hit
+    // and cancels rather than resting.
+    let mut ask = Order::new(OrderSide::Sell, 104.0, 1.0, 0);
+    book.execute_order(&mut ask);
+    let mut buy = Order::new(OrderSide::Buy, 0.0, 1.0, 0);
+    buy.live = OrderType::Market;
+    let outcome = book.execute_order(&mut buy);
+    assert_eq!(1, outcome.triggers.len());
+    let trigger = &outcome.triggers[0];
+    assert_eq!(Fixed::from(104), trigger.trigger_price);
+    assert_eq!(Fixed::from(104), trigger.stop.stop_price);
+    assert_eq!(Some(Fixed::from(1)), trigger.cancelled);
+    assert!(book.stops.is_empty());
+}
+
+#[test]
+fn pegged_order_reprices_against_non_pegged_liquidity() {
+    let mut book = OrderBook::new();
+    let mut bid = Order::new(OrderSide::Buy, 100.0, 1.0, 0);
+    let mut ask = Order::new(OrderSide::Sell, 102.0, 1.0, 0);
+    book.execute_order(&mut bid);
+    book.execute_order(&mut ask);
+
+    let mut peg = Order::new(OrderSide::Buy, 0.0, 2.0, 0);
+    peg.peg = Some(PegReference::Primary);
+    let outcome = book.execute_order(&mut peg);
+    assert_eq!(None, outcome.rejected);
+    assert_eq!(Some(Fixed::from(2)), outcome.resting);
+    assert_eq!(Fixed::from(100), peg.price);
+    let original_sequence = peg.sequence;
+
+    // A better non-pegged bid moves the primary peg up, with a new sequence.
+    let mut better = Order::new(OrderSide::Buy, 101.0, 1.0, 0);
+    book.execute_order(&mut better);
+    let updates = book.reprice_pegged();
+    assert_eq!(1, updates.len());
+    match &updates[0] {
+        PegUpdate::Amended(amendment) => {
+            assert_eq!(Fixed::from(101), amendment.order.price);
+            assert_eq!(original_sequence, amendment.previous_sequence);
+            assert_ne!(original_sequence, amendment.order.sequence);
+        }
+        other => panic!("expected an amendment, got {other:?}"),
+    }
+    assert_eq!(
+        1,
+        book.bids
+            .values()
+            .filter(|order| order.is_pegged() && order.price == Fixed::from(101))
+            .count()
+    );
+
+    // Removing the better non-pegged bid moves the peg back to the earlier
+    // non-pegged reference.
+    assert!(book.cancel(&better).is_some());
+    let updates = book.reprice_pegged();
+    assert_eq!(1, updates.len());
+    match &updates[0] {
+        PegUpdate::Amended(amendment) => {
+            assert_eq!(Fixed::from(100), amendment.order.price);
+        }
+        other => panic!("expected an amendment, got {other:?}"),
+    }
+
+    // No non-pegged reference is a rejection, not an orphaned peg.
+    let mut empty = OrderBook::new();
+    let mut orphan = Order::new(OrderSide::Buy, 0.0, 1.0, 0);
+    orphan.peg = Some(PegReference::Midpoint);
+    assert_eq!(
+        Some(RejectReason::PegReferenceUnavailable),
+        empty.execute_order(&mut orphan).rejected
+    );
+}
+
+#[test]
+fn pegged_order_rejects_a_crossing_target() {
+    let mut book = OrderBook::new();
+    let mut bid = Order::new(OrderSide::Buy, 99.0, 1.0, 0);
+    let mut ask = Order::new(OrderSide::Sell, 100.0, 1.0, 0);
+    book.execute_order(&mut bid);
+    book.execute_order(&mut ask);
+
+    let mut peg = Order::new(OrderSide::Buy, 0.0, 1.0, 0);
+    peg.peg = Some(PegReference::Primary);
+    peg.peg_offset = Fixed::from(2);
+    assert_eq!(
+        Some(RejectReason::PegWouldCross),
+        book.execute_order(&mut peg).rejected
+    );
+}
+
+fn stp_book(config: SymbolConfig) -> (OrderBook, Order, Order) {
+    let mut book = OrderBook::new();
+    let mut same = Order::new(OrderSide::Sell, 100.0, 1.0, 0);
+    same.owner_id = Some(1);
+    let mut other = Order::new(OrderSide::Sell, 100.0, 1.0, 0);
+    other.owner_id = Some(2);
+    book.execute_order_with_symbol(&mut same, config.clone());
+    book.execute_order_with_symbol(&mut other, config);
+    (book, same, other)
+}
+
+#[test]
+fn self_trade_prevention_modes_cancel_the_right_order() {
+    // CancelResting: remove the same-owner maker and keep matching.
+    let config = SymbolConfig::new(0, 2, 8)
+        .unwrap()
+        .with_stp(StpMode::CancelResting);
+    let (mut book, same, _) = stp_book(config.clone());
+    let mut taker = Order::new(OrderSide::Buy, 100.0, 2.0, 0);
+    taker.owner_id = Some(1);
+    let outcome = book.execute_order_with_symbol(&mut taker, config);
+    assert_eq!(1, outcome.stp_cancelled.len());
+    assert_eq!(same.sequence, outcome.stp_cancelled[0].order.sequence);
+    assert_eq!(1, outcome.fills.len());
+    assert_eq!(Some(Fixed::from(1)), outcome.resting);
+    assert_eq!(None, outcome.cancel_reason);
+
+    // CancelAggressor: the maker stays, the taker remainder is cancelled.
+    let config = SymbolConfig::new(0, 2, 8)
+        .unwrap()
+        .with_stp(StpMode::CancelAggressor);
+    let (mut book, same, other) = stp_book(config.clone());
+    let mut taker = Order::new(OrderSide::Buy, 100.0, 2.0, 0);
+    taker.owner_id = Some(1);
+    let outcome = book.execute_order_with_symbol(&mut taker, config);
+    assert!(outcome.stp_cancelled.is_empty());
+    assert!(outcome.fills.is_empty());
+    assert_eq!(Some(Fixed::from(2)), outcome.cancelled);
+    assert_eq!(
+        Some(RejectReason::SelfTradePrevented),
+        outcome.cancel_reason
+    );
+    assert!(book.bids.is_empty());
+    assert_eq!(2, book.asks.len());
+    assert_eq!(same.sequence, book.asks.values().next().unwrap().sequence);
+    assert!(
+        book.asks
+            .values()
+            .any(|order| order.sequence == other.sequence)
+    );
+
+    // CancelBoth: remove the maker and cancel the taker.
+    let config = SymbolConfig::new(0, 2, 8)
+        .unwrap()
+        .with_stp(StpMode::CancelBoth);
+    let (mut book, _, other) = stp_book(config.clone());
+    let mut taker = Order::new(OrderSide::Buy, 100.0, 2.0, 0);
+    taker.owner_id = Some(1);
+    let outcome = book.execute_order_with_symbol(&mut taker, config);
+    assert_eq!(1, outcome.stp_cancelled.len());
+    assert_eq!(Some(Fixed::from(2)), outcome.cancelled);
+    assert_eq!(
+        Some(RejectReason::SelfTradePrevented),
+        outcome.cancel_reason
+    );
+    assert_eq!(1, book.asks.len());
+    assert_eq!(other.sequence, book.asks.values().next().unwrap().sequence);
+
+    // Off: the owners are irrelevant and both makers fill.
+    let config = SymbolConfig::new(0, 2, 8).unwrap();
+    let (mut book, _, _) = stp_book(config.clone());
+    let mut taker = Order::new(OrderSide::Buy, 100.0, 2.0, 0);
+    taker.owner_id = Some(1);
+    let outcome = book.execute_order_with_symbol(&mut taker, config);
+    assert_eq!(2, outcome.fills.len());
+    assert!(outcome.stp_cancelled.is_empty());
+    assert_eq!(None, outcome.cancelled);
+}
+
+#[test]
+fn self_trade_prevention_fok_preflight_uses_the_same_policy() {
+    let config = SymbolConfig::new(0, 2, 8)
+        .unwrap()
+        .with_stp(StpMode::CancelResting);
+    let (mut book, _, _) = stp_book(config.clone());
+    let mut taker = Order::new(OrderSide::Buy, 100.0, 2.0, 0);
+    taker.owner_id = Some(1);
+    taker.tif = TimeInForce::Fok;
+    assert_eq!(
+        Some(RejectReason::FokUnfillable),
+        book.execute_order_with_symbol(&mut taker, config).rejected
+    );
+    assert_eq!(2, book.asks.len(), "a rejected FOK touches nothing");
+
+    let config = SymbolConfig::new(0, 2, 8)
+        .unwrap()
+        .with_stp(StpMode::CancelAggressor);
+    let (mut book, _, _) = stp_book(config.clone());
+    let mut taker = Order::new(OrderSide::Buy, 100.0, 1.0, 0);
+    taker.owner_id = Some(1);
+    taker.tif = TimeInForce::Fok;
+    assert_eq!(
+        Some(RejectReason::FokUnfillable),
+        book.execute_order_with_symbol(&mut taker, config).rejected
+    );
+}
+
+#[test]
+fn pegged_target_cannot_cross_another_pegged_order() {
+    let mut book = OrderBook::new();
+    let mut bid = Order::new(OrderSide::Buy, 100.0, 1.0, 0);
+    let mut ask = Order::new(OrderSide::Sell, 102.0, 1.0, 0);
+    book.execute_order(&mut bid);
+    book.execute_order(&mut ask);
+
+    let mut buy_peg = Order::new(OrderSide::Buy, 0.0, 1.0, 0);
+    buy_peg.peg = Some(PegReference::Primary);
+    assert_eq!(None, book.execute_order(&mut buy_peg).rejected);
+
+    book.last_trade_price = Some(Fixed::from(100));
+    let mut sell_peg = Order::new(OrderSide::Sell, 0.0, 1.0, 0);
+    sell_peg.peg = Some(PegReference::LastTrade);
+    sell_peg.peg_offset = Fixed::from(-1);
+    assert_eq!(
+        Some(RejectReason::PegWouldCross),
+        book.execute_order(&mut sell_peg).rejected,
+        "the full opposite BBO, including pegs, must be checked"
+    );
+}
+
+#[test]
+fn midpoint_and_last_trade_pegs_use_their_reference() {
+    let mut book = OrderBook::new();
+    let mut bid = Order::new(OrderSide::Buy, 100.0, 1.0, 0);
+    let mut ask = Order::new(OrderSide::Sell, 102.0, 1.0, 0);
+    book.execute_order(&mut bid);
+    book.execute_order(&mut ask);
+
+    let mut midpoint = Order::new(OrderSide::Buy, 0.0, 1.0, 0);
+    midpoint.peg = Some(PegReference::Midpoint);
+    let outcome = book.execute_order(&mut midpoint);
+    assert_eq!(None, outcome.rejected);
+    assert_eq!(Fixed::from(101), midpoint.price);
+
+    book.last_trade_price = Some(Fixed::from(100));
+    let mut last = Order::new(OrderSide::Buy, 0.0, 1.0, 0);
+    last.peg = Some(PegReference::LastTrade);
+    let outcome = book.execute_order(&mut last);
+    assert_eq!(None, outcome.rejected);
+    assert_eq!(Fixed::from(100), last.price);
+}

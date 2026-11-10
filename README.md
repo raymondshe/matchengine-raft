@@ -16,8 +16,8 @@
 [![CI](https://github.com/raymondshe/matchengine-raft/actions/workflows/ci.yml/badge.svg)](https://github.com/raymondshe/matchengine-raft/actions/workflows/ci.yml)
 [![Rust](https://img.shields.io/badge/rust-%E2%89%A5%201.89-orange.svg)](https://www.rust-lang.org)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
-[![Snapshot v10](https://img.shields.io/badge/snapshot-v10-blue.svg)](./docs)
-[![Market-data wire v6](https://img.shields.io/badge/marketdata%20wire-v6-blue.svg)](./docs/MARKET_DATA_PLAN.md)
+[![Snapshot v11](https://img.shields.io/badge/snapshot-v11-blue.svg)](./docs)
+[![Market-data wire v7](https://img.shields.io/badge/marketdata%20wire-v7-blue.svg)](./docs/MARKET_DATA_PLAN.md)
 [![WAL fsync: configurable](https://img.shields.io/badge/WAL%20fsync-configurable-blue.svg)](./docs/STORAGE.md)
 
 A Raft-replicated matching engine in Rust for teams that need deterministic execution, configurable durability and a live market-data path — without treating the engine as a black box.
@@ -70,7 +70,7 @@ A Raft-replicated matching engine in Rust for teams that need deterministic exec
 Everything below is implemented in this repository and exercised by tests; the links point at the code.
 
 **Matching engine**
-- **Price-time priority order book** with GTC, IOC, FOK, GTD, Day, market, post-only, iceberg, stop-market and stop-limit orders.
+- **Price-time priority order book** with GTC, IOC, FOK, GTD, Day, market, market-to-limit, post-only, iceberg, stop-market, stop-limit, trailing-stop and pegged orders, plus self-trade prevention.
 - **Amend and cancel** with deterministic priority rules: same-price reductions keep time priority; price or size increases re-queue under a new sequence.
 - **Asset-aware fee deduction** with maker/taker rates, rebates and exact notional accounting; crypto/FX default to received-asset fees, ETF/equity always settle in quote.
 - **Base or quote volume** with tick/lot enforcement, quote-limit normalization and quote-budget market sweeps.
@@ -142,7 +142,7 @@ quorum round. Lease reads require bounded clock drift between nodes; `/read` rem
 possibly stale read.
 
 Market-data egress is off the consensus path: the tap is a bounded `try_send`, so a slow
-subscriber can never block `apply`. The feature-gated `AeronSink` publishes the same wire-v6
+subscriber can never block `apply`. The feature-gated `AeronSink` publishes the same wire-v7
 messages on streams 2001–2007 from a dedicated publisher thread, with one exclusive publication
 per stream; the JSONL sink remains available for debugging.
 
@@ -160,7 +160,7 @@ per stream; the JSONL sink remains available for debugging.
 
 3. **Matching Engine** ([`order_book/`](./src/order_book/))
    - Price-time priority order book with bids and asks
-   - Order types: GTC, IOC, FOK, GTD, Day, post-only, iceberg, stop-market and stop-limit
+   - Order types: GTC, IOC, FOK, GTD, Day, market-to-limit, post-only, iceberg, stop-market, stop-limit, trailing-stop and pegged; STP modes
    - Deterministic expiry (`PurgeExpired` carries the timestamps through the log) and stop
      election on the replicated last trade price
    - The order book is the replicated state machine: deterministic `apply`, no clocks
@@ -168,7 +168,7 @@ per stream; the JSONL sink remains available for debugging.
 
 4. **Market-Data Egress** ([`market_data/`](./src/market_data/))
    - `apply` hands match events and a depth journal to a bounded tap (`try_send`; matching never waits)
-   - A leader-gated tokio task keeps a shadow book, derives BBO/OHLC bars and encodes wire v6
+   - A leader-gated tokio task keeps a shadow book, derives BBO/OHLC bars and encodes wire v7
    - Keys are `(symbol_id, stream_id, market_seq, sub_seq)`; one uncapped `TRADE` per taker
    - JSONL sink for debugging; the feature-gated `AeronSink` publishes streams 2001–2007 with one exclusive publication per stream
 
@@ -363,7 +363,7 @@ contract and [production decisions](./docs/PERFORMANCE.md#production-configurati
 for the trade-offs.
 
 The full benchmark methodology, storage-path details and optimization history are in
-[PERFORMANCE.md](./docs/PERFORMANCE.md). Snapshot **v10** and wire **v6** are breaking changes;
+[PERFORMANCE.md](./docs/PERFORMANCE.md). Snapshot **v11** and wire **v7** are breaking changes;
 see [DECIMAL.md](./docs/DECIMAL.md). Known gaps and the roadmap are tracked in
 [TODO.md](./TODO.md).
 

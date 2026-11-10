@@ -51,10 +51,13 @@ use crate::match_result::MatchEventKind;
 use crate::match_result::MatchResultSink;
 use crate::match_result::NoopSink;
 use crate::order_book::Fixed;
+use crate::order_book::MatchResult;
 use crate::order_book::Order;
 use crate::order_book::OrderBook;
 use crate::order_book::OrderSide;
+use crate::order_book::PegUpdate;
 use crate::order_book::RejectReason;
+use crate::order_book::StpCancel;
 use crate::order_book::SymbolConfig;
 use crate::store::config::sync_dir;
 use crate::store::types::MatchEngineRequest;
@@ -75,9 +78,10 @@ const SNAPSHOT_MAGIC: &[u8; 7] = b"MRFSNAP";
 /// single-symbol precision configuration; version 8 adds maker/taker fee rates to orders and fee
 /// fields to stored match events; version 9 adds base/quote asset metadata, tick/lot rules, volume
 /// units, fee assets and gross quote notional; version 10 replaces the boolean fee-overflow flag
-/// with the `MatchErrors` bit set. Postcard is not self-describing, so an older file is rejected
-/// with an explicit error instead of being decoded into a different shape.
-const SNAPSHOT_VERSION: u32 = 10;
+/// with the `MatchErrors` bit set; version 11 adds owner identity, market-to-limit, trailing-stop
+/// state, peg state and the symbol's STP policy. Postcard is not self-describing, so an older file
+/// is rejected with an explicit error instead of being decoded into a different shape.
+const SNAPSHOT_VERSION: u32 = 11;
 /// `magic + version + crc32 of the body`.
 const SNAPSHOT_HEADER_LEN: usize = SNAPSHOT_MAGIC.len() + 4 + 4;
 
@@ -354,6 +358,29 @@ impl<C: RaftTypeConfig> StateMachineStoreInner<C> {
         self.submissions_evicted = content.submissions_evicted;
         self.trim_events();
         self.trim_submissions();
+    }
+
+    /// Reprices resting pegged orders after a mutating request and appends the
+    /// resulting `Amended`/`Cancelled` events.
+    fn append_peg_updates(&mut self, log_index: u64, first_ordinal: u32, events: &mut EventBuffer) {
+        for update in self.orderbook.reprice_pegged() {
+            match update {
+                PegUpdate::Amended(amendment) => events.push(MatchEvent::for_amended(
+                    log_index,
+                    first_ordinal + events.len() as u32,
+                    &amendment,
+                )),
+                PegUpdate::Cancelled { order, reason } => {
+                    events.push(MatchEvent::for_cancelled_with_reason(
+                        log_index,
+                        first_ordinal + events.len() as u32,
+                        &order,
+                        order.open_volume(),
+                        Some(reason),
+                    ));
+                }
+            }
+        }
     }
 
     /// Appends one applied entry's events and trims the retained window.
@@ -646,6 +673,59 @@ struct PendingPublish {
 /// that buffer inline avoids a heap allocation on every request; a large sweep
 /// spills to the heap as usual.
 type EventBuffer = SmallVec<[MatchEvent; 4]>;
+
+/// Appends fills and STP maker cancellations in match order, returning the next
+/// free ordinal.
+fn append_fills_and_stp(
+    log_index: u64,
+    first_ordinal: u32,
+    taker_side: OrderSide,
+    taker_sequence: u64,
+    fills: &[MatchResult],
+    stp_cancelled: &[StpCancel],
+    events: &mut EventBuffer,
+) -> u32 {
+    let mut ordinal = first_ordinal;
+    let mut cancel_index = 0usize;
+    for (fill_index, fill) in fills.iter().enumerate() {
+        while cancel_index < stp_cancelled.len()
+            && stp_cancelled[cancel_index].after_fills == fill_index
+        {
+            let cancelled = &stp_cancelled[cancel_index];
+            events.push(MatchEvent::for_cancelled_with_reason(
+                log_index,
+                ordinal,
+                &cancelled.order,
+                cancelled.order.open_volume(),
+                Some(RejectReason::SelfTradePrevented),
+            ));
+            ordinal += 1;
+            cancel_index += 1;
+        }
+        MatchEvent::for_fills_into(
+            log_index,
+            ordinal,
+            taker_side,
+            taker_sequence,
+            std::slice::from_ref(fill),
+            events,
+        );
+        ordinal += 1;
+    }
+    while cancel_index < stp_cancelled.len() {
+        let cancelled = &stp_cancelled[cancel_index];
+        events.push(MatchEvent::for_cancelled_with_reason(
+            log_index,
+            ordinal,
+            &cancelled.order,
+            cancelled.order.open_volume(),
+            Some(RejectReason::SelfTradePrevented),
+        ));
+        ordinal += 1;
+        cancel_index += 1;
+    }
+    ordinal
+}
 
 /// Inline publish list for the common single-request entry.
 type PendingPublishes = SmallVec<[PendingPublish; 1]>;
@@ -1090,48 +1170,69 @@ where
                                 expired,
                             ));
                         }
-                        MatchEvent::for_place_at_into(
+                        let next = append_fills_and_stp(
                             log_index,
                             first_ordinal + events.len() as u32,
-                            &o,
+                            o.side,
+                            o.sequence,
                             &outcome.fills,
-                            outcome.resting,
+                            &outcome.stp_cancelled,
                             &mut events,
                         );
-                        if let Some(volume) = outcome.cancelled {
-                            events.push(MatchEvent::for_cancelled_volume(
+                        if let Some(volume) = outcome.resting {
+                            // An empty fill list emits only the `Rested` event.
+                            MatchEvent::for_place_at_into(
                                 log_index,
-                                first_ordinal + events.len() as u32,
+                                next,
+                                &o,
+                                &[],
+                                Some(volume),
+                                &mut events,
+                            );
+                        }
+                        if let Some(volume) = outcome.cancelled {
+                            events.push(MatchEvent::for_cancelled_with_reason(
+                                log_index,
+                                next + u32::from(outcome.resting.is_some()),
                                 &o,
                                 volume,
+                                outcome.cancel_reason,
                             ));
                         }
                         for trigger in &outcome.triggers {
+                            let ordinal = first_ordinal + events.len() as u32;
                             events.push(MatchEvent::for_triggered(
                                 log_index,
-                                first_ordinal + events.len() as u32,
+                                ordinal,
                                 &trigger.stop,
                                 trigger.trigger_price,
                             ));
-                            MatchEvent::for_fills_into(
+                            let next = append_fills_and_stp(
                                 log_index,
-                                first_ordinal + events.len() as u32,
+                                ordinal + 1,
                                 trigger.stop.side,
                                 trigger.stop.sequence,
                                 &trigger.fills,
+                                &trigger.stp_cancelled,
                                 &mut events,
                             );
                             if let Some(volume) = trigger.cancelled {
-                                events.push(MatchEvent::for_cancelled_volume(
+                                events.push(MatchEvent::for_cancelled_with_reason(
                                     log_index,
-                                    first_ordinal + events.len() as u32,
+                                    next,
                                     &trigger.stop,
                                     volume,
+                                    trigger.cancel_reason,
                                 ));
                             }
                         }
                     }
                 }
+                inner.append_peg_updates(
+                    log_index,
+                    first_ordinal + events.len() as u32,
+                    &mut events,
+                );
                 inner.record_events(&events);
                 if let Some(client_order_id) = client_order_id {
                     inner.record_submission(
@@ -1194,6 +1295,11 @@ where
                         RejectReason::UnsupportedOrder,
                     ));
                 }
+                inner.append_peg_updates(
+                    log_index,
+                    first_ordinal + events.len() as u32,
+                    &mut events,
+                );
                 inner.record_events(&events);
                 let market = self.take_market_frame(
                     inner,
@@ -1253,6 +1359,11 @@ where
                         )),
                     },
                 }
+                inner.append_peg_updates(
+                    log_index,
+                    first_ordinal + events.len() as u32,
+                    &mut events,
+                );
                 inner.record_events(&events);
                 let market = self.take_market_frame(
                     inner,
@@ -1283,6 +1394,11 @@ where
                         order,
                     ));
                 }
+                inner.append_peg_updates(
+                    log_index,
+                    first_ordinal + events.len() as u32,
+                    &mut events,
+                );
                 inner.record_events(&events);
                 let symbol_id = inner.symbol_config.symbol_id;
                 let market = self

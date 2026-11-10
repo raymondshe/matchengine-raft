@@ -95,7 +95,7 @@ support if desired, and broader crash/failover coverage.
 ## Snapshots (`src/store/state_machine.rs`)
 
 The state machine (order book + sequence counter + retained match-event window + submission dedupe
-map) stays in memory so applying entries is fast. Snapshot v10 is written as
+map) stays in memory so applying entries is fast. Snapshot v11 is written as
 `snapshot/current.snap` using the same atomic temp-file/rename protocol; `install_snapshot`
 validates the incoming bytes before replacing the durable copy, so a bad snapshot cannot destroy a
 good one.

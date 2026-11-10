@@ -866,7 +866,7 @@ independent of the feed.
   those are committed, so they are not wrong — consumers dedupe on
   `(symbol_id, stream_id, market_seq, sub_seq)` (§16.1) and honour the `RESET`/snapshot ordering
   rule. The keys are replicated-state derived, so the handover does not reset the sequence space.
-- **Leader restart.** State is restored from the v10 snapshot plus log replay (v10 replaces the
+- **Leader restart.** State is restored from the v11 snapshot plus log replay (v10 replaces the
   boolean fee-overflow flag with `MatchErrors`; v9 adds asset metadata, tick/lot rules, volume units
   and fee assets; v8 adds fee rates and fill fees; v7 adds
   the single-symbol precision configuration; v6 stores the last trade and match events as
@@ -1123,7 +1123,7 @@ book.
   but survive duplication and simplify recovery.
 - Archive deployment: every node, or only the current leader? Retention and disk budget?
 - Are lifecycle events and order sequences public? If not, split streams and networks.
-- ~~Price encoding~~ Resolved: wire v6 carries scale-18 `i128` prices, quantities and fees; old v2/v3
+- ~~Price encoding~~ Resolved: wire v7 carries scale-18 `i128` prices, quantities and fees; old v2/v3
   frames are not silently reinterpreted.
 - Journal vs event-only reconstruction: the journal is exact (iceberg refills, hidden volume) but
   touches the book module; events alone would leave the tap fully outside `order_book/` but need

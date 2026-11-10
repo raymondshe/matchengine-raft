@@ -39,12 +39,12 @@ on), [`MATCH_RESULTS.md`](./MATCH_RESULTS.md) (the pull-based replicated event l
 │                                        │ MarketDataSink::publish                       │
 │                                        ▼                                               │
 │                        AeronSink (new, feature `market-data-aeron`)                    │
-│                          wire v6 frames → one publication per stream 2001..2007        │
+│                          wire v7 frames → one publication per stream 2001..2007        │
 └──────────────────────────────┬──────────────────────────────────────────────────────────┘
                                │ Aeron multicast (or unicast relay)
                                ▼
 ┌───────────────── market-data system (new crate + process, N instances) ────────────────┐
-│ Aeron subscriptions ──► decode wire v6 ──► assembler (depth map · BBO · bars ·          │
+│ Aeron subscriptions ──► decode wire v7 ──► assembler (depth map · BBO · bars ·          │
 │ watermark · dedupe by (symbol, stream, market_seq, sub_seq))                            │
 │        │                                                                               │
 │        ▼                                                                               │
@@ -154,7 +154,7 @@ Binance's documented procedure for maintaining a local book from the diff stream
 | 1024 streams per connection | 1024 (configurable) | Binance parity; one connection can hold several symbols' streams |
 | Edge serves thousands of symbols | one symbol per engine deployment/cluster; one service instance aggregates several engines | engine contract stays one symbol per cluster; the service has one feed/state per configured symbol behind a shared hub |
 | `E`/`T` event times from the exchange | intake timestamps replicated in the log | the feed's rule: never a publish-time clock (§13 of the Aeron design) |
-| JSON only | JSON first; binary (wire v6 / an SBE-like format) is a later option | Binance itself now offers SBE streams; our wire v6 already exists on the Aeron edge |
+| JSON only | JSON first; binary (wire v7 / an SBE-like format) is a later option | Binance itself now offers SBE streams; our wire v7 already exists on the Aeron edge |
 
 ## 3. Goals and non-goals
 
@@ -244,7 +244,7 @@ and only lightly extended here.
   flag. Where the network forbids multicast (common in cloud VPCs), the same sink publishes N
   unicasts or a single relay subscribes — the market-data system is unchanged either way, because
   it only consumes.
-- **Frames:** the existing wire v6 format, unchanged (golden-tested with a strict reference
+- **Frames:** the existing wire v7 format, unchanged (golden-tested with a strict reference
   decoder). The market-data system reuses `wire::decode` from the engine crate via a path
   dependency, exactly like `demos/order_system/` reuses the client.
 - **Backpressure:** the processor task is off the matching path and *may* slow down; per the
@@ -293,7 +293,7 @@ and the record types), `rusteron-client`, `actix-web`/`actix-ws` and `tokio`.
   without a media driver:
 
 ```rust
-/// One decoded wire v6 message, or a transport-level loss signal.
+/// One decoded wire v7 message, or a transport-level loss signal.
 pub enum Sourced { Message(MarketMessage), Loss { last_seen: EventId, dropped: u64 } }
 
 pub trait FrameSource: Send + 'static {
@@ -390,7 +390,7 @@ dedicated OS thread                     main multi-thread Tokio runtime
 ┌──────────────────────────┐   bounded  ┌────────────────────────────────────────────┐
 │ Aeron subscriptions      │   handoff  │ one feed task per symbol                   │
 │ (one source per symbol)  │──queue────►│   dedupe · depth map · BBO · bars ·         │
-│ poll · decode wire v6    │  (drop→gap)│   watermark · gap policy                   │
+│ poll · decode wire v7    │  (drop→gap)│   watermark · gap policy                   │
 │ (rusteron, !Send)        │            │   caches: watch<Arc<Payload>>              │
 └──────────────────────────┘            │   conflation: interval(100ms/1000ms)       │
                                         │   serialize once → Bytes                   │
@@ -1084,4 +1084,4 @@ differ) behind one load balancer — multi-instance fleets work from day one (§
 - **Open:** default diff-depth speed (100 ms vs 1000 ms); whether `@lifecycle` should be opt-in;
   whether the periodic snapshot cadence should adapt to trading activity; whether P2's HTTP
   snapshot needs a request→engine path (stream 2010) or the periodic broadcast is enough; binary
-  (SBE-like / wire v6) WS frames for heavy consumers.
+  (SBE-like / wire v7) WS frames for heavy consumers.
