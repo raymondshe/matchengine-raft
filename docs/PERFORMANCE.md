@@ -1,6 +1,6 @@
 # Performance measurements
 
-Measured on **2026-10-30** (runtime flavor A/B and P0 offloads: **2026-10-31**; measurement scope and RSS: **2026-11-01**; book p50/p99 and the pinned-core approximation: **2026-11-04**; end-to-end/storage rerun with the OpenRaft quick wins: **2026-11-06**; realistic-mix replay: **2026-11-06**; dedicated Raft runtime: **2026-11-06**; WAL fsync Tokio rerun: **2026-11-07**; four-node no-fsync cluster: **2026-11-07**; write concurrency/batching sweep: **2026-11-08**; async WAL prototype: **2026-11-08**; production configuration decisions: **2026-11-08**; write admission control: **2026-11-09**; pre-connected write concurrency: **2026-11-09**; sustained single-node CPU profile: **2026-11-09**; benchmark regression gate: **2026-11-09**; read-path benchmark: **2026-11-08**; OpenRaft minimal-benchmark comparison: **2026-11-08**) on the reference development machine:
+Measured on **2026-10-30** (runtime flavor A/B and P0 offloads: **2026-10-31**; measurement scope and RSS: **2026-11-01**; book p50/p99 and the pinned-core approximation: **2026-11-04**; end-to-end/storage rerun with the OpenRaft quick wins: **2026-11-06**; realistic-mix replay: **2026-11-06**; dedicated Raft runtime: **2026-11-06**; WAL fsync Tokio rerun: **2026-11-07**; four-node no-fsync cluster: **2026-11-07**; write concurrency/batching sweep: **2026-11-08**; async WAL prototype: **2026-11-08**; production configuration decisions: **2026-11-08**; write admission control: **2026-11-09**; pre-connected write concurrency: **2026-11-09**; sustained single-node CPU profile: **2026-11-09**; benchmark regression gate: **2026-11-09**; read-path benchmark: **2026-11-08**; OpenRaft minimal-benchmark comparison: **2026-11-08**; WebSocket fan-out: **2026-11-10**) on the reference development machine:
 
 - Apple M4 (`arm64`)
 - Rust `1.93.1`
@@ -22,6 +22,7 @@ cargo bench --bench cluster_e2e -- --rounds 2 --concurrency-only  # 1/8/64/256/1
 cargo bench --bench cluster_e2e -- --rounds 4 --concurrency-only --clients 256,512,1024,2048 --max-inflight-writes 1024 --preconnect  # pre-connected admission sweep
 cargo bench --bench read_e2e -- --policy both  # local /read, /linearizable_read and /events; ReadIndex vs lease
 cargo bench --bench feed_load     # market-data feed at 50k/500k fills/s
+cargo bench --manifest-path demos/market_data_system/Cargo.toml --bench ws_fanout -- --clients 64 --updates 10000 --rate 20000  # WebSocket fan-out
 cargo bench --bench storage       # WAL append/read/recovery
 RAFT_WAL_FSYNC_MS=0 MATCHENGINE_ASYNC_WAL=1 cargo bench --features async-wal --bench storage  # prototype async WAL
 cargo bench --bench p0_bench -- duplicate|read|snapshot  # P0 lock/scan A/B
@@ -930,6 +931,29 @@ keeps up. The deliberate 2M fills/s overload shows the bounded-queue contract:
 frames are dropped rather than blocking `apply`, and the processor emits `GAP`
 markers. Peak queue includes one frame handed to the processor but not yet
 ingested, so it can show `capacity + 1`.
+
+The idle heartbeat adds at most one diagnostic `STATUS` per second when no entry
+is applied (`--market-data-aeron-heartbeat-ms`, default 1000; `0` disables). It
+runs on the off-thread processor and does not touch `apply`.
+
+## WebSocket fan-out (2026-11-10)
+
+`cargo bench --manifest-path demos/market_data_system/Cargo.toml --bench ws_fanout --
+--clients N --updates M --rate R` starts the reference service on a channel source,
+connects N loopback WebSocket clients to `@bookTicker`, and publishes M BBO updates at R/s.
+The hub serializes each payload once and fans the same `Bytes` out to every connection.
+
+| Clients | Updates | Offered | Delivered frames | Per client | Aggregate |
+|---:|---:|---:|---:|---:|---:|
+| 16 | 2,000 | 19,790/s | 15,973 | 998.3 | 158,052 frames/s |
+| 64 | 5,000 | 4,996/s | 110,649 | 1,728.9 | 110,571 frames/s |
+| 64 | 5,000 | 19,997/s | 46,560 | 727.5 | 186,217 frames/s |
+
+`@bookTicker` is a latest-value stream, so a slow connection intentionally drops older
+updates in its forward task; delivered frames are the effective fan-out, not a promise that
+every offered update reaches every client. The service remains bounded by the per-connection
+queue and closes a consumer with `1013` when it falls too far behind. These are local
+macOS/loopback numbers and exclude Aeron ingestion and JSON encoding changes under load.
 
 ## Storage benchmark
 

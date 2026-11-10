@@ -42,7 +42,7 @@ A Raft-replicated matching engine in Rust for teams that need deterministic exec
 | Execution | Deterministic price-time matching; `apply` reads no wall clock |
 | Durability | Segmented WAL + atomic snapshots; `RAFT_WAL_FSYNC_MS` (default: no fsync, 4 voters); snapshot every 100k entries or 30 minutes |
 | Replication | Raft peer RPCs over gRPC |
-| Market data | Aeron egress on streams 2001–2007 + Binance-style WebSocket service |
+| Market data | Aeron egress on streams 2001–2007 plus stream 2010 snapshot requests + Binance-style WebSocket service |
 | Symbol model | One symbol per process/cluster, configured and locked through Raft |
 | Numeric model | Exact 18-decimal fixed point through matching, events, snapshots and feeds |
 | Observability | Embedded console, health/readiness endpoints and metrics |
@@ -88,8 +88,8 @@ Everything below is implemented in this repository and exercised by tests; the l
 
 **APIs and data feeds**
 - **Durable match-event feed** at `POST /events` with cursor pagination, long-poll (`wait_ms`), retention limits, `client_order_id` idempotency, gRPC `StreamEvents` streaming and a reference MQ bridge sidecar; replay-safe retries.
-- **Deterministic market-data feed** with leader gating, shadow book, BBO, depth snapshots/deltas, lifecycle events, OHLC bars and a compact binary wire format with a reference decoder. The feature-gated **Aeron** egress publishes it on streams 2001–2007 with one exclusive publication per stream.
-- **Standalone market-data system** at `demos/market_data_system/`: consumes the feed over Aeron or JSONL and serves Binance-style WebSocket streams. One instance serves several symbols from a shared hub; clients hold a per-connection subscription set, switch symbols with live `UNSUBSCRIBE`/`SUBSCRIBE`, and scale horizontally without adding engine work.
+- **Deterministic market-data feed** with leader gating, shadow book, BBO, depth snapshots/deltas, lifecycle events, OHLC bars and a compact binary wire format with a reference decoder. The feature-gated **Aeron** egress publishes it on streams 2001–2007 with one exclusive publication per stream, an idle STATUS heartbeat and a stream-2010 snapshot-request path.
+- **Standalone market-data system** at `demos/market_data_system/`: consumes the feed over Aeron or JSONL and serves Binance-style WebSocket streams. One instance serves several symbols from a shared hub; clients hold a per-connection subscription set, switch symbols with live `UNSUBSCRIBE`/`SUBSCRIBE`, and scale horizontally without adding engine work. Late joiners request an immediate snapshot from the engine; `/ready` also expires on a missing frame/heartbeat.
 - **Flexible read consistency**: local reads, linearizable leader reads with lease reads by default and `ReadIndex` fallback, and linearizable follower reads; `GET /read-policy/status` reports lease hits and fallbacks.
 - **Lease reads by default**: leader-consistent reads try `ReadPolicy::LeaseRead` for `/linearizable_read`, `/events`, gRPC `StreamEvents` and `/get_linearizer`, falling back to `ReadIndex` when the lease is stale. Set `--read-policy read_index` to force a fresh quorum round. Lease reads require bounded clock drift (NTP/PTP).
 - **Leader-aware Rust client** that tracks and forwards requests to the current leader, with configurable timeouts, transient retry/backoff and typed API/no-leader errors; retries are at-least-once, so use `client_order_id` for idempotent write retries.
@@ -101,7 +101,7 @@ Everything below is implemented in this repository and exercised by tests; the l
 - **Embedded WebUI console** at `/console/`: cluster health, Raft leadership and replication, storage/event/feed state, a leader-only event viewer and diagnostics — no build step or external assets.
 - **Guarded Raft actions**: graceful leadership transfer over the gRPC `TransferLeader` RPC, a best-effort Pre-Vote election request, and snapshot triggering, with confirmation, action locking and audit logs.
 - **Standalone demo order desk** at `demos/order_system/`: a separate process and crate that places real orders and shows the full book, symbol configuration, a cursor-following `/events` tape and labelled demo estimates of the order-system freeze plus maker/taker fee settlement, with a demo-only linear perpetual/leverage overlay; reuses the console theme.
-- **Health and readiness probes**: `/health` reports the gRPC listener, Raft core and WAL/state-machine frontier; `/ready` additionally requires a known leader, making both suitable for orchestrators.
+- **Health and readiness probes**: `/health` reports the gRPC listener, Raft core and WAL/state-machine frontier; `/ready` additionally requires a known leader, and `/pretrade/status` reports symbol/provisioning readiness reasons, making them suitable for orchestrators and pre-trade gates.
 
 **Built to be trusted**
 - **Bounded public edge**: request-body, read-key, event-page, idempotency-key and snapshot-size limits, with malformed input rejected before Raft.
@@ -248,6 +248,9 @@ switches symbols with live `UNSUBSCRIBE`/`SUBSCRIBE`:
 - One exclusive Aeron publication per stream; a depth snapshot cannot block a
   trade or status stream.
 - One JSON encode per stream message, shared as `Bytes` across every subscriber.
+- An idle STATUS heartbeat keeps `@status` alive when the book is quiet; a late
+  joiner can request an immediate reset snapshot on stream 2010 instead of
+  waiting for the periodic broadcast.
 - 100/1000 ms depth conflation and latest-value collapse for `bookTicker` and
   partial depth, so bursts do not multiply socket writes.
 - Deterministic `(symbol_id, stream_id, market_seq, sub_seq)` keys make

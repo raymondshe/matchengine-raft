@@ -24,11 +24,13 @@ use openraft::type_config::TypeConfigExt;
 use reqwest::StatusCode;
 
 use crate::common::TempDir;
+use crate::common::TestAddr;
 
 type C = MatchEngineTypeConfig;
 
-const ADDR: &str = "127.0.0.1:21801";
-const ADDR_2: &str = "127.0.0.1:21802";
+const ADDR: TestAddr = TestAddr::new(21801);
+const ADDR_2: TestAddr = TestAddr::new(21802);
+const ADDR_3: TestAddr = TestAddr::new(21803);
 
 fn fixed(value: &str) -> Fixed {
     value.parse().expect("valid exact decimal")
@@ -369,7 +371,134 @@ fn gateway_symbol_guard_allows_configure_and_place_batch() {
     });
 }
 
-async fn raw_write(addr: &str, request: &MatchEngineRequest) -> reqwest::Response {
+#[test]
+fn provisioning_helper_and_pretrade_readiness() {
+    C::run(async {
+        let temp = TempDir::new("symbol-provisioning");
+        let storage = StorageConfig::new(temp.path()).with_instance_prefix("symbol-provisioning");
+        let node = build_match_engine_node(1, ADDR_3.to_string(), default_raft_config(), storage)
+            .await
+            .unwrap();
+        let client = MatchEngineClient::<C>::new(1, ADDR_3.to_string());
+
+        // Before initialization the diagnostic endpoint still answers, but the
+        // node is not pre-trade ready.
+        let status = client.pretrade_status().await.unwrap();
+        assert!(!status.ready);
+        assert!(!status.symbol_locked);
+        assert_eq!(0, status.open_orders);
+        assert_eq!(0, status.sequence);
+        assert!(
+            status
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("no cluster leader")),
+            "reasons: {:?}",
+            status.reasons
+        );
+
+        client.init().await.unwrap().unwrap();
+        wait_for_leader(&client).await;
+
+        // Local validation refuses an invalid configuration without a write.
+        let invalid = SymbolConfig {
+            price_decimals: 19,
+            ..SymbolConfig::new(7, 2, 2).unwrap()
+        };
+        let error = client
+            .provision_symbol(invalid)
+            .await
+            .unwrap()
+            .expect_err("invalid configuration must be refused");
+        assert!(error.contains("invalid symbol configuration"), "{error}");
+        assert_eq!(
+            "0",
+            client
+                .read(&"orderbook_sequence".to_string())
+                .await
+                .unwrap()
+        );
+
+        let config = SymbolConfig::new(7, 2, 2).unwrap();
+        let provisioned = client
+            .provision_symbol(config.clone())
+            .await
+            .unwrap()
+            .expect("provisioning succeeds");
+        assert_eq!(7, provisioned.symbol_id);
+        assert_eq!(config, provisioned.symbol_config);
+        assert!(!provisioned.symbol_locked);
+
+        // Provisioning is idempotent when the applied configuration matches.
+        let again = client
+            .provision_symbol(config.clone())
+            .await
+            .unwrap()
+            .expect("repeat provisioning succeeds");
+        assert_eq!(config, again.symbol_config);
+
+        let ready = client
+            .wait_for_pretrade_ready(&config, Duration::from_secs(15))
+            .await
+            .unwrap()
+            .expect("node becomes pre-trade ready");
+        assert!(ready.ready);
+        assert!(ready.reasons.is_empty(), "{:?}", ready.reasons);
+        assert!(ready.recovered);
+        assert_eq!(Some(1), ready.leader_id);
+
+        // The first accepted order locks provisioning and closes readiness.
+        client
+            .write(&MatchEngineRequest::place(
+                Order::new(OrderSide::Buy, fixed("100.25"), fixed("1.5"), 0).with_symbol(7),
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+
+        let status = client.pretrade_status().await.unwrap();
+        assert!(status.symbol_locked);
+        assert_eq!(1, status.open_orders);
+        assert!(!status.ready);
+        assert!(
+            status
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("locked")),
+            "reasons: {:?}",
+            status.reasons
+        );
+        assert!(
+            status
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("not empty")),
+            "reasons: {:?}",
+            status.reasons
+        );
+
+        let error = client
+            .provision_symbol(SymbolConfig::new(7, 3, 3).unwrap())
+            .await
+            .unwrap()
+            .expect_err("a locked symbol cannot be re-provisioned");
+        assert!(error.contains("locked"), "{error}");
+
+        let error = client
+            .wait_for_pretrade_ready(&SymbolConfig::new(8, 2, 2).unwrap(), Duration::from_secs(1))
+            .await
+            .unwrap()
+            .expect_err("a different symbol must not report ready");
+        assert!(error.contains("does not match"), "{error}");
+
+        node.shutdown().await.unwrap();
+    });
+}
+
+async fn raw_write(
+    addr: impl std::fmt::Display,
+    request: &MatchEngineRequest,
+) -> reqwest::Response {
     reqwest::Client::builder()
         .no_proxy()
         .build()
@@ -381,7 +510,10 @@ async fn raw_write(addr: &str, request: &MatchEngineRequest) -> reqwest::Respons
         .expect("send /write")
 }
 
-async fn raw_write_batch(addr: &str, requests: &[MatchEngineRequest]) -> reqwest::Response {
+async fn raw_write_batch(
+    addr: impl std::fmt::Display,
+    requests: &[MatchEngineRequest],
+) -> reqwest::Response {
     reqwest::Client::builder()
         .no_proxy()
         .build()

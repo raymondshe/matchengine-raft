@@ -30,6 +30,8 @@ use openraft::Config;
 use openraft::SnapshotPolicy;
 use openraft::type_config::TypeConfigExt;
 
+use crate::common::TestAddr;
+
 type C = MatchEngineTypeConfig;
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -86,7 +88,7 @@ async fn wait_for_leader(client: &MatchEngineClient<C>) -> anyhow::Result<()> {
 }
 
 async fn start(
-    addr: &str,
+    addr: impl std::fmt::Display,
     storage: &StorageConfig,
     config: Config,
 ) -> anyhow::Result<MatchEngineNode> {
@@ -94,7 +96,7 @@ async fn start(
     Ok(node)
 }
 
-fn make_client(addr: &str) -> MatchEngineClient<C> {
+fn make_client(addr: impl std::fmt::Display) -> MatchEngineClient<C> {
     MatchEngineClient::<C>::new(1, addr.to_string())
 }
 
@@ -157,7 +159,7 @@ async fn assert_order_state(
 #[test]
 fn restart_recovers_from_log_replay() {
     C::run(async {
-        let addr = "127.0.0.1:21201";
+        let addr = TestAddr::new(21201);
         let temp = TempDir::new("replay");
         let storage = StorageConfig::new(temp.0.clone()).with_instance_prefix("replay");
 
@@ -217,7 +219,7 @@ fn restart_recovers_from_log_replay() {
 #[test]
 fn restart_recovers_from_snapshot() {
     C::run(async {
-        let addr = "127.0.0.1:21202";
+        let addr = TestAddr::new(21202);
         let temp = TempDir::new("snapshot");
         let storage = StorageConfig::new(temp.0.clone()).with_instance_prefix("snapshot");
 
@@ -282,7 +284,7 @@ fn directory_size(dir: &std::path::Path) -> u64 {
 #[test]
 fn restart_recovers_large_log() {
     C::run(async {
-        let addr = "127.0.0.1:21203";
+        let addr = TestAddr::new(21203);
         let temp = TempDir::new("large-log");
         let storage = StorageConfig::new(temp.0.clone()).with_instance_prefix("large-log");
 
@@ -334,7 +336,7 @@ fn restart_recovers_large_log() {
 #[test]
 fn restart_recovers_large_snapshot() {
     C::run(async {
-        let addr = "127.0.0.1:21204";
+        let addr = TestAddr::new(21204);
         let temp = TempDir::new("large-snapshot");
         let storage = StorageConfig::new(temp.0.clone()).with_instance_prefix("large-snapshot");
 
@@ -388,7 +390,7 @@ fn restart_recovers_large_snapshot() {
 #[test]
 fn restart_loads_snapshot_then_replays_newer_wal_events() {
     C::run(async {
-        let addr = "127.0.0.1:21205";
+        let addr = TestAddr::new(21205);
         let temp = TempDir::new("snapshot-tail-events");
         let storage =
             StorageConfig::new(temp.0.clone()).with_instance_prefix("snapshot-tail-events");
@@ -501,7 +503,7 @@ fn restart_loads_snapshot_then_replays_newer_wal_events() {
 #[test]
 fn event_cursor_resumes_across_snapshot_and_restart() {
     C::run(async {
-        let addr = "127.0.0.1:21206";
+        let addr = TestAddr::new(21206);
         let temp = TempDir::new("event-cursor-snapshot");
         let storage = StorageConfig::new(temp.0.clone())
             .with_instance_prefix("event-cursor-snapshot")
@@ -688,7 +690,7 @@ fn event_cursor_resumes_across_snapshot_and_restart() {
 #[test]
 fn event_cursor_reports_retention_gap_across_restart() {
     C::run(async {
-        let addr = "127.0.0.1:21207";
+        let addr = TestAddr::new(21207);
         let temp = TempDir::new("event-cursor-retention");
         let storage = StorageConfig::new(temp.0.clone())
             .with_instance_prefix("event-cursor-retention")

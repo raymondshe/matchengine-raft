@@ -15,10 +15,13 @@ use matchengine_raft::market_data::DepthSnapshotRecord;
 use matchengine_raft::market_data::LevelUpdate;
 use matchengine_raft::market_data::MarketMessage;
 use matchengine_raft::market_data::MessageBody;
+use matchengine_raft::market_data::HEARTBEAT_SUB_SEQ;
 use matchengine_raft::market_data::STREAM_BBO;
 use matchengine_raft::market_data::STREAM_DEPTH_DELTA;
 use matchengine_raft::market_data::STREAM_DEPTH_SNAPSHOT;
+use matchengine_raft::market_data::STREAM_STATUS;
 use matchengine_raft::market_data::STREAM_TRADE;
+use matchengine_raft::market_data::StatusRecord;
 use matchengine_raft::market_data::TradeRecord;
 use matchengine_raft::market_data::flags;
 use matchengine_raft::order_book::DepthLevel;
@@ -60,6 +63,25 @@ fn message(
         symbol_id: 0,
         body,
     }
+}
+
+fn heartbeat(seq: u64) -> MarketMessage {
+    message(
+        STREAM_STATUS,
+        0,
+        seq,
+        HEARTBEAT_SUB_SEQ,
+        1_500,
+        MessageBody::Status(StatusRecord {
+            last_log_index: seq + 1,
+            last_ordinal: 0,
+            last_market_seq: seq,
+            last_sub_seq: 0,
+            applied_index: seq + 1,
+            book_sequence: seq,
+            pending_stops: 0,
+        }),
+    )
 }
 
 fn snapshot(boundary: u64) -> MarketMessage {
@@ -511,4 +533,64 @@ async fn wait_symbol_frame(ws: &mut Ws, symbol: &str) -> Value {
             return frame;
         }
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn readiness_requires_a_fresh_frame_or_heartbeat() {
+    let mut config = Config::for_test("127.0.0.1:0");
+    config.heartbeat_timeout = Duration::from_millis(150);
+    let (tx, source) = channel_source(8);
+    let running = start_single(config, source).await;
+
+    let (status, _) = http_get(&running.addr, "/ready").await;
+    assert_eq!(503, status, "no snapshot yet");
+
+    tx.send(Ok(snapshot(0))).await.unwrap();
+    wait_ready(&running.addr).await;
+
+    // Silence beyond the timeout drains the instance.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let (status, body) = http_get(&running.addr, "/ready").await;
+    assert_eq!(503, status, "stale heartbeat: {body}");
+    assert_eq!(false, serde_json::from_str::<Value>(&body).unwrap()["symbols"]["eurusd"]["heartbeat_fresh"]);
+
+    // The next frame (including an idle STATUS heartbeat) restores readiness.
+    tx.send(Ok(bbo(1))).await.unwrap();
+    wait_ready(&running.addr).await;
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn repeated_idle_heartbeats_are_forwarded() {
+    let config = Config::for_test("127.0.0.1:0");
+    let (tx, source) = channel_source(8);
+    let running = start_single(config, source).await;
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{}/ws", running.addr))
+        .await
+        .expect("connect");
+    ws.send(Message::text(
+        r#"{"method":"SUBSCRIBE","params":["eurusd@status"],"id":1}"#,
+    ))
+    .await
+    .unwrap();
+    loop {
+        let frame = next_json(&mut ws).await;
+        if frame["id"] == 1 {
+            break;
+        }
+    }
+
+    // The same `(market_seq, sub_seq)` heartbeat must reach @status each time;
+    // the assembler dedupes deterministic tape entries, not liveness frames.
+    for _ in 0..2 {
+        tx.send(Ok(heartbeat(10))).await.unwrap();
+        loop {
+            let frame = next_json(&mut ws).await;
+            if frame["e"] == "status" {
+                assert!(frame["ready"].as_bool().is_some());
+                break;
+            }
+        }
+    }
+    running.shutdown().await;
 }

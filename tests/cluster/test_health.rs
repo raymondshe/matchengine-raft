@@ -20,11 +20,12 @@ use reqwest::StatusCode;
 use serde_json::Value;
 
 use crate::common::TempDir;
+use crate::common::TestAddr;
 
 type C = MatchEngineTypeConfig;
 
-const ADDR: &str = "127.0.0.1:21905";
-const RAFT_ADDR: &str = "127.0.0.1:22905";
+const ADDR: TestAddr = TestAddr::new(21905);
+const RAFT_ADDR: TestAddr = TestAddr::new(22905);
 
 #[test]
 fn health_reports_grpc_leadership_and_storage() {
@@ -45,8 +46,8 @@ fn health_reports_grpc_leadership_and_storage() {
         assert_eq!(body["healthy"], true);
         assert_eq!(body["ready"], false);
         assert_eq!(body["node_id"], 1);
-        assert_eq!(body["http_addr"], ADDR);
-        assert_eq!(body["grpc_addr"], RAFT_ADDR);
+        assert_eq!(body["http_addr"], ADDR.to_string());
+        assert_eq!(body["grpc_addr"], RAFT_ADDR.to_string());
         assert_eq!(body["grpc_listening"], true);
         assert_eq!(body["recovered"], false);
         assert!(body["storage"]["wal"].is_object());
@@ -104,7 +105,7 @@ fn health_reports_grpc_leadership_and_storage() {
 #[test]
 fn metrics_exposes_data_server_and_runtime_stats() {
     C::run(async {
-        let addr = "127.0.0.1:21935";
+        let addr = TestAddr::new(21935);
         let temp = TempDir::new("metrics-observability");
         let storage = StorageConfig::new(temp.path()).with_instance_prefix("metrics-observability");
         let node = build_match_engine_node(1, addr.to_string(), default_raft_config(), storage)

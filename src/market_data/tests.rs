@@ -738,3 +738,40 @@ fn gap_and_status_share_the_stream_without_key_collisions() {
         .expect("cadence status");
     assert_eq!(0, status.last_sub_seq);
 }
+
+#[test]
+fn idle_heartbeat_uses_a_reserved_sub_seq_and_watermark() {
+    let config = MarketDataConfig {
+        heartbeat_ms: 1,
+        ..MarketDataConfig::default()
+    };
+    let mut h = harness(config);
+    h.processor.apply_snapshot(snapshot(4));
+    h.clear();
+    std::thread::sleep(std::time::Duration::from_millis(5));
+
+    h.processor.emit_idle_heartbeat();
+
+    let messages = h.messages();
+    assert_eq!(1, messages.len(), "one idle heartbeat: {messages:?}");
+    let heartbeat = &messages[0];
+    assert_eq!(STREAM_STATUS, heartbeat.stream);
+    assert_eq!(HEARTBEAT_SUB_SEQ, heartbeat.sub_seq);
+    assert_eq!(4, heartbeat.market_seq);
+    match &heartbeat.body {
+        MessageBody::Status(status) => {
+            assert_eq!(4, status.last_market_seq);
+            assert_eq!(5, status.last_log_index);
+            assert_eq!(0, status.last_ordinal);
+        }
+        other => panic!("expected heartbeat status, got {other:?}"),
+    }
+    assert_eq!(1, h.stats.heartbeats.load(Ordering::Relaxed));
+
+    // A recent frame suppresses the heartbeat.
+    h.clear();
+    h.processor.ingest(frame(5, 1_000, vec![], vec![]));
+    h.clear();
+    h.processor.emit_idle_heartbeat();
+    assert!(h.messages().is_empty(), "activity suppresses the heartbeat");
+}

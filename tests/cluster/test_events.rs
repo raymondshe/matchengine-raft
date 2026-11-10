@@ -21,10 +21,11 @@ use matchengine_raft::store::MatchEngineRequest;
 use openraft::type_config::TypeConfigExt;
 
 use crate::common::TempDir;
+use crate::common::TestAddr;
 
 type C = MatchEngineTypeConfig;
 
-const ADDR: &str = "127.0.0.1:21304";
+const ADDR: TestAddr = TestAddr::new(21304);
 
 #[test]
 fn events_are_returned_deduped_paged_and_bounded() {
@@ -185,13 +186,14 @@ async fn wait_for_leader(client: &MatchEngineClient<C>) {
 ///
 /// The returned `TempDir` must stay alive for the node's lifetime.
 async fn boot_node(
-    addr: &str,
+    addr: impl std::fmt::Display,
     prefix: &str,
 ) -> (
     matchengine_raft::MatchEngineNode,
     MatchEngineClient<C>,
     TempDir,
 ) {
+    let addr = addr.to_string();
     let temp = TempDir::new(prefix);
     let storage = StorageConfig::new(temp.path())
         .with_instance_prefix(prefix)
@@ -232,7 +234,7 @@ async fn seed_and_cursor(client: &MatchEngineClient<C>) -> matchengine_raft::mat
 #[test]
 fn events_long_poll_returns_new_events_or_an_empty_page_after_the_wait() {
     C::run(async {
-        const LONG_POLL_ADDR: &str = "127.0.0.1:21305";
+        const LONG_POLL_ADDR: TestAddr = TestAddr::new(21305);
         let (node, client, _temp) = boot_node(LONG_POLL_ADDR, "events-long-poll").await;
         let cursor = seed_and_cursor(&client).await;
 
@@ -306,12 +308,12 @@ fn event_service_streams_pages_with_an_idle_heartbeat() {
     use matchengine_raft::network::grpc::pb::event_service_client::EventServiceClient;
 
     C::run(async {
-        const STREAM_ADDR: &str = "127.0.0.1:21306";
-        const STREAM_GRPC: &str = "http://127.0.0.1:22306";
+        const STREAM_ADDR: TestAddr = TestAddr::new(21306);
         let (node, client, _temp) = boot_node(STREAM_ADDR, "events-stream").await;
+        let stream_grpc = STREAM_ADDR.raft_url();
         let cursor = seed_and_cursor(&client).await;
 
-        let mut grpc = EventServiceClient::connect(STREAM_GRPC.to_string())
+        let mut grpc = EventServiceClient::connect(stream_grpc.clone())
             .await
             .expect("connect event service");
 
@@ -410,7 +412,7 @@ fn event_service_streams_pages_with_an_idle_heartbeat() {
 #[test]
 fn bridge_sidecar_publishes_events_and_checkpoints_the_cursor() {
     C::run(async {
-        const BRIDGE_ADDR: &str = "127.0.0.1:21307";
+        const BRIDGE_ADDR: TestAddr = TestAddr::new(21307);
         let (node, client, temp) = boot_node(BRIDGE_ADDR, "events-bridge").await;
 
         // Two orders produce a rested event and a fill.
@@ -437,10 +439,11 @@ fn bridge_sidecar_publishes_events_and_checkpoints_the_cursor() {
 
         let out = temp.path().join("events.jsonl");
         let cursor = temp.path().join("events.cursor");
+        let bridge_addr = BRIDGE_ADDR.to_string();
         let status = std::process::Command::new(env!("CARGO_BIN_EXE_events_bridge"))
             .args([
                 "--engine",
-                BRIDGE_ADDR,
+                &bridge_addr,
                 "--engine-id",
                 "1",
                 "--out",

@@ -85,22 +85,19 @@ implemented: the replication lag threshold now sits above the 100k snapshot poli
 suppression is enabled, HTTP/2 windows/keepalive are tuned, snapshot chunks follow OpenRaft's
 configured size and readiness waits for recovery. The remaining P2/P3 items are tracked in §16.
 
-The next work, in order (re-prioritised 2026-11-10 after the storage/transport hygiene batch):
+The next work, in order (re-prioritised 2026-11-10 after the Aeron heartbeat/request batch):
 
-1. **Run the Linux pinned-core `e2e` pass (P2, §8).** Dispatch the manual `Linux benchmark`
-   workflow (or run the same commands on deployment hardware) and record the pinned short and
-   sustained rows. This remains blocked on a Linux host and `gh` authentication.
-2. **Aeron operation hardening and the snapshot-request stream (§6, P2).** Run external-driver
-   and multicast fan-out validation on Linux, add the idle heartbeat and publish `ws_fanout`
-   numbers; then add the late-joiner snapshot-request stream (2010).
-3. **Observability measurements and console actions (§16, P2).** Record heartbeat/`AppendStream`
+1. **Run the Linux pinned-core `e2e` pass and Linux Aeron validation (P2, §8/§6).**
+   Dispatch the manual `Linux benchmark` workflow for the pinned short/sustained rows and run the
+   external-driver plus multicast fan-out checklist in
+   [`demos/market_data_system/README.md`](./demos/market_data_system/README.md). Both remain blocked
+   on a Linux host; `gh` authentication is also needed for the workflow.
+2. **Observability measurements and console actions (§16, P2).** Record heartbeat/`AppendStream`
    counts and snapshot-transfer time, and add guarded purge-log/runtime-config console actions.
-4. **Provisioning and test hygiene (§2/§7, P2).** Add the `ConfigureSymbol` provisioning
-   helper/pre-trade readiness check, parameterize fixed test ports, and keep docs in sync.
-5. **Benchmark P2 follow-ups (P2, §17).** Add the open-loop latency run (or the coordinated-omission
+3. **Benchmark P2 follow-ups (P2, §17).** Add the open-loop latency run (or the coordinated-omission
    caveat), re-pin the benchmark to current `HEAD`, and evaluate a treap/sorted-vector/heap hybrid
    only as a book-only A/B.
-6. **Last: apply-path and per-level-bucket experiments (§8, P3).** Reserve known apply-path
+4. **Last: apply-path and per-level-bucket experiments (§8, P3).** Reserve known apply-path
    lengths, evaluate apply-thread affinity and adopt per-level buckets only if a sparse-level fast
    path or new measurements justify them; the measured wins are small or split.
 
@@ -175,7 +172,11 @@ Done:
 
 Remaining:
 
-- [ ] **P2** Add a provisioning helper for `ConfigureSymbol` and a pre-trade readiness check.
+- [x] **P2** Add a provisioning helper for `ConfigureSymbol` and a pre-trade readiness check.
+  Done: `MatchEngineClient::provision_symbol` validates/applies/verifies the configuration and
+  refuses a locked or non-empty engine; `wait_for_pretrade_ready` polls `GET /pretrade/status`
+  until healthy, recovered, leader-known, unlocked and empty. `/pretrade/status` is diagnostic
+  (`200` with reasons); `/ready` remains the operational probe.
 
 ## 3. Public trust boundary and request safety [done]
 
@@ -360,10 +361,13 @@ Remaining:
   message to `<dir>/<symbol>.jsonl` with the engine's JSONL shape, and `--replay-dir` feeds those
   files through the normal assembler/WebSocket path without a media driver. A dedicated archive
   task flushes each line before yielding; `tests/archive.rs` proves record-then-replay equality.
-- [ ] **P2** Aeron operation hardening: run the documented external-driver/multicast fan-out
-  validation on Linux, add an idle heartbeat, and publish `ws_fanout` benchmark numbers. The
-  external-driver runbook is now in `demos/market_data_system/README.md`.
-- [ ] **P2** Add the snapshot-request stream (2003/2010).
+- [x] **P2** Aeron operation hardening — implemented: idle STATUS heartbeat (`--market-data-aeron-heartbeat-ms`),
+  `ws_fanout` benchmark with published numbers, and the stream-2010 snapshot-request stream on
+  both engine and service. Linux external-driver/multicast fan-out validation remains blocked on
+  this macOS host; the runbook and commands are in `demos/market_data_system/README.md`.
+- [x] **P2** Add the snapshot-request stream (2003/2010). Done: fixed 24-byte `MSRQ` v1 request,
+  engine subscription and state-machine capture, service request on empty/stale depth and gap,
+  embedded-driver round-trip tests.
 
 ## 7. Tests and CI
 
@@ -455,8 +459,11 @@ Remaining (the public-suite follow-ups are tracked in §17):
   WAL fsync, kills the leader, truncates the last three WAL records to model an unsynced tail
   loss, proves the remaining three voters commit and replicate three more orders, then restarts
   the killed node and waits for it to catch up and accept a post-restart write.
-- [ ] **P2** Parameterize the fixed test ports; `test_cluster.rs` still binds 21001–21003.
-- [ ] **P2** Keep `AGENTS.md` and this file in sync after code changes; both are maintained by
+- [x] **P2** Parameterize the fixed test ports. Done: every integration suite renders HTTP/gRPC
+  addresses through `tests/cluster/common.rs`; `MATCHENGINE_TEST_PORT_OFFSET=N` shifts the whole
+  suite so a second `cargo test` process can run concurrently. `test_cluster.rs` no longer hardcodes
+  21001–21003 in its membership or expected error text.
+- [x] **P2** Keep `AGENTS.md` and this file in sync after code changes; both are maintained by
   hand.
 
 ## 8. Performance and capacity

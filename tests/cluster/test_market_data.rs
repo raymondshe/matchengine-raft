@@ -20,10 +20,11 @@ use matchengine_raft::store::MatchEngineRequest;
 use openraft::type_config::TypeConfigExt;
 
 use crate::common::TempDir;
+use crate::common::TestAddr;
 
 type C = MatchEngineTypeConfig;
 
-const ADDR: &str = "127.0.0.1:21303";
+const ADDR: TestAddr = TestAddr::new(21303);
 
 #[test]
 fn market_data_feed_publishes_trades_bbo_depth_and_bars() {

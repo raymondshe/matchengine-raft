@@ -37,3 +37,7 @@ aeron = ["dep:rusteron-client", "dep:rusteron-media-driver"]
 
 [dev-dependencies]
 tokio-tungstenite = "0.24"
+
+[[bench]]
+name = "ws_fanout"
+harness = false

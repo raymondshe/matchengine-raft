@@ -24,6 +24,7 @@ use serde::Serialize;
 use crate::MatchEngineNodeId;
 use crate::MatchEngineTypeConfig;
 use crate::app::MatchEngineApp;
+use crate::order_book::SymbolConfig;
 
 /// Shared health flag for the gRPC Raft listener.
 ///
@@ -112,6 +113,38 @@ pub struct HealthResponse {
     pub errors: Vec<String>,
 }
 
+/// Pre-trade state returned by `GET /pretrade/status`.
+///
+/// This is a diagnostic endpoint, not the operational `/ready` probe: it always
+/// returns `200` and reports why pre-trade readiness is false. A caller should
+/// provision the intended symbol with the client helper, then wait for
+/// `ready == true` before enabling order entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PreTradeStatus {
+    /// Healthy, recovered, leader known, symbol unlocked and the book empty.
+    pub ready: bool,
+    /// The symbol id from the applied configuration.
+    pub symbol_id: u32,
+    /// The full applied symbol and precision configuration.
+    pub symbol_config: SymbolConfig,
+    /// True after the first accepted order; provisioning is then closed.
+    pub symbol_locked: bool,
+    /// Resting visible orders on both sides.
+    pub open_orders: usize,
+    /// Parked stop orders.
+    pub open_stops: usize,
+    /// Next market/mutation sequence; zero means no mutating request applied.
+    pub sequence: u64,
+    /// Whether the node's listener, Raft core and storage are healthy.
+    pub healthy: bool,
+    /// The known cluster leader, if any.
+    pub leader_id: Option<MatchEngineNodeId>,
+    /// Whether startup recovery has completed.
+    pub recovered: bool,
+    /// Why `ready` is false; empty when ready.
+    pub reasons: Vec<String>,
+}
+
 /// Raft leadership state as seen by this node.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LeadershipHealth {
@@ -189,6 +222,16 @@ pub async fn ready(app: Data<MatchEngineApp>) -> HttpResponse {
     HttpResponse::build(status).json(report)
 }
 
+/// Pre-trade readiness and symbol provisioning state.
+///
+/// Always returns `200` so a provisioner can inspect `reasons` while the node
+/// is still starting or the symbol is locked. The operational gate remains
+/// `GET /ready`.
+#[get("/pretrade/status")]
+pub async fn pretrade_status(app: Data<MatchEngineApp>) -> HttpResponse {
+    HttpResponse::Ok().json(collect_pretrade_status(&app).await)
+}
+
 pub(crate) async fn collect_health(app: &MatchEngineApp) -> HealthResponse {
     let metrics = app.raft.metrics().borrow_watched().clone();
     let grpc_listening = app.grpc_health.is_listening();
@@ -249,6 +292,41 @@ pub(crate) async fn collect_health(app: &MatchEngineApp) -> HealthResponse {
             cluster_committed: metrics.cluster_committed,
         },
         errors,
+    }
+}
+
+/// Collects the pre-trade readiness view from health plus one state-machine
+/// snapshot.
+pub(crate) async fn collect_pretrade_status(app: &MatchEngineApp) -> PreTradeStatus {
+    let report = collect_health(app).await;
+    let state = app.state_machine_store.pretrade_state().await;
+
+    let mut reasons = report.errors.clone();
+    if report.leadership.leader_id.is_none() {
+        reasons.push("no cluster leader is known".to_string());
+    }
+    if !report.recovered {
+        reasons.push("state machine has not recovered".to_string());
+    }
+    if state.symbol_locked {
+        reasons.push("symbol configuration is locked after trading started".to_string());
+    }
+    if state.open_orders > 0 || state.open_stops > 0 {
+        reasons.push("order book is not empty".to_string());
+    }
+
+    PreTradeStatus {
+        ready: reasons.is_empty(),
+        symbol_id: state.symbol_id,
+        symbol_config: state.symbol_config,
+        symbol_locked: state.symbol_locked,
+        open_orders: state.open_orders,
+        open_stops: state.open_stops,
+        sequence: state.sequence,
+        healthy: report.healthy,
+        leader_id: report.leadership.leader_id,
+        recovered: report.recovered,
+        reasons,
     }
 }
 

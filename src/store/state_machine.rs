@@ -362,6 +362,26 @@ pub struct StateMachineData {
     pub submissions_evicted: u64,
 }
 
+/// Pre-trade snapshot of the symbol configuration and book occupancy.
+///
+/// The values come from one state-machine lock, so a readiness check cannot
+/// observe a symbol lock and an empty book from two different applies.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PreTradeState {
+    /// The one symbol this process/cluster trades.
+    pub symbol_id: u32,
+    /// The full replicated symbol configuration.
+    pub symbol_config: SymbolConfig,
+    /// True after the first accepted order; provisioning is then closed.
+    pub symbol_locked: bool,
+    /// Resting visible orders on both sides.
+    pub open_orders: usize,
+    /// Parked stop orders.
+    pub open_stops: usize,
+    /// Next market/mutation sequence; zero means no mutating request applied.
+    pub sequence: u64,
+}
+
 /// Inner storage for the state machine.
 #[derive(Debug)]
 pub struct StateMachineStoreInner<C: RaftTypeConfig> {
@@ -1121,6 +1141,21 @@ where
     pub async fn symbol_id(&self) -> u32 {
         let inner = self.inner.lock().await;
         inner.symbol_id()
+    }
+
+    /// Captures the symbol configuration and book occupancy under one lock.
+    ///
+    /// Used by the pre-trade readiness endpoint; it never mutates the book.
+    pub async fn pretrade_state(&self) -> PreTradeState {
+        let inner = self.inner.lock().await;
+        PreTradeState {
+            symbol_id: inner.symbol_id(),
+            symbol_config: inner.symbol_config(),
+            symbol_locked: inner.symbol_locked,
+            open_orders: inner.orderbook.bids.len() + inner.orderbook.asks.len(),
+            open_stops: inner.orderbook.stops.len(),
+            sequence: inner.orderbook.sequence,
+        }
     }
 
     pub async fn to_content(&self) -> StateMachineData {

@@ -24,6 +24,7 @@ use openraft::Config;
 use openraft::type_config::TypeConfigExt;
 
 use crate::common::TempDir;
+use crate::common::TestAddr;
 
 type C = MatchEngineTypeConfig;
 
@@ -38,7 +39,7 @@ fn test_config() -> Config {
 
 async fn start_node(
     id: u64,
-    addr: &str,
+    addr: impl std::fmt::Display,
     storage: &StorageConfig,
 ) -> anyhow::Result<MatchEngineNode> {
     Ok(build_match_engine_node(id, addr.to_string(), test_config(), storage.clone()).await?)
@@ -90,8 +91,8 @@ async fn read_orders(client: &MatchEngineClient<C>) -> anyhow::Result<Vec<Order>
     Ok(serde_json::from_str(&json)?)
 }
 
-fn addr(index: usize) -> &'static str {
-    ["127.0.0.1:21401", "127.0.0.1:21402", "127.0.0.1:21403"][index]
+fn addr(index: usize) -> String {
+    TestAddr::new(21401 + index as u16).to_string()
 }
 
 fn client(id: u64) -> MatchEngineClient<C> {
@@ -242,8 +243,8 @@ fn new_learner_catches_up_from_live_log() {
     C::run(async {
         let temp = TempDir::new("learner");
         let storage = StorageConfig::new(temp.path()).with_instance_prefix("learner");
-        let addr1 = "127.0.0.1:21501";
-        let addr2 = "127.0.0.1:21502";
+        let addr1 = TestAddr::new(21501);
+        let addr2 = TestAddr::new(21502);
         let node1 = start_node(1, addr1, &storage).await.unwrap();
         let node2 = start_node(2, addr2, &storage).await.unwrap();
         let client1 = MatchEngineClient::<C>::new(1, addr1.to_string());

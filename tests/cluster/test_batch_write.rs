@@ -16,10 +16,11 @@ use openraft::type_config::TypeConfigExt;
 use reqwest::StatusCode;
 
 use crate::common::TempDir;
+use crate::common::TestAddr;
 
 type C = MatchEngineTypeConfig;
 
-const ADDR: &str = "127.0.0.1:21904";
+const ADDR: TestAddr = TestAddr::new(21904);
 
 #[test]
 fn write_batch_applies_multiple_requests_in_one_entry() {

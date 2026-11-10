@@ -13,6 +13,8 @@ use matchengine_raft::store::MatchEngineRequest;
 use openraft::SnapshotPolicy;
 use openraft::type_config::TypeConfigExt;
 
+use crate::common::TestAddr;
+
 /// A learner that joins after the leader purged its log must be caught up with a
 /// streamed snapshot over gRPC.
 #[test]
@@ -21,8 +23,8 @@ fn test_grpc_snapshot_install() {
 }
 
 async fn test_grpc_snapshot_install_inner() -> anyhow::Result<()> {
-    let addr1 = "127.0.0.1:21101".to_string();
-    let addr2 = "127.0.0.1:21102".to_string();
+    let addr1 = TestAddr::new(21101);
+    let addr2 = TestAddr::new(21102);
 
     let config = || {
         let mut config = default_raft_config();
@@ -40,10 +42,10 @@ async fn test_grpc_snapshot_install_inner() -> anyhow::Result<()> {
     let temp = crate::common::TempDir::new("snapshot");
     let storage = StorageConfig::new(temp.path()).with_instance_prefix("snapshot");
 
-    let node1 = build_match_engine_node(1, addr1.clone(), config(), storage.clone()).await?;
-    let node2 = build_match_engine_node(2, addr2.clone(), config(), storage.clone()).await?;
+    let node1 = build_match_engine_node(1, addr1.to_string(), config(), storage.clone()).await?;
+    let node2 = build_match_engine_node(2, addr2.to_string(), config(), storage.clone()).await?;
 
-    let client1 = MatchEngineClient::<MatchEngineTypeConfig>::new(1, addr1);
+    let client1 = MatchEngineClient::<MatchEngineTypeConfig>::new(1, addr1.to_string());
     client1.init().await??;
 
     // `init` only appends the initial membership; the first election still has to
@@ -99,9 +101,9 @@ async fn test_grpc_snapshot_install_inner() -> anyhow::Result<()> {
     }
 
     // Node 2 has no log history of its own; this must go through InstallSnapshot.
-    client1.add_learner((2, addr2)).await??;
+    client1.add_learner((2, addr2.to_string())).await??;
 
-    let client2 = MatchEngineClient::<MatchEngineTypeConfig>::new(2, "127.0.0.1:21102".to_string());
+    let client2 = MatchEngineClient::<MatchEngineTypeConfig>::new(2, addr2.to_string());
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         if let Ok(value) = client2.read(&"orderbook_sequence".to_string()).await
@@ -152,7 +154,7 @@ fn test_periodic_snapshot_timer() {
 }
 
 async fn test_periodic_snapshot_timer_inner() -> anyhow::Result<()> {
-    let addr = "127.0.0.1:21103";
+    let addr = TestAddr::new(21103);
     let temp = crate::common::TempDir::new("periodic-snapshot");
     let storage = StorageConfig::new(temp.path())
         .with_instance_prefix("periodic-snapshot")

@@ -17,10 +17,11 @@ use openraft::type_config::TypeConfigExt;
 use tokio::sync::Barrier;
 
 use crate::common::TempDir;
+use crate::common::TestAddr;
 
 type C = MatchEngineTypeConfig;
 
-const ADDR: &str = "127.0.0.1:21933";
+const ADDR: TestAddr = TestAddr::new(21933);
 const CONCURRENT_WRITES: usize = 64;
 
 #[test]

@@ -7,6 +7,7 @@ pub mod types;
 
 pub use self::config::StorageConfig;
 pub use self::log_store::LogStore;
+pub use self::state_machine::PreTradeState;
 pub use self::state_machine::SnapshotData;
 pub use self::state_machine::StagedSnapshot;
 pub use self::state_machine::StateMachineData;

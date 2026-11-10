@@ -10,6 +10,7 @@ use futures_util::StreamExt;
 use matchengine_marketdata::AeronSpec;
 use matchengine_marketdata::Config;
 use matchengine_marketdata::aeron_source;
+use matchengine_marketdata::aeron_source_with_requester;
 use matchengine_marketdata::start;
 use matchengine_raft::market_data::BboRecord;
 use matchengine_raft::market_data::DepthSnapshotRecord;
@@ -20,6 +21,8 @@ use matchengine_raft::market_data::STREAM_BBO;
 use matchengine_raft::market_data::STREAM_DEPTH_DELTA;
 use matchengine_raft::market_data::STREAM_DEPTH_SNAPSHOT;
 use matchengine_raft::market_data::flags;
+use matchengine_raft::market_data::request;
+use matchengine_raft::market_data::request::SnapshotRequest;
 use matchengine_raft::market_data::wire;
 use matchengine_raft::order_book::DepthLevel;
 use matchengine_raft::order_book::Fixed;
@@ -27,6 +30,7 @@ use matchengine_raft::order_book::OrderSide;
 use rusteron_client::Aeron;
 use rusteron_client::AeronContext;
 use rusteron_client::AeronPublication;
+use rusteron_client::Handlers;
 use rusteron_client::cformat;
 use rusteron_media_driver::testing::EmbeddedDriver;
 use serde_json::Value;
@@ -34,6 +38,9 @@ use tokio_tungstenite::tungstenite::Message;
 
 type Ws =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// Embedded media drivers conflict when two tests start one at the same time.
+static AERON_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn fixed(value: &str) -> Fixed {
     value.parse().unwrap()
@@ -157,6 +164,7 @@ async fn next_json(ws: &mut Ws) -> Value {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn aeron_channel_feeds_the_service() {
+    let _guard = AERON_TEST_LOCK.lock().await;
     let driver = EmbeddedDriver::launch().expect("embedded driver");
     let dir = driver.dir().to_string();
 
@@ -235,4 +243,60 @@ async fn aeron_channel_feeds_the_service() {
 
     running.shutdown().await;
     drop(driver);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn snapshot_requests_publish_on_stream_2010() {
+    let _guard = AERON_TEST_LOCK.lock().await;
+    let driver = EmbeddedDriver::launch().expect("embedded driver");
+    let dir = driver.dir().to_string();
+    let spec = AeronSpec {
+        channel: "aeron:ipc".to_string(),
+        stream_base: 2001,
+        dir: Some(dir.clone()),
+        embedded: false,
+    };
+    let source = aeron_source_with_requester(&spec, 7)
+        .await
+        .expect("Aeron source");
+    // Keep the frame receiver alive so the blocking source loop stays up.
+    let _frames = source.frames;
+
+    let context = AeronContext::new().expect("context");
+    context.set_dir(&cformat!("{dir}")).expect("set dir");
+    let aeron = Aeron::new(&context).expect("client");
+    aeron.start().expect("start");
+    let request_stream = 2001 + request::STREAM_OFFSET;
+    let subscription = aeron
+        .async_add_subscription(
+            cformat!("aeron:ipc").as_c_str(),
+            i32::from(request_stream),
+            Handlers::NONE,
+            Handlers::NONE,
+        )
+        .expect("create subscription")
+        .poll_blocking(Duration::from_secs(5))
+        .expect("resolve subscription");
+
+    let mut received = None;
+    for _ in 0..100 {
+        source.requester.request(50);
+        subscription
+            .poll_fn(
+                |buffer, _header| {
+                    if let Ok(request) = SnapshotRequest::decode(buffer) {
+                        received = Some(request);
+                    }
+                },
+                10,
+            )
+            .expect("poll request");
+        if received.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let request = received.expect("snapshot request on stream 2010");
+    assert_eq!(7, request.symbol_id);
+    assert_eq!(50, request.depth_levels);
 }

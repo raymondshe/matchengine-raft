@@ -18,13 +18,16 @@
   重置快照（边界为下一个 `market_seq`）。队列满时丢弃帧并发送 `GAP`，`apply` 永远不会被订阅者阻塞
   或拖慢。
 
-JSONL sink 继续用于调试。同样的消息在 `src/market_data/wire.rs` 有二进制编码（64 字节头、版本 6、
+JSONL sink 继续用于调试。同样的消息在 `src/market_data/wire.rs` 有二进制编码（64 字节头、版本 7、
 scale-18 `i128`、小端消息体）。启用 `market-data-aeron` feature 后，`AeronSink` 由专用线程把它们发布到
 2001–2007 流：每个流一个独占 publication，支持嵌入式或外部 media driver，并周期重发重置深度快照
-（`--market-data-aeron-snapshot-every-ms`，默认 30 秒），让服务可以在流中途加入。每条消息携带当前进程配置的
+（`--market-data-aeron-snapshot-every-ms`，默认 30 秒），让服务可以在流中途加入。空闲时按
+`--market-data-aeron-heartbeat-ms`（默认 1 秒）发布带保留 `sub_seq` 的 STATUS 心跳；2010 流是
+subscriber→engine 的固定 24 字节快照请求（`MSRQ` v1），服务在深度缓存为空、过期或出现 GAP 时发送，
+引擎在状态机锁内抓取并排队一次重置快照。每条消息携带当前进程配置的
 `symbol_id`，便于多个按标的部署共享总线。可调参数：`--market-data-aeron-channel`、
 `--market-data-aeron-stream-base`、`--market-data-aeron-dir`、`--market-data-aeron-embedded-driver`、
-`--market-data-depth`、`--market-data-status-every`、`--market-data-bar-intervals-ms`、
-`--market-data-leader-only`。
+`--market-data-aeron-heartbeat-ms`、`--market-data-depth`、`--market-data-status-every`、
+`--market-data-bar-intervals-ms`、`--market-data-leader-only`。
 
 `/read marketdata_status` 返回 feed 计数器和领导者门控状态。

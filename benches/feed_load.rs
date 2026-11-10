@@ -91,6 +91,7 @@ async fn run_load(target_fills_per_second: u64, queue_capacity: usize) -> anyhow
         queue_capacity,
         leader_only: false,
         status_every: 0,
+        heartbeat_ms: 0,
         bar_intervals_ms: Vec::new(),
         ..MarketDataConfig::default()
     };

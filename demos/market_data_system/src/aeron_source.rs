@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use rusteron_client::Aeron;
 use rusteron_client::AeronContext;
+use rusteron_client::AeronExclusivePublication;
 use rusteron_client::AeronSubscription;
 use rusteron_client::Handlers;
 use rusteron_media_driver::testing::EmbeddedDriver;
@@ -19,30 +20,63 @@ use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio_stream::wrappers::ReceiverStream;
 
+use matchengine_raft::market_data::request;
+use matchengine_raft::market_data::request::SnapshotRequest;
 use matchengine_raft::market_data::wire;
 
 use crate::config::AeronSpec;
 use crate::source::BoxedSource;
 use crate::source::Item;
+use crate::source::SnapshotRequester;
 
 /// Streams published by the engine: 2001 TRADE .. 2007 BAR.
 const STREAM_COUNT: u16 = 7;
 
+/// The Aero source plus the handle that asks the engine for snapshots.
+pub struct AeronSource {
+    /// Decoded feed frames.
+    pub frames: BoxedSource,
+    /// Snapshot-request sender for stream 2010.
+    pub requester: SnapshotRequester,
+}
+
 /// Connects to (or embeds) a media driver and subscribes to all feed streams.
 pub async fn aeron_source(aeron: &AeronSpec) -> io::Result<BoxedSource> {
+    Ok(aeron_source_with_requester(aeron, 0).await?.frames)
+}
+
+/// Like [`aeron_source`], also returning the stream-2010 request handle.
+pub async fn aeron_source_with_requester(
+    aeron: &AeronSpec,
+    symbol_id: u32,
+) -> io::Result<AeronSource> {
     let channel = aeron.channel.clone();
     let stream_base = aeron.stream_base;
     let dir = aeron.dir.clone();
     let embedded = aeron.embedded;
+    let (requester, request_rx) = SnapshotRequester::channel(symbol_id);
 
     let (tx, rx) = mpsc::channel::<Item>(8_192);
     let (ready_tx, ready_rx) = oneshot::channel();
     // rusteron handles are `!Send`, so the blocking source owns them inside a
     // `spawn_blocking` closure instead of a Tokio task.
-    tokio::task::spawn_blocking(move || run(channel, stream_base, dir, embedded, tx, ready_tx));
+    tokio::task::spawn_blocking(move || {
+        run(
+            channel,
+            stream_base,
+            dir,
+            embedded,
+            tx,
+            request_rx,
+            ready_tx,
+        )
+    });
 
     match ready_rx.await {
-        Ok(Ok(())) => Ok(Box::new(ReceiverStream::new(rx))),
+        Ok(Ok(())) => Ok(AeronSource {
+            frames: Box::new(ReceiverStream::new(rx)),
+            requester,
+        }),
         Ok(Err(error)) => Err(error),
         Err(_) => Err(io::Error::other("Aeron source task stopped during setup")),
     }
@@ -54,12 +88,20 @@ fn run(
     dir: Option<String>,
     embedded: bool,
     tx: mpsc::Sender<Item>,
+    request_rx: std::sync::mpsc::Receiver<SnapshotRequest>,
     ready: oneshot::Sender<io::Result<()>>,
 ) {
     match setup(channel, stream_base, dir.as_deref(), embedded, tx) {
-        Ok((_driver, _aeron, subscriptions, tx)) => {
+        Ok((_driver, aeron, subscriptions, tx, channel, request_stream)) => {
             let _ = ready.send(Ok(()));
-            poll_loop(subscriptions, tx);
+            poll_loop(
+                subscriptions,
+                tx,
+                aeron,
+                channel,
+                request_stream,
+                request_rx,
+            );
         }
         Err(error) => {
             let _ = ready.send(Err(error));
@@ -72,6 +114,8 @@ type Setup = (
     Aeron,
     Vec<AeronSubscription>,
     mpsc::Sender<Item>,
+    CString,
+    u16,
 );
 
 fn setup(
@@ -143,11 +187,68 @@ fn setup(
             .map_err(|error| io::Error::other(format!("subscribe to stream {stream}: {error}")))?;
         subscriptions.push(subscription);
     }
-    Ok((driver, aeron, subscriptions, tx))
+    let request_stream = stream_base
+        .checked_add(request::STREAM_OFFSET)
+        .ok_or_else(|| io::Error::other("Aeron request stream id overflow"))?;
+    Ok((
+        driver,
+        aeron,
+        subscriptions,
+        tx,
+        channel,
+        request_stream,
+    ))
 }
 
-fn poll_loop(subscriptions: Vec<AeronSubscription>, tx: mpsc::Sender<Item>) {
+fn poll_loop(
+    subscriptions: Vec<AeronSubscription>,
+    tx: mpsc::Sender<Item>,
+    aeron: Aeron,
+    channel: CString,
+    request_stream: u16,
+    request_rx: std::sync::mpsc::Receiver<SnapshotRequest>,
+) {
+    let mut request_publication: Option<AeronExclusivePublication> = None;
     loop {
+        while let Ok(request) = request_rx.try_recv() {
+            if request_publication.is_none() {
+                let publication = aeron
+                    .async_add_exclusive_publication(
+                        channel.as_c_str(),
+                        i32::from(request_stream),
+                    )
+                    .and_then(|poller| poller.poll_blocking(Duration::from_secs(5)));
+                match publication {
+                    Ok(publication) => request_publication = Some(publication),
+                    Err(error) => {
+                        tracing::warn!(%error, "create snapshot-request publication failed");
+                        break;
+                    }
+                }
+            }
+            let Some(publication) = request_publication.as_ref() else {
+                break;
+            };
+            let payload = request.encode();
+            let mut offered = false;
+            for _ in 0..1_000 {
+                match publication.offer(&payload) {
+                    Ok(_) => {
+                        offered = true;
+                        break;
+                    }
+                    Err(error) if error.is_retryable() => std::hint::spin_loop(),
+                    Err(error) => {
+                        tracing::warn!(%error, "snapshot request offer failed");
+                        break;
+                    }
+                }
+            }
+            if !offered {
+                tracing::warn!("snapshot request backpressured; request dropped");
+            }
+        }
+
         let mut received = 0usize;
         for subscription in &subscriptions {
             let result = subscription.poll_fn(

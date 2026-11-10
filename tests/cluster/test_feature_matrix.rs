@@ -38,8 +38,16 @@ use openraft::type_config::TypeConfigExt;
 use reqwest::StatusCode;
 
 use crate::common::TempDir;
+use crate::common::TestAddr;
 
 type C = MatchEngineTypeConfig;
+
+const ADDR_MAIN: TestAddr = TestAddr::new(21909);
+const ADDR_LIFECYCLE: TestAddr = TestAddr::new(21910);
+const ADDR_NEGATIVE: TestAddr = TestAddr::new(21911);
+const ADDR_RECONSTRUCT: TestAddr = TestAddr::new(21934);
+const ADDR_AMEND: TestAddr = TestAddr::new(21936);
+const ADDR_SCHEMA: TestAddr = TestAddr::new(21937);
 
 /// The visible state of one resting order, reconstructed from events.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,7 +57,11 @@ struct VisibleOrder {
     volume: Fixed,
 }
 
-async fn start_node(addr: &str, label: &str) -> (MatchEngineNode, MatchEngineClient<C>, TempDir) {
+async fn start_node(
+    addr: impl std::fmt::Display,
+    label: &str,
+) -> (MatchEngineNode, MatchEngineClient<C>, TempDir) {
+    let addr = addr.to_string();
     let temp = TempDir::new(label);
     let storage = StorageConfig::new(temp.path()).with_instance_prefix(label);
     let node = build_match_engine_node(1, addr.to_string(), default_raft_config(), storage)
@@ -114,7 +126,7 @@ fn stop_limit(
 #[test]
 fn feature_matrix_reaches_engine() {
     C::run(async {
-        let (node, client, _temp) = start_node("127.0.0.1:21909", "feature-matrix").await;
+        let (node, client, _temp) = start_node(ADDR_MAIN, "feature-matrix").await;
 
         // GTC limit: rests in full.
         let response = apply(&client, place(limit(OrderSide::Buy, 100.0, 2.0))).await;
@@ -352,7 +364,7 @@ fn feature_matrix_reaches_engine() {
 #[test]
 fn event_lifecycle_reconstructs_state() {
     C::run(async {
-        let (node, client, _temp) = start_node("127.0.0.1:21910", "event-lifecycle").await;
+        let (node, client, _temp) = start_node(ADDR_LIFECYCLE, "event-lifecycle").await;
 
         let mut lifecycle = Vec::new();
 
@@ -484,7 +496,7 @@ fn event_lifecycle_reconstructs_state() {
 #[test]
 fn event_stream_reconstructs_visible_book() {
     C::run(async {
-        let (node, client, _temp) = start_node("127.0.0.1:21934", "event-reconstruct").await;
+        let (node, client, _temp) = start_node(ADDR_RECONSTRUCT, "event-reconstruct").await;
 
         // seq 0: a resting bid; seq 1: an ask well away from it.
         let response = apply(&client, place(limit(OrderSide::Buy, 100.0, 10.0))).await;
@@ -717,7 +729,7 @@ fn event_stream_reconstructs_visible_book() {
 #[test]
 fn amend_supports_parked_stops_and_icebergs() {
     C::run(async {
-        let (node, client, _temp) = start_node("127.0.0.1:21936", "amend-extended").await;
+        let (node, client, _temp) = start_node(ADDR_AMEND, "amend-extended").await;
 
         // Park a sell stop-limit: trigger 95, child limit 94, 5 units.
         let response = apply(&client, place(stop_limit(OrderSide::Sell, 94.0, 95.0, 5.0))).await;
@@ -814,7 +826,7 @@ fn amend_supports_parked_stops_and_icebergs() {
 #[test]
 fn negative_api_inputs_are_rejected() {
     C::run(async {
-        let (node, client, _temp) = start_node("127.0.0.1:21911", "negative-api").await;
+        let (node, client, _temp) = start_node(ADDR_NEGATIVE, "negative-api").await;
 
         assert_eq!(
             "",
@@ -822,8 +834,8 @@ fn negative_api_inputs_are_rejected() {
         );
 
         let http = reqwest::Client::builder().no_proxy().build().unwrap();
-        let write = "http://127.0.0.1:21911/write";
-        let read = "http://127.0.0.1:21911/read";
+        let write = ADDR_NEGATIVE.http_url() + "/write";
+        let read = ADDR_NEGATIVE.http_url() + "/read";
 
         let response = http.post(read).json(&123).send().await.unwrap();
         assert_eq!(StatusCode::BAD_REQUEST, response.status());
@@ -836,7 +848,7 @@ fn negative_api_inputs_are_rejected() {
             "id": 1,
             "sequence": 0
         });
-        let response = http.post(write).json(&bare_order).send().await.unwrap();
+        let response = http.post(&write).json(&bare_order).send().await.unwrap();
         assert_eq!(StatusCode::BAD_REQUEST, response.status());
 
         let missing_price = serde_json::json!({
@@ -848,7 +860,7 @@ fn negative_api_inputs_are_rejected() {
                 "sequence": 0
             }}
         });
-        let response = http.post(write).json(&missing_price).send().await.unwrap();
+        let response = http.post(&write).json(&missing_price).send().await.unwrap();
         assert_eq!(StatusCode::BAD_REQUEST, response.status());
 
         let unknown_tif = serde_json::json!({
@@ -862,7 +874,7 @@ fn negative_api_inputs_are_rejected() {
                 "sequence": 0
             }}
         });
-        let response = http.post(write).json(&unknown_tif).send().await.unwrap();
+        let response = http.post(&write).json(&unknown_tif).send().await.unwrap();
         assert_eq!(StatusCode::BAD_REQUEST, response.status());
 
         let valid = serde_json::json!({
@@ -875,7 +887,7 @@ fn negative_api_inputs_are_rejected() {
                 "sequence": 0
             }}
         });
-        let response = http.post(write).json(&valid).send().await.unwrap();
+        let response = http.post(&write).json(&valid).send().await.unwrap();
         assert_eq!(StatusCode::OK, response.status());
         let orders: serde_json::Value =
             serde_json::from_str(&client.read(&"orderbook_orders".to_string()).await.unwrap())
@@ -902,7 +914,7 @@ async fn wait_for_leader(client: &MatchEngineClient<C>) {
 #[test]
 fn schema_v11_order_types_and_stp_reach_engine() {
     C::run(async {
-        let (node, client, _temp) = start_node("127.0.0.1:21937", "schema-v11").await;
+        let (node, client, _temp) = start_node(ADDR_SCHEMA, "schema-v11").await;
         let config = SymbolConfig::new(0, 2, 8)
             .unwrap()
             .with_stp(StpMode::CancelResting);

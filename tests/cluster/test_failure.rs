@@ -32,22 +32,24 @@ use openraft::SnapshotPolicy;
 use openraft::type_config::TypeConfigExt;
 
 use crate::common::TempDir;
+use crate::common::TestAddr;
 
 type C = MatchEngineTypeConfig;
+
+const ADDR_CORE: TestAddr = TestAddr::new(21918);
+const ADDR_KILL: TestAddr = TestAddr::new(21921);
+const ADDR_LEADER: TestAddr = TestAddr::new(21922);
+const ADDR_LEARNER: TestAddr = TestAddr::new(21923);
 
 #[test]
 fn a_stopped_raft_core_stops_the_node() {
     C::run(async {
         let temp = TempDir::new("failure");
         let storage = StorageConfig::new(temp.path()).with_instance_prefix("failure");
-        let node = build_match_engine_node(
-            1,
-            "127.0.0.1:21918".to_string(),
-            default_raft_config(),
-            storage,
-        )
-        .await
-        .unwrap();
+        let node =
+            build_match_engine_node(1, ADDR_CORE.to_string(), default_raft_config(), storage)
+                .await
+                .unwrap();
 
         // A fatal WAL/snapshot error leaves RaftCore in the same state as this
         // explicit stop: `running_state` becomes `Err` and the core exits.
@@ -79,7 +81,7 @@ async fn assert_wal_failure_stops_the_node(port: u16, storage_full: bool) {
     let label = if storage_full { "enospc" } else { "eio" };
     let temp = TempDir::new(label);
     let storage = StorageConfig::new(temp.path()).with_instance_prefix(label);
-    let addr = format!("127.0.0.1:{port}");
+    let addr = TestAddr::new(port).to_string();
     let node = build_match_engine_node(1, addr.clone(), default_raft_config(), storage)
         .await
         .unwrap();
@@ -111,11 +113,11 @@ async fn assert_wal_failure_stops_the_node(port: u16, storage_full: bool) {
 fn sigkill_during_writes_recovers_the_committed_prefix() {
     C::run(async {
         let temp = TempDir::new("sigkill");
-        let addr = "127.0.0.1:21921";
+        let addr = ADDR_KILL.to_string();
         let base = format!("http://{addr}");
         let data_dir = temp.path().to_path_buf();
 
-        let mut child = ChildGuard(start_node_process(1, addr, &data_dir, "sigkill", &[]));
+        let mut child = ChildGuard(start_node_process(1, &addr, &data_dir, "sigkill", &[]));
         wait_for_health(&base).await;
 
         let client = MatchEngineClient::<C>::new(1, addr.to_string());
@@ -145,7 +147,7 @@ fn sigkill_during_writes_recovers_the_committed_prefix() {
 
         // A short pause lets the listener port leave TIME_WAIT before the restart.
         C::sleep(Duration::from_millis(100)).await;
-        let restarted = ChildGuard(start_node_process(1, addr, &data_dir, "sigkill", &[]));
+        let restarted = ChildGuard(start_node_process(1, &addr, &data_dir, "sigkill", &[]));
         wait_for_health(&base).await;
 
         let reader = MatchEngineClient::<C>::new(1, addr.to_string());
@@ -174,8 +176,8 @@ fn sigkill_during_learner_snapshot_install_leaves_no_partial_snapshot() {
     C::run(async {
         let leader_temp = TempDir::new("install-leader");
         let learner_temp = TempDir::new("install-learner");
-        let leader_addr = "127.0.0.1:21922";
-        let learner_addr = "127.0.0.1:21923";
+        let leader_addr = ADDR_LEADER.to_string();
+        let learner_addr = ADDR_LEARNER.to_string();
         let learner_base = format!("http://{learner_addr}");
 
         let mut config = default_raft_config();
@@ -224,7 +226,7 @@ fn sigkill_during_learner_snapshot_install_leaves_no_partial_snapshot() {
         let learner_data = learner_temp.path().to_path_buf();
         let mut child = ChildGuard(start_node_process(
             2,
-            learner_addr,
+            &learner_addr,
             &learner_data,
             "install-learner",
             &[
@@ -240,8 +242,10 @@ fn sigkill_during_learner_snapshot_install_leaves_no_partial_snapshot() {
         // `add_learner` blocks until the learner catches up; run it in the
         // background so the test can kill the learner mid-install.
         let adder = MatchEngineClient::<C>::new(1, leader_addr.to_string());
-        let add =
-            tokio::spawn(async move { adder.add_learner((2, learner_addr.to_string())).await });
+        let add = {
+            let learner_addr = learner_addr.clone();
+            tokio::spawn(async move { adder.add_learner((2, learner_addr)).await })
+        };
 
         let deadline = Instant::now() + Duration::from_secs(10);
         while !marker.exists() {
@@ -268,7 +272,7 @@ fn sigkill_during_learner_snapshot_install_leaves_no_partial_snapshot() {
         C::sleep(Duration::from_millis(100)).await;
         let restarted = ChildGuard(start_node_process(
             2,
-            learner_addr,
+            &learner_addr,
             &learner_data,
             "install-learner",
             &[],
@@ -317,7 +321,7 @@ fn four_voter_no_fsync_survives_leader_kill_and_tail_loss() {
         let root = temp.path().to_path_buf();
         let prefix = "four-voter-tail";
         let addrs: Vec<String> = (0..4)
-            .map(|offset| format!("127.0.0.1:{}", 21926 + offset))
+            .map(|offset| TestAddr::new(21926 + offset).to_string())
             .collect();
 
         let mut children: Vec<Option<ChildGuard>> = Vec::new();
@@ -502,18 +506,19 @@ impl Drop for ChildGuard {
 
 fn start_node_process(
     id: u64,
-    addr: &str,
+    addr: impl std::fmt::Display,
     data_dir: &Path,
     prefix: &str,
     envs: &[(&str, &str)],
 ) -> Child {
     let id = id.to_string();
+    let addr = addr.to_string();
     Command::new(env!("CARGO_BIN_EXE_matchengine-raft"))
         .args([
             "--id",
             &id,
             "--http-addr",
-            addr,
+            &addr,
             "--instance-prefix",
             prefix,
         ])

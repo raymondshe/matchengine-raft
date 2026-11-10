@@ -32,6 +32,7 @@ use crate::session;
 use crate::session::ConnectionGuard;
 use crate::session::SessionCtx;
 use crate::source::BoxedSource;
+use crate::source::SnapshotRequester;
 
 const TEST_PAGE: &str = include_str!("../web/index.html");
 const TEST_JS: &str = include_str!("../web/app.js");
@@ -76,6 +77,19 @@ pub async fn start(
     config: Config,
     sources: Vec<(SymbolSpec, BoxedSource)>,
 ) -> io::Result<RunningService> {
+    start_with_snapshot_requesters(config, sources, HashMap::new()).await
+}
+
+/// Like [`start`], with optional stream-2010 snapshot requesters per symbol.
+///
+/// The requester is cloned into each [`SymbolRuntime`] so a WebSocket session
+/// that subscribes to depth while the cache is empty/stale can ask the engine
+/// for a fresh snapshot.
+pub async fn start_with_snapshot_requesters(
+    config: Config,
+    sources: Vec<(SymbolSpec, BoxedSource)>,
+    mut snapshot_requesters: HashMap<String, SnapshotRequester>,
+) -> io::Result<RunningService> {
     let provided: HashSet<&str> = sources
         .iter()
         .map(|(spec, _)| spec.symbol.as_str())
@@ -97,19 +111,26 @@ pub async fn start(
 
     for (spec, source) in sources {
         let shared = Arc::new(Mutex::new(SharedState::default()));
+        let snapshot_requester = snapshot_requesters.remove(&spec.symbol);
         let feed = Feed::new(
             spec.clone(),
             config.bar_intervals_ms.clone(),
             config.lifecycle,
             config.snapshot_levels,
+            config.heartbeat_timeout,
             shared.clone(),
             registry.clone(),
             stats.clone(),
+            snapshot_requester.clone(),
         );
         feeds.push(tokio::spawn(feed.run(source, stop_rx.clone())));
         symbols.insert(
             spec.symbol.to_lowercase(),
-            Arc::new(SymbolRuntime { spec, shared }),
+            Arc::new(SymbolRuntime {
+                spec,
+                shared,
+                snapshot_requester,
+            }),
         );
     }
 
@@ -212,6 +233,9 @@ async fn ready(state: Data<AppState>) -> HttpResponse {
                 "ready": ready,
                 "snapshot_seen": state.snapshot_seen,
                 "depth_stale": state.depth_stale,
+                "heartbeat_fresh": state
+                    .heartbeat_deadline
+                    .is_some_and(|deadline| std::time::Instant::now() <= deadline),
             }),
         );
     }

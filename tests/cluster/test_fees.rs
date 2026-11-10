@@ -23,10 +23,11 @@ use matchengine_raft::store::MatchEngineRequest;
 use openraft::type_config::TypeConfigExt;
 
 use crate::common::TempDir;
+use crate::common::TestAddr;
 
 type C = MatchEngineTypeConfig;
 
-const ADDR: &str = "127.0.0.1:21901";
+const ADDR: TestAddr = TestAddr::new(21901);
 
 fn fixed(value: &str) -> Fixed {
     value.parse().expect("valid exact decimal")

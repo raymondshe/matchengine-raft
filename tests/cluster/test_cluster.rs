@@ -21,6 +21,12 @@ use openraft::type_config::TypeConfigExt;
 use reqwest::StatusCode;
 use tracing_subscriber::EnvFilter;
 
+use crate::common::TestAddr;
+
+fn addr(node_id: u64) -> String {
+    TestAddr::new(21000 + node_id as u16).to_string()
+}
+
 pub fn log_panic(panic: &PanicHookInfo) {
     let backtrace = { format!("{:?}", Backtrace::force_capture()) };
 
@@ -92,9 +98,7 @@ async fn test_cluster_inner() -> anyhow::Result<()> {
 
     let get_addr = |node_id| {
         let addr = match node_id {
-            1 => "127.0.0.1:21001".to_string(),
-            2 => "127.0.0.1:21002".to_string(),
-            3 => "127.0.0.1:21003".to_string(),
+            1..=3 => addr(node_id),
             _ => {
                 return Err(anyhow::anyhow!("node {} not found", node_id));
             }
@@ -169,9 +173,9 @@ async fn test_cluster_inner() -> anyhow::Result<()> {
             .collect::<BTreeMap<_, _>>();
         assert_eq!(
             btreemap! {
-                1 => BasicNode::new("127.0.0.1:21001"),
-                2 => BasicNode::new("127.0.0.1:21002"),
-                3 => BasicNode::new("127.0.0.1:21003"),
+                1 => BasicNode::new(addr(1)),
+                2 => BasicNode::new(addr(2)),
+                3 => BasicNode::new(addr(3)),
             },
             nodes_in_cluster
         );
@@ -271,9 +275,10 @@ async fn test_cluster_inner() -> anyhow::Result<()> {
         match x {
             Err(e) => {
                 let s = e.to_string();
-                let expect_err: String =
-                "has to forward request to: Some(1), Some(BasicNode { addr: \"127.0.0.1:21001\" })"
-                    .to_string();
+                let expect_err: String = format!(
+                    "has to forward request to: Some(1), Some(BasicNode {{ addr: \"{}\" }})",
+                    addr(1)
+                );
 
                 assert_eq!(s, expect_err);
             }

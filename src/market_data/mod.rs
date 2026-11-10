@@ -58,6 +58,7 @@ use crate::order_book::VolumeUnit;
 
 #[cfg(feature = "market-data-aeron")]
 pub mod aeron;
+pub mod request;
 pub mod wire;
 
 /// Aeron stream IDs reserved by the design (§15).
@@ -78,6 +79,8 @@ pub const STREAM_BAR: u16 = 2007;
 /// `sub_seq` reserved for the local `GAP` diagnostic, so it can never collide
 /// with a deterministic message in the same `(stream, market_seq)` anchor.
 pub const GAP_SUB_SEQ: u16 = u16::MAX;
+/// `sub_seq` reserved for the node-local idle `STATUS` heartbeat.
+pub const HEARTBEAT_SUB_SEQ: u16 = u16::MAX - 1;
 /// `sub_seq` of the reset snapshot's BBO: the first post-snapshot frame starts
 /// at the same `market_seq`, so the two must not share a key.
 const SNAPSHOT_BBO_SUB_SEQ: u16 = 1;
@@ -135,6 +138,9 @@ pub struct MarketDataConfig {
     /// Re-broadcast a fresh reset depth snapshot on this cadence while
     /// publishing (0 disables). Late-joining consumers need a snapshot.
     pub snapshot_every_ms: u64,
+    /// Publish a diagnostic idle `STATUS` heartbeat on this cadence when no
+    /// frame was applied (0 disables). Uses [`HEARTBEAT_SUB_SEQ`].
+    pub heartbeat_ms: u64,
 }
 
 impl Default for MarketDataConfig {
@@ -152,6 +158,7 @@ impl Default for MarketDataConfig {
             aeron_dir: None,
             aeron_embedded_driver: false,
             snapshot_every_ms: 30_000,
+            heartbeat_ms: 1_000,
         }
     }
 }
@@ -189,6 +196,8 @@ pub struct MarketDataStats {
     pub bars: AtomicU64,
     /// Status messages published.
     pub status: AtomicU64,
+    /// Idle diagnostic heartbeats published.
+    pub heartbeats: AtomicU64,
     /// Gap markers published.
     pub gaps: AtomicU64,
     /// Frames dropped on a full queue.
@@ -234,6 +243,7 @@ impl MarketDataStats {
             "lifecycle_shed": self.lifecycle_shed.load(Ordering::Relaxed),
             "bars": self.bars.load(Ordering::Relaxed),
             "status": self.status.load(Ordering::Relaxed),
+            "heartbeats": self.heartbeats.load(Ordering::Relaxed),
             "gaps": self.gaps.load(Ordering::Relaxed),
             "dropped_frames": self.dropped_frames.load(Ordering::Relaxed),
             "queued_frames": self.queued_frames.load(Ordering::Relaxed),
@@ -576,6 +586,16 @@ pub trait MarketDataSink: Send + 'static {
 
     /// Publishes one message. A failure is logged and never reaches `apply`.
     fn publish(&mut self, message: &MarketMessage) -> io::Result<()>;
+
+    /// Takes the transport's snapshot-request receiver, when it has one.
+    ///
+    /// The node wires this to a task that captures a fresh snapshot and queues
+    /// it through [`MarketDataControl::push_snapshot`]. The default is `None`.
+    fn take_snapshot_requests(
+        &mut self,
+    ) -> Option<tokio::sync::mpsc::UnboundedReceiver<request::SnapshotRequest>> {
+        None
+    }
 }
 
 /// Discards every message (used when the transport is injected separately).
@@ -892,6 +912,7 @@ pub struct MarketDataHandle {
     wake: Arc<Notify>,
     stop: watch::Sender<bool>,
     join: Option<JoinHandle<()>>,
+    snapshot_requests: Option<tokio::sync::mpsc::UnboundedReceiver<request::SnapshotRequest>>,
 }
 
 impl fmt::Debug for MarketDataHandle {
@@ -937,8 +958,9 @@ impl MarketDataHandle {
     /// whether messages go to JSONL, Aeron or a test sink.
     pub async fn start_with_sink(
         config: MarketDataConfig,
-        sink: Box<dyn MarketDataSink>,
+        mut sink: Box<dyn MarketDataSink>,
     ) -> io::Result<Self> {
+        let snapshot_requests = sink.take_snapshot_requests();
         let leader_only = config.leader_only;
         let (tap, channels) = MarketDataTap::channel(config.queue_capacity);
         channels.stats.set_sink(sink.name());
@@ -983,7 +1005,15 @@ impl MarketDataHandle {
             wake,
             stop,
             join: Some(join),
+            snapshot_requests,
         })
+    }
+
+    /// Takes the transport's snapshot-request receiver, if any.
+    pub fn take_snapshot_requests(
+        &mut self,
+    ) -> Option<tokio::sync::mpsc::UnboundedReceiver<request::SnapshotRequest>> {
+        self.snapshot_requests.take()
     }
 
     /// A clone of the tap to install on the state machine.
@@ -1213,6 +1243,10 @@ struct MarketDataProcessor {
     /// Frames applied after a takeover snapshot was captured but before it was
     /// installed; they are replayed once the snapshot is the active boundary.
     pre_snapshot: Vec<TapFrame>,
+    /// Last local clock read for the idle heartbeat; diagnostic only.
+    last_activity: std::time::Instant,
+    /// Symbol of the last snapshot/frame, used to label heartbeat messages.
+    last_symbol: Option<u32>,
 }
 
 impl MarketDataProcessor {
@@ -1251,6 +1285,8 @@ impl MarketDataProcessor {
             gap_pending,
             last_position: (0, 0),
             pre_snapshot: Vec::new(),
+            last_activity: std::time::Instant::now(),
+            last_symbol: None,
         }
     }
 
@@ -1261,6 +1297,13 @@ impl MarketDataProcessor {
         mut stop: watch::Receiver<bool>,
         wake: Arc<Notify>,
     ) {
+        let mut heartbeat = (self.config.heartbeat_ms > 0).then(|| {
+            let period = std::time::Duration::from_millis(self.config.heartbeat_ms);
+            let mut interval =
+                tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            interval
+        });
         loop {
             if *stop.borrow() {
                 break;
@@ -1276,6 +1319,14 @@ impl MarketDataProcessor {
                     }
                     None => break,
                 },
+                _ = async {
+                    match heartbeat.as_mut() {
+                        Some(interval) => {
+                            interval.tick().await;
+                        }
+                        None => std::future::pending::<()>().await,
+                    }
+                } => self.emit_idle_heartbeat(),
                 _ = wake.notified() => {}
                 changed = stop.changed() => {
                     if changed.is_err() || *stop.borrow() {
@@ -1298,10 +1349,58 @@ impl MarketDataProcessor {
         gate_open && !self.resetting.load(Ordering::Relaxed)
     }
 
+    /// Publishes a diagnostic `STATUS` when no frame was applied for one
+    /// heartbeat period. Node-local: the reserved `sub_seq` keeps it out of the
+    /// deterministic key space.
+    fn emit_idle_heartbeat(&mut self) {
+        if !self.publishing() {
+            return;
+        }
+        let Some(symbol) = self.last_symbol else {
+            return;
+        };
+        let period = std::time::Duration::from_millis(self.config.heartbeat_ms);
+        if period.is_zero() || self.last_activity.elapsed() < period {
+            return;
+        }
+        self.last_activity = std::time::Instant::now();
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_millis() as u64)
+            .unwrap_or_default();
+        let last_log_index = self.stats.last_log_index.load(Ordering::Relaxed);
+        let last_market_seq = self.stats.last_market_seq.load(Ordering::Relaxed);
+        let last_ordinal = self.last_position.1;
+        self.emit(
+            STREAM_STATUS,
+            0,
+            last_market_seq,
+            HEARTBEAT_SUB_SEQ,
+            last_log_index,
+            last_ordinal,
+            now_ms,
+            symbol,
+            MessageBody::Status(StatusRecord {
+                last_log_index,
+                last_ordinal,
+                last_market_seq,
+                last_sub_seq: 0,
+                applied_index: last_log_index,
+                book_sequence: self.book_sequence,
+                pending_stops: self.pending_stops,
+            }),
+        );
+        self.stats.status.fetch_add(1, Ordering::Relaxed);
+        self.stats.heartbeats.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Installs a reset point: new shadow, cleared bars, new active sequence.
     fn apply_snapshot(&mut self, snapshot: SnapshotFrame) {
         self.stats.snapshots.fetch_add(1, Ordering::Relaxed);
         let symbol = snapshot.symbol_id;
+        self.last_symbol = Some(symbol);
+        self.last_activity = std::time::Instant::now();
         self.shadow.entry(symbol).or_default().reset(
             &snapshot.bids,
             &snapshot.asks,
@@ -1312,6 +1411,15 @@ impl MarketDataProcessor {
         self.active_market_seq = Some(snapshot.market_seq);
         self.book_sequence = snapshot.book_sequence;
         self.pending_stops = snapshot.pending_stops;
+        self.stats
+            .last_market_seq
+            .store(snapshot.market_seq, Ordering::Relaxed);
+        self.stats
+            .last_log_index
+            .store(snapshot.log_index, Ordering::Relaxed);
+        self.stats
+            .last_ts_ms
+            .store(snapshot.ts_ms, Ordering::Relaxed);
         self.dropped_seen = self.dropped.load(Ordering::Relaxed);
         self.last_position = (snapshot.log_index, 0);
         self.resetting.store(false, Ordering::Relaxed);
@@ -1359,6 +1467,8 @@ impl MarketDataProcessor {
     // `is_multiple_of` would raise the crate's MSRV above 1.85.
     #[allow(clippy::manual_is_multiple_of)]
     fn ingest(&mut self, frame: TapFrame) {
+        self.last_activity = std::time::Instant::now();
+        self.last_symbol = Some(frame.symbol_id);
         // A takeover snapshot was captured at an earlier log position; frames
         // applied after the capture but before the snapshot is installed carry
         // a sequence at or above its boundary and must not be lost.

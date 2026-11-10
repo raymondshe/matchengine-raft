@@ -148,6 +148,11 @@ pub struct Opt {
     /// publishing, so consumers can join mid-stream (0 disables).
     #[clap(long, default_value_t = 30_000)]
     pub market_data_aeron_snapshot_every_ms: u64,
+
+    /// Publish a diagnostic idle STATUS heartbeat with a reserved `sub_seq`
+    /// on this cadence when no frame was applied (0 disables).
+    #[clap(long, default_value_t = 1_000)]
+    pub market_data_aeron_heartbeat_ms: u64,
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -216,6 +221,7 @@ async fn main() -> std::io::Result<()> {
         config.aeron_dir = options.market_data_aeron_dir;
         config.aeron_embedded_driver = options.market_data_aeron_embedded_driver;
         config.snapshot_every_ms = options.market_data_aeron_snapshot_every_ms;
+        config.heartbeat_ms = options.market_data_aeron_heartbeat_ms;
         if !options.market_data_bar_intervals_ms.is_empty() {
             config.bar_intervals_ms = options.market_data_bar_intervals_ms;
         }

@@ -19,11 +19,11 @@
 | `tests/cluster/test_membership.rs` | Kill the elected leader: a surviving voter takes over with the committed book and accepts new writes. A learner added after the writes catches up through normal log replication, is promoted, and writes through its own node |
 | `tests/cluster/test_late_join.rs` | A node with a stale snapshot/WAL is removed, misses 40 writes while the leader snapshots and purges, then rejoins as a learner and catches up from the live cluster |
 | `tests/cluster/test_exactness.rs` | An 18-fractional-digit price and quantity round-trip through `/write`, `/read`, `/events`, the JSONL market-data feed, snapshot v11 and a restart without passing through `f64` |
-| `tests/cluster/test_symbols.rs` | The HTTP edge rejects wrong-symbol `Place`/`Cancel`/`Amend` and whole batches with `400` before Raft, including sequence/book checks; a batch that configures a new symbol and places in one entry still works. Also covers precision rejection, the symbol lock and snapshot restart |
-| `tests/cluster/test_fees.rs` | Maker and taker fee rates produce exact fill fees in `/write`, `/events`, the file sink and the market-data feed, and survive snapshot restart |
+| `tests/cluster/test_symbols.rs` | The HTTP edge rejects wrong-symbol `Place`/`Cancel`/`Amend` and whole batches with `400` before Raft, including sequence/book checks; a batch that configures a new symbol and places in one entry still works. Also covers precision rejection, the symbol lock and snapshot restart, plus `provision_symbol`/`wait_for_pretrade_ready` and `/pretrade/status` |
+| `tests/cluster/test_health.rs` | `/health` reports the gRPC listener, leadership and WAL/state-machine state; `/ready` is `503` before initialization and `200` after a leader is elected; `/pretrade/status` reports symbolic readiness reasons |
 | `tests/cluster/test_fee_assets.rs` | QQQ/USD ETF/fiat and BTC/USDT crypto/stablecoin metadata, tick/lot enforcement, quote-volume limit normalization, and quote-asset plus received-asset fee deduction |
 | `tests/cluster/test_request_limits.rs` | Oversized JSON bodies, malformed input, invalid/oversized `client_order_id`s, oversized read keys and out-of-range event pages are rejected with `400`/`413` before Raft changes the book |
-| `tests/cluster/test_health.rs` | `/health` reports the gRPC listener, leadership and WAL/state-machine state; `/ready` is `503` before initialization and `200` after a leader is elected |
+| `tests/cluster/test_fees.rs` | Maker and taker fee rates produce exact fill fees in `/write`, `/events`, the file sink and the market-data feed, and survive snapshot restart |
 | `tests/cluster/test_console.rs` | Three-node cluster: embedded console assets, node/cluster APIs, unsafe-action rejection and leadership transfer through `/console/api/actions/transfer-leader` |
 | `tests/cluster/test_batch_write.rs` | Multiple requests are applied in one Raft entry with per-item sequences, continuous event ordinals, and edge validation for empty, nested, oversized and duplicate-id batches |
 | `tests/cluster/test_feature_matrix.rs` | Sends one order of every advertised type through `/write` and asserts the returned event kinds; follows rest → amend → partial fill → cancel and expiry/stop lifecycles, proving accepted actions emit explicit events rather than rejections; checks malformed bodies and unknown read keys |
@@ -40,17 +40,17 @@ the checked-in reference. See `tests/replay/README.md` for the case matrix and r
 The fuzz targets are a separate nightly-only crate; see `fuzz/README.md` and
 `.github/workflows/fuzz.yml`.
 
-Every integration test uses a unique temporary data directory. The cluster test uses fixed ports
-`21001-21003` (gRPC `22001-22003`), the snapshot tests `21101-21103`, the restart tests
-`21201-21205`, the match-result tests `21301`/`21302`, the market-data test `21303`, the event-log test
-`21304`, the failover test `21401-21403`, the learner catch-up test `21501-21502`, the late-join
-test `21601-21603`, the exactness test `21701` (gRPC `22701`), the symbol-config test `21801-21802` (gRPC `22801-22802`), the fee test `21901` (gRPC `22901`), the
-fee-asset tests `21902` and `21924` (gRPC `22902`/`22924`), the request-limit test `21903` (gRPC
-`22903`), the batch-write test `21904` (gRPC `22904`), the health test `21905` (gRPC `22905`), the
-console test `21906-21908` (gRPC `22906-22908`), the feature-matrix/lifecycle tests `21909-21911`
-(gRPC `22909-22911`), the client tests `21912-21917` (gRPC `22912-22917`) and the failure tests
-`21918-21923` (gRPC `22918-22923`); stop leftover processes (`pkill -f matchengine-raft`) before
-rerunning.
+Every integration test uses a unique temporary data directory and a unique checked-in base port.
+The cluster test uses `21001-21003` (gRPC `+1000`), snapshot `21101-21103`, restart `21201-21207`,
+match results/market data/events `21301-21307`, membership `21401-21403` and `21501-21502`,
+late join `21601-21603`, exactness `21701`, symbols `21801-21803`, and the remaining suites
+`21901-21937`. Ports are centralized in `tests/cluster/common.rs`; set
+`MATCHENGINE_TEST_PORT_OFFSET=N` to shift every HTTP and derived gRPC port by `N` so a second
+`cargo test` process can run concurrently. Stop leftover processes (`pkill -f matchengine-raft`)
+before rerunning.
+
+`test_cluster.rs` and every other integration suite use the same helper, so the offset applies to
+in-process nodes, spawned binaries, proxies and membership addresses consistently.
 
 ## Replaying orders
 

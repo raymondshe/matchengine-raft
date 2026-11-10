@@ -184,9 +184,9 @@ multi-symbol: one instance runs a feed/state per `--symbol` and shares one WebSo
 connection can hold several symbols' streams and switch symbols with live
 `UNSUBSCRIBE`/`SUBSCRIBE` on the same socket. On the engine side, `start_with_sink`, the
 `market-data-aeron` `AeronSink` (embedded or external driver, one exclusive publication per
-stream) and the periodic reset snapshot are in place; U9's empty depth deltas and bar `q` and
-U10's idle heartbeat/U15 benchmarks remain open — the service derives depth contiguity and kline
-quote volume itself.
+stream, periodic reset snapshot, idle heartbeat and snapshot-request stream 2010) and the
+periodic reset snapshot are in place; U9's empty depth deltas and bar `q` and U15's `ws_fanout`
+numbers remain open — the service derives depth contiguity and kline quote volume itself.
 
 ### U9 — Engine feed prerequisites for distribution (P0)
 
@@ -226,8 +226,12 @@ The engine side of the market-data system: publish the deterministic feed to Aer
 - **Idle heartbeat (FP-E7):** a diagnostic `STATUS` with a reserved `sub_seq` every
   `--market-data-aeron-heartbeat-ms` (default 1000) when nothing was applied, carrying
   epoch/leader/watermark.
+- **Snapshot request (U7):** stream 2010 carries a fixed 24-byte subscriber request; the node
+  captures a fresh snapshot (clamped to its configured depth) and queues it through the same
+  processor path as the periodic re-broadcast.
 - CLI flags (FP-E8): `--market-data-aeron-channel`, `--market-data-aeron-stream-base` (2001),
-  `--market-data-aeron-port-base` (`http_port + 3000`), plus the two timers above.
+  `--market-data-aeron-dir`, `--market-data-aeron-embedded-driver`,
+  `--market-data-aeron-snapshot-every-ms` and `--market-data-aeron-heartbeat-ms`.
 - Tests (FP-T1): embedded driver publish/receive per stream (golden bytes round-trip);
   backpressure → `GAP` and no `apply` stall; leadership gain/loss opens/closes publications;
   periodic snapshot and heartbeat cadence.
@@ -348,7 +352,7 @@ CI is green including the new crate.
 | Layer | Tests |
 |---|---|
 | Engine processor (U9) | per-entry depth contiguity incl. empty deltas; identical output across two processors; bar `q` goldens; wire v7 golden + v6 rejection |
-| Engine Aeron adapter (U10) | golden bytes per stream; embedded driver round-trip; backpressure → `GAP`, no `apply` stall; leadership lifecycle; snapshot/heartbeat cadence |
+| Engine Aeron adapter (U10) | golden bytes per stream; embedded driver round-trip; backpressure → `GAP`, no `apply` stall; leadership lifecycle; snapshot/heartbeat cadence; stream-2010 request round-trip |
 | Service ingestion (U11) | `FrameSource` channel driver; dedupe (duplicates, two sessions); snapshot reset; delta totals; watermark; gap→re-sync; heartbeat timeout |
 | Service hub (U12) | conflation windows; serialize-once; snapshot-on-subscribe; golden payloads per stream |
 | Service protocol (U13) | stream-name parsing; control protocol and error codes; limits (ping/pong, 24 h, caps); backpressure classes; Binance rules 3–6 as literal cases |
@@ -366,6 +370,7 @@ CI is green including the new crate.
 | 2005 | `LIFECYCLE` | one per entry; `rested` shed first above the cap |
 | 2006 | `STATUS` | every `status_every` (default 100) sequences; gap flags |
 | 2007 | `BAR` | trade OHLCV, closed + live (`partial`) |
+| 2010 | `SNAPSHOT_REQUEST` | subscriber → engine, fixed 24-byte request (`MSRQ`, v1) |
 
 Header (64 B): magic `AMKT`, version `2`, type, flags (`SNAPSHOT|RESET|GAP|END_OF_BATCH|
 PARTIAL_BAR|BAR_CLOSE`; bit 4 reserved), `market_seq`, `log_index`, `ordinal`, body length, epoch
@@ -406,13 +411,13 @@ PARTIAL_BAR|BAR_CLOSE`; bit 4 reserved), `market_seq`, `log_index`, `ordinal`, b
 | U6 | **done** | README/README_CN/AGENTS/TODO/AERON updates; bench `rest 1k bids + journal` |
 | U8 | **done** | deterministic `(market_seq, sub_seq)` across replicas; all mutations sequenced; auto GTD purge; one TRADE per taker; wire v7 encoder + reference decoder |
 | U9 | **partial** | `start_with_sink` seam done; per-entry empty depth deltas and bar quote volume still open (the service derives contiguity and kline `q`) |
-| U10 | **partial** | `AeronSink` (rusteron 0.2.13, embedded/external driver, one publication per stream, blocking publisher task, periodic reset snapshot) and the external-driver runbook are done; idle heartbeat, multicast fan-out validation and leadership-scoped publication lifecycle still open |
+| U10 | **partial** | `AeronSink` (rusteron 0.2.13, embedded/external driver, one publication per stream, blocking publisher task, periodic reset snapshot, idle heartbeat, stream-2010 request subscription) and the external-driver runbook are done; Linux external-driver/multicast fan-out validation and leadership-scoped publication lifecycle remain open |
 | U11 | **done (demo)** | `demos/market_data_system/`: `FrameSource` (JSONL + Aeron + channel), per-symbol feeds, assembler, dedupe/watermark/gap policy, caches |
 | U12 | **done (demo)** | shared WS hub: serialize-once broadcast, 100/1000 ms conflation, snapshot-on-subscribe, Binance payloads, multi-symbol keys |
 | U13 | **done (demo)** | Binance client protocol: raw/combined endpoints, live `SUBSCRIBE`/`UNSUBSCRIBE` across symbols on one connection, 1024-stream cap, ping/pong, 24 h rotation |
 | U14 | **partial** | health/readiness, metrics, graceful shutdown, stateless multi-instance design; per-instance parity test and `/metrics` runbook still open |
-| U15 | **partial** | engine→Aeron→service→WS end-to-end test and crate README done; `ws_fanout` benchmark and performance numbers still open |
-| U7 | **partial** | Archive recording/replay is done in the reference service (`--archive-dir`/`--replay-dir`, `tests/archive.rs`); the snapshot-request stream remains. Multi-symbol is deployment-level. The Aeron adapter moved to U10 |
+| U15 | **partial** | engine→Aeron→service→WS end-to-end test and crate README done; `ws_fanout` benchmark and numbers are published (16/64 clients, 110-158k delivered frames/s on macOS loopback); Linux pinned run remains open |
+| U7 | **partial** | Archive recording/replay is done in the reference service (`--archive-dir`/`--replay-dir`, `tests/archive.rs`); the snapshot-request stream 2010 is implemented on both engine and service, with an embedded-driver round-trip test. Multi-symbol is deployment-level. The Aeron adapter moved to U10 |
 
 ## Verification (2026-10-28)
 
@@ -423,7 +428,7 @@ PARTIAL_BAR|BAR_CLOSE`; bit 4 reserved), `market_seq`, `log_index`, `ordinal`, b
 | `cargo test --test cluster test_market_data` | passed; checks `market_seq` anchors for place/amend/cancel and the uncapped trade message |
 | U8 determinism | two processors fed identical frames emit identical messages; a takeover snapshot continues the same keys; wire v7 golden tests (scale-18 `i128`) |
 | automatic purge | `Place`/`Cancel`/`Amend` purge due GTD at intake time; `Day` only via `PurgeExpired`; guarded by the earliest-expiry index (no scan without GTD) |
-| `matchengine-raft --help` | all feed flags present, including `--market-data-status-every` and `--market-data-leader-only` |
+| `matchengine-raft --help` | all feed flags present, including `--market-data-status-every`, `--market-data-leader-only` and `--market-data-aeron-heartbeat-ms` |
 | Snapshot/log formats | U8 itself kept `SNAPSHOT_VERSION` 3; later work bumped it to 4 (event window + dedupe map), 5 (fixed-point order prices/quantities), 6 (last trade + match events fixed-point), 7 (single-symbol precision configuration), 8 (maker/taker fee rates and fill fees), 9 (asset metadata, tick/lot, volume units and fee assets), 10 (`MatchErrors` replacing the boolean fee-overflow flag) and 11 (owner identity, market-to-limit, trailing stops, pegs and STP). `market_seq` lives in the existing `OrderBook::sequence` |
 | Dependencies | `i256 0.2.5` added for exact notional multiplication; no other dependencies |
 

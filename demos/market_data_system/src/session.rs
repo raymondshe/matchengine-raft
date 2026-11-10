@@ -261,6 +261,27 @@ fn subscribe(
         receiver: Some(receiver),
     };
 
+    // A late joiner with no cached/stale depth asks the engine for an immediate
+    // snapshot on stream 2010 instead of waiting for the periodic broadcast.
+    let needs_snapshot = {
+        let state = runtime.shared.lock().expect("state lock");
+        match spec.kind {
+            StreamKind::DepthDiff(_) | StreamKind::DepthPartial { .. } => !state.ready(),
+            StreamKind::BookTicker => state.bbo.is_none(),
+            _ => false,
+        }
+    };
+    if needs_snapshot
+        && let Some(requester) = &runtime.snapshot_requester
+    {
+        let depth = ctx.config.snapshot_levels.clamp(1, usize::from(u16::MAX)) as u16;
+        if requester.request(depth) {
+            ctx.stats
+                .snapshot_requests
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     // Push the cached snapshot for stateful streams.
     let snapshot = {
         let state = runtime.shared.lock().expect("state lock");

@@ -103,8 +103,8 @@ After the batches in section 5:
 
 | Layer | Count | What it proves |
 |---|---:|---|
-| `src/` unit tests | 217 | Order-book algorithms, fees, property traces, protocol/storage units |
-| `tests/cluster/` integration tests | 71 | Raft, HTTP/gRPC, persistence, events, failover, market data |
+| `src/` unit tests | 219 | Order-book algorithms, fees, property traces, protocol/storage units, heartbeat/request codecs |
+| `tests/cluster/` integration tests | 72 | Raft, HTTP/gRPC, persistence, events, failover, market data, provisioning |
 | `tests/replay/` cases | 16 | End-to-end order-type lifecycles against checked-in expected events |
 | `src/order_book/conformance_tests.rs` | 35 | Explicit edge cases the randomized suite should not have to rediscover |
 

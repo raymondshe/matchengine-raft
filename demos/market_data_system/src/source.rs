@@ -8,6 +8,9 @@
 
 use std::io;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use futures_util::Stream;
@@ -19,9 +22,48 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 use matchengine_raft::market_data::MarketMessage;
+use matchengine_raft::market_data::request::SnapshotRequest;
 
 /// One decoded feed item or a transport error.
 pub type Item = io::Result<MarketMessage>;
+
+/// Non-blocking handle used by WebSocket sessions and the feed to ask the
+/// engine for a fresh depth snapshot on stream 2010.
+///
+/// This type is transport-neutral; only the Aeron source currently creates one.
+/// A full channel is reported to the caller and never blocks the session.
+#[derive(Clone, Debug)]
+pub struct SnapshotRequester {
+    tx: std::sync::mpsc::SyncSender<SnapshotRequest>,
+    symbol_id: u32,
+    next_id: Arc<AtomicU64>,
+}
+
+impl SnapshotRequester {
+    /// Creates a requester and the blocking receiver handed to the transport.
+    pub fn channel(symbol_id: u32) -> (Self, std::sync::mpsc::Receiver<SnapshotRequest>) {
+        let (tx, rx) = std::sync::mpsc::sync_channel(64);
+        (
+            Self {
+                tx,
+                symbol_id,
+                next_id: Arc::new(AtomicU64::new(1)),
+            },
+            rx,
+        )
+    }
+
+    /// Queues one request; returns false when the transport queue is full or
+    /// the publisher thread has stopped.
+    pub fn request(&self, depth_levels: u16) -> bool {
+        let request = SnapshotRequest::new(
+            self.symbol_id,
+            depth_levels,
+            self.next_id.fetch_add(1, Ordering::Relaxed),
+        );
+        self.tx.try_send(request).is_ok()
+    }
+}
 
 /// A stream of decoded market-data messages.
 ///

@@ -59,6 +59,8 @@ pub struct Config {
     pub pong_timeout: Duration,
     /// Forced reconnect after this lifetime.
     pub connection_lifetime: Duration,
+    /// Mark a symbol not ready when no frame/heartbeat arrives within this window.
+    pub heartbeat_timeout: Duration,
     /// Depth levels in a subscribe-time snapshot.
     pub snapshot_levels: usize,
     /// Broadcast channel capacity per stream key.
@@ -79,6 +81,7 @@ impl Config {
             ping_interval: Duration::from_secs(180),
             pong_timeout: Duration::from_secs(600),
             connection_lifetime: Duration::from_secs(24 * 60 * 60),
+            heartbeat_timeout: Duration::from_secs(30),
             snapshot_levels: DEFAULT_SNAPSHOT_LEVELS,
             broadcast_capacity: 1_024,
         }
@@ -105,6 +108,7 @@ impl Config {
         self.ping_interval = Duration::from_secs(30);
         self.pong_timeout = Duration::from_secs(60);
         self.connection_lifetime = Duration::from_secs(300);
+        self.heartbeat_timeout = Duration::from_secs(5);
         self.snapshot_levels = 50;
         self.broadcast_capacity = 64;
         self

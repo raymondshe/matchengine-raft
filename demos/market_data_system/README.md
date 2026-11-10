@@ -190,6 +190,75 @@ channel per symbol on the engine and the matching channel on every service
 instance. Each instance receives the same frames independently; no service
 state is shared.
 
+### Heartbeat and snapshot requests
+
+The engine re-broadcasts a reset depth snapshot every
+`--market-data-aeron-snapshot-every-ms` (default 30 s) and emits a diagnostic
+`STATUS` heartbeat with the reserved `HEARTBEAT_SUB_SEQ` every
+`--market-data-aeron-heartbeat-ms` (default 1 s) when no frame was applied.
+The service exposes the heartbeat on `@status`; a silent feed is therefore
+visible without waiting for a trade.
+
+Stream 2010 (base + 9) is the one subscriber-to-engine path. When a WebSocket
+client subscribes to depth/bookTicker while the service cache is empty or marked
+stale, the service sends a fixed 24-byte `MSRQ` v1 request. The engine captures
+the current book under the state-machine lock and queues a reset snapshot through
+the same processor path as the periodic broadcast. The periodic snapshot is
+still the fallback if the request is dropped.
+
+### Linux external-driver/multicast validation
+
+Run this on a Linux host with `aeronmd` installed (the embedded-driver path is
+covered by `cargo test --features aeron` on development hosts):
+
+```shell
+# 1. External driver over IPC.
+AERON_DIR=/dev/shm/aeron-$USER aeronmd &
+AERON_DIR=/dev/shm/aeron-$USER cargo run --release --features market-data-aeron -- \
+  --id 1 --http-addr 127.0.0.1:21001 \
+  --market-data-aeron-channel 'aeron:ipc' \
+  --market-data-aeron-dir /dev/shm/aeron-$USER
+AERON_DIR=/dev/shm/aeron-$USER cargo run --release \
+  --manifest-path demos/market_data_system/Cargo.toml --features aeron -- \
+  --addr 127.0.0.1:24700 --aeron-channel 'aeron:ipc' \
+  --aeron-dir /dev/shm/aeron-$USER --symbol eurusd:0:EUR:USD
+
+# 2. Multicast fan-out: two service instances consume the same group.
+#    Replace eth0 and the group with the host's NIC / test network.
+ENGINE_CHANNEL='aeron:udp?endpoint=239.1.2.3:24001|interface=eth0'
+cargo run --release --features market-data-aeron -- \
+  --id 1 --http-addr 127.0.0.1:21001 \
+  --market-data-aeron-channel "$ENGINE_CHANNEL" \
+  --market-data-aeron-snapshot-every-ms 5000
+for addr in 24700 24701; do
+  cargo run --release --manifest-path demos/market_data_system/Cargo.toml --features aeron -- \
+    --addr 127.0.0.1:$addr --aeron-channel "$ENGINE_CHANNEL" \
+    --symbol eurusd:0:EUR:USD &
+done
+```
+
+Expected result: both service `/ready` endpoints return `200`, both `/metrics`
+counters advance for the same order flow, a WebSocket `@depth@100ms` client gets
+a `depthSnapshot` immediately on subscribe (via stream 2010) rather than waiting
+for the periodic snapshot, and killing one service does not affect the other.
+This validation is **blocked on a Linux host**; macOS can run the embedded-driver
+and request-stream tests but not the external `aeronmd`/multicast checks.
+
+### WebSocket fan-out benchmark
+
+```shell
+cargo bench --manifest-path demos/market_data_system/Cargo.toml \
+  --bench ws_fanout -- --clients 64 --updates 5000 --rate 5000
+```
+
+Measured on the reference macOS host (loopback, channel source, `bookTicker`):
+64 clients delivered 110,649 frames (1,728.9/client) at 110,571 frames/s at a
+5k/s offer rate; at 20k/s the effective fan-out was 186,217 frames/s with more
+latest-value coalescing. A 16-client, 20k offers/s run delivered 158,052
+frames/s. `bookTicker` is a latest-value stream, so slow clients intentionally
+coalesce older updates. The full table and caveats are in
+[`docs/PERFORMANCE.md`](../../docs/PERFORMANCE.md#websocket-fan-out-2026-11-10).
+
 ## Streams
 
 | Stream | Payload |
@@ -252,8 +321,18 @@ even when entries in between did not touch the book.
 | `--queue` | `1024` | per-connection sequenced queue |
 | `--ping-secs` / `--pong-timeout-secs` | `180` / `600` | connection hygiene |
 | `--connection-lifetime-secs` | `86400` | forced reconnect |
+| `--heartbeat-timeout-secs` | `30` | mark a symbol not ready when no frame/heartbeat arrives within this window |
 | `--snapshot-levels` | `200` | subscribe-time depth levels |
 | `--no-lifecycle` | off | hide the extension stream |
+
+Engine-side Aeron flags (feature `market-data-aeron`):
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--market-data-aeron-channel` | unset | enables `AeronSink` on this channel |
+| `--market-data-aeron-stream-base` | `2001` | feed base; snapshot requests use base + 9 |
+| `--market-data-aeron-snapshot-every-ms` | `30000` | periodic reset depth snapshot; `0` disables |
+| `--market-data-aeron-heartbeat-ms` | `1000` | idle STATUS heartbeat; `0` disables |
 
 ## Scale-out
 
@@ -281,8 +360,11 @@ one holds both symbols on a single connection, the other switches
 per-connection metrics; `tests/archive.rs` records a channel source and re-reads
 the same messages through `jsonl_source`. The `aeron` feature adds an
 embedded-driver test that publishes engine wire frames over IPC and asserts they
-reach the WebSocket client; the engine has a matching `market_data::aeron` test
-behind `--features market-data-aeron`.
+reach the WebSocket client, plus a stream-2010 request round-trip; the engine has
+matching `market_data::aeron` tests for publish/receive, the idle heartbeat and
+the stream-2010 subscription behind `--features market-data-aeron`.
+`cargo bench --manifest-path demos/market_data_system/Cargo.toml --bench ws_fanout`
+reports WebSocket fan-out (see [`docs/PERFORMANCE.md`](../../docs/PERFORMANCE.md#websocket-fan-out-2026-11-10)).
 
 > **Dependency pin:** rusteron is pinned to `0.2.13`. Versions from `0.2.14`
 > call `std::hint::cold_path`, which is not available on the project's stable

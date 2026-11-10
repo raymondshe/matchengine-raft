@@ -20,10 +20,11 @@ use openraft::async_runtime::WatchReceiver;
 use openraft::type_config::TypeConfigExt;
 
 use crate::common::TempDir;
+use crate::common::TestAddr;
 
 type C = MatchEngineTypeConfig;
 
-const ADDR: &str = "127.0.0.1:21925";
+const ADDR: TestAddr = TestAddr::new(21925);
 
 #[test]
 fn no_fsync_requires_four_voters() {

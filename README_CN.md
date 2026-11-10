@@ -41,7 +41,7 @@
 | 执行 | 确定性价格-时间撮合；`apply` 不读墙上时钟 |
 | 持久化 | 可配置 fsync 的分段 WAL + 原子快照；`RAFT_WAL_FSYNC_MS` 默认不 fsync（要求 4 个投票成员）；每 100,000 条或 30 分钟生成快照 |
 | 复制 | Raft 节点间 RPC 使用 gRPC |
-| 行情数据 | Aeron 出口（2001–2007 流）+ Binance 风格 WebSocket 服务 |
+| 行情数据 | Aeron 出口（2001–2007 流 + 2010 快照请求）+ Binance 风格 WebSocket 服务 |
 | 标的模型 | 一个进程/集群一个标的，经 Raft 配置并在交易开始后锁定 |
 | 数值模型 | 撮合、事件、快照和 feed 全程使用 18 位定点数 |
 | 可观测性 | 内置控制台、健康/就绪检查和指标 |
@@ -87,8 +87,8 @@
 
 **API 与数据 Feed**
 - **持久化撮合事件 Feed**：`POST /events` 游标分页、长轮询（`wait_ms`）、保留上限、`client_order_id` 幂等、gRPC `StreamEvents` 流式推送和参考 MQ bridge sidecar，安全重试。
-- **确定性行情 Feed**：领导者门控、影子订单簿、BBO、深度快照/增量、生命周期事件、OHLC K 线和紧凑二进制行情格式（含参考解码器）。feature 门控的 **Aeron** 出口通过 2001–2007 流发布，每个流一个独占 publication。
-- **独立行情数据系统** `demos/market_data_system/`：通过 Aeron 或 JSONL 消费 feed，并提供 Binance 风格 WebSocket 行情流。一个实例通过共享 hub 服务多个 symbol；连接持有自己的订阅集合，可用实时 `UNSUBSCRIBE`/`SUBSCRIBE` 切换 symbol，并可水平扩展而不增加引擎开销。
+- **确定性行情 Feed**：领导者门控、影子订单簿、BBO、深度快照/增量、生命周期事件、OHLC K 线和紧凑二进制行情格式（含参考解码器）。feature 门控的 **Aeron** 出口通过 2001–2007 流发布，每个流一个独占 publication，并带空闲 STATUS 心跳和 2010 快照请求通道。
+- **独立行情数据系统** `demos/market_data_system/`：通过 Aeron 或 JSONL 消费 feed，并提供 Binance 风格 WebSocket 行情流。一个实例通过共享 hub 服务多个 symbol；连接持有自己的订阅集合，可用实时 `UNSUBSCRIBE`/`SUBSCRIBE` 切换 symbol，并可水平扩展而不增加引擎开销。晚加入的客户端可直接向引擎请求快照；缺少帧/心跳时 `/ready` 会失效。
 - **灵活读取一致性**：本地读、默认使用 lease read 并可回退 `ReadIndex` 的 leader 线性一致读，以及 follower 线性一致读；`GET /read-policy/status` 报告 lease 命中与回退。
 - **默认 lease read**：leader 一致读会为 `/linearizable_read`、`/events`、gRPC `StreamEvents` 和 `/get_linearizer` 先尝试 `ReadPolicy::LeaseRead`，lease 过期时回退到 `ReadIndex`。设置 `--read-policy read_index` 可强制每次使用新的 quorum 往返。lease read 要求节点间时钟漂移有界（NTP/PTP）。
 - **领导者感知 Rust 客户端**，自动跟踪并转发到当前领导者，支持可配置超时、瞬时错误重试/退避以及类型化的 API/无领导者错误；重试是至少一次语义，写入重试应使用 `client_order_id` 实现幂等。
@@ -236,6 +236,7 @@ quote 保证金叠加层，会估算名义价值、初始保证金和费用，�
 - `apply` 从不等待订阅者：tap 是有界 `try_send`，队列满时丢帧并发送 `GAP`，共识继续推进。
 - 每个流一个独占 Aeron publication；深度快照不会阻塞成交或状态流。
 - 每条流消息只编码一次 JSON，以 `Bytes` 共享给所有订阅者。
+- 空闲时发送 STATUS 心跳，保证 `@status` 可检测存活；晚加入的客户端可通过 2010 流请求立即快照，无需等待周期广播。
 - 100/1000 ms 深度合并，`bookTicker` 和部分深度按最新值折叠，突发流量不会放大 socket 写入。
 - 确定性的 `(symbol_id, stream_id, market_seq, sub_seq)` 键保证主备切换、重启和多实例扇出内容一致。
 - 无状态实例从周期重置快照 + 增量恢复，可在负载均衡后水平扩展。

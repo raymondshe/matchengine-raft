@@ -23,10 +23,12 @@ use matchengine_raft::store::MatchEngineRequest;
 use openraft::type_config::TypeConfigExt;
 
 use crate::common::TempDir;
+use crate::common::TestAddr;
 
 type C = MatchEngineTypeConfig;
 
-const ADDR: &str = "127.0.0.1:21301";
+const ADDR: TestAddr = TestAddr::new(21301);
+const ADDR_TYPES: TestAddr = TestAddr::new(21302);
 
 #[test]
 fn file_sink_records_rests_fills_and_cancels() {
@@ -201,16 +203,12 @@ fn file_sink_records_stop_triggers_and_expiries() {
             .with_instance_prefix("match-results-types")
             .with_match_event_log(&event_log);
 
-        let node = build_match_engine_node(
-            1,
-            "127.0.0.1:21302".to_string(),
-            default_raft_config(),
-            storage,
-        )
-        .await
-        .unwrap();
+        let node =
+            build_match_engine_node(1, ADDR_TYPES.to_string(), default_raft_config(), storage)
+                .await
+                .unwrap();
 
-        let client = MatchEngineClient::<C>::new(1, "127.0.0.1:21302".to_string());
+        let client = MatchEngineClient::<C>::new(1, ADDR_TYPES.to_string());
         client.init().await.unwrap().unwrap();
         wait_for_leader(&client).await;
 

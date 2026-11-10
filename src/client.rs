@@ -3,6 +3,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
+use std::time::Instant;
 
 use openraft::BasicNode;
 use openraft::RaftMetrics;
@@ -24,6 +25,10 @@ use serde::de::DeserializeOwned;
 use crate::network::api::EventsRequest;
 use crate::network::api::EventsResponse;
 use crate::network::api::EventsStatus;
+use crate::network::health::PreTradeStatus;
+use crate::order_book::SymbolConfig;
+use crate::store::MatchEngineRequest;
+use crate::store::MatchEngineResponse;
 
 /// Client transport policy.
 ///
@@ -286,6 +291,16 @@ where
         Ok(res.unwrap())
     }
 
+    /// Pre-trade readiness and symbol provisioning state.
+    ///
+    /// The endpoint is local to the target node and always returns `200`; use
+    /// [`MatchEngineClient::provision_symbol`] and
+    /// [`MatchEngineClient::wait_for_pretrade_ready`] for the normal
+    /// provisioning flow.
+    pub async fn pretrade_status(&self) -> Result<PreTradeStatus, ClientError<C>> {
+        self.send_raw_with_retry("pretrade/status").await
+    }
+
     /// Perform a linearizable read on a follower.
     ///
     /// This method demonstrates follower reads: it fetches a linearizer from the leader,
@@ -417,6 +432,68 @@ where
         Ok(res)
     }
 
+    /// Send one GET request whose response is raw JSON rather than the usual
+    /// `Result<Resp, Err>` envelope (`/health`, `/ready`, `/pretrade/status`).
+    async fn send_raw<Resp>(&self, uri: &str) -> Result<Resp, ClientError<C>>
+    where
+        Resp: DeserializeOwned,
+    {
+        let (_leader_id, url) = {
+            let t = self.leader.lock().unwrap();
+            let target_addr = &t.1;
+            (t.0.clone(), format!("http://{}/{}", target_addr, uri))
+        };
+
+        let resp = self.inner.get(url).send().await.map_err(|e| {
+            if e.is_timeout() {
+                ClientError::Timeout
+            } else if e.is_connect() {
+                ClientError::Rpc(RPCError::Unreachable(Unreachable::new(&e)))
+            } else {
+                ClientError::Rpc(RPCError::Network(NetworkError::new(&e)))
+            }
+        })?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ClientError::Api {
+                status: status.as_u16(),
+                body,
+            });
+        }
+
+        resp.json()
+            .await
+            .map_err(|e| ClientError::Decode(e.to_string()))
+    }
+
+    /// Raw-GET variant with transient retries.
+    async fn send_raw_with_retry<Resp>(&self, uri: &str) -> Result<Resp, ClientError<C>>
+    where
+        Resp: DeserializeOwned,
+    {
+        let mut attempt = 0usize;
+        loop {
+            match self.send_raw(uri).await {
+                Ok(value) => return Ok(value),
+                Err(error) if error.is_retryable() && attempt < self.config.max_retries => {
+                    attempt += 1;
+                    let delay = self.backoff(attempt);
+                    tracing::warn!(
+                        uri,
+                        attempt,
+                        timeout = ?delay,
+                        error = %error,
+                        "retrying transient client error"
+                    );
+                    tokio::time::sleep(delay).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
     /// Send one request, retrying transient transport/5xx errors with backoff.
     async fn send_with_retry<Req, Resp, Err>(
         &self,
@@ -527,6 +604,125 @@ where
             }
 
             return Ok(Err(inner));
+        }
+    }
+}
+
+impl<C> MatchEngineClient<C>
+where
+    C: RaftTypeConfig<Node = BasicNode, D = MatchEngineRequest, R = MatchEngineResponse>,
+{
+    /// Provisions the one symbol this process/cluster trades.
+    ///
+    /// Validates the configuration locally, refuses a locked symbol or a
+    /// non-empty book, writes `ConfigureSymbol` when the applied configuration
+    /// differs, and verifies the applied configuration afterwards. The inner
+    /// `Err` is an application refusal (invalid configuration, symbol already
+    /// locked, or an applied-state mismatch); the outer error is transport.
+    ///
+    /// This helper does not wait for full pre-trade readiness; call
+    /// [`MatchEngineClient::wait_for_pretrade_ready`] before enabling order
+    /// entry when the node may still be recovering or electing a leader.
+    pub async fn provision_symbol(
+        &self,
+        config: SymbolConfig,
+    ) -> Result<Result<PreTradeStatus, String>, ClientError<C>> {
+        if let Err(error) = config.validate() {
+            return Ok(Err(format!("invalid symbol configuration: {error}")));
+        }
+
+        let status = self.pretrade_status().await?;
+        if status.symbol_locked {
+            return Ok(Err(
+                "symbol configuration is locked after trading started".to_string()
+            ));
+        }
+        if status.open_orders > 0 || status.open_stops > 0 {
+            return Ok(Err(
+                "cannot provision a symbol while the book is not empty".to_string()
+            ));
+        }
+
+        if status.symbol_config != config {
+            let response = match self
+                .write(&MatchEngineRequest::ConfigureSymbol {
+                    config: config.clone(),
+                })
+                .await?
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    return Ok(Err(format!("configure symbol failed: {error}")));
+                }
+            };
+            if let Some(error) = response.data.error {
+                return Ok(Err(error));
+            }
+        }
+
+        let status = self.pretrade_status().await?;
+        if status.symbol_config != config {
+            return Ok(Err(format!(
+                "applied symbol {} does not match requested symbol {}",
+                status.symbol_config.symbol_id, config.symbol_id
+            )));
+        }
+        if status.symbol_locked {
+            return Ok(Err(
+                "symbol configuration became locked before provisioning completed".to_string(),
+            ));
+        }
+        Ok(Ok(status))
+    }
+
+    /// Waits until the node is pre-trade ready under `expected`.
+    ///
+    /// Polls `GET /pretrade/status` until `ready` is true and the applied
+    /// configuration matches `expected`, or `timeout` elapses. Transport errors
+    /// are retried while the deadline remains; a configuration mismatch is
+    /// returned immediately because waiting cannot fix it.
+    pub async fn wait_for_pretrade_ready(
+        &self,
+        expected: &SymbolConfig,
+        timeout: Duration,
+    ) -> Result<Result<PreTradeStatus, String>, ClientError<C>> {
+        let deadline = Instant::now() + timeout;
+        let mut attempt = 0usize;
+
+        loop {
+            match self.pretrade_status().await {
+                Ok(status) if status.symbol_config != *expected => {
+                    return Ok(Err(format!(
+                        "applied symbol {} does not match expected symbol {}",
+                        status.symbol_config.symbol_id, expected.symbol_id
+                    )));
+                }
+                Ok(status) if status.ready => return Ok(Ok(status)),
+                Ok(status) => {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        return Ok(Err(format!(
+                            "pre-trade readiness timed out: {}",
+                            status.reasons.join("; ")
+                        )));
+                    }
+                    attempt = attempt.saturating_add(1);
+                    tokio::time::sleep(
+                        self.backoff(attempt)
+                            .min(deadline.saturating_duration_since(now)),
+                    )
+                    .await;
+                }
+                Err(error) if error.is_retryable() && Instant::now() < deadline => {
+                    attempt = attempt.saturating_add(1);
+                    tokio::time::sleep(
+                        self.backoff(attempt)
+                            .min(deadline.saturating_duration_since(Instant::now())),
+                    )
+                    .await;
+                }
+                Err(error) => return Err(error),
+            }
         }
     }
 }

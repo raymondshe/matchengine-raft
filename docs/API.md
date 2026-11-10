@@ -44,6 +44,10 @@ OpenRaft-configured chunks (3 MiB default, 8 MiB cap), and both message directio
 - `GET /ready` - Readiness: returns `200` only when the node is healthy and a cluster leader is
   known; `503` during startup, elections or a partition. A follower with a known leader is ready
   for reads; writes still go to the leader.
+- `GET /pretrade/status` - Pre-trade diagnostic: always returns `200` with the applied
+  `symbol_config`, `symbol_locked`, open order/stop counts, `sequence`, health/leader/recovery
+  flags and the `reasons` pre-trade readiness is false. It is the probe behind the client
+  provisioning helper; `/ready` remains the operational gate.
 - `GET /read-policy/status` - Configured leader-read policy and per-endpoint lease/ReadIndex counters
 - `GET /admission/status` - Per-node write admission limit and current/peak/admitted/rejected counters
 - `GET /console/` - Embedded operational console (HTML/CSS/JS); no build step or external assets
@@ -191,6 +195,31 @@ orders are open, or after trading has started, is refused. A successful change o
 node also queues a market-data reset snapshot for the new symbol. The response uses the optional
 `error` field for this non-fatal case; the write itself is still committed. `stp` defaults to
 `"off"`; when enabled, the gateway must populate `order.owner_id`.
+
+### Provisioning helper and pre-trade readiness
+
+`MatchEngineClient` provides the normal provisioning flow:
+
+```rust
+let config = SymbolConfig::new(7, 2, 2)?;
+let status = client.provision_symbol(config.clone()).await??;
+assert_eq!(config, status.symbol_config);
+
+// Wait until the node is healthy, recovered, has a leader, is unlocked and
+// has an empty book.
+let ready = client
+    .wait_for_pretrade_ready(&config, Duration::from_secs(15))
+    .await??;
+assert!(ready.ready);
+```
+
+`provision_symbol` validates the configuration locally, refuses a locked symbol or non-empty
+book, writes `ConfigureSymbol` only when the applied configuration differs, and verifies the
+applied config afterwards. `wait_for_pretrade_ready` polls `GET /pretrade/status`; a configuration
+mismatch fails immediately, while transport errors and `ready == false` are retried until the
+timeout. Both return an outer transport error and an inner application error, matching
+`write`/`write_batch`. `GET /pretrade/status` is local to the serving node; point the client at
+the leader (or let the write path forward) before enabling order entry.
 
 Fee rates (`maker_fee_rate`, `taker_fee_rate`) are signed `Fixed` fractions supplied by the
 gateway from the user level. `"0.001"` means 10 bps and negative values are rebates. They are

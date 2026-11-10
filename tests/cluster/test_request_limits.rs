@@ -23,10 +23,11 @@ use openraft::type_config::TypeConfigExt;
 use reqwest::StatusCode;
 
 use crate::common::TempDir;
+use crate::common::TestAddr;
 
 type C = MatchEngineTypeConfig;
 
-const ADDR: &str = "127.0.0.1:21903";
+const ADDR: TestAddr = TestAddr::new(21903);
 
 #[test]
 fn hostile_requests_are_rejected_before_raft() {

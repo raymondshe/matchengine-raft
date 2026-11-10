@@ -263,6 +263,12 @@ and only lightly extended here.
   `sub_seq` (like `GAP`'s `u16::MAX`) every `--market-data-aeron-heartbeat-ms` (default 1000)
   whenever nothing was applied, carrying epoch/leader/watermark. It is node-local and diagnostic —
   it never participates in the deterministic key space.
+- **New: snapshot request (stream 2010).** A service that subscribes before the cached depth is
+  ready, or marks depth stale after a gap, sends a fixed 24-byte `MSRQ` v1 request
+  (`symbol_id`, `depth_levels`, `request_id`) on stream base + 9. The engine captures the book
+  under the normal state-machine lock (clamped to its configured snapshot depth) and queues a
+  reset snapshot; the next periodic snapshot remains a fallback. The request is diagnostic input,
+  never replicated state.
 - **Contiguity (P0, the one processor change):** Binance's rule 5 (`U == previous u + 1`) requires
   the update id to advance by exactly one per emitted diff. `market_seq` advances by one per
   mutating entry, but the processor today emits a `DEPTH_DELTA` only for entries with touched
@@ -949,6 +955,7 @@ from streams; the durable source is the engine's replicated event log, not the f
 | `--no-lifecycle` | off | hide the extension `@lifecycle` stream |
 | `--ping-secs` | 180 | ping interval (pong timeout = 10 × ping) |
 | `--pong-timeout-secs` | 600 | disconnect when no pong arrives within this window |
+| `--heartbeat-timeout-secs` | 30 | mark a symbol not ready when no frame/heartbeat arrives |
 
 ## 14. Testing
 
@@ -956,6 +963,8 @@ from streams; the durable source is the engine's replicated event log, not the f
 |---|---|
 | Engine: contiguity (P0) | every mutating entry yields exactly one depth message (empty allowed); rejections/parked stops produce the empty delta; two processors fed identical frames emit identical depth messages |
 | Engine: Aeron adapter | `AeronSink` golden frames per stream via `wire::encode`; embedded driver (as U7 planned) publication/receipt; backpressure slows the processor and produces `GAP`, never an `apply` stall; periodic snapshot + heartbeat cadence; leadership gain/loss opens/closes publications |
+| Engine: idle heartbeat | A reserved `HEARTBEAT_SUB_SEQ` STATUS is emitted only when idle and suppressed by any applied frame; the service treats a missing frame/heartbeat beyond `--heartbeat-timeout-secs` as not ready |
+| Engine/service: stream 2010 | `MSRQ` v1 request round-trips through the engine subscription; the service sends one on an empty/stale depth cache or gap; the engine queues a requested reset snapshot |
 | Service: `FrameSource` | `ChannelSource` drives every hub/protocol test with no media driver |
 | Stream names | parse every catalogue name and speed; reject unknown pair/stream/interval/level/speed; `symbol_id` validation against frames |
 | Control protocol | SUBSCRIBE/UNSUBSCRIBE/LIST round trips, id echo, error codes 0–4, rate limit, stream cap, malformed JSON, 4 KiB cap |
@@ -1081,7 +1090,7 @@ differ) behind one load balancer — multi-instance fleets work from day one (§
   match its engine's symbol; a mismatch is detected (frames rejected) rather than silent.
 - **Slow-consumer close (1013) vs Binance's silent 24 h rotate:** closing on overflow is more
   aggressive but honest; "conflate everything" would corrupt local books.
-- **Open:** default diff-depth speed (100 ms vs 1000 ms); whether `@lifecycle` should be opt-in;
-  whether the periodic snapshot cadence should adapt to trading activity; whether P2's HTTP
-  snapshot needs a request→engine path (stream 2010) or the periodic broadcast is enough; binary
-  (SBE-like / wire v7) WS frames for heavy consumers.
+- **Resolved (2026-11-10):** late joiners can request a snapshot on stream 2010; the periodic
+  broadcast remains the fallback. The remaining open questions are default diff-depth speed
+  (100 ms vs 1000 ms), whether `@lifecycle` should be opt-in, whether the periodic snapshot cadence
+  should adapt to trading activity, and binary (SBE-like / wire v7) WS frames for heavy consumers.

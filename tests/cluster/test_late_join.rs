@@ -22,12 +22,13 @@ use openraft::SnapshotPolicy;
 use openraft::type_config::TypeConfigExt;
 
 use crate::common::TempDir;
+use crate::common::TestAddr;
 
 type C = MatchEngineTypeConfig;
 
-const ADDR1: &str = "127.0.0.1:21601";
-const ADDR2: &str = "127.0.0.1:21602";
-const ADDR3: &str = "127.0.0.1:21603";
+const ADDR1: TestAddr = TestAddr::new(21601);
+const ADDR2: TestAddr = TestAddr::new(21602);
+const ADDR3: TestAddr = TestAddr::new(21603);
 
 fn test_config() -> Config {
     let mut config = default_raft_config();
@@ -42,13 +43,13 @@ fn test_config() -> Config {
 
 async fn start_node(
     id: u64,
-    addr: &str,
+    addr: impl std::fmt::Display,
     storage: &StorageConfig,
 ) -> anyhow::Result<MatchEngineNode> {
     Ok(build_match_engine_node(id, addr.to_string(), test_config(), storage.clone()).await?)
 }
 
-fn client(id: u64, addr: &str) -> MatchEngineClient<C> {
+fn client(id: u64, addr: impl std::fmt::Display) -> MatchEngineClient<C> {
     MatchEngineClient::<C>::new(id, addr.to_string())
 }
 

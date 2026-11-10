@@ -14,21 +14,25 @@ use std::time::Duration;
 use rusteron_client::Aeron;
 use rusteron_client::AeronContext;
 use rusteron_client::AeronExclusivePublication;
+use rusteron_client::Handlers;
 use rusteron_media_driver::testing::EmbeddedDriver;
 
 use crate::market_data::MarketDataConfig;
 use crate::market_data::MarketDataSink;
 use crate::market_data::MarketMessage;
 use crate::market_data::STREAM_TRADE;
+use crate::market_data::request;
+use crate::market_data::request::SnapshotRequest;
 use crate::market_data::wire;
 
 /// Queue from the processor task to the publication thread.
 const PUBLISH_QUEUE: usize = 8_192;
 
-/// Publishes wire-v6 frames to Aeron streams through a blocking task.
+/// Publishes wire frames to Aeron streams through a blocking task.
 pub struct AeronSink {
     tx: mpsc::SyncSender<(u16, Vec<u8>)>,
     stream_base: u16,
+    snapshot_requests: Option<tokio::sync::mpsc::UnboundedReceiver<SnapshotRequest>>,
 }
 
 impl AeronSink {
@@ -46,15 +50,32 @@ impl AeronSink {
         let embedded = config.aeron_embedded_driver;
 
         let (tx, rx) = mpsc::sync_channel(PUBLISH_QUEUE);
+        let (request_tx, request_rx) = tokio::sync::mpsc::unbounded_channel();
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let request_stream = stream_base
+            .checked_add(request::STREAM_OFFSET)
+            .ok_or_else(|| io::Error::other("Aeron request stream id overflow"))?;
         // rusteron handles are `!Send`, so the blocking publisher owns them
         // inside a `spawn_blocking` closure instead of a Tokio task.
         tokio::task::spawn_blocking(move || {
-            publisher_thread(channel, stream_base, dir, embedded, rx, ready_tx)
+            publisher_thread(
+                channel,
+                stream_base,
+                request_stream,
+                dir,
+                embedded,
+                rx,
+                request_tx,
+                ready_tx,
+            )
         });
 
         match ready_rx.await {
-            Ok(Ok(())) => Ok(Self { tx, stream_base }),
+            Ok(Ok(())) => Ok(Self {
+                tx,
+                stream_base,
+                snapshot_requests: Some(request_rx),
+            }),
             Ok(Err(error)) => Err(error),
             Err(_) => Err(io::Error::other(
                 "Aeron publisher task stopped during setup",
@@ -66,6 +87,12 @@ impl AeronSink {
 impl MarketDataSink for AeronSink {
     fn name(&self) -> &'static str {
         "aeron"
+    }
+
+    fn take_snapshot_requests(
+        &mut self,
+    ) -> Option<tokio::sync::mpsc::UnboundedReceiver<SnapshotRequest>> {
+        self.snapshot_requests.take()
     }
 
     fn publish(&mut self, message: &MarketMessage) -> io::Result<()> {
@@ -94,12 +121,15 @@ impl MarketDataSink for AeronSink {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn publisher_thread(
     channel: String,
     _stream_base: u16,
+    request_stream: u16,
     dir: Option<String>,
     embedded: bool,
     rx: mpsc::Receiver<(u16, Vec<u8>)>,
+    request_tx: tokio::sync::mpsc::UnboundedSender<SnapshotRequest>,
     ready: tokio::sync::oneshot::Sender<io::Result<()>>,
 ) {
     let driver = match embedded_driver(embedded, dir.as_deref()) {
@@ -159,11 +189,43 @@ fn publisher_thread(
         return;
     }
 
+    let request_subscription = match aeron
+        .async_add_subscription(
+            channel.as_c_str(),
+            i32::from(request_stream),
+            Handlers::NONE,
+            Handlers::NONE,
+        )
+        .and_then(|poller| poller.poll_blocking(Duration::from_secs(5)))
+    {
+        Ok(subscription) => Some(subscription),
+        Err(error) => {
+            tracing::warn!(%request_stream, %error, "subscribe to snapshot-request stream failed");
+            None
+        }
+    };
+
     let mut publications: HashMap<u16, AeronExclusivePublication> = HashMap::new();
     let _ = ready.send(Ok(()));
 
     loop {
-        let (stream, payload) = match rx.recv_timeout(Duration::from_millis(100)) {
+        if let Some(subscription) = &request_subscription {
+            let _ = subscription.poll_fn(
+                |buffer, _header| match SnapshotRequest::decode(buffer) {
+                    Ok(request) => {
+                        if request_tx.send(request).is_err() {
+                            // The node task is gone; keep publishing frames.
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "discarding malformed snapshot request");
+                    }
+                },
+                16,
+            );
+        }
+
+        let (stream, payload) = match rx.recv_timeout(Duration::from_millis(20)) {
             Ok(item) => item,
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -241,8 +303,12 @@ mod tests {
     use crate::market_data::MessageBody;
     use crate::market_data::STREAM_BBO;
 
+    /// Embedded media drivers conflict when two tests start one at the same time.
+    static AERON_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     #[tokio::test]
     async fn publishes_wire_frames_on_aeron() {
+        let _guard = AERON_TEST_LOCK.lock().await;
         let driver = EmbeddedDriver::launch().expect("embedded driver");
         let dir = driver.dir().to_string();
         let config = MarketDataConfig {
@@ -310,5 +376,51 @@ mod tests {
         assert_eq!(STREAM_BBO, received.stream);
         assert_eq!(7, received.market_seq);
         assert_eq!(message.body, received.body);
+    }
+
+    #[tokio::test]
+    async fn snapshot_requests_are_received_on_stream_2010() {
+        let _guard = AERON_TEST_LOCK.lock().await;
+        let driver = EmbeddedDriver::launch().expect("embedded driver");
+        let dir = driver.dir().to_string();
+        let config = MarketDataConfig {
+            aeron_channel: Some("aeron:ipc".to_string()),
+            aeron_dir: Some(dir.clone()),
+            ..MarketDataConfig::default()
+        };
+        let mut sink = AeronSink::start(&config).await.expect("sink");
+        let mut requests = sink.take_snapshot_requests().expect("request receiver");
+
+        let context = AeronContext::new().expect("context");
+        context.set_dir(&cformat!("{dir}")).expect("dir");
+        let aeron = Aeron::new(&context).expect("client");
+        aeron.start().expect("start");
+        let request_stream = STREAM_TRADE + request::STREAM_OFFSET;
+        let publication = aeron
+            .async_add_publication(&cformat!("aeron:ipc"), i32::from(request_stream))
+            .expect("create request publication")
+            .poll_blocking(Duration::from_secs(5))
+            .expect("resolve request publication");
+        for _ in 0..500 {
+            if publication.is_connected() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let expected = SnapshotRequest::new(3, 25, 9);
+        let payload = expected.encode();
+        let mut received = None;
+        for _ in 0..1_000 {
+            if publication.offer(&payload).is_ok()
+                && let Ok(Some(request)) =
+                    tokio::time::timeout(Duration::from_millis(100), requests.recv()).await
+            {
+                received = Some(request);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(Some(expected), received);
     }
 }

@@ -1,5 +1,6 @@
 //! Standalone market-data system binary.
 
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -8,11 +9,12 @@ use clap::Parser;
 use matchengine_marketdata::AeronSpec;
 use matchengine_marketdata::BoxedSource;
 use matchengine_marketdata::Config;
+use matchengine_marketdata::SnapshotRequester;
 use matchengine_marketdata::SymbolSpec;
 use matchengine_marketdata::archive_path;
 use matchengine_marketdata::archive_source;
 use matchengine_marketdata::jsonl_source;
-use matchengine_marketdata::start;
+use matchengine_marketdata::start_with_snapshot_requesters;
 
 #[derive(Parser, Debug)]
 #[clap(about = "Serve Binance-style WebSocket market data from one or more engine feeds")]
@@ -85,6 +87,10 @@ struct Opt {
     #[clap(long, default_value_t = 86_400)]
     connection_lifetime_secs: u64,
 
+    /// Mark a symbol not ready when no frame/heartbeat arrives within this window.
+    #[clap(long, default_value_t = 30)]
+    heartbeat_timeout_secs: u64,
+
     /// Depth levels in a subscribe-time snapshot.
     #[clap(long, default_value_t = 200)]
     snapshot_levels: usize,
@@ -155,6 +161,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         Duration::from_secs(opt.connection_lifetime_secs)
     };
+    config.heartbeat_timeout = Duration::from_secs(opt.heartbeat_timeout_secs.max(1));
     config.snapshot_levels = opt.snapshot_levels.max(1);
 
     if opt.replay_dir.is_some()
@@ -168,6 +175,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("--archive-dir cannot be combined with --replay-dir".into());
     }
 
+    let mut snapshot_requesters: HashMap<String, SnapshotRequester> = HashMap::new();
     let mut sources: Vec<(SymbolSpec, BoxedSource)> = if let Some(dir) = &opt.replay_dir {
         for spec in &symbols {
             let path = archive_path(dir, &spec.symbol);
@@ -211,7 +219,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 dir,
                 embedded: opt.aeron_embedded_driver,
             };
-            let source = aeron_source_for(&aeron).await?;
+            let (source, requester) = aeron_source_for(&aeron, spec.symbol_id).await?;
+            snapshot_requesters.insert(spec.symbol.clone(), requester);
             sources.push((spec.clone(), source));
         }
         sources
@@ -230,7 +239,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .collect();
     }
 
-    let running = start(config, sources).await?;
+    let running = start_with_snapshot_requesters(config, sources, snapshot_requesters).await?;
     println!("market-data system: ws://{}/ws", running.addr);
     println!(
         "  raw stream:      ws://{}/ws/<symbol>@<stream>",
@@ -257,12 +266,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[cfg(feature = "aeron")]
-async fn aeron_source_for(aeron: &AeronSpec) -> Result<BoxedSource, Box<dyn std::error::Error>> {
-    Ok(matchengine_marketdata::aeron_source(aeron).await?)
+async fn aeron_source_for(
+    aeron: &AeronSpec,
+    symbol_id: u32,
+) -> Result<(BoxedSource, SnapshotRequester), Box<dyn std::error::Error>> {
+    let source = matchengine_marketdata::aeron_source_with_requester(aeron, symbol_id).await?;
+    Ok((source.frames, source.requester))
 }
 
 #[cfg(not(feature = "aeron"))]
-async fn aeron_source_for(_aeron: &AeronSpec) -> Result<BoxedSource, Box<dyn std::error::Error>> {
+async fn aeron_source_for(
+    _aeron: &AeronSpec,
+    _symbol_id: u32,
+) -> Result<(BoxedSource, SnapshotRequester), Box<dyn std::error::Error>> {
     Err("--aeron-channel requires building with --features aeron".into())
 }
 

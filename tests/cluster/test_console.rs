@@ -22,10 +22,15 @@ use serde_json::Value;
 use serde_json::json;
 
 use crate::common::TempDir;
+use crate::common::TestAddr;
 
 type C = MatchEngineTypeConfig;
 
-const ADDRS: [&str; 3] = ["127.0.0.1:21906", "127.0.0.1:21907", "127.0.0.1:21908"];
+const ADDRS: [TestAddr; 3] = [
+    TestAddr::new(21906),
+    TestAddr::new(21907),
+    TestAddr::new(21908),
+];
 
 #[test]
 fn console_reports_cluster_and_transfers_leader() {

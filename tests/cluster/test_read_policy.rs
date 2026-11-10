@@ -17,11 +17,12 @@ use matchengine_raft::store::MatchEngineRequest;
 use openraft::type_config::TypeConfigExt;
 
 use crate::common::TempDir;
+use crate::common::TestAddr;
 
 type C = MatchEngineTypeConfig;
 
-const LEASE_ADDR: &str = "127.0.0.1:21930";
-const READ_INDEX_ADDR: &str = "127.0.0.1:21932";
+const LEASE_ADDR: TestAddr = TestAddr::new(21930);
+const READ_INDEX_ADDR: TestAddr = TestAddr::new(21932);
 
 #[test]
 fn default_lease_reads_serve_leader_reads_and_report_hits() {
@@ -37,7 +38,12 @@ fn read_index_policy_serves_leader_reads_without_lease_attempts() {
     ));
 }
 
-async fn run_policy_case(addr: &str, policy: Option<ReadPolicyMode>, expected_mode: &str) {
+async fn run_policy_case(
+    addr: impl std::fmt::Display,
+    policy: Option<ReadPolicyMode>,
+    expected_mode: &str,
+) {
+    let addr = addr.to_string();
     let temp = TempDir::new("read-policy");
     let mut storage = StorageConfig::new(temp.path()).with_instance_prefix("read-policy");
     if let Some(policy) = policy {

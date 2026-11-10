@@ -21,8 +21,10 @@ use tokio::sync::watch;
 use tokio::time::Duration;
 use tokio::time::MissedTickBehavior;
 
+use matchengine_raft::market_data::HEARTBEAT_SUB_SEQ;
 use matchengine_raft::market_data::MarketMessage;
 use matchengine_raft::market_data::MessageBody;
+use matchengine_raft::market_data::STREAM_STATUS;
 use matchengine_raft::market_data::flags;
 use matchengine_raft::order_book::Fixed;
 use matchengine_raft::order_book::OrderSide;
@@ -31,6 +33,7 @@ use crate::config::SymbolSpec;
 use crate::protocol;
 use crate::protocol::Speed;
 use crate::source::BoxedSource;
+use crate::source::SnapshotRequester;
 
 /// One aggregated price level.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -120,13 +123,19 @@ pub struct SharedState {
     pub last_ts_ms: u64,
     pub snapshot_seen: bool,
     pub depth_stale: bool,
+    /// Local deadline refreshed by every frame (including the idle heartbeat).
+    pub heartbeat_deadline: Option<std::time::Instant>,
     pub epoch: u64,
     pub leader_id: u64,
 }
 
 impl SharedState {
     pub fn ready(&self) -> bool {
-        self.snapshot_seen && !self.depth_stale
+        self.snapshot_seen
+            && !self.depth_stale
+            && self
+                .heartbeat_deadline
+                .is_some_and(|deadline| std::time::Instant::now() <= deadline)
     }
 }
 
@@ -134,6 +143,8 @@ impl SharedState {
 pub struct SymbolRuntime {
     pub spec: SymbolSpec,
     pub shared: Arc<Mutex<SharedState>>,
+    /// Optional stream-2010 snapshot request channel.
+    pub snapshot_requester: Option<crate::source::SnapshotRequester>,
 }
 
 /// Per-stream broadcast senders, created lazily on first subscribe.
@@ -192,6 +203,7 @@ pub struct Stats {
     pub published: AtomicU64,
     pub resyncs: AtomicU64,
     pub gaps: AtomicU64,
+    pub snapshot_requests: AtomicU64,
     pub slow_closes: AtomicU64,
     pub last_ts_ms: AtomicU64,
 }
@@ -205,6 +217,7 @@ impl Stats {
             "published": self.published.load(Ordering::Relaxed),
             "resyncs": self.resyncs.load(Ordering::Relaxed),
             "gaps": self.gaps.load(Ordering::Relaxed),
+            "snapshot_requests": self.snapshot_requests.load(Ordering::Relaxed),
             "slow_closes": self.slow_closes.load(Ordering::Relaxed),
             "last_ts_ms": self.last_ts_ms.load(Ordering::Relaxed),
         })
@@ -260,6 +273,8 @@ pub struct Feed {
     bar_intervals_ms: Vec<u64>,
     lifecycle: bool,
     snapshot_levels: usize,
+    heartbeat_timeout: Duration,
+    snapshot_requester: Option<SnapshotRequester>,
     shared: Arc<Mutex<SharedState>>,
     registry: Arc<Mutex<Registry>>,
     stats: Arc<Stats>,
@@ -271,20 +286,25 @@ pub struct Feed {
 }
 
 impl Feed {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         symbol: SymbolSpec,
         bar_intervals_ms: Vec<u64>,
         lifecycle: bool,
         snapshot_levels: usize,
+        heartbeat_timeout: Duration,
         shared: Arc<Mutex<SharedState>>,
         registry: Arc<Mutex<Registry>>,
         stats: Arc<Stats>,
+        snapshot_requester: Option<SnapshotRequester>,
     ) -> Self {
         Self {
             symbol,
             bar_intervals_ms,
             lifecycle,
             snapshot_levels,
+            heartbeat_timeout,
+            snapshot_requester,
             shared,
             registry,
             stats,
@@ -293,6 +313,26 @@ impl Feed {
             slow: DepthWindow::default(),
             last_depth_u: None,
         }
+    }
+
+    /// Asks the engine for a fresh snapshot when the optional transport
+    /// requester exists. Returns false when no requester is configured or the
+    /// request queue is full.
+    pub fn request_snapshot(&self, reason: &str) -> bool {
+        let Some(requester) = &self.snapshot_requester else {
+            return false;
+        };
+        let depth = self.snapshot_levels.clamp(1, usize::from(u16::MAX)) as u16;
+        let sent = requester.request(depth);
+        if sent {
+            self.stats
+                .snapshot_requests
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::debug!(%reason, depth, "requested fresh market-data snapshot");
+        } else {
+            tracing::warn!(%reason, "snapshot request queue full or transport stopped");
+        }
+        sent
     }
 
     /// Runs until the source ends or the service stops.
@@ -316,14 +356,21 @@ impl Feed {
     }
 
     fn apply(&mut self, message: MarketMessage) {
-        // Dedupe replayed JSONL lines and duplicate feeds by stream position.
-        let position = (message.market_seq, message.sub_seq);
-        if let Some(previous) = self.seen.get(&message.stream)
-            && position <= *previous
-        {
-            return;
+        // Idle heartbeats intentionally repeat the same `(market_seq, sub_seq)`
+        // key while the book is quiet; they are liveness/diagnostic frames, not
+        // deterministic tape entries, so let every one through.
+        let heartbeat =
+            message.stream == STREAM_STATUS && message.sub_seq == HEARTBEAT_SUB_SEQ;
+        if !heartbeat {
+            // Dedupe replayed JSONL lines and duplicate feeds by stream position.
+            let position = (message.market_seq, message.sub_seq);
+            if let Some(previous) = self.seen.get(&message.stream)
+                && position <= *previous
+            {
+                return;
+            }
+            self.seen.insert(message.stream, position);
         }
-        self.seen.insert(message.stream, position);
         self.stats.messages.fetch_add(1, Ordering::Relaxed);
         self.stats
             .last_ts_ms
@@ -334,6 +381,8 @@ impl Feed {
             state.last_ts_ms = message.ts_ms;
             state.epoch = message.epoch;
             state.leader_id = message.leader_id;
+            state.heartbeat_deadline =
+                Some(std::time::Instant::now() + self.heartbeat_timeout);
         }
 
         match &message.body {
@@ -406,6 +455,7 @@ impl Feed {
                     state.depth_stale = true;
                 }
                 self.broadcast_resync("gap", gap.dropped);
+                self.request_snapshot("gap");
             }
         }
     }

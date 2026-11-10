@@ -533,7 +533,7 @@ pub async fn build_match_engine_node(
     let sink_path = storage.match_event_log.clone();
     // Start the market-data publisher before the state machine so the tap can
     // be installed at open; it is node-local and never affects replication.
-    let market_data = match &storage.market_data {
+    let mut market_data = match &storage.market_data {
         Some(config) => Some(MarketDataHandle::start(config.clone(), node_id).await?),
         None => None,
     };
@@ -562,6 +562,52 @@ pub async fn build_match_engine_node(
             .as_ref()
             .map_or(10, |config| config.depth_levels);
         state_machine_store.set_market_data_control(handle.control(), depth_levels);
+    }
+
+    // Aeron subscribers can request a fresh snapshot on stream 2010. The sink
+    // forwards decoded requests here; capture under the normal state-machine
+    // read path and queue the snapshot through the same control used by the
+    // leadership watcher.
+    if let Some(handle) = market_data.as_mut()
+        && let Some(mut requests) = handle.take_snapshot_requests()
+    {
+        let control = handle.control();
+        let store = state_machine_store.clone();
+        let max_depth = storage
+            .market_data
+            .as_ref()
+            .map_or(10, |config| config.depth_levels)
+            .max(1);
+        tokio::spawn(async move {
+            while let Some(request) = requests.recv().await {
+                if !control.is_publishing() {
+                    tracing::debug!(
+                        request_id = request.request_id,
+                        "ignoring snapshot request while not publishing"
+                    );
+                    continue;
+                }
+                let configured_symbol = store.symbol_id().await;
+                if configured_symbol != request.symbol_id {
+                    tracing::warn!(
+                        request_id = request.request_id,
+                        requested_symbol = request.symbol_id,
+                        configured_symbol,
+                        "ignoring snapshot request for a different symbol"
+                    );
+                    continue;
+                }
+                let depth = usize::from(request.depth_levels).clamp(1, max_depth);
+                let snapshot = store.capture_market_data_snapshot(depth).await;
+                tracing::debug!(
+                    request_id = request.request_id,
+                    depth,
+                    market_seq = snapshot.market_seq,
+                    "queued requested market-data snapshot"
+                );
+                control.push_snapshot(snapshot);
+            }
+        });
     }
 
     tracing::info!(
@@ -723,6 +769,7 @@ pub async fn build_match_engine_node(
             // operational API
             .service(health::health)
             .service(health::ready)
+            .service(health::pretrade_status)
             .service(console::redirect)
             .service(console::index)
             .service(console::css)
