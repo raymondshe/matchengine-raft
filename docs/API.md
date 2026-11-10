@@ -106,9 +106,12 @@ p50/p99 on the 4-node benchmark.
 Lease and local-lease reads assume **bounded clock drift** between nodes. Use NTP or PTP; set
 `--read-policy read_index` unless the deployment guarantees that the leader's lease cannot outlive
 its actual leadership. A local-lease cache hit can overtake an unfinished write; await the write
-response before a read that must observe it. The status endpoint reports the mode and, per path,
-`lease_attempts`, `lease_hits`, `lease_fallbacks`, `lease_failures`, `read_index_attempts` and
-`read_index_failures`.
+response before a read that must observe it. Client retries are **at-least-once**: set
+`client_order_id` on writes that must not duplicate, and the replicated submission map returns the
+original sequence and events. Downstream event consumers are expected to be idempotent: resume from
+`(log_index, ordinal)` and dedupe on `event_id`; local-lease reads do not change either contract.
+The status endpoint reports the mode and, per path, `lease_attempts`, `lease_hits`,
+`lease_fallbacks`, `lease_failures`, `read_index_attempts` and `read_index_failures`.
 
 The Rust request/response types behind `/write` are:
 

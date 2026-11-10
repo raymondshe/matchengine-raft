@@ -83,9 +83,11 @@ Raft 节点间 RPC 仅由 `--http-addr` 端口 + 1000 上的 gRPC 提供；HTTP 
 
 Lease 与 local-lease read 假设节点间**时钟漂移有界**。使用 NTP 或 PTP；除非部署能保证 leader
 lease 不会超过实际领导权，否则设置 `--read-policy read_index`。local-lease 缓存命中可能越过尚未
-完成的写请求；需要读到某次写结果的客户端应先等待写响应。状态端点按读路径报告
-`lease_attempts`、`lease_hits`、`lease_fallbacks`、`lease_failures`、`read_index_attempts` 和
-`read_index_failures`。
+完成的写请求；需要读到某次写结果的客户端应先等待写响应。客户端重试是 **at-least-once**：需要
+去重的写请求应设置 `client_order_id`，复制的提交映射会返回原始 sequence 和事件。下游事件消费者
+应保证幂等：从 `(log_index, ordinal)` 恢复并按 `event_id` 去重；local-lease read 不改变这两个
+契约。状态端点按读路径报告 `lease_attempts`、`lease_hits`、`lease_fallbacks`、
+`lease_failures`、`read_index_attempts` 和 `read_index_failures`。
 - gRPC `EventService.StreamEvents` - 在 gRPC 监听器上按同一游标流式推送 JSON 事件页，支持 `wait_ms` 和 `max_pages`
 - `GET /events/status` - 保留事件窗口、淘汰计数和保留上限
 

@@ -898,8 +898,10 @@ Write-side cost was within noise. A single-node 64-client sustained `/write` run
 
 Caveats: the cache rebuilds the leader snapshot after notifications/command batches, so a
 read-heavy leader may pay CPU that these mixed rows do not isolate; a local lease hit can overtake
-an unfinished write, so clients must await the write response before a read that must observe it;
-and the same bounded-clock-drift contract applies. The local path is now the default; the core
+an unfinished write, so clients must await the write response before a read that must observe it.
+Client retries are at-least-once and should carry `client_order_id` for replicated dedupe;
+downstream event consumers should resume from `(log_index, ordinal)` and dedupe on `event_id`.
+The same bounded-clock-drift contract applies. The local path is now the default; the core
 `lease` mode remains available for comparison and for deployments that prefer the core queue order.
 
 ### OpenRaft minimal benchmark comparison (2026-11-08)

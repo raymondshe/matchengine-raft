@@ -27,20 +27,19 @@ measurement and production readiness; **P2** = important but not blocking; **P3*
 
 ## Top priorities
 
-Last prioritised 2026-11-10. There are no known P0 defects. One P1 production-readiness gate
-remains: the new `local_lease` default was adopted from single-host measurements and needs
-multi-host/clock-skew validation before it is treated as a production default.
-
-**P1 - production readiness**
-
-1. **Validate the default `local_lease` path (§16).** Rerun the read and write A/B on a second
-   host and a Linux multi-host four-voter cluster, and exercise a stale lease / forced cache miss
-   so the `ReadIndex` fallback and `/read-policy/status` counters are observed under clock skew.
-   The local-cache win is 11-36% on this host; the remaining risk is multi-host correctness and
-   tail behavior.
+Last prioritised 2026-11-11. There are no known P0 or P1 defects. The local-lease semantic risk is
+covered by the delivery contract: client retries are at-least-once and use `client_order_id` for
+replicated dedupe, while downstream event readers resume from `(log_index, ordinal)` and dedupe on
+`event_id`. A local-lease cache hit may overtake an unfinished write, so read-after-write is not a
+guarantee; clients that need it must await the write response. The remaining local-lease work is
+multi-host performance/tail validation.
 
 **P2 - evidence and operational follow-ups**
 
+1. **Validate the default `local_lease` path on a second host and a Linux multi-host four-voter
+   cluster (§16).** Rerun the read and write A/B, exercise a stale lease / forced cache miss so
+   the `ReadIndex` fallback and `/read-policy/status` counters are observed under clock skew, and
+   confirm the at-least-once/idempotent consumer contract still holds.
 2. **Run the Linux pinned-core `e2e` pass (§8).** Dispatch the manual `Linux benchmark` workflow
    for the pinned short/sustained rows.
 3. **Run the Linux Aeron external-driver and multicast validation (§6).** Use the checklist in
@@ -132,7 +131,7 @@ An OpenRaft utilization review (2026-11-06, [`RAFT_REVIEW.md`](./docs/RAFT_REVIE
 transport already uses `stream_append` and streamed snapshots correctly. Its P1 quick wins are
 implemented: the replication lag threshold now sits above the 100k snapshot policy, heartbeat
 suppression is enabled, HTTP/2 windows/keepalive are tuned, snapshot chunks follow OpenRaft's
-configured size and readiness waits for recovery. The remaining P1/P2/P3 items are tracked in §16.
+configured size and readiness waits for recovery. The remaining P2/P3 items are tracked in §16.
 
 The next work is the ordered list above; it replaces the previous single-item queue. The earlier
 measurement work is done: `book_replay` and `level_book` report warm p50/p99 plus an
@@ -943,11 +942,12 @@ and optional APIs.
   p50 53.5-53.8 µs vs 88.4-92.1 µs, p99 0.64-0.69 ms vs 1.17-1.19 ms) and `/events` by 8-16%,
   with write throughput within noise. The core `lease` mode remains available for comparison.
   Details in `docs/PERFORMANCE.md`.
-- [ ] **P1** Validate the default `local_lease` path on a second host and a Linux multi-host
+- [ ] **P2** Validate the default `local_lease` path on a second host and a Linux multi-host
   four-voter cluster: rerun `read_e2e --policy lease|local_lease` plus the e2e/cluster write A/B,
   exercise a stale lease or forced cache miss so the `ReadIndex` fallback is observed, and check
-  `/read-policy/status` counters under bounded clock skew. The single-host win is 11-36%; this is
-  the remaining production-readiness gate for making it the default.
+  `/read-policy/status` counters under bounded clock skew. Correctness is covered by the
+  at-least-once client contract (`client_order_id` dedupe) and idempotent downstream event
+  consumers (`event_id` dedupe); the remaining work is multi-host tail/performance evidence.
 - [ ] **P2** Cache follower-read linearizers for a short TTL bounded by the leader lease, or add a
   lease-based `/get_linearizer` mode; measure the per-read leader hop.
 

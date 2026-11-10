@@ -127,6 +127,20 @@ fn events_are_returned_deduped_paged_and_bounded() {
         assert_eq!(MatchEventKind::Fill, page.events[0].kind);
         assert!(!page.has_more);
 
+        // Replaying the same cursor is safe for an at-least-once consumer:
+        // event ids and the next cursor are stable, so the reader can dedupe.
+        let replay = client
+            .events(&EventsRequest {
+                after: Some(cursor),
+                limit: Some(10),
+                wait_ms: None,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(page.events, replay.events);
+        assert_eq!(page.next_after, replay.next_after);
+
         // One-by-one paging sees both events exactly once.
         let mut after = None;
         let mut seen = Vec::new();
