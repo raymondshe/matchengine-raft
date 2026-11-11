@@ -207,11 +207,16 @@ fn report(
 
 async fn blank_workload() -> anyhow::Result<()> {
     let (mut store, dir) = open_store("blank")?;
-    apply_entry(&mut store, 1, EntryPayload::Blank).await;
+    // Warm up runtime/lock/timer initialization before the measured window.
+    // Linux builds have shown a one-time 3-allocation baseline on the first
+    // apply after the counter reset; a single warm-up entry was not enough.
+    for index in 1..=64 {
+        apply_entry(&mut store, index, EntryPayload::Blank).await;
+    }
 
     reset_allocations();
     let started = Instant::now();
-    for index in 2..2 + MEASURED_ENTRIES as u64 {
+    for index in 65..65 + MEASURED_ENTRIES as u64 {
         apply_entry(&mut store, index, EntryPayload::Blank).await;
     }
     let elapsed = started.elapsed();

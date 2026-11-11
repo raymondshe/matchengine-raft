@@ -27,45 +27,53 @@ measurement and production readiness; **P2** = important but not blocking; **P3*
 
 ## Top priorities
 
-Last prioritised 2026-11-11. There are no known P0 or P1 defects. The local-lease semantic risk is
-covered by the delivery contract: client retries are at-least-once and use `client_order_id` for
-replicated dedupe, while downstream event readers resume from `(log_index, ordinal)` and dedupe on
-`event_id`. A local-lease cache hit may overtake an unfinished write, so read-after-write is not a
-guarantee; clients that need it must await the write response. The remaining local-lease work is
-multi-host performance/tail validation.
+Last prioritised 2026-11-11, after the OrbStack Linux lab and the Aeron
+external-driver/multicast validation. There are no known P0 or P1 defects. The local-lease semantic
+risk is covered by the delivery contract: client retries are at-least-once and use
+`client_order_id` for replicated dedupe, while downstream event readers resume from
+`(log_index, ordinal)` and dedupe on `event_id`. A local-lease cache hit may overtake an unfinished
+write, so read-after-write is not a guarantee; clients that need it must await the write response.
+
+The remaining P2 evidence gaps are second-host behaviour, not code paths: the four OrbStack
+containers share one kernel, host and clock, and the Aeron multicast run is loopback within one
+network namespace. The pinned-core `e2e` container run is done; only the bare-metal workflow
+dispatch remains.
 
 **P2 - evidence and operational follow-ups**
 
-1. **Validate the default `local_lease` path on a second host and a Linux multi-host four-voter
-   cluster (§16).** Rerun the read and write A/B, exercise a stale lease / forced cache miss so
-   the `ReadIndex` fallback and `/read-policy/status` counters are observed under clock skew, and
-   confirm the at-least-once/idempotent consumer contract still holds.
-2. **Run the Linux pinned-core `e2e` pass (§8).** Dispatch the manual `Linux benchmark` workflow
-   for the pinned short/sustained rows.
-3. **Run the Linux Aeron external-driver and multicast validation (§6).** Use the checklist in
-   [`demos/market_data_system/README.md`](./demos/market_data_system/README.md).
-4. **Keep docs synchronized (§10).** This is an ongoing gate: `AGENTS.md`, READMEs,
+1. **Validate on a second Linux host (§16 and §6).** One second-host lab should cover both
+   remaining production-topology gaps:
+   - default `local_lease`: rerun the read/write A/B, force a stale lease so the `ReadIndex`
+     fallback and `/read-policy/status` counters are observed under bounded clock skew, and keep
+     the at-least-once/idempotent consumer contract intact;
+   - Aeron multicast across a real multi-host fabric with independent service instances and a
+     non-loopback NIC, rather than the current single-host `lo` validation.
+2. **Dispatch the Linux bare-metal pinned-core `e2e` workflow (§8).** The OrbStack container run
+   already covers the pinned short check in both fsync modes; this is the last pinned-host row.
+   Low effort when a Linux runner is available.
+3. **Keep docs synchronized (§10).** This is an ongoing gate: `AGENTS.md`, READMEs,
    `docs/PERFORMANCE.md`, `docs/API.md` and this file must move with storage/wire/read-policy
    changes.
 
 **P3 - later, in impact order**
 
-5. Expose `purge_batch_size` and `max_in_snapshot_log_to_keep` with the snapshot policy (§16).
-6. Evaluate bounded admission waiting/backpressure against the current fail-fast `429` (§8).
-7. Benchmark `STREAM_APPEND_CHANNEL_SIZE` as a standalone transport constant (§16).
-8. Replace market-data leader-watcher metrics polling with OpenRaft `on_leader_change` callbacks
+4. Expose `purge_batch_size` and `max_in_snapshot_log_to_keep` with the snapshot policy (§16).
+5. Evaluate bounded admission waiting/backpressure against the current fail-fast `429` (§8).
+6. Benchmark `STREAM_APPEND_CHANNEL_SIZE` as a standalone transport constant (§16).
+7. Replace market-data leader-watcher metrics polling with OpenRaft `on_leader_change` callbacks
    (§16).
-9. Optional transport work: peer preconnect, larger HTTP/2 frames and snapshot compression (§16).
-10. Productionize async WAL only after a Linux multi-node A/B and pipelining work (§16).
-11. Evaluate a binary order-entry path (§14).
-12. Evaluate real ITCH-style replay data and custom MPMC/SIMD/io_uring work (§14).
-13. Evaluate the Aeron Raft transport only if a measured transport bottleneck appears (§4).
-14. Engine-level derivative support (instrument kind, leverage/margin fields) (§13).
-15. Custom reserve replenishment and stop-protection collars when the product requires them (§5).
-16. Consider protobuf/Avro on the public HTTP API; Raft RPCs stay postcard (§5).
-17. Decide whether to rename the remaining mixed-style modules before 1.0 (§10).
-18. Add AON, self-trade-prevention/order-mask and multi-symbol isolation conformance cases only
-    when those product behaviours land (§17).
+8. Optional transport work: peer preconnect, larger HTTP/2 frames and snapshot compression (§16).
+9. Productionize async WAL only after the second-host Linux multi-node A/B and pipelining work
+   from item 1 (§16).
+10. Evaluate a binary order-entry path (§14).
+11. Evaluate real ITCH-style replay data and custom MPMC/SIMD/io_uring work (§14).
+12. Evaluate the Aeron Raft transport only if a measured transport bottleneck appears (§4).
+13. Engine-level derivative support (instrument kind, leverage/margin fields) (§13).
+14. Custom reserve replenishment and stop-protection collars when the product requires them (§5).
+15. Consider protobuf/Avro on the public HTTP API; Raft RPCs stay postcard (§5).
+16. Decide whether to rename the remaining mixed-style modules before 1.0 (§10).
+17. Add AON and order-mask conformance cases when those behaviours land; STP coverage exists and
+    multi-symbol remains deployment-level isolation (§17).
 
 The detailed checkboxes and evidence for each item remain in the sections below. The earlier
 "recently completed" summary is kept for context.
@@ -396,8 +404,16 @@ Remaining:
   task flushes each line before yielding; `tests/archive.rs` proves record-then-replay equality.
 - [x] **P2** Aeron operation hardening — implemented: idle STATUS heartbeat (`--market-data-aeron-heartbeat-ms`),
   `ws_fanout` benchmark with published numbers, and the stream-2010 snapshot-request stream on
-  both engine and service. Linux external-driver/multicast fan-out validation remains blocked on
-  this macOS host; the runbook and commands are in `demos/market_data_system/README.md`.
+  both engine and service. Linux external-driver/multicast fan-out validation is covered by
+  `scripts/aeron-linux-lab.sh` on OrbStack x86_64 Linux: a supervised driver over IPC, then three
+  drivers over a loopback multicast group with two service instances, both ready and advancing on
+  the same order flow, both receiving a populated depth snapshot, and one service killed without
+  affecting the other. The first stream-2010 request is retained until its publication connects
+  instead of being dropped. A real multi-host multicast fabric remains a deployment-network check.
+  The runbook and commands are in `demos/market_data_system/README.md`.
+- [ ] **P2** Validate Aeron multicast across a real multi-host fabric: separate hosts/drivers on a
+  non-loopback NIC, independent service instances, and no shared `/dev/shm`. The single-host `lo`
+  path is covered by `scripts/aeron-linux-lab.sh`; this is the remaining deployment-topology check.
 - [x] **P2** Add the snapshot-request stream (2003/2010). Done: fixed 24-byte `MSRQ` v1 request,
   engine subscription and state-machine capture, service request on empty/stale depth and gap,
   embedded-driver round-trip tests.
@@ -601,12 +617,17 @@ Remaining (the public-suite follow-ups are tracked in §17):
   three. The 4-node/write-sweep/read-path/async-WAL rows are already recorded in
   `docs/PERFORMANCE.md`; the stable fsync/cluster rows stay informational until their variance
   settles.
-- [ ] **P2** Run `cargo bench --bench e2e -- --pin <cpu>` on a Linux host once, to separate
-  scheduler noise from the fsync cost that dominates the current p99. The flag is implemented;
-  this macOS host has no core-pinning API, so the recorded 2026-11-04 approximation is the
-  current-thread runtime (p50 3.95ms / p99 5.22ms vs 3.93ms / 5.10ms multi-thread, i.e. no change).
-  A manual `Linux benchmark` workflow (`.github/workflows/bench-linux.yml`) now runs the pinned
-  short and sustained e2e suites on `workflow_dispatch`; it has not been dispatched yet.
+- [x] **P2** Run `cargo bench --bench e2e -- --pin <cpu>` on a Linux host once, to separate
+  scheduler noise from the fsync cost that dominates the current p99. Done 2026-11-11 in the
+  OrbStack four-container Linux lab (shared Linux 7.2 kernel, CPU 0 pinned): every-append fsync
+  sequential 1,042-1,330 writes/s, p50 579-655 µs, p99 3.51-4.10 ms; no-fsync 24,161-24,818
+  writes/s, p50 39-40.6 µs, p99 50.4-53.4 µs. Fsync remains the p99 driver. This is a Linux
+  kernel in a container, not a bare-metal host; the manual `Linux benchmark` workflow remains
+  for a pinned bare-metal run. The Linux `apply_path --check` also exposed a one-time blank
+  allocation; the bench now warms up 64 blank entries and the check passes.
+- [ ] **P2** Dispatch `.github/workflows/bench-linux.yml` for the bare-metal pinned short and
+  sustained `e2e` rows. The OrbStack container run above covers the short pinned check in both
+  fsync modes; this is the remaining bare-metal evidence and needs a Linux runner.
 - [x] **P2** Decide the periodic-fsync tail. Decision: production uses either disabled fsync
   with at least four voters (maximum throughput) or every-append fsync (durable writes). The 10 ms
   mode is dominated: 7,374 writes/s and a 2.2-3.0 ms p99. The 100 ms mode is within noise of
@@ -946,6 +967,9 @@ and optional APIs.
   `/read-policy/status` counters under bounded clock skew. Correctness is covered by the
   at-least-once client contract (`client_order_id` dedupe) and idempotent downstream event
   consumers (`event_id` dedupe); the remaining work is multi-host tail/performance evidence.
+  **Partial 2026-11-11:** the OrbStack four-container lab runs four independent network
+  namespaces and filesystems on one Linux kernel and one host, so it validates the Linux build
+  and four-voter path but does not provide a second host or clock skew. This item remains open.
 - [x] **P2** Cache follower-read linearizers for a short TTL bounded by the leader lease, or add a
   lease-based `/get_linearizer` mode; measure the per-read leader hop. Done: `read_e2e` now
   includes `follower_read` on a non-leader and reuses one `tokio::sync::OnceCell` HTTP client. The
@@ -1034,9 +1058,9 @@ and optional APIs.
   Off by default; only every-append mode. A single-node e2e A/B found no consistent request-path
   gain: sequential writes stayed at ~258-260/s because each waits for `IOFlushed`, and concurrent
   writes were within run noise (18.3k sync vs 17.3k async median).
-- [ ] **P3** Productionize async WAL only after a Linux multi-node A/B and pipelining work: add
-  periodic-mode support if useful, bound the pending cache with backpressure, extend
-  crash/failover coverage, and test whether more append concurrency exposes a real gain. The
+- [ ] **P3** Productionize async WAL only after the second-host Linux multi-node A/B and
+  pipelining work: add periodic-mode support if useful, bound the pending cache with backpressure,
+  extend crash/failover coverage, and test whether more append concurrency exposes a real gain. The
   single-node A/B did not justify changing the default; keep the synchronous WAL as the default
   until then.
 - [ ] **P3** When exposing the snapshot policy, expose `purge_batch_size` and
@@ -1164,5 +1188,6 @@ reported 7.20 M/s book-only; the full review and competitor taxonomy are in
 
 ### Remaining feature work
 
-- [ ] **P3** Add AON, self-trade-prevention/order-mask and multi-symbol isolation cases only when
-  the product adds those behaviours; multi-symbol remains deployment-level isolation (§2).
+- [ ] **P3** Add AON and order-mask conformance cases when those behaviours land. STP already has
+  `SelfTradePrevented` conformance and integration coverage; multi-symbol remains deployment-level
+  isolation (§2).

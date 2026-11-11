@@ -1,6 +1,6 @@
 # Performance measurements
 
-Measured on **2026-10-30** (runtime flavor A/B and P0 offloads: **2026-10-31**; measurement scope and RSS: **2026-11-01**; book p50/p99 and the pinned-core approximation: **2026-11-04**; end-to-end/storage rerun with the OpenRaft quick wins: **2026-11-06**; realistic-mix replay: **2026-11-06**; dedicated Raft runtime: **2026-11-06**; WAL fsync Tokio rerun: **2026-11-07**; four-node no-fsync cluster: **2026-11-07**; write concurrency/batching sweep: **2026-11-08**; async WAL prototype: **2026-11-08**; production configuration decisions: **2026-11-08**; write admission control: **2026-11-09**; pre-connected write concurrency: **2026-11-09**; sustained single-node CPU profile: **2026-11-09**; benchmark regression gate: **2026-11-09**; read-path benchmark: **2026-11-08**; OpenRaft minimal-benchmark comparison: **2026-11-08**; WebSocket fan-out: **2026-11-10**; open-loop e2e, current-HEAD book re-pin and sorted-vector A/B: **2026-11-10**; apply-path inline buffers, affinity A/B and per-level rerun: **2026-11-10**; local lease-read experiment and dependency upgrade: **2026-11-10**; follower-read linearizer hop: **2026-11-11**) on the reference development machine:
+Measured on **2026-10-30** (runtime flavor A/B and P0 offloads: **2026-10-31**; measurement scope and RSS: **2026-11-01**; book p50/p99 and the pinned-core approximation: **2026-11-04**; end-to-end/storage rerun with the OpenRaft quick wins: **2026-11-06**; realistic-mix replay: **2026-11-06**; dedicated Raft runtime: **2026-11-06**; WAL fsync Tokio rerun: **2026-11-07**; four-node no-fsync cluster: **2026-11-07**; write concurrency/batching sweep: **2026-11-08**; async WAL prototype: **2026-11-08**; production configuration decisions: **2026-11-08**; write admission control: **2026-11-09**; pre-connected write concurrency: **2026-11-09**; sustained single-node CPU profile: **2026-11-09**; benchmark regression gate: **2026-11-09**; read-path benchmark: **2026-11-08**; OpenRaft minimal-benchmark comparison: **2026-11-08**; WebSocket fan-out: **2026-11-10**; open-loop e2e, current-HEAD book re-pin and sorted-vector A/B: **2026-11-10**; apply-path inline buffers, affinity A/B and per-level rerun: **2026-11-10**; local lease-read experiment and dependency upgrade: **2026-11-10**; follower-read linearizer hop: **2026-11-11**; Linux container pinned pass: **2026-11-11**) on the reference development machine:
 
 - Apple M4 (`arm64`)
 - Rust `1.93.1`
@@ -495,7 +495,9 @@ M4 baseline. Cold passes remain reported but are not gated.
 The pinned-core `e2e` pass is a separate, manual Linux run. `.github/workflows/bench-linux.yml`
 (`Linux benchmark`, `workflow_dispatch`) selects the last available CPU, runs the short e2e suite
 with `--pin`, then the 60 s / 500-client sustained pass. It has not been dispatched on this macOS
-development host.
+development host; the 2026-11-11 OrbStack container run in §"Linux container pinned pass" covers
+the short pinned check on a Linux kernel, while the workflow remains the bare-metal/pinned-host
+pass.
 
 ## End-to-end write path
 
@@ -1062,8 +1064,32 @@ timer, while Actix keeps its separate HTTP worker threads.
 
 The two runs are within the 5-10% run-to-run noise, so removing Tokio's multi-thread scheduler did
 not move the tail: p99 stays ~1.3x p50 and the p50 stays at the WAL `sync_data` cost. A true
-pinned single-core run remains a Linux-only measurement; run
-`cargo bench --bench e2e -- --pin 0` there when a Linux host is available.
+pinned single-core run remained a Linux-only measurement until the 2026-11-11 container run below.
+
+### Linux container pinned pass (2026-11-11)
+
+The four-container OrbStack lab (`scripts/orbstack-cluster.sh`) makes the pinned pass available
+without a second machine. The containers share OrbStack's Linux 7.2.12 aarch64 kernel; the
+measurement runs in a `matchengine-raft:builder` container pinned to CPU 0 on an M4 MacBook Air
+(10 vCPU, 12 GiB OrbStack VM). The full Linux `cargo test` (220 lib + 3 bridge + 74 cluster), the
+async-WAL cluster tests, `apply_path --check` and both pinned e2e modes passed.
+
+| Pinned e2e mode | Sequential writes/s | p50 | p99 | Concurrent writes/s | Concurrent batches (orders/s) |
+|---|---:|---:|---:|---:|---:|
+| WAL fsync disabled | 24,161-24,818 | 39-40.6 µs | 50.4-53.4 µs | 3,401-3,471 | 3,572-4,370 |
+| Every append fsync | 1,042-1,330 | 579-655 µs | 3.51-4.10 ms | 3,470-3,752 | 3,923-4,076 |
+
+The split is the expected one: with fsync disabled the p99 is ~50 µs, while every-append fsync
+pushes p50 to ~0.6 ms and p99 to ~3.5-4.1 ms. Pinning removes the scheduler contribution but not
+the WAL sync cost. The container's fsync is faster than the 2026-11-04 macOS approximation
+(258 writes/s, p50 3.95 ms, p99 5.22 ms) because the WAL lives on the OrbStack Linux filesystem,
+not APFS; this is a Linux-kernel check, not a bare-metal disk baseline.
+
+The Linux `apply_path --check` initially failed the blank row with 3 calls / 4,143 bytes: a
+one-time runtime/lock initialization attributed to the first entry after the counter reset.
+`benches/apply_path.rs` now warms up 64 blank entries before reset; blank is 0 calls on Linux and
+the other rows match the macOS ceilings (rest 3.17, cancel 3.00, fill 4.00, batch blank 1.02,
+batch rest 3.19 allocs/entry).
 
 ### P0 optimization A/B (2026-10-31)
 
@@ -1632,7 +1658,8 @@ The measurement rules transferred regardless of layout and are now implemented:
   see the realistic-mix section above. `tests/replay` remains correctness-only.
 - **Scheduler noise is now measurable.** `cargo bench --bench e2e -- --pin <cpu>` pins the process on
   Linux; on this macOS host the current-thread run was the closest approximation and showed no
-  change (see "Pinned-core pass"). A true pinned Linux run is still pending.
+  change (see "Pinned-core pass"). The 2026-11-11 OrbStack container run added the Linux pinning
+  measurement; a bare-metal pinned-host run is still pending.
 - **Compare like with like.** Their throughput is single-threaded book management with no
   durability; the concurrent ~156k orders/s measured here includes Raft commit, WAL `sync_data`,
   apply, events and JSON. Never quote the two side by side.

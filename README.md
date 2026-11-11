@@ -197,6 +197,9 @@ Start a local four-node cluster with `./scripts/test-cluster.sh`; use `--nodes N
 Manual startup, ports, membership changes, helper scripts and recovery drills are documented in the
 [runbook](./docs/RUNBOOK.md).
 
+For a four-container Linux lab on OrbStack Free (personal/non-commercial), see
+[OrbStack Linux lab](./docs/ORBSTACK_LAB.md).
+
 ## Operational Console
 
 Every node serves an embedded operational console at `/console/`. It shows cluster health, Raft
@@ -262,7 +265,8 @@ switches symbols with live `UNSUBSCRIBE`/`SUBSCRIBE`:
   8,192-frame tap queue).
 
 Run it with `./scripts/market-data-system.sh` (two engines over Aeron IPC) and
-open <http://127.0.0.1:24800/>. See
+open <http://127.0.0.1:24800/>. For the Linux external-driver and multicast
+validation, run `./scripts/aeron-linux-lab.sh`. See
 [`demos/market_data_system/README.md`](./demos/market_data_system/README.md)
 and [`docs/MARKET_DATA_WEBSOCKET.md`](./docs/MARKET_DATA_WEBSOCKET.md).
 

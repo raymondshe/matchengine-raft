@@ -203,46 +203,77 @@ Stream 2010 (base + 9) is the one subscriber-to-engine path. When a WebSocket
 client subscribes to depth/bookTicker while the service cache is empty or marked
 stale, the service sends a fixed 24-byte `MSRQ` v1 request. The engine captures
 the current book under the state-machine lock and queues a reset snapshot through
-the same processor path as the periodic broadcast. The periodic snapshot is
-still the fallback if the request is dropped.
+the same processor path as the periodic broadcast. If the request publication is
+not connected yet, the service retains the request and retries it; the periodic
+snapshot remains the fallback if the request cannot be delivered.
 
 ### Linux external-driver/multicast validation
 
-Run this on a Linux host with `aeronmd` installed (the embedded-driver path is
-covered by `cargo test --features aeron` on development hosts):
+`scripts/aeron-linux-lab.sh` automates the Linux validation on OrbStack. It
+builds the engine with `--features market-data-aeron` and the demo with
+`--features aeron`, then runs a separate driver process
+(`demos/market_data_system/src/bin/aeron_driver.rs`, a small Rust equivalent of
+`aeronmd` using the same Aeron C media driver) for two scenarios:
 
 ```shell
-# 1. External driver over IPC.
-AERON_DIR=/dev/shm/aeron-$USER aeronmd &
-AERON_DIR=/dev/shm/aeron-$USER cargo run --release --features market-data-aeron -- \
+./scripts/aeron-linux-lab.sh ipc
+./scripts/aeron-linux-lab.sh multicast
+./scripts/aeron-linux-lab.sh all
+```
+
+The script uses OrbStack's x86_64 Linux userland (Rosetta) because `rusteron`
+0.2.13 publishes precompiled Linux static libraries only for x86_64. A native
+aarch64 build needs CMake >= 3.30 and a source build; that is not part of the
+script. The container has a 1 GiB `/dev/shm`, `NET_ADMIN`, and its own network
+namespace; the multicast scenario uses `239.1.2.3:24001` on `lo`.
+
+For the manual IPC check, use the helper binary instead of `aeronmd`:
+
+```shell
+# terminal 1: supervised driver
+AERON_DIR=/dev/shm/aeron-ipc \
+  cargo run --release --manifest-path demos/market_data_system/Cargo.toml \
+    --features aeron --bin aeron_driver
+
+# terminal 2: engine
+AERON_DIR=/dev/shm/aeron-ipc cargo run --release --features market-data-aeron -- \
   --id 1 --http-addr 127.0.0.1:21001 \
   --market-data-aeron-channel 'aeron:ipc' \
-  --market-data-aeron-dir /dev/shm/aeron-$USER
-AERON_DIR=/dev/shm/aeron-$USER cargo run --release \
+  --market-data-aeron-dir /dev/shm/aeron-ipc
+
+# terminal 3: service
+AERON_DIR=/dev/shm/aeron-ipc cargo run --release \
   --manifest-path demos/market_data_system/Cargo.toml --features aeron -- \
   --addr 127.0.0.1:24700 --aeron-channel 'aeron:ipc' \
-  --aeron-dir /dev/shm/aeron-$USER --symbol eurusd:0:EUR:USD
-
-# 2. Multicast fan-out: two service instances consume the same group.
-#    Replace eth0 and the group with the host's NIC / test network.
-ENGINE_CHANNEL='aeron:udp?endpoint=239.1.2.3:24001|interface=eth0'
-cargo run --release --features market-data-aeron -- \
-  --id 1 --http-addr 127.0.0.1:21001 \
-  --market-data-aeron-channel "$ENGINE_CHANNEL" \
-  --market-data-aeron-snapshot-every-ms 5000
-for addr in 24700 24701; do
-  cargo run --release --manifest-path demos/market_data_system/Cargo.toml --features aeron -- \
-    --addr 127.0.0.1:$addr --aeron-channel "$ENGINE_CHANNEL" \
-    --symbol eurusd:0:EUR:USD &
-done
+  --aeron-dir /dev/shm/aeron-ipc --symbol eurusd:0:EUR:USD
 ```
+
+For multicast, start one supervised driver per process, give the engine and
+each service its own `--aeron-dir`/`--aeron-channel`, and use the same
+`aeron:udp?endpoint=239.1.2.3:24001|interface=lo` channel. The script starts
+three drivers: one for the engine and one for each of two service instances.
 
 Expected result: both service `/ready` endpoints return `200`, both `/metrics`
 counters advance for the same order flow, a WebSocket `@depth@100ms` client gets
 a `depthSnapshot` immediately on subscribe (via stream 2010) rather than waiting
 for the periodic snapshot, and killing one service does not affect the other.
-This validation is **blocked on a Linux host**; macOS can run the embedded-driver
-and request-stream tests but not the external `aeronmd`/multicast checks.
+
+**Verified 2026-11-11** in the OrbStack x86_64 lab:
+
+- IPC: external driver plus engine/service; service ready `200`; `snapshot_requests=1`;
+  the first `depthSnapshot` arrived in ~0.06 s with the configured bid/ask book.
+- Multicast: three external drivers and two independent service instances; both
+  ready `200`; both metrics advanced on the same order flow; both depth clients
+  received a populated `depthSnapshot`; killing one service left the other ready
+  and receiving.
+- The first stream-2010 request can arrive before its Aeron publication has
+  connected. The source now keeps that request pending and retries it instead
+  of dropping it; this was found during the validation.
+
+This validates the external-driver and multicast **code paths on a single
+Linux host/network namespace**. Cross-host multicast on a real fabric remains a
+deployment-network check, not a code-path check. The embedded-driver path is
+also covered by `cargo test --features aeron --test aeron` on development hosts.
 
 ### WebSocket fan-out benchmark
 

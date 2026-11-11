@@ -10,6 +10,7 @@ actix-web = "4.18.1"
 actix-ws = "0.3"
 bytes = "1"
 clap = { version = "4.6.7", features = ["derive", "env"] }
+ctrlc = { version = "3.5", optional = true }
 futures-util = "0.3"
 matchengine-raft = { path = "../.." }
 # Optional Aeron transport. Pinned to 0.2.13: 0.2.14+ uses an unstable API.
@@ -33,10 +34,15 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 [features]
 # Ingest the engine feed over Aeron. `cargo run --features aeron -- --aeron-channel ...`
-aeron = ["dep:rusteron-client", "dep:rusteron-media-driver"]
+aeron = ["dep:rusteron-client", "dep:rusteron-media-driver", "dep:ctrlc"]
 
 [dev-dependencies]
 tokio-tungstenite = "0.24"
+
+[[bin]]
+name = "aeron_driver"
+path = "src/bin/aeron_driver.rs"
+required-features = ["aeron"]
 
 [[bench]]
 name = "ws_fanout"

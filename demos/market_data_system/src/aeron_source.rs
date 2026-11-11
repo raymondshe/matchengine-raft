@@ -202,8 +202,15 @@ fn poll_loop(
     request_rx: std::sync::mpsc::Receiver<SnapshotRequest>,
 ) {
     let mut request_publication: Option<AeronExclusivePublication> = None;
+    let mut pending_request: Option<SnapshotRequest> = None;
     loop {
         while let Ok(request) = request_rx.try_recv() {
+            // Keep the newest request; a stale retry is not useful once a
+            // later subscriber has asked for a snapshot.
+            pending_request = Some(request);
+        }
+
+        if let Some(request) = pending_request.take() {
             if request_publication.is_none() {
                 let publication = aeron
                     .async_add_exclusive_publication(channel.as_c_str(), i32::from(request_stream))
@@ -212,30 +219,33 @@ fn poll_loop(
                     Ok(publication) => request_publication = Some(publication),
                     Err(error) => {
                         tracing::warn!(%error, "create snapshot-request publication failed");
-                        break;
                     }
                 }
             }
-            let Some(publication) = request_publication.as_ref() else {
-                break;
-            };
-            let payload = request.encode();
-            let mut offered = false;
-            for _ in 0..1_000 {
-                match publication.offer(&payload) {
-                    Ok(_) => {
-                        offered = true;
-                        break;
-                    }
-                    Err(error) if error.is_retryable() => std::hint::spin_loop(),
-                    Err(error) => {
-                        tracing::warn!(%error, "snapshot request offer failed");
-                        break;
+            if let Some(publication) = request_publication.as_ref() {
+                let payload = request.encode();
+                let mut offered = false;
+                for _ in 0..1_000 {
+                    match publication.offer(&payload) {
+                        Ok(_) => {
+                            offered = true;
+                            break;
+                        }
+                        Err(error) if error.is_retryable() => std::hint::spin_loop(),
+                        Err(error) => {
+                            tracing::warn!(%error, "snapshot request offer failed");
+                            break;
+                        }
                     }
                 }
-            }
-            if !offered {
-                tracing::warn!("snapshot request backpressured; request dropped");
+                if !offered {
+                    // The first request can arrive before the publication has
+                    // connected. Keep it pending and retry after polling the
+                    // subscriptions instead of dropping the only snapshot
+                    // request a new subscriber makes.
+                    tracing::debug!("snapshot request waiting for publication");
+                    pending_request = Some(request);
+                }
             }
         }
 

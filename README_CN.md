@@ -191,6 +191,9 @@ cargo build
 `--no-fsync` 控制，并用 `status`/`stop` 管理保留运行的集群。手动启动、端口、成员变更、辅助脚本和
 恢复演练见[运行手册](./docs/zh-CN/RUNBOOK.md)。
 
+基于 OrbStack Free（个人非商业用途）的四容器 Linux 实验环境见
+[OrbStack Linux lab](./docs/ORBSTACK_LAB.md)。
+
 ## 运维控制台
 
 每个节点在 `/console/` 提供内置运维控制台，展示集群健康、Raft 领导与复制、持久化存储、事件窗口和
@@ -245,7 +248,8 @@ quote 保证金叠加层，会估算名义价值、初始保证金和费用，�
 - feed 路径已按 500k fills/s 压测（495k fills/s，8,192 帧 tap 队列零丢弃）。
 
 运行 `./scripts/market-data-system.sh`（两个引擎通过 Aeron IPC）并打开
-<http://127.0.0.1:24800/>。详见
+<http://127.0.0.1:24800/>。Linux 外部驱动与 multicast 验证运行
+`./scripts/aeron-linux-lab.sh`。详见
 [`demos/market_data_system/README.md`](./demos/market_data_system/README.md) 和
 [`docs/MARKET_DATA_WEBSOCKET.md`](./docs/MARKET_DATA_WEBSOCKET.md)。
 
