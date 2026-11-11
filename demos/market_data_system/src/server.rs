@@ -37,7 +37,13 @@ use crate::source::SnapshotRequester;
 const TEST_PAGE: &str = include_str!("../web/index.html");
 const TEST_JS: &str = include_str!("../web/app.js");
 const TEST_CSS: &str = include_str!("../web/app.css");
-const CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self'; \
+/// TradingView Lightweight Charts v5.3.0 (Apache-2.0), vendored so the page
+/// needs no CDN and keeps working on an isolated demo network. The banner at
+/// the top of the file carries the upstream copyright and licence notice.
+const LIGHTWEIGHT_CHARTS: &str = include_str!("../web/lightweight-charts.js");
+// Lightweight Charts injects one <style> element for its chart layout, so the
+// page has to allow inline styles. Scripts stay restricted to this origin.
+const CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; \
                    connect-src 'self' ws: wss:; img-src 'self' data:; base-uri 'none'; \
                    frame-ancestors 'none'";
 
@@ -116,6 +122,7 @@ pub async fn start_with_snapshot_requesters(
             spec.clone(),
             config.bar_intervals_ms.clone(),
             config.lifecycle,
+            config.extensions,
             config.snapshot_levels,
             config.heartbeat_timeout,
             shared.clone(),
@@ -150,6 +157,7 @@ pub async fn start_with_snapshot_requesters(
             .service(test_page)
             .service(test_js)
             .service(test_css)
+            .service(lightweight_charts)
             .service(info)
             .service(health)
             .service(ready)
@@ -199,18 +207,36 @@ async fn test_css() -> HttpResponse {
     asset("text/css; charset=utf-8", TEST_CSS)
 }
 
+#[get("/lightweight-charts.js")]
+async fn lightweight_charts() -> HttpResponse {
+    asset("application/javascript; charset=utf-8", LIGHTWEIGHT_CHARTS)
+}
+
 #[get("/info")]
 async fn info(state: Data<AppState>) -> HttpResponse {
+    let mut streams = vec![
+        "bookTicker",
+        "trade",
+        "depth@100ms",
+        "depth@1000ms",
+        "depth5@100ms",
+        "depth10@100ms",
+        "depth20@1000ms",
+        "kline_1s",
+        "kline_1m",
+    ];
+    if state.config.extensions {
+        streams.extend(["sweep", "status"]);
+    }
+    if state.config.lifecycle {
+        streams.push("lifecycle");
+    }
     HttpResponse::Ok().json(json!({
         "symbols": state.config.symbols,
         "bar_intervals_ms": state.config.bar_intervals_ms,
+        "extensions": state.config.extensions,
         "lifecycle": state.config.lifecycle,
-        "streams": [
-            "bookTicker", "trade", "sweep",
-            "depth@100ms", "depth@1000ms",
-            "depth5@100ms", "depth10@100ms", "depth20@1000ms",
-            "kline_1s", "kline_1m", "status", "lifecycle"
-        ],
+        "streams": streams,
     }))
 }
 

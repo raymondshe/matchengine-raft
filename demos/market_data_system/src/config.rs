@@ -51,6 +51,9 @@ pub struct Config {
     pub max_streams: usize,
     /// Per-connection sequenced FIFO capacity.
     pub queue: usize,
+    /// Whether the engine extension streams (`@sweep`, `@status`,
+    /// `@lifecycle`) are exposed alongside the Binance-compatible streams.
+    pub extensions: bool,
     /// Whether the `@lifecycle` stream is exposed.
     pub lifecycle: bool,
     /// Server ping interval.
@@ -77,7 +80,9 @@ impl Config {
             // Binance allows up to 1024 streams on one connection.
             max_streams: 1_024,
             queue: 1_024,
-            lifecycle: true,
+            // Public defaults: only Binance-compatible streams are exposed.
+            extensions: false,
+            lifecycle: false,
             ping_interval: Duration::from_secs(180),
             pong_timeout: Duration::from_secs(600),
             connection_lifetime: Duration::from_secs(24 * 60 * 60),
@@ -111,6 +116,9 @@ impl Config {
         self.heartbeat_timeout = Duration::from_secs(5);
         self.snapshot_levels = 50;
         self.broadcast_capacity = 64;
+        // The test suite exercises the full catalogue, including extensions.
+        self.extensions = true;
+        self.lifecycle = true;
         self
     }
 

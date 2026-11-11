@@ -1578,16 +1578,24 @@ impl MarketDataProcessor {
                     } else {
                         OrderSide::Sell
                     };
-                    if let Some(level) = book.level(side, *price) {
-                        updates.push(LevelUpdate {
-                            side,
-                            level: DepthLevel {
-                                price: level.price,
-                                volume: level.volume,
-                                orders: level.orders,
-                            },
-                        });
-                    }
+                    // A level disappears from the shadow book when its last
+                    // order is filled or cancelled. Consumers apply absolute
+                    // levels, so publish the removal explicitly instead of
+                    // dropping the update: otherwise their books keep the
+                    // stale level forever.
+                    let level = book.level(side, *price).unwrap_or(LevelState {
+                        price: *price,
+                        volume: Fixed::ZERO,
+                        orders: 0,
+                    });
+                    updates.push(LevelUpdate {
+                        side,
+                        level: DepthLevel {
+                            price: level.price,
+                            volume: level.volume,
+                            orders: level.orders,
+                        },
+                    });
                 }
             }
             if !updates.is_empty() {

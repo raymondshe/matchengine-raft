@@ -5,10 +5,10 @@ const STREAMS = [
   "depth5@100ms", "depth10@100ms", "depth20@1000ms",
   "kline_1s", "kline_1m", "status", "lifecycle",
 ];
-const DEFAULT_STREAMS = ["bookTicker", "depth@100ms", "trade", "kline_1s"];
+const DEFAULT_STREAMS = ["bookTicker", "depth@100ms", "trade", "kline_1s", "status"];
 const MAX_FRAMES = 120;
 const MAX_TRADES = 40;
-const DEPTH_ROWS = 12;
+const DEPTH_ROWS = 10;
 
 const $ = (id) => document.getElementById(id);
 
@@ -22,7 +22,28 @@ const state = {
   selected: new Set(DEFAULT_STREAMS),
   frames: [],
   trades: [],
-  book: { bids: new Map(), asks: new Map(), lastUpdateId: null, stale: false },
+  book: {
+    bids: new Map(),
+    asks: new Map(),
+    lastUpdateId: null,
+    stale: false,
+    stream: null,
+    streamKind: null,
+  },
+  // Last non-empty top of book. A frame that reports an empty side leaves the
+  // previous value in place, and spread/mid are computed from the retained
+  // bid and ask.
+  bbo: { bid: null, bidSize: null, ask: null, askSize: null },
+  // One candlestick chart follows one kline stream; a second interval stream
+  // is ignored until the user toggles the kline subscriptions.
+  kline: {
+    chart: null,
+    candles: null,
+    volume: null,
+    stream: null,
+    interval: null,
+    lastTime: null,
+  },
   frameCount: 0,
   metricsTimer: null,
 };
@@ -68,6 +89,12 @@ function renderStreams() {
 
 function toggleStream(stream, checked) {
   if (checked) state.selected.add(stream); else state.selected.delete(stream);
+  // Each depth stream has its own update-id sequence; switch the book to a
+  // fresh source so frames from the previous stream cannot clobber it.
+  if (stream.startsWith("depth")) resetBookSource();
+  // The chart shows one interval at a time; toggling kline streams resets it
+  // so the newly selected stream can claim the series.
+  if (stream.startsWith("kline")) resetKlineChart();
   if (!state.ws || !state.connected || state.subscribedSymbol !== state.symbol) return;
   const method = checked ? "SUBSCRIBE" : "UNSUBSCRIBE";
   sendControl(method, [streamName(stream)]);
@@ -112,17 +139,36 @@ function updateSymbolChip() {
   $("symbol-chip").textContent = spec
     ? `Symbol ${displaySymbol()} · id ${spec.symbol_id}`
     : "Symbol —";
+  $("market-pair").textContent = displaySymbol();
+  $("market-pair-sub").textContent = spec
+    ? `${spec.base_asset} / ${spec.quote_asset} · id ${spec.symbol_id}`
+    : "—";
+  $("book-price-label").textContent = spec ? `Price (${spec.quote_asset})` : "Price";
+  $("book-size-label").textContent = spec ? `Size (${spec.base_asset})` : "Size";
 }
 
 async function loadInfo() {
   try {
     const info = await (await fetch("/info")).json();
     state.symbols = Array.isArray(info.symbols) ? info.symbols : [];
-    if (info.lifecycle === false) {
-      const index = STREAMS.indexOf("lifecycle");
-      if (index >= 0) STREAMS.splice(index, 1);
-      state.selected.delete("lifecycle");
+    // Honor the server's advertised catalogue: a public deployment exposes
+    // only the Binance-compatible streams, while the demo enables extensions.
+    const hasCatalogue = Array.isArray(info.streams) && info.streams.length > 0;
+    let advertiseStatus = true;
+    if (hasCatalogue) {
+      const advertised = new Set(info.streams);
+      advertiseStatus = advertised.has("status");
+      for (let index = STREAMS.length - 1; index >= 0; index -= 1) {
+        const stream = STREAMS[index];
+        if (!advertised.has(stream)) {
+          STREAMS.splice(index, 1);
+          state.selected.delete(stream);
+        }
+      }
+      if (advertiseStatus) state.selected.add("status");
     }
+    $("status-panel").hidden = !advertiseStatus;
+    document.querySelector(".diag-grid").classList.toggle("single", !advertiseStatus);
     if (state.symbols.length && !state.symbol) state.symbol = state.symbols[0].symbol;
     renderSymbolOptions();
     updateSymbolChip();
@@ -141,7 +187,8 @@ async function loadInfo() {
 }
 
 function resetSymbolView() {
-  state.book = { bids: new Map(), asks: new Map(), lastUpdateId: null, stale: false };
+  resetBookSource();
+  resetBbo();
   state.trades = [];
   state.frames = [];
   state.frameCount = 0;
@@ -149,13 +196,48 @@ function resetSymbolView() {
   $("frame-kind").textContent = "—";
   renderFrames();
   trimTrades();
+  resetKlineChart();
+  $("status").textContent = "waiting for status frames…";
+}
+
+function resetBookSource() {
+  state.book = {
+    bids: new Map(),
+    asks: new Map(),
+    lastUpdateId: null,
+    stale: false,
+    stream: null,
+    streamKind: null,
+  };
   renderBook();
   $("book-source").textContent = "no data";
   $("book-source").className = "badge neutral";
   setBookNote(`Waiting for ${displaySymbol()} depth.`, false);
-  $("kline-interval").textContent = "—";
-  $("kline").textContent = "—";
-  $("status").textContent = "—";
+}
+
+// One visual book follows exactly one depth stream. Mixing streams resets
+// `lastUpdateId` from another stream's sequence, which drops or gaps the
+// stream that was actually feeding the book.
+function claimBook(kind, raw) {
+  const partial = kind === "partialDepth";
+  // Single-stream connections have no wrapper key; a diff snapshot and its
+  // updates still belong to the same stream.
+  const key = raw && raw.stream ? raw.stream : (partial ? "partial" : "diff");
+  if (state.book.stream === key) return true;
+  if (state.book.stream === null) {
+    state.book.stream = key;
+    state.book.streamKind = partial ? "partial" : "diff";
+    return true;
+  }
+  // A diff stream is authoritative: its subscribe-time snapshot replaces the
+  // partial book, so depth@100ms keeps the book live when a partial stream is
+  // also selected.
+  if (!partial && kind === "depthSnapshot" && state.book.streamKind === "partial") {
+    state.book.stream = key;
+    state.book.streamKind = "diff";
+    return true;
+  }
+  return false;
 }
 
 function setBookNote(text, warn) {
@@ -263,12 +345,18 @@ function handleFrame(text) {
 
   switch (kind) {
     case "bookTicker": renderBookTicker(data); break;
-    case "depthSnapshot": applySnapshot(data, "snapshot"); break;
-    case "partialDepth": applySnapshot(data, "partial"); break;
-    case "depthUpdate": applyUpdate(data); break;
+    case "depthSnapshot":
+      if (claimBook(kind, raw)) applySnapshot(data, "snapshot");
+      break;
+    case "partialDepth":
+      if (claimBook(kind, raw)) applySnapshot(data, "partial");
+      break;
+    case "depthUpdate":
+      if (claimBook(kind, raw)) applyUpdate(data);
+      break;
     case "trade": addTrade(data); break;
     case "sweep": addSweep(data); break;
-    case "kline": renderKline(data); break;
+    case "kline": renderKline(data, raw); break;
     case "status": $("status").textContent = JSON.stringify(data, null, 2); break;
     case "resync":
       state.book.stale = true;
@@ -297,15 +385,49 @@ function kindOf(data) {
 }
 
 function renderBookTicker(data) {
-  const bid = Number(data.b), ask = Number(data.a);
-  const hasBid = Number.isFinite(bid) && bid > 0;
-  const hasAsk = Number.isFinite(ask) && ask > 0;
-  $("best-bid").textContent = hasBid ? data.b : "—";
-  $("best-bid-size").textContent = hasBid && data.B ? `size ${data.B}` : "—";
-  $("best-ask").textContent = hasAsk ? data.a : "—";
-  $("best-ask-size").textContent = hasAsk && data.A ? `size ${data.A}` : "—";
-  $("spread").textContent = hasBid && hasAsk ? (ask - bid).toFixed(6) : "—";
-  $("mid").textContent = hasBid && hasAsk ? `mid ${((ask + bid) / 2).toFixed(6)}` : "—";
+  updateBbo(data.b, data.B, data.a, data.A);
+}
+
+function resetBbo() {
+  state.bbo = { bid: null, bidSize: null, ask: null, askSize: null };
+  renderBbo();
+}
+
+// Keep the last complete top of book. A frame that reports an empty side is
+// not a new two-sided quote: replacing one side with it would pair a fresh
+// price with a stale one and can show a crossed spread.
+function updateBbo(bid, bidSize, ask, askSize) {
+  if (!(Number(bid) > 0) || !(Number(ask) > 0)) return;
+  const bbo = state.bbo;
+  bbo.bid = bid;
+  bbo.ask = ask;
+  if (bidSize !== undefined && bidSize !== null && bidSize !== "") bbo.bidSize = bidSize;
+  if (askSize !== undefined && askSize !== null && askSize !== "") bbo.askSize = askSize;
+  renderBbo();
+}
+
+function renderBbo() {
+  const { bid, bidSize, ask, askSize } = state.bbo;
+  const hasBid = bid !== null;
+  const hasAsk = ask !== null;
+  const spread = hasBid && hasAsk ? Number(ask) - Number(bid) : null;
+  const mid = hasBid && hasAsk ? (Number(ask) + Number(bid)) / 2 : null;
+  $("best-bid").textContent = hasBid ? bid : "—";
+  $("best-bid-size").textContent = hasBid && bidSize !== null ? `size ${bidSize}` : "—";
+  $("best-ask").textContent = hasAsk ? ask : "—";
+  $("best-ask-size").textContent = hasAsk && askSize !== null ? `size ${askSize}` : "—";
+  $("spread").textContent = spread === null ? "—" : trimNumber(spread);
+  $("spread-bps").textContent = spread === null || !mid
+    ? "—"
+    : `${(spread / mid * 10000).toFixed(1)} bps`;
+  $("mid").textContent = mid === null ? "—" : trimNumber(mid);
+  $("book-spread").textContent = spread === null ? "—" : trimNumber(spread);
+}
+
+// Keep trailing zeros off derived values so 98.5 does not read as 98.500000.
+function trimNumber(value) {
+  if (!Number.isFinite(value)) return "—";
+  return value.toFixed(6).replace(/(\.\d*?)0+$/, "$1").replace(/\.$/, "");
 }
 
 function applySnapshot(data, source) {
@@ -352,19 +474,17 @@ function applyLevels(levels, map) {
 function renderBook() {
   const bids = [...state.book.bids.entries()].sort((a, b) => Number(b[0]) - Number(a[0])).slice(0, DEPTH_ROWS);
   const asks = [...state.book.asks.entries()].sort((a, b) => Number(a[0]) - Number(b[0])).slice(0, DEPTH_ROWS);
+  // Ask rows run highest-to-lowest so the best ask sits just above the spread
+  // row, mirroring a trading-terminal ladder.
   renderLevels($("bids-body"), bids);
-  renderLevels($("asks-body"), asks);
+  renderLevels($("asks-body"), asks.slice().reverse());
   const bestBid = bids[0], bestAsk = asks[0];
-  $("best-bid").textContent = bestBid ? bestBid[0] : "—";
-  $("best-bid-size").textContent = bestBid ? `size ${bestBid[1]}` : "—";
-  $("best-ask").textContent = bestAsk ? bestAsk[0] : "—";
-  $("best-ask-size").textContent = bestAsk ? `size ${bestAsk[1]}` : "—";
-  $("spread").textContent = bestBid && bestAsk
-    ? (Number(bestAsk[0]) - Number(bestBid[0])).toFixed(6)
-    : "—";
-  $("mid").textContent = bestBid && bestAsk
-    ? `mid ${((Number(bestAsk[0]) + Number(bestBid[0])) / 2).toFixed(6)}`
-    : "—";
+  updateBbo(
+    bestBid ? bestBid[0] : null,
+    bestBid ? bestBid[1] : null,
+    bestAsk ? bestAsk[0] : null,
+    bestAsk ? bestAsk[1] : null,
+  );
 }
 
 function renderLevels(body, levels) {
@@ -376,35 +496,54 @@ function renderLevels(body, levels) {
     row.appendChild(cell); body.appendChild(row);
     return;
   }
+  // Scale the subtle depth bar against the largest visible level on this side.
+  const max = levels.reduce((value, level) => Math.max(value, Number(level[1]) || 0), 0);
   for (const [price, size] of levels) {
     const row = document.createElement("tr");
+    const share = max > 0 ? Math.min(100, (Number(size) / max) * 100) : 0;
+    row.style.setProperty("--depth", `${share.toFixed(1)}%`);
     for (const value of [price, size]) {
       const cell = document.createElement("td");
-      cell.className = "num"; cell.textContent = value;
+      cell.className = "num";
+      cell.textContent = value;
       row.appendChild(cell);
     }
     body.appendChild(row);
   }
 }
 
+// The tape column is tight; a 24-hour HH:MM:SS clock keeps every row on one
+// line while the full timestamp stays available as a hover title.
+function clockStamp(ms) {
+  const date = new Date(ms);
+  return {
+    time: date.toLocaleTimeString([], {
+      hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false,
+    }),
+    title: date.toLocaleString(),
+  };
+}
+
 function addTrade(data) {
+  const stamp = clockStamp(data.T || data.E || Date.now());
   state.trades.unshift({
-    at: new Date(data.T || data.E || Date.now()).toLocaleTimeString(),
+    at: stamp.time,
+    atTitle: stamp.title,
     side: data.m ? "SELL" : "BUY",
     price: data.p,
     qty: data.q,
-    fee: data.tf ? `${data.tf} ${data.tfa || ""}` : "—",
   });
   trimTrades();
 }
 
 function addSweep(data) {
+  const stamp = clockStamp(data.T || data.E || Date.now());
   state.trades.unshift({
-    at: new Date(data.T || data.E || Date.now()).toLocaleTimeString(),
+    at: stamp.time,
+    atTitle: stamp.title,
     side: data.m ? "SELL" : "BUY",
     price: `${data.volume} @ ${data.fills?.[0]?.p || "—"}`,
     qty: data.quoteVolume,
-    fee: "sweep",
   });
   trimTrades();
 }
@@ -417,20 +556,21 @@ function trimTrades() {
   if (!state.trades.length) {
     const row = document.createElement("tr");
     const cell = document.createElement("td");
-    cell.colSpan = 5; cell.className = "note"; cell.textContent = "no trades yet";
+    cell.colSpan = 4; cell.className = "note"; cell.textContent = "no trades yet";
     row.appendChild(cell); body.appendChild(row);
     return;
   }
   for (const trade of state.trades) {
     const row = document.createElement("tr");
+    const time = cellText(trade.at);
+    if (trade.atTitle) time.title = trade.atTitle;
     const side = document.createElement("td");
     side.textContent = trade.side;
     side.className = trade.side === "BUY" ? "buy" : "sell";
-    row.appendChild(cellText(trade.at));
+    row.appendChild(time);
     row.appendChild(side);
     row.appendChild(cellText(trade.price, "num"));
     row.appendChild(cellText(trade.qty, "num"));
-    row.appendChild(cellText(trade.fee, "num"));
     body.appendChild(row);
   }
 }
@@ -442,24 +582,138 @@ function cellText(value, className) {
   return cell;
 }
 
-function renderKline(data) {
-  const k = data.k || {};
-  $("kline-interval").textContent = k.i || "—";
-  const container = $("kline");
-  container.replaceChildren();
-  const fields = [
-    ["Open", k.o], ["High", k.h], ["Low", k.l], ["Close", k.c],
-    ["Volume", k.v], ["Quote", k.q], ["Trades", k.n], ["Closed", k.x ? "yes" : "no"],
-  ];
-  for (const [label, value] of fields) {
-    const box = document.createElement("div");
-    const name = document.createElement("span");
-    name.textContent = label;
-    const strong = document.createElement("strong");
-    strong.textContent = value === undefined || value === null ? "—" : String(value);
-    box.append(name, strong);
-    container.appendChild(box);
+function show(value) {
+  return value === undefined || value === null ? "—" : String(value);
+}
+
+// Lightweight Charts treats timestamps as UTC; the rest of the page uses the
+// browser's local clock, so format both tick marks and the crosshair label in
+// local time to keep the chart aligned with the trade tape.
+function localTime(seconds, withSeconds = true) {
+  if (typeof seconds !== "number") return "";
+  return new Date(seconds * 1000).toLocaleTimeString([], {
+    hour: "2-digit",
+    minute: "2-digit",
+    ...(withSeconds ? { second: "2-digit" } : {}),
+    hour12: false,
+  });
+}
+
+function ensureKlineChart() {
+  if (state.kline.chart) return true;
+  const lib = window.LightweightCharts;
+  const container = $("kline-chart");
+  if (!lib || !container) {
+    $("kline-stats").textContent = "Chart library unavailable; kline frames are still shown under Frames.";
+    return false;
   }
+  const chart = lib.createChart(container, {
+    autoSize: true,
+    layout: {
+      background: { type: lib.ColorType.Solid, color: "transparent" },
+      textColor: "#9fb2ce",
+      // Apache-2.0 attribution; the upstream banner is kept in the vendored file.
+      attributionLogo: true,
+    },
+    grid: {
+      vertLines: { color: "rgba(36, 51, 79, 0.55)" },
+      horzLines: { color: "rgba(36, 51, 79, 0.55)" },
+    },
+    localization: {
+      timeFormatter: (time) => localTime(time),
+    },
+    rightPriceScale: { borderColor: "#24334f" },
+    timeScale: {
+      borderColor: "#24334f",
+      timeVisible: true,
+      secondsVisible: true,
+      rightOffset: 2,
+      tickMarkFormatter: (time) => localTime(time, state.kline.interval !== "1m"),
+    },
+  });
+  const candles = chart.addSeries(lib.CandlestickSeries, {
+    upColor: "#4ade80",
+    downColor: "#f87171",
+    borderUpColor: "#4ade80",
+    borderDownColor: "#f87171",
+    wickUpColor: "#4ade80",
+    wickDownColor: "#f87171",
+  });
+  const volume = chart.addSeries(lib.HistogramSeries, {
+    priceFormat: { type: "volume" },
+    priceScaleId: "",
+    priceLineVisible: false,
+    lastValueVisible: false,
+  });
+  // Keep volume in the lower fifth of the pane without a second price scale.
+  volume.priceScale().applyOptions({ scaleMargins: { top: 0.78, bottom: 0 } });
+  state.kline.chart = chart;
+  state.kline.candles = candles;
+  state.kline.volume = volume;
+  return true;
+}
+
+// One chart follows one kline stream, like the depth book. If both
+// kline_1s and kline_1m are selected, the first to produce a frame owns the
+// chart; toggling a kline stream clears the claim so the other can take over.
+function claimKline(raw) {
+  const key = raw && raw.stream ? raw.stream : "kline";
+  if (state.kline.stream === key) return true;
+  if (state.kline.stream === null) {
+    state.kline.stream = key;
+    return true;
+  }
+  return false;
+}
+
+function resetKlineChart() {
+  state.kline.stream = null;
+  state.kline.interval = null;
+  state.kline.lastTime = null;
+  if (state.kline.candles) state.kline.candles.setData([]);
+  if (state.kline.volume) state.kline.volume.setData([]);
+  $("kline-interval").textContent = "—";
+  $("kline-stats").textContent = "Subscribe to kline_1s or kline_1m.";
+}
+
+function renderKline(data, raw) {
+  const k = data.k || {};
+  if (!claimKline(raw) || !ensureKlineChart()) return;
+  const interval = k.i || "—";
+  if (state.kline.interval !== interval) {
+    // A different interval means different bar times; keeping the old series
+    // would make Lightweight Charts reject the update as out of order.
+    state.kline.interval = interval;
+    state.kline.lastTime = null;
+    state.kline.candles.setData([]);
+    state.kline.volume.setData([]);
+  }
+  $("kline-interval").textContent = interval;
+
+  const time = Math.floor(Number(k.t) / 1000);
+  const open = Number(k.o);
+  const high = Number(k.h);
+  const low = Number(k.l);
+  const close = Number(k.c);
+  if ([time, open, high, low, close].every(Number.isFinite)) {
+    state.kline.candles.update({ time, open, high, low, close });
+    const volume = Number(k.v);
+    if (Number.isFinite(volume)) {
+      state.kline.volume.update({
+        time,
+        value: volume,
+        color: close >= open ? "rgba(74, 222, 128, 0.45)" : "rgba(248, 113, 113, 0.45)",
+      });
+    }
+    if (state.kline.lastTime !== time) {
+      state.kline.lastTime = time;
+      state.kline.chart.timeScale().scrollToRealTime();
+    }
+  }
+  $("kline-stats").textContent = [
+    `O ${show(k.o)}`, `H ${show(k.h)}`, `L ${show(k.l)}`, `C ${show(k.c)}`,
+    `V ${show(k.v)}`, `${show(k.n)} trades`, k.x ? "closed" : "open",
+  ].join(" · ");
 }
 
 function renderFrames() {

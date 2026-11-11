@@ -264,7 +264,8 @@ async fn serves_snapshots_streams_and_conflated_depth() {
         "unexpected depth levels: {update}"
     );
 
-    // Trades carry the engine's fees and the maker flag.
+    // Trades use the public Binance spot trade shape: no fees or execution
+    // details, just the fill and the buyer-maker flag.
     tx.send(Ok(trade(3))).await.unwrap();
     let fill = loop {
         let frame = next_json(&mut ws).await;
@@ -273,9 +274,14 @@ async fn serves_snapshots_streams_and_conflated_depth() {
         }
     };
     assert_eq!("1.085", fill["p"]);
-    assert_eq!("0.00868", fill["tf"]);
-    assert_eq!("USD", fill["tfa"]);
+    assert_eq!("4", fill["q"]);
     assert_eq!(false, fill["m"]);
+    assert!(fill["t"].as_u64().unwrap() > 0, "missing trade id: {fill}");
+    assert!(fill["tf"].is_null(), "fee must not be public: {fill}");
+    assert!(
+        fill["S"].is_null(),
+        "internal symbol id must not be public: {fill}"
+    );
 
     running.shutdown().await;
 }
@@ -354,10 +360,25 @@ async fn serves_the_test_page_and_info() {
         page.contains("WebSocket test page"),
         "unexpected page: {page}"
     );
+    assert!(
+        page.contains("/lightweight-charts.js") && page.contains("kline-chart"),
+        "page is missing the kline chart: {page}"
+    );
 
     let (status, js) = http_get(&running.addr, "/app.js").await;
     assert_eq!(200, status);
     assert!(js.contains("new WebSocket"));
+    assert!(
+        js.contains("CandlestickSeries"),
+        "kline chart wiring missing"
+    );
+
+    let (status, chart) = http_get(&running.addr, "/lightweight-charts.js").await;
+    assert_eq!(200, status);
+    assert!(
+        chart.contains("TradingView Lightweight Charts"),
+        "unexpected chart bundle"
+    );
 
     let (status, css) = http_get(&running.addr, "/app.css").await;
     assert_eq!(200, status);
@@ -367,6 +388,14 @@ async fn serves_the_test_page_and_info() {
     assert_eq!(200, status);
     let info: Value = serde_json::from_str(&info).expect("info json");
     assert_eq!("eurusd", info["symbols"][0]["symbol"]);
+    assert_eq!(true, info["extensions"]);
+    let streams = info["streams"].as_array().expect("stream list");
+    for expected in ["trade", "bookTicker", "depth@100ms", "kline_1s", "sweep"] {
+        assert!(
+            streams.iter().any(|stream| stream == expected),
+            "missing {expected} in {streams:?}"
+        );
+    }
     assert_eq!(0, info["symbols"][0]["symbol_id"]);
     assert_eq!("EUR", info["symbols"][0]["base_asset"]);
     assert_eq!("USD", info["symbols"][0]["quote_asset"]);
@@ -377,6 +406,31 @@ async fn serves_the_test_page_and_info() {
             .iter()
             .any(|s| s == "kline_1s")
     );
+
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn public_info_hides_extension_streams() {
+    let mut config = Config::for_test("127.0.0.1:0");
+    config.extensions = false;
+    config.lifecycle = false;
+    let (_tx, source) = channel_source(8);
+    let running = start_single(config, source).await;
+
+    let (status, info) = http_get(&running.addr, "/info").await;
+    assert_eq!(200, status);
+    let info: Value = serde_json::from_str(&info).expect("info json");
+    assert_eq!(false, info["extensions"]);
+    let streams = info["streams"].as_array().expect("stream list");
+    assert!(streams.iter().any(|stream| stream == "trade"));
+    assert!(streams.iter().any(|stream| stream == "bookTicker"));
+    for hidden in ["sweep", "status", "lifecycle"] {
+        assert!(
+            !streams.iter().any(|stream| stream == hidden),
+            "public catalogue must not expose {hidden}: {streams:?}"
+        );
+    }
 
     running.shutdown().await;
 }
@@ -415,7 +469,7 @@ async fn one_connection_switches_between_two_symbols() {
 
     eur_tx.send(Ok(bbo(2))).await.unwrap();
     let eur = wait_symbol_frame(&mut ws, "eurusd").await;
-    assert_eq!(0, eur["S"]);
+    assert_eq!("eurusd", eur["s"]);
 
     // Switch symbols on the same socket: unsubscribe the old topics, subscribe
     // the new ones. No reconnect.
@@ -436,7 +490,7 @@ async fn one_connection_switches_between_two_symbols() {
     btc.symbol_id = 1;
     btc_tx.send(Ok(btc)).await.unwrap();
     let frame = wait_symbol_frame(&mut ws, "btcusdt").await;
-    assert_eq!(1, frame["S"]);
+    assert_eq!("btcusdt", frame["s"]);
 
     // Binance-style LIST_SUBSCRIPTIONS reflects the switch on the same socket.
     ws.send(Message::text(r#"{"method":"LIST_SUBSCRIPTIONS","id":4}"#))
@@ -497,8 +551,10 @@ async fn one_connection_holds_two_symbols_at_once() {
             seen.insert(symbol.to_string(), frame);
         }
     }
-    assert_eq!(0, seen["eurusd"]["S"]);
-    assert_eq!(1, seen["btcusdt"]["S"]);
+    assert_eq!("eurusd", seen["eurusd"]["s"]);
+    assert_eq!(3, seen["eurusd"]["u"]);
+    assert_eq!("btcusdt", seen["btcusdt"]["s"]);
+    assert_eq!(4, seen["btcusdt"]["u"]);
 
     ws.send(Message::text(r#"{"method":"LIST_SUBSCRIPTIONS","id":2}"#))
         .await

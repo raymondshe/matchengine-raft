@@ -15,10 +15,23 @@ for several symbols at once (up to 1024 streams per connection).
   <img src="../../docs/market-data-system.png" alt="Market-data WebSocket test page" width="900">
 </p>
 
-The page shows the shared hub in action: one WebSocket connection, per-symbol
-readiness, a live book/trade tape and the raw frames. Switching the dropdown
-unsubscribes the old symbol's topics and subscribes the new ones without
-reconnecting.
+The page is arranged like a trading terminal: a market summary strip with the
+sticky best bid/ask, spread and mid, then the order-book ladder, the candlestick
+chart and the recent-trades tape side by side, with diagnostics and raw frames
+below. It shows the shared hub in action: one WebSocket connection, per-symbol
+readiness and the raw frames. Switching the dropdown unsubscribes the old
+symbol's topics and subscribes the new ones without reconnecting. The chart
+follows one `kline_<interval>` stream at a time (toggle a kline stream to switch
+intervals); the vendor copy of TradingView Lightweight Charts v5.3.0 lives in
+`web/lightweight-charts.js` (Apache-2.0, with `lightweight-charts.LICENSE` and
+`lightweight-charts.NOTICE`) and keeps its upstream banner, so the page needs
+no CDN. The tape deliberately does not show fees: the public WebSocket follows
+Binance's public trade stream, which has no fee field (commission only appears
+on private user-data streams). Fees remain available to internal consumers in
+the engine's replicated match events and the engine's own wire feed. The demo
+launcher serves the public Binance-compatible catalogue; pass `--extensions`
+to add the engine's `@sweep`, `@status` and `@lifecycle` streams for internal
+diagnostics.
 
 The production transport is **Aeron**: each engine publishes one stream per
 product on a multicast/unicast channel (or IPC on one host), and each service
@@ -292,17 +305,25 @@ coalesce older updates. The full table and caveats are in
 
 ## Streams
 
+The default catalogue is the Binance spot set. `--extensions` adds the
+engine-only streams; a public deployment should leave it off unless its clients
+know about them. Binance-compatible streams carry no fees, match errors, log
+indices or order sequences. Trade `t` is a deterministic id derived from the
+fill's `(log index, ordinal)`, so it stays unique and stable across replicas and
+restarts.
+
 | Stream | Payload |
 |---|---|
-| `<symbol>@trade` | one fill: `p`, `q`, `qv`, `T`, `m`, fees (`tf`/`tfa`/`mf`/`mfa`), `L`/`t` |
-| `<symbol>@sweep` | one taker with all fills |
-| `<symbol>@bookTicker` | `b`/`B`/`a`/`A`, `u`, `mid`, `spread`, `last` |
+| `<symbol>@trade` | Binance spot trade: `e`, `E`, `s`, `t`, `p`, `q`, `T`, `m` (no fees; fees stay internal) |
+| `<symbol>@bookTicker` | Binance spot book ticker: `u`, `s`, `b`, `B`, `a`, `A` |
 | `<symbol>@depth@100ms` / `@1000ms` | conflated `U`..`u` diff depth, absolute levels |
-| `<symbol>@depth5/10/20@100ms` / `@1000ms` | partial book depth (`s`/`S` added so raw multi-symbol connections can attribute it) |
-| `<symbol>@kline_<interval>` | OHLCV; `x` marks a closed bar, `q` quote volume |
-| `<symbol>@status` | engine watermark, epoch, leader |
-| `<symbol>@lifecycle` | order lifecycle records (extension; `--no-lifecycle` hides it) |
-| `resync` notice | sent on a gap/reset before a fresh snapshot |
+| `<symbol>@depth5/10/20@100ms` / `@1000ms` | partial book depth (`lastUpdateId`, `bids`, `asks`, plus `s` for raw multi-symbol connections) |
+| `<symbol>@kline_<interval>` | Binance kline: `e`, `E`, `s`, `k.{t,T,s,i,o,c,h,l,v,n,x,q}` |
+| `<symbol>@sweep` | one taker with all fills (engine extension) |
+| `<symbol>@status` | engine watermark, epoch, leader (engine extension) |
+| `<symbol>@lifecycle` | visible order lifecycle, no fees/errors (engine extension; `--no-lifecycle` hides it) |
+| `resync` notice | sent on a gap/reset before a fresh snapshot (engine extension) |
+| `depthSnapshot` | subscribe-time full book (engine extension; Binance clients would fetch REST depth) |
 
 Subscribe with Binance control messages:
 
@@ -315,8 +336,10 @@ Subscribe with Binance control messages:
 The subscription set belongs to the connection, not to a server-side "current
 symbol". Switching symbols means unsubscribing the old symbol's topics and
 subscribing the new ones; the socket stays open. Every data payload carries
-`s` (lowercase symbol) and `S` (symbol id), so a client can also hold streams
-for several symbols at once and route each frame by `s`.
+`s` (lowercase symbol), so a client can also hold streams for several symbols at
+once and route each frame by `s`. Fees, match errors, log indices and order
+sequences never appear on the public WebSocket; they are execution details and
+remain internal to the engine.
 
 Raw URLs (`/ws/<stream>`), combined streams (`/stream?streams=a/b`, wrapped in
 `{"stream":...,"data":...}`), subscribe-time snapshots for `bookTicker`,
@@ -354,7 +377,8 @@ even when entries in between did not touch the book.
 | `--connection-lifetime-secs` | `86400` | forced reconnect |
 | `--heartbeat-timeout-secs` | `30` | mark a symbol not ready when no frame/heartbeat arrives within this window |
 | `--snapshot-levels` | `200` | subscribe-time depth levels |
-| `--no-lifecycle` | off | hide the extension stream |
+| `--extensions` | off | expose the engine extension streams (`@sweep`, `@status`, `@lifecycle`); off keeps the public catalogue Binance-only |
+| `--no-lifecycle` | off | hide the extension `@lifecycle` stream even with `--extensions` |
 
 Engine-side Aeron flags (feature `market-data-aeron`):
 

@@ -8,7 +8,6 @@ use matchengine_raft::market_data::BboRecord;
 use matchengine_raft::market_data::LifecycleRecord;
 use matchengine_raft::market_data::StatusRecord;
 use matchengine_raft::market_data::TradeRecord;
-use matchengine_raft::order_book::FeeAsset;
 use matchengine_raft::order_book::Fixed;
 use matchengine_raft::order_book::OrderSide;
 
@@ -106,9 +105,9 @@ pub fn parse_stream(config: &Config, name: &str) -> Result<StreamSpec, ProtocolE
         .ok_or_else(ProtocolError::unknown_stream)?;
     let kind = match rest {
         "trade" => StreamKind::Trade,
-        "sweep" => StreamKind::Sweep,
+        "sweep" if config.extensions => StreamKind::Sweep,
         "bookTicker" => StreamKind::BookTicker,
-        "status" => StreamKind::Status,
+        "status" if config.extensions => StreamKind::Status,
         "lifecycle" if config.lifecycle => StreamKind::Lifecycle,
         rest if rest.starts_with("kline_") => {
             let interval_ms = parse_kline_interval(&rest["kline_".len()..])
@@ -223,23 +222,6 @@ pub fn control_list(id: u64, streams: &[String]) -> Vec<u8> {
         .into_bytes()
 }
 
-fn fee_asset(symbol: &SymbolSpec, asset: Option<FeeAsset>) -> Option<&str> {
-    asset.map(|asset| match asset {
-        FeeAsset::Base => symbol.base_asset.as_str(),
-        FeeAsset::Quote => symbol.quote_asset.as_str(),
-    })
-}
-
-fn fee_fields_with_assets(symbol: &SymbolSpec, fill: &TradeRecord) -> serde_json::Value {
-    json!({
-        "tf": fill.taker_fee,
-        "tfa": fee_asset(symbol, fill.taker_fee_asset),
-        "mf": fill.maker_fee,
-        "mfa": fee_asset(symbol, fill.maker_fee_asset),
-        "err": fill.error.codes().map(|code| code.as_str()).collect::<Vec<_>>(),
-    })
-}
-
 fn side_is_maker(fill: &TradeRecord) -> bool {
     fill.taker_side == OrderSide::Sell
 }
@@ -254,32 +236,38 @@ fn fill_volume(fills: &[TradeRecord]) -> (Fixed, Fixed) {
     (volume, quote)
 }
 
-/// One fill on `<symbol>@trade`.
+/// Deterministic public trade id derived from the fill's event position.
+///
+/// Binance clients treat `t` as a unique trade id, so two fills in the same
+/// log entry must not share it. `log_index * 1e9 + ordinal` is stable across
+/// replicas and restarts and fits a JSON integer for realistic log positions.
+fn trade_id(fill: &TradeRecord) -> u64 {
+    fill.log_index
+        .saturating_mul(1_000_000_000)
+        .saturating_add(u64::from(fill.ordinal))
+}
+
+/// One fill on `<symbol>@trade`, with the public Binance spot trade fields.
+///
+/// Fees, match errors, log indices and order sequences stay internal: they are
+/// execution details, not part of a public market-data stream.
 pub fn trade_payload(symbol: &SymbolSpec, fill: &TradeRecord) -> Vec<u8> {
-    let mut value = json!({
+    json!({
         "e": "trade",
         "E": fill.ts_ms,
         "s": symbol.symbol,
-        "S": symbol.symbol_id,
-        "t": fill.ordinal,
-        "L": fill.log_index,
+        "t": trade_id(fill),
         "p": fill.price,
         "q": fill.volume,
-        "qv": fill.quote_volume,
         "T": fill.ts_ms,
         "m": side_is_maker(fill),
-        "ts": fill.taker_sequence,
-        "ms": fill.maker_sequence,
-    });
-    let fees = fee_fields_with_assets(symbol, fill);
-    value
-        .as_object_mut()
-        .unwrap()
-        .extend(fees.as_object().unwrap().clone());
-    value.to_string().into_bytes()
+        "M": true,
+    })
+    .to_string()
+    .into_bytes()
 }
 
-/// One taker's fills on `<symbol>@sweep`.
+/// One taker's fills on `<symbol>@sweep` (engine extension).
 pub fn sweep_payload(
     symbol: &SymbolSpec,
     message: &matchengine_raft::market_data::MarketMessage,
@@ -295,30 +283,19 @@ pub fn sweep_payload(
     let fills_json: Vec<serde_json::Value> = fills
         .iter()
         .map(|fill| {
-            let mut value = json!({
-                "t": fill.ordinal,
+            json!({
+                "t": trade_id(fill),
                 "p": fill.price,
                 "q": fill.volume,
-                "qv": fill.quote_volume,
-                "ms": fill.maker_sequence,
-            });
-            let fees = fee_fields_with_assets(symbol, fill);
-            value
-                .as_object_mut()
-                .unwrap()
-                .extend(fees.as_object().unwrap().clone());
-            value
+            })
         })
         .collect();
     json!({
         "e": "sweep",
         "E": message.ts_ms,
         "s": symbol.symbol,
-        "S": symbol.symbol_id,
         "u": message.market_seq + 1,
-        "L": message.log_index,
         "T": first.ts_ms,
-        "ts": first.taker_sequence,
         "m": side_is_maker(first),
         "fills": fills_json,
         "volume": volume,
@@ -328,25 +305,15 @@ pub fn sweep_payload(
     .into_bytes()
 }
 
-/// Top of book on `<symbol>@bookTicker`.
-pub fn book_ticker_payload(
-    symbol: &SymbolSpec,
-    bbo: &BboRecord,
-    update_id: u64,
-    ts_ms: u64,
-) -> Vec<u8> {
+/// Top of book on `<symbol>@bookTicker`, with the public Binance spot fields.
+pub fn book_ticker_payload(symbol: &SymbolSpec, bbo: &BboRecord, update_id: u64) -> Vec<u8> {
     json!({
         "u": update_id,
         "s": symbol.symbol,
-        "S": symbol.symbol_id,
-        "E": ts_ms,
         "b": bbo.bid,
         "B": bbo.bid_volume,
         "a": bbo.ask,
         "A": bbo.ask_volume,
-        "mid": bbo.mid,
-        "spread": bbo.spread,
-        "last": bbo.last_trade,
     })
     .to_string()
     .into_bytes()
@@ -365,7 +332,6 @@ pub fn depth_update_payload(
         "e": "depthUpdate",
         "E": ts_ms,
         "s": symbol.symbol,
-        "S": symbol.symbol_id,
         "U": first_update_id,
         "u": last_update_id,
         "b": bids.iter().map(|(price, volume)| [price.to_string(), volume.to_string()]).collect::<Vec<_>>(),
@@ -387,7 +353,6 @@ pub fn depth_snapshot_payload(
         "e": "depthSnapshot",
         "E": ts_ms,
         "s": symbol.symbol,
-        "S": symbol.symbol_id,
         "lastUpdateId": last_update_id,
         "bids": bids.iter().map(|(price, volume, orders)| json!([price.to_string(), volume.to_string(), orders])).collect::<Vec<_>>(),
         "asks": asks.iter().map(|(price, volume, orders)| json!([price.to_string(), volume.to_string(), orders])).collect::<Vec<_>>(),
@@ -398,9 +363,9 @@ pub fn depth_snapshot_payload(
 
 /// Partial book depth on `<symbol>@depth<levels>@<speed>`.
 ///
-/// Binance's partial-depth payload omits the symbol; we include `s`/`S` so a
-/// raw `/ws` connection that holds streams for several symbols can attribute
-/// each frame without the combined-stream envelope.
+/// Binance's partial-depth payload omits the symbol; we include `s` so a raw
+/// `/ws` connection that holds streams for several symbols can attribute each
+/// frame without the combined-stream envelope.
 pub fn depth_partial_payload(
     symbol: &SymbolSpec,
     last_update_id: u64,
@@ -409,7 +374,6 @@ pub fn depth_partial_payload(
 ) -> Vec<u8> {
     json!({
         "s": symbol.symbol,
-        "S": symbol.symbol_id,
         "lastUpdateId": last_update_id,
         "bids": bids.iter().map(|(price, volume, orders)| json!([price.to_string(), volume.to_string(), orders])).collect::<Vec<_>>(),
         "asks": asks.iter().map(|(price, volume, orders)| json!([price.to_string(), volume.to_string(), orders])).collect::<Vec<_>>(),
@@ -430,10 +394,10 @@ pub fn kline_payload(
         "e": "kline",
         "E": ts_ms,
         "s": symbol.symbol,
-        "S": symbol.symbol_id,
         "k": {
             "t": bar.window_start_ms,
             "T": bar.window_start_ms.saturating_add(bar.interval_ms).saturating_sub(1),
+            "s": symbol.symbol,
             "i": kline_label(bar.interval_ms),
             "o": bar.open,
             "c": bar.close,
@@ -463,7 +427,6 @@ pub fn status_payload(
         "e": "status",
         "E": ts_ms,
         "s": symbol.symbol,
-        "S": symbol.symbol_id,
         "lastUpdateId": last_update_id,
         "lastLogIndex": status.last_log_index,
         "lastOrdinal": status.last_ordinal,
@@ -477,14 +440,37 @@ pub fn status_payload(
     .into_bytes()
 }
 
-/// Order-lifecycle records on `<symbol>@lifecycle`.
+/// Order-lifecycle records on `<symbol>@lifecycle` (engine extension).
+///
+/// The public feed keeps the visible lifecycle (kind, side, price, volume and
+/// reason) but drops fee, match-error and log-position fields, which belong to
+/// private execution data rather than a public market-data stream.
 pub fn lifecycle_payload(symbol: &SymbolSpec, records: &[LifecycleRecord], ts_ms: u64) -> Vec<u8> {
+    let events: Vec<serde_json::Value> = records
+        .iter()
+        .map(|record| {
+            let mut value = serde_json::to_value(record).expect("lifecycle record serializes");
+            if let Some(object) = value.as_object_mut() {
+                for key in [
+                    "log_index",
+                    "ordinal",
+                    "taker_fee",
+                    "taker_fee_asset",
+                    "maker_fee",
+                    "maker_fee_asset",
+                    "error",
+                ] {
+                    object.remove(key);
+                }
+            }
+            value
+        })
+        .collect();
     json!({
         "e": "lifecycle",
         "E": ts_ms,
         "s": symbol.symbol,
-        "S": symbol.symbol_id,
-        "events": records,
+        "events": events,
     })
     .to_string()
     .into_bytes()
@@ -495,7 +481,6 @@ pub fn resync_payload(symbol: &SymbolSpec, reason: &str, dropped: u32) -> Vec<u8
     json!({
         "e": "resync",
         "s": symbol.symbol,
-        "S": symbol.symbol_id,
         "reason": reason,
         "dropped": dropped,
     })
@@ -565,6 +550,18 @@ mod tests {
     fn lifecycle_can_be_disabled() {
         let mut config = config();
         config.lifecycle = false;
+        assert!(parse_stream(&config, "eurusd@lifecycle").is_err());
+    }
+
+    #[test]
+    fn public_catalogue_excludes_extensions() {
+        let mut config = config();
+        config.extensions = false;
+        config.lifecycle = false;
+        assert!(parse_stream(&config, "eurusd@trade").is_ok());
+        assert!(parse_stream(&config, "eurusd@bookTicker").is_ok());
+        assert!(parse_stream(&config, "eurusd@sweep").is_err());
+        assert!(parse_stream(&config, "eurusd@status").is_err());
         assert!(parse_stream(&config, "eurusd@lifecycle").is_err());
     }
 

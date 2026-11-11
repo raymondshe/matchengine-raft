@@ -232,6 +232,9 @@ struct DepthWindow {
     last_seq: Option<u64>,
     ts_ms: u64,
     changed: bool,
+    /// Last `lastUpdateId` emitted for this speed; each depth stream has its
+    /// own contiguous update sequence.
+    last_update_id: Option<u64>,
 }
 
 impl DepthWindow {
@@ -272,6 +275,7 @@ pub struct Feed {
     symbol: SymbolSpec,
     bar_intervals_ms: Vec<u64>,
     lifecycle: bool,
+    extensions: bool,
     snapshot_levels: usize,
     heartbeat_timeout: Duration,
     snapshot_requester: Option<SnapshotRequester>,
@@ -282,7 +286,6 @@ pub struct Feed {
     seen: HashMap<u16, (u64, u16)>,
     fast: DepthWindow,
     slow: DepthWindow,
-    last_depth_u: Option<u64>,
 }
 
 impl Feed {
@@ -291,6 +294,7 @@ impl Feed {
         symbol: SymbolSpec,
         bar_intervals_ms: Vec<u64>,
         lifecycle: bool,
+        extensions: bool,
         snapshot_levels: usize,
         heartbeat_timeout: Duration,
         shared: Arc<Mutex<SharedState>>,
@@ -302,6 +306,7 @@ impl Feed {
             symbol,
             bar_intervals_ms,
             lifecycle,
+            extensions,
             snapshot_levels,
             heartbeat_timeout,
             snapshot_requester,
@@ -311,7 +316,6 @@ impl Feed {
             seen: HashMap::new(),
             fast: DepthWindow::default(),
             slow: DepthWindow::default(),
-            last_depth_u: None,
         }
     }
 
@@ -391,8 +395,7 @@ impl Feed {
                     state.bbo = Some(bbo.clone());
                     state.bbo_update_id = update_id;
                 }
-                let payload =
-                    protocol::book_ticker_payload(&self.symbol, bbo, update_id, message.ts_ms);
+                let payload = protocol::book_ticker_payload(&self.symbol, bbo, update_id);
                 self.publish("bookTicker", payload);
             }
             MessageBody::Trade(fills) => {
@@ -401,9 +404,11 @@ impl Feed {
                     let payload = protocol::trade_payload(&self.symbol, fill);
                     self.publish("trade", payload);
                 }
-                let payload = protocol::sweep_payload(&self.symbol, &message);
-                if !payload.is_empty() {
-                    self.publish("sweep", payload);
+                if self.extensions {
+                    let payload = protocol::sweep_payload(&self.symbol, &message);
+                    if !payload.is_empty() {
+                        self.publish("sweep", payload);
+                    }
                 }
             }
             MessageBody::Lifecycle(records) => {
@@ -429,20 +434,22 @@ impl Feed {
                     let mut state = self.shared.lock().expect("state lock");
                     state.status = Some(status.clone());
                 }
-                let (last_update_id, ready) = {
-                    let state = self.shared.lock().expect("state lock");
-                    (state.last_update_id, state.ready())
-                };
-                let payload = protocol::status_payload(
-                    &self.symbol,
-                    status,
-                    last_update_id,
-                    message.epoch,
-                    message.leader_id,
-                    ready,
-                    message.ts_ms,
-                );
-                self.publish("status", payload);
+                if self.extensions {
+                    let (last_update_id, ready) = {
+                        let state = self.shared.lock().expect("state lock");
+                        (state.last_update_id, state.ready())
+                    };
+                    let payload = protocol::status_payload(
+                        &self.symbol,
+                        status,
+                        last_update_id,
+                        message.epoch,
+                        message.leader_id,
+                        ready,
+                        message.ts_ms,
+                    );
+                    self.publish("status", payload);
+                }
             }
             MessageBody::Gap(gap) => {
                 self.stats.gaps.fetch_add(1, Ordering::Relaxed);
@@ -492,7 +499,8 @@ impl Feed {
         state.depth_stale = false;
         drop(state);
 
-        self.last_depth_u = Some(message.market_seq);
+        self.fast.last_update_id = Some(message.market_seq);
+        self.slow.last_update_id = Some(message.market_seq);
         self.fast.reset();
         self.slow.reset();
 
@@ -554,7 +562,7 @@ impl Feed {
     }
 
     fn flush(&mut self, speed: Speed) {
-        let (first_seq, last_seq, ts_ms, bid_prices, ask_prices) = {
+        let (first_seq, last_seq, previous_update_id, ts_ms, bid_prices, ask_prices) = {
             let window = match speed {
                 Speed::Ms100 => &self.fast,
                 Speed::Ms1000 => &self.slow,
@@ -565,22 +573,30 @@ impl Feed {
             (
                 window.first_seq.expect("changed window has a sequence"),
                 window.last_seq.expect("changed window has a sequence"),
+                window.last_update_id,
                 window.ts_ms,
                 window.bids.clone(),
                 window.asks.clone(),
             )
         };
 
-        let last_update_id = last_seq + 1;
-        let first_update_id = match self.last_depth_u {
-            Some(previous) if previous < last_update_id => previous + 1,
-            _ => first_seq + 1,
+        // Each speed is its own diff stream: its `U` continues from the
+        // previous frame on the same speed, never from the other speed's
+        // flush. Sharing one boundary skipped ids between frames and made an
+        // otherwise contiguous client see a gap.
+        let (first_update_id, last_update_id) =
+            update_range(first_seq, last_seq, previous_update_id);
+        match speed {
+            Speed::Ms100 => self.fast.last_update_id = Some(last_update_id),
+            Speed::Ms1000 => self.slow.last_update_id = Some(last_update_id),
         }
-        .min(last_update_id);
-        self.last_depth_u = Some(last_update_id);
 
         let (bids, asks) = {
-            let state = self.shared.lock().expect("state lock");
+            let mut state = self.shared.lock().expect("state lock");
+            // Advance the cached snapshot boundary before publishing. A new
+            // subscriber can otherwise read the old lastUpdateId while a later
+            // update is already on the wire, which looks like a gap.
+            state.last_update_id = state.last_update_id.max(last_update_id);
             (
                 state.depth.touched(OrderSide::Buy, &bid_prices),
                 state.depth.touched(OrderSide::Sell, &ask_prices),
@@ -616,10 +632,6 @@ impl Feed {
             self.publish_key(&key, payload);
         }
 
-        {
-            let mut state = self.shared.lock().expect("state lock");
-            state.last_update_id = last_update_id;
-        }
         match speed {
             Speed::Ms100 => self.fast.reset(),
             Speed::Ms1000 => self.slow.reset(),
@@ -685,5 +697,47 @@ impl Feed {
         for key in keys {
             self.publish_key(&key, payload.to_vec());
         }
+    }
+}
+
+/// Contiguous `(U, u)` range for one speed's next depth frame.
+///
+/// `first_seq`/`last_seq` are the market sequences covered by the window and
+/// `previous` is the boundary emitted on the same speed last time. The range
+/// always starts right after that boundary so one speed's flush cannot create
+/// a hole in another speed's stream.
+fn update_range(first_seq: u64, last_seq: u64, previous: Option<u64>) -> (u64, u64) {
+    let last_update_id = last_seq + 1;
+    let first_update_id = match previous {
+        Some(previous) if previous < last_update_id => previous + 1,
+        _ => first_seq + 1,
+    }
+    .min(last_update_id);
+    (first_update_id, last_update_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::update_range;
+
+    #[test]
+    fn update_range_continues_from_the_same_speed_boundary() {
+        // First frame after a snapshot anchored at 10.
+        assert_eq!((11, 12), update_range(10, 11, Some(10)));
+        // The next frame starts where the previous one ended, even when the
+        // window also covers sequences another (slower) speed already emitted.
+        assert_eq!((13, 15), update_range(12, 14, Some(12)));
+    }
+
+    #[test]
+    fn update_range_skips_ids_already_emitted_by_this_speed() {
+        // A flush after the peer speed advanced the shared state must not
+        // reopen ids this speed already published.
+        assert_eq!((15, 17), update_range(10, 16, Some(14)));
+    }
+
+    #[test]
+    fn update_range_without_a_previous_boundary_starts_at_the_window() {
+        assert_eq!((41, 43), update_range(40, 42, None));
     }
 }

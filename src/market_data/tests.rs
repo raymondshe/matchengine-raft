@@ -370,6 +370,42 @@ fn each_frame_emits_its_own_post_batch_depth_total() {
 }
 
 #[test]
+fn removed_depth_level_is_published_as_a_zero_volume_level() {
+    let mut h = harness(MarketDataConfig::default());
+    h.processor.ingest(frame(
+        1,
+        1_000,
+        vec![depth(OrderSide::Sell, 100.0, 5.0, 1)],
+        vec![],
+    ));
+    // Filling or cancelling the last order at the level removes it from the
+    // engine's shadow book. Diff-depth consumers need the zero-volume level to
+    // delete their own copy.
+    h.processor.ingest(frame(
+        2,
+        1_001,
+        vec![depth(OrderSide::Sell, 100.0, -5.0, -1)],
+        vec![],
+    ));
+
+    let deltas: Vec<Vec<LevelUpdate>> = h
+        .messages()
+        .into_iter()
+        .filter_map(|message| match message.body {
+            MessageBody::DepthDelta(updates) => Some(updates),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(2, deltas.len());
+    assert_eq!(1, deltas[1].len());
+    let removal = &deltas[1][0];
+    assert_eq!(OrderSide::Sell, removal.side);
+    assert_eq!(100.0, removal.level.price);
+    assert_eq!(Fixed::ZERO, removal.level.volume);
+    assert_eq!(0, removal.level.orders);
+}
+
+#[test]
 fn bars_close_from_event_time_and_are_anchored() {
     let config = MarketDataConfig {
         bar_intervals_ms: vec![1_000],

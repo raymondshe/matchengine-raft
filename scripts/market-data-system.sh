@@ -62,6 +62,7 @@ start_engine() {
         --market-data-aeron-embedded-driver \
         --market-data-aeron-dir "$aeron_dir" \
         --market-data-aeron-snapshot-every-ms 5000 \
+        --market-data-status-every 10 \
         >"$DATA_DIR/engine-$name.log" 2>&1 &
     STARTED_PID=$!
 }

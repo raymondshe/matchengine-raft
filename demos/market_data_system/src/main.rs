@@ -71,6 +71,13 @@ struct Opt {
     #[clap(long, default_value_t = 1024)]
     queue: usize,
 
+    /// Expose engine extension streams (@sweep, @status, @lifecycle).
+    ///
+    /// Off by default so a public deployment serves the Binance-compatible
+    /// stream catalogue only.
+    #[clap(long)]
+    extensions: bool,
+
     /// Disable the extension `@lifecycle` stream.
     #[clap(long)]
     no_lifecycle: bool,
@@ -153,7 +160,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     config.max_connections = opt.max_connections;
     config.max_streams = opt.max_streams;
     config.queue = opt.queue.max(1);
-    config.lifecycle = !opt.no_lifecycle;
+    config.extensions = opt.extensions;
+    config.lifecycle = opt.extensions && !opt.no_lifecycle;
     config.ping_interval = Duration::from_secs(opt.ping_secs.max(1));
     config.pong_timeout = Duration::from_secs(opt.pong_timeout_secs.max(1));
     config.connection_lifetime = if opt.connection_lifetime_secs == 0 {

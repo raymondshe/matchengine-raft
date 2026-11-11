@@ -393,9 +393,10 @@ fn snapshot_payload(
     snapshot_levels: usize,
 ) -> Option<Vec<u8>> {
     match kind {
-        StreamKind::BookTicker => state.bbo.as_ref().map(|bbo| {
-            protocol::book_ticker_payload(symbol, bbo, state.bbo_update_id, state.last_ts_ms)
-        }),
+        StreamKind::BookTicker => state
+            .bbo
+            .as_ref()
+            .map(|bbo| protocol::book_ticker_payload(symbol, bbo, state.bbo_update_id)),
         StreamKind::DepthDiff(_) => {
             let bids = state.depth.top(OrderSide::Buy, snapshot_levels);
             let asks = state.depth.top(OrderSide::Sell, snapshot_levels);
