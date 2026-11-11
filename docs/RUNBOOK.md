@@ -10,11 +10,29 @@ The easiest way to see the cluster in action is to run the provided test script:
 ./scripts/test-cluster.sh
 ```
 
-This script builds, starts a 3-node cluster on `127.0.0.1:21001-21003` (gRPC Raft on
-`22001-22003`), initializes it, adds learners, changes membership, and places an order and reads the
-book back. It uses only `curl` against the HTTP API, showing the request/response flow. It stores
-state in `/tmp/matchengine-raft-test-cluster` and clears that directory on start, so reruns are
-reproducible; set `RAFT_DATA_DIR` to keep state somewhere else.
+This script builds a four-node cluster on `127.0.0.1:21001-21004` (gRPC Raft on `22001-22004`),
+initializes it, adds learners, changes membership, places resting orders and reads the book back
+from every node. It uses only `curl` against the HTTP API, showing the request/response flow. It
+stores state in `/tmp/matchengine-raft-test-cluster` and clears that directory on start, so reruns
+are reproducible; set `RAFT_DATA_DIR` or `--data-dir` to keep state somewhere else (add `--fresh`
+to wipe an explicit directory).
+
+Useful options:
+
+```shell
+./scripts/test-cluster.sh --nodes 3              # smaller cluster
+./scripts/test-cluster.sh --no-fsync              # production no-fsync profile (4+ voters)
+./scripts/test-cluster.sh --orders 100            # seed more resting orders
+./scripts/test-cluster.sh --release                # build/run target/release/matchengine-raft
+./scripts/test-cluster.sh --keep                  # leave the cluster running
+./scripts/test-cluster.sh status                  # health/readiness and leader
+./scripts/test-cluster.sh stop                    # stop the kept cluster
+```
+
+`--no-fsync` unsets `RAFT_WAL_FSYNC_MS`, so the binary requires at least four voters and the script
+initializes all nodes in one `/init` call. Without it the script uses `RAFT_WAL_FSYNC_MS=0` (fsync
+every append) so clusters with fewer than four nodes remain valid. `--base-port` moves the whole
+port range, and `--wait` bounds each readiness step.
 
 ### Using the Rust Tests
 
@@ -35,9 +53,10 @@ Start additional nodes (in separate terminals):
 ```shell
 ./target/debug/matchengine-raft --id 2 --http-addr 127.0.0.1:21002
 ./target/debug/matchengine-raft --id 3 --http-addr 127.0.0.1:21003
+./target/debug/matchengine-raft --id 4 --http-addr 127.0.0.1:21004
 ```
 
-Each node listens for gRPC Raft RPCs on `port + 1000` (`22001-22003` here). The HTTP listener is
+Each node listens for gRPC Raft RPCs on `port + 1000` (`22001-22004` here). The HTTP listener is
 reserved for the application and management API.
 
 All state is written to `<data-dir>/<instance-prefix>-<id>/`; see
@@ -65,13 +84,17 @@ curl -X POST -H "Content-Type: application/json" \
 curl -X POST -H "Content-Type: application/json" \
   -d '[3, "127.0.0.1:21003"]' \
   http://127.0.0.1:21001/add-learner
+
+curl -X POST -H "Content-Type: application/json" \
+  -d '[4, "127.0.0.1:21004"]' \
+  http://127.0.0.1:21001/add-learner
 ```
 
 #### 4. Change Membership
 
 ```shell
 curl -X POST -H "Content-Type: application/json" \
-  -d '[1, 2, 3]' \
+  -d '[1, 2, 3, 4]' \
   http://127.0.0.1:21001/change-membership
 ```
 

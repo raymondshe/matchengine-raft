@@ -187,8 +187,9 @@ cargo build
 
 ## 运行集群
 
-用 `./scripts/test-cluster.sh` 启动本地三节点集群；手动启动、端口、成员变更、辅助脚本和恢复演练见
-[运行手册](./docs/zh-CN/RUNBOOK.md)。
+用 `./scripts/test-cluster.sh` 启动本地四节点集群；可通过 `--nodes N`、`--base-port`、`--keep`、
+`--no-fsync` 控制，并用 `status`/`stop` 管理保留运行的集群。手动启动、端口、成员变更、辅助脚本和
+恢复演练见[运行手册](./docs/zh-CN/RUNBOOK.md)。
 
 ## 运维控制台
 

@@ -1,147 +1,33 @@
 #!/bin/sh
 
-set -o errexit
+# Start the local walkthrough cluster and leave it running.
+#
+# This is the same launcher as test-cluster.sh, with --keep, debug logging and
+# a separate default data dir, so it does not collide with the disposable
+# test-cluster run.
+
+set -eu
 
 # Always run from the repository root.
 cd "$(dirname "$0")/.."
 
-# These demos use fewer than the four voters required when WAL fsync is
-# disabled; use every-append fsync unless the caller overrides it.
-export RAFT_WAL_FSYNC_MS=${RAFT_WAL_FSYNC_MS:-0}
+export RUST_LOG=${RUST_LOG:-debug}
 
-# Demo script: use a dedicated data dir so a rerun starts from a clean cluster.
-# An explicit RAFT_DATA_DIR is respected and never wiped.
-if [ -z "${RAFT_DATA_DIR:-}" ]; then
-    export RAFT_DATA_DIR=/tmp/matchengine-raft-open-cluster
-    rm -rf "$RAFT_DATA_DIR"
+# Respect an explicit RAFT_DATA_DIR or --data-dir; otherwise use the historical
+# open-cluster root and clear it, matching the previous script.
+if [ -n "${RAFT_DATA_DIR:-}" ]; then
+    exec ./scripts/test-cluster.sh --keep "$@"
 fi
 
-cargo build
+data_dir_arg=0
+for arg in "$@"; do
+    case $arg in
+    -d | --data-dir) data_dir_arg=1 ;;
+    esac
+done
+if [ "$data_dir_arg" -eq 1 ]; then
+    exec ./scripts/test-cluster.sh --keep "$@"
+fi
 
-kill() {
-    if [ "$(uname)" = "Darwin" ]; then
-        # `pgrep -x` does not match the `./target/.../matchengine-raft` argv
-        # used by these scripts, so let pkill match the full command line.
-        pkill -f 'matchengine-raft' 2>/dev/null || true
-    else
-        set +e # killall will error if finds no process to kill
-        killall matchengine-raft
-        set -e
-    fi
-}
-
-rpc() {
-    local uri=$1
-    local body="$2"
-
-    echo '---'" rpc(:$uri, $body)"
-
-    {
-        if [ ".$body" = "." ]; then
-            curl --silent "127.0.0.1:$uri"
-        else
-            curl --silent "127.0.0.1:$uri" -H "Content-Type: application/json" -d "$body"
-        fi
-    } | {
-        if type jq > /dev/null 2>&1; then
-            jq
-        else
-            cat
-        fi
-    }
-
-    echo
-    echo
-}
-
-export RUST_LOG=debug 
-export RAFT_HEARTBEAT_INTERVAL=100
-
-echo "Killing all running matchengine-raft"
-
-kill
-
-sleep 1
-
-echo "Start 3 uninitialized matchengine-raft servers..."
-mkdir -p logs
-
-nohup ./target/debug/matchengine-raft  --id 1 --http-addr 127.0.0.1:21001 > logs/n1.log 2>&1 &
-sleep 1
-echo "Server 1 started"
-
-nohup ./target/debug/matchengine-raft  --id 2 --http-addr 127.0.0.1:21002 > logs/n2.log 2>&1 &
-sleep 1
-echo "Server 2 started"
-
-nohup ./target/debug/matchengine-raft  --id 3 --http-addr 127.0.0.1:21003 > logs/n3.log 2>&1 &
-sleep 1
-echo "Server 3 started"
-sleep 1
-
-echo "Initialize server 1 as a single-node cluster"
-sleep 2
-echo
-rpc 21001/init '[]'
-
-echo "Server 1 is a leader now"
-
-sleep 2
-
-echo "Get metrics from the leader"
-sleep 2
-echo
-rpc 21001/metrics
-sleep 1
-
-
-echo "Adding node 2 and node 3 as learners, to receive log from leader node 1"
-
-sleep 1
-echo
-rpc 21001/add-learner       '[2, "127.0.0.1:21002"]'
-echo "Node 2 added as leaner"
-sleep 1
-echo
-rpc 21001/add-learner       '[3, "127.0.0.1:21003"]'
-echo "Node 3 added as leaner"
-sleep 1
-
-echo "Get metrics from the leader, after adding 2 learners"
-sleep 2
-echo
-rpc 21001/metrics
-sleep 1
-
-echo "Changing membership from [1] to 3 nodes cluster: [1, 2, 3]"
-echo
-rpc 21001/change-membership '[1, 2, 3]'
-sleep 1
-echo "Membership changed"
-sleep 1
-
-echo "Get metrics from the leader again"
-sleep 1
-echo
-rpc 21001/metrics
-sleep 1
-
-echo "Place a resting buy order on the leader"
-sleep 1
-echo
-rpc 21001/write '{"Place": { "order": {"live": "Limit", "side": "Buy", "price": 4000.0, "volume": 4.4, "id": 1, "sequence": 0} }}'
-sleep 1
-echo "Order placed"
-sleep 1
-
-echo "Read the order book on every node, including the leader"
-sleep 1
-echo "Read from node 1"
-echo
-rpc 21001/read  '"orderbook_orders"'
-echo "Read from node 2"
-echo
-rpc 21002/read  '"orderbook_orders"'
-echo "Read from node 3"
-echo
-rpc 21003/read  '"orderbook_orders"'
+rm -rf /tmp/matchengine-raft-open-cluster
+exec ./scripts/test-cluster.sh --keep --data-dir /tmp/matchengine-raft-open-cluster "$@"

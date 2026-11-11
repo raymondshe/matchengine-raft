@@ -10,10 +10,27 @@
 ./scripts/test-cluster.sh
 ```
 
-该脚本会构建并启动一个 3 节点集群（`127.0.0.1:21001-21003`，gRPC Raft 位于
-`22001-22003`），完成初始化、添加学习者、变更成员以及读写操作。脚本只用 `curl` 访问 HTTP
+该脚本会构建一个四节点集群（`127.0.0.1:21001-21004`，gRPC Raft 位于 `22001-22004`），完成
+初始化、添加学习者、变更成员、写入挂单，并从每个节点读回订单簿。脚本只用 `curl` 访问 HTTP
 API，便于观察请求/应答流程。状态保存在 `/tmp/matchengine-raft-test-cluster`，每次启动前会清空
-该目录，因此可以重复运行；如需保留状态，请设置 `RAFT_DATA_DIR`。
+该目录，因此可以重复运行；如需保留状态，请设置 `RAFT_DATA_DIR` 或 `--data-dir`（显式目录默认
+不删除，可用 `--fresh` 强制清空）。
+
+常用选项：
+
+```shell
+./scripts/test-cluster.sh --nodes 3              # 更小的集群
+./scripts/test-cluster.sh --no-fsync              # 生产 no-fsync 配置（至少 4 个 voter）
+./scripts/test-cluster.sh --orders 100            # 写入更多挂单
+./scripts/test-cluster.sh --release                # 构建并运行 target/release/matchengine-raft
+./scripts/test-cluster.sh --keep                  # 启动后保留集群
+./scripts/test-cluster.sh status                  # 查看健康/就绪状态和领导者
+./scripts/test-cluster.sh stop                    # 停止保留运行的集群
+```
+
+`--no-fsync` 会取消 `RAFT_WAL_FSYNC_MS`，此时二进制要求至少 4 个 voter，脚本会用一次 `/init`
+初始化全部节点。未指定时脚本使用 `RAFT_WAL_FSYNC_MS=0`（每次追加都 fsync），因此少于四个节点
+的集群仍然有效。`--base-port` 整体移动端口范围，`--wait` 控制每一步的就绪超时。
 
 ### 使用 Rust 测试
 
@@ -34,9 +51,10 @@ API，便于观察请求/应答流程。状态保存在 `/tmp/matchengine-raft-t
 ```shell
 ./target/debug/matchengine-raft --id 2 --http-addr 127.0.0.1:21002
 ./target/debug/matchengine-raft --id 3 --http-addr 127.0.0.1:21003
+./target/debug/matchengine-raft --id 4 --http-addr 127.0.0.1:21004
 ```
 
-每个节点在 `端口 + 1000`（这里是 `22001-22003`）上监听 gRPC Raft RPC；HTTP 监听器只提供应用和
+每个节点在 `端口 + 1000`（这里是 `22001-22004`）上监听 gRPC Raft RPC；HTTP 监听器只提供应用和
 管理 API。
 
 所有状态写入 `<data-dir>/<instance-prefix>-<id>/`，详见[每节点数据目录](./STORAGE.md#每节点数据目录)。
@@ -63,13 +81,17 @@ curl -X POST -H "Content-Type: application/json" \
 curl -X POST -H "Content-Type: application/json" \
   -d '[3, "127.0.0.1:21003"]' \
   http://127.0.0.1:21001/add-learner
+
+curl -X POST -H "Content-Type: application/json" \
+  -d '[4, "127.0.0.1:21004"]' \
+  http://127.0.0.1:21001/add-learner
 ```
 
 #### 4. 变更成员
 
 ```shell
 curl -X POST -H "Content-Type: application/json" \
-  -d '[1, 2, 3]' \
+  -d '[1, 2, 3, 4]' \
   http://127.0.0.1:21001/change-membership
 ```
 

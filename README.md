@@ -192,8 +192,9 @@ cargo build
 
 ## Running the Cluster
 
-Start a local three-node cluster with `./scripts/test-cluster.sh`. Manual startup, ports,
-membership changes, helper scripts and recovery drills are documented in the
+Start a local four-node cluster with `./scripts/test-cluster.sh`; use `--nodes N`, `--base-port`,
+`--keep` and `--no-fsync` to control it, and the `status`/`stop` commands to manage a kept cluster.
+Manual startup, ports, membership changes, helper scripts and recovery drills are documented in the
 [runbook](./docs/RUNBOOK.md).
 
 ## Operational Console
