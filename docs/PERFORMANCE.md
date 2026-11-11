@@ -1,6 +1,6 @@
 # Performance measurements
 
-Measured on **2026-10-30** (runtime flavor A/B and P0 offloads: **2026-10-31**; measurement scope and RSS: **2026-11-01**; book p50/p99 and the pinned-core approximation: **2026-11-04**; end-to-end/storage rerun with the OpenRaft quick wins: **2026-11-06**; realistic-mix replay: **2026-11-06**; dedicated Raft runtime: **2026-11-06**; WAL fsync Tokio rerun: **2026-11-07**; four-node no-fsync cluster: **2026-11-07**; write concurrency/batching sweep: **2026-11-08**; async WAL prototype: **2026-11-08**; production configuration decisions: **2026-11-08**; write admission control: **2026-11-09**; pre-connected write concurrency: **2026-11-09**; sustained single-node CPU profile: **2026-11-09**; benchmark regression gate: **2026-11-09**; read-path benchmark: **2026-11-08**; OpenRaft minimal-benchmark comparison: **2026-11-08**; WebSocket fan-out: **2026-11-10**; open-loop e2e, current-HEAD book re-pin and sorted-vector A/B: **2026-11-10**; apply-path inline buffers, affinity A/B and per-level rerun: **2026-11-10**; local lease-read experiment and dependency upgrade: **2026-11-10**) on the reference development machine:
+Measured on **2026-10-30** (runtime flavor A/B and P0 offloads: **2026-10-31**; measurement scope and RSS: **2026-11-01**; book p50/p99 and the pinned-core approximation: **2026-11-04**; end-to-end/storage rerun with the OpenRaft quick wins: **2026-11-06**; realistic-mix replay: **2026-11-06**; dedicated Raft runtime: **2026-11-06**; WAL fsync Tokio rerun: **2026-11-07**; four-node no-fsync cluster: **2026-11-07**; write concurrency/batching sweep: **2026-11-08**; async WAL prototype: **2026-11-08**; production configuration decisions: **2026-11-08**; write admission control: **2026-11-09**; pre-connected write concurrency: **2026-11-09**; sustained single-node CPU profile: **2026-11-09**; benchmark regression gate: **2026-11-09**; read-path benchmark: **2026-11-08**; OpenRaft minimal-benchmark comparison: **2026-11-08**; WebSocket fan-out: **2026-11-10**; open-loop e2e, current-HEAD book re-pin and sorted-vector A/B: **2026-11-10**; apply-path inline buffers, affinity A/B and per-level rerun: **2026-11-10**; local lease-read experiment and dependency upgrade: **2026-11-10**; follower-read linearizer hop: **2026-11-11**) on the reference development machine:
 
 - Apple M4 (`arm64`)
 - Rust `1.93.1`
@@ -21,7 +21,7 @@ RAFT_WAL_FSYNC_MS=0 MATCHENGINE_ASYNC_WAL=1 cargo bench --features async-wal --b
 cargo bench --bench cluster_e2e -- --rounds 3  # four in-process no-fsync voters, leader-direct writes and batches
 cargo bench --bench cluster_e2e -- --rounds 2 --concurrency-only  # 1/8/64/256/1024/4096-client sweep
 cargo bench --bench cluster_e2e -- --rounds 4 --concurrency-only --clients 256,512,1024,2048 --max-inflight-writes 1024 --preconnect  # pre-connected admission sweep
-cargo bench --bench read_e2e -- --policy both  # local /read, /linearizable_read and /events; ReadIndex vs local_lease (or --policy local_lease)
+cargo bench --bench read_e2e -- --policy both  # local /read, /linearizable_read, follower /follower_read and /events; ReadIndex vs local_lease (or --policy local_lease)
 cargo bench --bench feed_load     # market-data feed at 50k/500k fills/s
 cargo bench --manifest-path demos/market_data_system/Cargo.toml --bench ws_fanout -- --clients 64 --updates 10000 --rate 20000  # WebSocket fan-out
 cargo bench --bench storage       # WAL append/read/recovery
@@ -62,7 +62,7 @@ its scope.
 | `e2e` `/write` | HTTP decode/validation, Raft proposal/commit, WAL append + `sync_data`, apply, response serialization | Cross-node replication, external client network beyond loopback | Sequential and concurrent bursts are closed-loop; `--duration --clients` is closed-loop; `--rate` is fixed-rate open-loop with an absolute schedule | `Instant` per request; p50/p95/p99/max; open-loop also reports dispatch lag and service latency | Medians/percentiles; runtime A/B uses four alternating runs, the 2026-11-06 rerun uses three; open-loop tails include generator scheduling |
 | `e2e` `/write_batch` | Same as `/write`, with 1–128 requests per Raft entry and one WAL fsync per entry | Same as `/write` | 200 sequential batches per size; 100 concurrent 32-order batches | `Instant` per batch | Medians of three runs per size; batch latency includes payload/apply growth |
 | `cluster_e2e` | Four in-process loopback voters with a separate client runtime; HTTP `/write`/`/write_batch`, Raft 3/4 quorum replication over gRPC, WAL append without fsync, apply and response; optional client-count, write-admission and OpenRaft config sweeps | Cross-host network latency, independent machines, disk contention between nodes | 50 warm-up writes; 500 sequential, 200 batches/size, 100×32 concurrent batches, and a 1/8/64/256/1024/4096-client sweep; fresh rounds | `Instant` per request/batch; p50/p95/p99 and medians | Two or three fresh rounds; high-concurrency tail is host-sensitive |
-| `read_e2e` | Four in-process loopback voters with a separate client runtime; local `/read`, `/linearizable_read` and `/events`; ReadIndex, core lease and local-lease policies; 1/64 readers; read-only and mixed with an offered 2,000 writes/s | Cross-host network and clock skew; independent machines | 100 warm-up reads per endpoint; 2,000 reads/reader per case; 100-event pages; depth-20 local reads; two runs per policy | `Instant` per request; p50/p95/p99 and throughput | Two runs; read-only rows are stable, mixed rows depend on writer pacing |
+| `read_e2e` | Four in-process loopback voters with a separate client runtime; local `/read`, `/linearizable_read`, follower `/follower_read` and `/events`; ReadIndex, core lease and local-lease policies; 1/64 readers; read-only and mixed with an offered 2,000 writes/s | Cross-host network and clock skew; independent machines | 100 warm-up reads per endpoint; 2,000 reads/reader per case (200 for follower reads), 100-event pages, depth-20 local reads; two runs per policy | `Instant` per request; p50/p95/p99 and throughput | Two runs; read-only rows are stable, mixed rows depend on writer pacing |
 | `feed_load` | Tokio tap, bounded queue, shadow book, wire encoding and processor drain with a null sink | JSONL/network sink I/O, Raft, HTTP | Offered-load generator at 50k/500k/2M fills/s | `Instant`; queue/drain counters | One run per target; no p99 table |
 | `storage` | WAL append/read/reopen with 20k real order entries and 512 KiB segments; optional `async-wal` prototype | State machine, Raft, HTTP | Closed-loop, 100-entry batches | `Instant` | Five runs per mode; no tail study; async variance is high |
 | `p0_bench duplicate` | State-machine duplicate-retry lookup over a 262k-event window | HTTP, Raft, WAL | 200 retries after one setup | `Instant`; mean/p50/p99/max | Single run; a single scheduling outlier moves the mean |
@@ -904,6 +904,29 @@ downstream event consumers should resume from `(log_index, ordinal)` and dedupe 
 The same bounded-clock-drift contract applies. The local path is now the default; the core
 `lease` mode remains available for comparison and for deployments that prefer the core queue order.
 
+### Follower-read linearizer hop (2026-11-11)
+
+`POST /follower_read` still contacts the leader for a fresh linearizer on every read. A follower-side
+TTL cache was **not** adopted: a linearizer obtained before a write could be reused after the write
+completed, so the follower could return state older than a completed write. The lease bounds leader
+liveness, not commit freshness. The safe optimization is the leader-side lease path already used by
+`/get_linearizer`, plus one shared follower-to-leader HTTP client (`tokio::sync::OnceCell`) instead
+of building a client per read.
+
+`cargo bench --bench read_e2e -- --policy read_index|local_lease` now includes `follower_read` on a
+non-leader (200 reads/reader to bound the per-read HTTP-hop run time). Read-only and 64-reader mixed
+rows:
+
+| Policy | 1 reader | 1-reader p50 / p99 | 64 readers | 64-reader p50 / p99 | 64 mixed |
+|---|---:|---:|---:|---:|---:|
+| `read_index` | 6,419 reads/s | 152.1 / 259.2 µs | 24,351 | 482.3 µs / 4.95 ms | 5,856 reads/s |
+| `local_lease` | 12,564 | 78.4 / 96.6 µs | 39,473 | 198.1 µs / 2.84 ms | 22,365 |
+
+The local-lease default roughly doubles the one-reader follower throughput and improves 64-reader
+p50/p99 by about 60%, because the leader avoids a fresh quorum round inside the hop. The remaining
+cost is the HTTP request itself; caching the linearizer would remove it but weaken the read
+guarantee, so it stays per-read. Follower `/read` is still the local, possibly stale option.
+
 ### OpenRaft minimal benchmark comparison (2026-11-08)
 
 The upstream [`openraft/benchmarks/minimal`](https://github.com/databendlabs/openraft/tree/main/benchmarks/minimal)
@@ -1390,6 +1413,9 @@ Kept intentionally:
   `MemorySink`. `FileLogSink`'s writer mutex is held during its blocking writes, but those run on
   the blocking pool, not on a Tokio worker. Async mutexes would add overhead without removing a
   stall.
+- `std::sync::Arc` stays for shared ownership; Tokio has no `Arc` equivalent. The one-time
+  follower-to-leader HTTP client uses `tokio::sync::OnceCell`, and the remaining
+  `std::sync::OnceLock` values are synchronous one-time configuration.
 - The state machine uses `futures::lock::Mutex`, which is already async; the WAL append order
   uses `tokio::sync::Mutex`.
 

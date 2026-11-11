@@ -46,6 +46,7 @@ const NODE_COUNT: u64 = 4;
 const FIRST_HTTP_PORT: u16 = 25101;
 const READERS: [usize; 2] = [1, 64];
 const READS_PER_READER: usize = 2_000;
+const FOLLOWER_READS_PER_READER: usize = 200;
 const WARMUP_READS: usize = 100;
 const SEED_ORDERS: usize = 2_000;
 const SEED_BATCH: usize = 128;
@@ -57,16 +58,23 @@ const READ_KEY: &str = "orderbook_depth:20";
 enum Endpoint {
     LocalRead,
     LinearizableRead,
+    FollowerRead,
     Events,
 }
 
 impl Endpoint {
-    const ALL: [Self; 3] = [Self::LocalRead, Self::LinearizableRead, Self::Events];
+    const ALL: [Self; 4] = [
+        Self::LocalRead,
+        Self::LinearizableRead,
+        Self::FollowerRead,
+        Self::Events,
+    ];
 
     fn as_str(self) -> &'static str {
         match self {
             Self::LocalRead => "local_read",
             Self::LinearizableRead => "linearizable_read",
+            Self::FollowerRead => "follower_read",
             Self::Events => "events",
         }
     }
@@ -75,6 +83,7 @@ impl Endpoint {
         match self {
             Self::LocalRead => None,
             Self::LinearizableRead => Some(ReadPath::LinearizableRead),
+            Self::FollowerRead => Some(ReadPath::GetLinearizer),
             Self::Events => Some(ReadPath::Events),
         }
     }
@@ -309,6 +318,9 @@ async fn read_once(
         Endpoint::LinearizableRead => {
             client.linearizable_read(key).await??;
         }
+        Endpoint::FollowerRead => {
+            client.follower_read(key).await??;
+        }
         Endpoint::Events => {
             let page = client
                 .events(&EventsRequest {
@@ -364,6 +376,11 @@ async fn measure_case(
         (None, None)
     };
 
+    let reads_per_reader = if endpoint == Endpoint::FollowerRead {
+        FOLLOWER_READS_PER_READER
+    } else {
+        READS_PER_READER
+    };
     let barrier = Arc::new(Barrier::new(readers + 1));
     let mut handles = Vec::with_capacity(readers);
     for _ in 0..readers {
@@ -372,8 +389,8 @@ async fn measure_case(
         let key = key.clone();
         handles.push(tokio::spawn(async move {
             barrier.wait().await;
-            let mut latencies = Vec::with_capacity(READS_PER_READER);
-            for _ in 0..READS_PER_READER {
+            let mut latencies = Vec::with_capacity(reads_per_reader);
+            for _ in 0..reads_per_reader {
                 let started = Instant::now();
                 read_once(&client, endpoint, &key).await?;
                 latencies.push(started.elapsed());
@@ -384,7 +401,7 @@ async fn measure_case(
 
     let started = Instant::now();
     barrier.wait().await;
-    let mut latencies = Vec::with_capacity(readers * READS_PER_READER);
+    let mut latencies = Vec::with_capacity(readers * reads_per_reader);
     for handle in handles {
         latencies.extend(handle.await??);
     }
@@ -443,13 +460,22 @@ async fn seed_book(client: &MatchEngineClient<C>) -> anyhow::Result<()> {
 
 async fn run_cases(cluster: &Cluster, leader_index: usize) -> anyhow::Result<Vec<CaseResult>> {
     let client = cluster.clients[leader_index].clone();
+    let follower_index = (0..NODE_COUNT as usize)
+        .find(|index| *index != leader_index)
+        .expect("a follower exists");
+    let follower_client = cluster.clients[follower_index].clone();
     let leader_addr = cluster.addrs[leader_index].1.clone();
     let key = READ_KEY.to_string();
 
     seed_book(&client).await?;
     for _ in 0..WARMUP_READS {
         for endpoint in Endpoint::ALL {
-            read_once(&client, endpoint, &key).await?;
+            let read_client = if endpoint == Endpoint::FollowerRead {
+                &follower_client
+            } else {
+                &client
+            };
+            read_once(read_client, endpoint, &key).await?;
         }
     }
 
@@ -457,8 +483,13 @@ async fn run_cases(cluster: &Cluster, leader_index: usize) -> anyhow::Result<Vec
     for readers in READERS {
         for mixed in [false, true] {
             for endpoint in Endpoint::ALL {
+                let read_client = if endpoint == Endpoint::FollowerRead {
+                    follower_client.clone()
+                } else {
+                    client.clone()
+                };
                 let case = measure_case(
-                    client.clone(),
+                    read_client,
                     &leader_addr,
                     key.clone(),
                     endpoint,
@@ -615,7 +646,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     println!(
-        "read-path benchmark: {NODE_COUNT}-node no-fsync cluster, {READS_PER_READER} reads/reader, key {READ_KEY}, events page {EVENTS_LIMIT}, mixed writes {MIXED_WRITE_RATE}/s"
+        "read-path benchmark: {NODE_COUNT}-node no-fsync cluster, {READS_PER_READER} reads/reader, follower endpoint {FOLLOWER_READS_PER_READER}, key {READ_KEY}, events page {EVENTS_LIMIT}, mixed writes {MIXED_WRITE_RATE}/s"
     );
     println!("cluster runtime and client runtime are separate");
 

@@ -83,7 +83,7 @@ the internal-only HTTP contract; TLS and operator authentication stay at the gat
   admitted and rejected totals.
 - `POST /read` - Read from the local state machine (may be stale)
 - `POST /linearizable_read` - Linearizable read; the request must reach the leader
-- `POST /follower_read` - Linearizable read served locally after fetching a linearizer from the leader
+- `POST /follower_read` - Linearizable read served locally after fetching a fresh leader linearizer per read; the follower does not cache linearizers because an older one could miss a completed write. Reuses one process-wide HTTP client for the hop.
 - `POST /events` - Read a page of the replicated match-event log (`after`, `limit`, `wait_ms`); linearizable and leader-only, with optional long-poll
 - `GET /events/status` - Retained event window, eviction counters and retention limit
 - gRPC `EventService.StreamEvents` - Stream JSON event pages with the same cursor, `wait_ms` and `max_pages` on the gRPC listener

@@ -65,7 +65,7 @@ Raft 节点间 RPC 仅由 `--http-addr` 端口 + 1000 上的 gRPC 提供；HTTP 
   可关闭拒绝；`GET /admission/status` 报告上限、当前在途、峰值、准入和拒绝总数。
 - `POST /read` - 从本地状态机读取（可能读到旧值）
 - `POST /linearizable_read` - 线性一致性读；请求必须到达领导者
-- `POST /follower_read` - 从领导者获取 linearizer 后在本地完成的线性一致性读
+- `POST /follower_read` - 从领导者获取 fresh linearizer 后在本地完成的线性一致性读；不在 follower 缓存 linearizer（旧值可能漏掉已完成的写），但复用单个进程级 HTTP client
 - `POST /events` - 分页读取复制的撮合事件日志（`after`、`limit`、`wait_ms`）；线性一致，仅领导者，支持长轮询
 - `GET /events/status` - 保留事件窗口、淘汰计数和保留上限
 

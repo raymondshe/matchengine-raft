@@ -336,6 +336,7 @@ disabled. Methodology, percentiles, durability modes and caveats are in
 | Replicated sequential 128-order batches | 227,319 orders/s |
 | Replicated 100 x 32 concurrent batches | 216,163 orders/s |
 | Local-lease linearizable reads (1 / 64 readers) | 27,357 / 56,924 reads/s; p50 34.8 / 53.5 µs |
+| Local-lease follower reads (1 / 64 readers) | 12,564 / 39,473 reads/s; p50 78.4 / 198.1 µs |
 | Local-lease event reads (1 / 64 readers) | 8,224 / 45,243 reads/s; p50 118.8 µs / 1.34 ms |
 | Market-data feed (null sink) | 495k fills/s, 0 drops at an 8,192-frame queue |
 | WAL append / read, no fsync (storage-only) | 2.15M / 5.66M entries/s |

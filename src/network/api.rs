@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::time::Duration;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
@@ -46,6 +47,14 @@ pub const MAX_EVENTS_WAIT_MS: u64 = 1_000;
 /// Raft snapshot and append bodies use their own larger caps because they carry
 /// state-machine data rather than a single order.
 pub const MAX_REQUEST_BODY_BYTES: usize = 1024 * 1024;
+
+/// Shared HTTP client for follower-to-leader linearizer requests.
+///
+/// The follower read path previously built a new client per read, which paid
+/// connector and pool setup on every request. One process-wide client keeps
+/// the leader connection warm without caching the linearizer itself (an older
+/// linearizer could miss a write that completed before the read).
+static FOLLOWER_HTTP: tokio::sync::OnceCell<reqwest::Client> = tokio::sync::OnceCell::const_new();
 /// Maximum accepted `client_order_id` length in bytes.
 pub const MAX_CLIENT_ORDER_ID_BYTES: usize = 128;
 /// Maximum accepted `/read` key length in bytes.
@@ -609,9 +618,13 @@ pub async fn events_status(app: Data<MatchEngineApp>) -> actix_web::Result<impl 
 /// This demonstrates how to distribute read load across followers while maintaining
 /// linearizability guarantees:
 /// 1. Get current leader from local metrics
-/// 2. Fetch linearizer from leader via HTTP
+/// 2. Fetch a fresh linearizer from the leader via HTTP (one shared client; no follower-side cache)
 /// 3. Wait for local state machine to catch up to the linearizer's read_log_id
 /// 4. Read from local state machine
+///
+/// The linearizer is deliberately not cached on the follower: one obtained before a
+/// completed write could make the read return older state. The shared client only
+/// amortizes connector/pool setup, not the per-read leader hop.
 #[post("/follower_read")]
 pub async fn follower_read(
     app: Data<MatchEngineApp>,
@@ -644,7 +657,18 @@ pub async fn follower_read(
     let leader_addr = &leader_node.addr;
 
     // 3. Get linearizer from leader via HTTP
-    let client = reqwest::Client::new();
+    let client = FOLLOWER_HTTP
+        .get_or_init(|| async {
+            reqwest::Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(5))
+                // Keep the leader connection warm for bursts, but release idle sockets so
+                // node/test shutdown is not held open by a process-wide client.
+                .pool_idle_timeout(Duration::from_secs(1))
+                .build()
+                .expect("follower HTTP client configuration is valid")
+        })
+        .await;
     let url = format!("http://{}/get_linearizer", leader_addr);
 
     let response = match client.post(&url).send().await {

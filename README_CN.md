@@ -313,6 +313,7 @@ HTTP 应用/管理 API 和 gRPC Raft 服务见 [API 参考](./docs/zh-CN/API.md)
 | 4 节点串行 128 单批次 | 227,319 orders/s |
 | 4 节点 100 x 32 并发批次 | 216,163 orders/s |
 | Local-lease 线性一致读（1 / 64 读者） | 27,357 / 56,924 reads/s；p50 34.8 / 53.5 µs |
+| Local-lease follower 读（1 / 64 读者） | 12,564 / 39,473 reads/s；p50 78.4 / 198.1 µs |
 | Local-lease 事件读（1 / 64 读者） | 8,224 / 45,243 reads/s；p50 118.8 µs / 1.34 ms |
 | 行情 feed（null sink） | 495k fills/s，8,192 帧队列 0 丢弃 |
 | WAL 追加 / 读取，不 fsync（仅存储） | 2.15M / 5.66M entries/s |

@@ -24,6 +24,7 @@ type C = MatchEngineTypeConfig;
 const LEASE_ADDR: TestAddr = TestAddr::new(21930);
 const READ_INDEX_ADDR: TestAddr = TestAddr::new(21932);
 const LOCAL_LEASE_ADDR: TestAddr = TestAddr::new(21938);
+const FOLLOWER_READ_ADDR: TestAddr = TestAddr::new(21939);
 
 #[test]
 fn default_local_lease_reads_serve_leader_reads_and_report_hits() {
@@ -46,6 +47,52 @@ fn read_index_policy_serves_leader_reads_without_lease_attempts() {
         Some(ReadPolicyMode::ReadIndex),
         "read_index",
     ));
+}
+
+#[test]
+fn follower_read_fetches_a_leader_linearizer() {
+    C::run(run_follower_read_case(FOLLOWER_READ_ADDR));
+}
+
+async fn run_follower_read_case(addr: impl std::fmt::Display) {
+    let addr = addr.to_string();
+    let temp = TempDir::new("follower-read");
+    let storage = StorageConfig::new(temp.path()).with_instance_prefix("follower-read");
+    let node = build_match_engine_node(1, addr.clone(), default_raft_config(), storage)
+        .await
+        .unwrap();
+
+    let client = MatchEngineClient::<C>::new(1, addr.clone());
+    client.init().await.unwrap().unwrap();
+    wait_for_leader(&client).await;
+    client
+        .write(&MatchEngineRequest::place(Order::new(
+            OrderSide::Buy,
+            100.0,
+            1.0,
+            0,
+        )))
+        .await
+        .unwrap()
+        .unwrap();
+
+    let key = "orderbook_depth:20".to_string();
+    let depth = client.follower_read(&key).await.unwrap().unwrap();
+    assert!(depth.contains("100"), "{depth}");
+
+    let http = reqwest::Client::builder().no_proxy().build().unwrap();
+    let status: ReadPolicyStatus = http
+        .get(format!("http://{addr}/read-policy/status"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(1, status.get_linearizer.lease_attempts);
+    assert_eq!(1, status.get_linearizer.lease_hits);
+
+    node.shutdown().await.unwrap();
 }
 
 async fn run_policy_case(

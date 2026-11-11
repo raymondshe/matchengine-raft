@@ -44,29 +44,27 @@ multi-host performance/tail validation.
    for the pinned short/sustained rows.
 3. **Run the Linux Aeron external-driver and multicast validation (§6).** Use the checklist in
    [`demos/market_data_system/README.md`](./demos/market_data_system/README.md).
-4. **Measure follower-read linearizer caching (§16).** A short TTL bounded by the leader lease, or
-   a lease-based `/get_linearizer`, is the remaining read-path optimization after local lease.
-5. **Keep docs synchronized (§10).** This is an ongoing gate: `AGENTS.md`, READMEs,
+4. **Keep docs synchronized (§10).** This is an ongoing gate: `AGENTS.md`, READMEs,
    `docs/PERFORMANCE.md`, `docs/API.md` and this file must move with storage/wire/read-policy
    changes.
 
 **P3 - later, in impact order**
 
-6. Expose `purge_batch_size` and `max_in_snapshot_log_to_keep` with the snapshot policy (§16).
-7. Evaluate bounded admission waiting/backpressure against the current fail-fast `429` (§8).
-8. Benchmark `STREAM_APPEND_CHANNEL_SIZE` as a standalone transport constant (§16).
-9. Replace market-data leader-watcher metrics polling with OpenRaft `on_leader_change` callbacks
+5. Expose `purge_batch_size` and `max_in_snapshot_log_to_keep` with the snapshot policy (§16).
+6. Evaluate bounded admission waiting/backpressure against the current fail-fast `429` (§8).
+7. Benchmark `STREAM_APPEND_CHANNEL_SIZE` as a standalone transport constant (§16).
+8. Replace market-data leader-watcher metrics polling with OpenRaft `on_leader_change` callbacks
    (§16).
-10. Optional transport work: peer preconnect, larger HTTP/2 frames and snapshot compression (§16).
-11. Productionize async WAL only after a Linux multi-node A/B and pipelining work (§16).
-12. Evaluate a binary order-entry path (§14).
-13. Evaluate real ITCH-style replay data and custom MPMC/SIMD/io_uring work (§14).
-14. Evaluate the Aeron Raft transport only if a measured transport bottleneck appears (§4).
-15. Engine-level derivative support (instrument kind, leverage/margin fields) (§13).
-16. Custom reserve replenishment and stop-protection collars when the product requires them (§5).
-17. Consider protobuf/Avro on the public HTTP API; Raft RPCs stay postcard (§5).
-18. Decide whether to rename the remaining mixed-style modules before 1.0 (§10).
-19. Add AON, self-trade-prevention/order-mask and multi-symbol isolation conformance cases only
+9. Optional transport work: peer preconnect, larger HTTP/2 frames and snapshot compression (§16).
+10. Productionize async WAL only after a Linux multi-node A/B and pipelining work (§16).
+11. Evaluate a binary order-entry path (§14).
+12. Evaluate real ITCH-style replay data and custom MPMC/SIMD/io_uring work (§14).
+13. Evaluate the Aeron Raft transport only if a measured transport bottleneck appears (§4).
+14. Engine-level derivative support (instrument kind, leverage/margin fields) (§13).
+15. Custom reserve replenishment and stop-protection collars when the product requires them (§5).
+16. Consider protobuf/Avro on the public HTTP API; Raft RPCs stay postcard (§5).
+17. Decide whether to rename the remaining mixed-style modules before 1.0 (§10).
+18. Add AON, self-trade-prevention/order-mask and multi-symbol isolation conformance cases only
     when those product behaviours land (§17).
 
 The detailed checkboxes and evidence for each item remain in the sections below. The earlier
@@ -948,8 +946,13 @@ and optional APIs.
   `/read-policy/status` counters under bounded clock skew. Correctness is covered by the
   at-least-once client contract (`client_order_id` dedupe) and idempotent downstream event
   consumers (`event_id` dedupe); the remaining work is multi-host tail/performance evidence.
-- [ ] **P2** Cache follower-read linearizers for a short TTL bounded by the leader lease, or add a
-  lease-based `/get_linearizer` mode; measure the per-read leader hop.
+- [x] **P2** Cache follower-read linearizers for a short TTL bounded by the leader lease, or add a
+  lease-based `/get_linearizer` mode; measure the per-read leader hop. Done: `read_e2e` now
+  includes `follower_read` on a non-leader and reuses one `tokio::sync::OnceCell` HTTP client. The
+  default `local_lease` leader path improved 1-reader follower throughput from 6,419 to 12,564
+  reads/s and 64-reader p50/p99 from 482 µs/4.95 ms to 198 µs/2.84 ms. A follower-side TTL cache
+  was rejected: a linearizer obtained before a completed write can return stale state, so the
+  follower keeps one fresh leader hop per read. Details in `docs/PERFORMANCE.md`.
 
 **Configuration, transport and observability**
 
