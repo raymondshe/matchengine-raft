@@ -169,7 +169,11 @@ h2 { font-size: 13px; margin: 0; letter-spacing: .02em; }
 .book-panel, .chart-panel, .trades-panel {
   display: flex;
   flex-direction: column;
+  min-height: 0;
 }
+/* Let the tape scroll inside the grid row instead of stretching the row to
+   fit all retained trades. */
+.trades-panel { contain: size; }
 
 /* Order book ladder */
 .book-columns {
@@ -238,7 +242,6 @@ td.num, th.num { text-align: right; }
 .trades .sell { color: var(--bad); }
 .trades-wrap { flex: 1 1 auto; min-height: 0; max-height: none; margin: 0 14px 12px; overflow: auto; }
 .trades thead th { position: sticky; top: 0; z-index: 1; background: var(--surface); }
-.table-wrap { max-height: 260px; overflow: auto; }
 
 /* Chart */
 .kline-chart {

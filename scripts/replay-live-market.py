@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Keep the demo market-data feeds alive with a fixed two-symbol book.
+"""Keep the demo market-data feeds alive with a two-symbol book.
 
 The market-data test page at http://127.0.0.1:24800/ shows live depth, BBO,
-trades and bars. This script seeds a small ladder on each side once, then sends
-one IOC buy and one IOC sell through the spread every interval and replenishes
-the best levels when they run low. Nothing is cancelled, so the shadow book has
-no stale levels and the page's book stays clean.
+trades and bars. This script seeds a ladder on each side once, then sends
+several marketable IOC orders per interval that walk up to a few levels. Sweep
+depth, size and side pressure vary, so the 1s/1m klines get real OHLC movement
+instead of printing the same two prices; touched levels are replenished and
+nothing is cancelled, so the shadow book stays clean.
 
 Usage:
     ./scripts/replay-live-market.py
@@ -18,31 +19,39 @@ The script only uses Python's standard library. It expects the two engines from
 
 import argparse
 import json
+import math
+import random
 import time
 import urllib.error
 import urllib.request
+
+RNG = random.Random()
 
 EUR = {
     "port": 24801,
     "symbol_id": 0,
     "decimals": 5,
+    "volume_decimals": 2,
     "bids": [f"{1.07990 - i * 0.00010:.5f}" for i in range(10)],
     "asks": [f"{1.08010 + i * 0.00010:.5f}" for i in range(10)],
-    "maker_volume": 100.0,
-    "taker_volume": 0.1,
-    "refill_below": 2.0,
+    "maker_volume": 20.0,
+    "refill_below": 4.0,
     "refill_volume": 20.0,
+    "sweep_levels": 5,
+    "trades_per_interval": 3,
 }
 BTC = {
     "port": 24802,
     "symbol_id": 1,
     "decimals": 2,
+    "volume_decimals": 8,
     "bids": [f"{59990.00 - i * 10:.2f}" for i in range(10)],
     "asks": [f"{60010.00 + i * 10:.2f}" for i in range(10)],
-    "maker_volume": 10.0,
-    "taker_volume": 0.01,
-    "refill_below": 0.2,
+    "maker_volume": 2.0,
+    "refill_below": 0.4,
     "refill_volume": 2.0,
+    "sweep_levels": 5,
+    "trades_per_interval": 3,
 }
 
 
@@ -94,11 +103,14 @@ def level_volume(levels, price):
 
 def ensure_book(spec, next_id):
     depth = read_depth(spec)
-    if depth.get("bids") or depth.get("asks"):
-        return
-    for side, prices in (("Buy", spec["bids"]), ("Sell", spec["asks"])):
+    for side, prices, levels in (
+        ("Buy", spec["bids"], depth.get("bids") or []),
+        ("Sell", spec["asks"], depth.get("asks") or []),
+    ):
+        present = {round(float(level["price"]), 8) for level in levels}
         for price in prices:
-            place(spec, side, price, spec["maker_volume"], next_id())
+            if round(float(price), 8) not in present:
+                place(spec, side, price, spec["maker_volume"], next_id())
 
 
 def replenish(spec, side, price, next_id):
@@ -108,17 +120,54 @@ def replenish(spec, side, price, next_id):
         place(spec, side, price, spec["refill_volume"], next_id())
 
 
-def replay_symbol(spec, next_id):
+def walk_volume(levels, spec):
+    """Volume that consumes the first levels and part of the last one."""
+    volume = sum(float(level["volume"]) for level in levels[:-1])
+    volume += float(levels[-1]["volume"]) * RNG.uniform(0.15, 0.95)
+    return round(max(volume, 0.01), spec["volume_decimals"])
+
+
+def replay_symbol(spec, next_id, bias):
     ensure_book(spec, next_id)
-    bid = spec["bids"][0]
-    ask = spec["asks"][0]
 
-    # Cross the fixed best levels; IOC orders leave no resting remainder.
-    place(spec, "Buy", ask, spec["taker_volume"], next_id(), tif="IOC")
-    place(spec, "Sell", bid, spec["taker_volume"], next_id(), tif="IOC")
+    for _ in range(spec["trades_per_interval"]):
+        depth = read_depth(spec)
+        bids = depth.get("bids") or []
+        asks = depth.get("asks") or []
+        if not bids or not asks:
+            ensure_book(spec, next_id)
+            depth = read_depth(spec)
+            bids = depth.get("bids") or []
+            asks = depth.get("asks") or []
+            if not bids or not asks:
+                continue
 
-    replenish(spec, "Buy", bid, next_id)
-    replenish(spec, "Sell", ask, next_id)
+        # Side pressure drifts with a slow wave, so the tape alternates
+        # between buy-dominated and sell-dominated runs.
+        buy = RNG.random() < 0.5 + bias
+        side = "Buy" if buy else "Sell"
+        levels = asks if buy else bids
+        max_levels = min(len(levels), spec["sweep_levels"])
+        weights = [max_levels - index for index in range(max_levels)]
+        count = RNG.choices(range(1, max_levels + 1), weights=weights, k=1)[0]
+        walked = levels[:count]
+        # The IOC limit sits at the deepest touched level so the order walks
+        # the book; the maker levels supply the trade prices.
+        place(
+            spec,
+            side,
+            walked[-1]["price"],
+            walk_volume(walked, spec),
+            next_id(),
+            tif="IOC",
+        )
+        maker_side = "Sell" if buy else "Buy"
+        for level in walked:
+            replenish(spec, maker_side, level["price"], next_id)
+
+    depth = read_depth(spec)
+    bid = depth["bids"][0]["price"] if depth.get("bids") else "—"
+    ask = depth["asks"][0]["price"] if depth.get("asks") else "—"
     return bid, ask
 
 
@@ -133,8 +182,10 @@ def main():
     )
     parser.add_argument("--skip-eur", action="store_true")
     parser.add_argument("--skip-btc", action="store_true")
+    parser.add_argument("--seed", type=int, default=7)
     args = parser.parse_args()
 
+    RNG.seed(args.seed)
     counter = [1000]
 
     def next_id():
@@ -145,18 +196,22 @@ def main():
     iteration = 0
     while args.iterations == 0 or iteration < args.iterations:
         iteration += 1
+        started = time.monotonic()
+        # Slow side-pressure wave: buy runs followed by sell runs.
+        bias = math.sin(iteration / 8.0) * 0.25
         try:
             parts = []
             if not args.skip_eur:
-                eur_bid, eur_ask = replay_symbol(EUR, next_id)
+                eur_bid, eur_ask = replay_symbol(EUR, next_id, bias)
                 parts.append(f"EURUSD {eur_bid}/{eur_ask}")
             if not args.skip_btc:
-                btc_bid, btc_ask = replay_symbol(BTC, next_id)
+                btc_bid, btc_ask = replay_symbol(BTC, next_id, bias)
                 parts.append(f"BTCUSDT {btc_bid}/{btc_ask}")
             print(f"[{iteration}] " + "  ".join(parts), flush=True)
         except (OSError, urllib.error.URLError, KeyError, ValueError) as error:
             print(f"[{iteration}] replay error: {error}", flush=True)
-        time.sleep(max(args.interval, 0.05))
+        elapsed = time.monotonic() - started
+        time.sleep(max(args.interval - elapsed, 0.05))
 
 
 if __name__ == "__main__":
