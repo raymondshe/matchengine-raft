@@ -1845,6 +1845,7 @@ dependencies = [
  "env_logger",
  "futures",
  "i256",
+ "libc",
  "openraft",
  "postcard",
  "prost",
