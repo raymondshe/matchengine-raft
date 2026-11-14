@@ -211,7 +211,7 @@ open http://127.0.0.1:8099/
 
 | Component | Namespace | Address / image | Notes |
 |---|---|---|---|
-| Manager API + GUI | `match-control` | `matchengine-k8s-control-plane:local`, port `8099` | Embedded GUI at `/`; catalog at `/data/catalog.json` (emptyDir in the demo) |
+| Manager API + GUI | `match-control` | `matchengine-k8s-control-plane:local`, port `8099` | Embedded GUI at `/`; JSON demo at `/data/catalog.json` or CRD mode through the API server |
 | Engine shard | `match-eu-1` | `matchengine-raft:k8s-nonroot` | Four voters; one engine process per symbol |
 | Supervisor pod | engine shard pods | `/health`, `/ready`, `/processes` on `9090` | One container per pod; children are one-process engines |
 | Engine console | each engine HTTP port | `/console/` | The manager reverse-proxies it; the symbol is the hero label |
@@ -261,10 +261,42 @@ kubectl -n match-control expose deployment match-manager --port=8099 --target-po
 kubectl -n match-control rollout status deploy/match-manager --timeout=120s
 ```
 
-Add a writable volume at `/data` and pass `--state /data/catalog.json` for a durable catalog; the
-live demo uses an `emptyDir`, so a manager rollout reseeds the 3-shard demo catalog. See
-[Catalog persistence and manager restarts](#catalog-persistence-and-manager-restarts) for the PVC
-and patch, or recreate the catalog through the API after a rollout.
+Add a writable volume at `/data` and pass `--state /data/catalog.json` for the JSON demo catalog;
+the live demo uses an `emptyDir`, so a manager rollout reseeds the 3-shard demo catalog. For
+production desired state, use CRD mode instead (see below).
+
+#### CRD mode (recommended for production)
+
+Desired state lives in `matching.io` CRDs and is persisted by the Kubernetes API server; the
+manager never connects to etcd directly. Install the CRDs and RBAC first:
+
+```sh
+cargo run --manifest-path demos/k8s_control_plane/Cargo.toml -- crds \
+  | kubectl apply -f -
+kubectl apply -f demos/k8s_control_plane/deploy/rbac.yaml
+```
+
+The manager pod must use the `match-manager` ServiceAccount and mount its token. The demo manifest
+currently sets `automountServiceAccountToken: false`, so patch it:
+
+```sh
+kubectl -n match-control patch deploy match-manager --type=merge \
+  -p '{"spec":{"template":{"spec":{"serviceAccountName":"match-manager","automountServiceAccountToken":true}}}}'
+```
+
+Run the manager with `--crd --no-seed` for a real cluster. The cache is bootstrapped by listing the
+CRDs and then refreshed by one informer per kind:
+
+```sh
+kubectl -n match-control set args deploy/match-manager -- \
+  serve --addr 0.0.0.0:8099 --crd --crd-namespace match-eu-1 --no-seed
+kubectl -n match-control rollout status deploy/match-manager --timeout=120s
+```
+
+`GET /api/v1/health` reports `"store":"crd"` in this mode. Status writes use the `/status`
+subresource and are rate-limited per object; audit history remains in memory in the demo and must
+move to an external append-only store in production. Engine WAL/snapshot, order-book, match-event
+and market-data payloads never go into CRDs/etcd.
 
 The manager needs network access to engine pods for the console proxy. The rendered NetworkPolicy
 allows HTTP from namespaces labelled `matching.io/role=control-plane`; keep that label if you serve
@@ -612,14 +644,36 @@ Reuse the original slots, HTTP ports and replica count. Raft membership stores t
 a recreated shard on different ports will not rejoin the old group. If a PVC is missing, that
 engine's data is gone and it must be initialized and configured from scratch.
 
-### Catalog persistence and manager restarts
+### Desired-state persistence and manager restarts
 
-The reference manager manifest already passes `--state /data/catalog.json`, but `/data` is an
-`emptyDir` in the demo Deployment. The catalog survives a process restart in the same pod, but a
-Deployment rollout or pod replacement reseeds the 3-shard demo catalog and loses symbols, routes,
-disabled states and audit history.
+**CRD mode (recommended).** Desired state lives in the `matching.io` CRDs, so a manager rollout or
+pod replacement has no catalog to lose: the new pod lists the CRDs and rebuilds its cache from
+informers. No PVC is needed for desired state. Back up before upgrades or destructive operations:
 
-For durability across pod replacement, back `/data` with a PVC:
+```sh
+# Selective catalog export (JSON, desired state only).
+cargo run --manifest-path demos/k8s_control_plane/Cargo.toml -- \
+  crd-backup --out /tmp/crd-catalog.json
+
+# Cluster-wide backup covers all CRs too.
+# etcd snapshot procedure depends on the managed Kubernetes provider.
+```
+
+Restore is selective and ordered: restore CRs first, then let the operator materialize workloads,
+then recover engine PVCs. `crd-restore` validates the JSON and writes the CRs through the API
+server:
+
+```sh
+cargo run --manifest-path demos/k8s_control_plane/Cargo.toml -- \
+  crd-restore --input /tmp/crd-catalog.json
+```
+
+Audit/action history is not part of CRDs. Use the external audit store for that. Engine data lives
+on the PVCs and is backed up separately with `VolumeSnapshot`/`VolumeGroupSnapshot`.
+
+**JSON demo fallback.** `serve --state /data/catalog.json` still works for local demos. The
+reference manifest uses an `emptyDir`, so a Deployment rollout reseeds the 3-shard demo catalog and
+loses symbols, routes, disabled states and audit history unless you back `/data` with a PVC:
 
 ```yaml
 apiVersion: v1
@@ -644,22 +698,20 @@ kubectl -n match-control patch deploy match-manager --type=json \
 kubectl -n match-control rollout status deploy/match-manager --timeout=120s
 ```
 
-Before any manager rollout, export the catalog and keep it with the shard/bundle JSON:
-
-```sh
-curl -s http://127.0.0.1:8099/api/v1/catalog > /tmp/manager-catalog.json
-```
-
-After a restart, recreate the desired state through `POST /api/v1/bundles`,
-`POST /api/v1/shards` and `POST /api/v1/symbols`. This does not restart engines; it only rebuilds
-the manager's view. `POST /api/v1/shards/{shard}/simulate?scenario=ready` only makes the demo GUI's
-synthesized route status honest and never changes engine state.
+In JSON mode, export the catalog before any manager rollout and recreate desired state through
+`POST /api/v1/bundles`, `POST /api/v1/shards` and `POST /api/v1/symbols` if the file is lost. This
+does not restart engines; it only rebuilds the manager's view.
+`POST /api/v1/shards/{shard}/simulate?scenario=ready` only makes the demo GUI's synthesized route
+status honest and never changes engine state.
 
 ### Troubleshooting
 
 | Symptom | Check |
 |---|---|
-| Manager pod restarted and the catalog looks like the 3-shard demo | The `/data` volume is an `emptyDir` or `--state` was not set; recreate from the saved catalog/bundles or back `/data` with a PVC. |
+| Manager pod restarted and the catalog looks like the 3-shard demo | JSON mode only: `/data` is an `emptyDir` or `--state` was not set. Use CRD mode or recreate from the saved catalog/bundles. CRD mode rebuilds from CRDs. |
+| `kubernetes_api` 403 in CRD mode | The manager ServiceAccount lacks RBAC or its token is not mounted. Apply `deploy/rbac.yaml`, set `serviceAccountName: match-manager`, and `automountServiceAccountToken: true`. |
+| `kubernetes_api` 404 in CRD mode | The five `matching.io` CRDs are not installed. Run `cargo run -- crds \| kubectl apply -f -`. |
+| CRD manager starts with an empty catalog | No CRs exist in the listed namespaces, or list/watch RBAC is missing. Restore with `crd-restore` or create symbols/shards through the API. |
 | `ImagePullBackOff` / old engine console without the symbol header | The image was rebuilt but the pod was not recreated. Use `imagePullPolicy: IfNotPresent`, then `kubectl -n match-eu-1 rollout restart statefulset/<shard>` and wait for `/ready`. |
 | `409 restart_required` on add/stop/start | The shard is containers mode with other active engines; use supervisor mode, an empty shard, or explicitly opt into `allowRestart`. |
 | `409 shard_not_idle` on drop | Stop every symbol in the shard first; the error names the active ones. Apply the updated ConfigMap before retrying. |
@@ -679,11 +731,15 @@ synthesized route status honest and never changes engine state.
 
 ### Cleanup and teardown
 
-Full demo wipe (deletes all engine data, retained PVCs included):
+Full demo wipe (deletes all engine data, retained PVCs and CRDs included):
 
 ```sh
+# Export CRD desired state first if you may restore it later and use CRD mode.
+cargo run --manifest-path demos/k8s_control_plane/Cargo.toml -- \
+  crd-backup --out /tmp/crd-catalog.json || true
 kubectl delete namespace match-control
 kubectl delete namespace match-eu-1
+kubectl delete -f demos/k8s_control_plane/deploy/crds.yaml --ignore-not-found
 ```
 
 Safe teardown that keeps data:

@@ -3,12 +3,14 @@
 Reference implementation of the design in
 [`docs/KUBERNETES_CONTROL_PLANE.md`](../../docs/KUBERNETES_CONTROL_PLANE.md): the CRD-shaped
 catalog, preflight validation, Kubernetes manifest rendering, and the operator's reconcile
-decision logic for hundreds of single-symbol Raft shards.
+decision logic for thousands of single-symbol Raft shards.
 
-This is a **demo crate**, not production infrastructure. It has no Kubernetes client, no
-controller loop, no database and no authentication. It exists to make the design executable and
-testable: one command renders the exact manifest set, one command prints what the operator would
-do next, and the embedded GUI shows the catalog, validation report and reconcile plan.
+This is a **reference manager**, not a production operator. It has either a JSON demo store or a
+CRD-backed store that writes through the Kubernetes API server; it has no controller loop, no
+admission webhooks and no authentication. It exists to make the design executable and testable:
+one command renders the exact manifest set, one command prints what the operator would do next,
+and the embedded GUI shows the catalog, validation report and reconcile plan. It never connects to
+etcd directly.
 
 [![Kubernetes control plane, supervisor and engine console](../../docs/kubernetes-console-architecture.png)](../../docs/kubernetes-console-architecture.html)
 
@@ -27,10 +29,12 @@ demos/k8s_control_plane/
 ├── src/validate.rs    placement, port, resource, symbol and asset rules
 ├── src/render.rs      StatefulSet / Services / PDB / NetworkPolicy / ConfigMap
 ├── src/reconcile.rs   bootstrap, membership, config, routing and upgrade plans
-├── src/store.rs       in-memory catalog with JSON persistence and audit
+├── src/store.rs       catalog cache, CatalogStore abstraction and JSON/memory backends
+├── src/crd.rs         CRD definitions, conversions, informers and the CRD-backed store
 ├── src/api.rs         Axum manager API
 ├── src/gui.rs         embedded single-page GUI
-├── src/main.rs        serve | render | validate | plan | seed
+├── src/main.rs        serve | render | validate | plan | seed | crds | crd-backup | crd-restore
+├── deploy/            generated CRDs and least-privilege RBAC
 └── examples/          demo ShardBundle JSON files
 ```
 
@@ -44,8 +48,19 @@ cd demos/k8s_control_plane
 # Manager GUI + API on http://127.0.0.1:8099/
 cargo run -- serve
 
-# Same, with a persisted catalog (seeded on first start)
+# Same, with a persisted JSON catalog (seeded on first start)
 cargo run -- serve --state /tmp/matchengine-k8s-control-plane/catalog.json
+
+# CRD-backed desired state through the Kubernetes API server (never direct etcd)
+cargo run -- serve --crd --crd-namespace match-eu-1
+
+# Install the CRDs and least-privilege RBAC
+cargo run -- crds | kubectl apply -f -
+kubectl apply -f deploy/rbac.yaml
+
+# Export/restore a CRD catalog (pass KUBECONFIG or run in-cluster)
+cargo run -- crd-backup --out /tmp/crd-catalog.json
+cargo run -- crd-restore --input /tmp/crd-catalog.json
 
 # Render a shard (JSON List; kubectl accepts it directly)
 cargo run -- render --shard fx-eu-01 --profile local > fx.json
@@ -73,6 +88,63 @@ The demo catalog contains three shards:
 
 Every shard has four voters. The Raft port is always the HTTP port + 1000. Each process is the
 existing single-symbol engine binary; packing does not merge Raft groups.
+
+## CRD-backed desired state
+
+The manager has two persistence backends behind the `CatalogStore` abstraction:
+
+- **JSON/memory** (default): `serve` or `serve --state <file>` for the offline demo.
+- **CRD**: `serve --crd --crd-namespace <ns>` writes `TradingSymbol`, `SymbolShard`,
+  `SymbolDeployment`, `SymbolRoute` and `Cell` CRs through the Kubernetes API server. etcd stores
+  them underneath, but the manager never opens an etcd connection.
+
+Install the generated CRDs and least-privilege RBAC first:
+
+```sh
+cargo run -- crds | kubectl apply -f -
+kubectl apply -f deploy/rbac.yaml
+```
+
+The manager container must use the `match-manager` ServiceAccount and mount its token:
+
+```yaml
+spec:
+  serviceAccountName: match-manager
+  automountServiceAccountToken: true
+```
+
+A manager started with `--crd` and no existing objects seeds the built-in demo catalog unless
+`--no-seed` is passed. For a real cluster use `--no-seed` and restore/create objects explicitly.
+
+### Data ownership
+
+| Data | Store |
+|---|---|
+| Desired state (`TradingSymbol`, `SymbolShard`, `SymbolDeployment`, `SymbolRoute`, `Cell`) | CRDs through the Kubernetes API server |
+| Status/conditions/leader address | CRD `/status` subresource, rate-limited to one write per object per second |
+| Audit/action history | In-memory in the demo; production should use an append-only store, not etcd |
+| Engine WAL/snapshot/order book/events/market data | Engine PVC and feed, never CRDs/etcd |
+| Console live snapshots and selected tab | Ephemeral; rebuilt from engine APIs |
+
+The cache is bootstrapped by listing all namespaces and then refreshed by one watcher per kind.
+Writes use `resourceVersion` optimistic concurrency; a stale object fails rather than overwriting
+a newer one. `crd.rs` deliberately keeps specs compact and rejects the temptation to store rendered
+manifests, event data or engine payloads in CRs.
+
+### Backup and restore
+
+`crd-backup` exports the live CRD catalog as the same JSON format used by the demo. `crd-restore`
+validates it and writes the objects back through the API server:
+
+```sh
+cargo run -- crd-backup --out /tmp/crd-catalog.json
+cargo run -- crd-restore --input /tmp/crd-catalog.json
+```
+
+The backup is selective (desired state only); audit and engine PVC data are separate. An etcd
+snapshot covers all CRs in the cluster, while `crd-backup` is useful for a single catalog export
+and for comparing against the operator's view. Restore order is: CRs first, then workloads, then
+PVCs/engine recovery.
 
 ## Manager API
 
@@ -416,8 +488,9 @@ cargo test --manifest-path demos/k8s_control_plane/Cargo.toml
 ```
 
 The suite covers the CRD model, validation rules, renderer output (including the stable supervisor
-pod template and disabled-process filtering), JSON persistence, every API endpoint (including the
-containers restart guard, the supervisor zero-impact shutdown, the retained-data start and the
+pod template and disabled-process filtering), JSON persistence, the CRD manifests/status
+subresources, catalog ↔ CRD backup/restore and spec/status diffing, every API endpoint (including
+the containers restart guard, the supervisor zero-impact shutdown, the retained-data start and the
 idle-shard drop with both storage choices), and each planner path (fresh bootstrap, blocked
 bootstrap, membership drift, config drift, leader loss, rolling upgrade, stop-the-world backup gate,
 paused shard, disabled processes). The root crate adds `tests/cluster/test_supervisor.rs`, which
@@ -429,18 +502,22 @@ workspace or CI yet. To add it, mirror the `demos/order_system` CI steps in
 
 ## Deliberate limitations
 
-- No Kubernetes client/controller, no CRD installation, no admission webhooks, no `Lease`
-  leader election. The operator is still a design.
+- No operator/controller, admission webhooks or `Lease` leader election. The CRD store writes
+  desired state and refreshes its cache from informers; reconciling StatefulSets/Services/PVCs is
+  still the operator's job.
 - Supervisor mode is implemented as a reference pod agent (`src/bin/match_supervisor.rs`); it
   manages children under the shared container CPU/memory limit. Per-process cgroups, log rotation
   and a production-grade supervisor control API remain future work.
 - Status is synthesized for the demo; there is no per-process status endpoint in the engine yet
-  (phase 2 in the design doc).
-- Backups are planned but not executed; the demo has no `VolumeGroupSnapshot` integration.
+  (phase 2 in the design doc). CRD status writes are rate-limited coalescing writes, not a full
+  operator status controller.
+- Engine PVC backups are planned but not executed; the demo has no `VolumeGroupSnapshot`
+  integration. CRD backup/restore is implemented.
 - No authentication or authorization. The real manager and operator sit behind the platform's
   SSO and RBAC; the public engine edge remains plaintext behind the gateway.
-- JSON persistence replaces Postgres; there is no multi-user concurrency control beyond one
-  process-wide lock and the audit trail.
+- The demo audit log is in-memory. Production audit belongs in an append-only store, not etcd.
+  There is no multi-user concurrency control beyond the write mutex and Kubernetes
+  `resourceVersion` checks.
 
 The engine interface used by the plans is real: `/init`, `/add-learner`,
 `/change-membership`, `/write {"ConfigureSymbol": …}`, `/read symbol_config`, `/ready`,

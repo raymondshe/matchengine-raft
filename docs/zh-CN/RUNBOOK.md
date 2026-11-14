@@ -204,7 +204,7 @@ open http://127.0.0.1:8099/
 
 | 组件 | 命名空间 | 地址/镜像 | 说明 |
 |---|---|---|---|
-| Manager API + GUI | `match-control` | `matchengine-k8s-control-plane:local`, 端口 `8099` | GUI 在 `/`；目录位于 `/data/catalog.json`（演示使用 emptyDir） |
+| Manager API + GUI | `match-control` | `matchengine-k8s-control-plane:local`, 端口 `8099` | GUI 在 `/`；JSON 演示目录位于 `/data/catalog.json`，生产可使用 CRD 模式 |
 | 引擎 shard | `match-eu-1` | `matchengine-raft:k8s-nonroot` | 四个 voter；每个 symbol 一个引擎进程 |
 | Supervisor Pod | 引擎 shard Pod | `9090` 上的 `/health`、`/ready`、`/processes` | 每个 Pod 一个容器；子进程是单 symbol 引擎 |
 | 引擎控制台 | 各引擎 HTTP 端口 | `/console/` | 管理器反向代理；symbol 是页面标题 |
@@ -255,8 +255,38 @@ kubectl -n match-control rollout status deploy/match-manager --timeout=120s
 ```
 
 如需目录持久化，给 `/data` 挂载可写卷并传 `--state /data/catalog.json`。当前演示使用
-`emptyDir`，因此管理器滚动更新会重新播种 3 个 shard 的演示目录。PVC 和 patch 方法见
-[目录持久化和管理器重启](#目录持久化和管理器重启)。
+`emptyDir`，因此管理器滚动更新会重新播种 3 个 shard 的演示目录。生产环境应使用下面的 CRD 模式。
+
+#### CRD 模式（生产推荐）
+
+期望状态存放在 `matching.io` CRD 中，由 Kubernetes API server（底层 etcd）持久化；管理器
+不会直接连接 etcd。先安装 CRD 和 RBAC：
+
+```sh
+cargo run --manifest-path demos/k8s_control_plane/Cargo.toml -- crds \
+  | kubectl apply -f -
+kubectl apply -f demos/k8s_control_plane/deploy/rbac.yaml
+```
+
+管理器 Pod 必须使用 `match-manager` ServiceAccount 并挂载 token。演示 manifest 当前设置
+`automountServiceAccountToken: false`，需要 patch：
+
+```sh
+kubectl -n match-control patch deploy match-manager --type=merge \
+  -p '{"spec":{"template":{"spec":{"serviceAccountName":"match-manager","automountServiceAccountToken":true}}}}'
+```
+
+真实集群使用 `--crd --no-seed` 启动管理器。缓存先通过 list 构建，再由每种 CRD 的 informer 刷新：
+
+```sh
+kubectl -n match-control set args deploy/match-manager -- \
+  serve --addr 0.0.0.0:8099 --crd --crd-namespace match-eu-1 --no-seed
+kubectl -n match-control rollout status deploy/match-manager --timeout=120s
+```
+
+该模式下 `GET /api/v1/health` 返回 `"store":"crd"`。状态通过 `/status` 子资源写入，并按对象限速；
+演示的审计历史仍在内存中，生产应写入外部 append-only 存储。引擎 WAL/snapshot、订单簿、撮合事件
+和行情数据永远不进入 CRD/etcd。
 
 管理器需要能访问引擎 Pod 以提供控制台代理。渲染出的 NetworkPolicy 允许来自带
 `matching.io/role=control-plane` 标签命名空间的 HTTP；如果 GUI 部署在其他命名空间，请保留该标签。
@@ -589,13 +619,34 @@ reserved，本来就没有工作负载需要 prune；目录返回 `404` 就是�
 必须复用原来的 slot、HTTP 端口和副本数。Raft 成员关系保存 peer 地址；用不同端口重建的 shard
 无法重新加入旧组。如果某个 PVC 丢失，该引擎的数据就不存在了，必须重新初始化和配置。
 
-### 目录持久化和管理器重启
+### 期望状态持久化和管理器重启
 
-参考管理器 manifest 已经传入 `--state /data/catalog.json`，但演示 Deployment 的 `/data` 是
-`emptyDir`。目录能在同一个 Pod 内跨进程重启保留，但 Deployment 滚动或 Pod 替换会重新播种
-3 shard 的演示目录，并丢失 symbols、routes、Disabled 状态和审计历史。
+**CRD 模式（推荐）。** 期望状态存放在 `matching.io` CRD 中，因此管理器滚动或 Pod 替换不会
+丢失目录：新 Pod 会 list CRD 并从 informer 重建缓存，不需要为期望状态挂载 PVC。升级或破坏性
+操作前先备份：
 
-要在 Pod 替换后仍保留目录，请用 PVC 挂载 `/data`：
+```sh
+# 选择性导出目录（JSON，只包含期望状态）。
+cargo run --manifest-path demos/k8s_control_plane/Cargo.toml -- \
+  crd-backup --out /tmp/crd-catalog.json
+
+# 集群级备份：etcd 快照同样覆盖所有 CR；具体命令取决于托管 Kubernetes 提供商。
+```
+
+恢复顺序是：先恢复 CR，再由 operator 物化工作负载，最后恢复引擎 PVC。`crd-restore` 会校验
+JSON 并通过 API server 写回 CRD：
+
+```sh
+cargo run --manifest-path demos/k8s_control_plane/Cargo.toml -- \
+  crd-restore --input /tmp/crd-catalog.json
+```
+
+审计/操作历史不属于 CRD，应使用外部审计存储。引擎数据在 PVC 中，使用
+`VolumeSnapshot`/`VolumeGroupSnapshot` 单独备份。
+
+**JSON 演示回退。** `serve --state /data/catalog.json` 仍可用于本地演示。参考 manifest 使用
+`emptyDir`，所以 Deployment 滚动会重新播种 3 shard 演示目录，并丢失 symbols、routes、
+Disabled 状态和审计历史，除非给 `/data` 挂载 PVC：
 
 ```yaml
 apiVersion: v1
@@ -620,21 +671,19 @@ kubectl -n match-control patch deploy match-manager --type=json \
 kubectl -n match-control rollout status deploy/match-manager --timeout=120s
 ```
 
-任何管理器滚动前，先导出目录，并与 shard/bundle JSON 一起保存：
-
-```sh
-curl -s http://127.0.0.1:8099/api/v1/catalog > /tmp/manager-catalog.json
-```
-
-重启后通过 `POST /api/v1/bundles`、`POST /api/v1/shards` 和 `POST /api/v1/symbols` 重建期望
-状态。这不会重启引擎，只重建管理器的视图。`POST /api/v1/shards/{shard}/simulate?scenario=ready`
-只让演示 GUI 的合成路由状态更真实，不会改变引擎状态。
+JSON 模式下，任何管理器滚动前先导出目录；如果文件丢失，通过 `POST /api/v1/bundles`、
+`POST /api/v1/shards` 和 `POST /api/v1/symbols` 重建期望状态。这不会重启引擎，只重建管理器
+视图。`POST /api/v1/shards/{shard}/simulate?scenario=ready` 只让演示 GUI 的合成路由状态更真实，
+不会改变引擎状态。
 
 ### 故障排查
 
 | 现象 | 检查 |
 |---|---|
-| 管理器 Pod 重启后目录变成 3-shard 演示 | `/data` 是 `emptyDir` 或未传 `--state`；用保存的目录/bundle 重建，或给 `/data` 挂载 PVC。 |
+| 管理器 Pod 重启后目录变成 3-shard 演示 | 仅 JSON 模式：`/data` 是 `emptyDir` 或未传 `--state`。改用 CRD 模式，或用保存的目录/bundle 重建；CRD 模式会从 CRD 重建。 |
+| CRD 模式返回 `kubernetes_api` 403 | 管理器 ServiceAccount 缺少 RBAC 或 token 未挂载。应用 `deploy/rbac.yaml`，设置 `serviceAccountName: match-manager` 和 `automountServiceAccountToken: true`。 |
+| CRD 模式返回 `kubernetes_api` 404 | 五个 `matching.io` CRD 未安装。运行 `cargo run -- crds \| kubectl apply -f -`。 |
+| CRD 管理器启动后目录为空 | 所列命名空间中没有 CR，或缺少 list/watch RBAC。用 `crd-restore` 恢复，或通过 API 创建 shard/symbol。 |
 | `ImagePullBackOff` / 引擎控制台没有 symbol 标题 | 镜像已重建但 Pod 未重建。使用 `imagePullPolicy: IfNotPresent`，然后 `kubectl -n match-eu-1 rollout restart statefulset/<shard>` 并等待 `/ready`。 |
 | 添加/停止/启动返回 `409 restart_required` | shard 是 containers 模式且还有其他活跃引擎；改用 supervisor shard、空 shard，或显式允许 `allowRestart`。 |
 | 删除返回 `409 shard_not_idle` | 先停止 shard 中所有 symbol；错误会列出活跃项。Apply 更新后的 ConfigMap 后重试。 |
@@ -654,11 +703,15 @@ curl -s http://127.0.0.1:8099/api/v1/catalog > /tmp/manager-catalog.json
 
 ### 清理
 
-完整删除演示环境（包括所有引擎数据和保留的 PVC）：
+完整删除演示环境（包括所有引擎数据、保留的 PVC 和 CRD）：
 
 ```sh
+# 如果使用 CRD 模式且以后可能需要恢复，先导出期望状态。
+cargo run --manifest-path demos/k8s_control_plane/Cargo.toml -- \
+  crd-backup --out /tmp/crd-catalog.json || true
 kubectl delete namespace match-control
 kubectl delete namespace match-eu-1
+kubectl delete -f demos/k8s_control_plane/deploy/crds.yaml --ignore-not-found
 ```
 
 保留数据的安全清理：

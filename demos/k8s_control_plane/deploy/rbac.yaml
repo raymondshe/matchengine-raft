@@ -1,0 +1,48 @@
+# Least-privilege RBAC for the CRD-backed manager.
+#
+# Apply the CRDs first:
+#   cargo run --manifest-path demos/k8s_control_plane/Cargo.toml -- crds \
+#     | kubectl apply -f -
+#
+# The manager needs list/watch to rebuild its cache, create/update/delete for desired state and
+# the /status subresource for the demo's simulated observations. It never talks to etcd directly.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: match-manager
+  namespace: match-control
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: match-manager-crd
+rules:
+  - apiGroups: ["matching.io"]
+    resources:
+      - cells
+      - symbolshards
+      - tradingsymbols
+      - symboldeployments
+      - symbolroutes
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["matching.io"]
+    resources:
+      - cells/status
+      - symbolshards/status
+      - tradingsymbols/status
+      - symboldeployments/status
+      - symbolroutes/status
+    verbs: ["get", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: match-manager-crd
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: match-manager-crd
+subjects:
+  - kind: ServiceAccount
+    name: match-manager
+    namespace: match-control

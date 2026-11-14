@@ -24,7 +24,9 @@ TLS/authentication stays at the gateway and is out of scope for this process.
 
 The Kubernetes control-plane design and reference demo are complete (§18): reserved and supervisor
 shards, create-symbol/migrate planning, a zero-impact supervisor pod agent, and a containers-mode
-restart guard. The real cell operator and production manager remain.
+restart guard. The reference manager now has both a JSON demo store and a CRD-backed desired-state
+store that writes through the Kubernetes API server (etcd underneath). The next production step is
+the real cell operator; production manager security and supervisor hardening remain.
 
 Priority key: **P0** = known correctness/security defect, do next; **P1** = correctness coverage,
 measurement and production readiness; **P2** = important but not blocking; **P3** = later/optional.
@@ -39,8 +41,23 @@ risk is covered by the delivery contract: client retries are at-least-once and u
 write, so read-after-write is not a guarantee; clients that need it must await the write response.
 
 The Kubernetes control plane is a new feature workstream, not a defect (§18). The design, reference
-manager, reserved/supervisor shards and zero-impact supervisor additions are done; the real cell
-operator, production manager and supervisor hardening are the remaining P1/P2 work.
+manager, reserved/supervisor shards, zero-impact supervisor additions and CRD-backed desired state
+are done. The next P1 workstream is the real cell operator, supervisor hardening and the remaining
+lifecycle execution.
+
+**P1 - production control-plane completion**
+
+- **CRD-backed desired state (done 2026-11-14).** Five CRDs with status subresources and printer
+  columns, `CatalogStore`/`CrdCatalogStore`, writes through the Kubernetes API server, informer
+  cache, `resourceVersion`, rate-limited status writes, CRD YAML/RBAC and `crd-backup`/`crd-restore`.
+  No direct etcd client; audit stays outside CRDs. The typed schema, scale/soak and full operator
+  remain follow-ups.
+- **Real cell operator.** Lease-based leader election, watches and reconciliation for the CRDs,
+  apply/prune of StatefulSet/Services/PDB/NetworkPolicy/ConfigMap, leader Service labels, status
+  conditions and route status.
+- **Production lifecycle execution.** Operator-driven containers-mode add/start/stop rolls,
+  supervisor hardening (cgroups, log rotation, orphan cleanup, backpressure), retention-window
+  deletion and migration cutover/drain/rollback.
 
 The remaining P2 evidence gaps are second-host behaviour, not code paths: the four OrbStack
 containers share one kernel, host and clock, and the Aeron multicast run is loopback within one
@@ -1208,7 +1225,9 @@ Design: [`docs/KUBERNETES_CONTROL_PLANE.md`](./docs/KUBERNETES_CONTROL_PLANE.md)
 [`docs/KUBERNETES_LOCAL_TESTING.md`](./docs/KUBERNETES_LOCAL_TESTING.md). Reference demo:
 [`demos/k8s_control_plane/`](./demos/k8s_control_plane/README.md). Supervisor:
 [`src/bin/match_supervisor.rs`](./src/bin/match_supervisor.rs). The engine remains one symbol per
-process; a `SymbolShard` is four pods and each process is its own four-voter Raft group.
+process; a `SymbolShard` is four pods and each process is its own four-voter Raft group. The
+reference manager's JSON catalog is a demo/interchange format; production desired state should be
+CRDs persisted by the Kubernetes API server (etcd underneath), with audit kept outside etcd.
 
 Done (2026-11-14):
 
@@ -1216,7 +1235,14 @@ Done (2026-11-14):
   `SymbolRoute`, slot/port ownership, four-voter bootstrap, storage/PVC, NetworkPolicy, probes,
   upgrades, backups and migration.
 - [x] **P1** Reference manager crate with model, bundle, validation, renderer, reconcile planner,
-  JSON store, Axum API, embedded GUI and CLI; 104 lib + 1 bin tests.
+  JSON store, Axum API, embedded GUI and CLI; 112 lib + 1 bin tests.
+- [x] **P1** CRD-backed desired state: five CRDs (`TradingSymbol`, `SymbolShard`,
+  `SymbolDeployment`, `SymbolRoute`, `Cell`) with status subresources, printer columns, generated
+  YAML and schema tests; `CatalogStore`/`CrdCatalogStore` writing through the Kubernetes API
+  server, informer-cache refresh, `resourceVersion` concurrency, rate-limited status writes, RBAC,
+  and `crds`/`crd-backup`/`crd-restore` commands with backup/restore and diff tests. No direct etcd
+  client; audit stays outside CRDs. Verified against the OrbStack API server in an isolated
+  namespace (26 CRs restored, informer cache updated, API-created symbol persisted as CRs).
 - [x] **P1** Reserved/empty shards (`phase: Reserved`); containers mode renders no StatefulSet
   until the first placement, while supervisor mode pre-warms the supervisor pods with an empty
   `processes.json`.
@@ -1264,12 +1290,23 @@ Done (2026-11-14):
   stability; supervisor config unit tests; manager API/provision/render/plan tests; fmt and Clippy
   clean.
 
-Remaining:
+Remaining (priority order is top to bottom within each tier):
 
-- [ ] **P1** Implement the real cell operator: CRD schemas/install, Lease election, watches and
+#### Control-plane data ownership
+
+| Data | Store | Rule |
+|---|---|---|
+| Desired state (`TradingSymbol`, `SymbolShard`, `SymbolDeployment`, `SymbolRoute`, `Cell`) | CRDs through the Kubernetes API server (etcd underneath) | Source of truth; the manager writes CRs, never etcd directly |
+| Status, conditions, `observedGeneration`, leader address | CR status subresource | Keep compact and rate-limit status writes |
+| Audit/action history | External append-only store (Postgres, object storage or log system) | Not etcd; Kubernetes Events expire |
+| Engine WAL/snapshot/order book/match events/market data | Engine PVC and feed | Never etcd |
+| Console live snapshots, selected shard, ephemeral UI state | Memory or live engine APIs | Not persisted |
+
+- [ ] **P1** Implement the real cell operator: CRD install, Lease election, watches and
   reconciliation for `SymbolShard`/`SymbolDeployment`/`SymbolRoute`/`Cell`, apply/prune of the
   StatefulSet/Services/PDB/NetworkPolicy/ConfigMap, leader Service labels, status conditions and
-  route status. The demo only renders and plans; it has no Kubernetes client.
+  route status. The demo only renders and plans; it has no Kubernetes client. Depends on the
+  CRD-backed store above.
 - [ ] **P1** Operator-driven containers-mode add: update the StatefulSet, delete/recreate pods one
   at a time, wait for readiness and a leader, verify quorum, then `/init` and configure the new
   process. The API creates desired state and enforces the restart guard, but the roll itself is
@@ -1285,17 +1322,20 @@ Remaining:
   source data, and provides rollback. `migrate` currently creates the shadow and plan only.
 - [ ] **P1** Wire the standalone `demos/k8s_control_plane` crate into CI (fmt, Clippy, tests). The
   root cluster suite already covers the supervisor; the demo crate is outside the workspace.
-- [ ] **P2** Production manager: Postgres instead of JSON, OIDC/RBAC, approvals, durable audit,
-  idempotency keys, namespace-qualified paths, pagination and dry-run diffs.
+- [ ] **P2** Production manager: OIDC/RBAC, approvals, idempotency keys, namespace-qualified
+  paths, pagination and dry-run diffs. Desired state stays in CRDs; use Postgres/object storage
+  only for audit, a query/read model or long-term history, not as a second source of truth.
 - [ ] **P2** Manager deployment packaging: checked-in Deployment/Service/RBAC/Pod Security/
-  NetworkPolicy, Helm/Kustomize, image digest pinning/publishing and a PVC for catalog state.
-  The live demo used a local image, an emptyDir and a port-forward.
+  NetworkPolicy, Helm/Kustomize, image digest pinning/publishing and etcd/CRD backup integration.
+  No PVC is needed for desired state; an optional volume is only for audit/export caches. The live
+  demo used a local image, an emptyDir and a port-forward.
 - [ ] **P2** Gateway integration: leader-aware routing from `SymbolRoute.status`, shadow/cutover/
   drain, retries and a canary path. No gateway is deployed in the demo.
 - [ ] **P2** Observability: a Prometheus text bridge for the engine's JSON `/metrics`, alert rules,
   dashboards and log shipping; the console's peer view is covered by the NetworkPolicy rule.
-- [ ] **P2** Backup/restore execution: `VolumeGroupSnapshot`/`VolumeSnapshot` integration, a
-  backup agent, checksums and a restore test. The demo plans backups but does not run them.
+- [ ] **P2** Backup/restore execution: `VolumeGroupSnapshot`/`VolumeSnapshot` integration for
+  engine PVCs, plus etcd/CRD backup and selective CR restore; a backup agent, checksums and a
+  restore test. The demo plans backups but does not run them.
 - [ ] **P2** Capacity and packing policy: tenant/owner placement, quotas, capacity accounting,
   noisy-neighbour detection and hot-symbol promotion. Auto placement currently chooses the most
   packed zero-impact shard.
@@ -1304,15 +1344,17 @@ Remaining:
   `kubectl`/`curl` steps. Add the repeatable script/runbook.
 - [ ] **P2** Security: manager OIDC and console-proxy authorization, approvals for destructive
   actions, NetworkPolicy tests and Pod Security Standards. The demo manager has no auth.
+- [ ] **P2** Scale and soak the CRD path: thousands of symbols/CRs across shards and cells, status
+  churn, API-server/etcd size and backup/restore, manager informer memory and operator workqueue
+  latency. No real engine load is required.
 - [ ] **P3** GUI: live cluster status instead of simulated observations, migration/promote forms,
   approvals, filters/pagination, diff/rollback and SSE/WebSocket updates.
 - [ ] **P3** CLI `create-shard`, `create-symbol` and `migrate` commands for automation; the
   API/GUI are implemented today.
-- [ ] **P3** Generated CRD YAML/OpenAPI, admission validation/defaulting and schema tests.
+- [ ] **P3** OpenAPI client, admission validation/defaulting and schema tests beyond the CRD YAML
+  delivered with the P1 store.
 - [ ] **P3** Multi-cell federation: cell registration/capacity, CR projection and cross-cell
   migration. The demo has one cell.
-- [ ] **P3** Scale test the manager catalog with 50–100 mock shards and 1,000 symbols (L4 in the
-  local test plan); no real engine load.
 - [ ] **P3** Operator-driven rolling upgrades and stop-the-world incompatible upgrades; the
   reconcile planner already returns the sequence, but execution is operator work.
 - [ ] **P3** Documentation: operator metrics, troubleshooting, capacity planning and disaster

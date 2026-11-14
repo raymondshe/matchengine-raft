@@ -6,9 +6,10 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::bundle::ShardBundle;
@@ -131,11 +132,69 @@ pub fn now_epoch() -> u64 {
         .unwrap_or(0)
 }
 
-/// Process-wide catalog with an optional JSON file.
+/// Persistence contract behind [`Store`].
+///
+/// The manager always mutates an in-memory cache first; this backend receives the previous and
+/// next catalog and makes the change durable. The CRD implementation writes through the
+/// Kubernetes API server; it never opens an etcd connection.
+#[async_trait]
+pub trait CatalogStore: Send + Sync {
+    /// Stable name shown by diagnostics.
+    fn mode(&self) -> &'static str;
+
+    /// Persist `after`, given the cache state in `before`.
+    async fn persist(&self, before: &Catalog, after: &Catalog) -> Result<(), ApiError>;
+}
+
+/// No-op backend used by tests and the offline demo.
+#[derive(Debug, Default)]
+pub struct MemoryCatalogStore;
+
+#[async_trait]
+impl CatalogStore for MemoryCatalogStore {
+    fn mode(&self) -> &'static str {
+        "memory"
+    }
+
+    async fn persist(&self, _before: &Catalog, _after: &Catalog) -> Result<(), ApiError> {
+        Ok(())
+    }
+}
+
+/// JSON file backend used by the local demo.
 #[derive(Debug)]
+pub struct JsonCatalogStore {
+    path: PathBuf,
+}
+
+#[async_trait]
+impl CatalogStore for JsonCatalogStore {
+    fn mode(&self) -> &'static str {
+        "json"
+    }
+
+    async fn persist(&self, _before: &Catalog, after: &Catalog) -> Result<(), ApiError> {
+        persist_catalog(&self.path, after)
+    }
+}
+
+/// Process-wide catalog cache plus a pluggable persistence backend.
+///
+/// Writes are serialized by `mutation`; the cache is replaced only after the backend accepts the
+/// new catalog. The CRD backend bootstraps this cache from informers and keeps it refreshed from
+/// Kubernetes watches.
 pub struct Store {
-    state: RwLock<Catalog>,
-    path: Option<PathBuf>,
+    state: Arc<RwLock<Catalog>>,
+    backend: Arc<dyn CatalogStore>,
+    mutation: tokio::sync::Mutex<()>,
+}
+
+impl std::fmt::Debug for Store {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Store")
+            .field("backend", &self.backend.mode())
+            .finish_non_exhaustive()
+    }
 }
 
 impl Store {
@@ -146,8 +205,9 @@ impl Store {
             Catalog::default()
         };
         Self {
-            state: RwLock::new(catalog),
-            path: None,
+            state: Arc::new(RwLock::new(catalog)),
+            backend: Arc::new(MemoryCatalogStore),
+            mutation: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -169,14 +229,63 @@ impl Store {
                 }
             }
         };
-        let store = Self {
-            state: RwLock::new(catalog),
-            path,
+        let backend: Arc<dyn CatalogStore> = match &path {
+            Some(path) => Arc::new(JsonCatalogStore { path: path.clone() }),
+            None => Arc::new(MemoryCatalogStore),
         };
-        if seed_demo && store.path.is_some() {
-            store.persist(&store.snapshot())?;
+        if seed_demo && let Some(path) = &path {
+            persist_catalog(path, &catalog)?;
+        }
+        Ok(Self {
+            state: Arc::new(RwLock::new(catalog)),
+            backend,
+            mutation: tokio::sync::Mutex::new(()),
+        })
+    }
+
+    /// Build a store whose desired state lives in CRDs in the Kubernetes API server.
+    ///
+    /// The cache is bootstrapped by listing the CRDs and then kept fresh by one watcher per kind.
+    /// This uses the normal kubeconfig/in-cluster configuration; there is no direct etcd client.
+    pub async fn crd(default_namespace: String, seed_demo: bool) -> Result<Self, ApiError> {
+        let client = kube::Client::try_default()
+            .await
+            .map_err(|error| ApiError::internal(format!("load Kubernetes client: {error}")))?;
+        let state = Arc::new(RwLock::new(Catalog::default()));
+        let backend = crate::crd::CrdCatalogStore::new(
+            client,
+            state.clone(),
+            default_namespace,
+            std::time::Duration::from_secs(1),
+        )
+        .await?;
+        let store = Self {
+            state,
+            backend: Arc::new(backend),
+            mutation: tokio::sync::Mutex::new(()),
+        };
+        let seedable = {
+            let catalog = store.snapshot();
+            catalog.cells.is_empty() && catalog.shards.is_empty() && catalog.symbols.is_empty()
+        };
+        if seed_demo && seedable {
+            let mut candidate = store.snapshot();
+            for bundle in crate::bundle::demo_bundles() {
+                candidate.insert_bundle(bundle);
+            }
+            candidate.audit(
+                "system",
+                "seed",
+                "crd-catalog",
+                "seeded the built-in demo shards into CRDs",
+            );
+            store.commit(candidate).await?;
         }
         Ok(store)
+    }
+
+    pub fn mode(&self) -> &'static str {
+        self.backend.mode()
     }
 
     pub fn snapshot(&self) -> Catalog {
@@ -187,31 +296,34 @@ impl Store {
     }
 
     /// Apply a mutation and persist the result. The closure returns an `ApiError` to abort
-    /// without changing state.
-    pub fn mutate<T>(
+    /// without changing state. Mutations are serialized; the cache is updated only after the
+    /// backend accepts the candidate.
+    pub async fn mutate<T>(
         &self,
-        f: impl FnOnce(&mut Catalog) -> Result<T, ApiError>,
+        f: impl FnOnce(&mut Catalog) -> Result<T, ApiError> + Send,
     ) -> Result<T, ApiError> {
-        let mut guard = self
+        let _guard = self.mutation.lock().await;
+        let before = self.snapshot();
+        let mut candidate = before.clone();
+        let result = f(&mut candidate)?;
+        self.backend.persist(&before, &candidate).await?;
+        *self
             .state
             .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let before = guard.clone();
-        let result = f(&mut guard)?;
-        if let Some(path) = &self.path
-            && let Err(error) = persist_catalog(path, &guard)
-        {
-            *guard = before;
-            return Err(error);
-        }
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = candidate;
         Ok(result)
     }
 
-    fn persist(&self, catalog: &Catalog) -> Result<(), ApiError> {
-        match &self.path {
-            Some(path) => persist_catalog(path, catalog),
-            None => Ok(()),
-        }
+    /// Replace the whole catalog, used by CRD seeding and restore tooling.
+    pub async fn commit(&self, candidate: Catalog) -> Result<(), ApiError> {
+        let _guard = self.mutation.lock().await;
+        let before = self.snapshot();
+        self.backend.persist(&before, &candidate).await?;
+        *self
+            .state
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = candidate;
+        Ok(())
     }
 }
 
@@ -270,6 +382,58 @@ mod tests {
         drop(store);
         let reopened = Store::open(Some(path.clone()), false).unwrap();
         assert_eq!(reopened.snapshot().shards.len(), snapshot.shards.len());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn memory_store_mutates_through_the_async_facade() {
+        let store = Store::in_memory(true);
+        assert_eq!(store.mode(), "memory");
+        store
+            .mutate(|catalog| {
+                catalog.audit("test", "check", "memory", "ok");
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(
+            store
+                .snapshot()
+                .audit
+                .iter()
+                .any(|entry| entry.action == "check")
+        );
+    }
+
+    #[tokio::test]
+    async fn json_store_persists_async_mutations() {
+        let dir = std::env::temp_dir().join(format!(
+            "k8s-control-plane-async-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = dir.join("catalog.json");
+        let store = Store::open(Some(path.clone()), true).unwrap();
+        assert_eq!(store.mode(), "json");
+        store
+            .mutate(|catalog| {
+                catalog.audit("test", "async-json", "catalog", "persisted");
+                Ok(())
+            })
+            .await
+            .unwrap();
+        drop(store);
+        let reopened = Store::open(Some(path), false).unwrap();
+        assert!(
+            reopened
+                .snapshot()
+                .audit
+                .iter()
+                .any(|entry| entry.action == "async-json")
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 }

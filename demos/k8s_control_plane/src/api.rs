@@ -94,6 +94,7 @@ async fn health(State(store): State<Arc<Store>>) -> Json<Value> {
     Json(json!({
         "status": "ok",
         "version": env!("CARGO_PKG_VERSION"),
+        "store": store.mode(),
         "cell": if catalog.cells.len() == 1 {
             catalog.cells.keys().next().cloned()
         } else {
@@ -202,10 +203,12 @@ async fn create_shard(
     Json(shard): Json<SymbolShard>,
 ) -> Result<Json<Value>, ApiError> {
     let mut created = None;
-    store.mutate(|catalog| {
-        created = Some(provision::create_empty_shard(catalog, shard)?);
-        Ok(())
-    })?;
+    store
+        .mutate(|catalog| {
+            created = Some(provision::create_empty_shard(catalog, shard)?);
+            Ok(())
+        })
+        .await?;
     Ok(Json(json!({ "shard": created })))
 }
 
@@ -227,14 +230,16 @@ async fn drop_shard(
     Json(request): Json<DropShardRequest>,
 ) -> Result<Json<Value>, ApiError> {
     let mut drop = None;
-    store.mutate(|catalog| {
-        drop = Some(provision::drop_shard(
-            catalog,
-            &name,
-            request.retain_storage,
-        )?);
-        Ok(())
-    })?;
+    store
+        .mutate(|catalog| {
+            drop = Some(provision::drop_shard(
+                catalog,
+                &name,
+                request.retain_storage,
+            )?);
+            Ok(())
+        })
+        .await?;
     Ok(Json(json!({ "drop": drop })))
 }
 
@@ -243,10 +248,12 @@ async fn create_symbol(
     Json(request): Json<CreateSymbolRequest>,
 ) -> Result<Json<Value>, ApiError> {
     let mut placement = None;
-    store.mutate(|catalog| {
-        placement = Some(provision::place_symbol(catalog, request)?);
-        Ok(())
-    })?;
+    store
+        .mutate(|catalog| {
+            placement = Some(provision::place_symbol(catalog, request)?);
+            Ok(())
+        })
+        .await?;
     Ok(Json(json!({ "placement": placement })))
 }
 
@@ -276,14 +283,16 @@ async fn shutdown_symbol(
     Json(request): Json<LifecycleRequest>,
 ) -> Result<Json<Value>, ApiError> {
     let mut shutdown = None;
-    store.mutate(|catalog| {
-        shutdown = Some(provision::shutdown_symbol(
-            catalog,
-            &name,
-            request.allow_restart,
-        )?);
-        Ok(())
-    })?;
+    store
+        .mutate(|catalog| {
+            shutdown = Some(provision::shutdown_symbol(
+                catalog,
+                &name,
+                request.allow_restart,
+            )?);
+            Ok(())
+        })
+        .await?;
     Ok(Json(json!({ "shutdown": shutdown })))
 }
 
@@ -293,14 +302,16 @@ async fn start_symbol(
     Json(request): Json<LifecycleRequest>,
 ) -> Result<Json<Value>, ApiError> {
     let mut start = None;
-    store.mutate(|catalog| {
-        start = Some(provision::start_symbol(
-            catalog,
-            &name,
-            request.allow_restart,
-        )?);
-        Ok(())
-    })?;
+    store
+        .mutate(|catalog| {
+            start = Some(provision::start_symbol(
+                catalog,
+                &name,
+                request.allow_restart,
+            )?);
+            Ok(())
+        })
+        .await?;
     Ok(Json(json!({ "start": start })))
 }
 
@@ -310,15 +321,17 @@ async fn migrate_symbol(
     Json(request): Json<MigrateRequest>,
 ) -> Result<Json<Value>, ApiError> {
     let mut migration = None;
-    store.mutate(|catalog| {
-        migration = Some(provision::migrate_symbol(
-            catalog,
-            &name,
-            &request.target_shard,
-            request.allow_restart,
-        )?);
-        Ok(())
-    })?;
+    store
+        .mutate(|catalog| {
+            migration = Some(provision::migrate_symbol(
+                catalog,
+                &name,
+                &request.target_shard,
+                request.allow_restart,
+            )?);
+            Ok(())
+        })
+        .await?;
     Ok(Json(json!({ "migration": migration })))
 }
 
@@ -842,30 +855,32 @@ async fn simulate(
         .transpose()?
         .unwrap_or(Scenario::Ready);
     let mut result = Value::Null;
-    store.mutate(|catalog| {
-        let observation = crate::reconcile::simulate(catalog, &name, scenario)?;
-        crate::reconcile::apply_observed_routes(catalog, &observation);
-        catalog.audit(
-            "demo",
-            "simulate",
-            &name,
-            format!("applied observed routes for scenario {:?}", scenario),
-        );
-        let symbols: Vec<String> = catalog
-            .shard_deployments(&name)
-            .iter()
-            .map(|d| d.spec.symbol_ref.clone())
-            .collect();
-        result = json!({
-            "scenario": scenario,
-            "observation": observation,
-            "routes": catalog.routes.values()
-                .filter(|r| symbols.contains(&r.spec.symbol_ref))
-                .collect::<Vec<_>>(),
-            "audit": catalog.recent_audit(5),
-        });
-        Ok(())
-    })?;
+    store
+        .mutate(|catalog| {
+            let observation = crate::reconcile::simulate(catalog, &name, scenario)?;
+            crate::reconcile::apply_observed_routes(catalog, &observation);
+            catalog.audit(
+                "demo",
+                "simulate",
+                &name,
+                format!("applied observed routes for scenario {:?}", scenario),
+            );
+            let symbols: Vec<String> = catalog
+                .shard_deployments(&name)
+                .iter()
+                .map(|d| d.spec.symbol_ref.clone())
+                .collect();
+            result = json!({
+                "scenario": scenario,
+                "observation": observation,
+                "routes": catalog.routes.values()
+                    .filter(|r| symbols.contains(&r.spec.symbol_ref))
+                    .collect::<Vec<_>>(),
+                "audit": catalog.recent_audit(5),
+            });
+            Ok(())
+        })
+        .await?;
     Ok(Json(result))
 }
 
@@ -929,28 +944,30 @@ async fn upsert_bundle(
     }
     let shard = bundle.shard.name.clone();
     let mut result = Value::Null;
-    store.mutate(|catalog| {
-        let mut candidate = catalog.clone();
-        candidate.insert_bundle(bundle.clone());
-        let report = validate_catalog(&candidate);
-        if !report.is_ok() {
-            return Err(ApiError::unprocessable(report));
-        }
-        catalog.insert_bundle(bundle.clone());
-        catalog.audit(
-            "api",
-            "upsert-bundle",
-            &shard,
-            format!(
-                "{} symbols, {} deployments",
-                bundle.symbols.len(),
-                bundle.deployments.len()
-            ),
-        );
-        let report = validate_catalog(catalog);
-        result = catalog_value(catalog, &report);
-        Ok(())
-    })?;
+    store
+        .mutate(|catalog| {
+            let mut candidate = catalog.clone();
+            candidate.insert_bundle(bundle.clone());
+            let report = validate_catalog(&candidate);
+            if !report.is_ok() {
+                return Err(ApiError::unprocessable(report));
+            }
+            catalog.insert_bundle(bundle.clone());
+            catalog.audit(
+                "api",
+                "upsert-bundle",
+                &shard,
+                format!(
+                    "{} symbols, {} deployments",
+                    bundle.symbols.len(),
+                    bundle.deployments.len()
+                ),
+            );
+            let report = validate_catalog(catalog);
+            result = catalog_value(catalog, &report);
+            Ok(())
+        })
+        .await?;
     Ok(Json(result))
 }
 

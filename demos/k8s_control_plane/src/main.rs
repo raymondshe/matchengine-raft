@@ -48,10 +48,51 @@ enum Command {
         /// Start empty instead of loading the built-in demo shards.
         #[arg(long)]
         no_seed: bool,
+        /// Persist desired state as matching.io CRDs through the Kubernetes API server.
+        #[arg(long, env = "CONTROL_PLANE_CRD")]
+        crd: bool,
+        /// Namespace used for CRs whose model namespace is empty.
+        #[arg(
+            long,
+            default_value = "match-eu-1",
+            env = "CONTROL_PLANE_CRD_NAMESPACE"
+        )]
+        crd_namespace: String,
         /// Host dialled by the engine-console proxy instead of the pod FQDN. Set it to
         /// `127.0.0.1` when the demo manager and a local engine share a machine.
         #[arg(long, env = "ENGINE_CONSOLE_HOST")]
         engine_console_host: Option<String>,
+    },
+    /// Print the five catalog CustomResourceDefinitions as YAML.
+    Crds {
+        /// Write here instead of stdout.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Export the live CRD catalog as a JSON backup.
+    CrdBackup {
+        /// Write here instead of stdout.
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Namespace used for CRs whose model namespace is empty.
+        #[arg(
+            long,
+            default_value = "match-eu-1",
+            env = "CONTROL_PLANE_CRD_NAMESPACE"
+        )]
+        namespace: String,
+    },
+    /// Validate a JSON catalog and restore it into CRDs through the Kubernetes API server.
+    CrdRestore {
+        #[arg(long)]
+        input: PathBuf,
+        /// Namespace used for CRs whose model namespace is empty.
+        #[arg(
+            long,
+            default_value = "match-eu-1",
+            env = "CONTROL_PLANE_CRD_NAMESPACE"
+        )]
+        namespace: String,
     },
     /// Render one shard (or every shard) as a `v1/List` of Kubernetes objects.
     Render {
@@ -134,8 +175,87 @@ async fn main() -> Result<()> {
             addr,
             state,
             no_seed,
+            crd,
+            crd_namespace,
             engine_console_host,
-        } => serve(addr, state, no_seed, engine_console_host).await,
+        } => {
+            serve(
+                addr,
+                state,
+                no_seed,
+                crd,
+                crd_namespace,
+                engine_console_host,
+            )
+            .await
+        }
+        Command::Crds { out } => {
+            let yaml = matchengine_k8s_control_plane::crd::crd_manifest_yaml()
+                .map_err(|error| anyhow::anyhow!("render CRDs: {error}"))?;
+            match out {
+                Some(path) => {
+                    if let Some(parent) = path.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    std::fs::write(&path, yaml)
+                        .with_context(|| format!("write {}", path.display()))?;
+                    eprintln!("wrote CRDs to {}", path.display());
+                }
+                None => print!("{yaml}"),
+            }
+            Ok(())
+        }
+        Command::CrdBackup { out, namespace } => {
+            let store = Store::crd(namespace, false)
+                .await
+                .map_err(|error| anyhow::anyhow!("open CRD catalog: {error}"))?;
+            let catalog = store.snapshot();
+            let text = serde_json::to_string_pretty(&catalog)?;
+            match out {
+                Some(path) => {
+                    if let Some(parent) = path.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    std::fs::write(&path, format!("{text}\n"))
+                        .with_context(|| format!("write {}", path.display()))?;
+                    eprintln!(
+                        "wrote {} cells, {} shards, {} symbols to {}",
+                        catalog.cells.len(),
+                        catalog.shards.len(),
+                        catalog.symbols.len(),
+                        path.display()
+                    );
+                }
+                None => println!("{text}"),
+            }
+            Ok(())
+        }
+        Command::CrdRestore { input, namespace } => {
+            let bytes =
+                std::fs::read(&input).with_context(|| format!("read {}", input.display()))?;
+            let catalog: Catalog = serde_json::from_slice(&bytes)
+                .with_context(|| format!("parse {}", input.display()))?;
+            let report = validate_catalog(&catalog);
+            if !report.is_ok() {
+                bail!("catalog validation failed:\n{}", report.to_text());
+            }
+            let store = Store::crd(namespace, false)
+                .await
+                .map_err(|error| anyhow::anyhow!("open CRD catalog: {error}"))?;
+            store
+                .commit(catalog.clone())
+                .await
+                .map_err(|error| anyhow::anyhow!("restore CRDs: {error}"))?;
+            eprintln!(
+                "restored {} cells, {} shards, {} symbols, {} deployments, {} routes",
+                catalog.cells.len(),
+                catalog.shards.len(),
+                catalog.symbols.len(),
+                catalog.deployments.len(),
+                catalog.routes.len()
+            );
+            Ok(())
+        }
         Command::Render {
             shard,
             all,
@@ -326,17 +446,24 @@ async fn serve(
     addr: String,
     state: Option<PathBuf>,
     no_seed: bool,
+    crd: bool,
+    crd_namespace: String,
     engine_console_host: Option<String>,
 ) -> Result<()> {
-    let store = Arc::new(
+    let store = if crd {
+        Store::crd(crd_namespace.clone(), !no_seed)
+            .await
+            .map_err(|error| anyhow::anyhow!("open CRD catalog: {error}"))?
+    } else {
         Store::open(state.clone(), !no_seed)
-            .map_err(|error| anyhow::anyhow!("open catalog: {error}"))?,
-    );
+            .map_err(|error| anyhow::anyhow!("open catalog: {error}"))?
+    };
+    let store = Arc::new(store);
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .with_context(|| format!("bind {addr}"))?;
     let local = listener.local_addr()?;
-    tracing::info!(%local, state = ?state, "control plane listening");
+    tracing::info!(%local, state = ?state, crd, crd_namespace, mode = store.mode(), "control plane listening");
     println!("control plane GUI: http://{local}/");
     let console = api::ConsoleOptions {
         host: engine_console_host,

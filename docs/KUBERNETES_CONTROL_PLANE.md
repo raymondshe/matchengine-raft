@@ -113,7 +113,7 @@ first accepted order, and the public edge is plaintext behind a trusted gateway.
 flowchart TB
   subgraph Global["Global control plane"]
     GUI["Management GUI<br/>(React)"]
-    API["Manager API<br/>(Rust/Axum + Postgres)"]
+    API["Manager API<br/>(Rust/Axum + CRDs)"]
     GUI --> API
   end
 
@@ -158,10 +158,13 @@ metrics endpoint or bridge exists) PodMonitors. It is the only component allowed
 `/add-learner`, `/change-membership`, `/console/api/actions/*` and the symbol `ConfigureSymbol`
 write. It uses a Kubernetes `Lease` so only one replica reconciles at a time.
 
-**Manager API + GUI.** The global configuration manager. It stores the symbol catalog, templates,
-approvals, operations and audit history in Postgres, and projects desired state into each cell as
-CRs. It never talks to engine pods directly during normal operation; it reads CR status and
-metrics. It is horizontally scalable; write operations use a database lease/leader election.
+**Manager API + GUI.** The global configuration manager. Desired state lives in the catalog CRDs
+(`TradingSymbol`, `SymbolShard`, `SymbolDeployment`, `SymbolRoute`, `Cell`) and is persisted by the
+Kubernetes API server (etcd underneath); the manager writes CRs, never etcd directly. Postgres (or
+an object store) holds approvals, operations, audit history and read models, not a second copy of
+desired state. The manager projects/reads CRs per cell and never talks to engine pods directly
+during normal operation. It is horizontally scalable; write operations use a database lease/leader
+election or Kubernetes `Lease`.
 
 **Gateway.** A stateless per-cell service that terminates TLS, authenticates clients, rate-limits,
 and routes each symbol's writes/reads to the current leader. It watches `SymbolRoute` and each
@@ -945,7 +948,7 @@ each cell. The symbol definition is immutable after activation; placement lives 
 `SymbolDeployment` (§6.7).
 
 ```yaml
-apiVersion: matching.example.com/v1alpha1
+apiVersion: matching.io/v1
 kind: TradingSymbol
 metadata:
   name: eurusd
@@ -990,7 +993,7 @@ zero-impact additions. The manager creates one with `POST /api/v1/shards`; the f
 `POST /api/v1/symbols` allocates slot 0 and materializes or starts the process.
 
 ```yaml
-apiVersion: matching.example.com/v1alpha1
+apiVersion: matching.io/v1
 kind: SymbolShard
 metadata:
   name: fx-eu-01
@@ -1103,7 +1106,7 @@ templates to create shards with consistent settings; the operator expands templa
 the CR before validation.
 
 ```yaml
-apiVersion: matching.example.com/v1alpha1
+apiVersion: matching.io/v1
 kind: ClusterTemplate
 metadata:
   name: prod-fx-packed
@@ -1125,7 +1128,7 @@ Describes one Kubernetes cell: API endpoint, region, storage classes, capacity, 
 observability URLs. The global manager uses it to place symbols.
 
 ```yaml
-apiVersion: matching.example.com/v1alpha1
+apiVersion: matching.io/v1
 kind: Cell
 metadata:
   name: eu-1
@@ -1149,7 +1152,7 @@ spec:
 Long-running work is an object, not a hidden goroutine:
 
 ```yaml
-apiVersion: matching.example.com/v1alpha1
+apiVersion: matching.io/v1
 kind: Operation
 metadata:
   name: upgrade-fx-eu-01-20261113
@@ -1179,7 +1182,7 @@ restore tool (§7.5). A restore is a runbook/volume operation until that tool ex
 `Backup` records the group snapshot and, per process, the indexes, checksums and restore test:
 
 ```yaml
-apiVersion: matching.example.com/v1alpha1
+apiVersion: matching.io/v1
 kind: Backup
 metadata:
   name: fx-eu-01-20261113t0200z
@@ -1213,8 +1216,8 @@ status:
       restoreTestedAt: "2026-11-13T03:12:00Z"
 ```
 
-The manager's Postgres stores the global catalog, approvals, audit events and a read cache; cell
-CRs remain the desired-state contract for workloads.
+The desired-state catalog lives in the five CRDs (etcd via the API server). Postgres stores
+approvals, audit events and read-model caches; it is not a second desired-state source of truth.
 
 ### 6.6 Status conditions
 
@@ -1236,7 +1239,7 @@ CRs remain the desired-state contract for workloads.
 Two CRs own placement and routing so that every fact has exactly one writer:
 
 ```yaml
-apiVersion: matching.example.com/v1alpha1
+apiVersion: matching.io/v1
 kind: SymbolDeployment
 metadata:
   name: eurusd-g1
@@ -1261,7 +1264,7 @@ status:
   bootstrappedAt: "2026-11-13T09:00:00Z"
   conditions: [...]
 ---
-apiVersion: matching.example.com/v1alpha1
+apiVersion: matching.io/v1
 kind: SymbolRoute
 metadata:
   name: eurusd
@@ -1593,7 +1596,7 @@ The request body asks the storage question explicitly:
 - `false` (destructive): the operator also deletes the PVCs. The data cannot be recovered from the
   cluster; only an external backup can restore it. The GUI requires a typed shard-name confirmation.
 
-Because the manager has no Kubernetes client, the drop response is a desired-state mutation plus an
+Because the manager does not apply workloads, the drop response is a desired-state mutation plus an
 operator sequence. It does not delete workloads or PVCs itself.
 
 Promotion/demotion is a process-level Raft membership migration, not a data copy through the
@@ -1618,11 +1621,28 @@ pod and HTTP port.
 ### 8.1 Backend
 
 Recommendation: **Rust + Axum** (same language as the engine), **kube-rs** for the Kubernetes API,
-**sqlx + Postgres** for the catalog/audit/operation history, **OpenAPI** for the typed client, and
-**SSE/WebSocket** for live status. Deploy 2–3 replicas behind a Service; writes use a PostgreSQL
-advisory lock so only one replica performs a mutation at a time. Reads can be served by all.
+**CRDs for desired state** (etcd persisted by the API server), **sqlx + Postgres** for
+approvals/audit/operations and read models, **OpenAPI** for the typed client, and **SSE/WebSocket**
+for live status. Deploy 2–3 replicas behind a Service; writes use a PostgreSQL advisory lock or a
+Kubernetes `Lease` so only one replica performs a mutation at a time. Reads can be served by all.
+Never open an etcd client and never put engine WAL/snapshot, order-book, match-event or market-data
+payloads in etcd.
 
 The manager does not proxy trading traffic. It is a control plane only.
+
+#### Desired-state storage decision
+
+| Data | Store |
+|---|---|
+| `TradingSymbol`, `SymbolShard`, `SymbolDeployment`, `SymbolRoute`, `Cell` | CRDs through the Kubernetes API server (etcd underneath) |
+| Status, conditions, leader address | CRD `/status` subresource; rate-limit updates |
+| Approvals/audit/operations/read models | Postgres, object storage or an append-only log — not etcd |
+| Engine WAL/snapshot/order book/events/market data | Engine PVC and feed — never etcd |
+
+The manager writes compact CRs and rebuilds its cache from informers. It must not use a direct etcd
+client: that bypasses API-server validation/admission/RBAC/audit and is unavailable on most managed
+Kubernetes services. etcd snapshots are the cluster-wide backup; a CRD export is the selective
+backup for a single catalog.
 
 ### 8.2 Authentication and authorization
 
@@ -1999,9 +2019,10 @@ sharding, chaos (node/zone loss, noisy neighbour), DR game day, GitOps.
 
 **Reference implementation.** [`demos/k8s_control_plane/`](../demos/k8s_control_plane/README.md)
 implements the phase 1 renderer, the phase 2 bootstrap/membership/upgrade decisions (as a
-reviewable plan rather than a controller) and a read-only manager API/GUI for phase 4, against an
-in-memory or JSON catalog. It is a standalone demo crate: it does not watch Kubernetes, install
-CRDs, run a controller or call the engine.
+reviewable plan rather than a controller), a read/write manager API/GUI, and a CRD-backed store
+that bootstraps from list calls, refreshes from informers, writes desired state through the
+Kubernetes API server and provides CRD backup/restore. It still does not run a controller or call
+the engine.
 
 ## 13. Required engine changes and open questions
 
