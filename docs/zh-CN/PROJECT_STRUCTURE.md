@@ -40,7 +40,8 @@ examples/
 └── replay_orders_events.rs  # 回放订单并从 POST /events 读取事件对比
 demos/
 ├── order_system/            # 独立下单系统
-└── market_data_system/      # 独立 Binance 风格 WebSocket 行情系统
+├── market_data_system/      # 独立 Binance 风格 WebSocket 行情系统
+└── k8s_control_plane/       # 参考 Kubernetes 控制平面（独立 crate）
 tests/
 ├── cluster/
     ├── main.rs              # 单一集成测试目标

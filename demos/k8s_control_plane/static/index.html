@@ -1,0 +1,899 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Match Engine Control Plane</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #0b1016;
+    --panel: #121a23;
+    --panel-2: #162231;
+    --border: #263445;
+    --text: #dbe6f2;
+    --muted: #8aa0b8;
+    --accent: #4fd1c5;
+    --accent-dim: #1f6f6a;
+    --warn: #f0b35b;
+    --bad: #ef6b73;
+    --good: #58d68d;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: radial-gradient(1100px 500px at 15% -10%, #14303a 0%, transparent 60%), var(--bg);
+    color: var(--text);
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  }
+  header {
+    display: flex; align-items: center; gap: 18px; flex-wrap: wrap;
+    padding: 18px 24px; border-bottom: 1px solid var(--border);
+    background: rgba(11, 16, 22, 0.82); backdrop-filter: blur(8px);
+    position: sticky; top: 0; z-index: 5;
+  }
+  h1 { font-size: 17px; margin: 0; letter-spacing: 0.4px; }
+  h1 span { color: var(--accent); }
+  .tag { font: 11px/1 var(--mono); color: var(--muted); border: 1px solid var(--border); border-radius: 999px; padding: 5px 9px; }
+  .stats { display: flex; gap: 16px; margin-left: auto; flex-wrap: wrap; }
+  .stat { text-align: right; }
+  .stat b { display: block; font: 600 18px/1.1 var(--mono); }
+  .stat small { color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: 1px; }
+  main { display: grid; grid-template-columns: 330px minmax(0, 1fr); gap: 0; min-height: calc(100vh - 74px); }
+  aside { border-right: 1px solid var(--border); padding: 18px; overflow: auto; }
+  aside h2, .section-title { font-size: 11px; text-transform: uppercase; letter-spacing: 1.4px; color: var(--muted); margin: 0 0 12px; }
+  .shard {
+    border: 1px solid var(--border); border-radius: 10px; padding: 12px;
+    margin-bottom: 10px; cursor: pointer; background: var(--panel);
+    transition: border-color .15s, transform .15s;
+  }
+  .shard:hover { border-color: var(--accent-dim); transform: translateX(2px); }
+  .shard:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .shard.active { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent-dim) inset; }
+  .shard .name { font: 600 13px/1.3 var(--mono); }
+  .shard .meta { color: var(--muted); font-size: 12px; margin-top: 4px; }
+  .shard .chips { margin-top: 8px; display: flex; gap: 6px; flex-wrap: wrap; }
+  .chip { font: 10px/1 var(--mono); padding: 4px 7px; border-radius: 5px; background: var(--panel-2); color: var(--muted); border: 1px solid var(--border); }
+  .chip.dedicated { color: var(--warn); border-color: #4a3a1e; }
+  .chip.packed { color: var(--accent); border-color: var(--accent-dim); }
+  .chip.bad { color: var(--bad); border-color: #5c2a2e; }
+  .chip.good { color: var(--good); border-color: #24513a; }
+  section.content { padding: 22px 26px 60px; overflow: auto; }
+  .headline { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+  .headline h2 { margin: 0; font: 600 21px/1.2 var(--mono); }
+  .headline .sub { color: var(--muted); font-size: 12px; }
+  .tabs { display: flex; gap: 4px; margin: 18px 0 16px; border-bottom: 1px solid var(--border); }
+  .tab {
+    padding: 9px 14px; border: none; background: none; color: var(--muted);
+    cursor: pointer; font: 600 12px/1 var(--mono); border-bottom: 2px solid transparent;
+  }
+  .tab:hover { color: var(--text); }
+  .tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+  .panel { display: none; }
+  .panel.active { display: block; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 12px; }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 14px; }
+  .card h3 { margin: 0 0 10px; font-size: 11px; letter-spacing: 1.2px; text-transform: uppercase; color: var(--muted); }
+  .kv { display: grid; grid-template-columns: 130px minmax(0, 1fr); gap: 4px 10px; font-size: 12px; }
+  .kv dt { color: var(--muted); }
+  .kv dd { margin: 0; font-family: var(--mono); overflow-wrap: anywhere; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th, td { text-align: left; padding: 8px 9px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { color: var(--muted); font-weight: 500; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; }
+  td.mono, .mono { font-family: var(--mono); }
+  .actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 14px; }
+  button, select, input {
+    background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
+    border-radius: 7px; padding: 7px 11px; font: 12px/1.2 var(--mono);
+  }
+  button { cursor: pointer; }
+  button:hover { border-color: var(--accent-dim); }
+  button.primary { background: var(--accent-dim); border-color: var(--accent); color: #eafffd; }
+  button.danger { border-color: #5c2a2e; color: var(--warn); }
+  label.field { display: flex; flex-direction: column; gap: 5px; color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: 1px; }
+  .plan-summary { color: var(--muted); margin-bottom: 12px; font-family: var(--mono); font-size: 12px; }
+  .step { display: grid; grid-template-columns: 26px minmax(0, 1fr); gap: 10px; padding: 10px 0; border-bottom: 1px solid var(--border); }
+  .step:last-child { border-bottom: none; }
+  .step .num { font: 11px/1.6 var(--mono); color: var(--muted); }
+  .step .action { font: 600 11px/1.5 var(--mono); color: var(--accent); text-transform: uppercase; letter-spacing: 0.5px; }
+  .step .target { font-family: var(--mono); font-size: 12px; }
+  .step .detail { color: var(--muted); font-size: 12px; margin-top: 3px; }
+  .step .endpoint { color: #7fb4c9; font: 11px/1.5 var(--mono); margin-top: 3px; overflow-wrap: anywhere; }
+  .issues { display: flex; flex-direction: column; gap: 7px; margin: 12px 0 18px; }
+  .issue { border-left: 3px solid var(--bad); background: #1d1418; padding: 8px 10px; border-radius: 0 7px 7px 0; font-size: 12px; }
+  .issue.warning { border-left-color: var(--warn); background: #1d1a12; }
+  .issue code { color: var(--muted); font: 10px/1.4 var(--mono); margin-right: 8px; }
+  pre {
+    background: #0a0f14; border: 1px solid var(--border); border-radius: 10px;
+    padding: 14px; overflow: auto; max-height: 62vh; font: 11.5px/1.5 var(--mono);
+    color: #c9d8e8;
+  }
+  .badge { display: inline-block; padding: 3px 7px; border-radius: 5px; font: 10px/1 var(--mono); border: 1px solid var(--border); color: var(--muted); }
+  .badge.ok { color: var(--good); border-color: #24513a; }
+  .badge.err { color: var(--bad); border-color: #5c2a2e; }
+  .badge.warn { color: var(--warn); border-color: #4a3a1e; }
+  #toast {
+    position: fixed; right: 18px; bottom: 18px; max-width: 420px; padding: 11px 14px;
+    border-radius: 9px; border: 1px solid var(--accent-dim); background: #102422;
+    color: var(--text); font-size: 12px; display: none; z-index: 20; box-shadow: 0 8px 30px #0008;
+  }
+  #toast.error { border-color: #5c2a2e; background: #241316; }
+  .muted { color: var(--muted); }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .audit { margin-top: 26px; }
+  .audit li { font-size: 11px; color: var(--muted); font-family: var(--mono); margin-bottom: 3px; }
+  .audit ul { list-style: none; padding: 0; margin: 0; }
+  .aside-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 12px; }
+  .aside-head h2 { margin: 0; }
+  .chip.reserved { color: var(--muted); border-style: dashed; }
+  .modal {
+    position: fixed; inset: 0; display: none; align-items: flex-start; justify-content: center;
+    padding: 40px 16px; background: rgba(0, 0, 0, 0.65); z-index: 30; overflow: auto;
+  }
+  .modal.open { display: flex; }
+  .modal-card {
+    width: min(820px, 100%); background: var(--panel); border: 1px solid var(--border);
+    border-radius: 12px; padding: 20px; box-shadow: 0 20px 60px #000a;
+  }
+  .modal-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; }
+  .modal-head h2 { margin: 0; font: 600 17px/1.2 var(--mono); }
+  .modal-head .close { background: none; border: none; color: var(--muted); font-size: 22px; line-height: 1; padding: 0 4px; }
+  .form-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
+  .form-grid .field input, .form-grid .field select { width: 100%; }
+  .form-actions { display: flex; align-items: center; justify-content: flex-end; gap: 8px; margin-top: 18px; flex-wrap: wrap; }
+  .form-actions .muted { margin-right: auto; font-size: 11px; }
+  @media (max-width: 860px) {
+    main { grid-template-columns: 1fr; }
+    aside { border-right: none; border-bottom: 1px solid var(--border); }
+    .modal-card { padding: 14px; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>match<span>engine</span> · control plane</h1>
+  <span class="tag">demo</span>
+  <span id="validation" class="badge">validating…</span>
+  <div class="stats" id="stats"></div>
+</header>
+<main>
+  <aside>
+    <div class="aside-head">
+      <h2>Symbol shards</h2>
+      <div class="actions" style="margin:0">
+        <button class="primary" id="newSymbolBtn" title="Create a symbol and bind it to a shard">+ symbol</button>
+        <button id="newShardBtn" title="Reserve an empty shard for new or migrated symbols">+ shard</button>
+      </div>
+    </div>
+    <div id="shardList"></div>
+    <div class="audit">
+      <h2>Audit</h2>
+      <ul id="auditList"></ul>
+    </div>
+  </aside>
+  <section class="content">
+    <div class="headline">
+      <h2 id="shardName">loading…</h2>
+      <span class="sub" id="shardSub"></span>
+    </div>
+    <div id="issueBox"></div>
+    <div class="tabs">
+      <button class="tab active" data-tab="overview">overview</button>
+      <button class="tab" data-tab="plan">reconcile plan</button>
+      <button class="tab" data-tab="manifests">manifests</button>
+      <button class="tab" data-tab="objects">objects</button>
+    </div>
+
+    <div class="panel active" id="tab-overview">
+      <div class="grid" id="overviewCards"></div>
+      <div class="card" style="margin-top:12px">
+        <h3>Engine processes</h3>
+        <table>
+          <thead><tr><th>Symbol</th><th>Deployment</th><th>Slot</th><th>HTTP</th><th>Raft</th><th>Config hash</th><th>Console</th></tr></thead>
+          <tbody id="processRows"></tbody>
+        </table>
+      </div>
+      <div class="card" style="margin-top:12px">
+        <h3>Observed leaders (simulated)</h3>
+        <table>
+          <thead><tr><th>Symbol</th><th>Pod</th><th>Leader address</th><th>Ready</th></tr></thead>
+          <tbody id="leaderRows"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="panel" id="tab-plan">
+      <div class="actions">
+        <label class="field">Observation
+          <select id="scenario">
+            <option value="fresh">fresh (nothing bootstrapped)</option>
+            <option value="ready" selected>ready</option>
+            <option value="degraded">degraded (one pod unready)</option>
+            <option value="leader-loss">leader loss</option>
+            <option value="config-drift">config drift</option>
+            <option value="upgrade">older image</option>
+          </select>
+        </label>
+        <label class="field">Target image
+          <input id="targetImage" size="42" spellcheck="false">
+        </label>
+        <label class="field">Target wire
+          <input id="wireVersion" type="number" min="1" value="7" style="width:80px">
+        </label>
+        <label class="field">Target snapshot
+          <input id="snapshotVersion" type="number" min="1" value="11" style="width:90px">
+        </label>
+        <label class="field">Mixed-version safe
+          <select id="mixedSafe"><option value="false">no</option><option value="true">yes</option></select>
+        </label>
+        <button class="primary" id="planBtn">Build plan</button>
+        <button id="adoptBtn">Adopt observation</button>
+      </div>
+      <div class="plan-summary" id="planSummary">—</div>
+      <div class="card"><div id="planSteps"><span class="muted">Build a plan to see the operator's next steps.</span></div></div>
+    </div>
+
+    <div class="panel" id="tab-manifests">
+      <div class="actions">
+        <label class="field">Profile
+          <select id="profile"><option value="production">production</option><option value="local">local</option></select>
+        </label>
+        <button class="primary" id="renderBtn">Render</button>
+        <button id="downloadBtn">Download List JSON</button>
+        <span class="muted" id="manifestHint"></span>
+      </div>
+      <pre id="manifestPre">—</pre>
+    </div>
+
+    <div class="panel" id="tab-objects">
+      <pre id="objectsPre">—</pre>
+    </div>
+  </section>
+</main>
+<div id="toast"></div>
+
+<div id="symbolModal" class="modal" aria-hidden="true">
+  <div class="modal-card">
+    <div class="modal-head">
+      <h2>New symbol</h2>
+      <button class="close" type="button" data-close="symbolModal" aria-label="Close">×</button>
+    </div>
+    <form id="symbolForm">
+      <div class="form-grid">
+        <label class="field">Symbol name
+          <input id="symName" required placeholder="usdjpy" spellcheck="false">
+        </label>
+        <label class="field">Symbol ID
+          <input id="symId" type="number" min="1" required value="4">
+        </label>
+        <label class="field">Base code
+          <input id="symBase" required value="USD" spellcheck="false">
+        </label>
+        <label class="field">Base class
+          <select id="symBaseClass">
+            <option value="fiat">fiat</option>
+            <option value="stablecoin">stablecoin</option>
+            <option value="crypto">crypto</option>
+            <option value="equity">equity</option>
+            <option value="etf">etf</option>
+          </select>
+        </label>
+        <label class="field">Base decimals
+          <input id="symBaseDec" type="number" min="0" max="18" value="2">
+        </label>
+        <label class="field">Quote code
+          <input id="symQuote" required value="JPY" spellcheck="false">
+        </label>
+        <label class="field">Quote class
+          <select id="symQuoteClass">
+            <option value="fiat">fiat</option>
+            <option value="stablecoin">stablecoin</option>
+            <option value="crypto">crypto</option>
+            <option value="equity">equity</option>
+            <option value="etf">etf</option>
+          </select>
+        </label>
+        <label class="field">Quote decimals
+          <input id="symQuoteDec" type="number" min="0" max="18" value="0">
+        </label>
+        <label class="field">Price decimals
+          <input id="symPriceDec" type="number" min="0" max="18" value="3">
+        </label>
+        <label class="field">Price tick
+          <input id="symTick" value="0.001" spellcheck="false">
+        </label>
+        <label class="field">Base lot
+          <input id="symLot" value="0.01" spellcheck="false">
+        </label>
+        <label class="field">Fee asset
+          <select id="symFee">
+            <option value="received">received</option>
+            <option value="quote">quote</option>
+            <option value="base">base</option>
+          </select>
+        </label>
+        <label class="field">STP
+          <select id="symStp">
+            <option value="off">off</option>
+            <option value="cancel_resting">cancel_resting</option>
+            <option value="cancel_aggressor">cancel_aggressor</option>
+            <option value="cancel_both">cancel_both</option>
+          </select>
+        </label>
+        <label class="field">Owner
+          <input id="symOwner" value="fx-team" spellcheck="false">
+        </label>
+        <label class="field">Target shard
+          <select id="symTarget"></select>
+        </label>
+      </div>
+      <div class="form-actions">
+        <span class="muted" id="symHint">Choose a supervisor shard for ongoing zero-impact placement; an empty containers shard is safe for its first symbol. Non-empty containers shards are disabled.</span>
+        <button type="button" data-close="symbolModal">Cancel</button>
+        <button type="submit" class="primary">Create symbol</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<div id="shardModal" class="modal" aria-hidden="true">
+  <div class="modal-card">
+    <div class="modal-head">
+      <h2>Reserve empty shard</h2>
+      <button class="close" type="button" data-close="shardModal" aria-label="Close">×</button>
+    </div>
+    <form id="shardForm">
+      <div class="form-grid">
+        <label class="field">Name
+          <input id="shardFormName" required placeholder="fx-eu-03" spellcheck="false">
+        </label>
+        <label class="field">Cell
+          <select id="shardCell"></select>
+        </label>
+        <label class="field">Class
+          <select id="shardClass">
+            <option value="Packed">Packed</option>
+            <option value="Dedicated">Dedicated</option>
+          </select>
+        </label>
+        <label class="field">Packing
+          <select id="shardMode">
+            <option value="supervisor">supervisor · zero-impact adds</option>
+            <option value="containers">containers · add requires pod roll</option>
+          </select>
+        </label>
+        <label class="field">Replicas
+          <input id="shardReplicas" type="number" min="3" max="9" value="4">
+        </label>
+        <label class="field">Max processes / pod
+          <input id="shardMax" type="number" min="1" max="20" value="4">
+        </label>
+        <label class="field">HTTP base port
+          <input id="shardBasePort" type="number" min="1024" value="21061">
+        </label>
+        <label class="field">Image
+          <input id="shardImage" spellcheck="false">
+        </label>
+        <label class="field">Storage class
+          <input id="shardStorageClass" value="local-path" spellcheck="false">
+        </label>
+        <label class="field">Storage size
+          <input id="shardStorageSize" value="2Gi" spellcheck="false">
+        </label>
+        <label class="field">CPU request
+          <input id="shardCpuReq" value="250m" spellcheck="false">
+        </label>
+        <label class="field">Memory request
+          <input id="shardMemReq" value="512Mi" spellcheck="false">
+        </label>
+        <label class="field">CPU limit
+          <input id="shardCpuLim" value="1" spellcheck="false">
+        </label>
+        <label class="field">Memory limit
+          <input id="shardMemLim" value="1Gi" spellcheck="false">
+        </label>
+      </div>
+      <div class="form-actions">
+        <span class="muted" id="shardHint">Supervisor mode is the zero-impact default: adding a symbol updates the ConfigMap and starts a child process; no pod restarts. Containers mode adds a container and requires a one-voter-at-a-time pod roll.</span>
+        <button type="button" data-close="shardModal">Cancel</button>
+        <button type="submit" class="primary">Reserve shard</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (c) => ({
+  "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+}[c]));
+
+let catalog = null;
+let selected = null;
+let detail = null;
+let manifestList = null;
+let loadedPlan = null;
+
+async function api(path, options) {
+  const response = await fetch(path, options);
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const issues = (body.issues || []).map((i) => i.code + ": " + i.message).join("; ");
+    throw new Error(body.message || body.error || ("HTTP " + response.status) + (issues ? " — " + issues : ""));
+  }
+  return body;
+}
+
+function toast(message, error = false) {
+  const el = $("toast");
+  el.textContent = message;
+  el.className = error ? "error" : "";
+  el.style.display = "block";
+  clearTimeout(el._timer);
+  el._timer = setTimeout(() => { el.style.display = "none"; }, 4200);
+}
+
+function renderHeader() {
+  const counts = catalog.counts || {};
+  $("stats").innerHTML = [
+    ["cells", counts.cells],
+    ["shards", counts.shards],
+    ["symbols", counts.symbols],
+    ["processes", counts.processes],
+  ].map(([label, value]) => `<div class="stat"><b>${esc(value)}</b><small>${label}</small></div>`).join("");
+  const errors = (catalog.validation?.errors || []).length;
+  const warnings = (catalog.validation?.warnings || []).length;
+  const badge = $("validation");
+  badge.className = "badge " + (errors ? "err" : warnings ? "warn" : "ok");
+  badge.textContent = errors ? errors + " errors" : warnings ? warnings + " warnings" : "catalog valid";
+}
+
+function renderShards() {
+  const shards = Object.values(catalog.shards || {});
+  $("shardList").innerHTML = shards.map((shard) => {
+    const deployments = Object.values(catalog.deployments || {}).filter((d) => d.spec.shardRef === shard.name);
+    const symbols = deployments.map((d) => d.spec.symbolRef);
+    const phase = shard.status?.phase || "Pending";
+    const empty = deployments.length === 0;
+    const phaseClass = phase === "Ready" ? "good" : phase === "Degraded" || phase === "Failed" ? "bad" : "";
+    return `<div class="shard ${shard.name === selected ? "active" : ""}" data-shard="${esc(shard.name)}" role="button" tabindex="0" aria-pressed="${shard.name === selected}">
+      <div class="name">${esc(shard.name)}</div>
+      <div class="meta">${esc(shard.spec.cell)} · ${esc(shard.spec.replicas)} voters · ${deployments.length} process${deployments.length === 1 ? "" : "es"}</div>
+      <div class="chips">
+        <span class="chip ${esc(shard.spec.class.toLowerCase())}">${esc(shard.spec.class)}</span>
+        <span class="chip ${shard.spec.packing.mode === "supervisor" ? "good" : ""}">${esc(shard.spec.packing.mode)}</span>
+        <span class="chip ${empty ? "reserved" : ""}">${empty ? "no symbols" : esc(symbols.join(", "))}</span>
+        <span class="chip ${empty ? "reserved" : phaseClass}">${esc(empty ? "reserved" : phase)}</span>
+        ${shard.spec.paused ? '<span class="chip bad">paused</span>' : ""}
+      </div>
+    </div>`;
+  }).join("");
+  document.querySelectorAll(".shard").forEach((el) => {
+    el.addEventListener("click", () => {
+      selected = el.dataset.shard;
+      renderShards();
+      loadShard();
+    });
+    el.addEventListener("keydown", (event) => {
+      if (event.key !== "Enter" && event.key !== " ") return;
+      event.preventDefault();
+      el.click();
+    });
+  });
+}
+
+function chipFor(severity) {
+  return severity === "warning" ? "warn" : "err";
+}
+
+function renderIssues(report) {
+  const issues = [...(report?.errors || []), ...(report?.warnings || [])];
+  if (!issues.length) { $("issueBox").innerHTML = ""; return; }
+  $("issueBox").innerHTML = `<div class="issues">${issues.map((issue) =>
+    `<div class="issue ${issue.severity === "warning" ? "warning" : ""}">
+      <code>${esc(issue.code)} · ${esc(issue.object)}</code>${esc(issue.message)}
+    </div>`).join("")}</div>`;
+}
+
+function renderOverview() {
+  const shard = detail.shard;
+  const resources = detail.perPod || {};
+  const validation = detail.shardValidation || detail.validation || {};
+  const errors = (validation.errors || []).length;
+  const warnings = (validation.warnings || []).length;
+  $("overviewCards").innerHTML = `
+    <div class="card"><h3>Shard</h3><dl class="kv">
+      <dt>cell</dt><dd>${esc(shard.spec.cell)}</dd>
+      <dt>class</dt><dd>${esc(shard.spec.class)}</dd>
+      <dt>environment</dt><dd>${esc(shard.spec.environment)}</dd>
+      <dt>replicas</dt><dd>${esc(shard.spec.replicas)}</dd>
+      <dt>packing</dt><dd>${esc(shard.spec.packing.mode)} · max ${esc(shard.spec.packing.maxProcessesPerPod)}/pod</dd>
+      <dt>paused</dt><dd>${shard.spec.paused ? "yes" : "no"}</dd>
+    </dl></div>
+    <div class="card"><h3>Per-pod request</h3><dl class="kv">
+      <dt>processes</dt><dd>${esc(resources.processes)}</dd>
+      <dt>cpu</dt><dd>${esc(resources.cpuRequest)}</dd>
+      <dt>memory</dt><dd>${esc(resources.memoryRequest)}</dd>
+      <dt>storage</dt><dd>${esc(resources.storageRequest)}</dd>
+      <dt>image</dt><dd>${esc(shard.spec.image)}</dd>
+    </dl></div>
+    <div class="card"><h3>Raft</h3><dl class="kv">
+      <dt>fsync</dt><dd>${esc(shard.spec.raft.walFsync.mode)}${shard.spec.raft.walFsync.intervalMs ? " / " + esc(shard.spec.raft.walFsync.intervalMs) + "ms" : ""}</dd>
+      <dt>read policy</dt><dd>${esc(shard.spec.raft.readPolicy)}</dd>
+      <dt>snapshot</dt><dd>every ${esc(shard.spec.raft.snapshot.everyMinutes)} min</dd>
+      <dt>release</dt><dd>wire v${esc(shard.spec.release.wireVersion)} · snap v${esc(shard.spec.release.snapshotVersion)}</dd>
+      <dt>upgrade</dt><dd>${esc(shard.spec.upgrade.strategy)}</dd>
+    </dl></div>
+    <div class="card"><h3>Validation</h3><dl class="kv">
+      <dt>errors</dt><dd><span class="badge ${errors ? "err" : "ok"}">${errors}</span></dd>
+      <dt>warnings</dt><dd><span class="badge ${warnings ? "warn" : "ok"}">${warnings}</span></dd>
+      <dt>ports</dt><dd>${esc(shard.spec.network.httpBasePort)}–${esc(shard.spec.network.httpBasePort + shard.spec.packing.maxProcessesPerPod - 1)} / raft +1000</dd>
+      <dt>namespace</dt><dd>${esc(shard.namespace)}</dd>
+    </dl></div>`;
+
+  const consoles = Object.fromEntries((detail.engineConsoles || []).map((entry) => [entry.symbol, entry]));
+  const processes = detail.deployments || [];
+  $("processRows").innerHTML = processes.length ? processes.map((deployment) => {
+    const entry = consoles[deployment.spec.symbolRef];
+    return `
+    <tr>
+      <td class="mono">${esc(deployment.spec.symbolRef)}</td>
+      <td class="mono">${esc(deployment.name)}</td>
+      <td class="mono">${esc(deployment.spec.placement.slot)}</td>
+      <td class="mono">${esc(deployment.spec.placement.httpPort)}</td>
+      <td class="mono">${esc(deployment.spec.placement.httpPort + 1000)}</td>
+      <td class="mono">${esc(deployment.spec.configHash || "derived")}</td>
+      <td class="mono">${entry ? `<a href="${esc(entry.proxyUrl || entry.url)}" target="_blank" rel="noreferrer" title="Open the engine console on pod ${esc(entry.pod)}${entry.leader ? " (leader)" : ""} through the manager">open ↗</a>` : "—"}</td>
+    </tr>`;
+  }).join("") : `<tr><td colspan="7" class="muted">No engine processes — this shard is reserved. Use <button class="primary" type="button" onclick="openSymbolModal()">+ symbol</button> to bind the first symbol and materialize the StatefulSet.</td></tr>`;
+
+  const observation = detail.observation || { processes: [] };
+  const leaders = (observation.processes || []).filter((p) => p.leader);
+  $("leaderRows").innerHTML = leaders.length ? leaders.map((row) => {
+    const deployment = detail.deployments.find((d) => d.spec.symbolRef === row.symbol);
+    const port = deployment?.spec.placement.httpPort;
+    const entry = consoles[row.symbol];
+    const address = `${detail.shard.name}-${row.pod}.${detail.shard.name}-headless.${detail.shard.namespace}.svc.cluster.local:${port}`;
+    return `<tr>
+      <td class="mono">${esc(row.symbol)}</td>
+      <td class="mono">${esc(detail.shard.name)}-${esc(row.pod)}</td>
+      <td class="mono">${entry ? `<a href="${esc(entry.proxyUrl || entry.url)}" target="_blank" rel="noreferrer" title="Open the engine console on this leader through the manager">${esc(address)} ↗</a>` : esc(address)}</td>
+      <td><span class="badge ${row.ready ? "ok" : "err"}">${row.ready ? "ready" : "not ready"}</span></td>
+    </tr>`;
+  }).join("") : `<tr><td colspan="4" class="muted">${processes.length ? `no leader in scenario ${esc(detail.scenario || "ready")}` : "no processes yet — reserved shard"}</td></tr>`;
+
+  renderIssues(validation);
+}
+
+function renderPlan(plan) {
+  loadedPlan = plan;
+  const data = plan.plan || plan;
+  const steps = data.steps || [];
+  const badgeClass = data.phase === "ready" ? "ok" : data.phase === "blocked" ? "err" : data.phase === "reserved" ? "" : "warn";
+  $("planSummary").innerHTML = `<span class="badge ${badgeClass}">${esc(data.phase)}</span>
+    &nbsp; ${esc(plan.summary || "")} &nbsp; <span class="muted">target image</span> ${esc(data.targetImage)}`;
+  const blocked = (data.blocked || []).map((b) => `<div class="issue">${esc(b)}</div>`).join("");
+  const notes = (data.notes || []).map((n) => `<div class="issue warning">${esc(n)}</div>`).join("");
+  $("planSteps").innerHTML = (blocked || notes ? `<div class="issues">${blocked}${notes}</div>` : "") +
+    (steps.length ? steps.map((step, index) => `
+      <div class="step">
+        <div class="num">${String(index + 1).padStart(2, "0")}</div>
+        <div>
+          <div class="action">${esc(step.action)}</div>
+          <div class="target">${esc(step.target)}</div>
+          ${step.endpoint ? `<div class="endpoint">${esc(step.endpoint)}</div>` : ""}
+          <div class="detail">${esc(step.detail)}</div>
+          ${(step.voters || []).length ? `<div class="endpoint">voters: ${(step.voters || []).map((v) => esc(v.id) + "=" + esc(v.addr)).join(", ")}</div>` : ""}
+        </div>
+      </div>`).join("") : `<span class="muted">No steps: the shard matches desired state.</span>`);
+}
+
+async function loadPlan() {
+  const scenario = $("scenario").value;
+  const params = new URLSearchParams({
+    scenario,
+    target_image: $("targetImage").value,
+    wire_version: $("wireVersion").value,
+    snapshot_version: $("snapshotVersion").value,
+    mixed_version_safe: $("mixedSafe").value,
+  });
+  try {
+    const result = await api(`/api/v1/shards/${encodeURIComponent(selected)}/plan?${params}`);
+    renderPlan(result);
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+async function loadDetail() {
+  detail = await api(`/api/v1/shards/${encodeURIComponent(selected)}?scenario=${encodeURIComponent($("scenario").value)}`);
+  $("shardName").textContent = detail.shard.name;
+  const cell = detail.cell?.name || detail.shard.spec.cell;
+  $("shardSub").textContent = `${cell} · ${detail.shard.spec.class} · ${detail.deployments.length} engine process${detail.deployments.length === 1 ? "" : "es"} · ${detail.shard.spec.replicas} voters`;
+  $("targetImage").value = detail.shard.spec.image;
+  $("objectsPre").textContent = JSON.stringify(detail, null, 2);
+  renderOverview();
+  renderIssues(detail.shardValidation || detail.validation);
+}
+
+async function loadShard() {
+  if (!selected) return;
+  try {
+    await loadDetail();
+    await loadPlan();
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+async function loadManifests() {
+  try {
+    manifestList = await api(`/api/v1/shards/${encodeURIComponent(selected)}/manifests?profile=${encodeURIComponent($("profile").value)}`);
+    $("manifestPre").textContent = JSON.stringify(manifestList, null, 2);
+    const empty = !(detail?.deployments || []).length;
+    $("manifestHint").textContent = empty
+      ? `${manifestList.items.length} objects · reserved shard: no StatefulSet until a symbol is bound`
+      : `${manifestList.items.length} objects · kubectl apply -f works with this List`;
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+async function adopt() {
+  try {
+    await api(`/api/v1/shards/${encodeURIComponent(selected)}/simulate?scenario=${encodeURIComponent($("scenario").value)}`, { method: "POST" });
+    toast("observation adopted: route statuses updated");
+    catalog = await api("/api/v1/catalog");
+    renderHeader();
+    renderShards();
+    await loadDetail();
+    await loadPlan();
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+async function loadAudit() {
+  try {
+    const body = await api("/api/v1/audit?limit=8");
+    $("auditList").innerHTML = (body.items || []).map((entry) =>
+      `<li>${esc(new Date(entry.at * 1000).toLocaleTimeString())} ${esc(entry.action)} ${esc(entry.target)}</li>`).join("")
+      || `<li>no entries</li>`;
+  } catch (_) { /* audit is optional */ }
+}
+
+function shardUsage(shard) {
+  const used = Object.values(catalog.deployments || {}).filter((d) => d.spec.shardRef === shard.name).length;
+  const max = shard.spec.packing.maxProcessesPerPod;
+  return { used, max, free: Math.max(0, max - used) };
+}
+
+function openModal(id) {
+  $(id).classList.add("open");
+  $(id).setAttribute("aria-hidden", "false");
+}
+
+function closeModal(id) {
+  $(id).classList.remove("open");
+  $(id).setAttribute("aria-hidden", "true");
+}
+
+function openSymbolModal() {
+  if (!catalog) return;
+  $("symbolForm").reset();
+  const shards = Object.values(catalog.shards || {});
+  $("symTarget").innerHTML = `<option value="">auto · zero-impact shards first</option>` + shards.map((shard) => {
+    const { used, max, free } = shardUsage(shard);
+    const unsafe = shard.spec.packing.mode === "containers" && used > 0;
+    const disabled = shard.spec.paused || free <= 0 || unsafe;
+    const note = shard.spec.paused ? " · paused" : free <= 0 ? " · full" : unsafe ? " · restart required" : shard.spec.packing.mode === "supervisor" ? " · zero-impact" : " · first add zero-impact";
+    return `<option value="${esc(shard.name)}" ${disabled ? "disabled" : ""}>${esc(shard.name)} · ${used}/${max}${note}</option>`;
+  }).join("");
+  const ids = Object.values(catalog.symbols || {}).map((symbol) => symbol.spec.symbolId);
+  $("symId").value = String((ids.length ? Math.max(...ids) : 0) + 1);
+  $("symName").value = "";
+  $("symBase").value = "USD";
+  $("symQuote").value = "JPY";
+  $("symBaseDec").value = "2";
+  $("symQuoteDec").value = "0";
+  $("symPriceDec").value = "3";
+  $("symTick").value = "0.001";
+  $("symLot").value = "0.01";
+  $("symOwner").value = "fx-team";
+  openModal("symbolModal");
+  $("symName").focus();
+}
+
+async function submitSymbol(event) {
+  event.preventDefault();
+  const text = (id) => $(id).value.trim();
+  const number = (id) => Number($(id).value);
+  const target = $("symTarget").value;
+  const symbol = {
+    name: text("symName"),
+    namespace: "",
+    spec: {
+      symbolId: number("symId"),
+      base: { code: text("symBase").toUpperCase(), class: $("symBaseClass").value, decimals: number("symBaseDec") },
+      quote: { code: text("symQuote").toUpperCase(), class: $("symQuoteClass").value, decimals: number("symQuoteDec") },
+      priceDecimals: number("symPriceDec"),
+      priceTick: text("symTick"),
+      baseLot: text("symLot"),
+      feeAssetPolicy: $("symFee").value,
+      stp: $("symStp").value,
+      owner: text("symOwner") || "manager",
+      generation: 1,
+    },
+  };
+  try {
+    const result = await api("/api/v1/symbols", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ symbol, shard: target || null, cell: target ? null : (Object.keys(catalog.cells || {})[0] || null) }),
+    });
+    const placement = result.placement;
+    closeModal("symbolModal");
+    toast(`created ${placement.symbol.name} on ${placement.shard} slot ${placement.slot} · http ${placement.httpPort}`);
+    catalog = await api("/api/v1/catalog");
+    selected = placement.shard;
+    manifestList = null;
+    renderHeader();
+    renderShards();
+    await loadDetail();
+    await loadPlan();
+    loadAudit();
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+function applyShardModeDefaults() {
+  const supervisor = $("shardMode").value === "supervisor";
+  $("shardCpuReq").value = supervisor ? "500m" : "250m";
+  $("shardMemReq").value = "256Mi";
+  $("shardCpuLim").value = supervisor ? "2" : "1";
+  $("shardMemLim").value = supervisor ? "1Gi" : "1Gi";
+}
+
+function openShardModal() {
+  if (!catalog) return;
+  $("shardForm").reset();
+  const cells = Object.values(catalog.cells || {});
+  $("shardCell").innerHTML = cells.map((cell) => `<option value="${esc(cell.name)}">${esc(cell.name)} · ${esc(cell.namespace)}</option>`).join("");
+  let n = 3;
+  while (catalog.shards[`fx-eu-${String(n).padStart(2, "0")}`]) n += 1;
+  $("shardFormName").value = `fx-eu-${String(n).padStart(2, "0")}`;
+  $("shardClass").value = "Packed";
+  $("shardMode").value = "supervisor";
+  $("shardReplicas").value = "4";
+  $("shardMax").value = "4";
+  $("shardMax").disabled = false;
+  const bases = Object.values(catalog.shards || {}).map((shard) => shard.spec.network.httpBasePort + shard.spec.packing.maxProcessesPerPod);
+  $("shardBasePort").value = String(Math.max(21041, ...bases, 0) + 20);
+  const first = Object.values(catalog.shards || {})[0];
+  $("shardImage").value = first?.spec.image || "matchengine-raft:k8s-nonroot";
+  $("shardStorageClass").value = first?.spec.storage?.className || "local-path";
+  $("shardStorageSize").value = "2Gi";
+  applyShardModeDefaults();
+  openModal("shardModal");
+  $("shardFormName").focus();
+}
+
+async function submitShard(event) {
+  event.preventDefault();
+  const text = (id) => $(id).value.trim();
+  const number = (id) => Number($(id).value);
+  const cell = $("shardCell").value;
+  const cellObj = (catalog.cells || {})[cell];
+  const shard = {
+    name: text("shardFormName"),
+    namespace: cellObj?.namespace || "match-eu-1",
+    spec: {
+      cell,
+      environment: "prod",
+      class: $("shardClass").value,
+      replicas: number("shardReplicas"),
+      packing: { mode: $("shardMode").value, maxProcessesPerPod: number("shardMax") },
+      image: text("shardImage"),
+      release: { wireVersion: 7, snapshotVersion: 11, mixedVersionSafe: false },
+      storage: { className: text("shardStorageClass"), size: text("shardStorageSize") },
+      defaultProcessResources: {
+        requests: { cpu: text("shardCpuReq"), memory: text("shardMemReq") },
+        limits: { cpu: text("shardCpuLim"), memory: text("shardMemLim") },
+      },
+      raft: { walFsync: { mode: "every" }, readPolicy: "local_lease", snapshot: { everyMinutes: 30 } },
+      quotas: { perProcess: { maxEvents: 262144, maxInflightWrites: 1024 } },
+      network: { httpBasePort: number("shardBasePort") },
+      upgrade: { strategy: "auto" },
+      paused: false,
+    },
+  };
+  try {
+    const result = await api("/api/v1/shards", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(shard),
+    });
+    closeModal("shardModal");
+    toast(`reserved ${result.shard.name} with ${result.shard.spec.packing.maxProcessesPerPod} slots`);
+    catalog = await api("/api/v1/catalog");
+    selected = result.shard.name;
+    manifestList = null;
+    renderHeader();
+    renderShards();
+    await loadDetail();
+    await loadPlan();
+    loadAudit();
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+function bind() {
+  $("newSymbolBtn").addEventListener("click", openSymbolModal);
+  $("newShardBtn").addEventListener("click", openShardModal);
+  $("symbolForm").addEventListener("submit", submitSymbol);
+  $("shardForm").addEventListener("submit", submitShard);
+  $("shardClass").addEventListener("change", () => {
+    const dedicated = $("shardClass").value === "Dedicated";
+    $("shardMax").value = dedicated ? "1" : "4";
+    $("shardMax").disabled = dedicated;
+  });
+  $("shardMode").addEventListener("change", applyShardModeDefaults);
+  document.querySelectorAll("[data-close]").forEach((button) => {
+    button.addEventListener("click", () => closeModal(button.dataset.close));
+  });
+  document.querySelectorAll(".modal").forEach((modal) => {
+    modal.addEventListener("click", (event) => {
+      if (event.target === modal) closeModal(modal.id);
+    });
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") {
+      document.querySelectorAll(".modal.open").forEach((modal) => closeModal(modal.id));
+    }
+  });
+  document.querySelectorAll(".tab").forEach((tab) => {
+    tab.addEventListener("click", () => {
+      document.querySelectorAll(".tab").forEach((t) => t.classList.toggle("active", t === tab));
+      document.querySelectorAll(".panel").forEach((p) => p.classList.toggle("active", p.id === "tab-" + tab.dataset.tab));
+      if (tab.dataset.tab === "manifests" && !manifestList) loadManifests();
+    });
+  });
+  $("planBtn").addEventListener("click", loadPlan);
+  $("adoptBtn").addEventListener("click", adopt);
+  $("renderBtn").addEventListener("click", loadManifests);
+  $("profile").addEventListener("change", loadManifests);
+  $("scenario").addEventListener("change", async () => { await loadDetail(); await loadPlan(); });
+  $("downloadBtn").addEventListener("click", () => {
+    if (!manifestList) return;
+    const blob = new Blob([JSON.stringify(manifestList, null, 2)], { type: "application/json" });
+    const link = document.createElement("a");
+    link.href = URL.createObjectURL(blob);
+    link.download = `${selected}-manifests.json`;
+    link.click();
+    URL.revokeObjectURL(link.href);
+  });
+}
+
+async function boot() {
+  bind();
+  try {
+    catalog = await api("/api/v1/catalog");
+    renderHeader();
+    const shards = Object.keys(catalog.shards || {});
+    selected = shards[0];
+    renderShards();
+    await loadShard();
+    loadAudit();
+  } catch (error) {
+    toast("cannot load catalog: " + error.message, true);
+  }
+}
+
+boot();
+</script>
+</body>
+</html>

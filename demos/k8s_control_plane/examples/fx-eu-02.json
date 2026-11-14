@@ -1,0 +1,101 @@
+{
+  "cell": {
+    "name": "eu-1",
+    "namespace": "match-eu-1",
+    "spec": {
+      "clusterId": "eu-1-prod",
+      "region": "eu-west",
+      "kubeContext": "orbstack",
+      "namespaces": [
+        "match-eu-1"
+      ],
+      "storageClasses": [
+        "local-path",
+        "fast-ssd"
+      ],
+      "capacity": {
+        "maxShards": 120,
+        "maxProcesses": 9600
+      },
+      "gateway": {
+        "url": "https://match-eu-1.example.com"
+      },
+      "observability": {
+        "prometheus": "https://prometheus-eu-1.example.com"
+      }
+    }
+  },
+  "shard": {
+    "name": "fx-eu-02",
+    "namespace": "match-eu-1",
+    "spec": {
+      "cell": "eu-1",
+      "environment": "prod",
+      "class": "Packed",
+      "replicas": 4,
+      "packing": {
+        "mode": "containers",
+        "maxProcessesPerPod": 4
+      },
+      "image": "registry.example.com/matchengine-raft:1.4.0-nonroot",
+      "release": {
+        "wireVersion": 7,
+        "snapshotVersion": 11,
+        "mixedVersionSafe": false
+      },
+      "storage": {
+        "className": "local-path",
+        "size": "2Gi"
+      },
+      "defaultProcessResources": {
+        "requests": {
+          "cpu": "250m",
+          "memory": "512Mi"
+        },
+        "limits": {
+          "cpu": "1",
+          "memory": "1Gi"
+        }
+      },
+      "raft": {
+        "walFsync": {
+          "mode": "every"
+        },
+        "readPolicy": "local_lease",
+        "snapshot": {
+          "everyMinutes": 30
+        }
+      },
+      "quotas": {
+        "perProcess": {
+          "maxEvents": 262144,
+          "maxInflightWrites": 1024
+        }
+      },
+      "network": {
+        "httpBasePort": 21041
+      },
+      "upgrade": {
+        "strategy": "auto"
+      },
+      "paused": false
+    },
+    "status": {
+      "observedGeneration": 0,
+      "phase": "Reserved",
+      "membersPerProcess": 0,
+      "capacity": {
+        "processes": 0,
+        "cpuRequest": "",
+        "memoryRequest": "",
+        "storageRequest": ""
+      },
+      "symbols": [],
+      "nodes": [],
+      "conditions": []
+    }
+  },
+  "symbols": [],
+  "deployments": [],
+  "routes": []
+}

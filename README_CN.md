@@ -56,6 +56,7 @@
 - [运维控制台](#运维控制台)
 - [演示下单系统](#演示下单系统)
 - [基于 Aeron 的行情数据系统](#基于-aeron-的行情数据系统)
+- [Kubernetes 控制平面](#kubernetes-控制平面)
 - [安全与部署边界](#安全与部署边界)
 - [项目结构](#项目结构)
 - [存储与撮合](#存储与撮合)
@@ -253,6 +254,28 @@ quote 保证金叠加层，会估算名义价值、初始保证金和费用，�
 [`demos/market_data_system/README.md`](./demos/market_data_system/README.md) 和
 [`docs/MARKET_DATA_WEBSOCKET.md`](./docs/MARKET_DATA_WEBSOCKET.md)。
 
+## Kubernetes 控制平面
+
+引擎每个进程只交易一个 symbol，因此多 symbol 部署是一组相互独立的 Raft 集群。
+`demos/k8s_control_plane/` 是参考控制平面：用四 Pod 的 `SymbolShard` 承载多个单 symbol 引擎进程，
+校验放置、端口和资源，渲染 StatefulSet/Services/PDB/NetworkPolicy，并规划 bootstrap、成员变更、
+路由和同版本升级。管理 API/GUI 负责 symbol 目录、RBAC、审批以及带白名单的引擎控制台代理。
+它还可以预留空 shard、把新 symbol 放入预留或已有 shard（自动分配下一个空闲 slot/端口），
+并为已有 symbol 生成影子迁移计划。Supervisor 模式只修改 ConfigMap 即可添加 symbol，
+已有引擎进程继续运行；containers 模式需要显式选择允许重启。
+
+[![Kubernetes 控制平面与引擎控制台](./docs/kubernetes-console-architecture.png)](./docs/kubernetes-console-architecture.html)
+
+[打开交互式架构图](./docs/kubernetes-console-architecture.html) ·
+[设计与 CRD](./docs/KUBERNETES_CONTROL_PLANE.md) ·
+[本地测试计划](./docs/KUBERNETES_LOCAL_TESTING.md) ·
+[参考实现](./demos/k8s_control_plane/README.md)
+
+![Kubernetes 控制平面管理 GUI](./docs/kubernetes-control-plane.png)
+
+管理 GUI：shard 目录、supervisor/containers 打包模式、校验、reconcile 计划、manifests、审计和引擎控制台链接。
+截图中的 `fx-sup-01` 为 supervisor 模式，`eurgbp` 和 `nzdusd` 均在不重启已有引擎的情况下加入。
+
 ## 安全与部署边界
 
 HTTP API 与 gRPC Raft 监听端口（HTTP 端口 + 1000）**按设计就是明文且无认证**。这是内部撮合引擎，
@@ -278,7 +301,7 @@ HTTP API 与 gRPC Raft 监听端口（HTTP 端口 + 1000）**按设计就是明�
 ## 项目结构
 
 顶层结构：`src/`（引擎）、`proto/`（gRPC schema）、`examples/`（回放/转储工具）、`demos/`
-（下单系统和行情系统）、`tests/cluster/`（集成测试）。完整目录树见
+（下单系统、行情系统和 Kubernetes 控制平面）、`tests/cluster/`（集成测试）。完整目录树见
 [项目结构](./docs/zh-CN/PROJECT_STRUCTURE.md)。
 
 ## 存储与撮合

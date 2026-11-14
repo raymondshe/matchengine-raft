@@ -40,7 +40,8 @@ examples/
 └── replay_orders_events.rs  # Replay orders and compare events from POST /events
 demos/
 ├── order_system/            # Standalone order desk (separate crate)
-└── market_data_system/      # Standalone Binance-style WebSocket market-data service
+├── market_data_system/      # Standalone Binance-style WebSocket market-data service
+└── k8s_control_plane/       # Reference Kubernetes control plane (separate crate)
 tests/
 ├── cluster/
     ├── main.rs              # Single integration test target

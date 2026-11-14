@@ -57,6 +57,7 @@ A Raft-replicated matching engine in Rust for teams that need deterministic exec
 - [Operational Console](#operational-console)
 - [Demo Order Desk](#demo-order-desk)
 - [Market-Data System over Aeron](#market-data-system-over-aeron)
+- [Kubernetes Control Plane](#kubernetes-control-plane)
 - [Security and Deployment Boundary](#security-and-deployment-boundary)
 - [Project Structure](#project-structure)
 - [Storage and Matching](#storage-and-matching)
@@ -270,6 +271,32 @@ validation, run `./scripts/aeron-linux-lab.sh`. See
 [`demos/market_data_system/README.md`](./demos/market_data_system/README.md)
 and [`docs/MARKET_DATA_WEBSOCKET.md`](./docs/MARKET_DATA_WEBSOCKET.md).
 
+## Kubernetes Control Plane
+
+The engine trades one symbol per process, so a multi-symbol deployment is a fleet of independent
+Raft clusters. `demos/k8s_control_plane/` is the reference control plane: it models four-pod
+`SymbolShard`s that pack several single-symbol engine processes per pod, validates placement and
+ports, renders the StatefulSet/Services/PDB/NetworkPolicy set, and plans bootstrap, membership,
+routing and same-version upgrades. The manager API/GUI owns the symbol catalog, RBAC, approvals
+and the allowlisted engine-console proxy. It can reserve empty shards, place a new symbol into a
+reserved or existing shard with the next free slot/port, and prepare a shadow migration plan for
+an existing symbol. Supervisor-mode shards add a symbol by changing only the ConfigMap, so
+existing engine processes keep running; containers-mode additions require an explicit restart
+opt-in.
+
+[![Kubernetes control plane and engine console](./docs/kubernetes-console-architecture.png)](./docs/kubernetes-console-architecture.html)
+
+[Open the interactive diagram](./docs/kubernetes-console-architecture.html) ·
+[Design and CRDs](./docs/KUBERNETES_CONTROL_PLANE.md) ·
+[Local test plan](./docs/KUBERNETES_LOCAL_TESTING.md) ·
+[Reference demo](./demos/k8s_control_plane/README.md)
+
+![Kubernetes control plane manager GUI](./docs/kubernetes-control-plane.png)
+
+The manager GUI: shard catalog, supervisor/containers packing modes, validation, reconcile plan,
+manifests, audit and engine-console links. The selected `fx-sup-01` shard is supervisor-mode and
+hosts `eurgbp` and `nzdusd`; both were added without restarting the running engines.
+
 ## Security and Deployment Boundary
 
 The HTTP API and the gRPC Raft listener (HTTP port + 1000) are **plaintext and unauthenticated by
@@ -299,8 +326,8 @@ memory.
 ## Project Structure
 
 Top-level layout: `src/` (engine), `proto/` (gRPC schema), `examples/` (replay and dump tools),
-`demos/` (order desk and market-data system) and `tests/cluster/` (integration tests). See
-[Project structure](./docs/PROJECT_STRUCTURE.md) for the full tree.
+`demos/` (order desk, market-data system and Kubernetes control plane) and `tests/cluster/`
+(integration tests). See [Project structure](./docs/PROJECT_STRUCTURE.md) for the full tree.
 
 ## Storage and Matching
 

@@ -22,4 +22,5 @@ mod test_request_limits;
 mod test_restart;
 mod test_snapshot;
 mod test_storage;
+mod test_supervisor;
 mod test_symbols;
