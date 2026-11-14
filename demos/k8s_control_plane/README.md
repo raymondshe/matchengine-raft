@@ -10,7 +10,7 @@ controller loop, no database and no authentication. It exists to make the design
 testable: one command renders the exact manifest set, one command prints what the operator would
 do next, and the embedded GUI shows the catalog, validation report and reconcile plan.
 
-[![Kubernetes control plane and engine console](../../docs/kubernetes-console-architecture.png)](../../docs/kubernetes-console-architecture.html)
+[![Kubernetes control plane, supervisor and engine console](../../docs/kubernetes-console-architecture.png)](../../docs/kubernetes-console-architecture.html)
 
 [Open the interactive diagram](../../docs/kubernetes-console-architecture.html).
 

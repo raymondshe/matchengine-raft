@@ -284,7 +284,7 @@ an existing symbol. Supervisor-mode shards add a symbol by changing only the Con
 existing engine processes keep running; containers-mode additions require an explicit restart
 opt-in.
 
-[![Kubernetes control plane and engine console](./docs/kubernetes-console-architecture.png)](./docs/kubernetes-console-architecture.html)
+[![Kubernetes control plane, supervisor and engine console](./docs/kubernetes-console-architecture.png)](./docs/kubernetes-console-architecture.html)
 
 [Open the interactive diagram](./docs/kubernetes-console-architecture.html) ·
 [Design and CRDs](./docs/KUBERNETES_CONTROL_PLANE.md) ·

@@ -264,7 +264,7 @@ quote 保证金叠加层，会估算名义价值、初始保证金和费用，�
 并为已有 symbol 生成影子迁移计划。Supervisor 模式只修改 ConfigMap 即可添加 symbol，
 已有引擎进程继续运行；containers 模式需要显式选择允许重启。
 
-[![Kubernetes 控制平面与引擎控制台](./docs/kubernetes-console-architecture.png)](./docs/kubernetes-console-architecture.html)
+[![Kubernetes 控制平面、Supervisor 与引擎控制台](./docs/kubernetes-console-architecture.png)](./docs/kubernetes-console-architecture.html)
 
 [打开交互式架构图](./docs/kubernetes-console-architecture.html) ·
 [设计与 CRD](./docs/KUBERNETES_CONTROL_PLANE.md) ·

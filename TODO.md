@@ -1,6 +1,6 @@
 # TODO
 
-Last reviewed: 2026-11-10. This is the working roadmap; see `AGENTS.md` for commands and the
+Last reviewed: 2026-11-14. This is the working roadmap; see `AGENTS.md` for commands and the
 current branch state.
 
 **Current baseline:** the OpenRaft 0.10 port, durable WAL/snapshot storage and exact scale-18
@@ -22,17 +22,25 @@ bottleneck. The remaining work is benchmark-derived correctness and measurement,
 evidence, OpenRaft utilization follow-ups (§16) and feature extensions (§5, §6, §13);
 TLS/authentication stays at the gateway and is out of scope for this process.
 
+The Kubernetes control-plane design and reference demo are complete (§18): reserved and supervisor
+shards, create-symbol/migrate planning, a zero-impact supervisor pod agent, and a containers-mode
+restart guard. The real cell operator and production manager remain.
+
 Priority key: **P0** = known correctness/security defect, do next; **P1** = correctness coverage,
 measurement and production readiness; **P2** = important but not blocking; **P3** = later/optional.
 
 ## Top priorities
 
-Last prioritised 2026-11-11, after the OrbStack Linux lab and the Aeron
+Last prioritised 2026-11-14, after the OrbStack Linux lab and the Aeron
 external-driver/multicast validation. There are no known P0 or P1 defects. The local-lease semantic
 risk is covered by the delivery contract: client retries are at-least-once and use
 `client_order_id` for replicated dedupe, while downstream event readers resume from
 `(log_index, ordinal)` and dedupe on `event_id`. A local-lease cache hit may overtake an unfinished
 write, so read-after-write is not a guarantee; clients that need it must await the write response.
+
+The Kubernetes control plane is a new feature workstream, not a defect (§18). The design, reference
+manager, reserved/supervisor shards and zero-impact supervisor additions are done; the real cell
+operator, production manager and supervisor hardening are the remaining P1/P2 work.
 
 The remaining P2 evidence gaps are second-host behaviour, not code paths: the four OrbStack
 containers share one kernel, host and clock, and the Aeron multicast run is loopback within one
@@ -689,6 +697,8 @@ Done:
 - [x] README/README_CN, AGENTS, TODO, PERFORMANCE, AERON, MATCH_RESULTS, MARKET_DATA_PLAN,
   FEE_DEDUCTION, DECIMAL, DEMO_ORDER_SYSTEM and MATCHING_ENGINE_TEST_SUITES are synced with the
   WAL + snapshot + gRPC design, snapshot v11 / wire v7 and the implemented demo crate.
+- [x] The Kubernetes control-plane docs, architecture diagram and manager GUI screenshot are linked
+  from `README.md`, `README_CN.md` and the demo README.
 - [x] `docs/DECIMAL.md` records the fixed-point research, BTC 18-decimal range analysis,
   microbenchmarks and the completed end-to-end migration.
 - [x] **P3** Renamed `src/matchengine/` to `src/order_book/` (2026-10-29); the public module is now
@@ -1191,3 +1201,99 @@ reported 7.20 M/s book-only; the full review and competitor taxonomy are in
 - [ ] **P3** Add AON and order-mask conformance cases when those behaviours land. STP already has
   `SelfTradePrevented` conformance and integration coverage; multi-symbol remains deployment-level
   isolation (§2).
+
+## 18. Kubernetes control plane and supervisor (2026-11-14)
+
+Design: [`docs/KUBERNETES_CONTROL_PLANE.md`](./docs/KUBERNETES_CONTROL_PLANE.md). Local tiers:
+[`docs/KUBERNETES_LOCAL_TESTING.md`](./docs/KUBERNETES_LOCAL_TESTING.md). Reference demo:
+[`demos/k8s_control_plane/`](./demos/k8s_control_plane/README.md). Supervisor:
+[`src/bin/match_supervisor.rs`](./src/bin/match_supervisor.rs). The engine remains one symbol per
+process; a `SymbolShard` is four pods and each process is its own four-voter Raft group.
+
+Done (2026-11-14):
+
+- [x] **P1** Design and local-test docs: CRD-shaped catalog, `SymbolShard`/`SymbolDeployment`/
+  `SymbolRoute`, slot/port ownership, four-voter bootstrap, storage/PVC, NetworkPolicy, probes,
+  upgrades, backups and migration.
+- [x] **P1** Reference manager crate with model, bundle, validation, renderer, reconcile planner,
+  JSON store, Axum API, embedded GUI and CLI; 79 lib + 1 bin tests.
+- [x] **P1** Reserved/empty shards (`phase: Reserved`); containers mode renders no StatefulSet
+  until the first placement, while supervisor mode pre-warms the supervisor pods with an empty
+  `processes.json`.
+- [x] **P1** Symbol provisioning: `POST /api/v1/shards`, `POST /api/v1/symbols`, lowest-free
+  slot allocation, `httpBasePort + slot`, route creation, whole-catalog validation, audit, auto
+  placement and GUI forms.
+- [x] **P1** Migration preparation: `POST /api/v1/symbols/{symbol}/migrate` creates a shadow
+  deployment and returns the learner/catch-up/membership/cutover/drain plan; the source route stays
+  active until cutover.
+- [x] **P1** Supervisor mode: `match_supervisor` reads `processes.json` from the shard ConfigMap,
+  starts/stops children, restarts crashes with backoff, exposes `/health`, `/ready` and
+  `/processes`, and graceful-stops children on SIGTERM. The image builds both binaries.
+- [x] **P1** Zero-impact guard: adding to a non-empty containers shard returns
+  `409 restart_required` unless `allowRestart: true`; auto placement and migration targets filter
+  unsafe shards; the GUI disables non-empty containers targets and defaults new packed shards to
+  supervisor.
+- [x] **P1** Manager console proxy: allowlisted console assets, `/console/api/*`, `/health`,
+  `/events` and five guarded actions; path rewriting; the rendered NetworkPolicy allows shard peer
+  HTTP for the console cluster view.
+- [x] **P1** Live OrbStack validation (manual apply): non-root engine/manager images; `fx-eu-01`
+  and `fx-eu-02` packed containers, `fx-eu-03` reserved in the catalog, `fx-sup-01` supervisor
+  with `eurgbp`/`nzdusd`, `me-btcusdt` dedicated. Adding both supervisor symbols left all four pod
+  UIDs and restart counts unchanged, the StatefulSet at generation 1, and the `eurgbp` PID
+  unchanged; both consoles report 4/4 peers.
+- [x] **P2** Architecture diagram (`docs/kubernetes-console-architecture.html/png`) and manager
+  GUI screenshot (`docs/kubernetes-control-plane.png`) in the READMEs.
+- [x] **P2** Regression coverage: `tests/cluster/test_supervisor.rs` proves add/remove PID
+  stability; supervisor config unit tests; manager API/provision/render/plan tests; fmt and Clippy
+  clean.
+
+Remaining:
+
+- [ ] **P1** Implement the real cell operator: CRD schemas/install, Lease election, watches and
+  reconciliation for `SymbolShard`/`SymbolDeployment`/`SymbolRoute`/`Cell`, apply/prune of the
+  StatefulSet/Services/PDB/NetworkPolicy/ConfigMap, leader Service labels, status conditions and
+  route status. The demo only renders and plans; it has no Kubernetes client.
+- [ ] **P1** Operator-driven containers-mode add: update the StatefulSet, delete/recreate pods one
+  at a time, wait for readiness and a leader, verify quorum, then `/init` and configure the new
+  process. The API creates desired state and enforces the restart guard, but the roll itself is
+  manual.
+- [ ] **P1** Supervisor hardening: per-process cgroups, log rotation, orphan cleanup, max-child
+  backpressure, a control API, and tests for crash restart, readiness aggregation and shutdown.
+  The reference supervisor shares one container CPU/memory limit.
+- [ ] **P1** Migration execution: a `promote`/cutover path that validates cross-shard
+  `previousDeploymentRef`, switches the route, drains/removes the old deployment, retains/deletes
+  source data, and provides rollback. `migrate` currently creates the shadow and plan only.
+- [ ] **P1** Wire the standalone `demos/k8s_control_plane` crate into CI (fmt, Clippy, tests). The
+  root cluster suite already covers the supervisor; the demo crate is outside the workspace.
+- [ ] **P2** Production manager: Postgres instead of JSON, OIDC/RBAC, approvals, durable audit,
+  idempotency keys, namespace-qualified paths, pagination and dry-run diffs.
+- [ ] **P2** Manager deployment packaging: checked-in Deployment/Service/RBAC/Pod Security/
+  NetworkPolicy, Helm/Kustomize, image digest pinning/publishing and a PVC for catalog state.
+  The live demo used a local image, an emptyDir and a port-forward.
+- [ ] **P2** Gateway integration: leader-aware routing from `SymbolRoute.status`, shadow/cutover/
+  drain, retries and a canary path. No gateway is deployed in the demo.
+- [ ] **P2** Observability: a Prometheus text bridge for the engine's JSON `/metrics`, alert rules,
+  dashboards and log shipping; the console's peer view is covered by the NetworkPolicy rule.
+- [ ] **P2** Backup/restore execution: `VolumeGroupSnapshot`/`VolumeSnapshot` integration, a
+  backup agent, checksums and a restore test. The demo plans backups but does not run them.
+- [ ] **P2** Capacity and packing policy: tenant/owner placement, quotas, capacity accounting,
+  noisy-neighbour detection and hot-symbol promotion. Auto placement currently chooses the most
+  packed zero-impact shard.
+- [ ] **P2** End-to-end operator smoke on OrbStack: create/apply a reserved or supervisor shard,
+  add a symbol, bootstrap membership, configure it and verify zero restarts without manual
+  `kubectl`/`curl` steps. Add the repeatable script/runbook.
+- [ ] **P2** Security: manager OIDC and console-proxy authorization, approvals for destructive
+  actions, NetworkPolicy tests and Pod Security Standards. The demo manager has no auth.
+- [ ] **P3** GUI: live cluster status instead of simulated observations, migration/promote forms,
+  approvals, filters/pagination, diff/rollback and SSE/WebSocket updates.
+- [ ] **P3** CLI `create-shard`, `create-symbol` and `migrate` commands for automation; the
+  API/GUI are implemented today.
+- [ ] **P3** Generated CRD YAML/OpenAPI, admission validation/defaulting and schema tests.
+- [ ] **P3** Multi-cell federation: cell registration/capacity, CR projection and cross-cell
+  migration. The demo has one cell.
+- [ ] **P3** Scale test the manager catalog with 50–100 mock shards and 1,000 symbols (L4 in the
+  local test plan); no real engine load.
+- [ ] **P3** Operator-driven rolling upgrades and stop-the-world incompatible upgrades; the
+  reconcile planner already returns the sequence, but execution is operator work.
+- [ ] **P3** Documentation: operator metrics, troubleshooting, capacity planning and disaster
+  recovery; keep the design and local test plan aligned as the operator lands.
