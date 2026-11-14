@@ -35,6 +35,7 @@
 - **18 位定点数** — 撮合路径不使用 `f64`；价格、数量和费用在 API、事件、快照和 feed 中全程精确。
 - **实时行情** — 确定性 feed 通过 Aeron 发布（每个流一个独占 publication），再由 Binance 风格 WebSocket 服务分发，支持 100/1000 ms 深度合并和水平扩展。
 - **可运维** — 内置控制台、`/health` + `/ready`、指标、重放工具和独立下单演示。
+- **Kubernetes 集群管理** — 参考管理器和 supervisor 可管理数千个单 symbol 引擎，支持零影响 symbol 生命周期、重启保护和带存储决策的 shard 删除。
 
 | 维度 | 当前状态 |
 |---|---|
@@ -43,6 +44,7 @@
 | 复制 | Raft 节点间 RPC 使用 gRPC |
 | 行情数据 | Aeron 出口（2001–2007 流 + 2010 快照请求）+ Binance 风格 WebSocket 服务 |
 | 标的模型 | 一个进程/集群一个标的，经 Raft 配置并在交易开始后锁定 |
+| 集群管理 | Kubernetes 控制平面参考实现：manager + supervisor；跨数千个单 symbol 引擎、四 Pod shard 和 cell 的零影响 symbol 生命周期和带存储决策的 shard 删除 |
 | 数值模型 | 撮合、事件、快照和 feed 全程使用 18 位定点数 |
 | 可观测性 | 内置控制台、健康/就绪检查和指标 |
 | 公共入口 | 请求/快照大小受限；仅支持回环或私有网络部署 |
@@ -98,10 +100,20 @@
 - **P99 感知写入准入**：每个节点默认限制 1,024 个并发 `/write` 和 `/write_batch` 请求，超出返回 `429`；`/admission/status` 报告当前、峰值、准入和拒绝计数。
 
 **运维可见性**
-- **内置 WebUI 控制台** `/console/`：集群健康、Raft 领导与复制、存储/事件/行情状态、仅领导者可见的事件查看器和诊断信息，无需构建步骤或外部资源。
+- **内置 WebUI 控制台** `/console/`：集群健康、Raft 领导与复制、存储/事件/行情状态、仅领导者可见的事件查看器和诊断信息，无需构建步骤或外部资源。当前 `BASE/QUOTE` 标的作为页面主标题。
 - **受保护的 Raft 操作**：通过 gRPC `TransferLeader` 进行优雅领导者切换、尽力而为的 Pre-Vote 选举请求和快照触发，带确认、操作锁和审计日志。
 - **独立演示下单系统** `demos/order_system/`：独立进程与 crate，可提交真实订单，展示完整订单簿、标的自定义、游标跟随的 `/events` 事件流，以及带“演示估算”标注的订单系统冻结额与 maker/taker 费用结算预览，并复用控制台主题。
 - **健康与就绪探针**：`/health` 报告 gRPC 监听器、Raft 核心和 WAL/状态机前沿；`/ready` 还要求已知领导者，适合编排系统使用。
+
+**Kubernetes 集群管理（面向生产）**
+- **一个控制平面管理数千个单 symbol 引擎** — 每个 symbol 保留独立进程和四 voter Raft 组；2,000 个 symbol 的集群是 8,000 个引擎进程，按每个 Pod 20 个进程计算，需要 100 个四 Pod shard（400 个 Pod），并按 cell 分区。打包减少的是 Pod 和 Kubernetes 对象数量，而不是每个 symbol 的 Raft 组。
+- **Supervisor 零影响模式** — 每个 Pod 一个 supervisor 容器，读取 `processes.json` 后启停单个子进程；添加、停止或启动 symbol 不会改变其他引擎的 PID、监听端口和数据目录。OrbStack 验证中添加和轮换子进程时，所有 Pod UID 和重启计数保持不变。
+- **Containers 模式显式爆炸半径保护** — 非空 containers shard 默认返回 `409 restart_required`；只有显式 `allowRestart` 才允许逐 voter 滚动，避免日常添加操作悄悄重启整个集群。
+- **完整生命周期与存储决策** — 优雅停止/启动复用同一 deployment、slot/端口和 PVC，直接恢复 WAL/snapshot，无需重新 `/init`；空闲 shard 可删除，并通过 `retainStorage` 选择保留 PVC 以便恢复，或不可逆地删除。
+- **期望状态管理器，而不是手工 YAML 堆** — 跨多个 shard/cell 提供目录校验、最小空闲 slot 与 `httpBasePort + slot` 分配、StatefulSet/Services/PDB/NetworkPolicy/ConfigMap 渲染、bootstrap/升级 reconcile 计划、审计和引擎控制台代理。
+- **生产级 Kubernetes 原语** — 四 voter shard、每 Pod 一个 PVC、PDB、NetworkPolicy、headless gRPC Service、健康/就绪探针、非 root 镜像和 leader-aware 路由元数据。参考管理器和 supervisor 已在本仓库实现；生产 operator/controller 在控制平面设计与路线图中定义。
+
+可运行演示见 [Kubernetes 控制平面](#kubernetes-控制平面)，生产 operator 契约见[设计文档](./docs/KUBERNETES_CONTROL_PLANE.md)。
 
 **可信赖的工程质量**
 - **受限的公共入口**：请求体、read key、事件分页、幂等键和快照大小均有上限，畸形输入在进入 Raft 前拒绝。
@@ -267,7 +279,8 @@ quote 保证金叠加层，会估算名义价值、初始保证金和费用，�
 管理器还支持优雅停止和重新启用单个 symbol：停止后保留 deployment、slot/端口和 PVC，`Disabled`
 状态不会释放容量；重新启用复用同一数据目录，不需要重新 `/init`。所有引擎停止后可以删除整个
 shard；删除前会明确询问是否保留 PVC（默认保留，便于以后用相同 shard 名称恢复）。运维控制台会把
-当前 `BASE/QUOTE` symbol 作为醒目标题。
+当前 `BASE/QUOTE` symbol 作为醒目标题。该架构通过 shard 和 cell 扩展到数千个单 symbol 引擎及其
+对应的四 voter 进程实例；参考管理器和 supervisor 已在本仓库实现，生产 operator/controller 是下一层。
 
 [![Kubernetes 控制平面、Supervisor 与引擎控制台](./docs/kubernetes-console-architecture.png)](./docs/kubernetes-console-architecture.html)
 

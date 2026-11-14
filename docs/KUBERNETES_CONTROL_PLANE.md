@@ -13,8 +13,8 @@ Related documents: [`AGENTS.md`](../AGENTS.md), [`docs/OPERATIONAL_CONSOLE.md`](
 
 ## 1. Summary
 
-The engine is a single-symbol, Raft-replicated process. Supporting hundreds of trading symbols
-therefore means running hundreds of independent Raft clusters. Doing that by hand with shell
+The engine is a single-symbol, Raft-replicated process. Supporting thousands of trading symbols
+therefore means running thousands of independent Raft clusters. Doing that by hand with shell
 scripts does not scale: each cluster needs four (or more) stable pods, per-node durable storage,
 a one-time bootstrap, symbol configuration, leader-aware routing, backups, upgrades and health
 monitoring.
@@ -102,7 +102,7 @@ first accepted order, and the public edge is plaintext behind a trusted gateway.
 | Each process keeps its book, event window and snapshot buffers in memory | Packed-shard memory is the sum of the per-process requests/limits; overcommitting memory is not safe. Pack cold symbols with small requests, keep hot symbols dedicated. |
 | Admission limits are per process (`--max-inflight-writes`) | Tune per container; per-container CPU/memory limits prevent one busy symbol from starving its siblings; expose `/admission/status` and alert on rejects. |
 | A pod/node failure affects every process in the pod | Every symbol loses one of four voters, which quorum tolerates. A bad pod image/disk affects all co-located symbols; keep hot symbols in dedicated shards. |
-| Kubernetes has per-node pod/IP and API-server limits | Packing reduces pods from `4 × symbols` to `4 × shards`; 300 symbols at 20 processes per pod is 60 pods (1,200 processes/containers). See §9. |
+| Kubernetes has per-node pod/IP and API-server limits | Packing reduces pods from `4 × symbols` to `4 × shards`; 2,000 symbols at 20 processes per pod is 100 shards = 400 pods (8,000 processes/containers). See §9. |
 | Containers per pod are practically bounded (kubelet/CRI/log/probe overhead) | Target 10–20 containers per pod, hard-cap around 30. The pod's CPU/memory request is the sum of its containers; plan node sizes accordingly. |
 
 ## 4. Architecture
@@ -1769,7 +1769,7 @@ Argo CD/Flux applies the CRs; the operator reconciles. The GUI reads status back
 changes, the manager can write CRs directly with an audit reason and an approval. In both modes
 the CR is the single desired-state contract.
 
-## 9. Scaling to hundreds of symbols
+## 9. Scaling to thousands of symbols
 
 ### 9.1 Cell sharding
 
@@ -1802,6 +1802,7 @@ limits; adjust for symbol volume, `MAX_EVENTS` and the hot/packed mix.
 | 200 | 10 | 40 | 800 | 20 |
 | 500 | 25 | 100 | 2,000 | 20 |
 | 1,000 | 50 | 200 | 4,000 | 20 |
+| 2,000 | 100 | 400 | 8,000 | 20 |
 
 **Mixed** (hot symbols dedicated; the rest packed at 20 processes per pod):
 
@@ -1855,7 +1856,7 @@ monitoring target count.
 ### 9.4 Market-data fan-out
 
 The engine's market-data sink and the standalone market-data system are separate from the
-matching cluster. For hundreds of symbols:
+matching cluster. For thousands of symbols:
 
 - One process owns seven Aeron streams, `base..base+6`, default base `2001`. A packed pod must give
   each process a unique base (`2001 + 7 * slot`) and a unique `--market-data-aeron-stream-base`;
@@ -2062,7 +2063,7 @@ CRDs, run a controller or call the engine.
 - Hibernation policy for low-volume symbols and how clients are notified.
 - Whether market-data deployments are managed by the same CRD or a separate `MarketDataService`.
 - Upgrade waves: same-version rolls are quick, but an incompatible upgrade is stop-the-world per
-  shard; the manager must sequence hundreds of maintenance windows and show the number of affected
+  shard; the manager must sequence thousands of maintenance windows and show the number of affected
   processes. Define the blast-radius policy.
 - Cross-cell symbol migration: new process plus cutover vs cross-cell Raft membership; default to
   the former.
