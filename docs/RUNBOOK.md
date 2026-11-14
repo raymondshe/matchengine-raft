@@ -183,7 +183,7 @@ details are in [`demos/k8s_control_plane/README.md`](../demos/k8s_control_plane/
 | Add a symbol | `POST /api/v1/symbols` or **+ symbol** | supervisor is zero-impact; containers may return `409 restart_required` |
 | Stop an engine | `POST /api/v1/symbols/{symbol}/shutdown` or **stop** | keeps the deployment record, slot/ports and PVC |
 | Start an engine | `POST /api/v1/symbols/{symbol}/start` or **start** | reuses the record/slot/PVC; do not re-run `/init` |
-| Drop a shard | `POST /api/v1/shards/{shard}/drop` or **drop shard** | requires every engine stopped; asks `retainStorage` |
+| Drop a shard | `POST /api/v1/shards/{shard}/drop` or **drop shard** | catalog-only; requires every engine stopped; asks `retainStorage`; the operator prunes workloads/PVCs |
 | Audit | `GET /api/v1/audit` | `shutdown-symbol`, `start-symbol` and `drop-shard` are recorded |
 
 The GUI is served at `/` (and `/console`). From a workstation:
@@ -434,7 +434,22 @@ shard is zero-impact to stop or start.
 Dropping removes the shard, its deployments, and routes that point at them from the **manager
 catalog**. Symbols still referenced by a deployment in another shard are kept. Every engine in the
 shard must be stopped first; the API returns `409 shard_not_idle` and names the active symbols.
-The manager never deletes workloads or PVCs itself.
+
+> **Important: the manager does not delete Kubernetes resources.**
+> A successful `drop` only removes catalog records. The StatefulSet, pods, Services, ConfigMap,
+> PDB and NetworkPolicy remain until the operator prunes them. PVCs are deleted only if you chose
+> `retainStorage: false` and then run the returned `delete-storage` step. A **reserved** shard that
+> never materialized has no Kubernetes objects to clean up; after the catalog 404, there is nothing
+> else to delete.
+
+The expected end state depends on what the shard contained:
+
+| Shard at drop | After the operator applies the steps |
+|---|---|
+| Reserved (`0` deployments, never materialized) | No StatefulSet/pods/Services/ConfigMap/PDB/NetworkPolicy/PVCs existed; only the catalog record disappears. |
+| Materialized, `retainStorage: true` | Workload and shard objects are gone; the four `data-<shard>-0..3` PVCs remain Bound/Released so the shard can be restored. |
+| Materialized, `retainStorage: false` | Workload and shard objects are gone; the PVCs/PVs are gone too. This is irreversible. |
+
 
 #### 1. Save the catalog and manifests
 
@@ -521,15 +536,47 @@ Deleting a namespace or all PVCs bypasses the manager's retention choice and is 
 
 #### 5. Verify
 
+Use this checklist after the drop and after the operator prune:
+
+- [ ] Manager catalog returns `404` for the shard.
+- [ ] No StatefulSet, pods, Services, ConfigMap, PDB or NetworkPolicy remains with the shard name.
+- [ ] `retainStorage: true`: the `data-<shard>-0..N-1` PVCs still exist (and their PVs are Bound).
+- [ ] `retainStorage: false`: no PVC or PV remains for the shard.
+- [ ] The remaining StatefulSet/pod/PVC counts match the shards still in the catalog.
+
 ```sh
-# The manager catalog no longer has the shard.
-curl -s -o /dev/null -w '%{http_code}\n' "http://127.0.0.1:8099/api/v1/shards/$SHARD"   # 404
+SHARD=fx-eu-03
+
+# Catalog is gone.
+curl -s -o /dev/null -w 'catalog HTTP %{http_code}\n' \
+  "http://127.0.0.1:8099/api/v1/shards/$SHARD"   # 404
 curl -s http://127.0.0.1:8099/api/v1/shards | python3 -m json.tool | head
 
-# The operator prune is complete; retained PVCs should still be Bound or Released.
-kubectl -n match-eu-1 get pvc | grep "data-$SHARD-" || true
-kubectl -n match-eu-1 get pods | grep "$SHARD" || true
+# Workload objects are pruned.
+kubectl -n match-eu-1 get statefulsets,deployments,pods,services,configmaps,pdb,networkpolicy \
+  -o name | grep "$SHARD" || echo "no workload objects"
+
+# Storage matches the retainStorage choice.
+kubectl -n match-eu-1 get pvc -o name | grep "$SHARD" || echo "no PVCs"
+kubectl get pv -o name | grep "$SHARD" || echo "no PVs"
+
+# Remaining resources line up with the remaining catalog shards.
+kubectl -n match-eu-1 get statefulsets --no-headers | wc -l
+kubectl -n match-eu-1 get pods --no-headers | wc -l
+kubectl -n match-eu-1 get pvc --no-headers | wc -l
 ```
+
+Reference example: dropping reserved `fx-eu-03` with `retainStorage: false` recorded
+
+```text
+drop-shard | fx-eu-03 | removed 0 deployment(s), 0 route(s), 0 symbol(s); retainStorage=false
+```
+
+and left no `fx-eu-03` object of any kind. The remaining four shards accounted for exactly
+4 StatefulSets, 16 pods, 9 Services, 4 shard ConfigMaps, 4 PDBs, 4 NetworkPolicies and 16 Bound
+PVCs. Because the shard was reserved, there was no workload to prune; the catalog `404` was the
+whole cleanup. For a materialized shard, the same check must show the workload objects gone and the
+PVC state matching the storage choice.
 
 ### Restore a shard with retained storage
 
@@ -617,6 +664,7 @@ synthesized route status honest and never changes engine state.
 | `409 restart_required` on add/stop/start | The shard is containers mode with other active engines; use supervisor mode, an empty shard, or explicitly opt into `allowRestart`. |
 | `409 shard_not_idle` on drop | Stop every symbol in the shard first; the error names the active ones. Apply the updated ConfigMap before retrying. |
 | Drop returned `200` but pods/StatefulSet still exist | The manager only wrote desired state. Prune with the manifests saved before the drop: `kubectl -n match-eu-1 delete -f /tmp/<shard>-manifests.json --ignore-not-found`. |
+| Reserved shard drop shows no PVCs or workloads | Expected: a reserved shard never materialized. Verify the catalog returns `404` and no object with the shard name exists; there is nothing else to clean up. |
 | Drop with `retainStorage: true` but PVCs are gone | The operator or namespace cleanup deleted them; the manager cannot recreate data. Restore from backup or re-initialize the shard. |
 | Restored shard pods stay `Pending` or do not see old data | Recreate the same shard name, replica count, slots/ports and storage class; PVC names are `data-<shard>-<pod>`. Different ports or names do not rebind the old claims or rejoin the old group. |
 | `start` marks `Active` but the child is missing | The ConfigMap was not applied yet, or kubelet has not propagated it. Apply only the ConfigMap and check `/processes`; propagation can take up to a minute. |

@@ -39,8 +39,8 @@ Raft 节点间 RPC 仅由 `--http-addr` 端口 + 1000 上的 gRPC 提供；HTTP 
   `503`。知道领导者的 follower 可服务读请求，写请求仍需发送给领导者。
 - `GET /read-policy/status` - 当前 leader 读策略及各读路径的 lease/ReadIndex 计数
 - `GET /admission/status` - 每节点写入准入上限及当前/峰值/准入/拒绝计数
-- `GET /console/` - 内置运维控制台（HTML/CSS/JS），无需构建步骤或外部资源
-- `GET /console/api/node` - 稳定的节点快照：健康、Raft 角色、存储前沿、事件和 feed
+- `GET /console/` - 内置运维控制台（HTML/CSS/JS），无需构建步骤或外部资源；当前 `BASE/QUOTE` symbol 作为醒目标题
+- `GET /console/api/node` - 稳定的节点快照：健康、Raft 角色、存储前沿、事件、feed 和当前 symbol（`symbol_id`、base/quote、tick/lot）
 - `GET /console/api/cluster` - 当前成员关系中的本节点与对端快照
 - `POST /console/api/actions/transfer-leader` - 优雅领导者切换（仅领导者）
 - `POST /console/api/actions/elect` - 尽力而为的本地 Pre-Vote 选举请求

@@ -264,11 +264,17 @@ quote 保证金叠加层，会估算名义价值、初始保证金和费用，�
 并为已有 symbol 生成影子迁移计划。Supervisor 模式只修改 ConfigMap 即可添加 symbol，
 已有引擎进程继续运行；containers 模式需要显式选择允许重启。
 
+管理器还支持优雅停止和重新启用单个 symbol：停止后保留 deployment、slot/端口和 PVC，`Disabled`
+状态不会释放容量；重新启用复用同一数据目录，不需要重新 `/init`。所有引擎停止后可以删除整个
+shard；删除前会明确询问是否保留 PVC（默认保留，便于以后用相同 shard 名称恢复）。运维控制台会把
+当前 `BASE/QUOTE` symbol 作为醒目标题。
+
 [![Kubernetes 控制平面、Supervisor 与引擎控制台](./docs/kubernetes-console-architecture.png)](./docs/kubernetes-console-architecture.html)
 
 [打开交互式架构图](./docs/kubernetes-console-architecture.html) ·
 [设计与 CRD](./docs/KUBERNETES_CONTROL_PLANE.md) ·
 [本地测试计划](./docs/KUBERNETES_LOCAL_TESTING.md) ·
+[Kubernetes 运行手册](./docs/zh-CN/RUNBOOK.md#kubernetes-控制平面orbstack-演示) ·
 [参考实现](./demos/k8s_control_plane/README.md)
 
 ![Kubernetes 控制平面管理 GUI](./docs/kubernetes-control-plane.png)
