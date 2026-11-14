@@ -235,9 +235,23 @@ impl MatchEngineNode {
     /// stopped (including on a fatal WAL/snapshot error), is not allowed to keep
     /// serving HTTP as if it were healthy: the failure is returned to the caller
     /// after stopping the remaining tasks, so the process can exit non-zero.
-    pub async fn run(mut self) -> std::io::Result<()> {
+    pub async fn run(self) -> std::io::Result<()> {
+        self.run_until(std::future::pending()).await
+    }
+
+    /// Runs the node until it fails, or until `shutdown` resolves.
+    ///
+    /// The binary passes a SIGTERM/SIGINT future here. Containers-mode pods run
+    /// the engine as PID 1, where the kernel ignores default-disposition signals;
+    /// without an explicit future Kubernetes waits the full grace period before
+    /// SIGKILL and every rollout pod takes 60 seconds to stop.
+    pub async fn run_until<F>(mut self, shutdown: F) -> std::io::Result<()>
+    where
+        F: std::future::Future<Output = ()>,
+    {
         let grpc_failure = self.grpc_failure_rx.take();
         let raft_failure = wait_for_raft_stop(self.raft.clone());
+        tokio::pin!(shutdown);
         let http_result = tokio::select! {
             result = &mut self.http_task => {
                 result.map_err(|e| std::io::Error::other(format!("HTTP server task failed: {e}")))
@@ -255,6 +269,12 @@ impl MatchEngineNode {
                 let _ = (&mut self.http_task).await;
                 self.stop_background().await?;
                 return Err(failure);
+            }
+            _ = &mut shutdown => {
+                tracing::info!("shutdown signal received; stopping node");
+                self.http_handle.stop(true).await;
+                let _ = (&mut self.http_task).await;
+                return self.stop_background().await;
             }
         };
 

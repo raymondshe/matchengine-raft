@@ -1,0 +1,2173 @@
+//! Cell operator: Lease election, CRD watches, workload reconciliation and status.
+//!
+//! The operator is the only component that applies rendered workloads. It watches the five
+//! catalog CRDs, renders each shard through the same deterministic renderer as the manager,
+//! server-side-applies the desired StatefulSet/Services/PDB/NetworkPolicy/ConfigMap, prunes
+//! managed objects that are no longer desired, labels the dedicated-shard leader pod for the
+//! leader Service, and writes status/route conditions back through the CRD status subresource.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::time::Duration;
+
+use anyhow::{Context, Result, anyhow, bail};
+use futures::StreamExt;
+use k8s_openapi::api::apps::v1::StatefulSet;
+use k8s_openapi::api::coordination::v1::{Lease, LeaseSpec};
+use k8s_openapi::api::core::v1::Pod;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::{MicroTime, ObjectMeta};
+use k8s_openapi::jiff::Timestamp;
+use kube::Client;
+use kube::api::{
+    Api, ApiResource, DeleteParams, DynamicObject, ListParams, Patch, PatchParams, PostParams,
+};
+use kube::runtime::watcher::{self, Event};
+use serde::Deserialize;
+use serde_json::{Value, json};
+use tokio::sync::{mpsc, watch};
+use tracing::{debug, info, warn};
+
+use crate::api::{format_bytes, format_cpu};
+use crate::crd::{self, CrdKind, DEFAULT_NAMESPACE, ObjectKey};
+use crate::model::{
+    Condition, DeploymentState, DeploymentStatus, PackingMode, Phase, RouteStatus, ShardClass,
+    ShardNodeStatus, ShardStatus, ShardSymbolStatus, SymbolDeployment, SymbolRoute, SymbolShard,
+    TradingSymbol, TradingSymbolStatus, desired_config_hash,
+};
+use crate::render::{MANAGED_BY, Profile, RenderOptions, render_shard};
+use crate::store::Catalog;
+use crate::validate::per_pod_totals;
+
+const FIELD_MANAGER: &str = "match-engine-operator";
+const LEADER_LABEL: &str = "matching.io/role";
+/// Maximum applied-index gap tolerated before promoting new voters.
+const MEMBERSHIP_CATCH_UP_LAG: u64 = 128;
+
+/// Runtime options for the cell operator.
+#[derive(Debug, Clone)]
+pub struct OperatorOptions {
+    pub profile: Profile,
+    pub resync: Duration,
+    pub observe_timeout: Duration,
+    pub lease_namespace: String,
+    pub lease_name: String,
+    pub identity: String,
+    pub lease_duration: Duration,
+    pub lease_renew: Duration,
+    /// Restrict CRD/workload watches and pruning to one namespace. `None` is cell-wide.
+    pub namespace: Option<String>,
+    pub dry_run: bool,
+}
+
+impl OperatorOptions {
+    pub fn validate(&self) -> Result<()> {
+        if self.lease_duration.is_zero() {
+            bail!("lease duration must be greater than zero");
+        }
+        if self.lease_renew.is_zero() {
+            bail!("lease renew interval must be greater than zero");
+        }
+        if self.lease_renew >= self.lease_duration {
+            bail!("lease renew interval must be shorter than the lease duration");
+        }
+        if self.observe_timeout.is_zero() {
+            bail!("observe timeout must be greater than zero");
+        }
+        Ok(())
+    }
+}
+
+/// Run the operator until cancellation or leadership loss.
+pub async fn run(client: Client, options: OperatorOptions) -> Result<()> {
+    options.validate()?;
+    info!(
+        identity = %options.identity,
+        lease = %format!("{}/{}", options.lease_namespace, options.lease_name),
+        "cell operator starting"
+    );
+    let mut keeper = LeaseKeeper::acquire(client.clone(), &options).await?;
+    info!("leader lease acquired; starting CRD watches");
+
+    let (tx, mut rx) = mpsc::channel(1);
+    spawn_watchers(client.clone(), tx, options.namespace.clone());
+    let mut ticker = tokio::time::interval(options.resync.max(Duration::from_secs(1)));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {}
+            Some(()) = rx.recv() => {}
+            _ = keeper.lost() => bail!("leader lease lost; stopping reconciliation"),
+        }
+        match reconcile_once(&client, &options).await {
+            Ok(stats) => info!(
+                shards = stats.shards,
+                desired_objects = stats.desired_objects,
+                applied = stats.applied,
+                pruned = stats.pruned,
+                status_writes = stats.status_writes,
+                bootstraps = stats.bootstraps,
+                membership_changes = stats.membership_changes,
+                config_writes = stats.config_writes,
+                rollouts = stats.rollouts,
+                action_failures = stats.action_failures,
+                "reconcile complete"
+            ),
+            Err(error) => warn!(%error, "reconcile failed; retrying on the next watch/resync"),
+        }
+    }
+}
+
+struct LeaseKeeper {
+    lost: watch::Receiver<bool>,
+}
+
+impl LeaseKeeper {
+    async fn acquire(client: Client, options: &OperatorOptions) -> Result<Self> {
+        let api = Api::<Lease>::namespaced(client.clone(), &options.lease_namespace);
+        loop {
+            match try_acquire(&api, options).await {
+                Ok(Some(lease)) => {
+                    info!(
+                        holder = options.identity,
+                        resource_version = ?lease.metadata.resource_version,
+                        "leader lease acquired"
+                    );
+                    return Ok(Self::spawn_renewal(api, lease, options.clone()));
+                }
+                Ok(None) => {
+                    debug!("leader lease held by another operator; waiting");
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
+                Err(error) => {
+                    warn!(%error, "lease acquire failed; retrying");
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
+            }
+        }
+    }
+
+    fn spawn_renewal(api: Api<Lease>, _initial: Lease, options: OperatorOptions) -> Self {
+        let (tx, rx) = watch::channel(false);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(options.lease_renew);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                match renew_once(
+                    &api,
+                    &options.lease_name,
+                    &options.identity,
+                    options.lease_duration,
+                )
+                .await
+                {
+                    Ok(true) => debug!("leader lease renewed"),
+                    Ok(false) => {
+                        warn!("leader lease moved to another holder");
+                        let _ = tx.send(true);
+                        return;
+                    }
+                    Err(error) => {
+                        warn!(%error, "leader lease renewal failed");
+                        let _ = tx.send(true);
+                        return;
+                    }
+                }
+            }
+        });
+        Self { lost: rx }
+    }
+
+    async fn lost(&mut self) {
+        while !*self.lost.borrow() {
+            if self.lost.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+}
+
+async fn try_acquire(api: &Api<Lease>, options: &OperatorOptions) -> Result<Option<Lease>> {
+    let now = Timestamp::now();
+    let duration = lease_seconds(options.lease_duration);
+    match api.get(&options.lease_name).await {
+        Ok(mut lease) => {
+            let spec = lease.spec.get_or_insert_with(LeaseSpec::default);
+            let same_holder = spec.holder_identity.as_deref() == Some(options.identity.as_str());
+            let expired = lease_expired(spec, now.as_second());
+            if !same_holder && !expired {
+                return Ok(None);
+            }
+            let previous_holder = spec.holder_identity.clone();
+            if !same_holder {
+                spec.acquire_time = Some(MicroTime(now));
+                spec.lease_transitions = Some(spec.lease_transitions.unwrap_or(0) + 1);
+            }
+            spec.holder_identity = Some(options.identity.clone());
+            spec.lease_duration_seconds = Some(duration);
+            spec.renew_time = Some(MicroTime(now));
+            let updated = api
+                .replace(&options.lease_name, &PostParams::default(), &lease)
+                .await
+                .context("replace leader lease")?;
+            info!(previous_holder = ?previous_holder, "leader lease acquired or renewed");
+            Ok(Some(updated))
+        }
+        Err(kube::Error::Api(error)) if error.code == 404 => {
+            let lease = Lease {
+                metadata: ObjectMeta {
+                    name: Some(options.lease_name.clone()),
+                    namespace: Some(options.lease_namespace.clone()),
+                    ..ObjectMeta::default()
+                },
+                spec: Some(LeaseSpec {
+                    holder_identity: Some(options.identity.clone()),
+                    lease_duration_seconds: Some(duration),
+                    acquire_time: Some(MicroTime(now)),
+                    renew_time: Some(MicroTime(now)),
+                    lease_transitions: Some(0),
+                    ..LeaseSpec::default()
+                }),
+            };
+            match api.create(&PostParams::default(), &lease).await {
+                Ok(lease) => Ok(Some(lease)),
+                Err(kube::Error::Api(error)) if error.code == 409 => Ok(None),
+                Err(error) => Err(error).context("create leader lease"),
+            }
+        }
+        Err(error) => Err(error).context("get leader lease"),
+    }
+}
+
+async fn renew_once(
+    api: &Api<Lease>,
+    lease_name: &str,
+    identity: &str,
+    duration: Duration,
+) -> Result<bool> {
+    let mut lease = api.get(lease_name).await.context("get leader lease")?;
+    let spec = lease.spec.get_or_insert_with(LeaseSpec::default);
+    if spec.holder_identity.as_deref() != Some(identity) {
+        return Ok(false);
+    }
+    spec.renew_time = Some(MicroTime(Timestamp::now()));
+    spec.lease_duration_seconds = Some(lease_seconds(duration));
+    api.replace(lease_name, &PostParams::default(), &lease)
+        .await
+        .context("renew leader lease")?;
+    Ok(true)
+}
+
+fn lease_seconds(duration: Duration) -> i32 {
+    i32::try_from(duration.as_secs()).unwrap_or(i32::MAX)
+}
+
+fn lease_expired(spec: &LeaseSpec, now_secs: i64) -> bool {
+    let Some(renew_time) = spec.renew_time.as_ref() else {
+        return true;
+    };
+    let duration = spec.lease_duration_seconds.unwrap_or(0).max(0) as i64;
+    now_secs.saturating_sub(renew_time.0.as_second()) >= duration
+}
+
+fn spawn_watchers(client: Client, tx: mpsc::Sender<()>, namespace: Option<String>) {
+    for kind in CrdKind::ALL {
+        let client = client.clone();
+        let tx = tx.clone();
+        let namespace = namespace.clone();
+        tokio::spawn(async move {
+            loop {
+                let api = match namespace.as_deref() {
+                    Some(namespace) => Api::<DynamicObject>::namespaced_with(
+                        client.clone(),
+                        namespace,
+                        &kind.api_resource(),
+                    ),
+                    None => Api::<DynamicObject>::all_with(client.clone(), &kind.api_resource()),
+                };
+                let mut stream = std::pin::pin!(watcher::watcher(api, watcher::Config::default()));
+                while let Some(event) = stream.next().await {
+                    match event {
+                        Ok(Event::Apply(_))
+                        | Ok(Event::Delete(_))
+                        | Ok(Event::InitApply(_))
+                        | Ok(Event::InitDone)
+                        | Ok(Event::Init) => {
+                            let _ = tx.try_send(());
+                        }
+                        Err(error) => {
+                            warn!(?kind, %error, "CRD watch failed; reconnecting");
+                            break;
+                        }
+                    }
+                }
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        });
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum WorkloadKind {
+    ConfigMap,
+    Service,
+    PodDisruptionBudget,
+    NetworkPolicy,
+    StatefulSet,
+}
+
+impl WorkloadKind {
+    const ALL: [Self; 5] = [
+        Self::ConfigMap,
+        Self::Service,
+        Self::PodDisruptionBudget,
+        Self::NetworkPolicy,
+        Self::StatefulSet,
+    ];
+
+    fn from_kind(kind: &str) -> Option<Self> {
+        match kind {
+            "ConfigMap" => Some(Self::ConfigMap),
+            "Service" => Some(Self::Service),
+            "PodDisruptionBudget" => Some(Self::PodDisruptionBudget),
+            "NetworkPolicy" => Some(Self::NetworkPolicy),
+            "StatefulSet" => Some(Self::StatefulSet),
+            _ => None,
+        }
+    }
+
+    fn api_resource(self) -> ApiResource {
+        let (group, version, kind, plural) = match self {
+            Self::ConfigMap => ("", "v1", "ConfigMap", "configmaps"),
+            Self::Service => ("", "v1", "Service", "services"),
+            Self::PodDisruptionBudget => (
+                "policy",
+                "v1",
+                "PodDisruptionBudget",
+                "poddisruptionbudgets",
+            ),
+            Self::NetworkPolicy => (
+                "networking.k8s.io",
+                "v1",
+                "NetworkPolicy",
+                "networkpolicies",
+            ),
+            Self::StatefulSet => ("apps", "v1", "StatefulSet", "statefulsets"),
+        };
+        ApiResource {
+            group: group.to_string(),
+            version: version.to_string(),
+            api_version: if group.is_empty() {
+                version.to_string()
+            } else {
+                format!("{group}/{version}")
+            },
+            kind: kind.to_string(),
+            plural: plural.to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct WorkloadKey {
+    pub kind: WorkloadKind,
+    pub namespace: String,
+    pub name: String,
+}
+
+fn workload_key(value: &Value) -> Result<WorkloadKey> {
+    let kind = value
+        .get("kind")
+        .and_then(Value::as_str)
+        .and_then(WorkloadKind::from_kind)
+        .ok_or_else(|| anyhow!("rendered object has no supported kind"))?;
+    let name = value
+        .pointer("/metadata/name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("rendered {kind:?} has no metadata.name"))?;
+    let namespace = value
+        .pointer("/metadata/namespace")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("rendered {kind:?} {name} has no metadata.namespace"))?;
+    Ok(WorkloadKey {
+        kind,
+        namespace: namespace.to_string(),
+        name: name.to_string(),
+    })
+}
+
+#[derive(Debug, Default)]
+struct ReconcileStats {
+    shards: usize,
+    desired_objects: usize,
+    applied: usize,
+    pruned: usize,
+    status_writes: usize,
+    bootstraps: usize,
+    membership_changes: usize,
+    config_writes: usize,
+    rollouts: usize,
+    action_failures: usize,
+}
+
+struct CrdView {
+    catalog: Catalog,
+    objects: BTreeMap<ObjectKey, DynamicObject>,
+}
+
+impl CrdView {
+    fn object(&self, kind: CrdKind, namespace: &str, name: &str) -> Option<&DynamicObject> {
+        self.objects.get(&ObjectKey {
+            kind,
+            namespace: namespace_or_default(namespace).to_string(),
+            name: name.to_string(),
+        })
+    }
+}
+
+async fn load_view(client: &Client, namespace: Option<&str>) -> Result<CrdView> {
+    let mut objects = Vec::new();
+    for kind in CrdKind::ALL {
+        let api = match namespace {
+            Some(namespace) => Api::<DynamicObject>::namespaced_with(
+                client.clone(),
+                namespace,
+                &kind.api_resource(),
+            ),
+            None => Api::<DynamicObject>::all_with(client.clone(), &kind.api_resource()),
+        };
+        let list = api
+            .list(&ListParams::default())
+            .await
+            .with_context(|| format!("list {}", kind.plural()))?;
+        objects.extend(list.items);
+    }
+    let catalog = crd::catalog_from_objects(objects.iter().cloned(), DEFAULT_NAMESPACE);
+    let mut by_key = BTreeMap::new();
+    for object in objects {
+        let Some(kind) = crd::object_kind(&object) else {
+            continue;
+        };
+        if let Some(key) = ObjectKey::from_object(kind, &object, DEFAULT_NAMESPACE) {
+            by_key.insert(key, object);
+        }
+    }
+    Ok(CrdView {
+        catalog,
+        objects: by_key,
+    })
+}
+
+fn namespace_or_default(namespace: &str) -> &str {
+    if namespace.is_empty() {
+        DEFAULT_NAMESPACE
+    } else {
+        namespace
+    }
+}
+
+fn render_options(shard: &SymbolShard, options: &OperatorOptions) -> RenderOptions {
+    RenderOptions {
+        profile: options.profile,
+        namespace: Some(namespace_or_default(&shard.namespace).to_string()),
+        image_pull_policy: None,
+        storage_class: None,
+        replicas: None,
+        non_root: Some(true),
+    }
+}
+
+async fn reconcile_once(client: &Client, options: &OperatorOptions) -> Result<ReconcileStats> {
+    let view = load_view(client, options.namespace.as_deref()).await?;
+    let mut stats = ReconcileStats {
+        shards: view.catalog.shards.len(),
+        ..ReconcileStats::default()
+    };
+    let mut desired = BTreeMap::<WorkloadKey, Value>::new();
+    let mut failed_shards = BTreeSet::new();
+
+    for shard in view.catalog.shards.values() {
+        match render_shard(&view.catalog, &shard.name, &render_options(shard, options)) {
+            Ok(objects) => {
+                for object in objects.into_iter().filter(|object| !object.is_null()) {
+                    let key = workload_key(&object)?;
+                    desired.insert(key, object);
+                }
+            }
+            Err(error) => {
+                warn!(shard = %shard.name, %error, "cannot render shard; skipping apply/prune");
+                failed_shards.insert(shard.name.clone());
+            }
+        }
+    }
+    stats.desired_objects = desired.len();
+
+    if !options.dry_run {
+        for (key, object) in &desired {
+            apply_object(client, key, object).await?;
+            stats.applied += 1;
+        }
+        stats.pruned = prune_objects(
+            client,
+            &desired,
+            &failed_shards,
+            options.namespace.as_deref(),
+        )
+        .await?;
+    } else {
+        info!(
+            desired = stats.desired_objects,
+            "dry-run: skipping workload apply/prune"
+        );
+    }
+
+    let observations = observe_catalog(&view.catalog, options).await;
+    if !options.dry_run {
+        let actions = actuate_catalog(&view.catalog, &observations, options).await;
+        stats.bootstraps = actions.bootstraps;
+        stats.membership_changes = actions.membership_changes;
+        stats.config_writes = actions.config_writes;
+        stats.action_failures = actions.failures;
+        stats.rollouts = rollout_containers(client, &view.catalog, &observations).await?;
+        stats.status_writes = write_statuses(client, &view, &observations).await?;
+        label_leaders(client, &view.catalog, &observations).await?;
+    } else {
+        info!(
+            deployments = observations.len(),
+            "dry-run: skipping status writes, leader labels and bootstrap/config actions"
+        );
+    }
+    Ok(stats)
+}
+
+async fn apply_object(client: &Client, key: &WorkloadKey, object: &Value) -> Result<()> {
+    let api = Api::<DynamicObject>::namespaced_with(
+        client.clone(),
+        &key.namespace,
+        &key.kind.api_resource(),
+    );
+    let params = PatchParams::apply(FIELD_MANAGER).force();
+    api.patch(&key.name, &params, &Patch::Apply(object))
+        .await
+        .with_context(|| {
+            format!(
+                "server-side apply {:?} {}/{}",
+                key.kind, key.namespace, key.name
+            )
+        })?;
+    Ok(())
+}
+
+async fn prune_objects(
+    client: &Client,
+    desired: &BTreeMap<WorkloadKey, Value>,
+    failed_shards: &BTreeSet<String>,
+    namespace: Option<&str>,
+) -> Result<usize> {
+    let mut pruned = 0;
+    let selector = format!("app.kubernetes.io/managed-by={MANAGED_BY}");
+    for kind in WorkloadKind::ALL {
+        let list_api = match namespace {
+            Some(namespace) => Api::<DynamicObject>::namespaced_with(
+                client.clone(),
+                namespace,
+                &kind.api_resource(),
+            ),
+            None => Api::<DynamicObject>::all_with(client.clone(), &kind.api_resource()),
+        };
+        let list = list_api
+            .list(&ListParams::default().labels(&selector))
+            .await
+            .with_context(|| format!("list managed {:?}", kind))?;
+        for object in list.items {
+            let Some(name) = object.metadata.name.clone() else {
+                continue;
+            };
+            let Some(namespace) = object.metadata.namespace.clone() else {
+                continue;
+            };
+            let key = WorkloadKey {
+                kind,
+                namespace: namespace.clone(),
+                name: name.clone(),
+            };
+            if desired.contains_key(&key) {
+                continue;
+            }
+            if object
+                .metadata
+                .labels
+                .as_ref()
+                .and_then(|labels| labels.get("matching.io/shard"))
+                .is_some_and(|shard| failed_shards.contains(shard))
+            {
+                continue;
+            }
+            let namespaced = Api::<DynamicObject>::namespaced_with(
+                client.clone(),
+                &namespace,
+                &kind.api_resource(),
+            );
+            match namespaced.delete(&name, &DeleteParams::default()).await {
+                Ok(_) => {
+                    info!(?kind, namespace, name, "pruned managed object");
+                    pruned += 1;
+                }
+                Err(kube::Error::Api(error)) if error.code == 404 => {}
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("delete managed {:?} {namespace}/{name}", kind));
+                }
+            }
+        }
+    }
+    Ok(pruned)
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PodObservation {
+    pub pod: u8,
+    pub healthy: bool,
+    pub ready: bool,
+    pub is_leader: bool,
+    pub leader_id: Option<u64>,
+    pub applied_index: Option<u64>,
+    pub last_log_index: Option<u64>,
+    pub voters: Vec<u64>,
+    pub learners: Vec<u64>,
+    pub symbol_config: Option<Value>,
+    pub config_locked: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct DeploymentObservation {
+    pub pods: Vec<PodObservation>,
+    pub leader_pod: Option<u8>,
+    pub leader_pod_name: Option<String>,
+    pub leader_addr: Option<String>,
+    pub ready: bool,
+    pub phase: Phase,
+    pub applied_index: Option<u64>,
+    pub lag: Option<u64>,
+    pub voters: Vec<u64>,
+    pub learners: Vec<u64>,
+    pub configured: bool,
+    pub config_locked: bool,
+}
+
+pub type Observations = BTreeMap<String, DeploymentObservation>;
+
+#[derive(Debug, Deserialize)]
+struct HealthProbe {
+    #[serde(default)]
+    healthy: bool,
+    #[serde(default)]
+    ready: bool,
+    #[serde(default)]
+    leadership: LeadershipProbe,
+    #[serde(default)]
+    storage: StorageProbe,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct LeadershipProbe {
+    #[serde(default)]
+    leader_id: Option<u64>,
+    #[serde(default)]
+    is_leader: bool,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct StorageProbe {
+    #[serde(default)]
+    wal: Option<WalProbe>,
+    #[serde(default)]
+    state_machine: Option<StateMachineProbe>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct WalProbe {
+    #[serde(default)]
+    last_log_id: Option<LogIdProbe>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct StateMachineProbe {
+    #[serde(default)]
+    last_applied: Option<LogIdProbe>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct LogIdProbe {
+    #[serde(default)]
+    index: u64,
+}
+
+async fn observe_catalog(catalog: &Catalog, options: &OperatorOptions) -> Observations {
+    let http = reqwest::Client::new();
+    let mut observations = BTreeMap::new();
+    for shard in catalog.shards.values() {
+        for deployment in catalog.shard_deployments(&shard.name) {
+            let deployment = deployment.clone();
+            if deployment.spec.desired_state == DeploymentState::Disabled {
+                observations.insert(
+                    deployment.name.clone(),
+                    DeploymentObservation {
+                        phase: Phase::Disabled,
+                        ..DeploymentObservation::default()
+                    },
+                );
+                continue;
+            }
+            let desired_config = catalog
+                .symbols
+                .get(&deployment.spec.symbol_ref)
+                .map(desired_symbol_config);
+            let futures = (0..shard.spec.replicas).map(|pod| {
+                let http = http.clone();
+                let shard = shard.clone();
+                let deployment = deployment.clone();
+                let timeout = options.observe_timeout;
+                async move { observe_pod(&http, &shard, &deployment, pod, timeout).await }
+            });
+            let pods: Vec<PodObservation> = futures::stream::iter(futures)
+                .buffer_unordered(16)
+                .collect()
+                .await;
+            observations.insert(
+                deployment.name.clone(),
+                deployment_observation(shard, &deployment, pods, desired_config.as_ref()),
+            );
+        }
+    }
+    observations
+}
+
+fn desired_symbol_config(symbol: &TradingSymbol) -> Value {
+    json!({
+        "symbol_id": symbol.spec.symbol_id,
+        "base_asset": symbol.spec.base,
+        "quote_asset": symbol.spec.quote,
+        "price_decimals": symbol.spec.price_decimals,
+        "price_tick": symbol.spec.price_tick,
+        "base_lot": symbol.spec.base_lot,
+        "fee_asset_policy": symbol.spec.fee_asset_policy,
+        "stp": symbol.spec.stp,
+    })
+}
+
+async fn fetch_json(http: &reqwest::Client, url: &str, timeout: Duration) -> Option<Value> {
+    http.get(url)
+        .timeout(timeout)
+        .send()
+        .await
+        .ok()?
+        .json::<Value>()
+        .await
+        .ok()
+}
+
+fn membership_ids(value: &Value, pointer: &str) -> Vec<u64> {
+    value
+        .pointer(pointer)
+        .and_then(Value::as_array)
+        .map(|ids| ids.iter().filter_map(Value::as_u64).collect())
+        .unwrap_or_default()
+}
+
+fn membership_nodes(value: &Value) -> Vec<u64> {
+    value
+        .pointer("/Ok/membership_config/membership/nodes")
+        .and_then(Value::as_object)
+        .map(|nodes| {
+            nodes
+                .keys()
+                .filter_map(|id| id.parse::<u64>().ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+async fn observe_pod(
+    http: &reqwest::Client,
+    shard: &SymbolShard,
+    deployment: &SymbolDeployment,
+    pod: u8,
+    timeout: Duration,
+) -> PodObservation {
+    let namespace = namespace_or_default(&shard.namespace);
+    let base = format!(
+        "http://{}-{pod}.{}-headless.{namespace}.svc.cluster.local:{}",
+        shard.name, shard.name, deployment.spec.placement.http_port
+    );
+    let health_url = format!("{base}/health");
+    let metrics_url = format!("{base}/metrics");
+    let pretrade_url = format!("{base}/pretrade/status");
+    let (health, metrics, pretrade) = tokio::join!(
+        fetch_json(http, &health_url, timeout),
+        fetch_json(http, &metrics_url, timeout),
+        fetch_json(http, &pretrade_url, timeout),
+    );
+    let Some(health) = health else {
+        return PodObservation {
+            pod,
+            error: Some(format!("{base}/health unavailable")),
+            ..PodObservation::default()
+        };
+    };
+    let probe: HealthProbe = match serde_json::from_value(health) {
+        Ok(probe) => probe,
+        Err(error) => {
+            return PodObservation {
+                pod,
+                error: Some(format!("decode /health: {error}")),
+                ..PodObservation::default()
+            };
+        }
+    };
+    let voters = metrics
+        .as_ref()
+        .map(|value| membership_ids(value, "/Ok/membership_config/membership/configs/0"))
+        .unwrap_or_default();
+    let nodes = metrics.as_ref().map(membership_nodes).unwrap_or_default();
+    let learners: Vec<u64> = nodes
+        .into_iter()
+        .filter(|id| !voters.contains(id))
+        .collect();
+    let symbol_config = pretrade
+        .as_ref()
+        .and_then(|value| value.get("symbol_config").cloned());
+    let config_locked = pretrade
+        .as_ref()
+        .and_then(|value| value.get("symbol_locked"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    PodObservation {
+        pod,
+        healthy: probe.healthy,
+        ready: probe.healthy && probe.ready,
+        is_leader: probe.leadership.is_leader,
+        leader_id: probe.leadership.leader_id,
+        applied_index: probe
+            .storage
+            .state_machine
+            .and_then(|state| state.last_applied)
+            .map(|log| log.index),
+        last_log_index: probe
+            .storage
+            .wal
+            .and_then(|wal| wal.last_log_id)
+            .map(|log| log.index),
+        voters,
+        learners,
+        symbol_config,
+        config_locked,
+        error: None,
+    }
+}
+
+pub fn deployment_observation(
+    shard: &SymbolShard,
+    deployment: &SymbolDeployment,
+    mut pods: Vec<PodObservation>,
+    desired_config: Option<&Value>,
+) -> DeploymentObservation {
+    pods.sort_by_key(|pod| pod.pod);
+    let leader_pod = pods
+        .iter()
+        .find(|pod| pod.is_leader)
+        .map(|pod| pod.pod)
+        .or_else(|| {
+            pods.iter()
+                .find(|pod| pod.leader_id == Some(u64::from(pod.pod)))
+                .map(|pod| pod.pod)
+        });
+    let leader = leader_pod.and_then(|leader| pods.iter().find(|pod| pod.pod == leader));
+    let leader_addr = leader_pod.map(|pod| {
+        format!(
+            "{}-{pod}.{}-headless.{}.svc.cluster.local:{}",
+            shard.name,
+            shard.name,
+            namespace_or_default(&shard.namespace),
+            deployment.spec.placement.http_port
+        )
+    });
+    let replica_count = shard.spec.replicas as usize;
+    let ready =
+        pods.len() == replica_count && pods.iter().all(|pod| pod.ready) && leader_pod.is_some();
+    let phase = if deployment.spec.desired_state == DeploymentState::Disabled {
+        Phase::Disabled
+    } else if ready {
+        Phase::Ready
+    } else if pods.iter().any(|pod| pod.ready) {
+        Phase::Degraded
+    } else {
+        Phase::Pending
+    };
+    let applied_index = pods.iter().filter_map(|pod| pod.applied_index).max();
+    let lag = {
+        let last_log = pods.iter().filter_map(|pod| pod.last_log_index).max();
+        let min_applied = pods.iter().filter_map(|pod| pod.applied_index).min();
+        last_log
+            .zip(min_applied)
+            .map(|(last, applied)| last.saturating_sub(applied))
+    };
+    let configured = desired_config.is_some_and(|desired| {
+        leader
+            .and_then(|pod| pod.symbol_config.as_ref())
+            .is_some_and(|observed| observed == desired)
+    });
+    let config_locked =
+        leader.is_some_and(|pod| pod.config_locked) || pods.iter().any(|pod| pod.config_locked);
+    let voters = pods
+        .iter()
+        .find(|pod| !pod.voters.is_empty())
+        .map(|pod| pod.voters.clone())
+        .unwrap_or_default();
+    let learners = pods
+        .iter()
+        .find(|pod| !pod.learners.is_empty())
+        .map(|pod| pod.learners.clone())
+        .unwrap_or_default();
+    DeploymentObservation {
+        pods,
+        leader_pod,
+        leader_pod_name: leader_pod.map(|pod| format!("{}-{pod}", shard.name)),
+        leader_addr,
+        ready,
+        phase,
+        applied_index,
+        lag,
+        voters,
+        learners,
+        configured,
+        config_locked,
+    }
+}
+
+#[derive(Debug, Default)]
+struct ActuationStats {
+    bootstraps: usize,
+    membership_changes: usize,
+    config_writes: usize,
+    failures: usize,
+}
+
+fn process_url(shard: &SymbolShard, deployment: &SymbolDeployment, pod: u8, path: &str) -> String {
+    format!(
+        "http://{}-{pod}.{}-headless.{}.svc.cluster.local:{}/{path}",
+        shard.name,
+        shard.name,
+        namespace_or_default(&shard.namespace),
+        deployment.spec.placement.http_port
+    )
+}
+
+fn voter_endpoints(shard: &SymbolShard, deployment: &SymbolDeployment) -> Vec<(u64, String)> {
+    (0..shard.spec.replicas)
+        .map(|pod| {
+            (
+                u64::from(pod),
+                format!(
+                    "{}-{pod}.{}-headless.{}.svc.cluster.local:{}",
+                    shard.name,
+                    shard.name,
+                    namespace_or_default(&shard.namespace),
+                    deployment.spec.placement.http_port
+                ),
+            )
+        })
+        .collect()
+}
+
+async fn post_json(
+    http: &reqwest::Client,
+    url: &str,
+    body: &Value,
+    timeout: Duration,
+) -> Result<Value> {
+    post_json_with_header(http, url, body, timeout, None).await
+}
+
+async fn post_json_with_header(
+    http: &reqwest::Client,
+    url: &str,
+    body: &Value,
+    timeout: Duration,
+    header: Option<(&str, &str)>,
+) -> Result<Value> {
+    let mut request = http.post(url).timeout(timeout).json(body);
+    if let Some((name, value)) = header {
+        request = request.header(name, value);
+    }
+    let response = request
+        .send()
+        .await
+        .with_context(|| format!("POST {url}"))?;
+    let status = response.status();
+    let value: Value = response.json().await.unwrap_or(Value::Null);
+    if !status.is_success() || value.get("Err").is_some() {
+        bail!("POST {url} returned {status}: {value}");
+    }
+    Ok(value)
+}
+
+async fn actuate_catalog(
+    catalog: &Catalog,
+    observations: &Observations,
+    options: &OperatorOptions,
+) -> ActuationStats {
+    let http = reqwest::Client::new();
+    let mut stats = ActuationStats::default();
+    for shard in catalog.shards.values() {
+        for deployment in catalog.shard_deployments(&shard.name) {
+            if deployment.spec.desired_state == DeploymentState::Disabled {
+                continue;
+            }
+            let Some(observation) = observations.get(&deployment.name) else {
+                continue;
+            };
+            if observation.pods.len() != shard.spec.replicas as usize
+                || !observation.pods.iter().all(|pod| pod.healthy)
+            {
+                continue;
+            }
+            let desired: BTreeSet<u64> = (0..shard.spec.replicas).map(u64::from).collect();
+            let voters: BTreeSet<u64> = observation.voters.iter().copied().collect();
+            let learners: BTreeSet<u64> = observation.learners.iter().copied().collect();
+            let known: BTreeSet<u64> = voters.union(&learners).copied().collect();
+
+            if voters.is_empty() && known.is_empty() {
+                let endpoints = voter_endpoints(shard, deployment);
+                match post_json(
+                    &http,
+                    &process_url(shard, deployment, 0, "init"),
+                    &json!(endpoints),
+                    options.observe_timeout,
+                )
+                .await
+                {
+                    Ok(_) => {
+                        stats.bootstraps += 1;
+                        info!(shard = %shard.name, deployment = %deployment.name, "bootstrapped Raft group");
+                    }
+                    Err(error) => {
+                        stats.failures += 1;
+                        warn!(shard = %shard.name, deployment = %deployment.name, %error, "bootstrap failed");
+                    }
+                }
+                continue;
+            }
+
+            if voters != desired {
+                let Some(leader) = observation.leader_pod else {
+                    continue;
+                };
+                let missing_known: Vec<u64> = desired.difference(&known).copied().collect();
+                if !missing_known.is_empty() {
+                    for id in missing_known {
+                        let address = voter_endpoints(shard, deployment)
+                            .into_iter()
+                            .find(|(candidate, _)| *candidate == id)
+                            .map(|(_, address)| address)
+                            .unwrap_or_default();
+                        match post_json(
+                            &http,
+                            &process_url(shard, deployment, leader, "add-learner"),
+                            &json!([id, address]),
+                            options.observe_timeout,
+                        )
+                        .await
+                        {
+                            Ok(_) => {
+                                stats.membership_changes += 1;
+                                info!(shard = %shard.name, deployment = %deployment.name, node = id, "added learner");
+                            }
+                            Err(error) => {
+                                stats.failures += 1;
+                                warn!(shard = %shard.name, deployment = %deployment.name, node = id, %error, "add learner failed");
+                            }
+                        }
+                    }
+                    continue;
+                }
+                let desired_ids: Vec<u64> = desired.iter().copied().collect();
+                // Do not promote a voter that is still replaying/installing a snapshot.
+                // The index gap is a conservative proxy; wait until every desired pod
+                // reports applied/last-log state and the slowest applied index is close
+                // to the newest log index.
+                let mut catch_up = Some((u64::MAX, 0u64));
+                for pod in observation
+                    .pods
+                    .iter()
+                    .filter(|pod| desired.contains(&u64::from(pod.pod)))
+                {
+                    let (Some(applied), Some(last)) = (pod.applied_index, pod.last_log_index)
+                    else {
+                        catch_up = None;
+                        break;
+                    };
+                    let Some((min_applied, max_log)) = catch_up else {
+                        break;
+                    };
+                    catch_up = Some((min_applied.min(applied), max_log.max(last)));
+                }
+                match catch_up {
+                    None => {
+                        info!(
+                            shard = %shard.name,
+                            deployment = %deployment.name,
+                            "waiting for membership status before changing voters"
+                        );
+                        continue;
+                    }
+                    Some((min_applied, max_log))
+                        if max_log.saturating_sub(min_applied) > MEMBERSHIP_CATCH_UP_LAG =>
+                    {
+                        info!(
+                            shard = %shard.name,
+                            deployment = %deployment.name,
+                            min_applied,
+                            max_log,
+                            "waiting for desired voters to catch up before membership change"
+                        );
+                        continue;
+                    }
+                    Some(_) => {}
+                }
+                match post_json(
+                    &http,
+                    &process_url(shard, deployment, leader, "change-membership"),
+                    &json!(desired_ids),
+                    options.observe_timeout,
+                )
+                .await
+                {
+                    Ok(_) => {
+                        stats.membership_changes += 1;
+                        info!(shard = %shard.name, deployment = %deployment.name, "changed Raft membership");
+                    }
+                    Err(error) => {
+                        stats.failures += 1;
+                        warn!(shard = %shard.name, deployment = %deployment.name, %error, "change membership failed");
+                    }
+                }
+                continue;
+            }
+
+            if observation.leader_pod.is_none() || observation.configured {
+                continue;
+            }
+            if observation.config_locked {
+                continue;
+            }
+            let Some(symbol) = catalog.symbols.get(&deployment.spec.symbol_ref) else {
+                continue;
+            };
+            let body = json!({
+                "ConfigureSymbol": {
+                    "config": desired_symbol_config(symbol),
+                }
+            });
+            match post_json(
+                &http,
+                &process_url(
+                    shard,
+                    deployment,
+                    observation.leader_pod.unwrap_or(0),
+                    "write",
+                ),
+                &body,
+                options.observe_timeout,
+            )
+            .await
+            {
+                Ok(_) => {
+                    stats.config_writes += 1;
+                    info!(shard = %shard.name, deployment = %deployment.name, "applied symbol configuration");
+                }
+                Err(error) => {
+                    stats.failures += 1;
+                    warn!(shard = %shard.name, deployment = %deployment.name, %error, "configure symbol failed");
+                }
+            }
+        }
+    }
+    stats
+}
+
+async fn rollout_containers(
+    client: &Client,
+    catalog: &Catalog,
+    observations: &Observations,
+) -> Result<usize> {
+    let http = reqwest::Client::new();
+    let mut actions = 0;
+    for shard in catalog.shards.values() {
+        if shard.spec.paused || shard.spec.packing.mode != PackingMode::Containers {
+            continue;
+        }
+        let active: Vec<&SymbolDeployment> = catalog
+            .shard_deployments(&shard.name)
+            .into_iter()
+            .filter(|deployment| deployment.spec.desired_state != DeploymentState::Disabled)
+            .collect();
+        if active.is_empty() {
+            continue;
+        }
+        let namespace = namespace_or_default(&shard.namespace);
+        let api = Api::<StatefulSet>::namespaced(client.clone(), namespace);
+        let stateful_set = match api.get(&shard.name).await {
+            Ok(stateful_set) => stateful_set,
+            Err(kube::Error::Api(error)) if error.code == 404 => continue,
+            Err(error) => return Err(error).context("get StatefulSet for rollout"),
+        };
+        let update_revision = stateful_set
+            .status
+            .as_ref()
+            .and_then(|status| status.update_revision.clone());
+        let current_revision = stateful_set
+            .status
+            .as_ref()
+            .and_then(|status| status.current_revision.clone());
+        let Some(update_revision) = update_revision else {
+            continue;
+        };
+        if Some(&update_revision) == current_revision.as_ref() {
+            continue;
+        }
+        let pods = Api::<Pod>::namespaced(client.clone(), namespace)
+            .list(&ListParams::default().labels(&format!("matching.io/cluster={}", shard.name)))
+            .await
+            .with_context(|| format!("list pods for rollout {}", shard.name))?;
+        if pods.items.is_empty() {
+            continue;
+        }
+        let mut outdated: Vec<&Pod> = pods
+            .items
+            .iter()
+            .filter(|pod| {
+                pod.metadata.deletion_timestamp.is_none()
+                    && pod
+                        .metadata
+                        .labels
+                        .as_ref()
+                        .and_then(|labels| labels.get("controller-revision-hash"))
+                        .is_none_or(|revision| revision != &update_revision)
+            })
+            .collect();
+        if outdated.is_empty() {
+            continue;
+        }
+        let leader_pods: BTreeSet<&str> = active
+            .iter()
+            .filter_map(|deployment| observations.get(&deployment.name))
+            .filter_map(|observation| observation.leader_pod_name.as_deref())
+            .collect();
+        // Replace pods that are not running first: they hold no live process and a Pending
+        // old-revision pod otherwise blocks the StatefulSet from ever starting the new one.
+        // Among running pods, prefer non-leaders and then higher ordinals (StatefulSet order).
+        outdated.sort_by_key(|pod| {
+            let running = pod_running(pod);
+            let leader = pod
+                .metadata
+                .name
+                .as_deref()
+                .is_some_and(|name| leader_pods.contains(name));
+            (
+                running,
+                leader,
+                std::cmp::Reverse(pod_index(pod).unwrap_or(0)),
+            )
+        });
+        let mut candidate = None;
+        let mut transferred = 0;
+        for pod in &outdated {
+            let Some(name) = pod.metadata.name.as_deref() else {
+                continue;
+            };
+            // A non-running pod holds no live engine, so replacing it cannot reduce a
+            // healthy count. It must be replaced even when a newly added process has not
+            // reached quorum anywhere yet; otherwise the add roll deadlocks on a Pending pod.
+            if !pod_running(pod) {
+                candidate = Some((pod, name));
+                break;
+            }
+            if !processes_tolerate_removal(shard, &active, observations, pod) {
+                continue;
+            }
+            if leader_pods.contains(name) {
+                // Hand off only a pod whose removal is already quorum-safe; deleting it
+                // happens on the next reconcile so the new leader can settle first.
+                transferred += transfer_leaders(&http, shard, &active, observations, name).await;
+                break;
+            }
+            candidate = Some((pod, name));
+            break;
+        }
+        if transferred > 0 {
+            actions += transferred;
+        }
+        let Some((_, candidate_name)) = candidate else {
+            continue;
+        };
+
+        match Api::<Pod>::namespaced(client.clone(), namespace)
+            .delete(candidate_name, &DeleteParams::default())
+            .await
+        {
+            Ok(_) => {
+                actions += 1;
+                info!(
+                    shard = %shard.name,
+                    pod = %candidate_name,
+                    revision = %update_revision,
+                    "deleted one outdated pod for containers rollout"
+                );
+            }
+            Err(kube::Error::Api(error)) if error.code == 404 => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("delete outdated pod {namespace}/{candidate_name}"));
+            }
+        }
+    }
+    Ok(actions)
+}
+
+fn pod_running(pod: &Pod) -> bool {
+    pod.status
+        .as_ref()
+        .and_then(|status| status.phase.as_deref())
+        .is_some_and(|phase| phase == "Running")
+}
+
+fn pod_index(pod: &Pod) -> Option<u8> {
+    pod.metadata
+        .labels
+        .as_ref()
+        .and_then(|labels| labels.get("apps.kubernetes.io/pod-index"))
+        .and_then(|index| index.parse().ok())
+        .or_else(|| {
+            pod.metadata
+                .name
+                .as_deref()
+                .and_then(|name| name.rsplit_once('-')?.1.parse().ok())
+        })
+}
+
+fn pod_has_container(pod: &Pod, name: &str) -> bool {
+    pod.spec.as_ref().is_some_and(|spec| {
+        spec.containers
+            .iter()
+            .any(|container| container.name == name)
+    })
+}
+
+/// Returns true when removing `pod` leaves a healthy quorum for every active process it hosts.
+///
+/// Processes whose container is absent from the pod (for example a symbol that is still being
+/// added) are unaffected by the removal. A process that is already below quorum blocks the roll
+/// because replacing one of its remaining members would make the loss worse.
+fn processes_tolerate_removal(
+    shard: &SymbolShard,
+    active: &[&SymbolDeployment],
+    observations: &Observations,
+    pod: &Pod,
+) -> bool {
+    let quorum = usize::from(shard.spec.replicas) / 2 + 1;
+    let Some(index) = pod_index(pod) else {
+        return false;
+    };
+    for deployment in active {
+        if !pod_has_container(pod, &deployment.spec.symbol_ref) {
+            continue;
+        }
+        let Some(observation) = observations.get(&deployment.name) else {
+            return false;
+        };
+        let healthy = observation.pods.iter().filter(|row| row.ready).count();
+        let candidate_healthy = observation
+            .pods
+            .iter()
+            .any(|row| row.pod == index && row.ready);
+        let remaining = healthy.saturating_sub(usize::from(candidate_healthy));
+        if remaining < quorum {
+            info!(
+                shard = %shard.name,
+                deployment = %deployment.name,
+                pod = index,
+                healthy,
+                remaining,
+                quorum,
+                "holding rollout until the process can survive the pod removal"
+            );
+            return false;
+        }
+    }
+    true
+}
+
+async fn transfer_leaders(
+    http: &reqwest::Client,
+    shard: &SymbolShard,
+    active: &[&SymbolDeployment],
+    observations: &Observations,
+    candidate_name: &str,
+) -> usize {
+    let mut transferred = 0;
+    for deployment in active {
+        let Some(observation) = observations.get(&deployment.name) else {
+            continue;
+        };
+        if observation.leader_pod_name.as_deref() != Some(candidate_name) {
+            continue;
+        }
+        let Some(follower) = observation
+            .pods
+            .iter()
+            .find(|pod| pod.ready && format!("{}-{}", shard.name, pod.pod) != candidate_name)
+            .map(|pod| pod.pod)
+        else {
+            warn!(
+                shard = %shard.name,
+                deployment = %deployment.name,
+                pod = %candidate_name,
+                "no ready follower for leader transfer; skipping rollout"
+            );
+            continue;
+        };
+        let leader = observation.leader_pod.unwrap_or(0);
+        let url = process_url(
+            shard,
+            deployment,
+            leader,
+            "console/api/actions/transfer-leader",
+        );
+        match post_json_with_header(
+            http,
+            &url,
+            &json!({ "target": follower }),
+            Duration::from_millis(1_500),
+            Some(("x-console-action", "1")),
+        )
+        .await
+        {
+            Ok(_) => {
+                transferred += 1;
+                info!(
+                    shard = %shard.name,
+                    deployment = %deployment.name,
+                    from = leader,
+                    to = follower,
+                    "transferred leadership before rollout"
+                );
+            }
+            Err(error) => {
+                warn!(
+                    shard = %shard.name,
+                    deployment = %deployment.name,
+                    %error,
+                    "leader transfer failed; skipping rollout"
+                );
+            }
+        }
+    }
+    transferred
+}
+
+fn deployment_status(
+    existing: &DeploymentStatus,
+    observation: Option<&DeploymentObservation>,
+) -> DeploymentStatus {
+    let mut status = existing.clone();
+    let Some(observation) = observation else {
+        status.phase = Phase::Pending;
+        status.ready = false;
+        status.leader_pod = None;
+        status.leader_addr = None;
+        status.conditions = vec![Condition::false_("Ready", "NoObservation")];
+        return status;
+    };
+    status.phase = observation.phase;
+    status.ready = observation.ready;
+    status.leader_pod = observation.leader_pod_name.clone();
+    status.leader_addr = observation.leader_addr.clone();
+    status.applied_index = observation.applied_index;
+    status.lag = observation.lag;
+    if observation.phase == Phase::Disabled {
+        status.leader_pod = None;
+        status.leader_addr = None;
+        status.conditions = vec![
+            Condition::false_("Ready", "DeploymentDisabled"),
+            Condition::false_("Configured", "DeploymentDisabled"),
+        ];
+        return status;
+    }
+    let leader = if observation.leader_pod.is_some() {
+        Condition::true_("LeaderElected")
+    } else {
+        Condition::false_("LeaderElected", "NoLeader")
+    };
+    let configured = if observation.configured {
+        Condition::true_("Configured")
+    } else if observation.config_locked {
+        Condition::false_("Configured", "LockedWithDifferentConfig")
+    } else {
+        Condition::false_("Configured", "Pending")
+    };
+    let ready = if observation.ready {
+        Condition::true_("Ready")
+    } else if observation.pods.iter().any(|pod| pod.ready) && !observation.configured {
+        Condition::false_("Ready", "Configuring")
+    } else if observation.pods.iter().any(|pod| pod.ready) {
+        Condition::false_("Ready", "PodsNotReady")
+    } else {
+        Condition::false_("Ready", "PodsUnavailable")
+    };
+    status.conditions = vec![ready, leader, configured];
+    status
+}
+
+fn route_status(
+    existing: &RouteStatus,
+    route: &SymbolRoute,
+    deployment: &SymbolDeployment,
+    deployment_status: &DeploymentStatus,
+) -> RouteStatus {
+    let mut status = existing.clone();
+    status.observed_generation = u64::from(deployment.spec.generation);
+    status.active_deployment_ref = route.spec.active_deployment_ref.clone();
+    let configured = deployment_status
+        .conditions
+        .iter()
+        .any(|condition| condition.kind == "Configured" && condition.status == "True");
+    let ready = deployment_status.phase == Phase::Ready && configured;
+    status.phase = if deployment.spec.desired_state == DeploymentState::Disabled {
+        Phase::Disabled
+    } else if ready {
+        Phase::Ready
+    } else if deployment_status.phase == Phase::Degraded {
+        Phase::Degraded
+    } else {
+        Phase::Pending
+    };
+    status.leader_addr = if ready {
+        deployment_status.leader_addr.clone()
+    } else {
+        None
+    };
+    status
+}
+
+fn shard_status(
+    shard: &SymbolShard,
+    catalog: &Catalog,
+    observations: &Observations,
+    observed_generation: u64,
+) -> ShardStatus {
+    let deployments = catalog.shard_deployments(&shard.name);
+    let active: Vec<&SymbolDeployment> = deployments
+        .iter()
+        .copied()
+        .filter(|deployment| deployment.spec.desired_state != DeploymentState::Disabled)
+        .collect();
+    let totals = per_pod_totals(shard, &active);
+    let mut symbols: Vec<ShardSymbolStatus> = deployments
+        .iter()
+        .filter_map(|deployment| {
+            let symbol = catalog.symbols.get(&deployment.spec.symbol_ref)?;
+            let observation = observations.get(&deployment.name);
+            Some(ShardSymbolStatus {
+                name: symbol.name.clone(),
+                deployment_ref: deployment.name.clone(),
+                generation: deployment.spec.generation,
+                slot: deployment.spec.placement.slot,
+                http_port: deployment.spec.placement.http_port,
+                leader_pod: observation.and_then(|observation| {
+                    observation
+                        .leader_pod
+                        .map(|pod| format!("{}-{pod}", shard.name))
+                }),
+                leader_addr: observation.and_then(|observation| observation.leader_addr.clone()),
+                ready: observation
+                    .is_some_and(|observation| observation.ready && observation.configured),
+                applied_index: observation.and_then(|observation| observation.applied_index),
+                lag: observation.and_then(|observation| observation.lag),
+                config_hash: desired_config_hash(deployment, symbol),
+            })
+        })
+        .collect();
+    symbols.sort_by_key(|symbol| symbol.slot);
+
+    let nodes: Vec<ShardNodeStatus> = (0..shard.spec.replicas)
+        .map(|pod| ShardNodeStatus {
+            name: format!("{}-{pod}", shard.name),
+            id: pod,
+            ready: !active.is_empty()
+                && active.iter().all(|deployment| {
+                    observations
+                        .get(&deployment.name)
+                        .and_then(|observation| observation.pods.iter().find(|row| row.pod == pod))
+                        .is_some_and(|row| row.ready)
+                }),
+            processes: active.len() as u16,
+        })
+        .collect();
+
+    let ready_count = active
+        .iter()
+        .filter(|deployment| {
+            observations
+                .get(&deployment.name)
+                .is_some_and(|observation| observation.ready && observation.configured)
+        })
+        .count();
+    let phase = if active.is_empty() {
+        Phase::Reserved
+    } else if ready_count == active.len() {
+        Phase::Ready
+    } else if ready_count > 0
+        || active.iter().any(|deployment| {
+            observations
+                .get(&deployment.name)
+                .is_some_and(|observation| observation.pods.iter().any(|pod| pod.ready))
+        })
+    {
+        Phase::Degraded
+    } else {
+        Phase::Pending
+    };
+    let ready = if phase == Phase::Ready {
+        Condition::true_("Ready")
+    } else {
+        Condition::false_(
+            "Ready",
+            if phase == Phase::Reserved {
+                "Reserved"
+            } else {
+                "PodsNotReady"
+            },
+        )
+    };
+    let progress = if phase == Phase::Ready {
+        Condition::false_("Progressing", "Settled")
+    } else {
+        Condition::true_("Progressing")
+    };
+    ShardStatus {
+        observed_generation,
+        phase,
+        members_per_process: shard.spec.replicas,
+        capacity: crate::model::ShardCapacity {
+            processes: totals.processes as u16,
+            cpu_request: format_cpu(totals.cpu_request_millis),
+            memory_request: format_bytes(totals.memory_request_bytes),
+            storage_request: shard.spec.storage.size.clone(),
+        },
+        symbols,
+        nodes,
+        conditions: vec![ready, progress],
+    }
+}
+
+fn symbol_status(
+    existing: &TradingSymbolStatus,
+    deployment: Option<&SymbolDeployment>,
+    deployment_status: Option<&DeploymentStatus>,
+) -> TradingSymbolStatus {
+    let mut status = existing.clone();
+    if let (Some(deployment), Some(deployment_status)) = (deployment, deployment_status) {
+        status.phase = if deployment.spec.desired_state == DeploymentState::Disabled {
+            Phase::Disabled
+        } else {
+            deployment_status.phase
+        };
+        status.config_hash = deployment.spec.config_hash.clone();
+        status.applied_by = "operator".to_string();
+    } else {
+        status.phase = Phase::Pending;
+    }
+    status
+}
+
+async fn write_statuses(
+    client: &Client,
+    view: &CrdView,
+    observations: &Observations,
+) -> Result<usize> {
+    let catalog = &view.catalog;
+    let mut writes = 0;
+    for shard in catalog.shards.values() {
+        let generation = view
+            .object(CrdKind::Shard, &shard.namespace, &shard.name)
+            .and_then(|object| object.metadata.generation)
+            .unwrap_or(0) as u64;
+        let status = shard_status(shard, catalog, observations, generation);
+        writes += write_status(
+            client,
+            view,
+            CrdKind::Shard,
+            &shard.namespace,
+            &shard.name,
+            &status,
+        )
+        .await?;
+
+        for deployment in catalog.shard_deployments(&shard.name) {
+            let dstatus = deployment_status(&deployment.status, observations.get(&deployment.name));
+            writes += write_status(
+                client,
+                view,
+                CrdKind::Deployment,
+                &deployment.namespace,
+                &deployment.name,
+                &dstatus,
+            )
+            .await?;
+        }
+    }
+
+    for route in catalog.routes.values() {
+        let deployment = catalog.deployments.get(&route.spec.active_deployment_ref);
+        let Some(deployment) = deployment else {
+            continue;
+        };
+        let dstatus = deployment_status(&deployment.status, observations.get(&deployment.name));
+        let status = route_status(&route.status, route, deployment, &dstatus);
+        writes += write_status(
+            client,
+            view,
+            CrdKind::Route,
+            &route.namespace,
+            &route.name,
+            &status,
+        )
+        .await?;
+    }
+
+    for symbol in catalog.symbols.values() {
+        let deployment = catalog
+            .deployments
+            .values()
+            .find(|deployment| deployment.spec.symbol_ref == symbol.name);
+        let dstatus = deployment.map(|deployment| {
+            deployment_status(&deployment.status, observations.get(&deployment.name))
+        });
+        let status = symbol_status(&symbol.status, deployment, dstatus.as_ref());
+        writes += write_status(
+            client,
+            view,
+            CrdKind::Symbol,
+            &symbol.namespace,
+            &symbol.name,
+            &status,
+        )
+        .await?;
+    }
+    Ok(writes)
+}
+
+async fn write_status<T: serde::Serialize>(
+    client: &Client,
+    view: &CrdView,
+    kind: CrdKind,
+    namespace: &str,
+    name: &str,
+    status: &T,
+) -> Result<usize> {
+    let namespace = namespace_or_default(namespace);
+    let Some(object) = view.object(kind, namespace, name) else {
+        return Ok(0);
+    };
+    let value = serde_json::to_value(status).context("encode status")?;
+    if object.data.get("status") == Some(&value) {
+        return Ok(0);
+    }
+    let mut updated = object.clone();
+    updated.data["status"] = value;
+    let api =
+        Api::<DynamicObject>::namespaced_with(client.clone(), namespace, &kind.api_resource());
+    match api
+        .replace_status(name, &PostParams::default(), &updated)
+        .await
+    {
+        Ok(_) => Ok(1),
+        Err(error) => {
+            warn!(?kind, namespace, name, %error, "status update failed");
+            Ok(0)
+        }
+    }
+}
+
+fn leader_label(leader_pod: Option<&str>, pod_name: &str) -> Option<&'static str> {
+    if leader_pod == Some(pod_name) {
+        Some("leader")
+    } else {
+        None
+    }
+}
+
+async fn label_leaders(
+    client: &Client,
+    catalog: &Catalog,
+    observations: &Observations,
+) -> Result<()> {
+    for shard in catalog.shards.values() {
+        if shard.spec.class != ShardClass::Dedicated {
+            continue;
+        }
+        let deployments = catalog.shard_deployments(&shard.name);
+        let leader_pod = deployments
+            .first()
+            .and_then(|deployment| observations.get(&deployment.name))
+            .and_then(|observation| observation.leader_pod)
+            .map(|pod| format!("{}-{pod}", shard.name));
+        let namespace = namespace_or_default(&shard.namespace);
+        let api = Api::<Pod>::namespaced(client.clone(), namespace);
+        let pods = api
+            .list(&ListParams::default().labels(&format!("matching.io/cluster={}", shard.name)))
+            .await
+            .with_context(|| format!("list pods for shard {}", shard.name))?;
+        for pod in pods.items {
+            let Some(name) = pod.metadata.name.clone() else {
+                continue;
+            };
+            let desired = leader_label(leader_pod.as_deref(), &name);
+            let current = pod
+                .metadata
+                .labels
+                .as_ref()
+                .and_then(|labels| labels.get(LEADER_LABEL))
+                .map(String::as_str);
+            if current == desired {
+                continue;
+            }
+            let patch = json!({
+                "metadata": {
+                    "labels": {
+                        "matching.io/role": desired
+                    }
+                }
+            });
+            api.patch(&name, &PatchParams::default(), &Patch::Merge(patch))
+                .await
+                .with_context(|| format!("patch leader label on pod {namespace}/{name}"))?;
+            debug!(namespace, name, ?desired, "updated leader label");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{ShardNodeStatus, SymbolDeployment};
+    use crate::store::demo_catalog;
+
+    fn observation(ready: bool, leader_pod: Option<u8>) -> DeploymentObservation {
+        DeploymentObservation {
+            pods: Vec::new(),
+            leader_pod,
+            leader_pod_name: leader_pod.map(|pod| format!("eurusd-{pod}")),
+            leader_addr: leader_pod.map(|pod| format!("eurusd-{pod}:21001")),
+            ready,
+            phase: if ready { Phase::Ready } else { Phase::Pending },
+            applied_index: Some(10),
+            lag: Some(0),
+            voters: vec![0, 1, 2, 3],
+            learners: Vec::new(),
+            configured: true,
+            config_locked: false,
+        }
+    }
+
+    #[test]
+    fn deployment_status_ready_and_route_publish() {
+        let catalog = demo_catalog();
+        let deployment = catalog.deployments["eurusd-g1"].clone();
+        let route = catalog.routes["eurusd"].clone();
+        let status = deployment_status(&deployment.status, Some(&observation(true, Some(0))));
+        assert_eq!(status.phase, Phase::Ready);
+        assert!(status.ready);
+        assert_eq!(status.leader_pod.as_deref(), Some("eurusd-0"));
+        let route_status = route_status(&route.status, &route, &deployment, &status);
+        assert_eq!(route_status.phase, Phase::Ready);
+        assert_eq!(route_status.leader_addr.as_deref(), Some("eurusd-0:21001"));
+        assert_eq!(route_status.observed_generation, 1);
+    }
+
+    #[test]
+    fn deployment_status_is_degraded_when_some_pods_report() {
+        let catalog = demo_catalog();
+        let deployment = catalog.deployments["eurusd-g1"].clone();
+        let mut observation = observation(false, None);
+        observation.phase = Phase::Degraded;
+        observation.pods = vec![PodObservation {
+            pod: 0,
+            ready: true,
+            healthy: true,
+            ..PodObservation::default()
+        }];
+        let status = deployment_status(&deployment.status, Some(&observation));
+        assert_eq!(status.phase, Phase::Degraded);
+        assert!(!status.ready);
+        assert!(
+            status
+                .conditions
+                .iter()
+                .any(|condition| condition.kind == "Ready")
+        );
+    }
+
+    #[test]
+    fn disabled_deployment_has_no_leader_route() {
+        let catalog = demo_catalog();
+        let mut deployment = catalog.deployments["eurusd-g1"].clone();
+        deployment.spec.desired_state = DeploymentState::Disabled;
+        let route = catalog.routes["eurusd"].clone();
+        let observation = DeploymentObservation {
+            phase: Phase::Disabled,
+            ..DeploymentObservation::default()
+        };
+        let dstatus = deployment_status(&deployment.status, Some(&observation));
+        assert_eq!(dstatus.phase, Phase::Disabled);
+        assert!(dstatus.leader_addr.is_none());
+        let rstatus = route_status(&route.status, &route, &deployment, &dstatus);
+        assert_eq!(rstatus.phase, Phase::Disabled);
+        assert!(rstatus.leader_addr.is_none());
+    }
+
+    #[test]
+    fn shard_status_lists_symbols_and_nodes() {
+        let catalog = demo_catalog();
+        let shard = catalog.shards["fx-eu-01"].clone();
+        let observations = Observations::from([
+            ("eurusd-g1".to_string(), observation(true, Some(0))),
+            ("gbpusd-g1".to_string(), observation(true, Some(1))),
+        ]);
+        let status = shard_status(&shard, &catalog, &observations, 3);
+        assert_eq!(status.observed_generation, 3);
+        assert_eq!(status.phase, Phase::Ready);
+        assert_eq!(status.members_per_process, 4);
+        assert_eq!(status.symbols.len(), 2);
+        assert_eq!(status.capacity.processes, 2);
+        assert_eq!(
+            status.nodes.iter().filter(|node| node.ready).count(),
+            0,
+            "no per-pod rows in the synthetic observation"
+        );
+        assert_eq!(status.nodes.len(), 4);
+    }
+
+    #[test]
+    fn leader_label_only_marks_the_leader_pod() {
+        assert_eq!(
+            leader_label(Some("me-btcusdt-2"), "me-btcusdt-2"),
+            Some("leader")
+        );
+        assert_eq!(leader_label(Some("me-btcusdt-2"), "me-btcusdt-1"), None);
+        assert_eq!(leader_label(None, "me-btcusdt-2"), None);
+    }
+
+    #[test]
+    fn shard_nodes_are_ready_when_every_process_reports() {
+        let catalog = demo_catalog();
+        let shard = catalog.shards["fx-eu-01"].clone();
+        let mut observations = Observations::new();
+        for name in ["eurusd-g1", "gbpusd-g1"] {
+            let deployment = catalog.deployments[name].clone();
+            let symbol = catalog.symbols[&deployment.spec.symbol_ref].clone();
+            let desired = desired_symbol_config(&symbol);
+            let pods = (0..shard.spec.replicas)
+                .map(|pod| PodObservation {
+                    pod,
+                    healthy: true,
+                    ready: true,
+                    is_leader: pod == 0,
+                    leader_id: Some(0),
+                    applied_index: Some(10),
+                    last_log_index: Some(10),
+                    symbol_config: Some(desired.clone()),
+                    error: None,
+                    ..PodObservation::default()
+                })
+                .collect();
+            observations.insert(
+                name.to_string(),
+                deployment_observation(&shard, &deployment, pods, Some(&desired)),
+            );
+        }
+        let status = shard_status(&shard, &catalog, &observations, 1);
+        assert_eq!(status.phase, Phase::Ready);
+        assert_eq!(status.nodes.len(), 4);
+        assert!(status.nodes.iter().all(|node| node.ready));
+        assert_eq!(status.nodes[0].processes, 2);
+    }
+
+    #[test]
+    fn operator_options_reject_bad_lease_intervals() {
+        let base = OperatorOptions {
+            profile: Profile::Local,
+            resync: Duration::from_secs(10),
+            observe_timeout: Duration::from_millis(500),
+            lease_namespace: "match-control".to_string(),
+            lease_name: "operator".to_string(),
+            identity: "test".to_string(),
+            lease_duration: Duration::from_secs(15),
+            lease_renew: Duration::from_secs(5),
+            namespace: None,
+            dry_run: false,
+        };
+        assert!(base.validate().is_ok());
+        let bad = OperatorOptions {
+            lease_renew: base.lease_duration,
+            ..base
+        };
+        assert!(bad.validate().is_err());
+    }
+
+    #[test]
+    fn lease_expiry_uses_renew_time_and_duration() {
+        let spec = LeaseSpec {
+            renew_time: Some(MicroTime(Timestamp::now())),
+            lease_duration_seconds: Some(15),
+            ..LeaseSpec::default()
+        };
+        let now = Timestamp::now().as_second();
+        assert!(!lease_expired(&spec, now));
+        assert!(lease_expired(&spec, now + 16));
+        assert!(lease_expired(&LeaseSpec::default(), now));
+    }
+
+    #[test]
+    fn workload_key_reads_rendered_metadata() {
+        let catalog = demo_catalog();
+        let objects = render_shard(
+            &catalog,
+            "fx-eu-01",
+            &RenderOptions {
+                profile: Profile::Local,
+                namespace: Some("match-eu-1".to_string()),
+                non_root: Some(true),
+                ..RenderOptions::default()
+            },
+        )
+        .unwrap();
+        let keys: Vec<WorkloadKey> = objects
+            .iter()
+            .map(workload_key)
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert!(keys.iter().any(|key| key.kind == WorkloadKind::StatefulSet));
+        assert!(keys.iter().any(|key| key.kind == WorkloadKind::ConfigMap));
+    }
+
+    #[test]
+    fn dedicated_shard_leader_name_matches_pod_ordinal() {
+        let pod = ShardNodeStatus {
+            name: "me-btcusdt-2".to_string(),
+            id: 2,
+            ready: true,
+            processes: 1,
+        };
+        assert_eq!(pod.name, format!("me-btcusdt-{}", pod.id));
+    }
+
+    #[test]
+    fn deployed_shard_has_one_active_deployment() {
+        let catalog = demo_catalog();
+        let deployments: Vec<&SymbolDeployment> = catalog.shard_deployments("me-btcusdt");
+        assert_eq!(deployments.len(), 1);
+    }
+
+    fn rollout_pod(name: &str, container: &str) -> Pod {
+        Pod {
+            metadata: k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
+                name: Some(name.to_string()),
+                ..Default::default()
+            },
+            spec: Some(k8s_openapi::api::core::v1::PodSpec {
+                containers: vec![k8s_openapi::api::core::v1::Container {
+                    name: container.to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn rollout_observations(deployment: &SymbolDeployment, ready: [bool; 4]) -> Observations {
+        Observations::from([(
+            deployment.name.clone(),
+            DeploymentObservation {
+                pods: ready
+                    .into_iter()
+                    .enumerate()
+                    .map(|(pod, ready)| PodObservation {
+                        pod: pod as u8,
+                        ready,
+                        healthy: ready,
+                        ..PodObservation::default()
+                    })
+                    .collect(),
+                ..DeploymentObservation::default()
+            },
+        )])
+    }
+
+    #[test]
+    fn rollout_removal_requires_a_healthy_quorum() {
+        let catalog = demo_catalog();
+        let shard = catalog.shards["fx-eu-01"].clone();
+        let deployment = catalog.deployments["eurusd-g1"].clone();
+        let active = vec![&deployment];
+        let pod = rollout_pod("fx-eu-01-2", "eurusd");
+
+        let observations = rollout_observations(&deployment, [true, true, true, true]);
+        assert!(processes_tolerate_removal(
+            &shard,
+            &active,
+            &observations,
+            &pod
+        ));
+
+        let observations = rollout_observations(&deployment, [true, true, true, false]);
+        assert!(!processes_tolerate_removal(
+            &shard,
+            &active,
+            &observations,
+            &pod
+        ));
+
+        let pending = rollout_pod("fx-eu-01-3", "eurusd");
+        assert!(processes_tolerate_removal(
+            &shard,
+            &active,
+            &observations,
+            &pending
+        ));
+
+        let unrelated = rollout_pod("fx-eu-01-2", "gbpusd");
+        assert!(processes_tolerate_removal(
+            &shard,
+            &active,
+            &observations,
+            &unrelated
+        ));
+    }
+
+    #[test]
+    fn pod_index_prefers_the_statefulset_label() {
+        let mut pod = rollout_pod("fx-eu-01-9", "eurusd");
+        assert_eq!(pod_index(&pod), Some(9));
+        pod.metadata.labels = Some(std::collections::BTreeMap::from([(
+            "apps.kubernetes.io/pod-index".to_string(),
+            "2".to_string(),
+        )]));
+        assert_eq!(pod_index(&pod), Some(2));
+        assert!(!pod_running(&pod));
+    }
+}

@@ -1,9 +1,11 @@
 # Kubernetes deployment template and configuration control plane
 
-Status: **proposed design** — no production operator, CRDs or management GUI exist yet. A
-runnable reference demo (manager API/GUI, validator, renderer and reconcile planner) lives in
-[`demos/k8s_control_plane/`](../demos/k8s_control_plane/README.md).
-Last updated: 2026-11-14.
+Status: **reference implementation** — the manager API/GUI, CRD-backed desired state, validator,
+renderer and Lease-elected cell operator live in
+[`demos/k8s_control_plane/`](../demos/k8s_control_plane/README.md). Production hardening still
+covers per-process cgroup isolation, retention-window deletion, migration cutover/drain/rollback
+and production manager security.
+Last updated: 2026-11-15.
 
 Related documents: [`AGENTS.md`](../AGENTS.md), [`docs/OPERATIONAL_CONSOLE.md`](./OPERATIONAL_CONSOLE.md),
 [`docs/STORAGE.md`](./STORAGE.md), [`docs/PERFORMANCE.md`](./PERFORMANCE.md),
@@ -154,9 +156,13 @@ load. A region can contain one or more cells.
 
 **Operator.** A Kubernetes controller deployed once per cell. It watches the match-engine CRDs in
 that cell and reconciles them into StatefulSets, Services, PDBs, NetworkPolicies and (once a text
-metrics endpoint or bridge exists) PodMonitors. It is the only component allowed to call `/init`,
-`/add-learner`, `/change-membership`, `/console/api/actions/*` and the symbol `ConfigureSymbol`
-write. It uses a Kubernetes `Lease` so only one replica reconciles at a time.
+metrics endpoint or bridge exists) PodMonitors. The operator is also the component that calls
+`/init`, `/add-learner`, `/change-membership`, `/console/api/actions/*` and the symbol
+`ConfigureSymbol` write. It uses a Kubernetes `Lease` so only one replica reconciles at a time; the
+reference implementation performs Lease election, CRD watches, server-side apply/prune, leader
+labels, status/route conditions, bootstrap/config/membership execution and quorum-safe
+containers-mode add/start/stop rolls. Retention-window deletion and cross-shard cutover/drain/
+rollback remain follow-ups.
 
 **Manager API + GUI.** The global configuration manager. Desired state lives in the catalog CRDs
 (`TradingSymbol`, `SymbolShard`, `SymbolDeployment`, `SymbolRoute`, `Cell`) and is persisted by the
@@ -293,6 +299,12 @@ per-process service on `httpPort + 1000`; no group ID or wire change is needed.
   a time (quorum stays 3/4 for every symbol); when all four pods have the new container, initialise
   that symbol's process and apply its config. Existing symbols restart one voter at a time. Remove
   in reverse: drain the symbol, stop its process, remove the container, retain data.
+  The controller replaces non-running pods first, keeps replacing until every pod matches
+  `updateRevision`, and gates each running-pod removal on a healthy quorum for every process it
+  hosts. A leader pod is transferred only when its removal is quorum-safe; the delete happens on
+  the next reconcile. This avoids the add deadlock where a new process cannot bootstrap until all
+  pods carry its container, and prevents leader-transfer churn while a group is at three healthy
+  voters.
 - **Supervisor mode:** the supervisor registers/starts a new engine process on all four pods and
   the operator initialises it; no pod template change and no restart of existing symbols.
 - **Promotion/demotion:** add the process to the target shard (containers or supervisor), add the
@@ -653,7 +665,9 @@ Until it exists, the FQDN-as-bind-address form above is the recommended template
   co-locating the gateway and the engine on the same small node pool if it causes CPU contention.
 - `PriorityClass` for match engines above batch workloads, but below system-critical components.
 - `terminationGracePeriodSeconds` must exceed the engine's shutdown path. The operator transfers
-  leadership before deleting a leader pod.
+  leadership before deleting a leader pod. The engine binary installs SIGTERM/SIGINT handlers and
+  drains through `MatchEngineNode::run_until`; this matters in containers mode because the engine
+  is PID 1 and would otherwise ignore SIGTERM and wait for SIGKILL at the end of the grace period.
 
 ```yaml
 apiVersion: policy/v1
@@ -2019,10 +2033,10 @@ sharding, chaos (node/zone loss, noisy neighbour), DR game day, GitOps.
 
 **Reference implementation.** [`demos/k8s_control_plane/`](../demos/k8s_control_plane/README.md)
 implements the phase 1 renderer, the phase 2 bootstrap/membership/upgrade decisions (as a
-reviewable plan rather than a controller), a read/write manager API/GUI, and a CRD-backed store
-that bootstraps from list calls, refreshes from informers, writes desired state through the
-Kubernetes API server and provides CRD backup/restore. It still does not run a controller or call
-the engine.
+reviewable plan rather than a controller), a read/write manager API/GUI, a CRD-backed store and a
+Lease-elected cell operator that bootstraps its cache from list/watch, server-side-applies/prunes
+the rendered workloads, labels the dedicated-shard leader and writes shard/deployment/route/symbol
+status. Bootstrap, membership and `ConfigureSymbol` execution remain the next operator step.
 
 ## 13. Required engine changes and open questions
 

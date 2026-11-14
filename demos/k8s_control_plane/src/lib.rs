@@ -21,6 +21,7 @@ pub mod crd;
 pub mod error;
 pub mod gui;
 pub mod model;
+pub mod operator;
 pub mod provision;
 pub mod reconcile;
 pub mod render;

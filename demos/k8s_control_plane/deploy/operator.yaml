@@ -1,0 +1,53 @@
+# Lease-elected cell operator. Two replicas demonstrate Lease handover; only the holder reconciles.
+# Install deploy/crds.yaml and deploy/rbac.yaml first.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: match-operator
+  namespace: match-control
+  labels:
+    app.kubernetes.io/name: match-operator
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: match-operator
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: match-operator
+    spec:
+      serviceAccountName: match-operator
+      automountServiceAccountToken: true
+      securityContext:
+        runAsUser: 10001
+        runAsGroup: 10001
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: operator
+          image: matchengine-k8s-control-plane:local
+          imagePullPolicy: IfNotPresent
+          command: ["/usr/local/bin/match-operator"]
+          args:
+            - --lease-namespace
+            - match-control
+            - --lease-name
+            - match-engine-operator
+            - --profile
+            - local
+            - --resync-seconds
+            - "10"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi

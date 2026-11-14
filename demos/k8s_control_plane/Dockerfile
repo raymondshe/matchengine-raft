@@ -10,6 +10,7 @@ FROM rust:1.93-bookworm AS builder
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         build-essential \
+        cmake \
         pkg-config \
         ca-certificates \
     && rm -rf /var/lib/apt/lists/*
@@ -19,7 +20,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY static ./static
 
-RUN cargo build --release --bin k8s-control-plane
+RUN cargo build --release --bin k8s-control-plane --bin match-operator
 
 FROM debian:bookworm-slim AS runtime
 
@@ -33,6 +34,7 @@ RUN apt-get update \
         --shell /usr/sbin/nologin controlplane
 
 COPY --from=builder /src/target/release/k8s-control-plane /usr/local/bin/k8s-control-plane
+COPY --from=builder /src/target/release/match-operator /usr/local/bin/match-operator
 
 ENV HOME=/tmp
 USER 10001:10001

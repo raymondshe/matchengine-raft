@@ -44,7 +44,7 @@
 | 复制 | Raft 节点间 RPC 使用 gRPC |
 | 行情数据 | Aeron 出口（2001–2007 流 + 2010 快照请求）+ Binance 风格 WebSocket 服务 |
 | 标的模型 | 一个进程/集群一个标的，经 Raft 配置并在交易开始后锁定 |
-| 集群管理 | Kubernetes 控制平面参考实现：CRD 期望状态（底层 etcd，经 API server）、manager + supervisor；跨数千个单 symbol 引擎、四 Pod shard 和 cell 的零影响 symbol 生命周期和带存储决策的 shard 删除 |
+| 集群管理 | Kubernetes 控制平面参考实现：CRD 期望状态（底层 etcd，经 API server）、manager + supervisor + Lease 选举 operator；跨数千个单 symbol 引擎、四 Pod shard 和 cell 的零影响 symbol 生命周期和带存储决策的 shard 删除 |
 | 数值模型 | 撮合、事件、快照和 feed 全程使用 18 位定点数 |
 | 可观测性 | 内置控制台、健康/就绪检查和指标 |
 | 公共入口 | 请求/快照大小受限；仅支持回环或私有网络部署 |
@@ -111,8 +111,9 @@
 - **Containers 模式显式爆炸半径保护** — 非空 containers shard 默认返回 `409 restart_required`；只有显式 `allowRestart` 才允许逐 voter 滚动，避免日常添加操作悄悄重启整个集群。
 - **完整生命周期与存储决策** — 优雅停止/启动复用同一 deployment、slot/端口和 PVC，直接恢复 WAL/snapshot，无需重新 `/init`；空闲 shard 可删除，并通过 `retainStorage` 选择保留 PVC 以便恢复，或不可逆地删除。
 - **CRD 期望状态** — 五个 `matching.io` CRD（`TradingSymbol`、`SymbolShard`、`SymbolDeployment`、`SymbolRoute`、`Cell`），带 status 子资源；管理器通过 Kubernetes API server 写入，从 informer 重建缓存，使用 `resourceVersion` 并发控制并限制 status 写入频率。etcd 持久化 CR，管理器不直接连接 etcd，引擎 WAL/事件也不会进入 etcd。
+- **Lease 选举的 cell operator** — 监听 CRD，server-side apply/prune StatefulSet/Services/PDB/NetworkPolicy/ConfigMap，为 dedicated shard 的 leader Pod 打标签以驱动 leader Service，并写入 shard/deployment/route/symbol 状态和条件。watch 触发即时 reconcile，Kubernetes Lease 让多副本串行。
 - **期望状态管理器，而不是手工 YAML 堆** — 跨多个 shard/cell 提供目录校验、最小空闲 slot 与 `httpBasePort + slot` 分配、StatefulSet/Services/PDB/NetworkPolicy/ConfigMap 渲染、bootstrap/升级 reconcile 计划、审计和引擎控制台代理。
-- **生产级 Kubernetes 原语** — 四 voter shard、每 Pod 一个 PVC、PDB、NetworkPolicy、headless gRPC Service、健康/就绪探针、非 root 镜像和 leader-aware 路由元数据。参考管理器和 supervisor 已在本仓库实现；生产 operator/controller 在控制平面设计与路线图中定义。
+- **生产级 Kubernetes 原语** — 四 voter shard、每 Pod 一个 PVC、PDB、NetworkPolicy、headless gRPC Service、健康/就绪探针、非 root 镜像和 leader-aware 路由元数据。参考管理器、supervisor 和 Lease 选举 operator 已在本仓库实现；operator 还执行 bootstrap/config/membership 以及带 quorum 门禁的 containers 增/启/停滚动。
 
 可运行演示见 [Kubernetes 控制平面](#kubernetes-控制平面)，生产 operator 契约见[设计文档](./docs/KUBERNETES_CONTROL_PLANE.md)。
 
@@ -282,8 +283,10 @@ quote 保证金叠加层，会估算名义价值、初始保证金和费用，�
 shard；删除前会明确询问是否保留 PVC（默认保留，便于以后用相同 shard 名称恢复）。运维控制台会把
 当前 `BASE/QUOTE` symbol 作为醒目标题。该架构通过 shard 和 cell 扩展到数千个单 symbol 引擎及其
 对应的四 voter 进程实例；期望状态可使用 JSON 演示存储或 CRD 后端，后者通过 Kubernetes API server
-写入五个 `matching.io` CRD（底层 etcd），并从 informer 刷新缓存。参考管理器和 supervisor 已在
-本仓库实现，生产 operator/controller 是下一层。
+写入五个 `matching.io` CRD（底层 etcd），并从 informer 刷新缓存。Lease 选举的 operator 监听 CRD、
+apply/prune 渲染出的工作负载、为 dedicated leader Pod 打标签、写入 shard/deployment/route 状态、
+bootstrap/配置每个 Raft 组，并在 quorum 门禁后逐 Pod 滚动 containers。PVC 保留窗口和跨 shard
+cutover 仍是后续工作。
 
 [![Kubernetes 控制平面、Supervisor 与引擎控制台](./docs/kubernetes-console-architecture.png)](./docs/kubernetes-console-architecture.html)
 

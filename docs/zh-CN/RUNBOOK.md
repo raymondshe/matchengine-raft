@@ -193,7 +193,9 @@ open http://127.0.0.1:8099/
 - 一个引擎进程只交易一个 symbol；一个 shard 是共享同一个 StatefulSet 的四个 Pod。
 - **Supervisor** shard 启停单个子进程时不修改 Pod 模板。**Containers** shard 增删容器会重建
   所有 Pod，因此默认返回 `409 restart_required`；只有显式传 `allowRestart: true` 才允许逐
-  voter 滚动。Containers shard 中最后一个活跃引擎的停止/启动是零影响的。
+  voter 滚动。Operator 会先替换 Pending Pod，再在确认每个进程仍保有健康多数后逐个删除运行中的
+  Pod；只有删除后仍满足 quorum 时才转移 leader。Containers shard 中最后一个活跃引擎的停止/启动
+  是零影响的。
 - 已停止的 deployment 保留为 `Disabled`，slot 和端口继续占用，`freeSlots` 不会增加；这是为了
   防止新 symbol 复用旧数据。
 - 引擎数据位于 PVC `data-<shard>-<pod>` 内的 `/data/<symbol>-<pod>`。删除 shard 时
@@ -205,6 +207,7 @@ open http://127.0.0.1:8099/
 | 组件 | 命名空间 | 地址/镜像 | 说明 |
 |---|---|---|---|
 | Manager API + GUI | `match-control` | `matchengine-k8s-control-plane:local`, 端口 `8099` | GUI 在 `/`；JSON 演示目录位于 `/data/catalog.json`，生产可使用 CRD 模式 |
+| Cell operator | `match-control` | 同一镜像，`/usr/local/bin/match-operator` | Lease 选举；监听 CRD、apply/prune 工作负载、bootstrap/配置 Raft、逐 Pod 滚动 containers、标记 leader 并写入状态 |
 | 引擎 shard | `match-eu-1` | `matchengine-raft:k8s-nonroot` | 四个 voter；每个 symbol 一个引擎进程 |
 | Supervisor Pod | 引擎 shard Pod | `9090` 上的 `/health`、`/ready`、`/processes` | 每个 Pod 一个容器；子进程是单 symbol 引擎 |
 | 引擎控制台 | 各引擎 HTTP 端口 | `/console/` | 管理器反向代理；symbol 是页面标题 |
@@ -287,6 +290,51 @@ kubectl -n match-control rollout status deploy/match-manager --timeout=120s
 该模式下 `GET /api/v1/health` 返回 `"store":"crd"`。状态通过 `/status` 子资源写入，并按对象限速；
 演示的审计历史仍在内存中，生产应写入外部 append-only 存储。引擎 WAL/snapshot、订单簿、撮合事件
 和行情数据永远不进入 CRD/etcd。
+
+#### 部署 cell operator
+
+Operator 是真正执行 apply/prune、状态写入、引擎 bootstrap/配置和 containers 模式滚动的组件。
+先安装 CRD、RBAC，再部署两个副本的 operator Deployment（演示 Lease 交接）：
+
+```sh
+kubectl apply -f demos/k8s_control_plane/deploy/crds.yaml
+kubectl apply -f demos/k8s_control_plane/deploy/rbac.yaml
+kubectl apply -f demos/k8s_control_plane/deploy/operator.yaml
+kubectl -n match-control rollout status deploy/match-operator --timeout=120s
+
+# 只有 Lease 持有者执行 reconcile。
+kubectl -n match-control get lease match-engine-operator \
+  -o jsonpath='{.spec.holderIdentity} {.spec.renewTime}{"\n"}'
+kubectl -n match-control logs deploy/match-operator --tail=20
+```
+
+本地运行二进制时，用 `--namespace` 把 watch/prune 限制在一个命名空间，并使用本地 Lease：
+
+```sh
+cargo run --manifest-path demos/k8s_control_plane/Cargo.toml --bin match-operator -- \
+  --namespace match-eu-1 \
+  --lease-namespace match-control --lease-name match-engine-operator \
+  --profile local --resync-seconds 10
+```
+
+Operator 负责：
+
+- **Apply/prune** 渲染出的 ConfigMap、Services、PDB、NetworkPolicy 和 StatefulSet。Prune 只处理带
+  `app.kubernetes.io/managed-by=match-engine-operator` 标签的对象；渲染失败的 shard 不会被 prune。
+  Operator 永远不删除 PVC。
+- **Leader Service 标签**：dedicated shard 中由引擎报告为 leader 的 Pod 获得
+  `matching.io/role=leader`，其他 Pod 移除该标签；`<shard>-leader` Service 通过它选择 leader。
+- **状态/条件**：从每个 Pod 的 `/health` 读取 `SymbolShard`、`SymbolDeployment`、
+  `TradingSymbol` 和 `SymbolRoute` 的 phase、readiness、leader Pod/地址、applied index/lag 和
+  `observedGeneration`。只有 deployment Ready 时才发布 `SymbolRoute.status.leaderAddr`。
+- **Bootstrap/配置/成员**：deployment 的所有 Pod 健康后，对空 Raft 组执行 `/init`，补加
+  learner、切换 voter，并在 leader 上应用 `ConfigureSymbol`；只有实际配置与期望一致才发布路由。
+- **Containers 滚动**：先替换 Pending Pod；删除运行中 Pod 前检查其承载的每个进程仍保有健康多数；
+  只有删除后仍满足 quorum 才转移 leader。因此 operator 的 ServiceAccount 还需要 `pods/delete`
+  权限（`deploy/rbac.yaml` 已包含）。
+
+`--dry-run` 只记录期望数量，不 apply、不写状态、不 bootstrap、不滚动。保留窗口到期后的 PVC
+删除和跨 shard cutover/drain/rollback 仍是后续工作；`drop-shard` 和 `migrate` 目前只返回步骤计划。
 
 管理器需要能访问引擎 Pod 以提供控制台代理。渲染出的 NetworkPolicy 允许来自带
 `matching.io/role=control-plane` 标签命名空间的 HTTP；如果 GUI 部署在其他命名空间，请保留该标签。
@@ -442,8 +490,20 @@ done
 引擎必须重新初始化和配置。
 
 Containers 模式下，其他引擎仍活跃时 `shutdown`/`start` 会返回 `409 restart_required`，除非设置
-`allowRestart`。Apply 渲染出的 StatefulSet 变更，逐个删除/重建 Pod，并在处理下一个 Pod 前等待
-`/ready`。Containers shard 中最后一个活跃引擎的停止/启动是零影响的。
+`allowRestart`。Operator apply 渲染出的 StatefulSet 变更后会逐个滚动 Pod：先替换 Pending Pod；
+删除运行中 Pod 前确认其承载的每个进程仍保有健康多数；只有删除后仍满足 quorum 时才转移 leader。
+可用以下命令观察：
+
+```sh
+kubectl -n match-eu-1 get statefulset fx-eu-01 \
+  -o jsonpath='{.status.updateRevision} {.status.currentRevision} ready={.status.readyReplicas}{"\n"}'
+kubectl -n match-control logs deploy/match-operator --tail=100 | grep -E 'deleted|holding|leadership'
+```
+
+不要为了腾出容量手动删除健康的旧 Pod；quorum 门禁会等待 Pending 的新 revision Pod 调度成功。
+引擎作为 PID 1 已处理 SIGTERM，因此终止很快；没有该处理的旧镜像会等满 grace period。所有 Pod
+都是新 revision 且容器 Ready 后，空 Raft 组才执行 `/init`，否则进程从 PVC 恢复；只有观测配置
+与期望不同才应用 `ConfigureSymbol`。Containers shard 中最后一个活跃引擎的停止/启动是零影响的。
 
 ### 删除 shard
 
@@ -684,6 +744,11 @@ JSON 模式下，任何管理器滚动前先导出目录；如果文件丢失，
 | CRD 模式返回 `kubernetes_api` 403 | 管理器 ServiceAccount 缺少 RBAC 或 token 未挂载。应用 `deploy/rbac.yaml`，设置 `serviceAccountName: match-manager` 和 `automountServiceAccountToken: true`。 |
 | CRD 模式返回 `kubernetes_api` 404 | 五个 `matching.io` CRD 未安装。运行 `cargo run -- crds \| kubectl apply -f -`。 |
 | CRD 管理器启动后目录为空 | 所列命名空间中没有 CR，或缺少 list/watch RBAC。用 `crd-restore` 恢复，或通过 API 创建 shard/symbol。 |
+| Operator 没有 Lease 持有者 | 检查 `kubectl -n match-control get lease match-engine-operator`；确认 `match-operator` ServiceAccount 有 `coordination.k8s.io/leases` 权限且 token 已挂载。 |
+| Operator 无法 apply 工作负载 | 检查 `match-operator` ClusterRole 是否有 StatefulSet/Service/ConfigMap/PDB/NetworkPolicy 的 create/update/delete，以及 Pod 的 list/watch/patch/delete（滚动需要 delete）。 |
+| Route 状态一直是 Pending | Operator 无法访问 `<pod>.<shard>-headless.<ns>.svc:httpPort/health`，或没有引擎报告 leader。检查就绪状态、NetworkPolicy 和控制台 cluster 页。 |
+| Leader Service 没有 endpoint | 只有 dedicated shard 才有 leader Service。检查 `SymbolDeployment.status.leaderPod`；没有 leader 时 operator 会移除 `matching.io/role=leader`。 |
+| Operator 意外 prune 对象 | 检查 `--namespace` 作用域和 shard CR 是否仍存在。没有 managed-by 标签的对象永远不会被 prune；operator 永远不删除 PVC。 |
 | `ImagePullBackOff` / 引擎控制台没有 symbol 标题 | 镜像已重建但 Pod 未重建。使用 `imagePullPolicy: IfNotPresent`，然后 `kubectl -n match-eu-1 rollout restart statefulset/<shard>` 并等待 `/ready`。 |
 | 添加/停止/启动返回 `409 restart_required` | shard 是 containers 模式且还有其他活跃引擎；改用 supervisor shard、空 shard，或显式允许 `allowRestart`。 |
 | 删除返回 `409 shard_not_idle` | 先停止 shard 中所有 symbol；错误会列出活跃项。Apply 更新后的 ConfigMap 后重试。 |

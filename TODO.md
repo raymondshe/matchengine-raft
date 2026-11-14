@@ -24,40 +24,34 @@ TLS/authentication stays at the gateway and is out of scope for this process.
 
 The Kubernetes control-plane design and reference demo are complete (§18): reserved and supervisor
 shards, create-symbol/migrate planning, a zero-impact supervisor pod agent, and a containers-mode
-restart guard. The reference manager now has both a JSON demo store and a CRD-backed desired-state
-store that writes through the Kubernetes API server (etcd underneath). The next production step is
-the real cell operator; production manager security and supervisor hardening remain.
+restart guard. The reference manager has both a JSON demo store and a CRD-backed desired-state
+store that writes through the Kubernetes API server (etcd underneath). The Lease-elected operator
+now also executes bootstrap/config/membership and quorum-safe containers add/start/stop rolls;
+per-process isolation, retention-window deletion, migration cutover and production manager
+security remain.
 
 Priority key: **P0** = known correctness/security defect, do next; **P1** = correctness coverage,
 measurement and production readiness; **P2** = important but not blocking; **P3** = later/optional.
 
 ## Top priorities
 
-Last prioritised 2026-11-14, after the OrbStack Linux lab and the Aeron
-external-driver/multicast validation. There are no known P0 or P1 defects. The local-lease semantic
-risk is covered by the delivery contract: client retries are at-least-once and use
-`client_order_id` for replicated dedupe, while downstream event readers resume from
-`(log_index, ordinal)` and dedupe on `event_id`. A local-lease cache hit may overtake an unfinished
-write, so read-after-write is not a guarantee; clients that need it must await the write response.
+Last prioritised 2026-11-15, after the operator lifecycle validation on OrbStack. There are no
+known P0 or P1 defects. The local-lease semantic risk is covered by the delivery contract: client
+retries are at-least-once and use `client_order_id` for replicated dedupe, while downstream event
+readers resume from `(log_index, ordinal)` and dedupe on `event_id`. A local-lease cache hit may
+overtake an unfinished write, so read-after-write is not a guarantee; clients that need it must
+await the write response.
 
-The Kubernetes control plane is a new feature workstream, not a defect (§18). The design, reference
-manager, reserved/supervisor shards, zero-impact supervisor additions and CRD-backed desired state
-are done. The next P1 workstream is the real cell operator, supervisor hardening and the remaining
-lifecycle execution.
+The Kubernetes control plane is a new feature workstream, not a defect (§18).
+Bootstrap/config/membership execution and containers add/start/stop rolls are done; the remaining
+production lifecycle items are below.
 
-**P1 - production control-plane completion**
+**P1 - remaining production control-plane work**
 
-- **CRD-backed desired state (done 2026-11-14).** Five CRDs with status subresources and printer
-  columns, `CatalogStore`/`CrdCatalogStore`, writes through the Kubernetes API server, informer
-  cache, `resourceVersion`, rate-limited status writes, CRD YAML/RBAC and `crd-backup`/`crd-restore`.
-  No direct etcd client; audit stays outside CRDs. The typed schema, scale/soak and full operator
-  remain follow-ups.
-- **Real cell operator.** Lease-based leader election, watches and reconciliation for the CRDs,
-  apply/prune of StatefulSet/Services/PDB/NetworkPolicy/ConfigMap, leader Service labels, status
-  conditions and route status.
-- **Production lifecycle execution.** Operator-driven containers-mode add/start/stop rolls,
-  supervisor hardening (cgroups, log rotation, orphan cleanup, backpressure), retention-window
-  deletion and migration cutover/drain/rollback.
+- **Production lifecycle completion.** Per-process cgroups and optional rotating per-child logs
+  (today the pod/container limit and kubelet log rotation are the boundary), retention-window
+  deletion, and migration cutover/drain/rollback. These need a durable retention record and a
+  cross-shard cutover state machine; see §18.
 
 The remaining P2 evidence gaps are second-host behaviour, not code paths: the four OrbStack
 containers share one kernel, host and clock, and the Aeron multicast run is loopback within one
@@ -1235,7 +1229,7 @@ Done (2026-11-14):
   `SymbolRoute`, slot/port ownership, four-voter bootstrap, storage/PVC, NetworkPolicy, probes,
   upgrades, backups and migration.
 - [x] **P1** Reference manager crate with model, bundle, validation, renderer, reconcile planner,
-  JSON store, Axum API, embedded GUI and CLI; 112 lib + 1 bin tests.
+  JSON store, Axum API, embedded GUI and CLI; 123 lib + 2 bin tests.
 - [x] **P1** CRD-backed desired state: five CRDs (`TradingSymbol`, `SymbolShard`,
   `SymbolDeployment`, `SymbolRoute`, `Cell`) with status subresources, printer columns, generated
   YAML and schema tests; `CatalogStore`/`CrdCatalogStore` writing through the Kubernetes API
@@ -1302,24 +1296,37 @@ Remaining (priority order is top to bottom within each tier):
 | Engine WAL/snapshot/order book/match events/market data | Engine PVC and feed | Never etcd |
 | Console live snapshots, selected shard, ephemeral UI state | Memory or live engine APIs | Not persisted |
 
-- [ ] **P1** Implement the real cell operator: CRD install, Lease election, watches and
-  reconciliation for `SymbolShard`/`SymbolDeployment`/`SymbolRoute`/`Cell`, apply/prune of the
-  StatefulSet/Services/PDB/NetworkPolicy/ConfigMap, leader Service labels, status conditions and
-  route status. The demo only renders and plans; it has no Kubernetes client. Depends on the
-  CRD-backed store above.
-- [ ] **P1** Operator-driven containers-mode add: update the StatefulSet, delete/recreate pods one
-  at a time, wait for readiness and a leader, verify quorum, then `/init` and configure the new
-  process. The API creates desired state and enforces the restart guard, but the roll itself is
-  manual.
-- [ ] **P1** Supervisor hardening: per-process cgroups, log rotation, orphan cleanup, max-child
-  backpressure, a control API, and tests for crash restart, readiness aggregation and shutdown.
-  The reference supervisor shares one container CPU/memory limit.
+- [x] **P1** Lease-elected cell operator: `match-operator` binary with Kubernetes `Lease` election
+  and handover, CRD watchers, namespace scoping and dry-run; server-side apply/prune of managed
+  StatefulSet/Services/PDB/NetworkPolicy/ConfigMap; dedicated-shard leader Service labels; status
+  and conditions for shards/deployments/symbols/routes from `/health`; PVC-safe pruning. Live
+  OrbStack validation covered reserved and materialized shards, apply/prune, status, leader-label
+  removal and Lease handover.
+- [x] **P1** Bootstrap/config/membership execution: the operator runs `/init`, `/add-learner`,
+  `/change-membership` and `ConfigureSymbol` once every pod for a deployment reports healthy,
+  waits for a leader, and only publishes a route when the applied config matches the desired
+  symbol. Live proof on `fx-boot-01`: four voters, applied config, Ready deployment/shard/route,
+  leader label and leader Service endpoint.
+- [x] **P1** Operator-driven containers-mode add/start/stop rolls: update the StatefulSet, replace
+  non-running pods first, transfer leadership only after a quorum-safety check, and delete one
+  outdated pod at a time. Live proof on `fx-roll-01`: `rollalt` added to a packed shard, both
+  processes configured and routed, `rollalt` stopped, re-added, and image/config rolls completed.
+  The engine's SIGTERM handler makes containers-mode pod termination prompt instead of waiting for
+  the 60s grace period.
+- [x] **P1** Supervisor resilience: exponential restart backoff with a cumulative restart count,
+  `--max-processes` backpressure, PID-file orphan cleanup after a supervisor SIGKILL, and tests
+  for add/remove, crash restart, backpressure and orphan cleanup. Per-process cgroups and
+  rotating per-child logs remain deliberate follow-ups: the current boundary is the pod/container
+  limit plus kubelet log rotation.
 - [ ] **P1** Retention window and automated deletion: `drop-shard` returns the keep/delete PVC
-  steps but the operator executes them. Add a configurable retention window, a verified
-  delete/PVC-release operation and a guard against shard-name reuse while retained PVCs exist.
-- [ ] **P1** Migration execution: a `promote`/cutover path that validates cross-shard
-  `previousDeploymentRef`, switches the route, drains/removes the old deployment, retains/deletes
-  source data, and provides rollback. `migrate` currently creates the shadow and plan only.
+  steps but the operator does not execute them. This needs a durable retained-shard record (CR or
+  annotation/tombstone) because deleting the shard CR removes the only catalog pointer, plus a
+  configurable window, a verified PVC-release operation and a guard against shard-name reuse while
+  retained PVCs exist.
+- [ ] **P1** Migration execution: a `promote`/cutover state machine that validates the cross-shard
+  `previousDeploymentRef`, adds the target voters as learners, waits for catch-up, switches the
+  route, drains/removes the old deployment, retains/deletes source data and supports rollback.
+  `migrate` currently creates the shadow and plan only.
 - [ ] **P1** Wire the standalone `demos/k8s_control_plane` crate into CI (fmt, Clippy, tests). The
   root cluster suite already covers the supervisor; the demo crate is outside the workspace.
 - [ ] **P2** Production manager: OIDC/RBAC, approvals, idempotency keys, namespace-qualified
@@ -1339,9 +1346,10 @@ Remaining (priority order is top to bottom within each tier):
 - [ ] **P2** Capacity and packing policy: tenant/owner placement, quotas, capacity accounting,
   noisy-neighbour detection and hot-symbol promotion. Auto placement currently chooses the most
   packed zero-impact shard.
-- [ ] **P2** End-to-end operator smoke on OrbStack: create/apply a reserved or supervisor shard,
-  add a symbol, bootstrap membership, configure it and verify zero restarts without manual
-  `kubectl`/`curl` steps. Add the repeatable script/runbook.
+- [ ] **P2** End-to-end operator smoke on OrbStack: the containers-mode path (create CRs, apply,
+  bootstrap four voters, configure, add/stop/re-add a symbol, image/config roll, inspect status)
+  is live-validated; add a repeatable script/runbook and repeat the same flow for a supervisor
+  shard and a reserved-to-materialized transition.
 - [ ] **P2** Security: manager OIDC and console-proxy authorization, approvals for destructive
   actions, NetworkPolicy tests and Pod Security Standards. The demo manager has no auth.
 - [ ] **P2** Scale and soak the CRD path: thousands of symbols/CRs across shards and cells, status

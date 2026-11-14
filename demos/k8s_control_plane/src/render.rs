@@ -686,6 +686,7 @@ fn supervisor_stateful_set(ctx: &Ctx<'_>) -> Value {
             "--read-policy", ctx.shard.spec.raft.read_policy.as_str(),
             "--max-inflight-writes", ctx.shard.spec.quotas.per_process.max_inflight_writes.to_string(),
             "--max-events", ctx.shard.spec.quotas.per_process.max_events.to_string(),
+            "--max-processes", ctx.shard.spec.packing.max_processes_per_pod.to_string(),
         ],
         "env": env,
         "ports": ports,
@@ -948,6 +949,13 @@ mod tests {
         assert_eq!(
             before_sts["spec"]["template"]["spec"]["containers"][0]["name"],
             "supervisor"
+        );
+        let args = before_sts["spec"]["template"]["spec"]["containers"][0]["args"]
+            .as_array()
+            .unwrap();
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == "--max-processes" && pair[1] == "4")
         );
         assert_eq!(
             before_sts["spec"]["template"]["spec"]["containers"][0]["resources"]["requests"]["cpu"],

@@ -3,6 +3,7 @@
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use reqwest::Client;
@@ -13,13 +14,16 @@ use tokio::time::sleep;
 const SUPERVISOR_ADDR: &str = "127.0.0.1:39090";
 
 fn temp_dir() -> PathBuf {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir().join(format!(
-        "match-supervisor-it-{}-{}",
+        "match-supervisor-it-{}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_nanos()
+            .as_nanos(),
+        seq
     ))
 }
 
@@ -36,7 +40,7 @@ while [ $# -gt 0 ]; do
   esac
 done
 echo $$ > "$dir/$name.pid"
-exec sleep 300
+while :; do sleep 1; done
 "#,
         dir.display()
     );
@@ -67,15 +71,19 @@ fn write_processes(path: &std::path::Path, processes: &[(&str, u16)]) {
     .unwrap();
 }
 
-async fn running(client: &Client) -> Option<Vec<String>> {
-    let body: Value = client
-        .get(format!("http://{SUPERVISOR_ADDR}/processes"))
+async fn status(client: &Client, addr: &str) -> Option<Value> {
+    client
+        .get(format!("http://{addr}/processes"))
         .send()
         .await
         .ok()?
         .json()
         .await
-        .ok()?;
+        .ok()
+}
+
+async fn running(client: &Client, addr: &str) -> Option<Vec<String>> {
+    let body = status(client, addr).await?;
     Some(
         body["running"]
             .as_array()?
@@ -85,10 +93,10 @@ async fn running(client: &Client) -> Option<Vec<String>> {
     )
 }
 
-async fn wait_for(client: &Client, names: &[&str], timeout: Duration) -> bool {
+async fn wait_for(client: &Client, addr: &str, names: &[&str], timeout: Duration) -> bool {
     let start = Instant::now();
     while start.elapsed() < timeout {
-        if let Some(current) = running(client).await
+        if let Some(current) = running(client, addr).await
             && current.len() == names.len()
             && names.iter().all(|name| current.iter().any(|n| n == name))
         {
@@ -103,8 +111,11 @@ async fn start_supervisor(
     dir: &std::path::Path,
     config: &std::path::Path,
     engine: &std::path::Path,
+    addr: &str,
+    extra: &[&str],
 ) -> Child {
-    Command::new(env!("CARGO_BIN_EXE_match_supervisor"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_match_supervisor"));
+    command
         .arg("--config")
         .arg(config)
         .arg("--id")
@@ -116,14 +127,14 @@ async fn start_supervisor(
         .arg("--engine-bin")
         .arg(engine)
         .arg("--supervisor-addr")
-        .arg(SUPERVISOR_ADDR)
+        .arg(addr)
         .arg("--poll-interval-ms")
         .arg("100")
+        .args(extra)
         .kill_on_drop(true)
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("start supervisor")
+        .stderr(Stdio::null());
+    command.spawn().expect("start supervisor")
 }
 
 async fn wait_for_file(path: &std::path::Path, timeout: Duration) -> bool {
@@ -145,14 +156,20 @@ async fn adding_a_process_does_not_restart_existing_children() {
     let engine = script(&dir);
     write_processes(&config, &[("alpha", 39101)]);
 
-    let mut supervisor = start_supervisor(&dir, &config, &engine).await;
+    let mut supervisor = start_supervisor(&dir, &config, &engine, SUPERVISOR_ADDR, &[]).await;
     let client = Client::builder()
         .timeout(Duration::from_secs(2))
         .build()
         .unwrap();
 
     assert!(
-        wait_for(&client, &["alpha"], Duration::from_secs(10)).await,
+        wait_for(
+            &client,
+            SUPERVISOR_ADDR,
+            &["alpha"],
+            Duration::from_secs(10)
+        )
+        .await,
         "alpha did not start"
     );
     assert!(
@@ -164,7 +181,13 @@ async fn adding_a_process_does_not_restart_existing_children() {
 
     write_processes(&config, &[("alpha", 39101), ("beta", 39102)]);
     assert!(
-        wait_for(&client, &["alpha", "beta"], Duration::from_secs(10)).await,
+        wait_for(
+            &client,
+            SUPERVISOR_ADDR,
+            &["alpha", "beta"],
+            Duration::from_secs(10)
+        )
+        .await,
         "beta did not start"
     );
     assert!(
@@ -189,7 +212,7 @@ async fn adding_a_process_does_not_restart_existing_children() {
 
     write_processes(&config, &[("beta", 39102)]);
     assert!(
-        wait_for(&client, &["beta"], Duration::from_secs(10)).await,
+        wait_for(&client, SUPERVISOR_ADDR, &["beta"], Duration::from_secs(10)).await,
         "alpha was not removed"
     );
     let beta_after = std::fs::read_to_string(dir.join("beta.pid"))
@@ -211,5 +234,217 @@ async fn adding_a_process_does_not_restart_existing_children() {
         libc::kill(supervisor.id().unwrap() as i32, libc::SIGTERM);
     }
     let _ = tokio::time::timeout(Duration::from_secs(10), supervisor.wait()).await;
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+fn read_pid(path: &std::path::Path) -> Option<i32> {
+    std::fs::read_to_string(path)
+        .ok()?
+        .trim()
+        .parse::<i32>()
+        .ok()
+}
+
+fn process_alive(pid: i32) -> bool {
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+async fn wait_for_restart(
+    client: &Client,
+    addr: &str,
+    name: &str,
+    old_pid: u32,
+    timeout: Duration,
+) -> Option<(u32, u32)> {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if let Some(body) = status(client, addr).await
+            && let Some(row) = body["running"]
+                .as_array()?
+                .iter()
+                .find(|row| row["name"] == name)
+        {
+            let pid = row["pid"].as_u64().unwrap_or_default() as u32;
+            let restarts = row["restarts"].as_u64().unwrap_or_default() as u32;
+            if pid != 0 && pid != old_pid && restarts >= 1 {
+                return Some((pid, restarts));
+            }
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    None
+}
+
+#[tokio::test]
+async fn max_processes_rejects_excess_children() {
+    const ADDR: &str = "127.0.0.1:39091";
+    let dir = temp_dir();
+    std::fs::create_dir_all(&dir).unwrap();
+    let config = dir.join("processes.json");
+    let engine = script(&dir);
+    write_processes(&config, &[("alpha", 39111), ("beta", 39112)]);
+
+    let mut supervisor = start_supervisor(
+        &dir,
+        &config,
+        &engine,
+        ADDR,
+        &["--max-processes", "1", "--restart-base-ms", "100"],
+    )
+    .await;
+    let client = Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .unwrap();
+
+    assert!(
+        wait_for(&client, ADDR, &["alpha"], Duration::from_secs(10)).await,
+        "alpha did not start"
+    );
+    sleep(Duration::from_millis(300)).await;
+    let body = status(&client, ADDR).await.expect("status");
+    let running: Vec<&str> = body["running"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|row| row["name"].as_str())
+        .collect();
+    assert_eq!(running, vec!["alpha"]);
+    let rejected: Vec<&str> = body["rejected"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|row| row["name"].as_str())
+        .collect();
+    assert_eq!(rejected, vec!["beta"]);
+    assert!(!dir.join("beta.pid").exists(), "beta must not be started");
+
+    unsafe {
+        libc::kill(supervisor.id().unwrap() as i32, libc::SIGTERM);
+    }
+    let _ = tokio::time::timeout(Duration::from_secs(10), supervisor.wait()).await;
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn crashed_child_restarts_with_a_backoff_count() {
+    const ADDR: &str = "127.0.0.1:39092";
+    let dir = temp_dir();
+    std::fs::create_dir_all(&dir).unwrap();
+    let config = dir.join("processes.json");
+    let engine = script(&dir);
+    write_processes(&config, &[("alpha", 39121)]);
+
+    let mut supervisor = start_supervisor(
+        &dir,
+        &config,
+        &engine,
+        ADDR,
+        &[
+            "--restart-base-ms",
+            "100",
+            "--restart-max-ms",
+            "400",
+            "--restart-stable-ms",
+            "60000",
+        ],
+    )
+    .await;
+    let client = Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .unwrap();
+
+    assert!(
+        wait_for(&client, ADDR, &["alpha"], Duration::from_secs(10)).await,
+        "alpha did not start"
+    );
+    assert!(
+        wait_for_file(&dir.join("alpha.pid"), Duration::from_secs(5)).await,
+        "alpha did not write its pid"
+    );
+    let old_pid = read_pid(&dir.join("alpha.pid")).expect("alpha pid");
+    unsafe {
+        libc::kill(old_pid, libc::SIGKILL);
+    }
+    let (new_pid, restarts) = wait_for_restart(
+        &client,
+        ADDR,
+        "alpha",
+        old_pid as u32,
+        Duration::from_secs(10),
+    )
+    .await
+    .expect("alpha did not restart");
+    assert_ne!(new_pid as i32, old_pid);
+    assert!(restarts >= 1);
+
+    unsafe {
+        libc::kill(supervisor.id().unwrap() as i32, libc::SIGTERM);
+    }
+    let _ = tokio::time::timeout(Duration::from_secs(10), supervisor.wait()).await;
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn startup_stops_orphans_from_a_killed_supervisor() {
+    const FIRST_ADDR: &str = "127.0.0.1:39093";
+    const SECOND_ADDR: &str = "127.0.0.1:39094";
+    let dir = temp_dir();
+    std::fs::create_dir_all(&dir).unwrap();
+    let config = dir.join("processes.json");
+    let engine = script(&dir);
+    write_processes(&config, &[("alpha", 39131)]);
+    let extra = ["--restart-base-ms", "100"];
+
+    let mut first = start_supervisor(&dir, &config, &engine, FIRST_ADDR, &extra).await;
+    let client = Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .unwrap();
+    assert!(
+        wait_for(&client, FIRST_ADDR, &["alpha"], Duration::from_secs(10)).await,
+        "alpha did not start"
+    );
+    assert!(
+        wait_for_file(&dir.join("alpha.pid"), Duration::from_secs(5)).await,
+        "alpha did not write its pid"
+    );
+    let orphan_pid = read_pid(&dir.join("alpha.pid")).expect("alpha pid");
+
+    unsafe {
+        libc::kill(first.id().unwrap() as i32, libc::SIGKILL);
+    }
+    let _ = tokio::time::timeout(Duration::from_secs(10), first.wait()).await;
+    assert!(
+        process_alive(orphan_pid),
+        "the child should outlive a SIGKILLed supervisor"
+    );
+
+    let mut second = start_supervisor(&dir, &config, &engine, SECOND_ADDR, &extra).await;
+    let start = Instant::now();
+    let mut replacement = None;
+    while start.elapsed() < Duration::from_secs(15) {
+        if let Some(pid) = read_pid(&dir.join("alpha.pid"))
+            && pid != orphan_pid
+            && process_alive(pid)
+        {
+            replacement = Some(pid);
+            break;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    let replacement = replacement.expect("supervisor did not start a replacement child");
+    assert_ne!(replacement, orphan_pid);
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(5) && process_alive(orphan_pid) {
+        sleep(Duration::from_millis(100)).await;
+    }
+    assert!(!process_alive(orphan_pid), "orphaned child is still alive");
+
+    unsafe {
+        libc::kill(second.id().unwrap() as i32, libc::SIGTERM);
+    }
+    let _ = tokio::time::timeout(Duration::from_secs(10), second.wait()).await;
     let _ = std::fs::remove_dir_all(dir);
 }

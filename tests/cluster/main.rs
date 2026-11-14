@@ -20,6 +20,7 @@ mod test_min_voters;
 mod test_read_policy;
 mod test_request_limits;
 mod test_restart;
+mod test_shutdown;
 mod test_snapshot;
 mod test_storage;
 mod test_supervisor;

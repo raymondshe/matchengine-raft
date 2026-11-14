@@ -5,10 +5,10 @@ use clap::Parser;
 use env_logger::Env;
 use matchengine_raft::DEFAULT_SNAPSHOT_INTERVAL;
 use matchengine_raft::StorageConfig;
+use matchengine_raft::build_match_engine_node;
 use matchengine_raft::market_data::MarketDataConfig;
 use matchengine_raft::network::admission::DEFAULT_MAX_INFLIGHT_WRITES;
 use matchengine_raft::network::read_policy::ReadPolicyMode;
-use matchengine_raft::start_match_engine_node_with_storage;
 use matchengine_raft::store::state_machine::DEFAULT_MAX_EVENTS;
 
 #[derive(Parser, Clone, Debug)]
@@ -232,11 +232,37 @@ async fn main() -> std::io::Result<()> {
         storage = storage.with_market_data(config);
     }
 
-    start_match_engine_node_with_storage(
+    let node = build_match_engine_node(
         options.id,
         options.http_addr,
         matchengine_raft::default_raft_config(),
         storage,
     )
-    .await
+    .await?;
+    node.run_until(shutdown_signal()).await
+}
+
+/// Resolves on SIGTERM or Ctrl-C.
+///
+/// The engine is PID 1 in containers-mode pods, so the kernel does not apply the
+/// default SIGTERM disposition; without this handler every rollout relies on the
+/// 60-second grace period and a SIGKILL.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        if let Ok(mut signal) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        {
+            signal.recv().await;
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
 }

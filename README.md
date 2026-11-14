@@ -45,7 +45,7 @@ A Raft-replicated matching engine in Rust for teams that need deterministic exec
 | Replication | Raft peer RPCs over gRPC |
 | Market data | Aeron egress on streams 2001–2007 plus stream 2010 snapshot requests + Binance-style WebSocket service |
 | Symbol model | One symbol per process/cluster, configured and locked through Raft |
-| Fleet control | Kubernetes control-plane reference: CRD-backed desired state (etcd via the API server), manager + supervisor; zero-impact symbol lifecycle and storage-aware shard drop across thousands of single-symbol engines, four-pod shards and cells |
+| Fleet control | Kubernetes control-plane reference: CRD-backed desired state (etcd via the API server), manager + supervisor + Lease-elected operator; zero-impact symbol lifecycle and storage-aware shard drop across thousands of single-symbol engines, four-pod shards and cells |
 | Numeric model | Exact 18-decimal fixed point through matching, events, snapshots and feeds |
 | Observability | Embedded console, health/readiness endpoints and metrics |
 | Public edge | Bounded request/snapshot limits; loopback or private-network deployment |
@@ -112,8 +112,9 @@ Everything below is implemented in this repository and exercised by tests; the l
 - **Explicit containers blast-radius guard** — a non-empty containers shard returns `409 restart_required`; `allowRestart` opts into a one-voter-at-a-time pod roll, so a routine add cannot silently restart the fleet.
 - **Complete lifecycle with storage decisions** — graceful shutdown/start reuses the same deployment, slot/ports and PVC and recovers WAL/snapshot without a new `/init`; an idle shard can be dropped with `retainStorage` keeping the PVCs for restore or deleting them irreversibly.
 - **CRD-backed desired state** — five `matching.io` CRDs (`TradingSymbol`, `SymbolShard`, `SymbolDeployment`, `SymbolRoute`, `Cell`) with status subresources; the manager writes through the Kubernetes API server, rebuilds its cache from informers, uses `resourceVersion` concurrency and rate-limits status writes. etcd persists the CRs; the manager never connects to etcd directly, and engine WAL/events never go there.
+- **Lease-elected cell operator** — watches the CRDs, server-side-applies/prunes the StatefulSet/Services/PDB/NetworkPolicy/ConfigMap, labels the dedicated-shard leader for the leader Service, and writes shard/deployment/route/symbol status and conditions. Watches trigger immediate reconciliation; a Kubernetes Lease serializes replicas.
 - **Desired-state manager, not a hand-run YAML pile** — catalog validation, lowest-free slot and `httpBasePort + slot` allocation, rendered StatefulSet/Services/PDB/NetworkPolicy/ConfigMap, reconcile bootstrap/upgrade plans, audit and an engine-console proxy across many shards and cells.
-- **Production Kubernetes primitives** — four-voter shards, one PVC per pod, PDB, NetworkPolicy, headless gRPC services, health/readiness probes, non-root images and leader-aware routing metadata. The reference manager and supervisor are implemented here; the production operator/controller is specified in the control-plane design and roadmap.
+- **Production Kubernetes primitives** — four-voter shards, one PVC per pod, PDB, NetworkPolicy, headless gRPC services, health/readiness probes, non-root images and leader-aware routing metadata. The reference manager, supervisor and Lease-elected operator are implemented here; the operator also runs bootstrap/config/membership and quorum-safe containers add/start/stop rolls.
 
 See [Kubernetes Control Plane](#kubernetes-control-plane) for the runnable demo and [the design](./docs/KUBERNETES_CONTROL_PLANE.md) for the production operator contract.
 
@@ -301,10 +302,12 @@ The same control plane supports graceful shutdown and start of one symbol, retai
 ports and PVC and recovering its WAL/snapshot without a new `/init`. An idle shard can be dropped
 with an explicit choice to keep the PVCs for a later restore or delete them irreversibly. Desired
 state can use the JSON demo store or the CRD backend, which writes the five `matching.io` CRDs
-through the Kubernetes API server (etcd underneath) and refreshes its cache from informers. The
-architecture scales to thousands of single-symbol engines and their four-voter process instances
-across shards and cells; the reference manager and supervisor are implemented here, and the
-production operator/controller is the next layer.
+through the Kubernetes API server (etcd underneath) and refreshes its cache from informers. A
+Lease-elected operator watches the CRDs, applies/prunes the rendered workloads, labels dedicated
+leader pods, writes shard/deployment/route status, bootstraps/configures each Raft group and rolls
+containers one pod at a time behind a quorum gate. The architecture scales to thousands of
+single-symbol engines and their four-voter process instances across shards and cells; PVC retention
+and cross-shard cutover remain explicit follow-ups.
 
 [![Kubernetes control plane, supervisor and engine console](./docs/kubernetes-console-architecture.png)](./docs/kubernetes-console-architecture.html)
 

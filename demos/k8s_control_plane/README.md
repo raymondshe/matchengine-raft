@@ -31,10 +31,12 @@ demos/k8s_control_plane/
 ├── src/reconcile.rs   bootstrap, membership, config, routing and upgrade plans
 ├── src/store.rs       catalog cache, CatalogStore abstraction and JSON/memory backends
 ├── src/crd.rs         CRD definitions, conversions, informers and the CRD-backed store
+├── src/operator.rs    Lease-elected operator: watches, apply/prune, status and leader labels
 ├── src/api.rs         Axum manager API
 ├── src/gui.rs         embedded single-page GUI
 ├── src/main.rs        serve | render | validate | plan | seed | crds | crd-backup | crd-restore
-├── deploy/            generated CRDs and least-privilege RBAC
+├── src/bin/match_operator.rs  cell operator binary
+├── deploy/            generated CRDs, least-privilege RBAC and the operator Deployment
 └── examples/          demo ShardBundle JSON files
 ```
 
@@ -57,6 +59,12 @@ cargo run -- serve --crd --crd-namespace match-eu-1
 # Install the CRDs and least-privilege RBAC
 cargo run -- crds | kubectl apply -f -
 kubectl apply -f deploy/rbac.yaml
+
+# Run the Lease-elected cell operator (separate binary)
+cargo run --bin match-operator -- \
+  --namespace match-eu-1 \
+  --lease-namespace match-control --lease-name match-engine-operator \
+  --profile local
 
 # Export/restore a CRD catalog (pass KUBECONFIG or run in-cluster)
 cargo run -- crd-backup --out /tmp/crd-catalog.json
@@ -145,6 +153,63 @@ The backup is selective (desired state only); audit and engine PVC data are sepa
 snapshot covers all CRs in the cluster, while `crd-backup` is useful for a single catalog export
 and for comparing against the operator's view. Restore order is: CRs first, then workloads, then
 PVCs/engine recovery.
+
+## Cell operator
+
+`match-operator` is the Lease-elected reconciler for a cell. It watches the five CRDs, renders
+each shard with the same deterministic renderer as the manager, and reconciles the result:
+
+- **Lease election** — `coordination.k8s.io/v1` Lease, default
+  `match-control/match-engine-operator`; renews every 5s with a 15s duration. A non-holder waits
+  and only reconciles after acquiring the Lease.
+- **Apply** — server-side apply of the desired ConfigMap, Services, PodDisruptionBudget,
+  NetworkPolicy and StatefulSet, with field manager `match-engine-operator`.
+- **Prune** — managed objects labeled `app.kubernetes.io/managed-by=match-engine-operator` that are
+  no longer desired are deleted. Shard render failures are treated as unsafe and their objects are
+  not pruned. PVCs are never deleted by the operator.
+- **Leader Service labels** — for a dedicated shard, the pod whose engine reports leadership gets
+  `matching.io/role=leader`; all other pods have that label removed. The rendered
+  `<shard>-leader` Service selects it. If there is no leader, the label is removed.
+- **Status and routes** — probes each pod's `/health`, then writes `SymbolShard`,
+  `SymbolDeployment`, `TradingSymbol` and `SymbolRoute` status through the `/status` subresource:
+  phase, readiness, leader pod/address, applied index/lag, conditions and
+  `observedGeneration`. The route only publishes `leaderAddr` when the deployment is ready.
+
+```sh
+# Local run; watches one namespace and uses a local Lease.
+cargo run --bin match-operator -- \
+  --namespace match-eu-1 \
+  --lease-namespace match-control --lease-name match-engine-operator \
+  --profile local --resync-seconds 10
+
+# Deploy two replicas (Lease handover); install CRDs/RBAC first.
+kubectl apply -f deploy/operator.yaml
+kubectl -n match-control get lease match-engine-operator
+kubectl -n match-control logs deploy/match-operator --tail=20
+```
+
+`--dry-run` logs desired counts without applying, pruning, labeling or writing status.
+`--namespace` scopes CRD/workload lists and pruning to one namespace; omit it for a cell-wide
+operator.
+
+The operator also drives the engine lifecycle once the workload exists:
+
+- **Bootstrap and configuration** — when every pod for a deployment reports healthy and has the
+  process container, it calls `/init` with the four pod endpoints if the Raft group is empty,
+  adds missing learners, changes membership to the desired voter set, and applies
+  `ConfigureSymbol` on the leader. A route publishes `leaderAddr` only after the applied symbol
+  config matches the desired `TradingSymbol`.
+- **Containers rolls** — it compares each pod's `controller-revision-hash` with the StatefulSet
+  `updateRevision`, replaces non-running (for example Pending) pods first, and only deletes a
+  running pod after checking that every process it hosts retains a healthy Raft quorum. A leader
+  pod is transferred only when its removal is already quorum-safe; the deletion happens on the
+  next reconcile. This handles adding, removing and re-adding containers without a bootstrap
+  deadlock.
+- **Fast termination** — the engine binary handles SIGTERM/SIGINT as PID 1, so a containers-mode
+  pod drains immediately instead of waiting for Kubernetes' 60-second grace period and SIGKILL.
+
+The operator ServiceAccount needs `pods/delete` in addition to list/watch/patch; `deploy/rbac.yaml`
+includes it. `--dry-run` skips bootstrap, rollout, status and label actions.
 
 ## Manager API
 
@@ -489,12 +554,19 @@ cargo test --manifest-path demos/k8s_control_plane/Cargo.toml
 
 The suite covers the CRD model, validation rules, renderer output (including the stable supervisor
 pod template and disabled-process filtering), JSON persistence, the CRD manifests/status
-subresources, catalog ↔ CRD backup/restore and spec/status diffing, every API endpoint (including
-the containers restart guard, the supervisor zero-impact shutdown, the retained-data start and the
-idle-shard drop with both storage choices), and each planner path (fresh bootstrap, blocked
-bootstrap, membership drift, config drift, leader loss, rolling upgrade, stop-the-world backup gate,
-paused shard, disabled processes). The root crate adds `tests/cluster/test_supervisor.rs`, which
-proves that adding or removing a child does not change the existing child's PID.
+subresources, catalog ↔ CRD backup/restore and spec/status diffing, the operator's Lease expiry,
+status/route computation, leader-label selection and workload rendering, every API endpoint
+(including the containers restart guard, the supervisor zero-impact shutdown, the retained-data
+start and the idle-shard drop with both storage choices), and each planner path (fresh bootstrap,
+blocked bootstrap, membership drift, config drift, leader loss, rolling upgrade, stop-the-world
+backup gate, paused shard, disabled processes). The operator was also exercised against OrbStack:
+Lease acquisition/handover, apply/prune of a reserved and a dedicated shard, PVC retention, status
+conditions and leader-label removal. A separate OrbStack run proved the full operator lifecycle on
+a packed containers shard: four-voter `/init`, `ConfigureSymbol`, leader label/Service, adding a
+second symbol, stopping it, re-adding it, image and config rolls, with the per-pod quorum gate and
+leader handoff. The root crate adds `tests/cluster/test_supervisor.rs` (add/remove PID stability,
+restart backoff, max-child backpressure, orphan cleanup) and `tests/cluster/test_shutdown.rs`
+(prompt SIGTERM shutdown of the real engine process).
 
 The crate is standalone (`[workspace]` in its `Cargo.toml`) and is not wired into the root
 workspace or CI yet. To add it, mirror the `demos/order_system` CI steps in
@@ -502,12 +574,17 @@ workspace or CI yet. To add it, mirror the `demos/order_system` CI steps in
 
 ## Deliberate limitations
 
-- No operator/controller, admission webhooks or `Lease` leader election. The CRD store writes
-  desired state and refreshes its cache from informers; reconciling StatefulSets/Services/PVCs is
-  still the operator's job.
+- The reference operator applies/prunes workloads, labels the dedicated-shard leader, writes
+  status, bootstraps/configures Raft groups (`/init`, learners, membership, `ConfigureSymbol`) and
+  runs quorum-safe containers-mode add/start/stop rolls. Retention-window PVC deletion and
+  cross-shard cutover/drain/rollback remain explicit follow-ups; `drop-shard` and `migrate` return
+  plans for those steps.
+- No admission webhooks, finalizers or multi-version CRD conversion. The CRD schema uses
+  preserve-unknown fields; typed schemas are a follow-up.
 - Supervisor mode is implemented as a reference pod agent (`src/bin/match_supervisor.rs`); it
-  manages children under the shared container CPU/memory limit. Per-process cgroups, log rotation
-  and a production-grade supervisor control API remain future work.
+  manages children under the shared container CPU/memory limit with bounded restart backoff,
+  max-child backpressure and orphan cleanup. Per-process cgroups and rotating per-child log files
+  remain future work; the current log boundary is the kubelet's container log rotation.
 - Status is synthesized for the demo; there is no per-process status endpoint in the engine yet
   (phase 2 in the design doc). CRD status writes are rate-limited coalescing writes, not a full
   operator status controller.

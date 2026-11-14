@@ -62,6 +62,25 @@ struct Opt {
     /// How often the rendered process list is re-read.
     #[arg(long, default_value_t = 1_000)]
     poll_interval_ms: u64,
+    /// Maximum number of children started from the process list.
+    ///
+    /// The operator validates the shard cap, but the supervisor enforces it too
+    /// so a bad ConfigMap cannot exhaust the pod. Excess processes are reported
+    /// under `rejected` instead of being started.
+    #[arg(long, default_value_t = 20)]
+    max_processes: usize,
+    /// Initial restart delay after a child exits.
+    #[arg(long, default_value_t = 1_000)]
+    restart_base_ms: u64,
+    /// Maximum restart delay; the delay doubles per consecutive crash.
+    #[arg(long, default_value_t = 30_000)]
+    restart_max_ms: u64,
+    /// How long a child must stay up before its backoff resets to the base delay.
+    #[arg(long, default_value_t = 60_000)]
+    restart_stable_ms: u64,
+    /// PID/state directory. Defaults to `<data-dir>/.supervisor`.
+    #[arg(long)]
+    state_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -96,8 +115,16 @@ struct RunningProcess {
 struct StatusSnapshot {
     desired: Vec<ProcessSpec>,
     running: Vec<RunningProcess>,
+    rejected: Vec<RejectedProcess>,
     config_error: Option<String>,
     supervisor_uptime_secs: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RejectedProcess {
+    name: String,
+    reason: String,
 }
 
 struct Managed {
@@ -137,7 +164,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut desired: Vec<ProcessSpec> = Vec::new();
     let mut children: BTreeMap<String, Managed> = BTreeMap::new();
     let mut backoff: BTreeMap<String, Instant> = BTreeMap::new();
+    let mut restart_counts: BTreeMap<String, u32> = BTreeMap::new();
     let mut last_config_error: Option<String> = None;
+    let state_dir = opt
+        .state_dir
+        .clone()
+        .unwrap_or_else(|| opt.data_dir.join(".supervisor"));
+    cleanup_orphans(&state_dir, &opt.engine_bin).await;
     let mut shutdown = Box::pin(shutdown_signal());
     let mut ticker = tokio::time::interval(Duration::from_millis(opt.poll_interval_ms.max(100)));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -155,6 +188,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         match read_config(&opt.config) {
             Ok(next) => {
                 if next != desired {
+                    if next.len() > opt.max_processes {
+                        warn!(
+                            desired = next.len(),
+                            max_processes = opt.max_processes,
+                            "process list exceeds the supervisor cap; excess processes stay stopped"
+                        );
+                    }
                     info!(
                         processes = next.len(),
                         names = ?next.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
@@ -175,12 +215,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        // Stop children that are no longer desired.
+        let allowed = allowed_names(&desired, opt.max_processes);
+        let rejected = rejected_processes(&desired, opt.max_processes);
         let desired_names: BTreeSet<String> =
             desired.iter().map(|spec| spec.name.clone()).collect();
+
+        // Stop children that are no longer desired or exceed the current cap.
         let removed: Vec<String> = children
             .keys()
-            .filter(|name| !desired_names.contains(*name))
+            .filter(|name| !desired_names.contains(*name) || !allowed.contains(*name))
             .cloned()
             .collect();
         for name in removed {
@@ -189,6 +232,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 terminate(&mut managed.child).await;
             }
             backoff.remove(&name);
+            restart_counts.remove(&name);
+            remove_pid_file(&state_dir, &name);
         }
 
         // Reap crashed children. They are restarted on a later tick with backoff.
@@ -205,8 +250,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .collect();
         for (name, status) in exited {
             children.remove(&name);
-            warn!(process = %name, ?status, "child exited; restarting with backoff");
-            backoff.insert(name, Instant::now() + Duration::from_secs(1));
+            remove_pid_file(&state_dir, &name);
+            let attempts = {
+                let attempts = restart_counts.entry(name.clone()).or_insert(0);
+                *attempts += 1;
+                *attempts
+            };
+            let delay = restart_delay(opt.restart_base_ms, opt.restart_max_ms, attempts);
+            warn!(
+                process = %name,
+                ?status,
+                attempts,
+                delay_ms = delay.as_millis(),
+                "child exited; restarting with exponential backoff"
+            );
+            backoff.insert(name, Instant::now() + delay);
+        }
+
+        // Reset the backoff exponent after a child has stayed up long enough.
+        for (name, managed) in &children {
+            if managed.started.elapsed() >= Duration::from_millis(opt.restart_stable_ms)
+                && restart_counts.get(name).is_some_and(|count| *count > 0)
+            {
+                restart_counts.insert(name.clone(), 0);
+                info!(process = %name, "child stable; restart backoff reset");
+            }
         }
 
         // Detect a changed slot/port for an existing name without touching it.
@@ -223,8 +291,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        // Start missing children.
-        for spec in &desired {
+        // Start missing children, up to the cap.
+        for spec in desired.iter().filter(|spec| allowed.contains(&spec.name)) {
             if children.contains_key(&spec.name) {
                 continue;
             }
@@ -236,12 +304,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             match spawn_child(&opt, spec) {
                 Ok(child) => {
                     let pid = child.id().unwrap_or_default();
+                    write_pid_file(&state_dir, &spec.name, pid);
+                    let restarts = restart_counts.get(&spec.name).copied().unwrap_or(0);
                     info!(
                         process = %spec.name,
                         slot = spec.slot,
                         http_port = spec.http_port,
                         raft_port = spec.raft_port,
                         pid,
+                        restarts,
                         "child started"
                     );
                     children.insert(
@@ -250,14 +321,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             spec: spec.clone(),
                             child,
                             started: Instant::now(),
-                            restarts: 0,
+                            restarts,
                         },
                     );
                     backoff.remove(&spec.name);
                 }
                 Err(error) => {
-                    warn!(process = %spec.name, %error, "failed to start child");
-                    backoff.insert(spec.name.clone(), Instant::now() + Duration::from_secs(1));
+                    let attempts = {
+                        let attempts = restart_counts.entry(spec.name.clone()).or_insert(0);
+                        *attempts += 1;
+                        *attempts
+                    };
+                    let delay = restart_delay(opt.restart_base_ms, opt.restart_max_ms, attempts);
+                    warn!(
+                        process = %spec.name,
+                        %error,
+                        attempts,
+                        delay_ms = delay.as_millis(),
+                        "failed to start child"
+                    );
+                    backoff.insert(spec.name.clone(), Instant::now() + delay);
                 }
             }
         }
@@ -277,6 +360,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         *status.lock().await = StatusSnapshot {
             desired: desired.clone(),
             running,
+            rejected,
             config_error: last_config_error.clone(),
             supervisor_uptime_secs: started.elapsed().as_secs(),
         };
@@ -285,9 +369,174 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for (name, mut managed) in children {
         info!(process = %name, pid = managed.child.id(), "stopping child for shutdown");
         terminate(&mut managed.child).await;
+        remove_pid_file(&state_dir, &name);
     }
     http.abort();
     Ok(())
+}
+
+fn allowed_names(desired: &[ProcessSpec], max: usize) -> BTreeSet<String> {
+    desired
+        .iter()
+        .take(max)
+        .map(|spec| spec.name.clone())
+        .collect()
+}
+
+fn rejected_processes(desired: &[ProcessSpec], max: usize) -> Vec<RejectedProcess> {
+    desired
+        .iter()
+        .skip(max)
+        .map(|spec| RejectedProcess {
+            name: spec.name.clone(),
+            reason: format!("supervisor max-processes cap is {max}"),
+        })
+        .collect()
+}
+
+fn restart_delay(base_ms: u64, max_ms: u64, attempts: u32) -> Duration {
+    let shift = attempts.saturating_sub(1).min(16);
+    let delay = base_ms
+        .saturating_mul(1u64 << shift)
+        .min(max_ms.max(base_ms));
+    Duration::from_millis(delay)
+}
+
+fn pid_path(state_dir: &Path, name: &str) -> PathBuf {
+    state_dir.join(format!("{name}.pid"))
+}
+
+fn write_pid_file(state_dir: &Path, name: &str, pid: u32) {
+    if let Err(error) = std::fs::create_dir_all(state_dir) {
+        warn!(%error, dir = %state_dir.display(), "cannot create supervisor state directory");
+        return;
+    }
+    if let Err(error) = std::fs::write(pid_path(state_dir, name), pid.to_string()) {
+        warn!(process = %name, %error, "cannot write child pid file");
+    }
+}
+
+fn remove_pid_file(state_dir: &Path, name: &str) {
+    let _ = std::fs::remove_file(pid_path(state_dir, name));
+}
+
+/// Stops children left behind by a previous supervisor instance.
+///
+/// A clean shutdown removes the PID files itself. This path covers SIGKILL of
+/// the supervisor: the engine children are reparented and keep holding their
+/// ports and data directories unless the next supervisor stops them. The
+/// command line is checked before signalling so a recycled PID is not killed.
+async fn cleanup_orphans(state_dir: &Path, engine_bin: &Path) {
+    let entries = match std::fs::read_dir(state_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return,
+        Err(error) => {
+            warn!(%error, dir = %state_dir.display(), "cannot scan supervisor state directory");
+            return;
+        }
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("pid") {
+            continue;
+        }
+        let Some(name) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        let pid = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|value| value.trim().parse::<i32>().ok());
+        let Some(pid) = pid.filter(|pid| *pid > 1) else {
+            let _ = std::fs::remove_file(&path);
+            continue;
+        };
+        if !process_alive(pid) {
+            let _ = std::fs::remove_file(&path);
+            continue;
+        }
+        if !process_matches(pid, name, engine_bin) {
+            warn!(
+                process = %name,
+                pid,
+                "stale pid file does not match an engine child; removing without signalling"
+            );
+            let _ = std::fs::remove_file(&path);
+            continue;
+        }
+        warn!(
+            process = %name,
+            pid,
+            "stopping orphaned child from a previous supervisor"
+        );
+        unsafe {
+            libc::kill(pid, libc::SIGTERM);
+        }
+        for _ in 0..50 {
+            if !process_alive(pid) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        if process_alive(pid) {
+            warn!(process = %name, pid, "orphaned child ignored SIGTERM; killing");
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+fn process_alive(pid: i32) -> bool {
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+fn process_matches(pid: i32, name: &str, engine_bin: &Path) -> bool {
+    let Some(command) = process_command_line(pid) else {
+        return false;
+    };
+    let engine = engine_bin
+        .file_name()
+        .and_then(|file| file.to_str())
+        .unwrap_or_default();
+    if !engine.is_empty() && !command.contains(engine) {
+        return false;
+    }
+    let args: Vec<&str> = command.split_whitespace().collect();
+    args.windows(2)
+        .any(|pair| pair[0] == "--instance-prefix" && pair[1] == name)
+}
+
+#[cfg(target_os = "linux")]
+fn process_command_line(pid: i32) -> Option<String> {
+    let bytes = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    let args: Vec<String> = bytes
+        .split(|byte| *byte == 0)
+        .filter(|arg| !arg.is_empty())
+        .map(|arg| String::from_utf8_lossy(arg).into_owned())
+        .collect();
+    if args.is_empty() {
+        None
+    } else {
+        Some(args.join(" "))
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_command_line(pid: i32) -> Option<String> {
+    let output = std::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "command="])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let command = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if command.is_empty() {
+        None
+    } else {
+        Some(command)
+    }
 }
 
 fn read_config(path: &Path) -> io::Result<Vec<ProcessSpec>> {
@@ -516,11 +765,13 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
-    #[test]
-    fn parses_and_sorts_processes() {
+    fn temp_dir() -> PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
-            "match-supervisor-test-{}-{}",
+            "match-supervisor-test-{}-{}-{seq}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -528,6 +779,20 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn restart_delay_doubles_and_caps() {
+        assert_eq!(restart_delay(100, 1_000, 1), Duration::from_millis(100));
+        assert_eq!(restart_delay(100, 1_000, 2), Duration::from_millis(200));
+        assert_eq!(restart_delay(100, 1_000, 4), Duration::from_millis(800));
+        assert_eq!(restart_delay(100, 1_000, 8), Duration::from_millis(1_000));
+    }
+
+    #[test]
+    fn parses_and_sorts_processes() {
+        let dir = temp_dir();
         let path = dir.join("processes.json");
         std::fs::write(
             &path,
@@ -545,15 +810,7 @@ mod tests {
 
     #[test]
     fn rejects_duplicate_names_and_ports() {
-        let dir = std::env::temp_dir().join(format!(
-            "match-supervisor-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = temp_dir();
         let path = dir.join("processes.json");
         std::fs::write(
             &path,
@@ -579,15 +836,7 @@ mod tests {
 
     #[test]
     fn rejects_nonstandard_raft_offset() {
-        let dir = std::env::temp_dir().join(format!(
-            "match-supervisor-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = temp_dir();
         let path = dir.join("processes.json");
         std::fs::write(
             &path,

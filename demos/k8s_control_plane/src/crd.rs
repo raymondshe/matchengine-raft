@@ -96,6 +96,14 @@ impl CrdKind {
     }
 }
 
+/// Resolve a dynamic object's kind to one of the catalog CRDs.
+pub fn object_kind(object: &DynamicObject) -> Option<CrdKind> {
+    object
+        .types
+        .as_ref()
+        .and_then(|types| CrdKind::from_kind(&types.kind))
+}
+
 /// Generate the five CustomResourceDefinition manifests.
 ///
 /// The schema deliberately preserves unknown fields inside `spec`/`status`: the manager already
@@ -463,7 +471,11 @@ pub struct ObjectKey {
 }
 
 impl ObjectKey {
-    fn from_object(kind: CrdKind, object: &DynamicObject, default_namespace: &str) -> Option<Self> {
+    pub fn from_object(
+        kind: CrdKind,
+        object: &DynamicObject,
+        default_namespace: &str,
+    ) -> Option<Self> {
         Some(Self {
             kind,
             namespace: metadata_namespace(object, default_namespace),

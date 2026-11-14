@@ -212,6 +212,7 @@ open http://127.0.0.1:8099/
 | Component | Namespace | Address / image | Notes |
 |---|---|---|---|
 | Manager API + GUI | `match-control` | `matchengine-k8s-control-plane:local`, port `8099` | Embedded GUI at `/`; JSON demo at `/data/catalog.json` or CRD mode through the API server |
+| Cell operator | `match-control` | same image, `/usr/local/bin/match-operator` | Lease-elected; watches CRDs, applies/prunes workloads, bootstraps/configures Raft, rolls containers one pod at a time, labels leaders and writes status |
 | Engine shard | `match-eu-1` | `matchengine-raft:k8s-nonroot` | Four voters; one engine process per symbol |
 | Supervisor pod | engine shard pods | `/health`, `/ready`, `/processes` on `9090` | One container per pod; children are one-process engines |
 | Engine console | each engine HTTP port | `/console/` | The manager reverse-proxies it; the symbol is the hero label |
@@ -297,6 +298,58 @@ kubectl -n match-control rollout status deploy/match-manager --timeout=120s
 subresource and are rate-limited per object; audit history remains in memory in the demo and must
 move to an external append-only store in production. Engine WAL/snapshot, order-book, match-event
 and market-data payloads never go into CRDs/etcd.
+
+#### Deploy the cell operator
+
+The operator is the reconciler that applies/prunes workloads, writes status, and drives engine
+bootstrap, configuration and containers-mode rollouts. Install the CRDs and RBAC first, then the
+two-replica operator Deployment (Lease handover):
+
+```sh
+kubectl apply -f demos/k8s_control_plane/deploy/crds.yaml
+kubectl apply -f demos/k8s_control_plane/deploy/rbac.yaml
+kubectl apply -f demos/k8s_control_plane/deploy/operator.yaml
+kubectl -n match-control rollout status deploy/match-operator --timeout=120s
+
+# Only the Lease holder reconciles.
+kubectl -n match-control get lease match-engine-operator \
+  -o jsonpath='{.spec.holderIdentity} {.spec.renewTime}{"\n"}'
+kubectl -n match-control logs deploy/match-operator --tail=20
+```
+
+For a local binary run, use `--namespace` to scope watches/pruning to one namespace and a local
+Lease:
+
+```sh
+cargo run --manifest-path demos/k8s_control_plane/Cargo.toml --bin match-operator -- \
+  --namespace match-eu-1 \
+  --lease-namespace match-control --lease-name match-engine-operator \
+  --profile local --resync-seconds 10
+```
+
+What it reconciles:
+
+- **Apply/prune** the rendered ConfigMap, Services, PDB, NetworkPolicy and StatefulSet. Pruning is
+  limited to objects labeled `app.kubernetes.io/managed-by=match-engine-operator`; a shard that
+  fails to render is not pruned. PVCs are never deleted by the operator.
+- **Leader Service labels** for dedicated shards: the engine-reported leader pod gets
+  `matching.io/role=leader`; the other pods lose it. The `<shard>-leader` Service selects that pod.
+- **Status/conditions** for `SymbolShard`, `SymbolDeployment`, `TradingSymbol` and `SymbolRoute`,
+  from each pod's `/health`: phase, readiness, leader pod/address, applied index/lag and
+  `observedGeneration`. `SymbolRoute.status.leaderAddr` is only published when the deployment is
+  Ready.
+
+- **Bootstrap/config/membership** — once every pod for a deployment is healthy, run `/init` for an
+  empty group, add missing learners, change membership to the desired voters and apply
+  `ConfigureSymbol` on the leader. Routes only publish `leaderAddr` after the config matches.
+- **Containers rolls** — replace non-running pods first, gate each running-pod deletion on a
+  healthy quorum for every process it hosts, and transfer leadership only when the removal is
+  already quorum-safe. The operator ServiceAccount therefore needs `pods/delete` in addition to
+  list/watch/patch (included in `deploy/rbac.yaml`).
+
+`--dry-run` logs desired counts without applying, writing status, bootstrapping or rolling.
+Retention-window PVC deletion and cross-shard cutover/drain/rollback remain explicit follow-ups;
+`drop-shard` and `migrate` still return plans for those steps.
 
 The manager needs network access to engine pods for the console proxy. The rendered NetworkPolicy
 allows HTTP from namespaces labelled `matching.io/role=control-plane`; keep that label if you serve
@@ -457,9 +510,28 @@ stays `0`. After a start, wait for `/ready`, `GET /read symbol_id` and the conso
 initialized and configured from scratch.
 
 In containers mode, `shutdown`/`start` return `409 restart_required` while other engines are active
-unless `allowRestart` is set. Apply the rendered StatefulSet change, delete/recreate one pod at a
-time, and wait for `/ready` before moving to the next pod. The last active engine in a containers
-shard is zero-impact to stop or start.
+unless `allowRestart` is set. After the operator applies the rendered StatefulSet change it rolls
+one pod at a time: non-running pods are replaced first, a running pod is removed only when every
+process on it keeps a healthy quorum, and a leader is transferred only when its removal is already
+quorum-safe. Watch the revision and operator actions:
+
+```sh
+kubectl -n match-eu-1 get statefulset fx-eu-01 \
+  -o jsonpath='{.status.updateRevision} {.status.currentRevision} ready={.status.readyReplicas}{"\n"}'
+kubectl -n match-eu-1 get pods -l matching.io/cluster=fx-eu-01 \
+  -o custom-columns='NAME:.metadata.name,REV:.metadata.labels.controller-revision-hash,READY:.status.containerStatuses[*].ready'
+kubectl -n match-control logs deploy/match-operator --tail=100 | grep -E 'deleted|holding|leadership'
+```
+
+A Pending new-revision pod is deleted even while the existing process is below full strength,
+because it holds no live engine and otherwise blocks the StatefulSet. Do not raise capacity by
+deleting a healthy old pod manually; the quorum gate will wait for the Pending pod to schedule.
+The engine handles SIGTERM as PID 1, so pod termination is prompt; an older image without the
+handler waits for the full grace period. After all pods show the new revision and both containers
+`Ready`, the operator runs `/init` only for an empty Raft group, otherwise the process recovers
+from its PVC, and it applies `ConfigureSymbol` only when the observed config differs.
+
+The last active engine in a containers shard is zero-impact to stop or start.
 
 ### Drop a shard
 
@@ -712,6 +784,11 @@ status honest and never changes engine state.
 | `kubernetes_api` 403 in CRD mode | The manager ServiceAccount lacks RBAC or its token is not mounted. Apply `deploy/rbac.yaml`, set `serviceAccountName: match-manager`, and `automountServiceAccountToken: true`. |
 | `kubernetes_api` 404 in CRD mode | The five `matching.io` CRDs are not installed. Run `cargo run -- crds \| kubectl apply -f -`. |
 | CRD manager starts with an empty catalog | No CRs exist in the listed namespaces, or list/watch RBAC is missing. Restore with `crd-restore` or create symbols/shards through the API. |
+| Operator has no Lease holder | Check `kubectl -n match-control get lease match-engine-operator`; verify the `match-operator` ServiceAccount has `coordination.k8s.io/leases` permissions and the pod token is mounted. |
+| Operator cannot apply workloads | Check the `match-operator` ClusterRole for StatefulSet/Service/ConfigMap/PDB/NetworkPolicy create/update/delete and pods list/patch. |
+| Route status stays Pending | The operator could not reach `<pod>.<shard>-headless.<ns>.svc:httpPort/health` or no engine reports a leader. Check readiness, the NetworkPolicy and the console cluster view. |
+| Leader Service has no endpoints | Only dedicated shards get a leader Service. Check `SymbolDeployment.status.leaderPod`; the operator removes `matching.io/role=leader` when no leader is reported. |
+| Operator pruned objects unexpectedly | Check the `--namespace` scope and that the shard still exists in its CRDs. Objects without the managed-by label are never pruned; PVCs are never pruned by the operator. |
 | `ImagePullBackOff` / old engine console without the symbol header | The image was rebuilt but the pod was not recreated. Use `imagePullPolicy: IfNotPresent`, then `kubectl -n match-eu-1 rollout restart statefulset/<shard>` and wait for `/ready`. |
 | `409 restart_required` on add/stop/start | The shard is containers mode with other active engines; use supervisor mode, an empty shard, or explicitly opt into `allowRestart`. |
 | `409 shard_not_idle` on drop | Stop every symbol in the shard first; the error names the active ones. Apply the updated ConfigMap before retrying. |
