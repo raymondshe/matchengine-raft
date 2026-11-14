@@ -146,6 +146,7 @@ pub struct NodeSnapshot {
     pub events: EventsSnapshot,
     pub market_data: Option<MarketDataSnapshot>,
     pub orderbook: OrderbookSnapshot,
+    pub symbol: SymbolSnapshot,
     pub capabilities: Vec<String>,
     pub errors: Vec<String>,
 }
@@ -211,6 +212,21 @@ pub struct OrderbookSnapshot {
     pub bid_levels: usize,
     pub ask_levels: usize,
     pub parked_stops: usize,
+}
+
+/// The one symbol this process/cluster trades, for the console header.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SymbolSnapshot {
+    pub symbol_id: u32,
+    pub base: String,
+    pub quote: String,
+    /// `BASE/QUOTE`, the console's primary label.
+    pub display: String,
+    pub price_decimals: u8,
+    pub base_decimals: u8,
+    pub quote_decimals: u8,
+    pub price_tick: String,
+    pub base_lot: String,
 }
 
 /// Cluster aggregate served by `GET /console/api/cluster`.
@@ -905,7 +921,7 @@ async fn collect_node_snapshot(app: &MatchEngineApp) -> NodeSnapshot {
         })
         .unwrap_or_default();
 
-    let (events, market_data, orderbook) = {
+    let (events, market_data, orderbook, symbol) = {
         let inner = app.state_machine_store.inner().lock().await;
         let events = EventsSnapshot {
             retained_events: inner.retained_event_count(),
@@ -941,7 +957,19 @@ async fn collect_node_snapshot(app: &MatchEngineApp) -> NodeSnapshot {
             ask_levels: count_price_levels(inner.orderbook.asks.keys().map(|key| key.price)),
             parked_stops: inner.orderbook.stops.len(),
         };
-        (events, market_data, orderbook)
+        let config = inner.symbol_config();
+        let symbol = SymbolSnapshot {
+            symbol_id: config.symbol_id,
+            base: config.base_asset.code.clone(),
+            quote: config.quote_asset.code.clone(),
+            display: format!("{}/{}", config.base_asset.code, config.quote_asset.code),
+            price_decimals: config.price_decimals,
+            base_decimals: config.base_asset.decimals,
+            quote_decimals: config.quote_asset.decimals,
+            price_tick: config.price_tick.to_string(),
+            base_lot: config.base_lot.to_string(),
+        };
+        (events, market_data, orderbook, symbol)
     };
 
     NodeSnapshot {
@@ -971,6 +999,7 @@ async fn collect_node_snapshot(app: &MatchEngineApp) -> NodeSnapshot {
         events,
         market_data,
         orderbook,
+        symbol,
         capabilities: vec![
             "console_v1".to_string(),
             "transfer_leader".to_string(),

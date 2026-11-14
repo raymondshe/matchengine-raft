@@ -23,7 +23,9 @@ use serde_json::{Value, json};
 
 use crate::bundle::ShardBundle;
 use crate::error::ApiError;
-use crate::model::{Cell, Release, SymbolDeployment, SymbolRoute, SymbolShard, TradingSymbol};
+use crate::model::{
+    Cell, DeploymentState, Release, SymbolDeployment, SymbolRoute, SymbolShard, TradingSymbol,
+};
 use crate::provision::{self, CreateSymbolRequest};
 use crate::reconcile::{Action, PlanStep, ReconcilePlan, Scenario, ShardObservation, summarize};
 use crate::render::{Profile, RenderOptions, as_list, render_shard};
@@ -54,6 +56,7 @@ pub fn router_with_options(store: Arc<Store>, console: ConsoleOptions) -> Router
         .route("/api/v1/cells", get(cells))
         .route("/api/v1/shards", get(shards).post(create_shard))
         .route("/api/v1/shards/{name}", get(shard_detail))
+        .route("/api/v1/shards/{name}/drop", post(drop_shard))
         .route("/api/v1/shards/{name}/manifests", get(manifests))
         .route(
             "/api/v1/shards/{name}/plan",
@@ -74,6 +77,8 @@ pub fn router_with_options(store: Arc<Store>, console: ConsoleOptions) -> Router
         )
         .route("/api/v1/symbols", get(symbols).post(create_symbol))
         .route("/api/v1/symbols/{name}/migrate", post(migrate_symbol))
+        .route("/api/v1/symbols/{name}/shutdown", post(shutdown_symbol))
+        .route("/api/v1/symbols/{name}/start", post(start_symbol))
         .route("/api/v1/deployments", get(deployments))
         .route("/api/v1/routes", get(routes))
         .route("/api/v1/validate", get(validate))
@@ -101,13 +106,18 @@ async fn health(State(store): State<Arc<Store>>) -> Json<Value> {
 }
 
 fn counts(catalog: &Catalog) -> Value {
+    let active_processes = catalog
+        .deployments
+        .values()
+        .filter(|deployment| deployment.spec.desired_state != DeploymentState::Disabled)
+        .count();
     json!({
         "cells": catalog.cells.len(),
         "shards": catalog.shards.len(),
         "symbols": catalog.symbols.len(),
         "deployments": catalog.deployments.len(),
         "routes": catalog.routes.len(),
-        "processes": catalog.deployments.len(),
+        "processes": active_processes,
     })
 }
 
@@ -145,7 +155,12 @@ async fn shards(State(store): State<Arc<Store>>) -> Json<Value> {
         .shards
         .values()
         .map(|shard| {
-            let deployments = catalog.shard_deployments(&shard.name);
+            let all_deployments = catalog.shard_deployments(&shard.name);
+            let deployments: Vec<&SymbolDeployment> = all_deployments
+                .iter()
+                .copied()
+                .filter(|d| d.spec.desired_state != DeploymentState::Disabled)
+                .collect();
             let symbols: Vec<String> = deployments
                 .iter()
                 .map(|d| d.spec.symbol_ref.clone())
@@ -161,12 +176,13 @@ async fn shards(State(store): State<Arc<Store>>) -> Json<Value> {
                 "image": shard.spec.image,
                 "paused": shard.spec.paused,
                 "processes": totals.processes,
+                "disabledProcesses": all_deployments.len() - deployments.len(),
                 "slots": shard.spec.packing.max_processes_per_pod,
                 "freeSlots": shard
                     .spec
                     .packing
                     .max_processes_per_pod
-                    .saturating_sub(deployments.len() as u16),
+                    .saturating_sub(all_deployments.len() as u16),
                 "symbols": symbols,
                 "perPod": {
                     "cpuRequestMillis": totals.cpu_request_millis,
@@ -193,6 +209,35 @@ async fn create_shard(
     Ok(Json(json!({ "shard": created })))
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DropShardRequest {
+    /// Keep the PVCs so the shard can be recreated from its data. Defaults to the safe choice.
+    #[serde(default = "default_retain_storage")]
+    retain_storage: bool,
+}
+
+fn default_retain_storage() -> bool {
+    true
+}
+
+async fn drop_shard(
+    State(store): State<Arc<Store>>,
+    Path(name): Path<String>,
+    Json(request): Json<DropShardRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let mut drop = None;
+    store.mutate(|catalog| {
+        drop = Some(provision::drop_shard(
+            catalog,
+            &name,
+            request.retain_storage,
+        )?);
+        Ok(())
+    })?;
+    Ok(Json(json!({ "drop": drop })))
+}
+
 async fn create_symbol(
     State(store): State<Arc<Store>>,
     Json(request): Json<CreateSymbolRequest>,
@@ -211,6 +256,52 @@ struct MigrateRequest {
     target_shard: String,
     #[serde(default)]
     allow_restart: bool,
+}
+
+/// Body for `POST /api/v1/symbols/{name}/shutdown` and `/start`.
+///
+/// `allowRestart` is the explicit opt-in for a containers-mode shard that still hosts other
+/// active engines. The default rejects the request because adding or removing a container
+/// recreates every pod in the StatefulSet.
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct LifecycleRequest {
+    #[serde(default)]
+    allow_restart: bool,
+}
+
+async fn shutdown_symbol(
+    State(store): State<Arc<Store>>,
+    Path(name): Path<String>,
+    Json(request): Json<LifecycleRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let mut shutdown = None;
+    store.mutate(|catalog| {
+        shutdown = Some(provision::shutdown_symbol(
+            catalog,
+            &name,
+            request.allow_restart,
+        )?);
+        Ok(())
+    })?;
+    Ok(Json(json!({ "shutdown": shutdown })))
+}
+
+async fn start_symbol(
+    State(store): State<Arc<Store>>,
+    Path(name): Path<String>,
+    Json(request): Json<LifecycleRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let mut start = None;
+    store.mutate(|catalog| {
+        start = Some(provision::start_symbol(
+            catalog,
+            &name,
+            request.allow_restart,
+        )?);
+        Ok(())
+    })?;
+    Ok(Json(json!({ "start": start })))
 }
 
 async fn migrate_symbol(
@@ -331,6 +422,12 @@ async fn proxy_console(
                 format!("shard {shard_name} does not host symbol {symbol}"),
             )
         })?;
+    if deployment.spec.desired_state == DeploymentState::Disabled {
+        return Err(ApiError::conflict(
+            "process_disabled",
+            format!("symbol {symbol} is shut down; no engine console is available"),
+        ));
+    }
     let upstream_path = console_upstream_path(path)?;
     let host = options.host.clone().unwrap_or_else(|| {
         format!(
@@ -501,7 +598,12 @@ async fn shard_detail(
     };
     let observation = crate::reconcile::simulate(&catalog, &name, scenario);
     let validation = validate_catalog(&catalog);
-    let deployments: Vec<&SymbolDeployment> = catalog.shard_deployments(&name);
+    let all_deployments: Vec<&SymbolDeployment> = catalog.shard_deployments(&name);
+    let deployments: Vec<&SymbolDeployment> = all_deployments
+        .iter()
+        .copied()
+        .filter(|d| d.spec.desired_state != DeploymentState::Disabled)
+        .collect();
     let symbols: Vec<&TradingSymbol> = deployments
         .iter()
         .filter_map(|d| catalog.symbols.get(&d.spec.symbol_ref))
@@ -537,11 +639,16 @@ async fn shard_detail(
         })
         .collect();
     let mut scope: BTreeSet<String> = BTreeSet::from([shard.name.clone(), shard.spec.cell.clone()]);
-    for deployment in &deployments {
+    for deployment in &all_deployments {
         scope.insert(deployment.name.clone());
     }
-    for symbol in &symbols {
-        scope.insert(symbol.name.clone());
+    for symbol in catalog.symbols.values() {
+        if all_deployments
+            .iter()
+            .any(|d| d.spec.symbol_ref == symbol.name)
+        {
+            scope.insert(symbol.name.clone());
+        }
     }
     for route in &routes {
         scope.insert(route.name.clone());
@@ -550,7 +657,7 @@ async fn shard_detail(
     Ok(Json(json!({
         "shard": shard,
         "cell": cell,
-        "deployments": deployments,
+        "deployments": all_deployments,
         "symbols": symbols,
         "routes": routes,
         "observation": observation.ok(),
@@ -561,7 +668,9 @@ async fn shard_detail(
             .spec
             .packing
             .max_processes_per_pod
-            .saturating_sub(deployments.len() as u16),
+            .saturating_sub(all_deployments.len() as u16),
+        "activeProcesses": deployments.len(),
+        "disabledProcesses": all_deployments.len() - deployments.len(),
         "empty": deployments.is_empty(),
         "perPod": {
             "processes": totals.processes,
@@ -864,7 +973,14 @@ pub fn cluster_totals(catalog: &Catalog) -> BTreeMap<String, u64> {
     totals.insert("cells".to_string(), catalog.cells.len() as u64);
     totals.insert("shards".to_string(), catalog.shards.len() as u64);
     totals.insert("symbols".to_string(), catalog.symbols.len() as u64);
-    totals.insert("processes".to_string(), catalog.deployments.len() as u64);
+    totals.insert(
+        "processes".to_string(),
+        catalog
+            .deployments
+            .values()
+            .filter(|deployment| deployment.spec.desired_state != DeploymentState::Disabled)
+            .count() as u64,
+    );
     totals
 }
 
@@ -1113,6 +1229,26 @@ mod tests {
         let (status, body) = get_json("/api/v1/shards/nope/processes/eurusd/pods/0/console/").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body["error"], "shard_not_found");
+    }
+
+    #[tokio::test]
+    async fn console_proxy_rejects_disabled_processes() {
+        let store = Arc::new(Store::in_memory(true));
+        let app = router(store);
+        let (status, body) = post_json_to(
+            app.clone(),
+            "/api/v1/symbols/eurusd/shutdown",
+            json!({ "allowRestart": true }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) = get_json_from(
+            app,
+            "/api/v1/shards/fx-eu-01/processes/eurusd/pods/0/console/",
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"], "process_disabled");
     }
 
     #[test]
@@ -1431,6 +1567,338 @@ mod tests {
         assert_eq!(body["placement"]["shard"], "fx-eu-01");
         assert_eq!(body["placement"]["slot"], 2);
         assert_eq!(body["placement"]["httpPort"], 21003);
+    }
+
+    #[tokio::test]
+    async fn shutdown_endpoint_guards_containers_and_retains_the_slot() {
+        let store = Arc::new(Store::in_memory(true));
+        let app = router(store.clone());
+        let (status, body) =
+            post_json_to(app.clone(), "/api/v1/symbols/eurusd/shutdown", json!({})).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["error"], "restart_required");
+        assert_eq!(
+            store.snapshot().deployments["eurusd-g1"].spec.desired_state,
+            DeploymentState::Active
+        );
+
+        let (status, body) = post_json_to(
+            app.clone(),
+            "/api/v1/symbols/eurusd/shutdown",
+            json!({ "allowRestart": true }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let shutdown = &body["shutdown"];
+        assert_eq!(shutdown["mode"], "containers");
+        assert_eq!(shutdown["zeroImpact"], false);
+        assert!(
+            shutdown["steps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|step| step["action"] == "rolling-remove")
+        );
+
+        let (status, detail) = get_json_from(app.clone(), "/api/v1/shards/fx-eu-01").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(detail["deployments"].as_array().unwrap().len(), 2);
+        assert_eq!(detail["activeProcesses"], 1);
+        assert_eq!(detail["disabledProcesses"], 1);
+        assert_eq!(detail["engineConsoles"].as_array().unwrap().len(), 1);
+        // The disabled record still owns slot 0, so free capacity does not grow.
+        assert_eq!(detail["freeSlots"], 18);
+        assert_eq!(detail["deployments"][0]["spec"]["desiredState"], "Disabled");
+
+        let (status, list) = get_json_from(app.clone(), "/api/v1/shards").await;
+        assert_eq!(status, StatusCode::OK);
+        let shard = list["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["name"] == "fx-eu-01")
+            .unwrap();
+        assert_eq!(shard["processes"], 1);
+        assert_eq!(shard["disabledProcesses"], 1);
+        assert_eq!(shard["freeSlots"], 18);
+        assert_eq!(shard["symbols"], json!(["gbpusd"]));
+
+        let (status, manifests) =
+            get_json_from(app, "/api/v1/shards/fx-eu-01/manifests?profile=local").await;
+        assert_eq!(status, StatusCode::OK);
+        let items = manifests["items"].as_array().unwrap();
+        let config = items
+            .iter()
+            .find(|item| item["kind"] == "ConfigMap")
+            .unwrap();
+        let processes = config["data"]["processes.json"].as_str().unwrap();
+        assert!(processes.contains("gbpusd"));
+        assert!(!processes.contains("eurusd"));
+    }
+
+    #[tokio::test]
+    async fn shutdown_endpoint_marks_a_supervisor_child_disabled_without_restart() {
+        let mut bundle = crate::bundle::demo_bundles().remove(0);
+        bundle.shard.name = "fx-sup-01".to_string();
+        bundle.shard.spec.network.http_base_port = 21101;
+        bundle.shard.spec.packing.mode = crate::model::PackingMode::Supervisor;
+        for (index, deployment) in bundle.deployments.iter_mut().enumerate() {
+            deployment.spec.shard_ref = "fx-sup-01".to_string();
+            deployment.spec.placement.http_port = 21101 + index as u16;
+        }
+
+        let store = Arc::new(Store::in_memory(false));
+        let app = router(store.clone());
+        let (status, body) = post_json_to(
+            app.clone(),
+            "/api/v1/bundles",
+            serde_json::to_value(&bundle).unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let (status, body) =
+            post_json_to(app.clone(), "/api/v1/symbols/eurusd/shutdown", json!({})).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let shutdown = &body["shutdown"];
+        assert_eq!(shutdown["mode"], "supervisor");
+        assert_eq!(shutdown["zeroImpact"], true);
+        assert!(
+            shutdown["steps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|step| step["action"] == "stop-process")
+        );
+
+        let (status, detail) = get_json_from(app.clone(), "/api/v1/shards/fx-sup-01").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(detail["activeProcesses"], 1);
+        assert_eq!(detail["disabledProcesses"], 1);
+        assert_eq!(detail["freeSlots"], 18);
+        assert_eq!(detail["deployments"][0]["spec"]["desiredState"], "Disabled");
+
+        let (status, plan) =
+            get_json_from(app.clone(), "/api/v1/shards/fx-sup-01/plan?scenario=ready").await;
+        assert_eq!(status, StatusCode::OK);
+        let targets: Vec<&str> = plan["plan"]["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|step| step["target"].as_str().unwrap())
+            .collect();
+        assert!(!targets.contains(&"eurusd"), "{plan}");
+    }
+
+    #[tokio::test]
+    async fn start_endpoint_reactivates_a_supervisor_child_from_retained_state() {
+        let mut bundle = crate::bundle::demo_bundles().remove(0);
+        bundle.shard.name = "fx-sup-01".to_string();
+        bundle.shard.spec.network.http_base_port = 21101;
+        bundle.shard.spec.packing.mode = crate::model::PackingMode::Supervisor;
+        for (index, deployment) in bundle.deployments.iter_mut().enumerate() {
+            deployment.spec.shard_ref = "fx-sup-01".to_string();
+            deployment.spec.placement.http_port = 21101 + index as u16;
+        }
+
+        let store = Arc::new(Store::in_memory(false));
+        let app = router(store.clone());
+        let (status, body) = post_json_to(
+            app.clone(),
+            "/api/v1/bundles",
+            serde_json::to_value(&bundle).unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) =
+            post_json_to(app.clone(), "/api/v1/symbols/eurusd/shutdown", json!({})).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let (status, body) =
+            post_json_to(app.clone(), "/api/v1/symbols/eurusd/start", json!({})).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let start = &body["start"];
+        assert_eq!(start["mode"], "supervisor");
+        assert_eq!(start["zeroImpact"], true);
+        assert!(
+            start["steps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|step| step["action"] == "start-process")
+        );
+
+        let (status, detail) = get_json_from(app.clone(), "/api/v1/shards/fx-sup-01").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(detail["activeProcesses"], 2);
+        assert_eq!(detail["disabledProcesses"], 0);
+        assert_eq!(detail["engineConsoles"].as_array().unwrap().len(), 2);
+        assert_eq!(detail["deployments"][0]["spec"]["desiredState"], "Active");
+        assert_eq!(detail["routes"][0]["spec"]["state"], "Active");
+
+        let (status, manifests) =
+            get_json_from(app, "/api/v1/shards/fx-sup-01/manifests?profile=local").await;
+        assert_eq!(status, StatusCode::OK);
+        let config = manifests["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["kind"] == "ConfigMap")
+            .unwrap();
+        let processes = config["data"]["processes.json"].as_str().unwrap();
+        assert!(processes.contains("eurusd"), "{processes}");
+        assert!(processes.contains("gbpusd"), "{processes}");
+    }
+
+    #[tokio::test]
+    async fn start_endpoint_keeps_the_containers_restart_guard() {
+        let store = Arc::new(Store::in_memory(true));
+        let app = router(store.clone());
+        let (status, body) = post_json_to(
+            app.clone(),
+            "/api/v1/symbols/eurusd/shutdown",
+            json!({ "allowRestart": true }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let (status, body) =
+            post_json_to(app.clone(), "/api/v1/symbols/eurusd/start", json!({})).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["error"], "restart_required");
+
+        let (status, body) = post_json_to(
+            app.clone(),
+            "/api/v1/symbols/eurusd/start",
+            json!({ "allowRestart": true }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["start"]["mode"], "containers");
+        assert_eq!(body["start"]["zeroImpact"], false);
+        assert!(
+            body["start"]["steps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|step| step["action"] == "rolling-add")
+        );
+
+        let (status, body) =
+            post_json_to(app.clone(), "/api/v1/symbols/eurusd/start", json!({})).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["error"], "already_active");
+
+        let (status, detail) = get_json_from(app, "/api/v1/shards/fx-eu-01").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(detail["activeProcesses"], 2);
+        assert_eq!(detail["disabledProcesses"], 0);
+    }
+
+    #[tokio::test]
+    async fn drop_endpoint_defaults_to_retaining_storage() {
+        let store = Arc::new(Store::in_memory(true));
+        let app = router(store);
+        let (status, body) =
+            post_json_to(app.clone(), "/api/v1/shards/fx-eu-02/drop", json!({})).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let drop = &body["drop"];
+        assert_eq!(drop["shard"], "fx-eu-02");
+        assert_eq!(drop["retainStorage"], true);
+        assert_eq!(drop["mode"], "reserved");
+        assert_eq!(drop["removedDeployments"].as_array().unwrap().len(), 0);
+
+        let (status, list) = get_json_from(app.clone(), "/api/v1/shards").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(list["items"].as_array().unwrap().len(), 2);
+        let (status, body) = get_json_from(app, "/api/v1/shards/fx-eu-02").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"], "shard_not_found");
+    }
+
+    #[tokio::test]
+    async fn drop_endpoint_rejects_a_shard_with_active_engines() {
+        let store = Arc::new(Store::in_memory(true));
+        let app = router(store);
+        let (status, body) =
+            post_json_to(app.clone(), "/api/v1/shards/fx-eu-01/drop", json!({})).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["error"], "shard_not_idle");
+        assert!(body["message"].as_str().unwrap().contains("eurusd"));
+        let (status, _) = get_json_from(app, "/api/v1/shards/fx-eu-01").await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn drop_endpoint_reports_the_pvcs_for_each_storage_choice() {
+        let store = Arc::new(Store::in_memory(true));
+        let app = router(store);
+        let (status, body) =
+            post_json_to(app.clone(), "/api/v1/symbols/btcusdt/shutdown", json!({})).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let (status, body) = post_json_to(
+            app.clone(),
+            "/api/v1/shards/me-btcusdt/drop",
+            json!({ "retainStorage": false }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let drop = &body["drop"];
+        assert_eq!(drop["retainStorage"], false);
+        assert_eq!(drop["mode"], "containers");
+        assert_eq!(drop["pvcs"].as_array().unwrap().len(), 4);
+        assert!(
+            drop["steps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|step| step["action"] == "delete-storage")
+        );
+        assert!(
+            drop["notes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|note| note.as_str().unwrap().contains("irreversible"))
+        );
+
+        let (status, symbols) = get_json_from(app, "/api/v1/symbols").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            symbols["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|item| item["symbol"]["name"] != "btcusdt")
+        );
+    }
+
+    #[tokio::test]
+    async fn all_disabled_processes_render_no_workload() {
+        let store = Arc::new(Store::in_memory(true));
+        let app = router(store.clone());
+        for (symbol, allow_restart) in [("eurusd", true), ("gbpusd", false)] {
+            let (status, body) = post_json_to(
+                app.clone(),
+                &format!("/api/v1/symbols/{symbol}/shutdown"),
+                json!({ "allowRestart": allow_restart }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+        }
+        let (status, manifest) =
+            get_json_from(app, "/api/v1/shards/fx-eu-01/manifests?profile=local").await;
+        assert_eq!(status, StatusCode::OK);
+        let kinds: Vec<&str> = manifest["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["kind"].as_str().unwrap())
+            .collect();
+        assert!(!kinds.contains(&"StatefulSet"), "{kinds:?}");
+        assert!(!kinds.contains(&"Service"), "{kinds:?}");
+        assert!(kinds.contains(&"ConfigMap"), "{kinds:?}");
     }
 
     #[test]

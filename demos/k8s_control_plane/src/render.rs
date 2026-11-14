@@ -12,8 +12,8 @@ use serde_json::{Value, json};
 use crate::bundle::ShardBundle;
 use crate::error::ApiError;
 use crate::model::{
-    Cell, PackingMode, RAFT_PORT_OFFSET, Resources, ShardClass, SymbolDeployment, SymbolShard,
-    TradingSymbol, dns_label, port_name,
+    Cell, DeploymentState, PackingMode, RAFT_PORT_OFFSET, Resources, ShardClass, SymbolDeployment,
+    SymbolShard, TradingSymbol, dns_label, port_name,
 };
 use crate::store::Catalog;
 use crate::validate::validate_bundle;
@@ -210,7 +210,11 @@ pub fn render_shard(
         })
     })?;
 
-    let deployments: Vec<&SymbolDeployment> = catalog.shard_deployments(&shard.name);
+    let deployments: Vec<&SymbolDeployment> = catalog
+        .shard_deployments(&shard.name)
+        .into_iter()
+        .filter(|deployment| deployment.spec.desired_state != DeploymentState::Disabled)
+        .collect();
     let empty = deployments.is_empty();
     let supervisor = shard.spec.packing.mode == PackingMode::Supervisor;
     let mut symbols = Vec::new();

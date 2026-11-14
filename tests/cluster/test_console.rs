@@ -95,6 +95,10 @@ fn console_reports_cluster_and_transfers_leader() {
         assert_eq!(StatusCode::OK, status);
         assert_eq!(node["node_id"], 1);
         assert_eq!(node["schema_version"], 1);
+        assert_eq!(node["symbol"]["symbol_id"], 0);
+        assert_eq!(node["symbol"]["display"], "BTC/USDT");
+        assert_eq!(node["symbol"]["base"], "BTC");
+        assert_eq!(node["symbol"]["quote"], "USDT");
         assert!(node["raft"]["voters"].as_array().unwrap().len() >= 3);
         assert!(node["storage"]["wal"].is_object());
         assert!(

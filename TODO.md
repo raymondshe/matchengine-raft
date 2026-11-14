@@ -1216,7 +1216,7 @@ Done (2026-11-14):
   `SymbolRoute`, slot/port ownership, four-voter bootstrap, storage/PVC, NetworkPolicy, probes,
   upgrades, backups and migration.
 - [x] **P1** Reference manager crate with model, bundle, validation, renderer, reconcile planner,
-  JSON store, Axum API, embedded GUI and CLI; 79 lib + 1 bin tests.
+  JSON store, Axum API, embedded GUI and CLI; 104 lib + 1 bin tests.
 - [x] **P1** Reserved/empty shards (`phase: Reserved`); containers mode renders no StatefulSet
   until the first placement, while supervisor mode pre-warms the supervisor pods with an empty
   `processes.json`.
@@ -1233,9 +1233,26 @@ Done (2026-11-14):
   `409 restart_required` unless `allowRestart: true`; auto placement and migration targets filter
   unsafe shards; the GUI disables non-empty containers targets and defaults new packed shards to
   supervisor.
+- [x] **P1** Graceful shutdown and start: `POST /api/v1/symbols/{symbol}/shutdown` marks the
+  deployment and route `Disabled`, retains the data directory and slot, and returns the operator
+  sequence. `POST /api/v1/symbols/{symbol}/start` re-enables the same deployment, generation, slot,
+  ports and PVC; the engine recovers its own WAL/snapshot and rejoins the same group without a new
+  `/init`/`ConfigureSymbol`. A supervisor child is removed from/added to `processes.json` while the
+  other children keep running; a non-empty containers shard requires `allowRestart`. Disabled
+  deployments are omitted from rendering, simulation and planning; the GUI shows `stopped` rows
+  with stop/start actions.
+- [x] **P1** Idle-shard drop with a storage choice: `POST /api/v1/shards/{shard}/drop` requires
+  every deployment to be `Disabled`, removes the shard/deployments/routes (and symbols no longer
+  used elsewhere), and returns the PVC names. `retainStorage` defaults to `true` so the PVCs can be
+  rebound by a recreated shard; `false` returns the irreversible delete-storage steps. The GUI
+  disables drop while any engine is active and asks retain-vs-delete behind a typed shard-name
+  confirmation.
 - [x] **P1** Manager console proxy: allowlisted console assets, `/console/api/*`, `/health`,
   `/events` and five guarded actions; path rewriting; the rendered NetworkPolicy allows shard peer
   HTTP for the console cluster view.
+- [x] **P2** Engine console symbol header: `/console/api/node` exposes the applied
+  `SymbolConfig`; the console renders `BASE/QUOTE` as the large hero label, a top-bar chip and the
+  browser title, so an operator cannot confuse single-symbol consoles during incident triage.
 - [x] **P1** Live OrbStack validation (manual apply): non-root engine/manager images; `fx-eu-01`
   and `fx-eu-02` packed containers, `fx-eu-03` reserved in the catalog, `fx-sup-01` supervisor
   with `eurgbp`/`nzdusd`, `me-btcusdt` dedicated. Adding both supervisor symbols left all four pod
@@ -1260,6 +1277,9 @@ Remaining:
 - [ ] **P1** Supervisor hardening: per-process cgroups, log rotation, orphan cleanup, max-child
   backpressure, a control API, and tests for crash restart, readiness aggregation and shutdown.
   The reference supervisor shares one container CPU/memory limit.
+- [ ] **P1** Retention window and automated deletion: `drop-shard` returns the keep/delete PVC
+  steps but the operator executes them. Add a configurable retention window, a verified
+  delete/PVC-release operation and a guard against shard-name reuse while retained PVCs exist.
 - [ ] **P1** Migration execution: a `promote`/cutover path that validates cross-shard
   `previousDeploymentRef`, switches the route, drains/removes the old deployment, retains/deletes
   source data, and provides rollback. `migrate` currently creates the shadow and plan only.

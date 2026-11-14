@@ -110,6 +110,8 @@ pub enum Phase {
     Cancelled,
     /// An empty shard reservation: capacity is allocated, but no SymbolDeployment is bound.
     Reserved,
+    /// The deployment has been shut down; its data and slot are retained.
+    Disabled,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]

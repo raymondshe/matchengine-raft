@@ -65,8 +65,9 @@ console inherits that contract and must not be exposed directly to an untrusted 
   port.
 - The HTTP and gRPC listeners are plaintext and unauthenticated. The supported deployment is
   loopback or a trusted private network behind a gateway.
-- One process/cluster trades exactly one symbol. The console therefore has no symbol/cluster
-  selector in the first version.
+- One process/cluster trades exactly one symbol. The console therefore has no symbol selector, but
+  it shows the applied symbol (`BASE/QUOTE`) as the primary header label so an operator cannot
+  confuse consoles during incident triage.
 - `GET /health` already reports the gRPC listener flag, Raft role/leader, WAL frontier and
   state-machine applied state.
 - `GET /metrics` returns the raw OpenRaft `RaftMetrics` JSON, wrapped in a `Result`. The console
@@ -262,6 +263,17 @@ Module layout:
     "evictions_total": 0,
     "retention_limit": 262144
   },
+  "symbol": {
+    "symbol_id": 1,
+    "base": "EUR",
+    "quote": "USD",
+    "display": "EUR/USD",
+    "price_decimals": 5,
+    "base_decimals": 2,
+    "quote_decimals": 2,
+    "price_tick": "0.00001",
+    "base_lot": "0.01"
+  },
   "market_data": {
     "enabled": true,
     "leader_gate_open": true,
@@ -280,6 +292,8 @@ Notes:
 - `heartbeat` ages are derived from `RaftMetrics::heartbeat`; absent entries become `null`.
 - `capabilities` lets the cluster view disable leader transfer until every voter supports the new
   RPC, which matters during a rolling upgrade.
+- `symbol` is the applied `SymbolConfig` (the default BTC/USDT before the first
+  `ConfigureSymbol`); `display` is the exact `BASE/QUOTE` string the console renders.
 - The console must tolerate unknown fields and additive changes (`schema_version` remains `1` for
   additive changes).
 

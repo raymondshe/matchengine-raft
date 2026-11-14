@@ -83,6 +83,7 @@ existing single-symbol engine binary; packing does not merge Raft groups.
 | `GET` | `/api/v1/catalog` | full catalog plus validation report |
 | `GET` | `/api/v1/shards` | shard list with per-pod CPU/memory requests, `slots`, `freeSlots`, phase and paused state |
 | `POST` | `/api/v1/shards` | reserve an empty shard from a `SymbolShard` body |
+| `POST` | `/api/v1/shards/{name}/drop` | drop an idle shard; `retainStorage` (default `true`) keeps the PVCs so it can be brought up again, `false` deletes them |
 | `GET` | `/api/v1/shards/{name}` | shard detail, deployments, symbols, routes, simulated observation, `slots`/`freeSlots`/`empty`, a shard-scoped `shardValidation`, and per-process `engineConsoles` (`url` and `proxyUrl`) |
 | `GET/POST` | `/api/v1/shards/{name}/processes/{symbol}/pods/{pod}/console/*` | reverse proxy to that engine's `/console/` assets, JSON APIs and guarded actions; `/init`, `/write`, `/read` and Raft RPCs are never reachable |
 | `GET` | `/api/v1/shards/{name}/manifests` | rendered `v1/List`; `?profile=local\|production` |
@@ -92,6 +93,8 @@ existing single-symbol engine binary; packing does not merge Raft groups.
 | `GET` | `/api/v1/symbols` | symbols with their deployment, shard and validation |
 | `POST` | `/api/v1/symbols` | create a symbol; bind it to `shard`, or auto-place in `cell`; `allowRestart` defaults to `false` |
 | `POST` | `/api/v1/symbols/{symbol}/migrate` | create a shadow deployment in `targetShard` and return the migration plan; the target must be zero-impact unless `allowRestart` |
+| `POST` | `/api/v1/symbols/{symbol}/shutdown` | gracefully stop one engine; mark its deployment/route `Disabled`, retain data and slot; a non-empty containers shard needs `allowRestart` |
+| `POST` | `/api/v1/symbols/{symbol}/start` | re-enable a disabled engine from its retained data/slot; supervisor starts only that child; same `allowRestart` guard |
 | `GET` | `/api/v1/validate` | catalog validation report as JSON and text |
 | `POST` | `/api/v1/bundles` | validate and upsert a `ShardBundle` |
 | `GET` | `/api/v1/audit` | recent audit entries |
@@ -226,6 +229,80 @@ That path is data-safe (graceful pod recreation, same PVC, one voter at a time) 
 restart every engine in the shard, so it is not used for zero-impact placement. The GUI disables
 non-empty containers-mode targets and labels them `restart required`.
 
+### Graceful shutdown
+
+The shard detail table has a **stop** button per active process. It calls:
+
+```bash
+curl -s -X POST http://127.0.0.1:8099/api/v1/symbols/nzdusd/shutdown \
+  -H 'content-type: application/json' -d '{}'
+```
+
+The manager sets `SymbolDeployment.spec.desiredState=Disabled`,
+`SymbolRoute.spec.state=Disabled` and both status phases to `Disabled`. The deployment record,
+route, slot/ports and PVC stay; the response returns the operator steps:
+
+- **Supervisor mode:** apply the updated ConfigMap. The supervisor sees the child disappear from
+  `processes.json`, sends SIGTERM to that PID, waits up to 30 seconds and keeps the other children
+  running. This is the zero-impact shutdown path.
+- **Containers mode:** the target is the last active engine in the shard: prune the StatefulSet and
+  pods, keep the PVC. If other engines are active, the request returns `409 restart_required`
+  because removing a container recreates every pod; pass `{"allowRestart": true}` to accept the
+  one-voter-at-a-time roll.
+
+`freeSlots` does not increase and the slot is not reused while the data is retained. Disabled rows
+remain visible as `stopped` with a **start** button. Starting is the symmetric operation:
+
+```bash
+curl -s -X POST http://127.0.0.1:8099/api/v1/symbols/nzdusd/start \
+  -H 'content-type: application/json' -d '{}'
+```
+
+The manager reuses the existing deployment, generation, slot, ports and PVC. In supervisor mode
+the updated ConfigMap makes the supervisor start that child on all four pods; in containers mode
+the workload is re-materialized (or rolled with `allowRestart`) and the same PVC is mounted. The
+engine recovers its own WAL/snapshot and rejoins the same four-voter group, so the operator does not
+call `/init` or `ConfigureSymbol` again unless the data directory was deleted. The route stays
+`Pending` until the engine reports `/ready` and a leader, then it is published back to `Active`.
+Use `kubectl -n match-eu-1 exec <pod> -- curl -s http://127.0.0.1:9090/processes` to verify
+supervisor children before and after.
+
+### Dropping a shard
+
+Dropping is only allowed after every engine in the shard is stopped. The **drop shard** button is
+disabled while any process is active; the API returns `409 shard_not_idle` and names the symbols
+that still need to be shut down. Dropping an idle shard never restarts another engine.
+
+The drop dialog asks the storage question before anything is removed:
+
+- **Keep storage (recommended, default):** prune the StatefulSet/Services/PDB/NetworkPolicy/
+  ConfigMap but keep the PVCs. The shard can be recreated later with the same name, replicas and
+  storage class; new pods bind the retained PVCs and recover their WAL/snapshot.
+- **Delete storage:** also delete the PVCs. The data cannot be recovered from the cluster.
+
+```bash
+# Keep the PVCs: the shard can be brought up again.
+curl -s -X POST http://127.0.0.1:8099/api/v1/shards/fx-eu-03/drop \
+  -H 'content-type: application/json' -d '{"retainStorage": true}'
+
+# Delete the PVCs: destructive.
+curl -s -X POST http://127.0.0.1:8099/api/v1/shards/fx-eu-03/drop \
+  -H 'content-type: application/json' -d '{"retainStorage": false}'
+```
+
+The manager always removes the shard, its deployments, and routes that point at those deployments.
+A symbol is removed only if no deployment in another shard still references it, so a migration
+shadow survives. The response lists `removedDeployments`, `removedRoutes`, `removedSymbols` and the
+predicted `pvcs` (`data-<shard>-0..N-1`), plus the operator steps:
+
+- `prune-workload` (or `remove-catalog` for a reserved shard);
+- `keep-storage` or `delete-storage`;
+- `verify`.
+
+The manager does not call Kubernetes. The GUI requires typing the shard name and defaults to
+keeping storage. Dropping a shard does not delete its backups; only the PVC deletion is
+irreversible.
+
 ### Simulation scenarios
 
 `fresh`, `ready`, `degraded`, `leader-loss`, `config-drift`, `upgrade`. They are synthesized
@@ -248,13 +325,17 @@ For one shard:
   and a `tmp` `emptyDir`.
 
 An empty reserved shard renders only the `ConfigMap`, `PodDisruptionBudget` and `NetworkPolicy`.
-Binding the first symbol adds the Services, leader Service (dedicated) and StatefulSet.
+Binding the first symbol adds the Services, leader Service (dedicated) and StatefulSet. A
+containers shard whose deployments are all `Disabled` renders the same minimal set: the workload
+can be pruned while the PVC is retained. A supervisor shard keeps its supervisor StatefulSet with
+an empty `processes.json`, so the pod stays available for a later re-enable.
 
 For **supervisor** mode the StatefulSet has one `supervisor` container and a read-only ConfigMap
 volume; `processes.json` lists the child processes. The headless and metrics Services expose the
 full reserved port range, and the supervisor container declares those ports. Adding a
 `SymbolDeployment` changes only the ConfigMap, so the pod template and existing child processes
-stay untouched.
+stay untouched. Disabled deployments are omitted from `processes.json`, which stops exactly that
+child.
 
 Containers bind their stable pod DNS name (`$(POD_NAME).<shard>-headless.<namespace>.svc...`)
 on their own HTTP port. The engine's `--id` is the pod ordinal, which repeats across processes;
@@ -335,11 +416,12 @@ cargo test --manifest-path demos/k8s_control_plane/Cargo.toml
 ```
 
 The suite covers the CRD model, validation rules, renderer output (including the stable supervisor
-pod template), JSON persistence, every API endpoint, and each planner path (fresh bootstrap,
-blocked bootstrap, membership drift, config drift, leader loss, rolling upgrade, stop-the-world
-backup gate, paused shard). The root crate adds
-`tests/cluster/test_supervisor.rs`, which proves that adding or removing a child does not change
-the existing child's PID.
+pod template and disabled-process filtering), JSON persistence, every API endpoint (including the
+containers restart guard, the supervisor zero-impact shutdown, the retained-data start and the
+idle-shard drop with both storage choices), and each planner path (fresh bootstrap, blocked
+bootstrap, membership drift, config drift, leader loss, rolling upgrade, stop-the-world backup gate,
+paused shard, disabled processes). The root crate adds `tests/cluster/test_supervisor.rs`, which
+proves that adding or removing a child does not change the existing child's PID.
 
 The crate is standalone (`[workspace]` in its `Cargo.toml`) and is not wired into the root
 workspace or CI yet. To add it, mirror the `demos/order_system` CI steps in

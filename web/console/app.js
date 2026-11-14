@@ -132,8 +132,19 @@
     state.node = local && local.snapshot ? local.snapshot : null;
     const node = state.node;
     const warnings = cluster.warnings || [];
-
+    const symbol = node && node.symbol;
+    const symbolDisplay = symbol && symbol.display ? symbol.display : "— / —";
     text("node-title", node ? `node-${node.node_id} / ${node.http_addr}` : `node-${cluster.local_node_id}`);
+    text("symbol-title", symbolDisplay);
+    text("symbol-chip-value", symbolDisplay);
+    text("symbol-id", symbol ? `symbol ${symbol.symbol_id}` : "symbol —");
+    text(
+      "symbol-meta",
+      symbol
+        ? `id ${symbol.symbol_id} · price ${symbol.price_decimals} dp · tick ${symbol.price_tick} · lot ${symbol.base_lot}`
+        : "waiting for the node snapshot",
+    );
+    document.title = `${symbolDisplay} · MatchEngine Raft Console`;
     setChip(
       "cluster-chip",
       warnings.length === 0 ? "Cluster healthy" : "Cluster degraded",

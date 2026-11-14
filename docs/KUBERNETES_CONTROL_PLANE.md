@@ -800,10 +800,25 @@ data:
 - **Containers mode:** adding a symbol creates a `SymbolDeployment` and updates the StatefulSet pod
   template with a new container. The operator rolls one pod at a time (each symbol loses one voter;
   quorum stays 3/4), then initialises the new process on all four pods and applies its config.
-  Removing is the reverse after the gateway drains the symbol.
+  Removing is the reverse after the gateway drains the symbol; the last active engine in a shard
+  can be stopped without restarting another engine, then its StatefulSet/pods are pruned and the
+  PVC is retained.
 - **Supervisor mode:** the supervisor reads the bound `SymbolDeployment` objects (or a rendered
   ConfigMap cache) and starts/stops engine processes on all four pods without a pod-template
   change; the operator initialises/removes each process.
+- **Graceful shutdown:** `POST /api/v1/symbols/{symbol}/shutdown` sets the deployment and route to
+  `Disabled` and returns the stop plan. In supervisor mode the operator applies the updated
+  `processes.json`; the supervisor sends SIGTERM to that child while the other children keep
+  running. In containers mode a non-empty shard is rejected unless the request sets
+  `allowRestart: true`, because removing a container recreates the pods. The deployment record,
+  route, slot/ports and PVC stay; disabled records are omitted from rendered workloads and
+  reconcile observations but still count against `freeSlots`.
+- **Re-enable:** `POST /api/v1/symbols/{symbol}/start` sets the same deployment and route back to
+  `Active` (status `Pending`) without allocating a new generation, slot or port. In supervisor mode
+  the updated ConfigMap starts that child on all four pods; in containers mode the workload is
+  re-materialized or rolled with the same `allowRestart` guard. The engine recovers its retained
+  WAL/snapshot and rejoins its group, so `/init` and `ConfigureSymbol` are not repeated; the route
+  is published only after `/ready`.
 - **Migration/promotion:** create a shadow `SymbolDeployment` on the target shard, add the four
   target `pod:httpPort` addresses as learners to the symbol's Raft group, wait for catch-up, change
   membership to the target addresses, switch `SymbolRoute.spec.activeDeploymentRef`, then drain the
@@ -886,7 +901,9 @@ For dynamic add/remove and denser packing, the reference supervisor
   `--instance-prefix <symbol>`, and reaps/restarts failed children with backoff.
 - Adding a symbol updates the ConfigMap only. The supervisor starts the new child on all four
   pods; existing children keep their PIDs, listeners and data directories. Removing a symbol
-  sends SIGTERM to that child and retains its data directory for the retention window.
+  (a `Disabled` deployment omitted from `processes.json`) sends SIGTERM to that child, waits up to
+  30 seconds and retains its data directory for the retention window. The other children are not
+  signalled.
 - `/health` is a liveness probe that stays green while the supervisor is alive, so a starting
   child cannot restart the whole pod. `/ready` aggregates every desired child's `/ready`; pod
   readiness can be temporarily false while a new child starts, but the gateway uses per-symbol
@@ -1491,7 +1508,7 @@ mode also runs idle supervisor pods with an empty process list. The first placem
 the Services and StatefulSet (containers) or starts a child (supervisor) without an existing
 process to disturb.
 
-The reference manager exposes three operations:
+The reference manager exposes six operations:
 
 - `POST /api/v1/shards` creates an empty shard from a `SymbolShard` body.
 - `POST /api/v1/symbols` creates a `TradingSymbol`, a `SymbolDeployment` and a `SymbolRoute`. The
@@ -1501,14 +1518,29 @@ The reference manager exposes three operations:
 - `POST /api/v1/symbols/{symbol}/migrate` creates a shadow deployment in the target shard and
   returns the learner/catch-up/cutover/drain sequence. The source route stays active until the
   operator performs the cutover. The target follows the same zero-impact rule.
+- `POST /api/v1/symbols/{symbol}/shutdown` gracefully disables one deployment and its route,
+  retains the slot/ports and data directory, and returns the stop sequence. The default rejects a
+  non-empty **containers** shard with `restart_required`; `allowRestart: true` permits the
+  one-voter-at-a-time pod roll. A supervisor shard removes only that child from `processes.json`.
+- `POST /api/v1/symbols/{symbol}/start` re-enables a `Disabled` deployment and route with the same
+  slot, ports, generation and retained PVC. It returns the start sequence: resume the route
+  (status stays `Pending`), start the supervisor child or materialize the workload, let the engine
+  recover its own WAL/snapshot and rejoin the same group, then publish the route after `/ready`.
+  No `/init` or `ConfigureSymbol` is required when the data directory is intact. Containers mode
+  keeps the same restart guard (`restart_required` unless `allowRestart: true`).
+- `POST /api/v1/shards/{shard}/drop` removes an idle shard and its dependent records. The body's
+  `retainStorage` decides whether the operator keeps the PVCs (`true`, the default) so the shard
+  can be recreated from its retained WAL/snapshot, or deletes them (`false`, irreversible). Every
+  deployment in the shard must be `Disabled` first; symbols still used by a deployment in another
+  shard are kept. The manager returns the prune and storage steps but does not call Kubernetes.
 
 `allowRestart` defaults to `false`. A non-empty **containers**-mode shard is rejected with
-`restart_required`, because adding a container changes the StatefulSet pod template and recreates
-every pod. `allowRestart: true` permits the one-voter-at-a-time roll: the PVC retains data and
-quorum stays at 3/4, but every engine restarts. **Supervisor** mode changes only the ConfigMap;
-the supervisor starts one child per pod and existing children keep their PIDs and data. Use
-supervisor mode for ongoing zero-impact placement; an empty shard is safe only for its first
-placement.
+`restart_required`, because adding or removing a container changes the StatefulSet pod template
+and recreates every pod. `allowRestart: true` permits the one-voter-at-a-time roll: the PVC
+retains data and quorum stays at 3/4, but every other engine restarts. **Supervisor** mode changes
+only the ConfigMap; the supervisor starts or stops one child per pod and existing children keep
+their PIDs and data. Use supervisor mode for ongoing zero-impact placement; an empty shard is safe
+only for its first placement.
 
 The manager allocates the lowest free slot and `httpBasePort + slot`, writes
 `SymbolDeployment.spec.placement` and `SymbolRoute.spec.activeDeploymentRef`, and validates the
@@ -1527,9 +1559,42 @@ Adding a symbol does not require a new shard; it adds one engine process to the 
 - If the pod is already at `maxProcessesPerPod`, place the symbol in another shard or promote a hot
   symbol out first.
 
-Removing a symbol drains its gateway route, stops its process/container, and retains its data
-directory for a retention window before deletion. The slot/ports are not reused while the data is
-retained.
+Graceful shutdown is the first step of removal. It marks
+`SymbolDeployment.spec.desiredState=Disabled`, `SymbolRoute.spec.state=Disabled` and the status
+phase `Disabled`, but keeps the deployment record, route, slot/ports and PVC. Disabled records are
+excluded from rendered ConfigMaps and workloads and from reconcile observations, while their slot
+still counts as used so `freeSlots` does not grow and a new process cannot reuse the port while the
+data is retained. Actual deletion of the deployment record and PVC is a separate operator action
+after the retention window. `POST /api/v1/symbols/{symbol}/start` reuses the retained record, slot
+and data directory to bring the symbol back `Active`; a new generation is only needed for a config
+or image change.
+
+#### Dropping a shard and the storage decision
+
+Drop a shard only after every deployment in it is `Disabled`. The manager rejects an active shard
+with `409 shard_not_idle` and names the symbols that must be stopped first. Dropping an idle shard
+never restarts an engine.
+
+`POST /api/v1/shards/{shard}/drop` always removes the shard record, its deployments, and routes
+whose active/previous deployment is in the shard. A symbol is removed only when no deployment in
+another shard still references it, so a migration shadow is not deleted. The response lists the
+removed objects and the predicted PVC names (`data-<shard>-0..N-1`).
+
+The request body asks the storage question explicitly:
+
+```json
+{ "retainStorage": true }
+```
+
+- `true` (default, safe): the operator prunes the StatefulSet/Services/PDB/NetworkPolicy/ConfigMap
+  but keeps the PVCs. Re-create a shard with the same name, replicas and storage class, re-add the
+  same symbols/slots, then apply the manifests; the new pods bind the retained PVCs and recover
+  their WAL/snapshot. Do not reuse the name for unrelated data.
+- `false` (destructive): the operator also deletes the PVCs. The data cannot be recovered from the
+  cluster; only an external backup can restore it. The GUI requires a typed shard-name confirmation.
+
+Because the manager has no Kubernetes client, the drop response is a desired-state mutation plus an
+operator sequence. It does not delete workloads or PVCs itself.
 
 Promotion/demotion is a process-level Raft membership migration, not a data copy through the
 manager:
@@ -1594,6 +1659,8 @@ GET    /api/v1/symbols/{symbol}
 PATCH  /api/v1/symbols/{symbol}            only while unlocked; otherwise new generation
 POST   /api/v1/symbols/{symbol}/promote    packed shard -> dedicated shard
 POST   /api/v1/symbols/{symbol}/move       process migration to another shard
+POST   /api/v1/symbols/{symbol}/shutdown   graceful stop; retain data/slot; allowRestart for a non-empty containers shard
+POST   /api/v1/symbols/{symbol}/start      re-enable from retained data/slot; same restart guard
 GET    /api/v1/symbols/{symbol}/deployments
 POST   /api/v1/symbols/{symbol}/deployments   new generation/shadow deployment
 GET    /api/v1/routes?cell=&state=
@@ -1601,6 +1668,7 @@ GET    /api/v1/routes/{symbol}
 PATCH  /api/v1/routes/{symbol}             cutover: set activeDeploymentRef
 GET    /api/v1/shards?cell=&class=&phase=
 POST   /api/v1/shards
+POST   /api/v1/shards/{shard}/drop       retainStorage=true keeps the PVCs; false deletes them
 GET    /api/v1/shards/{namespace}/{name}
 PATCH  /api/v1/shards/{namespace}/{name}
 POST   /api/v1/shards/{namespace}/{name}/operations
@@ -1621,9 +1689,10 @@ List endpoints use server-side pagination and label filters. Mutation endpoints 
 restore tool exists; a restore request today returns `501` with the runbook reference.
 
 The reference demo implements the local workflow subset: `POST /api/v1/shards`,
-`POST /api/v1/symbols` and `POST /api/v1/symbols/{symbol}/migrate`. It resolves the namespace
-from the cell/shard and does not implement approvals, pagination, operations or a Kubernetes
-client.
+`POST /api/v1/shards/{shard}/drop`, `POST /api/v1/symbols`,
+`POST /api/v1/symbols/{symbol}/migrate`, `POST /api/v1/symbols/{symbol}/shutdown` and
+`POST /api/v1/symbols/{symbol}/start`. It resolves the namespace from the cell/shard and does not
+implement approvals, pagination, operations or a Kubernetes client.
 
 ### 8.4 GUI
 
@@ -1641,7 +1710,10 @@ Screens:
 2. **Shards** — searchable table: shard, class (dedicated/packed), processes, pods, containers per pod,
    vCPU/memory/disk, phase, version, max lag, last backup. Bulk select → upgrade/snapshot/pause.
 3. **Shard detail** — four pod cards; every hosted symbol with its slot, HTTP port, leader pod,
-   applied index/lag, config hash and readiness; resource usage; add/remove/migrate/promote actions.
+   applied index/lag, config hash and readiness; resource usage; add/remove/migrate/promote/stop
+   actions. Disabled rows stay visible as `stopped` with their slot and PVC retained. **Drop
+   shard** is available only after every engine is stopped; its dialog asks whether to keep the
+   PVCs (and therefore whether the shard can be brought up again).
    Each process row has an **Open console** link. The browser calls the manager's reverse proxy
    (`/api/v1/shards/{shard}/processes/{symbol}/pods/{pod}/console/`), which dials that pod's
    `/console/` and rewrites the console's absolute asset and API paths onto the proxy prefix. Only

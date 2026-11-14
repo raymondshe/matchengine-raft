@@ -17,6 +17,7 @@
     </div>
   </div>
   <div class="topbar-status">
+    <span class="chip symbol-chip" id="symbol-chip">Symbol <strong id="symbol-chip-value">—/—</strong></span>
     <span class="chip" id="cluster-chip"><span class="dot"></span> Connecting</span>
     <span class="chip" id="leader-chip">Leader <strong>—</strong></span>
     <span class="chip" id="term-chip">Term <strong>—</strong></span>
@@ -27,10 +28,14 @@
 
 <main class="page">
   <div class="page-head">
-    <div>
-      <div class="eyebrow">Operational console</div>
-      <h1 id="node-title">node-—</h1>
-      <p>One symbol, one Raft group. Switch tabs for cluster, Raft, storage, events, actions and diagnostics.</p>
+    <div class="page-head-copy">
+      <div class="eyebrow">Trading symbol</div>
+      <div class="symbol-head">
+        <h1 class="symbol-title" id="symbol-title">— / —</h1>
+        <span class="chip symbol-chip" id="symbol-id">symbol —</span>
+      </div>
+      <p class="symbol-meta" id="symbol-meta">waiting for the node snapshot</p>
+      <p class="node-meta"><span class="mono" id="node-title">node-—</span> · one symbol, one Raft group. Switch tabs for cluster, Raft, storage, events, actions and diagnostics.</p>
     </div>
     <label class="toggle"><input type="checkbox" id="auto-refresh" checked> Auto-refresh 2s</label>
   </div>

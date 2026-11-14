@@ -10,8 +10,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::ApiError;
 use crate::model::{
-    DeploymentState, PackingMode, Phase, Placement, RouteSpec, ShardStatus, SymbolDeployment,
-    SymbolRoute, SymbolShard, TradingSymbol, dns_label,
+    DeploymentState, PackingMode, Phase, Placement, RouteSpec, RouteState, ShardStatus,
+    SymbolDeployment, SymbolRoute, SymbolShard, TradingSymbol, dns_label,
 };
 use crate::store::Catalog;
 use crate::validate::validate_catalog;
@@ -67,6 +67,64 @@ pub struct MigrationPlan {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MigrationStep {
+    pub action: String,
+    pub detail: String,
+}
+
+/// Result of a graceful symbol shutdown.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShutdownResult {
+    pub symbol: String,
+    pub deployment: String,
+    pub shard: String,
+    /// `supervisor` or `containers`.
+    pub mode: String,
+    /// True when no other engine in the shard is restarted.
+    pub zero_impact: bool,
+    pub steps: Vec<LifecycleStep>,
+    pub notes: Vec<String>,
+}
+
+/// Result of re-enabling a disabled symbol from its retained data.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StartResult {
+    pub symbol: String,
+    pub deployment: String,
+    pub shard: String,
+    /// `supervisor` or `containers`.
+    pub mode: String,
+    /// True when no other engine in the shard is restarted.
+    pub zero_impact: bool,
+    pub steps: Vec<LifecycleStep>,
+    pub notes: Vec<String>,
+}
+
+/// Result of dropping one shard from the catalog.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DropShardResult {
+    pub shard: String,
+    pub namespace: String,
+    /// `supervisor`, `containers` or `reserved`.
+    pub mode: String,
+    /// True when the retained storage keeps the shard data recoverable.
+    pub retain_storage: bool,
+    /// All dropped deployments must already be Disabled, so no engine restarts.
+    pub zero_impact: bool,
+    pub removed_deployments: Vec<String>,
+    pub removed_routes: Vec<String>,
+    pub removed_symbols: Vec<String>,
+    /// PVC names predicted from the StatefulSet volume claim template.
+    pub pvcs: Vec<String>,
+    pub steps: Vec<LifecycleStep>,
+    pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LifecycleStep {
     pub action: String,
     pub detail: String,
 }
@@ -421,6 +479,611 @@ pub fn migrate_symbol(
                 .to_string(),
             "slots are not reused while the source data is retained".to_string(),
         ],
+    })
+}
+
+/// Gracefully shut down one symbol's engine.
+///
+/// Supervisor mode removes the child from `processes.json`; the supervisor stops it on every pod
+/// while the other children keep running. Containers mode can only remove a container by
+/// recreating pods, so a non-empty shard is rejected unless `allow_restart` is set. The deployment
+/// record, route and slot remain, and the data directory is retained.
+pub fn shutdown_symbol(
+    catalog: &mut Catalog,
+    symbol_name: &str,
+    allow_restart: bool,
+) -> Result<ShutdownResult, ApiError> {
+    let symbol = catalog.symbols.get(symbol_name).cloned().ok_or_else(|| {
+        ApiError::not_found("symbol_not_found", format!("unknown symbol {symbol_name}"))
+    })?;
+    let route = catalog
+        .route_for_symbol(symbol_name)
+        .cloned()
+        .ok_or_else(|| {
+            ApiError::conflict(
+                "route_missing",
+                format!("symbol {symbol_name} has no SymbolRoute"),
+            )
+        })?;
+    let deployment = catalog
+        .deployments
+        .get(&route.spec.active_deployment_ref)
+        .cloned()
+        .ok_or_else(|| {
+            ApiError::conflict(
+                "deployment_missing",
+                format!(
+                    "route {} points at missing deployment {}",
+                    route.name, route.spec.active_deployment_ref
+                ),
+            )
+        })?;
+    if deployment.spec.desired_state == DeploymentState::Disabled
+        || route.spec.state == RouteState::Disabled
+    {
+        return Err(ApiError::conflict(
+            "already_disabled",
+            format!("symbol {symbol_name} is already shut down"),
+        ));
+    }
+    let shard = catalog
+        .shards
+        .get(&deployment.spec.shard_ref)
+        .cloned()
+        .ok_or_else(|| {
+            ApiError::conflict(
+                "shard_missing",
+                format!("shard {} is not registered", deployment.spec.shard_ref),
+            )
+        })?;
+    let active_others = catalog
+        .shard_deployments(&shard.name)
+        .into_iter()
+        .filter(|other| {
+            other.name != deployment.name && other.spec.desired_state != DeploymentState::Disabled
+        })
+        .count();
+    let supervisor = shard.spec.packing.mode == PackingMode::Supervisor;
+    let zero_impact = supervisor || active_others == 0;
+    if !supervisor && active_others > 0 && !allow_restart {
+        return Err(ApiError::conflict(
+            "restart_required",
+            format!(
+                "shard {} uses containers packing and hosts {} other active engine(s); removing this container recreates every pod and restarts them. Use a supervisor-mode shard, an empty shard, or set allowRestart=true.",
+                shard.name, active_others
+            ),
+        ));
+    }
+
+    let mut candidate = catalog.clone();
+    if let Some(target) = candidate.deployments.get_mut(&deployment.name) {
+        target.spec.desired_state = DeploymentState::Disabled;
+        target.status.phase = Phase::Disabled;
+    }
+    if let Some(target) = candidate.routes.get_mut(&route.name) {
+        target.spec.state = RouteState::Disabled;
+        target.status.phase = Phase::Disabled;
+    }
+    if let Some(target) = candidate.symbols.get_mut(&symbol.name) {
+        target.status.phase = Phase::Disabled;
+    }
+    if let Some(target) = candidate.shards.get_mut(&shard.name) {
+        target.status.phase = Phase::Pending;
+    }
+    let report = validate_catalog(&candidate);
+    if !report.is_ok() {
+        return Err(ApiError::unprocessable(report));
+    }
+
+    *catalog = candidate;
+    catalog.audit(
+        "api",
+        "shutdown-symbol",
+        &symbol.name,
+        format!(
+            "{} on shard {}; zeroImpact={}, allowRestart={}",
+            deployment.name, shard.name, zero_impact, allow_restart
+        ),
+    );
+
+    let mode = if supervisor {
+        "supervisor"
+    } else {
+        "containers"
+    };
+    let mut steps = vec![
+        LifecycleStep {
+            action: "pause-traffic".to_string(),
+            detail: format!(
+                "patch SymbolRoute {} state=Disabled; the gateway stops new writes",
+                route.name
+            ),
+        },
+        LifecycleStep {
+            action: "drain".to_string(),
+            detail:
+                "wait for in-flight writes; the engine flushes its WAL when it receives SIGTERM"
+                    .to_string(),
+        },
+    ];
+    if supervisor {
+        steps.push(LifecycleStep {
+            action: "stop-process".to_string(),
+            detail: format!(
+                "apply the updated {}-shard ConfigMap; the supervisor sends SIGTERM to {} on all four pods; the other children keep running",
+                shard.name, symbol.name
+            ),
+        });
+    } else if active_others == 0 {
+        steps.push(LifecycleStep {
+            action: "remove-workload".to_string(),
+            detail: format!(
+                "the shard has no other active engine; prune the {} StatefulSet and pods; PVC data is retained",
+                shard.name
+            ),
+        });
+    } else {
+        steps.push(LifecycleStep {
+            action: "rolling-remove".to_string(),
+            detail: format!(
+                "update the {} StatefulSet and recreate pods one at a time; the other engines restart one voter at a time",
+                shard.name
+            ),
+        });
+    }
+    steps.push(LifecycleStep {
+        action: "retain-data".to_string(),
+        detail: format!(
+            "keep /data/{}-<pod> and the deployment record/slot; do not reuse the slot until the retention window ends",
+            symbol.name
+        ),
+    });
+
+    let mut notes = vec![
+        "the manager writes desired state; the operator applies the ConfigMap or workload change"
+            .to_string(),
+    ];
+    if supervisor {
+        notes.push(format!(
+            "supervisor mode: stopping {} does not restart any other engine in {}",
+            symbol.name, shard.name
+        ));
+    } else if active_others == 0 {
+        notes.push(format!(
+            "containers mode: {} was the only active engine in {}; no other engine is affected",
+            symbol.name, shard.name
+        ));
+    } else {
+        notes.push(format!(
+            "containers mode: the opt-in roll restarts {} other engine(s) one voter at a time; data stays on the PVCs",
+            active_others
+        ));
+    }
+    notes.push(format!(
+        "the deployment and route stay Disabled; starting {} again needs a new generation or an explicit re-enable operation",
+        symbol.name
+    ));
+
+    Ok(ShutdownResult {
+        symbol: symbol.name,
+        deployment: deployment.name,
+        shard: shard.name,
+        mode: mode.to_string(),
+        zero_impact,
+        steps,
+        notes,
+    })
+}
+
+/// Re-enable a disabled symbol from its retained data directory and slot.
+///
+/// Supervisor mode adds the child back to `processes.json`; the supervisor starts it on every pod
+/// while the other children keep running. Containers mode can only add a container back by
+/// recreating pods, so a non-empty shard is rejected unless `allow_restart` is set. No new
+/// generation, slot or port is allocated, and no `/init` or `ConfigureSymbol` is required when the
+/// retained data directory is intact.
+pub fn start_symbol(
+    catalog: &mut Catalog,
+    symbol_name: &str,
+    allow_restart: bool,
+) -> Result<StartResult, ApiError> {
+    let symbol = catalog.symbols.get(symbol_name).cloned().ok_or_else(|| {
+        ApiError::not_found("symbol_not_found", format!("unknown symbol {symbol_name}"))
+    })?;
+    let route = catalog
+        .route_for_symbol(symbol_name)
+        .cloned()
+        .ok_or_else(|| {
+            ApiError::conflict(
+                "route_missing",
+                format!("symbol {symbol_name} has no SymbolRoute"),
+            )
+        })?;
+    let deployment = catalog
+        .deployments
+        .get(&route.spec.active_deployment_ref)
+        .cloned()
+        .ok_or_else(|| {
+            ApiError::conflict(
+                "deployment_missing",
+                format!(
+                    "route {} points at missing deployment {}",
+                    route.name, route.spec.active_deployment_ref
+                ),
+            )
+        })?;
+    let deployment_disabled = deployment.spec.desired_state == DeploymentState::Disabled;
+    let route_disabled = route.spec.state == RouteState::Disabled;
+    if !deployment_disabled && !route_disabled {
+        return Err(ApiError::conflict(
+            "already_active",
+            format!("symbol {symbol_name} is already active"),
+        ));
+    }
+    let shard = catalog
+        .shards
+        .get(&deployment.spec.shard_ref)
+        .cloned()
+        .ok_or_else(|| {
+            ApiError::conflict(
+                "shard_missing",
+                format!("shard {} is not registered", deployment.spec.shard_ref),
+            )
+        })?;
+    let active_others = catalog
+        .shard_deployments(&shard.name)
+        .into_iter()
+        .filter(|other| {
+            other.name != deployment.name && other.spec.desired_state != DeploymentState::Disabled
+        })
+        .count();
+    let supervisor = shard.spec.packing.mode == PackingMode::Supervisor;
+    let zero_impact = supervisor || active_others == 0;
+    if !supervisor && active_others > 0 && !allow_restart {
+        return Err(ApiError::conflict(
+            "restart_required",
+            format!(
+                "shard {} uses containers packing and hosts {} other active engine(s); adding this container back recreates every pod and restarts them. Use a supervisor-mode shard, an empty shard, or set allowRestart=true.",
+                shard.name, active_others
+            ),
+        ));
+    }
+
+    let mut candidate = catalog.clone();
+    if let Some(target) = candidate.deployments.get_mut(&deployment.name) {
+        target.spec.desired_state = DeploymentState::Active;
+        target.status.phase = Phase::Pending;
+        target.status.ready = false;
+        target.status.leader_pod = None;
+        target.status.leader_addr = None;
+        target.status.lag = None;
+        target.status.conditions.clear();
+    }
+    if let Some(target) = candidate.routes.get_mut(&route.name) {
+        target.spec.state = RouteState::Active;
+        target.status.phase = Phase::Pending;
+        target.status.leader_addr = None;
+        target.status.active_deployment_ref = deployment.name.clone();
+    }
+    if let Some(target) = candidate.symbols.get_mut(&symbol.name) {
+        target.status.phase = Phase::Pending;
+    }
+    if let Some(target) = candidate.shards.get_mut(&shard.name) {
+        target.status.phase = Phase::Pending;
+    }
+    let report = validate_catalog(&candidate);
+    if !report.is_ok() {
+        return Err(ApiError::unprocessable(report));
+    }
+
+    *catalog = candidate;
+    catalog.audit(
+        "api",
+        "start-symbol",
+        &symbol.name,
+        format!(
+            "{} on shard {} slot {} http {}; zeroImpact={}, allowRestart={}",
+            deployment.name,
+            shard.name,
+            deployment.spec.placement.slot,
+            deployment.spec.placement.http_port,
+            zero_impact,
+            allow_restart
+        ),
+    );
+
+    let mode = if supervisor {
+        "supervisor"
+    } else {
+        "containers"
+    };
+    let mut steps = vec![LifecycleStep {
+        action: "resume-route".to_string(),
+        detail: format!(
+            "set SymbolRoute {} state=Active but hold gateway traffic until the engine is ready",
+            route.name
+        ),
+    }];
+    if supervisor {
+        steps.push(LifecycleStep {
+            action: "start-process".to_string(),
+            detail: format!(
+                "apply the updated {}-shard ConfigMap; the supervisor starts {} on all four pods from its retained data directory; the other children keep running",
+                shard.name, symbol.name
+            ),
+        });
+    } else if active_others == 0 {
+        steps.push(LifecycleStep {
+            action: "materialize-workload".to_string(),
+            detail: format!(
+                "apply the {} manifests; the StatefulSet and pods recreate and mount the retained PVC",
+                shard.name
+            ),
+        });
+    } else {
+        steps.push(LifecycleStep {
+            action: "rolling-add".to_string(),
+            detail: format!(
+                "update the {} StatefulSet and recreate pods one at a time; the other engines restart one voter at a time",
+                shard.name
+            ),
+        });
+    }
+    steps.push(LifecycleStep {
+        action: "recover".to_string(),
+        detail: format!(
+            "open the existing /data/{}-<pod> WAL and snapshot; retain the existing slot {} and ports {}/{}; do not call /init or ConfigureSymbol unless the data directory was deleted",
+            symbol.name,
+            deployment.spec.placement.slot,
+            deployment.spec.placement.http_port,
+            deployment.spec.placement.raft_port()
+        ),
+    });
+    steps.push(LifecycleStep {
+        action: "verify-ready".to_string(),
+        detail:
+            "wait for GET /ready and the applied symbol config, then publish the leader and route"
+                .to_string(),
+    });
+
+    let mut notes = vec![
+        "the manager writes desired state; the operator applies the ConfigMap or workload change"
+            .to_string(),
+        format!(
+            "the retained slot {} and data directory are reused; no new generation or port is allocated",
+            deployment.spec.placement.slot
+        ),
+    ];
+    if supervisor {
+        notes.push(format!(
+            "supervisor mode: starting {} does not restart any other engine in {}",
+            symbol.name, shard.name
+        ));
+    } else if active_others == 0 {
+        notes.push(format!(
+            "containers mode: {} is the only active engine in {}; no other engine is affected",
+            symbol.name, shard.name
+        ));
+    } else {
+        notes.push(format!(
+            "containers mode: the opt-in roll restarts {} other engine(s) one voter at a time; data stays on the PVCs",
+            active_others
+        ));
+    }
+    notes.push(
+        "the engine must recover its own WAL/snapshot and rejoin the same four-voter group; the manager does not copy data"
+            .to_string(),
+    );
+
+    Ok(StartResult {
+        symbol: symbol.name,
+        deployment: deployment.name,
+        shard: shard.name,
+        mode: mode.to_string(),
+        zero_impact,
+        steps,
+        notes,
+    })
+}
+
+/// Drop a shard after every engine in it has been shut down.
+///
+/// `retain_storage` decides whether the operator keeps the PVCs. The catalog always loses the
+/// shard, its deployments and the routes that point at them; symbols still used by a deployment in
+/// another shard are kept. This function is deliberately blocked while any deployment is active:
+/// dropping an idle shard never restarts another engine.
+pub fn drop_shard(
+    catalog: &mut Catalog,
+    shard_name: &str,
+    retain_storage: bool,
+) -> Result<DropShardResult, ApiError> {
+    let shard = catalog.shards.get(shard_name).cloned().ok_or_else(|| {
+        ApiError::not_found("shard_not_found", format!("unknown shard {shard_name}"))
+    })?;
+    let deployments: Vec<SymbolDeployment> = catalog
+        .shard_deployments(shard_name)
+        .into_iter()
+        .cloned()
+        .collect();
+    let active: Vec<&SymbolDeployment> = deployments
+        .iter()
+        .filter(|deployment| deployment.spec.desired_state != DeploymentState::Disabled)
+        .collect();
+    if !active.is_empty() {
+        let symbols = active
+            .iter()
+            .map(|deployment| deployment.spec.symbol_ref.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(ApiError::conflict(
+            "shard_not_idle",
+            format!(
+                "shard {shard_name} still hosts active process(es): {symbols}; shut them down before dropping the shard"
+            ),
+        ));
+    }
+
+    let mode = if deployments.is_empty() {
+        "reserved"
+    } else if shard.spec.packing.mode == PackingMode::Supervisor {
+        "supervisor"
+    } else {
+        "containers"
+    };
+    let pvcs: Vec<String> = (0..shard.spec.replicas)
+        .map(|pod| format!("data-{}-{pod}", shard.name))
+        .collect();
+    let removed_deployments: Vec<String> = deployments
+        .iter()
+        .map(|deployment| deployment.name.clone())
+        .collect();
+    let removed_names: BTreeSet<String> = removed_deployments.iter().cloned().collect();
+    let dropped_symbols: BTreeSet<String> = deployments
+        .iter()
+        .map(|deployment| deployment.spec.symbol_ref.clone())
+        .collect();
+
+    let mut candidate = catalog.clone();
+    candidate.shards.remove(shard_name);
+    for deployment in &deployments {
+        candidate.deployments.remove(&deployment.name);
+    }
+    let mut removed_routes = Vec::new();
+    candidate.routes.retain(|route_name, route| {
+        let touches_dropped = removed_names.contains(&route.spec.active_deployment_ref)
+            || route
+                .spec
+                .previous_deployment_ref
+                .as_ref()
+                .is_some_and(|previous| removed_names.contains(previous));
+        if touches_dropped {
+            removed_routes.push(route_name.clone());
+            false
+        } else {
+            true
+        }
+    });
+    let mut removed_symbols = Vec::new();
+    for symbol in dropped_symbols {
+        let still_used = candidate
+            .deployments
+            .values()
+            .any(|deployment| deployment.spec.symbol_ref == symbol);
+        if !still_used && candidate.symbols.remove(&symbol).is_some() {
+            removed_symbols.push(symbol);
+        }
+    }
+    let report = validate_catalog(&candidate);
+    if !report.is_ok() {
+        return Err(ApiError::unprocessable(report));
+    }
+
+    *catalog = candidate;
+    catalog.audit(
+        "api",
+        "drop-shard",
+        shard_name,
+        format!(
+            "removed {} deployment(s), {} route(s), {} symbol(s); retainStorage={}",
+            removed_deployments.len(),
+            removed_routes.len(),
+            removed_symbols.len(),
+            retain_storage
+        ),
+    );
+
+    let mut steps = Vec::new();
+    if deployments.is_empty() {
+        steps.push(LifecycleStep {
+            action: "remove-catalog".to_string(),
+            detail:
+                "no deployment is bound; the manager removed the reserved shard record; verify any prior StatefulSet and pods are gone"
+                    .to_string(),
+        });
+    } else {
+        steps.push(LifecycleStep {
+            action: "prune-workload".to_string(),
+            detail: format!(
+                "delete the {} StatefulSet, Services, PodDisruptionBudget, NetworkPolicy and ConfigMap; all engines are already Disabled",
+                shard.name
+            ),
+        });
+    }
+    if retain_storage {
+        steps.push(LifecycleStep {
+            action: "keep-storage".to_string(),
+            detail: format!(
+                "keep the PVCs: {}; re-create a shard with the same name, replicas and storage class to rebind them",
+                pvcs.join(", ")
+            ),
+        });
+    } else {
+        steps.push(LifecycleStep {
+            action: "delete-storage".to_string(),
+            detail: format!(
+                "delete the PVCs: {}; this permanently deletes the retained WAL/snapshot data",
+                pvcs.join(", ")
+            ),
+        });
+    }
+    steps.push(LifecycleStep {
+        action: "verify".to_string(),
+        detail: format!(
+            "verify the {} pods and workloads are gone; the manager already removed the catalog records",
+            shard.name
+        ),
+    });
+
+    let mut notes = vec![format!(
+        "the manager removed shard {} from the catalog with {} deployment(s), {} route(s) and {} symbol(s)",
+        shard.name,
+        removed_deployments.len(),
+        removed_routes.len(),
+        removed_symbols.len()
+    )];
+    if deployments.is_empty() {
+        notes.push(format!(
+            "reserved shard: no deployment is bound; the PVC names ({}) are the ones a previous workload with this name would have used",
+            pvcs.join(", ")
+        ));
+    } else {
+        notes.push(
+            "all engines were already Disabled, so dropping the shard does not restart another engine"
+                .to_string(),
+        );
+        if retain_storage {
+            notes.push(format!(
+                "PVCs remain ({}) and are the only copy of the data; do not reuse the shard name for unrelated data, and delete the PVCs only after an explicit retention decision",
+                pvcs.join(", ")
+            ));
+            notes.push(
+                "to bring the shard back, re-create it with the same name, replicas and storage class, re-add the same symbols/slots, then apply the manifests; new pods bind the retained PVCs and recover their WAL/snapshot"
+                    .to_string(),
+            );
+        } else {
+            notes.push(
+                "PVC deletion is irreversible; only an external backup can restore this shard's data"
+                    .to_string(),
+            );
+        }
+    }
+    notes.push(
+        "the manager writes desired state; the operator performs the prune and PVC operations"
+            .to_string(),
+    );
+
+    Ok(DropShardResult {
+        shard: shard.name,
+        namespace: shard.namespace,
+        mode: mode.to_string(),
+        retain_storage,
+        zero_impact: true,
+        removed_deployments,
+        removed_routes,
+        removed_symbols,
+        pvcs,
+        steps,
+        notes,
     })
 }
 
@@ -789,5 +1452,344 @@ mod tests {
         let mut catalog = demo_catalog();
         let error = migrate_symbol(&mut catalog, "eurusd", "fx-eu-01", false).unwrap_err();
         assert_eq!(error.code, "migration_same_shard");
+    }
+
+    fn supervisor_catalog() -> Catalog {
+        let mut catalog = demo_catalog();
+        catalog
+            .shards
+            .get_mut("fx-eu-01")
+            .unwrap()
+            .spec
+            .packing
+            .mode = PackingMode::Supervisor;
+        catalog
+    }
+
+    #[test]
+    fn supervisor_shutdown_stops_one_child_and_retains_its_slot() {
+        let mut catalog = supervisor_catalog();
+        let result = shutdown_symbol(&mut catalog, "eurusd", false).unwrap();
+        assert_eq!(result.mode, "supervisor");
+        assert!(result.zero_impact);
+        assert!(
+            result
+                .steps
+                .iter()
+                .any(|step| step.action == "stop-process")
+        );
+        assert!(
+            result
+                .notes
+                .iter()
+                .any(|note| note.contains("does not restart any other engine"))
+        );
+        assert_eq!(
+            catalog.deployments["eurusd-g1"].spec.desired_state,
+            DeploymentState::Disabled
+        );
+        assert_eq!(
+            catalog.deployments["eurusd-g1"].status.phase,
+            Phase::Disabled
+        );
+        assert_eq!(catalog.routes["eurusd"].spec.state, RouteState::Disabled);
+        assert_eq!(catalog.routes["eurusd"].status.phase, Phase::Disabled);
+        assert_eq!(catalog.symbols["eurusd"].status.phase, Phase::Disabled);
+        assert_eq!(
+            catalog.deployments["gbpusd-g1"].spec.desired_state,
+            DeploymentState::Active
+        );
+        // The data directory and slot are retained: the disabled record still owns slot 0.
+        assert_eq!(catalog.shard_processes("fx-eu-01"), 2);
+        assert_eq!(
+            catalog
+                .shard_deployments("fx-eu-01")
+                .iter()
+                .filter(|deployment| deployment.spec.desired_state == DeploymentState::Disabled)
+                .count(),
+            1
+        );
+        let error = shutdown_symbol(&mut catalog, "eurusd", false).unwrap_err();
+        assert_eq!(error.code, "already_disabled");
+    }
+
+    #[test]
+    fn containers_shutdown_requires_opt_in_when_other_engines_run() {
+        let mut catalog = demo_catalog();
+        let error = shutdown_symbol(&mut catalog, "eurusd", false).unwrap_err();
+        assert_eq!(error.code, "restart_required");
+        assert_eq!(
+            catalog.deployments["eurusd-g1"].spec.desired_state,
+            DeploymentState::Active
+        );
+
+        let result = shutdown_symbol(&mut catalog, "eurusd", true).unwrap();
+        assert_eq!(result.mode, "containers");
+        assert!(!result.zero_impact);
+        assert!(
+            result
+                .steps
+                .iter()
+                .any(|step| step.action == "rolling-remove")
+        );
+        assert_eq!(
+            catalog.deployments["gbpusd-g1"].spec.desired_state,
+            DeploymentState::Active
+        );
+    }
+
+    #[test]
+    fn containers_shutdown_of_the_last_active_engine_is_zero_impact() {
+        let mut catalog = demo_catalog();
+        shutdown_symbol(&mut catalog, "eurusd", true).unwrap();
+        let result = shutdown_symbol(&mut catalog, "gbpusd", false).unwrap();
+        assert_eq!(result.mode, "containers");
+        assert!(result.zero_impact);
+        assert!(
+            result
+                .steps
+                .iter()
+                .any(|step| step.action == "remove-workload")
+        );
+        assert!(result.steps.iter().any(|step| step.action == "retain-data"));
+    }
+
+    #[test]
+    fn dedicated_shutdown_is_zero_impact() {
+        let mut catalog = demo_catalog();
+        let result = shutdown_symbol(&mut catalog, "btcusdt", false).unwrap();
+        assert_eq!(result.mode, "containers");
+        assert!(result.zero_impact);
+        assert_eq!(
+            catalog.deployments["btcusdt-g1"].spec.desired_state,
+            DeploymentState::Disabled
+        );
+    }
+
+    #[test]
+    fn shutdown_unknown_symbol_is_not_found() {
+        let mut catalog = demo_catalog();
+        let error = shutdown_symbol(&mut catalog, "nope", false).unwrap_err();
+        assert_eq!(error.code, "symbol_not_found");
+        assert_eq!(error.status, axum::http::StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn supervisor_start_reuses_the_retained_slot() {
+        let mut catalog = supervisor_catalog();
+        shutdown_symbol(&mut catalog, "eurusd", false).unwrap();
+        let result = start_symbol(&mut catalog, "eurusd", false).unwrap();
+        assert_eq!(result.mode, "supervisor");
+        assert!(result.zero_impact);
+        for action in ["resume-route", "start-process", "recover", "verify-ready"] {
+            assert!(
+                result.steps.iter().any(|step| step.action == action),
+                "missing {action}: {:?}",
+                result
+                    .steps
+                    .iter()
+                    .map(|step| step.action.as_str())
+                    .collect::<Vec<_>>()
+            );
+        }
+        assert!(
+            result
+                .notes
+                .iter()
+                .any(|note| note.contains("does not restart any other engine"))
+        );
+        let deployment = &catalog.deployments["eurusd-g1"];
+        assert_eq!(deployment.spec.desired_state, DeploymentState::Active);
+        assert_eq!(deployment.spec.placement.slot, 0);
+        assert_eq!(deployment.spec.placement.http_port, 21001);
+        assert_eq!(deployment.status.phase, Phase::Pending);
+        assert!(!deployment.status.ready);
+        assert_eq!(catalog.routes["eurusd"].spec.state, RouteState::Active);
+        assert_eq!(catalog.routes["eurusd"].status.phase, Phase::Pending);
+        assert_eq!(catalog.symbols["eurusd"].status.phase, Phase::Pending);
+        assert_eq!(catalog.shard_processes("fx-eu-01"), 2);
+        let error = start_symbol(&mut catalog, "eurusd", false).unwrap_err();
+        assert_eq!(error.code, "already_active");
+    }
+
+    #[test]
+    fn containers_start_requires_opt_in_when_other_engines_run() {
+        let mut catalog = demo_catalog();
+        shutdown_symbol(&mut catalog, "eurusd", true).unwrap();
+        let error = start_symbol(&mut catalog, "eurusd", false).unwrap_err();
+        assert_eq!(error.code, "restart_required");
+        assert_eq!(
+            catalog.deployments["eurusd-g1"].spec.desired_state,
+            DeploymentState::Disabled
+        );
+
+        let result = start_symbol(&mut catalog, "eurusd", true).unwrap();
+        assert_eq!(result.mode, "containers");
+        assert!(!result.zero_impact);
+        assert!(result.steps.iter().any(|step| step.action == "rolling-add"));
+        assert_eq!(
+            catalog.deployments["eurusd-g1"].spec.desired_state,
+            DeploymentState::Active
+        );
+        assert_eq!(
+            catalog.deployments["gbpusd-g1"].spec.desired_state,
+            DeploymentState::Active
+        );
+    }
+
+    #[test]
+    fn containers_start_of_the_only_engine_is_zero_impact() {
+        let mut catalog = demo_catalog();
+        shutdown_symbol(&mut catalog, "eurusd", true).unwrap();
+        shutdown_symbol(&mut catalog, "gbpusd", false).unwrap();
+        let result = start_symbol(&mut catalog, "eurusd", false).unwrap();
+        assert_eq!(result.mode, "containers");
+        assert!(result.zero_impact);
+        assert!(
+            result
+                .steps
+                .iter()
+                .any(|step| step.action == "materialize-workload")
+        );
+        assert_eq!(catalog.deployments["eurusd-g1"].spec.placement.slot, 0);
+        assert_eq!(
+            catalog.deployments["gbpusd-g1"].spec.desired_state,
+            DeploymentState::Disabled
+        );
+    }
+
+    #[test]
+    fn start_unknown_symbol_is_not_found() {
+        let mut catalog = demo_catalog();
+        let error = start_symbol(&mut catalog, "nope", false).unwrap_err();
+        assert_eq!(error.code, "symbol_not_found");
+    }
+
+    #[test]
+    fn drop_reserved_shard_removes_only_its_catalog_record() {
+        let mut catalog = demo_catalog();
+        let result = drop_shard(&mut catalog, "fx-eu-02", true).unwrap();
+        assert_eq!(result.mode, "reserved");
+        assert!(result.zero_impact);
+        assert!(result.removed_deployments.is_empty());
+        assert_eq!(result.pvcs.len(), 4);
+        assert!(
+            result
+                .steps
+                .iter()
+                .any(|step| step.action == "remove-catalog")
+        );
+        assert!(
+            result
+                .steps
+                .iter()
+                .any(|step| step.action == "keep-storage")
+        );
+        assert!(!catalog.shards.contains_key("fx-eu-02"));
+        assert!(catalog.shards.contains_key("fx-eu-01"));
+        assert!(catalog.deployments.contains_key("eurusd-g1"));
+        assert!(
+            catalog
+                .audit
+                .iter()
+                .any(|entry| entry.action == "drop-shard" && entry.target == "fx-eu-02")
+        );
+    }
+
+    #[test]
+    fn drop_shard_requires_every_engine_to_be_disabled() {
+        let mut catalog = demo_catalog();
+        let error = drop_shard(&mut catalog, "fx-eu-01", true).unwrap_err();
+        assert_eq!(error.code, "shard_not_idle");
+        assert!(error.message.contains("eurusd"));
+        assert!(catalog.shards.contains_key("fx-eu-01"));
+    }
+
+    #[test]
+    fn drop_supervisor_shard_retains_pvcs_and_removes_dependents() {
+        let mut catalog = supervisor_catalog();
+        shutdown_symbol(&mut catalog, "eurusd", false).unwrap();
+        shutdown_symbol(&mut catalog, "gbpusd", false).unwrap();
+        let result = drop_shard(&mut catalog, "fx-eu-01", true).unwrap();
+        assert_eq!(result.mode, "supervisor");
+        assert!(result.retain_storage);
+        assert_eq!(
+            result.removed_deployments,
+            vec!["eurusd-g1".to_string(), "gbpusd-g1".to_string()]
+        );
+        assert_eq!(
+            result.pvcs,
+            vec![
+                "data-fx-eu-01-0".to_string(),
+                "data-fx-eu-01-1".to_string(),
+                "data-fx-eu-01-2".to_string(),
+                "data-fx-eu-01-3".to_string()
+            ]
+        );
+        assert!(
+            result
+                .steps
+                .iter()
+                .any(|step| step.action == "prune-workload")
+        );
+        assert!(
+            result
+                .steps
+                .iter()
+                .any(|step| step.action == "keep-storage")
+        );
+        assert!(
+            result
+                .notes
+                .iter()
+                .any(|note| note.contains("re-create it with the same name"))
+        );
+        assert!(!catalog.shards.contains_key("fx-eu-01"));
+        assert!(!catalog.deployments.contains_key("eurusd-g1"));
+        assert!(!catalog.deployments.contains_key("gbpusd-g1"));
+        assert!(!catalog.routes.contains_key("eurusd"));
+        assert!(!catalog.routes.contains_key("gbpusd"));
+        assert!(!catalog.symbols.contains_key("eurusd"));
+        assert!(!catalog.symbols.contains_key("gbpusd"));
+        assert!(catalog.symbols.contains_key("btcusdt"));
+    }
+
+    #[test]
+    fn drop_shard_can_delete_storage() {
+        let mut catalog = demo_catalog();
+        shutdown_symbol(&mut catalog, "btcusdt", false).unwrap();
+        let result = drop_shard(&mut catalog, "me-btcusdt", false).unwrap();
+        assert_eq!(result.mode, "containers");
+        assert!(!result.retain_storage);
+        assert_eq!(result.pvcs.len(), 4);
+        assert!(
+            result
+                .steps
+                .iter()
+                .any(|step| step.action == "delete-storage")
+        );
+        assert!(
+            result
+                .notes
+                .iter()
+                .any(|note| note.contains("PVC deletion is irreversible"))
+        );
+        assert!(!catalog.shards.contains_key("me-btcusdt"));
+        assert!(!catalog.symbols.contains_key("btcusdt"));
+    }
+
+    #[test]
+    fn drop_keeps_a_symbol_that_still_has_a_shadow_elsewhere() {
+        let mut catalog = demo_catalog();
+        migrate_symbol(&mut catalog, "eurusd", "fx-eu-02", false).unwrap();
+        shutdown_symbol(&mut catalog, "eurusd", false).unwrap_err();
+        // The source shard is containers mode while gbpusd is still active; shut both down.
+        shutdown_symbol(&mut catalog, "eurusd", true).unwrap();
+        shutdown_symbol(&mut catalog, "gbpusd", false).unwrap();
+        let result = drop_shard(&mut catalog, "fx-eu-01", true).unwrap();
+        assert_eq!(result.removed_symbols, vec!["gbpusd".to_string()]);
+        assert!(catalog.symbols.contains_key("eurusd"));
+        assert!(catalog.deployments.contains_key("eurusd-shadow"));
+        assert!(!catalog.routes.contains_key("eurusd"));
     }
 }

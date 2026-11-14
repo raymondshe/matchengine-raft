@@ -195,21 +195,34 @@ pub fn plan_shard(
         ApiError::not_found("shard_not_found", format!("unknown shard {shard_name}"))
     })?;
     let deployments = catalog.shard_deployments(shard_name);
-    if deployments.is_empty() {
+    let active: Vec<&SymbolDeployment> = deployments
+        .iter()
+        .copied()
+        .filter(|deployment| {
+            deployment.spec.desired_state != crate::model::DeploymentState::Disabled
+        })
+        .collect();
+    if active.is_empty() {
+        let disabled = deployments.len();
+        let note = if disabled > 0 {
+            format!(
+                "{disabled} deployment(s) are disabled: no engine process is desired. Apply the updated ConfigMap/workload and keep the PVCs; slots stay reserved until an explicit re-enable."
+            )
+        } else {
+            "reserved shard: no SymbolDeployment is bound; the StatefulSet materializes when the first symbol is placed"
+                .to_string()
+        };
         return Ok(ReconcilePlan {
             shard: shard_name.to_string(),
             phase: PlanPhase::Reserved,
             steps: Vec::new(),
             blocked: Vec::new(),
-            notes: vec![
-                "reserved shard: no SymbolDeployment is bound; the StatefulSet materializes when the first symbol is placed"
-                    .to_string(),
-            ],
+            notes: vec![note],
             target_image: target_image.unwrap_or(&shard.spec.image).to_string(),
         });
     }
     let mut processes = Vec::new();
-    for deployment in deployments {
+    for deployment in active {
         let symbol = catalog
             .symbols
             .get(&deployment.spec.symbol_ref)
@@ -785,7 +798,13 @@ pub fn simulate(
     let shard = catalog.shards.get(shard_name).ok_or_else(|| {
         ApiError::not_found("shard_not_found", format!("unknown shard {shard_name}"))
     })?;
-    let deployments = catalog.shard_deployments(shard_name);
+    let deployments: Vec<&SymbolDeployment> = catalog
+        .shard_deployments(shard_name)
+        .into_iter()
+        .filter(|deployment| {
+            deployment.spec.desired_state != crate::model::DeploymentState::Disabled
+        })
+        .collect();
     let now = now_epoch();
     if deployments.is_empty() {
         return Ok(ShardObservation {
@@ -848,6 +867,9 @@ pub fn simulate(
 /// `PublishRoute` step; the demo API uses it to keep the GUI's leader column honest.
 pub fn apply_observed_routes(catalog: &mut Catalog, observation: &ShardObservation) {
     for route in catalog.routes.values_mut() {
+        if route.spec.state == crate::model::RouteState::Disabled {
+            continue;
+        }
         let Some(deployment) = catalog
             .deployments
             .get(&route.spec.active_deployment_ref)
@@ -855,6 +877,9 @@ pub fn apply_observed_routes(catalog: &mut Catalog, observation: &ShardObservati
         else {
             continue;
         };
+        if deployment.spec.desired_state == crate::model::DeploymentState::Disabled {
+            continue;
+        }
         let Some(leader) = observation
             .processes
             .iter()
@@ -967,6 +992,52 @@ mod tests {
             !plan.blocked.iter().any(|blocked| blocked.contains("route")),
             "{:?}",
             plan.blocked
+        );
+    }
+
+    #[test]
+    fn disabled_deployments_are_skipped_by_simulation_and_plans() {
+        let mut catalog = catalog();
+        crate::provision::shutdown_symbol(&mut catalog, "eurusd", true).unwrap();
+        let observation = simulate(&catalog, "fx-eu-01", Scenario::Ready).unwrap();
+        assert!(
+            observation
+                .processes
+                .iter()
+                .all(|row| row.symbol != "eurusd"),
+            "{:?}",
+            observation.processes
+        );
+        let plan = plan_shard(&catalog, "fx-eu-01", &observation, None, None).unwrap();
+        assert_eq!(plan.phase, PlanPhase::Ready);
+        assert!(
+            plan.steps.iter().all(|step| step.target != "eurusd"),
+            "{:?}",
+            plan.steps
+        );
+        assert!(
+            plan.notes.iter().all(|note| !note.contains("eurusd")),
+            "{:?}",
+            plan.notes
+        );
+    }
+
+    #[test]
+    fn all_disabled_shard_plan_retains_data_and_slots() {
+        let mut catalog = catalog();
+        crate::provision::shutdown_symbol(&mut catalog, "eurusd", true).unwrap();
+        crate::provision::shutdown_symbol(&mut catalog, "gbpusd", false).unwrap();
+        let observation = simulate(&catalog, "fx-eu-01", Scenario::Ready).unwrap();
+        assert!(observation.processes.is_empty());
+        let plan = plan_shard(&catalog, "fx-eu-01", &observation, None, None).unwrap();
+        assert_eq!(plan.phase, PlanPhase::Reserved);
+        assert!(plan.steps.is_empty());
+        assert!(
+            plan.notes
+                .iter()
+                .any(|note| note.contains("PVC") || note.contains("disabled")),
+            "{:?}",
+            plan.notes
         );
     }
 

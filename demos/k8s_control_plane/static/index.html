@@ -63,6 +63,8 @@
   .headline { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
   .headline h2 { margin: 0; font: 600 21px/1.2 var(--mono); }
   .headline .sub { color: var(--muted); font-size: 12px; }
+  .headline .danger { margin-left: auto; align-self: center; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
   .tabs { display: flex; gap: 4px; margin: 18px 0 16px; border-bottom: 1px solid var(--border); }
   .tab {
     padding: 9px 14px; border: none; background: none; color: var(--muted);
@@ -82,6 +84,7 @@
   th, td { text-align: left; padding: 8px 9px; border-bottom: 1px solid var(--border); vertical-align: top; }
   th { color: var(--muted); font-weight: 500; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; }
   td.mono, .mono { font-family: var(--mono); }
+  tr.disabled-row td { opacity: 0.55; }
   .actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 14px; }
   button, select, input {
     background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
@@ -142,6 +145,11 @@
   .modal-head .close { background: none; border: none; color: var(--muted); font-size: 22px; line-height: 1; padding: 0 4px; }
   .form-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
   .form-grid .field input, .form-grid .field select { width: 100%; }
+  .choice-list { display: grid; gap: 10px; margin: 14px 0; }
+  .choice { display: flex; align-items: flex-start; gap: 10px; padding: 11px; border: 1px solid var(--border); border-radius: 9px; background: var(--panel-2); cursor: pointer; }
+  .choice input { margin-top: 3px; accent-color: var(--accent); }
+  .choice strong { display: block; font-size: 12px; }
+  .choice small { display: block; color: var(--muted); font-size: 11px; line-height: 1.4; margin-top: 2px; }
   .form-actions { display: flex; align-items: center; justify-content: flex-end; gap: 8px; margin-top: 18px; flex-wrap: wrap; }
   .form-actions .muted { margin-right: auto; font-size: 11px; }
   @media (max-width: 860px) {
@@ -177,6 +185,7 @@
     <div class="headline">
       <h2 id="shardName">loading…</h2>
       <span class="sub" id="shardSub"></span>
+      <button class="danger" id="dropShardBtn" type="button" title="Stop every engine before dropping the shard" disabled>drop shard</button>
     </div>
     <div id="issueBox"></div>
     <div class="tabs">
@@ -191,7 +200,7 @@
       <div class="card" style="margin-top:12px">
         <h3>Engine processes</h3>
         <table>
-          <thead><tr><th>Symbol</th><th>Deployment</th><th>Slot</th><th>HTTP</th><th>Raft</th><th>Config hash</th><th>Console</th></tr></thead>
+          <thead><tr><th>Symbol</th><th>Deployment</th><th>State</th><th>Slot</th><th>HTTP</th><th>Raft</th><th>Config hash</th><th>Console</th><th>Action</th></tr></thead>
           <tbody id="processRows"></tbody>
         </table>
       </div>
@@ -404,6 +413,36 @@
   </div>
 </div>
 
+<div id="dropModal" class="modal" aria-hidden="true">
+  <div class="modal-card">
+    <div class="modal-head">
+      <h2>Drop shard <span id="dropShardName"></span></h2>
+      <button class="close" type="button" data-close="dropModal" aria-label="Close">×</button>
+    </div>
+    <form id="dropForm">
+      <p class="muted">This removes the shard, its deployments, routes and symbols that are not used elsewhere from the manager catalog. Every engine in the shard must already be stopped. Choose what happens to the Kubernetes storage before the operator prunes the workload.</p>
+      <div class="choice-list">
+        <label class="choice">
+          <input type="radio" name="dropStorage" value="retain" checked>
+          <span><strong>Keep storage (recommended)</strong><small>Keep the PVCs so the shard can be recreated later with the same name, replicas and storage class. The retained WAL/snapshot is the only copy.</small></span>
+        </label>
+        <label class="choice">
+          <input type="radio" name="dropStorage" value="delete">
+          <span><strong>Delete storage</strong><small>Delete the PVCs as part of the drop. This is irreversible and the shard cannot be brought up with its data again.</small></span>
+        </label>
+      </div>
+      <label class="field"><span>Type <code id="dropConfirmName">shard</code> to confirm</span>
+        <input id="dropConfirmInput" autocomplete="off" spellcheck="false" placeholder="shard name">
+      </label>
+      <div class="form-actions">
+        <span class="muted" id="dropHint">PVCs remain; re-create the shard later to recover its data.</span>
+        <button type="button" data-close="dropModal">Cancel</button>
+        <button type="submit" class="danger" id="dropSubmit" disabled>Drop shard</button>
+      </div>
+    </form>
+  </div>
+</div>
+
 <script>
 const $ = (id) => document.getElementById(id);
 const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (c) => ({
@@ -453,19 +492,25 @@ function renderHeader() {
 function renderShards() {
   const shards = Object.values(catalog.shards || {});
   $("shardList").innerHTML = shards.map((shard) => {
-    const deployments = Object.values(catalog.deployments || {}).filter((d) => d.spec.shardRef === shard.name);
+    const all = Object.values(catalog.deployments || {}).filter((d) => d.spec.shardRef === shard.name);
+    const deployments = all.filter((d) => d.spec.desiredState !== "Disabled");
+    const stopped = all.length - deployments.length;
     const symbols = deployments.map((d) => d.spec.symbolRef);
     const phase = shard.status?.phase || "Pending";
-    const empty = deployments.length === 0;
+    const empty = all.length === 0;
+    const allStopped = deployments.length === 0 && stopped > 0;
     const phaseClass = phase === "Ready" ? "good" : phase === "Degraded" || phase === "Failed" ? "bad" : "";
+    const meta = `${esc(shard.spec.cell)} · ${esc(shard.spec.replicas)} voters · ${deployments.length} process${deployments.length === 1 ? "" : "es"}${stopped ? ` · ${stopped} stopped` : ""}`;
+    const symbolChip = allStopped ? "all stopped" : empty ? "no symbols" : esc(symbols.join(", "));
+    const phaseChip = allStopped ? "Disabled" : empty ? "reserved" : esc(phase);
     return `<div class="shard ${shard.name === selected ? "active" : ""}" data-shard="${esc(shard.name)}" role="button" tabindex="0" aria-pressed="${shard.name === selected}">
       <div class="name">${esc(shard.name)}</div>
-      <div class="meta">${esc(shard.spec.cell)} · ${esc(shard.spec.replicas)} voters · ${deployments.length} process${deployments.length === 1 ? "" : "es"}</div>
+      <div class="meta">${meta}</div>
       <div class="chips">
         <span class="chip ${esc(shard.spec.class.toLowerCase())}">${esc(shard.spec.class)}</span>
         <span class="chip ${shard.spec.packing.mode === "supervisor" ? "good" : ""}">${esc(shard.spec.packing.mode)}</span>
-        <span class="chip ${empty ? "reserved" : ""}">${empty ? "no symbols" : esc(symbols.join(", "))}</span>
-        <span class="chip ${empty ? "reserved" : phaseClass}">${esc(empty ? "reserved" : phase)}</span>
+        <span class="chip ${empty ? "reserved" : ""}">${symbolChip}</span>
+        <span class="chip ${empty ? "reserved" : allStopped ? "" : phaseClass}">${phaseChip}</span>
         ${shard.spec.paused ? '<span class="chip bad">paused</span>' : ""}
       </div>
     </div>`;
@@ -537,17 +582,33 @@ function renderOverview() {
   const processes = detail.deployments || [];
   $("processRows").innerHTML = processes.length ? processes.map((deployment) => {
     const entry = consoles[deployment.spec.symbolRef];
+    const state = deployment.spec.desiredState || "Active";
+    const disabled = state === "Disabled";
+    const stateClass = disabled ? "" : state === "Shadow" || state === "Draining" ? "warn" : "ok";
+    const action = state === "Active"
+      ? `<button class="danger" type="button" data-stop="${esc(deployment.spec.symbolRef)}" title="Gracefully stop this engine; data and slot are retained">stop</button>`
+      : state === "Disabled"
+        ? `<button class="primary" type="button" data-start="${esc(deployment.spec.symbolRef)}" title="Re-enable this engine from its retained data directory">start</button>`
+        : "";
     return `
-    <tr>
+    <tr class="${disabled ? "disabled-row" : ""}">
       <td class="mono">${esc(deployment.spec.symbolRef)}</td>
       <td class="mono">${esc(deployment.name)}</td>
+      <td><span class="badge ${stateClass}">${esc(disabled ? "stopped" : state)}</span></td>
       <td class="mono">${esc(deployment.spec.placement.slot)}</td>
       <td class="mono">${esc(deployment.spec.placement.httpPort)}</td>
       <td class="mono">${esc(deployment.spec.placement.httpPort + 1000)}</td>
       <td class="mono">${esc(deployment.spec.configHash || "derived")}</td>
       <td class="mono">${entry ? `<a href="${esc(entry.proxyUrl || entry.url)}" target="_blank" rel="noreferrer" title="Open the engine console on pod ${esc(entry.pod)}${entry.leader ? " (leader)" : ""} through the manager">open ↗</a>` : "—"}</td>
+      <td>${action}</td>
     </tr>`;
-  }).join("") : `<tr><td colspan="7" class="muted">No engine processes — this shard is reserved. Use <button class="primary" type="button" onclick="openSymbolModal()">+ symbol</button> to bind the first symbol and materialize the StatefulSet.</td></tr>`;
+  }).join("") : `<tr><td colspan="9" class="muted">No engine processes — this shard is reserved. Use <button class="primary" type="button" onclick="openSymbolModal()">+ symbol</button> to bind the first symbol and materialize the StatefulSet.</td></tr>`;
+  document.querySelectorAll("[data-stop]").forEach((button) => {
+    button.addEventListener("click", () => shutdownSymbol(button.dataset.stop));
+  });
+  document.querySelectorAll("[data-start]").forEach((button) => {
+    button.addEventListener("click", () => startSymbol(button.dataset.start));
+  });
 
   const observation = detail.observation || { processes: [] };
   const leaders = (observation.processes || []).filter((p) => p.leader);
@@ -611,7 +672,13 @@ async function loadDetail() {
   detail = await api(`/api/v1/shards/${encodeURIComponent(selected)}?scenario=${encodeURIComponent($("scenario").value)}`);
   $("shardName").textContent = detail.shard.name;
   const cell = detail.cell?.name || detail.shard.spec.cell;
-  $("shardSub").textContent = `${cell} · ${detail.shard.spec.class} · ${detail.deployments.length} engine process${detail.deployments.length === 1 ? "" : "es"} · ${detail.shard.spec.replicas} voters`;
+  const active = (detail.deployments || []).filter((deployment) => deployment.spec.desiredState !== "Disabled");
+  const stopped = (detail.deployments || []).length - active.length;
+  $("shardSub").textContent = `${cell} · ${detail.shard.spec.class} · ${active.length} engine process${active.length === 1 ? "" : "es"}${stopped ? ` · ${stopped} stopped` : ""} · ${detail.shard.spec.replicas} voters`;
+  $("dropShardBtn").disabled = active.length > 0;
+  $("dropShardBtn").title = active.length > 0
+    ? "Stop every engine in this shard before dropping it"
+    : "Drop this shard from the catalog and choose whether to keep its PVCs";
   $("targetImage").value = detail.shard.spec.image;
   $("objectsPre").textContent = JSON.stringify(detail, null, 2);
   renderOverview();
@@ -632,9 +699,10 @@ async function loadManifests() {
   try {
     manifestList = await api(`/api/v1/shards/${encodeURIComponent(selected)}/manifests?profile=${encodeURIComponent($("profile").value)}`);
     $("manifestPre").textContent = JSON.stringify(manifestList, null, 2);
-    const empty = !(detail?.deployments || []).length;
-    $("manifestHint").textContent = empty
-      ? `${manifestList.items.length} objects · reserved shard: no StatefulSet until a symbol is bound`
+    const all = detail?.deployments || [];
+    const active = all.filter((deployment) => deployment.spec.desiredState !== "Disabled");
+    $("manifestHint").textContent = !active.length
+      ? `${manifestList.items.length} objects · ${all.length ? "all processes are stopped: no StatefulSet until an explicit re-enable, the PVCs are retained" : "reserved shard: no StatefulSet until a symbol is bound"}`
       : `${manifestList.items.length} objects · kubectl apply -f works with this List`;
   } catch (error) {
     toast(error.message, true);
@@ -650,6 +718,128 @@ async function adopt() {
     renderShards();
     await loadDetail();
     await loadPlan();
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+async function shutdownSymbol(name, allowRestart = false) {
+  if (!allowRestart) {
+    const ok = confirm(`Stop ${name}?\n\nThe engine receives SIGTERM, its data directory and slot are retained, and no other engine is restarted.`);
+    if (!ok) return;
+  }
+  try {
+    const result = await api(`/api/v1/symbols/${encodeURIComponent(name)}/shutdown`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ allowRestart }),
+    });
+    const shutdown = result.shutdown;
+    const next = (shutdown.steps || []).map((step) => step.action).join(" → ");
+    toast(`stopped ${name} · ${shutdown.mode} · data retained${shutdown.zeroImpact ? " · no other engine restarted" : ""}${next ? " · apply: " + next : ""}`);
+    catalog = await api("/api/v1/catalog");
+    manifestList = null;
+    renderHeader();
+    renderShards();
+    await loadDetail();
+    await loadPlan();
+    loadAudit();
+  } catch (error) {
+    if (!allowRestart && String(error.message).includes("restart_required")) {
+      const ok = confirm(`${name} shares a containers-mode shard with other active engines.\n\nRemoving its container recreates every pod and restarts the other engines one voter at a time. Continue?`);
+      if (ok) return shutdownSymbol(name, true);
+      return;
+    }
+    toast(error.message, true);
+  }
+}
+
+async function startSymbol(name, allowRestart = false) {
+  if (!allowRestart) {
+    const ok = confirm(`Start ${name}?\n\nThe engine reuses its retained data directory and slot; no new generation or port is allocated.`);
+    if (!ok) return;
+  }
+  try {
+    const result = await api(`/api/v1/symbols/${encodeURIComponent(name)}/start`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ allowRestart }),
+    });
+    const start = result.start;
+    const next = (start.steps || []).map((step) => step.action).join(" → ");
+    toast(`marked ${name} Active · ${start.mode}${start.zeroImpact ? " · no other engine restarted" : ""}${next ? " · apply: " + next : ""}`);
+    catalog = await api("/api/v1/catalog");
+    manifestList = null;
+    renderHeader();
+    renderShards();
+    await loadDetail();
+    await loadPlan();
+    loadAudit();
+  } catch (error) {
+    if (!allowRestart && String(error.message).includes("restart_required")) {
+      const ok = confirm(`${name} shares a containers-mode shard with other active engines.\n\nAdding its container back recreates every pod and restarts the other engines one voter at a time. Continue?`);
+      if (ok) return startSymbol(name, true);
+      return;
+    }
+    toast(error.message, true);
+  }
+}
+
+function updateDropChoice() {
+  const choice = document.querySelector('input[name="dropStorage"]:checked');
+  const retain = !choice || choice.value === "retain";
+  $("dropHint").textContent = retain
+    ? "PVCs remain; re-create the shard later with the same name to recover its data."
+    : "PVCs are deleted as part of the drop; this cannot be undone.";
+}
+
+function updateDropSubmit() {
+  const expected = detail?.shard?.name || "";
+  const typed = $("dropConfirmInput").value.trim();
+  $("dropSubmit").disabled = !expected || typed !== expected;
+}
+
+function openDropModal() {
+  if (!detail?.shard) return;
+  const active = (detail.deployments || []).filter((deployment) => deployment.spec.desiredState !== "Disabled");
+  if (active.length > 0) {
+    toast("stop every engine in the shard before dropping it", true);
+    return;
+  }
+  $("dropShardName").textContent = detail.shard.name;
+  $("dropConfirmName").textContent = detail.shard.name;
+  $("dropConfirmInput").value = "";
+  const retain = document.querySelector('input[name="dropStorage"][value="retain"]');
+  if (retain) retain.checked = true;
+  updateDropChoice();
+  updateDropSubmit();
+  openModal("dropModal");
+  $("dropConfirmInput").focus();
+}
+
+async function submitDrop(event) {
+  event.preventDefault();
+  if (!detail?.shard) return;
+  const name = detail.shard.name;
+  const choice = document.querySelector('input[name="dropStorage"]:checked');
+  const retainStorage = !choice || choice.value === "retain";
+  try {
+    const result = await api(`/api/v1/shards/${encodeURIComponent(name)}/drop`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ retainStorage }),
+    });
+    const drop = result.drop;
+    closeModal("dropModal");
+    toast(`dropped ${name} · ${drop.retainStorage ? "PVCs retained" : "storage deleted"} · ${drop.removedDeployments.length} deployment(s)`);
+    catalog = await api("/api/v1/catalog");
+    manifestList = null;
+    const remaining = Object.keys(catalog.shards || {});
+    selected = remaining.includes(selected) ? selected : remaining[0] || null;
+    renderHeader();
+    renderShards();
+    if (selected) await loadShard();
+    loadAudit();
   } catch (error) {
     toast(error.message, true);
   }
@@ -836,6 +1026,12 @@ function bind() {
   $("newShardBtn").addEventListener("click", openShardModal);
   $("symbolForm").addEventListener("submit", submitSymbol);
   $("shardForm").addEventListener("submit", submitShard);
+  $("dropForm").addEventListener("submit", submitDrop);
+  $("dropShardBtn").addEventListener("click", openDropModal);
+  $("dropConfirmInput").addEventListener("input", updateDropSubmit);
+  document.querySelectorAll('input[name="dropStorage"]').forEach((radio) => {
+    radio.addEventListener("change", updateDropChoice);
+  });
   $("shardClass").addEventListener("change", () => {
     const dedicated = $("shardClass").value === "Dedicated";
     $("shardMax").value = dedicated ? "1" : "4";
