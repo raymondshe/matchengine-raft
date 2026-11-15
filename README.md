@@ -313,6 +313,7 @@ of single-symbol engines and their four-voter process instances across shards an
 
 [Open the interactive diagram](./docs/kubernetes-console-architecture.html) ·
 [Design and CRDs](./docs/KUBERNETES_CONTROL_PLANE.md) ·
+[etcd storage](./docs/ETCD_STORAGE.md) ·
 [Local test plan](./docs/KUBERNETES_LOCAL_TESTING.md) ·
 [Reference demo](./demos/k8s_control_plane/README.md)
 

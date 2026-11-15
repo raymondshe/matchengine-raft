@@ -292,6 +292,7 @@ bootstrap/配置每个 Raft 组、在 quorum 门禁后逐 Pod 滚动 containers�
 
 [打开交互式架构图](./docs/kubernetes-console-architecture.html) ·
 [设计与 CRD](./docs/KUBERNETES_CONTROL_PLANE.md) ·
+[etcd 存储](./docs/ETCD_STORAGE.md) ·
 [本地测试计划](./docs/KUBERNETES_LOCAL_TESTING.md) ·
 [Kubernetes 运行手册](./docs/zh-CN/RUNBOOK.md#kubernetes-控制平面orbstack-演示) ·
 [参考实现](./demos/k8s_control_plane/README.md)

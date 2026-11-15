@@ -106,7 +106,8 @@ The manager has two persistence backends behind the `CatalogStore` abstraction:
 - **JSON/memory** (default): `serve` or `serve --state <file>` for the offline demo.
 - **CRD**: `serve --crd --crd-namespace <ns>` writes `TradingSymbol`, `SymbolShard`,
   `SymbolDeployment`, `SymbolRoute` and `Cell` CRs through the Kubernetes API server. etcd stores
-  them underneath, but the manager never opens an etcd connection.
+  them underneath, but the manager never opens an etcd connection. The concrete key layout, live
+  inventory and size/write guidance are in [`docs/ETCD_STORAGE.md`](../../docs/ETCD_STORAGE.md).
 
 Install the generated CRDs and least-privilege RBAC first:
 

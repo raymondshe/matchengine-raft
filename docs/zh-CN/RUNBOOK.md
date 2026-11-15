@@ -264,7 +264,8 @@ kubectl -n match-control rollout status deploy/match-manager --timeout=120s
 #### CRD 模式（生产推荐）
 
 期望状态存放在 `matching.io` CRD 中，由 Kubernetes API server（底层 etcd）持久化；管理器
-不会直接连接 etcd。先安装 CRD 和 RBAC：
+不会直接连接 etcd。具体键布局、对象清单和容量/备份边界见
+[`docs/ETCD_STORAGE.md`](../ETCD_STORAGE.md)。先安装 CRD 和 RBAC：
 
 ```sh
 cargo run --manifest-path demos/k8s_control_plane/Cargo.toml -- crds \

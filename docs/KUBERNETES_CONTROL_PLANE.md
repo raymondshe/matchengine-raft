@@ -957,7 +957,10 @@ The global manager's cluster holds the catalog CRDs (`TradingSymbol`, `Cell`, `C
 Each cell holds the runtime CRDs (`SymbolDeployment`, `SymbolRoute`, `SymbolShard`, `Backup`,
 `Operation`) plus a namespaced projection of the `TradingSymbol` it is allowed to run. The manager
 projects a symbol into a cell and a shard; the cell operator never reaches back into the
-management cluster.
+management cluster. The reference implementation currently installs the first five kinds
+(`Cell`, `TradingSymbol`, `SymbolShard`, `SymbolDeployment`, `SymbolRoute`); `ClusterTemplate`,
+`Backup` and `Operation` remain design-level contracts. See [`ETCD_STORAGE.md`](./ETCD_STORAGE.md)
+for the actual etcd key map and live object inventory.
 
 There are two placement facts, and each has exactly one owner:
 
@@ -1683,6 +1686,9 @@ The manager writes compact CRs and rebuilds its cache from informers. It must no
 client: that bypasses API-server validation/admission/RBAC/audit and is unavailable on most managed
 Kubernetes services. etcd snapshots are the cluster-wide backup; a CRD export is the selective
 backup for a single catalog.
+
+See [`ETCD_STORAGE.md`](./ETCD_STORAGE.md) for the concrete key layout, live object inventory,
+approximate sizes, status-write behaviour and backup/restore boundaries.
 
 ### 8.2 Authentication and authorization
 
