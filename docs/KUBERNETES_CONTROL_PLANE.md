@@ -944,7 +944,9 @@ For dynamic add/remove and denser packing, the reference supervisor
   inherited; a production supervisor should add log rotation and optional cgroup isolation.
 - There is no engine change: each spawned process is the existing single-symbol binary.
 - Trade-off: processes share the supervisor's container CPU/memory limit; there is no per-process
-  cgroup isolation unless the supervisor manages cgroups. Use one supervisor per batch of 5–10
+  cgroup isolation unless the supervisor manages cgroups. Size `defaultProcessResources` for the
+  aggregate of all children and set `packing.resourcesSizedForAggregate: true` after reviewing the
+  container limits; the validator warns otherwise. Use one supervisor per batch of 5–10
   processes if you need coarse isolation.
 - The StatefulSet pod template is stable across add/remove. Only the ConfigMap cache changes;
   `SymbolDeployment` remains the source of truth and the operator writes the cache.

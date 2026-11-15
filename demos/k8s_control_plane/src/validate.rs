@@ -314,11 +314,14 @@ fn validate_shard(
             "a dedicated shard must set maxProcessesPerPod to 1",
         );
     }
-    if shard.spec.packing.mode == PackingMode::Supervisor && max_processes > 1 {
+    if shard.spec.packing.mode == PackingMode::Supervisor
+        && max_processes > 1
+        && !shard.spec.packing.resources_sized_for_aggregate
+    {
         report.warn(
             "supervisor_resources",
             object,
-            "supervisor mode shares one container CPU/memory limit across its processes; size defaultProcessResources for the aggregate, not one process",
+            "supervisor mode shares one container CPU/memory limit across its processes; size defaultProcessResources for the aggregate and set packing.resourcesSizedForAggregate=true",
         );
     }
     if shard.spec.packing.log_dir.is_some()
@@ -981,6 +984,16 @@ mod tests {
         );
         assert!(
             report
+                .warnings
+                .iter()
+                .any(|w| w.code == "supervisor_resources"),
+            "{}",
+            report.to_text()
+        );
+        bundle.shard.spec.packing.resources_sized_for_aggregate = true;
+        let report = validate_bundle(&bundle);
+        assert!(
+            !report
                 .warnings
                 .iter()
                 .any(|w| w.code == "supervisor_resources"),

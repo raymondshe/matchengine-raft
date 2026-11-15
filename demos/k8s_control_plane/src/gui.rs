@@ -35,6 +35,10 @@ mod tests {
         assert!(INDEX.contains("class=\"rollout-progress\""));
         assert!(INDEX.contains("pods updated"));
         assert!(INDEX.contains("progress.percent"));
+        assert!(INDEX.contains("Scenario simulator"));
+        assert!(INDEX.contains("does not read live pod containers"));
+        assert!(INDEX.contains("Apply simulated status"));
+        assert!(INDEX.contains("does not change desired state"));
     }
 
     #[test]

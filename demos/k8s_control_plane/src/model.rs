@@ -359,6 +359,10 @@ pub struct Packing {
     pub log_max_bytes: u64,
     #[serde(default = "default_log_max_files")]
     pub log_max_files: usize,
+    /// Confirms that `defaultProcessResources` is sized for the aggregate of all
+    /// supervisor children, not one child. Set after reviewing the container limits.
+    #[serde(default)]
+    pub resources_sized_for_aggregate: bool,
 }
 
 fn default_max_processes() -> u16 {
@@ -384,6 +388,7 @@ impl Default for Packing {
             log_dir: None,
             log_max_bytes: default_log_max_bytes(),
             log_max_files: default_log_max_files(),
+            resources_sized_for_aggregate: false,
         }
     }
 }

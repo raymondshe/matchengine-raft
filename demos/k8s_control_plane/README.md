@@ -467,7 +467,10 @@ irreversible.
 ### Simulation scenarios
 
 `fresh`, `ready`, `degraded`, `leader-loss`, `config-drift`, `upgrade`. They are synthesized
-from the catalog, not read from a cluster, so the GUI and `plan` work offline.
+from the catalog, not read from a cluster, so the GUI and `plan` work offline. The synthesized
+image for every scenario except `upgrade` is the shard's `spec.image`; `upgrade` uses the older
+demo image so the rolling-restart path can be exercised. The GUI labels the plan tab as a scenario
+simulator; use **overview** for the operator's live rollout status.
 
 ## What the renderer emits
 
@@ -564,7 +567,10 @@ blocked and returns the backup step first.
 - ETF/equity bases force `feeAssetPolicy: quote`;
 - CPU/memory requests are non-zero and do not exceed limits;
 - nodes, deployments and routes must resolve to each other, and symbol IDs are unique per cell;
-- images should be digest-pinned (warning).
+- images should be digest-pinned (warning);
+- supervisor shards with multiple children should size `defaultProcessResources` for the aggregate
+  and set `packing.resourcesSizedForAggregate: true` after reviewing the container limits (warning
+  otherwise).
 
 Errors block rendering; warnings do not.
 

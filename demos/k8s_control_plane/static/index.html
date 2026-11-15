@@ -223,6 +223,11 @@
     </div>
 
     <div class="panel" id="tab-plan">
+      <div class="issue warning" style="margin:0 0 12px">
+        Scenario simulator: this plan uses the selected synthetic observation plus the current CRD
+        catalog. It does not read live pod containers; the operator is the live reconciler. Use
+        <b>overview</b> for actual rollout status.
+      </div>
       <div class="actions">
         <label class="field">Observation
           <select id="scenario">
@@ -247,7 +252,7 @@
           <select id="mixedSafe"><option value="false">no</option><option value="true">yes</option></select>
         </label>
         <button class="primary" id="planBtn">Build plan</button>
-        <button id="adoptBtn">Adopt observation</button>
+        <button id="adoptBtn" title="Demo only: write the selected simulated observation into catalog status; does not execute the plan or change workloads">Apply simulated status</button>
       </div>
       <div class="plan-summary" id="planSummary">—</div>
       <div class="card"><div id="planSteps"><span class="muted">Build a plan to see the operator's next steps.</span></div></div>
@@ -744,9 +749,12 @@ async function loadManifests() {
 }
 
 async function adopt() {
+  const scenario = $("scenario").value;
+  const ok = confirm(`Apply the ${scenario} simulated status?\n\nThis overwrites route, deployment and symbol status in the catalog to look like the selected observation. It does not change desired state, start/stop engines, or call Raft or Kubernetes. In CRD mode it writes status through the API server; the operator will replace it with live observations on its next reconcile. Use only for demo/testing.`);
+  if (!ok) return;
   try {
-    await api(`/api/v1/shards/${encodeURIComponent(selected)}/simulate?scenario=${encodeURIComponent($("scenario").value)}`, { method: "POST" });
-    toast("observation adopted: route statuses updated");
+    await api(`/api/v1/shards/${encodeURIComponent(selected)}/simulate?scenario=${encodeURIComponent(scenario)}`, { method: "POST" });
+    toast("simulated status applied: route/deployment/symbol statuses updated");
     catalog = await api("/api/v1/catalog");
     renderHeader();
     renderShards();

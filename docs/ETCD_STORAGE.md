@@ -99,7 +99,8 @@ Stores the cell identity and policy inputs, not engine state:
 Stores the shard's pod-template inputs and observed status:
 
 - `spec.image`, `replicas`, `class`, `environment`;
-- `spec.packing` (`containers` or `supervisor`, max processes, log settings);
+- `spec.packing` (`containers` or `supervisor`, max processes, log settings); supervisor shards
+  also set `resourcesSizedForAggregate` after sizing the container resources for all children;
 - `spec.network.httpBasePort`, storage class/size, per-process resources and quotas;
 - `spec.raft` read policy, snapshot interval and WAL fsync mode;
 - `spec.release` wire/snapshot versions and `spec.upgrade.strategy`;

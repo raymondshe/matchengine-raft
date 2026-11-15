@@ -814,6 +814,11 @@ pub fn simulate(
             now,
         });
     }
+    let observed_image = match scenario {
+        Scenario::Upgrade => DEMO_PREVIOUS_IMAGE,
+        _ if shard.spec.image.is_empty() => DEMO_TARGET_IMAGE,
+        _ => shard.spec.image.as_str(),
+    };
     let mut processes = Vec::new();
     for (index, deployment) in deployments.iter().enumerate() {
         let symbol = catalog
@@ -833,10 +838,6 @@ pub fn simulate(
             if scenario == Scenario::ConfigDrift && index == 0 && pod == 1 {
                 row_hash = "0000000000000000".to_string();
             }
-            let image = match scenario {
-                Scenario::Upgrade => DEMO_PREVIOUS_IMAGE.to_string(),
-                _ => DEMO_TARGET_IMAGE.to_string(),
-            };
             processes.push(ProcessObservation {
                 symbol: symbol.name.clone(),
                 deployment: deployment.name.clone(),
@@ -850,7 +851,7 @@ pub fn simulate(
                     Vec::new()
                 },
                 config_hash: row_hash,
-                image,
+                image: observed_image.to_string(),
                 applied_index: bootstrapped.then_some(1_000),
             });
         }
@@ -964,6 +965,29 @@ mod tests {
         let catalog = catalog();
         let observation = simulate(&catalog, shard, scenario).unwrap();
         plan_shard(&catalog, shard, &observation, None, None).unwrap()
+    }
+
+    #[test]
+    fn ready_scenario_uses_the_shard_image() {
+        let mut catalog = catalog();
+        catalog.shards.get_mut("fx-eu-01").unwrap().spec.image =
+            "matchengine-raft:k8s-operator-v2".to_string();
+        let observation = simulate(&catalog, "fx-eu-01", Scenario::Ready).unwrap();
+        assert!(
+            observation
+                .processes
+                .iter()
+                .all(|row| row.image == "matchengine-raft:k8s-operator-v2")
+        );
+        let plan = plan_shard(&catalog, "fx-eu-01", &observation, None, None).unwrap();
+        assert_eq!(plan.phase, PlanPhase::Ready);
+        assert!(
+            !plan
+                .steps
+                .iter()
+                .any(|step| matches!(step.action, Action::RestartPod | Action::TransferLeader)),
+            "a ready shard at the target image has no rollout steps"
+        );
     }
 
     #[test]
