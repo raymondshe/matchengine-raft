@@ -235,7 +235,11 @@ pub fn render_shard(
                     warnings: Vec::new(),
                 })
             })?;
-        if let Some(route) = catalog.route_for_symbol(&symbol.name) {
+        if let Some(route) = catalog.route_for_symbol(&symbol.name)
+            && deployments
+                .iter()
+                .any(|deployment| deployment.name == route.spec.active_deployment_ref)
+        {
             routes.push(route.clone());
         }
         symbols.push(symbol.clone());
@@ -328,6 +332,7 @@ fn config_map(ctx: &Ctx<'_>) -> Value {
                 "slot": deployment.spec.placement.slot,
                 "httpPort": deployment.spec.placement.http_port,
                 "raftPort": deployment.spec.placement.raft_port(),
+                "raftIdOffset": deployment.spec.raft_id_offset,
             })
         })
         .collect();
@@ -497,6 +502,12 @@ fn network_policy(ctx: &Ctx<'_>) -> Value {
                     "from": [{ "podSelector": { "matchLabels": { "matching.io/cluster": ctx.shard.name } } }],
                     "ports": [{ "protocol": "TCP", "port": http_first, "endPort": http_last }],
                 },
+                {
+                    "from": [{ "podSelector": { "matchLabels": {
+                        "app.kubernetes.io/name": "match-engine",
+                        "matching.io/cluster-id": ctx.cell.spec.cluster_id
+                    } } }],
+                },
             ],
             "egress": [
                 {
@@ -517,6 +528,12 @@ fn network_policy(ctx: &Ctx<'_>) -> Value {
                 {
                     "to": [{ "podSelector": { "matchLabels": { "matching.io/cluster": ctx.shard.name } } }],
                     "ports": [{ "protocol": "TCP", "port": http_first, "endPort": http_last }],
+                },
+                {
+                    "to": [{ "podSelector": { "matchLabels": {
+                        "app.kubernetes.io/name": "match-engine",
+                        "matching.io/cluster-id": ctx.cell.spec.cluster_id
+                    } } }],
                 },
             ],
         },
@@ -670,24 +687,63 @@ fn supervisor_stateful_set(ctx: &Ctx<'_>) -> Value {
         env.push(json!({ "name": "RAFT_WAL_FSYNC_MS", "value": value }));
     }
 
+    let mut supervisor_args = vec![
+        json!("--config"),
+        json!("/etc/match/processes.json"),
+        json!("--id"),
+        json!("$(POD_ORDINAL)"),
+        json!("--pod-fqdn"),
+        json!("$(POD_FQDN)"),
+        json!("--data-dir"),
+        json!("/data"),
+        json!("--engine-bin"),
+        json!("/usr/local/bin/matchengine-raft"),
+        json!("--supervisor-addr"),
+        json!("0.0.0.0:9090"),
+        json!("--snapshot-interval-ms"),
+        json!(snapshot_ms.to_string()),
+        json!("--read-policy"),
+        json!(ctx.shard.spec.raft.read_policy.as_str()),
+        json!("--max-inflight-writes"),
+        json!(
+            ctx.shard
+                .spec
+                .quotas
+                .per_process
+                .max_inflight_writes
+                .to_string()
+        ),
+        json!("--max-events"),
+        json!(ctx.shard.spec.quotas.per_process.max_events.to_string()),
+        json!("--max-processes"),
+        json!(ctx.shard.spec.packing.max_processes_per_pod.to_string()),
+    ];
+    if let Some(root) = &ctx.shard.spec.packing.cgroup_root {
+        supervisor_args.extend([json!("--cgroup-root"), json!(root)]);
+    }
+    if let Some(max) = &ctx.shard.spec.packing.child_memory_max {
+        supervisor_args.extend([json!("--child-memory-max"), json!(max)]);
+    }
+    if let Some(max) = &ctx.shard.spec.packing.child_cpu_max {
+        supervisor_args.extend([json!("--child-cpu-max"), json!(max)]);
+    }
+    if let Some(dir) = &ctx.shard.spec.packing.log_dir {
+        supervisor_args.extend([
+            json!("--log-dir"),
+            json!(dir),
+            json!("--log-max-bytes"),
+            json!(ctx.shard.spec.packing.log_max_bytes.to_string()),
+            json!("--log-max-files"),
+            json!(ctx.shard.spec.packing.log_max_files.to_string()),
+        ]);
+    }
+
     let supervisor = json!({
         "name": "supervisor",
         "image": ctx.shard.spec.image,
         "imagePullPolicy": ctx.image_pull_policy(),
         "command": ["/usr/local/bin/match_supervisor"],
-        "args": [
-            "--config", "/etc/match/processes.json",
-            "--id", "$(POD_ORDINAL)",
-            "--pod-fqdn", "$(POD_FQDN)",
-            "--data-dir", "/data",
-            "--engine-bin", "/usr/local/bin/matchengine-raft",
-            "--supervisor-addr", "0.0.0.0:9090",
-            "--snapshot-interval-ms", snapshot_ms.to_string(),
-            "--read-policy", ctx.shard.spec.raft.read_policy.as_str(),
-            "--max-inflight-writes", ctx.shard.spec.quotas.per_process.max_inflight_writes.to_string(),
-            "--max-events", ctx.shard.spec.quotas.per_process.max_events.to_string(),
-            "--max-processes", ctx.shard.spec.packing.max_processes_per_pod.to_string(),
-        ],
+        "args": supervisor_args,
         "env": env,
         "ports": ports,
         "resources": resources_json(&ctx.shard.spec.default_process_resources),
@@ -843,6 +899,7 @@ fn container(ctx: &Ctx<'_>, deployment: &SymbolDeployment, symbol: &TradingSymbo
         "command": ["/usr/local/bin/matchengine-raft"],
         "args": [
             "--id", "$(POD_ORDINAL)",
+            "--id-offset", deployment.spec.raft_id_offset.to_string(),
             "--http-addr", format!("$(POD_FQDN):{http_port}"),
             "--data-dir", "/data",
             "--instance-prefix", dns_label(&symbol.name),
@@ -935,7 +992,6 @@ mod tests {
             let shard = catalog.shards.get_mut("fx-eu-02").expect("reserved shard");
             shard.spec.packing.mode = PackingMode::Supervisor;
         }
-
         let before = render_shard(&catalog, "fx-eu-02", &RenderOptions::default()).unwrap();
         let before_sts = object(&before, "StatefulSet");
         let before_template = before_sts["spec"]["template"].clone();
@@ -1004,6 +1060,78 @@ mod tests {
     }
 
     #[test]
+    fn supervisor_render_passes_isolation_and_log_flags() {
+        let mut catalog = demo_catalog();
+        {
+            let shard = catalog.shards.get_mut("fx-eu-02").expect("reserved shard");
+            shard.spec.packing.mode = PackingMode::Supervisor;
+            shard.spec.packing.cgroup_root = Some("/sys/fs/cgroup/match".to_string());
+            shard.spec.packing.child_memory_max = Some("268435456".to_string());
+            shard.spec.packing.child_cpu_max = Some("25000 100000".to_string());
+            shard.spec.packing.log_dir = Some("/data/logs".to_string());
+            shard.spec.packing.log_max_bytes = 1024;
+            shard.spec.packing.log_max_files = 3;
+        }
+        let objects = render_shard(&catalog, "fx-eu-02", &RenderOptions::default()).unwrap();
+        let stateful_set = object(&objects, "StatefulSet");
+        let args = stateful_set["spec"]["template"]["spec"]["containers"][0]["args"]
+            .as_array()
+            .unwrap();
+        for pair in [
+            ["--cgroup-root", "/sys/fs/cgroup/match"],
+            ["--child-memory-max", "268435456"],
+            ["--child-cpu-max", "25000 100000"],
+            ["--log-dir", "/data/logs"],
+            ["--log-max-bytes", "1024"],
+            ["--log-max-files", "3"],
+        ] {
+            assert!(
+                args.windows(2)
+                    .any(|window| window[0] == pair[0] && window[1] == pair[1]),
+                "missing {pair:?} in {args:?}"
+            );
+        }
+        assert!(
+            stateful_set["spec"]["volumeClaimTemplates"][0]["metadata"]
+                .get("labels")
+                .is_none(),
+            "PVC labels are applied by the operator, not the immutable StatefulSet template"
+        );
+    }
+
+    #[test]
+    fn migration_shadow_renders_with_a_distinct_raft_id_range() {
+        let mut catalog = demo_catalog();
+        let mut shadow = catalog.deployments["eurusd-g1"].clone();
+        shadow.name = "eurusd-shadow".to_string();
+        shadow.spec.shard_ref = "fx-eu-02".to_string();
+        shadow.spec.placement = crate::model::Placement {
+            slot: 0,
+            http_port: 21041,
+        };
+        shadow.spec.raft_id_offset = 4;
+        shadow.spec.desired_state = DeploymentState::Shadow;
+        catalog.deployments.insert(shadow.name.clone(), shadow);
+
+        let objects = render_shard(&catalog, "fx-eu-02", &RenderOptions::default()).unwrap();
+        let stateful_set = object(&objects, "StatefulSet");
+        let args = stateful_set["spec"]["template"]["spec"]["containers"][0]["args"]
+            .as_array()
+            .unwrap();
+        assert!(
+            args.windows(2)
+                .any(|pair| { pair[0] == "--id-offset" && pair[1] == "4" })
+        );
+        let processes: Value = serde_json::from_str(
+            object(&objects, "ConfigMap")["data"]["processes.json"]
+                .as_str()
+                .expect("supervisor process list"),
+        )
+        .unwrap();
+        assert_eq!(processes["processes"][0]["raftIdOffset"], 4);
+    }
+
+    #[test]
     fn packed_shard_renders_the_expected_objects() {
         let catalog = demo_catalog();
         let objects = render_shard(&catalog, "fx-eu-01", &RenderOptions::default()).unwrap();
@@ -1030,10 +1158,15 @@ mod tests {
         assert_eq!(containers[0]["name"], "eurusd");
         assert_eq!(containers[1]["name"], "gbpusd");
         assert_eq!(
-            containers[0]["args"][3], "$(POD_FQDN):21001",
+            containers[0]["args"][2], "--id-offset",
+            "migration targets use a distinct Raft ID range"
+        );
+        assert_eq!(containers[0]["args"][3], "0");
+        assert_eq!(
+            containers[0]["args"][5], "$(POD_FQDN):21001",
             "http address uses the stable pod DNS name"
         );
-        assert_eq!(containers[1]["args"][3], "$(POD_FQDN):21002");
+        assert_eq!(containers[1]["args"][5], "$(POD_FQDN):21002");
         assert_eq!(
             sts["spec"]["template"]["spec"]["automountServiceAccountToken"],
             false
@@ -1159,6 +1292,16 @@ mod tests {
         assert_eq!(policy["spec"]["ingress"][2]["ports"][0]["endPort"], 21020);
         assert_eq!(policy["spec"]["egress"][3]["ports"][0]["port"], 21001);
         assert_eq!(policy["spec"]["egress"][3]["ports"][0]["endPort"], 21020);
+        // Migration peers in the same cell may reach each other across shards.
+        let cluster_id = catalog.cells["eu-1"].spec.cluster_id.as_str();
+        assert_eq!(
+            policy["spec"]["ingress"][3]["from"][0]["podSelector"]["matchLabels"]
+                ["matching.io/cluster-id"]
+                .as_str(),
+            Some(cluster_id)
+        );
+        assert!(policy["spec"]["ingress"][3].get("ports").is_none());
+        assert!(policy["spec"]["egress"][4].get("ports").is_none());
     }
 
     #[test]

@@ -13,7 +13,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use futures::StreamExt;
 use k8s_openapi::api::apps::v1::StatefulSet;
 use k8s_openapi::api::coordination::v1::{Lease, LeaseSpec};
-use k8s_openapi::api::core::v1::Pod;
+use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Pod};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{MicroTime, ObjectMeta};
 use k8s_openapi::jiff::Timestamp;
 use kube::Client;
@@ -29,9 +29,10 @@ use tracing::{debug, info, warn};
 use crate::api::{format_bytes, format_cpu};
 use crate::crd::{self, CrdKind, DEFAULT_NAMESPACE, ObjectKey};
 use crate::model::{
-    Condition, DeploymentState, DeploymentStatus, PackingMode, Phase, RouteStatus, ShardClass,
-    ShardNodeStatus, ShardStatus, ShardSymbolStatus, SymbolDeployment, SymbolRoute, SymbolShard,
-    TradingSymbol, TradingSymbolStatus, desired_config_hash,
+    Condition, DeploymentState, DeploymentStatus, PackingMode, Phase, RouteState, RouteStatus,
+    ShardClass, ShardNodeStatus, ShardRolloutStatus, ShardStatus, ShardSymbolStatus,
+    SymbolDeployment, SymbolRoute, SymbolShard, TradingSymbol, TradingSymbolStatus,
+    desired_config_hash,
 };
 use crate::render::{MANAGED_BY, Profile, RenderOptions, render_shard};
 use crate::store::Catalog;
@@ -39,6 +40,8 @@ use crate::validate::per_pod_totals;
 
 const FIELD_MANAGER: &str = "match-engine-operator";
 const LEADER_LABEL: &str = "matching.io/role";
+const RETAIN_UNTIL_ANNOTATION: &str = "matching.io/retain-until";
+const RETAINED_AT_ANNOTATION: &str = "matching.io/retained-at";
 /// Maximum applied-index gap tolerated before promoting new voters.
 const MEMBERSHIP_CATCH_UP_LAG: u64 = 128;
 
@@ -55,6 +58,9 @@ pub struct OperatorOptions {
     pub lease_renew: Duration,
     /// Restrict CRD/workload watches and pruning to one namespace. `None` is cell-wide.
     pub namespace: Option<String>,
+    /// How long orphaned shard PVCs are retained before deletion. `0` marks them for
+    /// manual deletion instead of starting a timer.
+    pub retention_seconds: u64,
     pub dry_run: bool,
 }
 
@@ -109,10 +115,17 @@ pub async fn run(client: Client, options: OperatorOptions) -> Result<()> {
                 membership_changes = stats.membership_changes,
                 config_writes = stats.config_writes,
                 rollouts = stats.rollouts,
+                retention_marks = stats.retention_marks,
+                retention_deletes = stats.retention_deletes,
+                pvc_labels = stats.pvc_labels,
+                migration_actions = stats.migration_actions,
                 action_failures = stats.action_failures,
                 "reconcile complete"
             ),
-            Err(error) => warn!(%error, "reconcile failed; retrying on the next watch/resync"),
+            Err(error) => warn!(
+                error = %format!("{error:#}"),
+                "reconcile failed; retrying on the next watch/resync"
+            ),
         }
     }
 }
@@ -407,6 +420,10 @@ struct ReconcileStats {
     membership_changes: usize,
     config_writes: usize,
     rollouts: usize,
+    retention_marks: usize,
+    retention_deletes: usize,
+    pvc_labels: usize,
+    migration_actions: usize,
     action_failures: usize,
 }
 
@@ -514,6 +531,10 @@ async fn reconcile_once(client: &Client, options: &OperatorOptions) -> Result<Re
             options.namespace.as_deref(),
         )
         .await?;
+        stats.pvc_labels = label_shard_pvcs(client, &view).await?;
+        let (marks, deletes) = reconcile_retention(client, &view, options).await?;
+        stats.retention_marks = marks;
+        stats.retention_deletes = deletes;
     } else {
         info!(
             desired = stats.desired_objects,
@@ -528,6 +549,7 @@ async fn reconcile_once(client: &Client, options: &OperatorOptions) -> Result<Re
         stats.membership_changes = actions.membership_changes;
         stats.config_writes = actions.config_writes;
         stats.action_failures = actions.failures;
+        stats.migration_actions = execute_migrations(client, &view, &observations, options).await?;
         stats.rollouts = rollout_containers(client, &view.catalog, &observations).await?;
         stats.status_writes = write_statuses(client, &view, &observations).await?;
         label_leaders(client, &view.catalog, &observations).await?;
@@ -547,15 +569,43 @@ async fn apply_object(client: &Client, key: &WorkloadKey, object: &Value) -> Res
         &key.kind.api_resource(),
     );
     let params = PatchParams::apply(FIELD_MANAGER).force();
-    api.patch(&key.name, &params, &Patch::Apply(object))
-        .await
-        .with_context(|| {
+    match api.patch(&key.name, &params, &Patch::Apply(object)).await {
+        Ok(_) => Ok(()),
+        Err(error) if key.kind == WorkloadKind::StatefulSet && is_validation_error(&error) => {
+            // A fleet adopted from `kubectl apply` can leave list entries (containers, ports,
+            // env) co-owned by `kubectl-client-side-apply`. Removing a container with SSA then
+            // strips the operator-owned fields but leaves a partial item behind, so the API
+            // rejects the pod template (for example "containers[0].image: Required value").
+            // Merge patch replaces arrays as a whole and migrates the StatefulSet cleanly.
+            warn!(
+                kind = ?key.kind,
+                namespace = %key.namespace,
+                name = %key.name,
+                error = %format!("{error:#}"),
+                "server-side apply failed; retrying StatefulSet with a merge patch"
+            );
+            let params = PatchParams::default();
+            api.patch(&key.name, &params, &Patch::Merge(object))
+                .await
+                .with_context(|| {
+                    format!(
+                        "merge patch {:?} {}/{} after server-side apply failed: {error:#}",
+                        key.kind, key.namespace, key.name
+                    )
+                })?;
+            Ok(())
+        }
+        Err(error) => Err(error).with_context(|| {
             format!(
                 "server-side apply {:?} {}/{}",
                 key.kind, key.namespace, key.name
             )
-        })?;
-    Ok(())
+        }),
+    }
+}
+
+fn is_validation_error(error: &kube::Error) -> bool {
+    matches!(error, kube::Error::Api(response) if response.code == 422)
 }
 
 async fn prune_objects(
@@ -627,6 +677,8 @@ async fn prune_objects(
 #[derive(Debug, Clone, Default)]
 pub struct PodObservation {
     pub pod: u8,
+    /// Raft node ID reported by `/health`; defaults to the pod ordinal when absent.
+    pub raft_id: Option<u64>,
     pub healthy: bool,
     pub ready: bool,
     pub is_leader: bool,
@@ -664,6 +716,8 @@ struct HealthProbe {
     healthy: bool,
     #[serde(default)]
     ready: bool,
+    #[serde(default)]
+    node_id: Option<u64>,
     #[serde(default)]
     leadership: LeadershipProbe,
     #[serde(default)]
@@ -845,6 +899,7 @@ async fn observe_pod(
         .unwrap_or(false);
     PodObservation {
         pod,
+        raft_id: probe.node_id.or(Some(u64::from(pod))),
         healthy: probe.healthy,
         ready: probe.healthy && probe.ready,
         is_leader: probe.leadership.is_leader,
@@ -880,7 +935,7 @@ pub fn deployment_observation(
         .map(|pod| pod.pod)
         .or_else(|| {
             pods.iter()
-                .find(|pod| pod.leader_id == Some(u64::from(pod.pod)))
+                .find(|pod| pod.leader_id == pod.raft_id.or(Some(u64::from(pod.pod))))
                 .map(|pod| pod.pod)
         });
     let leader = leader_pod.and_then(|leader| pods.iter().find(|pod| pod.pod == leader));
@@ -965,10 +1020,11 @@ fn process_url(shard: &SymbolShard, deployment: &SymbolDeployment, pod: u8, path
 }
 
 fn voter_endpoints(shard: &SymbolShard, deployment: &SymbolDeployment) -> Vec<(u64, String)> {
+    let offset = deployment.spec.raft_id_offset;
     (0..shard.spec.replicas)
         .map(|pod| {
             (
-                u64::from(pod),
+                offset.saturating_add(u64::from(pod)),
                 format!(
                     "{}-{pod}.{}-headless.{}.svc.cluster.local:{}",
                     shard.name,
@@ -1022,7 +1078,7 @@ async fn actuate_catalog(
     let mut stats = ActuationStats::default();
     for shard in catalog.shards.values() {
         for deployment in catalog.shard_deployments(&shard.name) {
-            if deployment.spec.desired_state == DeploymentState::Disabled {
+            if deployment.spec.desired_state != DeploymentState::Active {
                 continue;
             }
             let Some(observation) = observations.get(&deployment.name) else {
@@ -1033,7 +1089,20 @@ async fn actuate_catalog(
             {
                 continue;
             }
-            let desired: BTreeSet<u64> = (0..shard.spec.replicas).map(u64::from).collect();
+            // An initialised source in an in-flight migration must not be re-actuated:
+            // the migration controller temporarily moves its voter set to the target.
+            // Before the source has voters/configuration, still allow /init and
+            // ConfigureSymbol so a shadow can be created concurrently.
+            if migration_source(catalog, deployment)
+                && (!observation.voters.is_empty() || !observation.learners.is_empty())
+                && observation.configured
+            {
+                continue;
+            }
+            let offset = deployment.spec.raft_id_offset;
+            let desired: BTreeSet<u64> = (0..shard.spec.replicas)
+                .map(|pod| offset.saturating_add(u64::from(pod)))
+                .collect();
             let voters: BTreeSet<u64> = observation.voters.iter().copied().collect();
             let learners: BTreeSet<u64> = observation.learners.iter().copied().collect();
             let known: BTreeSet<u64> = voters.union(&learners).copied().collect();
@@ -1101,7 +1170,7 @@ async fn actuate_catalog(
                 for pod in observation
                     .pods
                     .iter()
-                    .filter(|pod| desired.contains(&u64::from(pod.pod)))
+                    .filter(|pod| desired.contains(&pod.raft_id.unwrap_or(u64::from(pod.pod))))
                 {
                     let (Some(applied), Some(last)) = (pod.applied_index, pod.last_log_index)
                     else {
@@ -1195,6 +1264,780 @@ async fn actuate_catalog(
         }
     }
     stats
+}
+
+/// Executes a single migration transition per shard/symbol per reconcile.
+///
+/// Forward: add the target's offset IDs as learners to the source leader, wait for catch-up,
+/// change membership, then switch the route and drain the source. Reverse (`state: Rollback`):
+/// add the source IDs back to the target leader, wait, change membership back, restore the route
+/// and disable the target. The source PVCs are retained throughout.
+async fn execute_migrations(
+    client: &Client,
+    view: &CrdView,
+    observations: &Observations,
+    options: &OperatorOptions,
+) -> Result<usize> {
+    let http = reqwest::Client::new();
+    let mut actions = finish_cutovers(client, view, observations).await?;
+    actions += rollback_migrations(client, view, observations, options).await?;
+
+    for deployment in view.catalog.deployments.values() {
+        if deployment.spec.desired_state != DeploymentState::Shadow {
+            continue;
+        }
+        let Some(route) = view.catalog.routes.values().find(|route| {
+            route.spec.symbol_ref == deployment.spec.symbol_ref
+                && route.spec.active_deployment_ref != deployment.name
+        }) else {
+            continue;
+        };
+        if route.spec.state == RouteState::Rollback {
+            continue;
+        }
+        let Some(source) = view
+            .catalog
+            .deployments
+            .get(&route.spec.active_deployment_ref)
+        else {
+            continue;
+        };
+        if !matches!(
+            source.spec.desired_state,
+            DeploymentState::Active | DeploymentState::Draining
+        ) || source.spec.shard_ref == deployment.spec.shard_ref
+        {
+            continue;
+        }
+        let (Some(source_shard), Some(target_shard)) = (
+            view.catalog.shards.get(&source.spec.shard_ref),
+            view.catalog.shards.get(&deployment.spec.shard_ref),
+        ) else {
+            continue;
+        };
+        if source_shard.spec.cell != target_shard.spec.cell {
+            warn!(
+                symbol = %route.spec.symbol_ref,
+                "cross-cell migration is not supported by the Raft membership controller"
+            );
+            continue;
+        }
+        let (Some(source_obs), Some(target_obs)) = (
+            observations.get(&source.name),
+            observations.get(&deployment.name),
+        ) else {
+            continue;
+        };
+        if target_obs.pods.len() != target_shard.spec.replicas as usize
+            || !target_obs.pods.iter().all(|pod| pod.healthy)
+        {
+            continue;
+        }
+        let source_ids = deployment_ids(source, source_shard.spec.replicas);
+        let target_ids = deployment_ids(deployment, target_shard.spec.replicas);
+        let source_set: BTreeSet<u64> = source_ids.iter().copied().collect();
+        let target_set: BTreeSet<u64> = target_ids.iter().copied().collect();
+        let source_voters: BTreeSet<u64> = source_obs.voters.iter().copied().collect();
+        let target_voters: BTreeSet<u64> = target_obs.voters.iter().copied().collect();
+
+        if target_voters == target_set && target_obs.leader_pod.is_some() {
+            patch_spec(
+                client,
+                CrdKind::Route,
+                &route.namespace,
+                &route.name,
+                json!({
+                    "activeDeploymentRef": deployment.name,
+                    "previousDeploymentRef": source.name,
+                    "state": "Cutover"
+                }),
+            )
+            .await?;
+            actions += 1;
+            info!(
+                symbol = %route.spec.symbol_ref,
+                source = %source.name,
+                target = %deployment.name,
+                "migration target is caught up; route moved to Cutover"
+            );
+            continue;
+        }
+        if source_voters == target_set {
+            info!(
+                symbol = %route.spec.symbol_ref,
+                target = %deployment.name,
+                "waiting for the target group to elect a leader after membership change"
+            );
+            continue;
+        }
+        if !source_voters.is_empty() && source_voters != source_set {
+            warn!(
+                symbol = %route.spec.symbol_ref,
+                source = %source.name,
+                voters = ?source_voters,
+                "source membership is not the source generation; refusing automatic migration"
+            );
+            continue;
+        }
+        let Some(leader) = source_obs.leader_pod else {
+            continue;
+        };
+        let known: BTreeSet<u64> = source_obs
+            .voters
+            .iter()
+            .chain(source_obs.learners.iter())
+            .copied()
+            .collect();
+        let missing: Vec<u64> = target_set.difference(&known).copied().collect();
+        if !missing.is_empty() {
+            let endpoints = voter_endpoints(target_shard, deployment);
+            for id in missing {
+                let Some((_, address)) = endpoints.iter().find(|(candidate, _)| *candidate == id)
+                else {
+                    continue;
+                };
+                match post_json(
+                    &http,
+                    &process_url(source_shard, source, leader, "add-learner"),
+                    &json!([id, address]),
+                    options.observe_timeout,
+                )
+                .await
+                {
+                    Ok(_) => {
+                        actions += 1;
+                        info!(
+                            symbol = %route.spec.symbol_ref,
+                            source = %source.name,
+                            target = %deployment.name,
+                            node = id,
+                            "added migration target as a learner"
+                        );
+                    }
+                    Err(error) => warn!(
+                        symbol = %route.spec.symbol_ref,
+                        node = id,
+                        %error,
+                        "add migration learner failed"
+                    ),
+                }
+            }
+            continue;
+        }
+
+        let Some(symbol) = view.catalog.symbols.get(&deployment.spec.symbol_ref) else {
+            continue;
+        };
+        let desired = desired_symbol_config(symbol);
+        if !target_obs
+            .pods
+            .iter()
+            .all(|pod| pod.symbol_config.as_ref() == Some(&desired))
+        {
+            info!(
+                symbol = %route.spec.symbol_ref,
+                target = %deployment.name,
+                "waiting for the migration target to apply the symbol configuration"
+            );
+            continue;
+        }
+        let Some((min_applied, max_log)) = observed_indices(target_obs, &target_ids) else {
+            continue;
+        };
+        if max_log.saturating_sub(min_applied) > MEMBERSHIP_CATCH_UP_LAG {
+            info!(
+                symbol = %route.spec.symbol_ref,
+                target = %deployment.name,
+                min_applied,
+                max_log,
+                "waiting for migration target catch-up"
+            );
+            continue;
+        }
+        match post_json(
+            &http,
+            &process_url(source_shard, source, leader, "change-membership"),
+            &json!(target_ids),
+            options.observe_timeout,
+        )
+        .await
+        {
+            Ok(_) => {
+                actions += 1;
+                info!(
+                    symbol = %route.spec.symbol_ref,
+                    source = %source.name,
+                    target = %deployment.name,
+                    "changed membership to migration target voters"
+                );
+            }
+            Err(error) => warn!(
+                symbol = %route.spec.symbol_ref,
+                target = %deployment.name,
+                %error,
+                "migration membership change failed"
+            ),
+        }
+    }
+    Ok(actions)
+}
+
+async fn finish_cutovers(
+    client: &Client,
+    view: &CrdView,
+    observations: &Observations,
+) -> Result<usize> {
+    let mut actions = 0;
+    for route in view.catalog.routes.values() {
+        if route.spec.state != RouteState::Cutover {
+            continue;
+        }
+        let Some(previous) = route.spec.previous_deployment_ref.as_deref() else {
+            warn!(route = %route.name, "cutover route has no previousDeploymentRef");
+            continue;
+        };
+        let (Some(source), Some(target)) = (
+            view.catalog.deployments.get(previous),
+            view.catalog
+                .deployments
+                .get(&route.spec.active_deployment_ref),
+        ) else {
+            continue;
+        };
+        let Some(target_obs) = observations.get(&target.name) else {
+            continue;
+        };
+        if target_obs.leader_pod.is_none() {
+            info!(target = %target.name, "waiting for the cutover target leader");
+            continue;
+        }
+        if target.spec.desired_state != DeploymentState::Active {
+            patch_spec(
+                client,
+                CrdKind::Deployment,
+                &target.namespace,
+                &target.name,
+                json!({ "desiredState": "Active" }),
+            )
+            .await?;
+            actions += 1;
+        }
+        if source.spec.desired_state != DeploymentState::Draining {
+            patch_spec(
+                client,
+                CrdKind::Deployment,
+                &source.namespace,
+                &source.name,
+                json!({ "desiredState": "Draining" }),
+            )
+            .await?;
+            actions += 1;
+        }
+        patch_spec(
+            client,
+            CrdKind::Route,
+            &route.namespace,
+            &route.name,
+            json!({ "state": "Active" }),
+        )
+        .await?;
+        actions += 1;
+        info!(
+            symbol = %route.spec.symbol_ref,
+            source = %source.name,
+            target = %target.name,
+            "migration cutover complete; source is draining"
+        );
+    }
+    Ok(actions)
+}
+
+async fn rollback_migrations(
+    client: &Client,
+    view: &CrdView,
+    observations: &Observations,
+    options: &OperatorOptions,
+) -> Result<usize> {
+    let http = reqwest::Client::new();
+    let mut actions = 0;
+    for route in view.catalog.routes.values() {
+        if route.spec.state != RouteState::Rollback {
+            continue;
+        }
+        let Some(previous) = route.spec.previous_deployment_ref.as_deref() else {
+            warn!(route = %route.name, "rollback requested without previousDeploymentRef");
+            continue;
+        };
+        let (Some(source), Some(target)) = (
+            view.catalog.deployments.get(previous),
+            view.catalog
+                .deployments
+                .get(&route.spec.active_deployment_ref),
+        ) else {
+            continue;
+        };
+        let (Some(source_shard), Some(target_shard)) = (
+            view.catalog.shards.get(&source.spec.shard_ref),
+            view.catalog.shards.get(&target.spec.shard_ref),
+        ) else {
+            continue;
+        };
+        let source_ids = deployment_ids(source, source_shard.spec.replicas);
+        let target_ids = deployment_ids(target, target_shard.spec.replicas);
+        let source_set: BTreeSet<u64> = source_ids.iter().copied().collect();
+        let target_set: BTreeSet<u64> = target_ids.iter().copied().collect();
+
+        if source.spec.desired_state == DeploymentState::Disabled {
+            patch_spec(
+                client,
+                CrdKind::Deployment,
+                &source.namespace,
+                &source.name,
+                json!({
+                    "desiredState": "Active"
+                }),
+            )
+            .await?;
+            actions += 1;
+            info!(source = %source.name, "starting the rollback source deployment");
+            continue;
+        }
+        let (Some(source_obs), Some(target_obs)) = (
+            observations.get(&source.name),
+            observations.get(&target.name),
+        ) else {
+            continue;
+        };
+        let source_voters: BTreeSet<u64> = source_obs.voters.iter().copied().collect();
+        let target_voters: BTreeSet<u64> = target_obs.voters.iter().copied().collect();
+        if source_voters == source_set && source_obs.leader_pod.is_some() {
+            patch_spec(
+                client,
+                CrdKind::Route,
+                &route.namespace,
+                &route.name,
+                json!({
+                    "activeDeploymentRef": previous,
+                    "previousDeploymentRef": null,
+                    "state": "Active"
+                }),
+            )
+            .await?;
+            patch_spec(
+                client,
+                CrdKind::Deployment,
+                &source.namespace,
+                &source.name,
+                json!({
+                    "desiredState": "Active"
+                }),
+            )
+            .await?;
+            patch_spec(
+                client,
+                CrdKind::Deployment,
+                &target.namespace,
+                &target.name,
+                json!({
+                    "desiredState": "Disabled"
+                }),
+            )
+            .await?;
+            actions += 3;
+            info!(
+                symbol = %route.spec.symbol_ref,
+                source = %source.name,
+                target = %target.name,
+                "migration rollback complete"
+            );
+            continue;
+        }
+        if target_voters == source_set {
+            info!(
+                symbol = %route.spec.symbol_ref,
+                source = %source.name,
+                "waiting for the rollback source group to elect a leader"
+            );
+            continue;
+        }
+        if !target_voters.is_empty() && target_voters != target_set {
+            warn!(
+                symbol = %route.spec.symbol_ref,
+                target = %target.name,
+                voters = ?target_voters,
+                "target membership is not the target generation; refusing rollback"
+            );
+            continue;
+        }
+        let Some(leader) = target_obs.leader_pod else {
+            continue;
+        };
+        let known: BTreeSet<u64> = target_obs
+            .voters
+            .iter()
+            .chain(target_obs.learners.iter())
+            .copied()
+            .collect();
+        let missing: Vec<u64> = source_set.difference(&known).copied().collect();
+        if !missing.is_empty() {
+            let endpoints = voter_endpoints(source_shard, source);
+            for id in missing {
+                let Some((_, address)) = endpoints.iter().find(|(candidate, _)| *candidate == id)
+                else {
+                    continue;
+                };
+                match post_json(
+                    &http,
+                    &process_url(target_shard, target, leader, "add-learner"),
+                    &json!([id, address]),
+                    options.observe_timeout,
+                )
+                .await
+                {
+                    Ok(_) => {
+                        actions += 1;
+                        info!(
+                            symbol = %route.spec.symbol_ref,
+                            target = %target.name,
+                            node = id,
+                            "added rollback source as a learner"
+                        );
+                    }
+                    Err(error) => warn!(
+                        symbol = %route.spec.symbol_ref,
+                        node = id,
+                        %error,
+                        "add rollback learner failed"
+                    ),
+                }
+            }
+            continue;
+        }
+        let Some((min_applied, max_log)) = observed_indices(source_obs, &source_ids) else {
+            continue;
+        };
+        if max_log.saturating_sub(min_applied) > MEMBERSHIP_CATCH_UP_LAG {
+            info!(
+                symbol = %route.spec.symbol_ref,
+                source = %source.name,
+                min_applied,
+                max_log,
+                "waiting for rollback source catch-up"
+            );
+            continue;
+        }
+        match post_json(
+            &http,
+            &process_url(target_shard, target, leader, "change-membership"),
+            &json!(source_ids),
+            options.observe_timeout,
+        )
+        .await
+        {
+            Ok(_) => {
+                actions += 1;
+                info!(
+                    symbol = %route.spec.symbol_ref,
+                    source = %source.name,
+                    target = %target.name,
+                    "changed membership back to rollback source voters"
+                );
+            }
+            Err(error) => warn!(
+                symbol = %route.spec.symbol_ref,
+                %error,
+                "rollback membership change failed"
+            ),
+        }
+    }
+    Ok(actions)
+}
+
+fn migration_source(catalog: &Catalog, deployment: &SymbolDeployment) -> bool {
+    let previous = catalog.routes.values().any(|route| {
+        route.spec.previous_deployment_ref.as_deref() == Some(deployment.name.as_str())
+            && route.spec.active_deployment_ref != deployment.name
+    });
+    previous
+        || catalog.deployments.values().any(|candidate| {
+            candidate.spec.desired_state == DeploymentState::Shadow
+                && candidate.spec.symbol_ref == deployment.spec.symbol_ref
+                && candidate.spec.shard_ref != deployment.spec.shard_ref
+        })
+}
+
+fn deployment_ids(deployment: &SymbolDeployment, replicas: u8) -> Vec<u64> {
+    let offset = deployment.spec.raft_id_offset;
+    (0..replicas)
+        .map(|pod| offset.saturating_add(u64::from(pod)))
+        .collect()
+}
+
+fn observed_indices(observation: &DeploymentObservation, ids: &[u64]) -> Option<(u64, u64)> {
+    let wanted: BTreeSet<u64> = ids.iter().copied().collect();
+    let mut min_applied = u64::MAX;
+    let mut max_log = 0;
+    let mut found = 0;
+    for pod in &observation.pods {
+        let id = pod.raft_id.unwrap_or(u64::from(pod.pod));
+        if !wanted.contains(&id) {
+            continue;
+        }
+        let applied = pod.applied_index?;
+        let last = pod.last_log_index?;
+        min_applied = min_applied.min(applied);
+        max_log = max_log.max(last);
+        found += 1;
+    }
+    (found == wanted.len()).then_some((min_applied, max_log))
+}
+
+async fn patch_spec(
+    client: &Client,
+    kind: CrdKind,
+    namespace: &str,
+    name: &str,
+    spec: Value,
+) -> Result<()> {
+    let namespace = namespace_or_default(namespace);
+    let api =
+        Api::<DynamicObject>::namespaced_with(client.clone(), namespace, &kind.api_resource());
+    api.patch(
+        name,
+        &PatchParams::default(),
+        &Patch::Merge(json!({ "spec": spec })),
+    )
+    .await
+    .with_context(|| format!("patch {:?} spec {namespace}/{name}", kind))?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetentionAction {
+    /// Mark the PVC for manual deletion instead of starting a timer.
+    MarkManual,
+    /// Start or continue the retention timer at this Unix-second deadline.
+    MarkAt(u64),
+    /// Still inside the window or intentionally retained.
+    Keep,
+    /// The window has elapsed; delete the PVC.
+    Delete,
+}
+
+fn retention_action(annotation: Option<&str>, now: u64, window: u64) -> RetentionAction {
+    match annotation {
+        Some("manual") => RetentionAction::Keep,
+        Some(value) => match value.parse::<u64>() {
+            Ok(deadline) if now >= deadline => RetentionAction::Delete,
+            Ok(_) => RetentionAction::Keep,
+            Err(_) => RetentionAction::Keep,
+        },
+        None if window == 0 => RetentionAction::MarkManual,
+        None => RetentionAction::MarkAt(now.saturating_add(window)),
+    }
+}
+
+/// Applies the standard shard labels to PVCs created by the StatefulSet.
+///
+/// The PVC template deliberately carries no labels so an existing StatefulSet can be adopted
+/// without an immutable `volumeClaimTemplates` update. The operator labels the PVCs after
+/// creation; retention then has the durable `matching.io/shard` selector it needs.
+async fn label_shard_pvcs(client: &Client, view: &CrdView) -> Result<usize> {
+    let mut writes = 0;
+    for shard in view.catalog.shards.values() {
+        let namespace = namespace_or_default(&shard.namespace);
+        let api = Api::<PersistentVolumeClaim>::namespaced(client.clone(), namespace);
+        let cluster_id = view
+            .catalog
+            .cells
+            .get(&shard.spec.cell)
+            .map(|cell| cell.spec.cluster_id.clone())
+            .unwrap_or_default();
+        let desired = BTreeMap::from([
+            (
+                "app.kubernetes.io/name".to_string(),
+                "match-engine".to_string(),
+            ),
+            ("app.kubernetes.io/instance".to_string(), shard.name.clone()),
+            (
+                "app.kubernetes.io/managed-by".to_string(),
+                MANAGED_BY.to_string(),
+            ),
+            ("matching.io/shard".to_string(), shard.name.clone()),
+            ("matching.io/cluster".to_string(), shard.name.clone()),
+            ("matching.io/cell".to_string(), shard.spec.cell.clone()),
+            ("matching.io/cluster-id".to_string(), cluster_id),
+            (
+                "matching.io/environment".to_string(),
+                shard.spec.environment.clone(),
+            ),
+        ]);
+        for pod in 0..shard.spec.replicas {
+            let name = format!("data-{}-{pod}", shard.name);
+            let pvc = match api.get(&name).await {
+                Ok(pvc) => pvc,
+                Err(kube::Error::Api(error)) if error.code == 404 => continue,
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("get PVC {namespace}/{name} for labeling"));
+                }
+            };
+            let labels = pvc.metadata.labels.clone().unwrap_or_default();
+            if desired
+                .iter()
+                .all(|(key, value)| labels.get(key) == Some(value))
+            {
+                continue;
+            }
+            let patch = json!({ "metadata": { "labels": &desired } });
+            api.patch(&name, &PatchParams::default(), &Patch::Merge(patch))
+                .await
+                .with_context(|| format!("label PVC {namespace}/{name}"))?;
+            writes += 1;
+        }
+    }
+    Ok(writes)
+}
+
+/// Marks orphaned shard PVCs and deletes them after the configured retention window.
+///
+/// The PVC annotation is the durable retention record: deleting the `SymbolShard` CR removes the
+/// only catalog pointer, but the PVCs remain labeled and carry their own deadline. A shard that
+/// reappears clears the marker, so a transient list/read failure cannot delete live data.
+async fn reconcile_retention(
+    client: &Client,
+    view: &CrdView,
+    options: &OperatorOptions,
+) -> Result<(usize, usize)> {
+    let api = match options.namespace.as_deref() {
+        Some(namespace) => Api::<PersistentVolumeClaim>::namespaced(client.clone(), namespace),
+        None => Api::<PersistentVolumeClaim>::all(client.clone()),
+    };
+    let pvcs = api
+        .list(&ListParams::default().labels("app.kubernetes.io/managed-by=match-engine-operator"))
+        .await
+        .context("list retained PVCs")?;
+    let now = crate::store::now_epoch();
+    let mut marks = 0;
+    let mut deletes = 0;
+    for pvc in pvcs.items {
+        let Some(name) = pvc.metadata.name.as_deref() else {
+            continue;
+        };
+        let Some(shard) = pvc
+            .metadata
+            .labels
+            .as_ref()
+            .and_then(|labels| labels.get("matching.io/shard"))
+        else {
+            continue;
+        };
+        let namespace = pvc
+            .metadata
+            .namespace
+            .as_deref()
+            .unwrap_or(DEFAULT_NAMESPACE);
+        let api = Api::<PersistentVolumeClaim>::namespaced(client.clone(), namespace);
+        let annotations = pvc.metadata.annotations.as_ref();
+        let retained = annotations.and_then(|values| values.get(RETAIN_UNTIL_ANNOTATION));
+
+        if view.catalog.shards.contains_key(shard) {
+            if retained.is_some() {
+                let patch = json!({
+                    "metadata": {
+                        "annotations": {
+                            RETAIN_UNTIL_ANNOTATION: null,
+                            RETAINED_AT_ANNOTATION: null
+                        }
+                    }
+                });
+                api.patch(name, &PatchParams::default(), &Patch::Merge(patch))
+                    .await
+                    .with_context(|| format!("clear PVC retention on {namespace}/{name}"))?;
+                marks += 1;
+                info!(
+                    namespace,
+                    name, shard, "cancelled PVC retention because the shard exists again"
+                );
+            }
+            continue;
+        }
+        if pvc.metadata.deletion_timestamp.is_some() {
+            continue;
+        }
+        // Do not start the retention clock while the workload still exists. This
+        // protects against a transient CR-list gap and lets the operator prune the
+        // StatefulSet (and release its pods) before touching its PVCs.
+        match Api::<StatefulSet>::namespaced(client.clone(), namespace)
+            .get(shard)
+            .await
+        {
+            Ok(_) => continue,
+            Err(kube::Error::Api(error)) if error.code == 404 => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("get StatefulSet {namespace}/{shard} for retention"));
+            }
+        }
+
+        match retention_action(retained.map(String::as_str), now, options.retention_seconds) {
+            RetentionAction::Keep => {}
+            RetentionAction::MarkManual => {
+                let patch = json!({
+                    "metadata": {
+                        "annotations": {
+                            RETAIN_UNTIL_ANNOTATION: "manual",
+                            RETAINED_AT_ANNOTATION: now.to_string()
+                        }
+                    }
+                });
+                api.patch(name, &PatchParams::default(), &Patch::Merge(patch))
+                    .await
+                    .with_context(|| format!("mark PVC retention on {namespace}/{name}"))?;
+                marks += 1;
+                info!(
+                    namespace,
+                    name, shard, "marked orphaned PVC for manual retention"
+                );
+            }
+            RetentionAction::MarkAt(deadline) => {
+                let patch = json!({
+                    "metadata": {
+                        "annotations": {
+                            RETAIN_UNTIL_ANNOTATION: deadline.to_string(),
+                            RETAINED_AT_ANNOTATION: now.to_string()
+                        }
+                    }
+                });
+                api.patch(name, &PatchParams::default(), &Patch::Merge(patch))
+                    .await
+                    .with_context(|| format!("mark PVC retention on {namespace}/{name}"))?;
+                marks += 1;
+                info!(
+                    namespace,
+                    name,
+                    shard,
+                    retain_until = deadline,
+                    "marked orphaned PVC for retention"
+                );
+            }
+            RetentionAction::Delete => match api.delete(name, &DeleteParams::default()).await {
+                Ok(_) => {
+                    deletes += 1;
+                    info!(
+                        namespace,
+                        name, shard, "deleted PVC after the retention window"
+                    );
+                }
+                Err(kube::Error::Api(error)) if error.code == 404 => {}
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("delete retained PVC {namespace}/{name}"));
+                }
+            },
+        }
+    }
+    Ok((marks, deletes))
 }
 
 async fn rollout_containers(
@@ -1561,11 +2404,72 @@ fn route_status(
     status
 }
 
+async fn rollout_statuses(
+    client: &Client,
+    catalog: &Catalog,
+) -> Result<BTreeMap<String, ShardRolloutStatus>> {
+    let mut statuses = BTreeMap::new();
+    for shard in catalog.shards.values() {
+        let namespace = namespace_or_default(&shard.namespace);
+        let api = Api::<StatefulSet>::namespaced(client.clone(), namespace);
+        let stateful_set = match api.get(&shard.name).await {
+            Ok(stateful_set) => stateful_set,
+            Err(kube::Error::Api(error)) if error.code == 404 => continue,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "get StatefulSet {namespace}/{} for rollout status",
+                        shard.name
+                    )
+                });
+            }
+        };
+        let updated = stateful_set
+            .status
+            .as_ref()
+            .and_then(|status| status.updated_replicas)
+            .unwrap_or(0);
+        let ready = stateful_set
+            .status
+            .as_ref()
+            .and_then(|status| status.ready_replicas)
+            .unwrap_or(0);
+        statuses.insert(
+            shard.name.clone(),
+            shard_rollout_status(
+                u16::from(shard.spec.replicas),
+                updated.max(0) as u32,
+                ready.max(0) as u32,
+            ),
+        );
+    }
+    Ok(statuses)
+}
+
+fn shard_rollout_status(replicas: u16, updated: u32, ready: u32) -> ShardRolloutStatus {
+    let replicas = u32::from(replicas);
+    let updated = updated.min(replicas);
+    let ready = ready.min(replicas);
+    let percent = if replicas == 0 {
+        100
+    } else {
+        ((updated * 100) / replicas) as u8
+    };
+    ShardRolloutStatus {
+        updated_replicas: updated,
+        ready_replicas: ready,
+        replicas,
+        percent,
+        complete: updated == replicas && ready == replicas,
+    }
+}
+
 fn shard_status(
     shard: &SymbolShard,
     catalog: &Catalog,
     observations: &Observations,
     observed_generation: u64,
+    rollout: Option<&ShardRolloutStatus>,
 ) -> ShardStatus {
     let deployments = catalog.shard_deployments(&shard.name);
     let active: Vec<&SymbolDeployment> = deployments
@@ -1651,7 +2555,7 @@ fn shard_status(
             },
         )
     };
-    let progress = if phase == Phase::Ready {
+    let progress = if phase == Phase::Ready && rollout.is_none_or(|rollout| rollout.complete) {
         Condition::false_("Progressing", "Settled")
     } else {
         Condition::true_("Progressing")
@@ -1668,6 +2572,7 @@ fn shard_status(
         },
         symbols,
         nodes,
+        rollout: rollout.cloned(),
         conditions: vec![ready, progress],
     }
 }
@@ -1698,13 +2603,20 @@ async fn write_statuses(
     observations: &Observations,
 ) -> Result<usize> {
     let catalog = &view.catalog;
+    let rollouts = rollout_statuses(client, catalog).await?;
     let mut writes = 0;
     for shard in catalog.shards.values() {
         let generation = view
             .object(CrdKind::Shard, &shard.namespace, &shard.name)
             .and_then(|object| object.metadata.generation)
             .unwrap_or(0) as u64;
-        let status = shard_status(shard, catalog, observations, generation);
+        let status = shard_status(
+            shard,
+            catalog,
+            observations,
+            generation,
+            rollouts.get(&shard.name),
+        );
         writes += write_status(
             client,
             view,
@@ -1794,6 +2706,17 @@ async fn write_status<T: serde::Serialize>(
         .await
     {
         Ok(_) => Ok(1),
+        Err(kube::Error::Api(error)) if error.code == 409 => {
+            // A spec patch in this reconcile changed the resourceVersion; the next
+            // reconcile writes the status against the fresh object.
+            debug!(
+                ?kind,
+                namespace,
+                name,
+                "status update conflicts with a spec change; retrying next reconcile"
+            );
+            Ok(0)
+        }
         Err(error) => {
             warn!(?kind, namespace, name, %error, "status update failed");
             Ok(0)
@@ -1947,7 +2870,7 @@ mod tests {
             ("eurusd-g1".to_string(), observation(true, Some(0))),
             ("gbpusd-g1".to_string(), observation(true, Some(1))),
         ]);
-        let status = shard_status(&shard, &catalog, &observations, 3);
+        let status = shard_status(&shard, &catalog, &observations, 3, None);
         assert_eq!(status.observed_generation, 3);
         assert_eq!(status.phase, Phase::Ready);
         assert_eq!(status.members_per_process, 4);
@@ -1959,6 +2882,23 @@ mod tests {
             "no per-pod rows in the synthetic observation"
         );
         assert_eq!(status.nodes.len(), 4);
+    }
+
+    #[test]
+    fn rollout_percentage_tracks_updated_pods_and_readiness() {
+        let half = shard_rollout_status(4, 2, 2);
+        assert_eq!(half.percent, 50);
+        assert_eq!(half.updated_replicas, 2);
+        assert!(!half.complete);
+
+        let finalizing = shard_rollout_status(4, 4, 3);
+        assert_eq!(finalizing.percent, 100);
+        assert_eq!(finalizing.ready_replicas, 3);
+        assert!(!finalizing.complete);
+
+        let done = shard_rollout_status(4, 4, 4);
+        assert_eq!(done.percent, 100);
+        assert!(done.complete);
     }
 
     #[test]
@@ -1999,11 +2939,83 @@ mod tests {
                 deployment_observation(&shard, &deployment, pods, Some(&desired)),
             );
         }
-        let status = shard_status(&shard, &catalog, &observations, 1);
+        let status = shard_status(&shard, &catalog, &observations, 1, None);
         assert_eq!(status.phase, Phase::Ready);
         assert_eq!(status.nodes.len(), 4);
         assert!(status.nodes.iter().all(|node| node.ready));
         assert_eq!(status.nodes[0].processes, 2);
+
+        let rolling = shard_rollout_status(4, 2, 2);
+        let status = shard_status(&shard, &catalog, &observations, 1, Some(&rolling));
+        assert_eq!(status.phase, Phase::Ready);
+        assert!(
+            status
+                .conditions
+                .iter()
+                .any(|condition| condition.kind == "Progressing" && condition.status == "True"),
+            "an active engines-ready shard is still progressing while pods update"
+        );
+
+        let done = shard_rollout_status(4, 4, 4);
+        let status = shard_status(&shard, &catalog, &observations, 1, Some(&done));
+        assert!(
+            status
+                .conditions
+                .iter()
+                .any(|condition| condition.kind == "Progressing" && condition.status == "False"),
+            "the rollout settles only when every pod is updated and ready"
+        );
+    }
+
+    #[test]
+    fn migration_ids_and_catch_up_use_raft_ids() {
+        let catalog = demo_catalog();
+        let mut deployment = catalog.deployments["eurusd-g1"].clone();
+        deployment.spec.raft_id_offset = 4;
+        assert_eq!(deployment_ids(&deployment, 4), vec![4, 5, 6, 7]);
+
+        let observation = DeploymentObservation {
+            pods: (0..4)
+                .map(|pod| PodObservation {
+                    pod,
+                    raft_id: Some(4 + u64::from(pod)),
+                    applied_index: Some(10),
+                    last_log_index: Some(10),
+                    ..PodObservation::default()
+                })
+                .collect(),
+            ..DeploymentObservation::default()
+        };
+        assert_eq!(
+            observed_indices(&observation, &[4, 5, 6, 7]),
+            Some((10, 10))
+        );
+        let mut lagging = observation.clone();
+        lagging.pods[0].applied_index = Some(1);
+        assert_eq!(observed_indices(&lagging, &[4, 5, 6, 7]), Some((1, 10)));
+        assert_eq!(observed_indices(&observation, &[4, 5, 8]), None);
+    }
+
+    #[test]
+    fn retention_window_marks_then_deletes() {
+        assert_eq!(retention_action(None, 100, 0), RetentionAction::MarkManual);
+        assert_eq!(
+            retention_action(None, 100, 60),
+            RetentionAction::MarkAt(160)
+        );
+        assert_eq!(retention_action(Some("160"), 100, 0), RetentionAction::Keep);
+        assert_eq!(
+            retention_action(Some("100"), 100, 0),
+            RetentionAction::Delete
+        );
+        assert_eq!(
+            retention_action(Some("manual"), 100, 60),
+            RetentionAction::Keep
+        );
+        assert_eq!(
+            retention_action(Some("bad"), 100, 60),
+            RetentionAction::Keep
+        );
     }
 
     #[test]
@@ -2018,6 +3030,7 @@ mod tests {
             lease_duration: Duration::from_secs(15),
             lease_renew: Duration::from_secs(5),
             namespace: None,
+            retention_seconds: 0,
             dry_run: false,
         };
         assert!(base.validate().is_ok());
@@ -2073,6 +3086,24 @@ mod tests {
             processes: 1,
         };
         assert_eq!(pod.name, format!("me-btcusdt-{}", pod.id));
+    }
+
+    #[test]
+    fn only_validation_errors_trigger_the_statefulset_merge_patch_fallback() {
+        let invalid = kube::Error::Api(Box::new(kube::core::Status {
+            message: "StatefulSet.apps \"fx-eu-01\" is invalid".to_string(),
+            reason: "Invalid".to_string(),
+            code: 422,
+            ..Default::default()
+        }));
+        assert!(is_validation_error(&invalid));
+        let conflict = kube::Error::Api(Box::new(kube::core::Status {
+            message: "conflict".to_string(),
+            reason: "Conflict".to_string(),
+            code: 409,
+            ..Default::default()
+        }));
+        assert!(!is_validation_error(&conflict));
     }
 
     #[test]

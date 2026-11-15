@@ -321,6 +321,27 @@ fn validate_shard(
             "supervisor mode shares one container CPU/memory limit across its processes; size defaultProcessResources for the aggregate, not one process",
         );
     }
+    if shard.spec.packing.log_dir.is_some()
+        && (shard.spec.packing.log_max_bytes == 0 || shard.spec.packing.log_max_files == 0)
+    {
+        report.error(
+            "log_rotation",
+            object,
+            "logMaxBytes and logMaxFiles must be greater than zero",
+        );
+    }
+    if shard.spec.packing.mode != PackingMode::Supervisor
+        && (shard.spec.packing.cgroup_root.is_some()
+            || shard.spec.packing.child_memory_max.is_some()
+            || shard.spec.packing.child_cpu_max.is_some()
+            || shard.spec.packing.log_dir.is_some())
+    {
+        report.warn(
+            "supervisor_isolation",
+            object,
+            "cgroupRoot/child limits/logDir only apply to supervisor mode; containers mode uses the container runtime",
+        );
+    }
     if shard.spec.class == ShardClass::Dedicated && deployments.len() > 1 {
         report.error(
             "dedicated_symbols",

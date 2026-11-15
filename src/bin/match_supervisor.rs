@@ -20,10 +20,11 @@ use std::time::{Duration, Instant};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
 #[derive(Debug, Parser)]
@@ -81,6 +82,28 @@ struct Opt {
     /// PID/state directory. Defaults to `<data-dir>/.supervisor`.
     #[arg(long)]
     state_dir: Option<PathBuf>,
+    /// Optional cgroup v2 root. When set, each child is placed in `<root>/<name>`.
+    ///
+    /// This requires cgroup delegation inside the container; failures are logged and
+    /// do not stop the child, because the pod/container limit remains the outer bound.
+    #[arg(long)]
+    cgroup_root: Option<PathBuf>,
+    /// Optional `memory.max` value for each child cgroup (bytes or `max`).
+    #[arg(long)]
+    child_memory_max: Option<String>,
+    /// Optional `cpu.max` value for each child cgroup, for example `50000 100000`.
+    #[arg(long)]
+    child_cpu_max: Option<String>,
+    /// Optional per-child log directory. When set, stdout/stderr are mirrored to the
+    /// container log and written to `<log-dir>/<name>.log` with size-based rotation.
+    #[arg(long)]
+    log_dir: Option<PathBuf>,
+    /// Rotate a child log after this many bytes.
+    #[arg(long, default_value_t = 64 * 1024 * 1024)]
+    log_max_bytes: u64,
+    /// Number of rotated files to keep per child, including the active `.log`.
+    #[arg(long, default_value_t = 4)]
+    log_max_files: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -90,6 +113,8 @@ struct ProcessSpec {
     slot: u16,
     http_port: u16,
     raft_port: u16,
+    #[serde(default)]
+    raft_id_offset: u64,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -108,6 +133,8 @@ struct RunningProcess {
     pid: u32,
     uptime_secs: u64,
     restarts: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    isolation_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -132,6 +159,23 @@ struct Managed {
     child: Child,
     started: Instant,
     restarts: u32,
+    logs: Vec<JoinHandle<()>>,
+    isolation_error: Option<String>,
+}
+
+struct SpawnedChild {
+    child: Child,
+    logs: Vec<JoinHandle<()>>,
+    isolation_error: Option<String>,
+}
+
+/// A size-rotated file shared by one child's stdout and stderr.
+struct RotatingLog {
+    base: PathBuf,
+    max_bytes: u64,
+    max_files: usize,
+    file: tokio::fs::File,
+    size: u64,
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -230,6 +274,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Some(mut managed) = children.remove(&name) {
                 info!(process = %name, pid = managed.child.id(), "stopping removed process");
                 terminate(&mut managed.child).await;
+                for task in managed.logs.drain(..) {
+                    task.abort();
+                }
             }
             backoff.remove(&name);
             restart_counts.remove(&name);
@@ -249,7 +296,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             })
             .collect();
         for (name, status) in exited {
-            children.remove(&name);
+            if let Some(mut managed) = children.remove(&name) {
+                for task in managed.logs.drain(..) {
+                    task.abort();
+                }
+            }
             remove_pid_file(&state_dir, &name);
             let attempts = {
                 let attempts = restart_counts.entry(name.clone()).or_insert(0);
@@ -301,9 +352,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             {
                 continue;
             }
-            match spawn_child(&opt, spec) {
-                Ok(child) => {
-                    let pid = child.id().unwrap_or_default();
+            match spawn_child(&opt, spec).await {
+                Ok(spawned) => {
+                    let pid = spawned.child.id().unwrap_or_default();
                     write_pid_file(&state_dir, &spec.name, pid);
                     let restarts = restart_counts.get(&spec.name).copied().unwrap_or(0);
                     info!(
@@ -313,15 +364,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         raft_port = spec.raft_port,
                         pid,
                         restarts,
+                        isolation_error = ?spawned.isolation_error,
                         "child started"
                     );
                     children.insert(
                         spec.name.clone(),
                         Managed {
                             spec: spec.clone(),
-                            child,
+                            child: spawned.child,
                             started: Instant::now(),
                             restarts,
+                            logs: spawned.logs,
+                            isolation_error: spawned.isolation_error,
                         },
                     );
                     backoff.remove(&spec.name);
@@ -355,6 +409,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 pid: managed.child.id().unwrap_or_default(),
                 uptime_secs: managed.started.elapsed().as_secs(),
                 restarts: managed.restarts,
+                isolation_error: managed.isolation_error.clone(),
             })
             .collect();
         *status.lock().await = StatusSnapshot {
@@ -369,6 +424,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for (name, mut managed) in children {
         info!(process = %name, pid = managed.child.id(), "stopping child for shutdown");
         terminate(&mut managed.child).await;
+        for task in managed.logs.drain(..) {
+            task.abort();
+        }
         remove_pid_file(&state_dir, &name);
     }
     http.abort();
@@ -579,11 +637,13 @@ fn read_config(path: &Path) -> io::Result<Vec<ProcessSpec>> {
     Ok(processes)
 }
 
-fn spawn_child(opt: &Opt, spec: &ProcessSpec) -> io::Result<Child> {
+async fn spawn_child(opt: &Opt, spec: &ProcessSpec) -> io::Result<SpawnedChild> {
     let mut command = Command::new(&opt.engine_bin);
     command
         .arg("--id")
         .arg(opt.id.to_string())
+        .arg("--id-offset")
+        .arg(spec.raft_id_offset.to_string())
         .arg("--http-addr")
         .arg(format!("{}:{}", opt.pod_fqdn, spec.http_port))
         .arg("--data-dir")
@@ -603,7 +663,179 @@ fn spawn_child(opt: &Opt, spec: &ProcessSpec) -> io::Result<Child> {
     if let Ok(log) = std::env::var("RUST_LOG") {
         command.env("RUST_LOG", log);
     }
-    command.spawn()
+
+    let log_writer = if let Some(dir) = &opt.log_dir {
+        let base = dir.join(format!("{}.log", spec.name));
+        match RotatingLog::open(base, opt.log_max_bytes, opt.log_max_files).await {
+            Ok(log) => {
+                command.stdout(Stdio::piped()).stderr(Stdio::piped());
+                Some(Arc::new(Mutex::new(log)))
+            }
+            Err(error) => {
+                warn!(
+                    process = %spec.name,
+                    %error,
+                    "cannot open per-child log; falling back to the container log"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let mut child = command.spawn()?;
+    let pid = child.id().unwrap_or_default();
+    let isolation_error = if let Some(root) = &opt.cgroup_root {
+        match apply_cgroup(
+            root,
+            &spec.name,
+            pid,
+            opt.child_memory_max.as_deref(),
+            opt.child_cpu_max.as_deref(),
+        ) {
+            Ok(()) => None,
+            Err(error) => {
+                warn!(
+                    process = %spec.name,
+                    pid,
+                    %error,
+                    "cannot place child in its cgroup; continuing under the container limit"
+                );
+                Some(error.to_string())
+            }
+        }
+    } else {
+        None
+    };
+
+    let mut logs = Vec::new();
+    if let Some(log) = log_writer {
+        if let Some(stdout) = child.stdout.take() {
+            logs.push(tokio::spawn(pump_log(stdout, log.clone(), true)));
+        }
+        if let Some(stderr) = child.stderr.take() {
+            logs.push(tokio::spawn(pump_log(stderr, log, false)));
+        }
+    }
+    Ok(SpawnedChild {
+        child,
+        logs,
+        isolation_error,
+    })
+}
+
+fn apply_cgroup(
+    root: &Path,
+    name: &str,
+    pid: u32,
+    memory_max: Option<&str>,
+    cpu_max: Option<&str>,
+) -> io::Result<()> {
+    std::fs::create_dir_all(root)?;
+    // Best effort: the parent cgroup must delegate the controllers for these writes to work.
+    let _ = std::fs::write(root.join("cgroup.subtree_control"), "+memory +cpu");
+    let dir = root.join(name);
+    std::fs::create_dir_all(&dir)?;
+    if let Some(max) = memory_max {
+        std::fs::write(dir.join("memory.max"), max)?;
+    }
+    if let Some(max) = cpu_max {
+        std::fs::write(dir.join("cpu.max"), max)?;
+    }
+    std::fs::write(dir.join("cgroup.procs"), pid.to_string())?;
+    Ok(())
+}
+
+async fn pump_log<R>(mut reader: R, log: Arc<Mutex<RotatingLog>>, to_stdout: bool)
+where
+    R: AsyncRead + Unpin,
+{
+    let mut buffer = [0u8; 8192];
+    loop {
+        match reader.read(&mut buffer).await {
+            Ok(0) => break,
+            Ok(read) => {
+                {
+                    let mut log = log.lock().await;
+                    if let Err(error) = log.write(&buffer[..read]).await {
+                        warn!(%error, "cannot write per-child log");
+                        break;
+                    }
+                }
+                if to_stdout {
+                    let _ = tokio::io::stdout().write_all(&buffer[..read]).await;
+                } else {
+                    let _ = tokio::io::stderr().write_all(&buffer[..read]).await;
+                }
+            }
+            Err(error) => {
+                warn!(%error, "cannot read child output");
+                break;
+            }
+        }
+    }
+}
+
+impl RotatingLog {
+    async fn open(base: PathBuf, max_bytes: u64, max_files: usize) -> io::Result<Self> {
+        if let Some(parent) = base.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&base)
+            .await?;
+        let size = file.metadata().await?.len();
+        Ok(Self {
+            base,
+            max_bytes: max_bytes.max(1),
+            max_files: max_files.max(1),
+            file,
+            size,
+        })
+    }
+
+    async fn write(&mut self, bytes: &[u8]) -> io::Result<()> {
+        if self.size > 0 && self.size.saturating_add(bytes.len() as u64) > self.max_bytes {
+            self.rotate().await?;
+        }
+        self.file.write_all(bytes).await?;
+        self.size = self.size.saturating_add(bytes.len() as u64);
+        Ok(())
+    }
+
+    async fn rotate(&mut self) -> io::Result<()> {
+        self.file.flush().await?;
+        if self.max_files <= 1 {
+            let _ = tokio::fs::remove_file(&self.base).await;
+        } else {
+            let oldest = rotated_path(&self.base, self.max_files - 1);
+            let _ = tokio::fs::remove_file(oldest).await;
+            for index in (1..self.max_files - 1).rev() {
+                let from = rotated_path(&self.base, index);
+                let to = rotated_path(&self.base, index + 1);
+                let _ = tokio::fs::rename(from, to).await;
+            }
+            let _ = tokio::fs::rename(&self.base, rotated_path(&self.base, 1)).await;
+        }
+        self.file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.base)
+            .await?;
+        self.size = 0;
+        Ok(())
+    }
+}
+
+fn rotated_path(base: &Path, index: usize) -> PathBuf {
+    let name = base
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("child.log");
+    base.with_file_name(format!("{name}.{index}"))
 }
 
 async fn terminate(child: &mut Child) {
@@ -791,20 +1023,62 @@ mod tests {
     }
 
     #[test]
+    fn cgroup_files_are_written() {
+        let root = temp_dir().join("cgroup");
+        apply_cgroup(&root, "alpha", 1234, Some("1048576"), Some("50000 100000")).unwrap();
+        let dir = root.join("alpha");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("memory.max")).unwrap(),
+            "1048576"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("cpu.max")).unwrap(),
+            "50000 100000"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("cgroup.procs")).unwrap(),
+            "1234"
+        );
+    }
+
+    #[tokio::test]
+    async fn rotating_log_keeps_the_requested_number_of_files() {
+        let dir = temp_dir();
+        let mut log = RotatingLog::open(dir.join("alpha.log"), 10, 3)
+            .await
+            .unwrap();
+        for _ in 0..6 {
+            log.write(b"12345").await.unwrap();
+        }
+        log.file.flush().await.unwrap();
+        drop(log);
+
+        assert!(dir.join("alpha.log").exists());
+        assert!(dir.join("alpha.log.1").exists());
+        assert!(dir.join("alpha.log.2").exists());
+        assert!(
+            !dir.join("alpha.log.3").exists(),
+            "rotation must keep at most max_files files"
+        );
+    }
+
+    #[test]
     fn parses_and_sorts_processes() {
         let dir = temp_dir();
         let path = dir.join("processes.json");
         std::fs::write(
             &path,
             r#"{"processes":[
-                {"name":"gbpusd","slot":1,"httpPort":21002,"raftPort":22002},
+                {"name":"gbpusd","slot":1,"httpPort":21002,"raftPort":22002,"raftIdOffset":4},
                 {"name":"eurusd","slot":0,"httpPort":21001,"raftPort":22001}
             ]}"#,
         )
         .unwrap();
         let processes = read_config(&path).unwrap();
         assert_eq!(processes[0].name, "eurusd");
+        assert_eq!(processes[0].raft_id_offset, 0);
         assert_eq!(processes[1].name, "gbpusd");
+        assert_eq!(processes[1].raft_id_offset, 4);
         let _ = std::fs::remove_dir_all(dir);
     }
 

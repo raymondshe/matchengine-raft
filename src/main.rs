@@ -17,6 +17,13 @@ pub struct Opt {
     #[clap(long)]
     pub id: u64,
 
+    /// Offset added to `--id` when deriving the Raft node ID and data-directory suffix.
+    ///
+    /// Migration targets use a distinct ID range so they can join the source group as
+    /// learners before cutover without colliding with the source voters.
+    #[clap(long, env = "RAFT_ID_OFFSET", default_value_t = 0)]
+    pub id_offset: u64,
+
     #[clap(long)]
     pub http_addr: String,
 
@@ -163,6 +170,7 @@ async fn main() -> std::io::Result<()> {
 
     // Parse the parameters passed by arguments.
     let options = Opt::parse();
+    let node_id = options.id.saturating_add(options.id_offset);
 
     match options.read_policy {
         ReadPolicyMode::Lease => tracing::warn!(
@@ -233,7 +241,7 @@ async fn main() -> std::io::Result<()> {
     }
 
     let node = build_match_engine_node(
-        options.id,
+        node_id,
         options.http_addr,
         matchengine_raft::default_raft_config(),
         storage,

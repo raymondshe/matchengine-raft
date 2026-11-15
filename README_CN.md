@@ -113,7 +113,7 @@
 - **CRD 期望状态** — 五个 `matching.io` CRD（`TradingSymbol`、`SymbolShard`、`SymbolDeployment`、`SymbolRoute`、`Cell`），带 status 子资源；管理器通过 Kubernetes API server 写入，从 informer 重建缓存，使用 `resourceVersion` 并发控制并限制 status 写入频率。etcd 持久化 CR，管理器不直接连接 etcd，引擎 WAL/事件也不会进入 etcd。
 - **Lease 选举的 cell operator** — 监听 CRD，server-side apply/prune StatefulSet/Services/PDB/NetworkPolicy/ConfigMap，为 dedicated shard 的 leader Pod 打标签以驱动 leader Service，并写入 shard/deployment/route/symbol 状态和条件。watch 触发即时 reconcile，Kubernetes Lease 让多副本串行。
 - **期望状态管理器，而不是手工 YAML 堆** — 跨多个 shard/cell 提供目录校验、最小空闲 slot 与 `httpBasePort + slot` 分配、StatefulSet/Services/PDB/NetworkPolicy/ConfigMap 渲染、bootstrap/升级 reconcile 计划、审计和引擎控制台代理。
-- **生产级 Kubernetes 原语** — 四 voter shard、每 Pod 一个 PVC、PDB、NetworkPolicy、headless gRPC Service、健康/就绪探针、非 root 镜像和 leader-aware 路由元数据。参考管理器、supervisor 和 Lease 选举 operator 已在本仓库实现；operator 还执行 bootstrap/config/membership 以及带 quorum 门禁的 containers 增/启/停滚动。
+- **生产级 Kubernetes 原语** — 四 voter shard、每 Pod 一个 PVC、PDB、NetworkPolicy、headless gRPC Service、健康/就绪探针、非 root 镜像和 leader-aware 路由元数据。参考管理器、supervisor 和 Lease 选举 operator 已在本仓库实现；operator 还执行 bootstrap/config/membership、带 quorum 门禁的 containers 增/启/停滚动、PVC 保留窗口以及跨 shard cutover/rollback。
 
 可运行演示见 [Kubernetes 控制平面](#kubernetes-控制平面)，生产 operator 契约见[设计文档](./docs/KUBERNETES_CONTROL_PLANE.md)。
 
@@ -285,8 +285,8 @@ shard；删除前会明确询问是否保留 PVC（默认保留，便于以后�
 对应的四 voter 进程实例；期望状态可使用 JSON 演示存储或 CRD 后端，后者通过 Kubernetes API server
 写入五个 `matching.io` CRD（底层 etcd），并从 informer 刷新缓存。Lease 选举的 operator 监听 CRD、
 apply/prune 渲染出的工作负载、为 dedicated leader Pod 打标签、写入 shard/deployment/route 状态、
-bootstrap/配置每个 Raft 组，并在 quorum 门禁后逐 Pod 滚动 containers。PVC 保留窗口和跨 shard
-cutover 仍是后续工作。
+bootstrap/配置每个 Raft 组、在 quorum 门禁后逐 Pod 滚动 containers、执行 PVC 保留窗口，并通过
+独立 Raft ID 范围完成跨 shard cutover/rollback。
 
 [![Kubernetes 控制平面、Supervisor 与引擎控制台](./docs/kubernetes-console-architecture.png)](./docs/kubernetes-console-architecture.html)
 

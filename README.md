@@ -114,7 +114,7 @@ Everything below is implemented in this repository and exercised by tests; the l
 - **CRD-backed desired state** — five `matching.io` CRDs (`TradingSymbol`, `SymbolShard`, `SymbolDeployment`, `SymbolRoute`, `Cell`) with status subresources; the manager writes through the Kubernetes API server, rebuilds its cache from informers, uses `resourceVersion` concurrency and rate-limits status writes. etcd persists the CRs; the manager never connects to etcd directly, and engine WAL/events never go there.
 - **Lease-elected cell operator** — watches the CRDs, server-side-applies/prunes the StatefulSet/Services/PDB/NetworkPolicy/ConfigMap, labels the dedicated-shard leader for the leader Service, and writes shard/deployment/route/symbol status and conditions. Watches trigger immediate reconciliation; a Kubernetes Lease serializes replicas.
 - **Desired-state manager, not a hand-run YAML pile** — catalog validation, lowest-free slot and `httpBasePort + slot` allocation, rendered StatefulSet/Services/PDB/NetworkPolicy/ConfigMap, reconcile bootstrap/upgrade plans, audit and an engine-console proxy across many shards and cells.
-- **Production Kubernetes primitives** — four-voter shards, one PVC per pod, PDB, NetworkPolicy, headless gRPC services, health/readiness probes, non-root images and leader-aware routing metadata. The reference manager, supervisor and Lease-elected operator are implemented here; the operator also runs bootstrap/config/membership and quorum-safe containers add/start/stop rolls.
+- **Production Kubernetes primitives** — four-voter shards, one PVC per pod, PDB, NetworkPolicy, headless gRPC services, health/readiness probes, non-root images and leader-aware routing metadata. The reference manager, supervisor and Lease-elected operator are implemented here; the operator also runs bootstrap/config/membership, quorum-safe containers add/start/stop rolls, PVC retention and cross-shard cutover/rollback.
 
 See [Kubernetes Control Plane](#kubernetes-control-plane) for the runnable demo and [the design](./docs/KUBERNETES_CONTROL_PLANE.md) for the production operator contract.
 
@@ -304,10 +304,10 @@ with an explicit choice to keep the PVCs for a later restore or delete them irre
 state can use the JSON demo store or the CRD backend, which writes the five `matching.io` CRDs
 through the Kubernetes API server (etcd underneath) and refreshes its cache from informers. A
 Lease-elected operator watches the CRDs, applies/prunes the rendered workloads, labels dedicated
-leader pods, writes shard/deployment/route status, bootstraps/configures each Raft group and rolls
-containers one pod at a time behind a quorum gate. The architecture scales to thousands of
-single-symbol engines and their four-voter process instances across shards and cells; PVC retention
-and cross-shard cutover remain explicit follow-ups.
+leader pods, writes shard/deployment/route status, bootstraps/configures each Raft group, rolls
+containers one pod at a time behind a quorum gate, applies PVC retention windows and performs
+cross-shard cutover/rollback with a distinct Raft ID range. The architecture scales to thousands
+of single-symbol engines and their four-voter process instances across shards and cells.
 
 [![Kubernetes control plane, supervisor and engine console](./docs/kubernetes-console-architecture.png)](./docs/kubernetes-console-architecture.html)
 

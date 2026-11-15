@@ -49,6 +49,10 @@ struct Opt {
     /// Restrict CRDs, workloads and pruning to one namespace. Omit for cell-wide.
     #[arg(long, env = "OPERATOR_NAMESPACE")]
     namespace: Option<String>,
+    /// Retention window for PVCs whose shard CR no longer exists. `0` marks them
+    /// `matching.io/retain-until=manual` instead of starting a deletion timer.
+    #[arg(long, default_value_t = 0, env = "OPERATOR_RETENTION_SECONDS")]
+    retention_seconds: u64,
     /// Per-pod `/health` timeout.
     #[arg(long, default_value_t = 750, env = "OPERATOR_OBSERVE_TIMEOUT_MS")]
     observe_timeout_ms: u64,
@@ -96,6 +100,7 @@ async fn main() -> Result<()> {
         lease_duration: Duration::from_secs(opt.lease_duration_seconds),
         lease_renew: Duration::from_secs(opt.lease_renew_seconds),
         namespace: opt.namespace,
+        retention_seconds: opt.retention_seconds,
         dry_run: opt.dry_run,
     };
     let client = kube::Client::try_default()

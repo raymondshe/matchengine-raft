@@ -2,9 +2,9 @@
 
 Status: **reference implementation** — the manager API/GUI, CRD-backed desired state, validator,
 renderer and Lease-elected cell operator live in
-[`demos/k8s_control_plane/`](../demos/k8s_control_plane/README.md). Production hardening still
-covers per-process cgroup isolation, retention-window deletion, migration cutover/drain/rollback
-and production manager security.
+[`demos/k8s_control_plane/`](../demos/k8s_control_plane/README.md). Residual hardening is live
+cgroup-delegation validation and production manager security; supervisor cgroups/log rotation,
+PVC retention and cross-shard cutover/rollback are implemented.
 Last updated: 2026-11-15.
 
 Related documents: [`AGENTS.md`](../AGENTS.md), [`docs/OPERATIONAL_CONSOLE.md`](./OPERATIONAL_CONSOLE.md),
@@ -160,9 +160,10 @@ metrics endpoint or bridge exists) PodMonitors. The operator is also the compone
 `/init`, `/add-learner`, `/change-membership`, `/console/api/actions/*` and the symbol
 `ConfigureSymbol` write. It uses a Kubernetes `Lease` so only one replica reconciles at a time; the
 reference implementation performs Lease election, CRD watches, server-side apply/prune, leader
-labels, status/route conditions, bootstrap/config/membership execution and quorum-safe
-containers-mode add/start/stop rolls. Retention-window deletion and cross-shard cutover/drain/
-rollback remain follow-ups.
+labels, status/route conditions, bootstrap/config/membership execution, quorum-safe
+containers-mode add/start/stop rolls, PVC retention and cross-shard cutover/rollback. Per-child
+cgroups and rotating logs are opt-in supervisor features; cgroups fail open when the pod cannot
+delegate a cgroup v2 subtree.
 
 **Manager API + GUI.** The global configuration manager. Desired state lives in the catalog CRDs
 (`TradingSymbol`, `SymbolShard`, `SymbolDeployment`, `SymbolRoute`, `Cell`) and is persisted by the
@@ -307,11 +308,13 @@ per-process service on `httpPort + 1000`; no group ID or wire change is needed.
   voters.
 - **Supervisor mode:** the supervisor registers/starts a new engine process on all four pods and
   the operator initialises it; no pod template change and no restart of existing symbols.
-- **Promotion/demotion:** add the process to the target shard (containers or supervisor), add the
-  target four pod/port pairs as learners to the symbol's Raft group, wait for catch-up, change
-  membership to the target addresses, then remove the source process. The source group stays
-  available until the target has quorum. The symbol's data is transferred by Raft snapshot install,
-  not by copying files through the manager.
+- **Promotion/demotion:** create a shadow `SymbolDeployment` on the target shard's four pods
+  (container or supervisor) with a non-overlapping `raftIdOffset`; the target processes start
+  empty and uninitialised. The operator adds the target Raft IDs as learners to the source group,
+  waits for catch-up, changes membership to the target voters, switches the route and drains the
+  source to `Draining`. The source group stays available until the target has quorum. The symbol's
+  data is transferred by Raft snapshot install, not by copying files. Set the route
+  `state: Rollback` to reverse the membership and route; the source PVCs are retained.
 - **Cross-cell:** create the process in the target cell and use a gateway cutover; avoid
   cross-region Raft membership unless the latency budget explicitly allows it.
 
@@ -721,6 +724,11 @@ spec:
               matching.io/cluster: me-eurusd-prod
       ports:
         - { protocol: TCP, port: 21001, endPort: 21030 }
+    - from:                                   # migration peers in the same cell
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: match-engine
+              matching.io/cluster-id: eu-1-prod
   egress:
     - to:
         - podSelector:
@@ -746,12 +754,19 @@ spec:
               matching.io/cluster: me-eurusd-prod
       ports:
         - { protocol: TCP, port: 21001, endPort: 21030 }
+    - to:                                    # migration peers in the same cell
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: match-engine
+              matching.io/cluster-id: eu-1-prod
 ```
 
 The engine console's cluster view probes each peer's `/console/api/node` over HTTP. Without the
-last ingress/egress pair, the console shows every peer as unreachable even while Raft is healthy;
-this was observed on the OrbStack L0 tier. The rule stays inside the shard's own trust boundary:
-external HTTP is still limited to the gateway, observability and control-plane namespaces.
+same-shard ingress/egress pair, the console shows every peer as unreachable even while Raft is
+healthy; this was observed on the OrbStack L0 tier. The migration rules allow engine pods in the
+same cell to reach each other on any port, because a target shard uses a different HTTP/gRPC port
+range; they remain inside the cell's engine trust boundary. External HTTP is still limited to the
+gateway, observability and control-plane namespaces.
 
 Do not add an ingress rule for the Raft port from the gateway or the public internet. The
 headless Service is for peers, the operator and monitoring. The gateway uses each symbol's leader
@@ -1611,19 +1626,30 @@ The request body asks the storage question explicitly:
   cluster; only an external backup can restore it. The GUI requires a typed shard-name confirmation.
 
 Because the manager does not apply workloads, the drop response is a desired-state mutation plus an
-operator sequence. It does not delete workloads or PVCs itself.
+operator sequence. The operator prunes the workload and, for orphaned shard PVCs, records a
+retention deadline on the PVC (`matching.io/retain-until`) and deletes it after the configured
+window (`--retention-seconds`; `0` marks manual deletion). If the shard CR returns before the
+deadline, the operator clears the marker. The `volumeClaimTemplates` entry intentionally has no
+labels so an existing StatefulSet can be adopted without an immutable template update; the operator
+labels each shard PVC (`matching.io/shard`, `matching.io/cell`, `app.kubernetes.io/managed-by`, and
+the related placement labels) after creation. The adoption procedure is in
+`docs/RUNBOOK.md` under "Adopt an existing fleet".
 
 Promotion/demotion is a process-level Raft membership migration, not a data copy through the
 manager:
 
 1. Create a shadow `SymbolDeployment` on the target shard's four pods (container or supervisor),
-   with a new local slot/port on the target; the target process starts empty.
-2. Add the four target `pod:httpPort` addresses as learners to the source symbol's Raft group and
-   wait for catch-up.
-3. Change membership to the target voters.
-4. Switch `SymbolRoute.spec.activeDeploymentRef` to the target deployment and keep the source as
-   `previousDeploymentRef` until the target has served a successful read/write.
+   with a new local slot/port and a `raftIdOffset` above the source range; the target process
+   starts empty and uninitialised.
+2. Add the four target Raft IDs as learners to the source symbol's Raft group and wait for
+   catch-up; the operator uses `/add-learner` and polls applied/log indexes.
+3. Change membership to the target voters and wait for the target leader.
+4. Switch `SymbolRoute.spec.activeDeploymentRef` to the target deployment, keep the source as
+   `previousDeploymentRef` and set the source deployment to `Draining`.
 5. Drain and remove the old process/container; delete the source data after the retention window.
+6. Set the route `state: Rollback` to add the source IDs back as learners, change membership back,
+   restore the source route and disable the target. This is reversible until the source PVCs are
+   deleted.
 
 This is how a hot symbol moves from a packed shard to a dedicated shard (promotion) or back
 (demotion). The operation is reversible until the final membership change; if the target fails,

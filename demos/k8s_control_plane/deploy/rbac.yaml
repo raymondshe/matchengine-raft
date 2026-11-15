@@ -65,7 +65,7 @@ rules:
       - tradingsymbols
       - symboldeployments
       - symbolroutes
-    verbs: ["get", "list", "watch"]
+    verbs: ["get", "list", "watch", "patch", "update"]
   - apiGroups: ["matching.io"]
     resources:
       - cells/status
@@ -76,6 +76,9 @@ rules:
     verbs: ["get", "update", "patch"]
   - apiGroups: [""]
     resources: ["pods"]
+    verbs: ["get", "list", "watch", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
     verbs: ["get", "list", "watch", "patch", "delete"]
   - apiGroups: [""]
     resources: ["services", "configmaps"]

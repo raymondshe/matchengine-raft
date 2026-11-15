@@ -5723,6 +5723,7 @@ OTHER DEALINGS IN THE FONT SOFTWARE.
           <li>OpenRaft stream_append pipelines entries over gRPC</li>
           <li>Learners install chunked full_snapshot transfers</li>
           <li>Pre-Vote and leadership transfer are explicit RPCs</li>
+          <li>Leader-consistent reads default to local lease; read_index forces a quorum round</li>
         </ul>
       </div>
 
@@ -5735,7 +5736,7 @@ OTHER DEALINGS IN THE FONT SOFTWARE.
           <li>Segmented WAL with one fsync per append batch</li>
           <li>Atomic snapshot plus WAL-tail recovery</li>
           <li>One symbol per process/cluster</li>
-          <li>Match results leave apply through Noop/JSONL sink</li>
+          <li>Match results leave apply through the sink and the replicated event window</li>
         </ul>
       </div>
 

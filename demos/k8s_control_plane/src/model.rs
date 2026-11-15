@@ -343,10 +343,34 @@ pub struct Packing {
     pub mode: PackingMode,
     #[serde(default = "default_max_processes")]
     pub max_processes_per_pod: u16,
+    /// Optional cgroup v2 root for per-child isolation in supervisor mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cgroup_root: Option<String>,
+    /// Optional child `memory.max` value (bytes or `max`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_memory_max: Option<String>,
+    /// Optional child `cpu.max` value, for example `50000 100000`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_cpu_max: Option<String>,
+    /// Optional per-child log directory. Kubelet still receives the mirrored output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_dir: Option<String>,
+    #[serde(default = "default_log_max_bytes")]
+    pub log_max_bytes: u64,
+    #[serde(default = "default_log_max_files")]
+    pub log_max_files: usize,
 }
 
 fn default_max_processes() -> u16 {
     20
+}
+
+fn default_log_max_bytes() -> u64 {
+    64 * 1024 * 1024
+}
+
+fn default_log_max_files() -> usize {
+    4
 }
 
 impl Default for Packing {
@@ -354,6 +378,12 @@ impl Default for Packing {
         Self {
             mode: PackingMode::Containers,
             max_processes_per_pod: default_max_processes(),
+            cgroup_root: None,
+            child_memory_max: None,
+            child_cpu_max: None,
+            log_dir: None,
+            log_max_bytes: default_log_max_bytes(),
+            log_max_files: default_log_max_files(),
         }
     }
 }
@@ -605,8 +635,24 @@ pub struct ShardStatus {
     pub symbols: Vec<ShardSymbolStatus>,
     #[serde(default)]
     pub nodes: Vec<ShardNodeStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollout: Option<ShardRolloutStatus>,
     #[serde(default)]
     pub conditions: Vec<Condition>,
+}
+
+/// StatefulSet rollout progress for a containers-mode shard.
+///
+/// `percent` is the fraction of pods that have the new pod template. `complete` also requires
+/// every pod to be ready, so 100% can briefly mean "updated, waiting for readiness".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ShardRolloutStatus {
+    pub updated_replicas: u32,
+    pub ready_replicas: u32,
+    pub replicas: u32,
+    pub percent: u8,
+    pub complete: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -672,6 +718,12 @@ pub struct DeploymentSpec {
     pub generation: u32,
     pub shard_ref: String,
     pub placement: Placement,
+    /// Offset added to the pod ordinal to derive this generation's Raft node IDs.
+    ///
+    /// Migration shadows use a non-overlapping range so they can join the source group
+    /// as learners before cutover.
+    #[serde(default)]
+    pub raft_id_offset: u64,
     /// Optional per-generation image override. Empty inherits `SymbolShard.spec.image`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
@@ -764,6 +816,7 @@ pub enum RouteState {
     Shadow,
     Cutover,
     Draining,
+    Rollback,
     Disabled,
 }
 

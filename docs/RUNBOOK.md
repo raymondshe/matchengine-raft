@@ -331,7 +331,8 @@ What it reconciles:
 
 - **Apply/prune** the rendered ConfigMap, Services, PDB, NetworkPolicy and StatefulSet. Pruning is
   limited to objects labeled `app.kubernetes.io/managed-by=match-engine-operator`; a shard that
-  fails to render is not pruned. PVCs are never deleted by the operator.
+  fails to render is not pruned. Shard PVCs are retained; only orphaned PVCs past the retention
+  window are deleted.
 - **Leader Service labels** for dedicated shards: the engine-reported leader pod gets
   `matching.io/role=leader`; the other pods lose it. The `<shard>-leader` Service selects that pod.
 - **Status/conditions** for `SymbolShard`, `SymbolDeployment`, `TradingSymbol` and `SymbolRoute`,
@@ -344,16 +345,23 @@ What it reconciles:
   `ConfigureSymbol` on the leader. Routes only publish `leaderAddr` after the config matches.
 - **Containers rolls** — replace non-running pods first, gate each running-pod deletion on a
   healthy quorum for every process it hosts, and transfer leadership only when the removal is
-  already quorum-safe. The operator ServiceAccount therefore needs `pods/delete` in addition to
-  list/watch/patch (included in `deploy/rbac.yaml`).
+  already quorum-safe. The operator ServiceAccount needs `pods/delete` in addition to
+  list/watch/patch.
+- **Retention** — an orphaned shard PVC gets `matching.io/retain-until` (a Unix deadline or
+  `manual`). After the deadline the operator deletes it; a returning shard clears the marker.
+  Configure with `--retention-seconds` (`0` keeps the manual marker).
+- **Migration** — a `SymbolDeployment` with `desiredState: Shadow` and a non-overlapping
+  `raftIdOffset` is added to the source leader as a learner; after catch-up the operator changes
+  membership, switches the route, activates the target and drains the source. Set route
+  `state: Rollback` to reverse. The operator needs `patch`/`update` on the CRs for this.
 
-`--dry-run` logs desired counts without applying, writing status, bootstrapping or rolling.
-Retention-window PVC deletion and cross-shard cutover/drain/rollback remain explicit follow-ups;
-`drop-shard` and `migrate` still return plans for those steps.
+`--dry-run` logs desired counts without applying, writing status, bootstrapping, rolling or
+retention changes.
 
 The manager needs network access to engine pods for the console proxy. The rendered NetworkPolicy
 allows HTTP from namespaces labelled `matching.io/role=control-plane`; keep that label if you serve
-the GUI from another namespace.
+the GUI from another namespace. It also allows same-cell engine pods to reach each other on all
+ports for cross-shard migration.
 
 Port-forward the manager for a workstation browser:
 
@@ -365,6 +373,90 @@ kubectl -n match-control port-forward deploy/match-manager 8099:8099
 When the manager runs on the workstation instead of in the cluster, point the console proxy at
 loopback with `cargo run --manifest-path demos/k8s_control_plane/Cargo.toml -- serve
 --engine-console-host 127.0.0.1`; ports still come from each deployment's catalog placement.
+
+#### Adopt an existing fleet (brownfield)
+
+Use this when the engines and PVCs already exist and the manager has not yet been switched to CRD
+mode. The goal is to reproduce the live placement exactly, adopt the objects, and only then let the
+operator change anything. Keep `--retention-seconds 0` until the adoption is verified. Build the
+demo binaries once so the commands below resolve:
+
+```sh
+cargo build --manifest-path demos/k8s_control_plane/Cargo.toml \
+  --bin k8s-control-plane --bin match-operator
+```
+
+1. **Back up the live state.** Never start an operator with an empty or incomplete CR catalog:
+   live StatefulSets carry `app.kubernetes.io/managed-by=match-engine-operator`, so an empty
+   catalog prunes them.
+
+   ```sh
+   mkdir -p /tmp/match-adopt
+   kubectl -n match-eu-1 get sts,deploy,svc,cm,pdb,networkpolicy,pvc -o yaml \
+     > /tmp/match-adopt/fleet.yaml
+   kubectl -n match-eu-1 get pvc -o wide > /tmp/match-adopt/pvc.txt
+   kubectl -n match-eu-1 get pods -o wide > /tmp/match-adopt/pods-before.txt
+   ```
+
+   Capture the data baseline for every symbol (`orderbook_sequence` and `orderbook_orders` on the
+   leader or through the manager console proxy). Save the manager's current catalog too:
+   `curl -s http://127.0.0.1:8099/api/v1/catalog > /tmp/match-adopt/catalog.json`.
+
+2. **Rebuild and validate the catalog.** Reuse the old manager catalog if it matches the live
+   placement; otherwise reconstruct it from the StatefulSets, ConfigMaps and symbol configs. Set
+   `raftIdOffset: 0` on existing deployments, clear `status`, and validate:
+
+   ```sh
+   k8s-control-plane validate --data /tmp/match-adopt/catalog.json
+   k8s-control-plane crd-restore --input /tmp/match-adopt/catalog.json --namespace match-eu-1
+   ```
+
+3. **Diff before adopting.** Render the full desired set and compare it with the live objects:
+
+   ```sh
+   k8s-control-plane render --data /tmp/match-adopt/catalog.json --all --profile local \
+     > /tmp/match-adopt/rendered.json
+   kubectl apply --server-side --dry-run=server -f /tmp/match-adopt/rendered.json
+   ```
+
+   Expected differences on an older fleet are the operator-owned fields (`--id-offset`,
+   supervisor `--max-processes`), the same-cell NetworkPolicy rules, and PVC labels. Existing
+   StatefulSets cannot gain labels on `volumeClaimTemplates`; the operator labels PVCs after
+   creation instead, so do not add them back to the template. The operator force-applies and takes
+   over fields previously owned by `kubectl-client-side-apply`.
+
+4. **Start the operator conservatively.** Use a dedicated Lease name for the first run and
+   `--retention-seconds 0`. A dry run first is safe:
+
+   ```sh
+   match-operator --namespace match-eu-1 --lease-namespace match-control \
+     --lease-name match-engine-operator-adopt --profile local --resync-seconds 10 --dry-run
+   ```
+
+   Confirm the desired object count and that no workload is reported for pruning, then start it
+   without `--dry-run`. Watch `reconcile complete` and `SymbolShard`/`SymbolDeployment` phases. The
+   first apply updates the StatefulSet template; existing pods keep running until a rollout is
+   triggered. If an adopted StatefulSet still has client-side list ownership, a container removal
+   can fail server-side-apply validation; the operator retries that StatefulSet with a merge patch,
+   which replaces the container array cleanly.
+
+5. **Upgrade the image deliberately.** The new template carries `--id-offset`, which the old
+   engine binary does not understand. Build and publish an image with `--id-offset` and SIGTERM
+   handling, set `shard.spec.image` in the CR, and let the operator roll containers-mode shards one
+   pod at a time. Supervisor shards are intentionally skipped by the rollout controller; transfer
+   each hosted symbol's leadership first, then delete one supervisor pod at a time.
+
+6. **Verify adoption.** Check that every `SymbolShard`, `SymbolDeployment` and `SymbolRoute` is
+   `Ready`, all PVCs are still `Bound` and now carry `matching.io/shard`, and the saved
+   `orderbook_sequence`/`orderbook_orders` values are unchanged. Then switch the manager to CRD
+   mode (`--crd --no-seed --crd-namespace match-eu-1`) and confirm `"store":"crd"` from
+   `/api/v1/health`.
+
+7. **Roll back safely.** Scale the operator to zero before changing the catalog, so deleting or
+   editing a CR cannot prune workloads. Restore the backed-up manager catalog and workload YAML
+   with `kubectl apply --server-side --force-conflicts`, or set `shard.spec.image` back and let the
+   operator roll. PVCs are never deleted by adoption or rollback; only the retention timer deletes
+   an orphaned PVC.
 
 ### Create the catalog and apply shards
 
@@ -533,6 +625,45 @@ from its PVC, and it applies `ConfigureSymbol` only when the observed config dif
 
 The last active engine in a containers shard is zero-impact to stop or start.
 
+### Migrate a symbol and roll back
+
+`POST /api/v1/symbols/{name}/migrate` creates a shadow `SymbolDeployment` on the target shard
+with a non-overlapping `raftIdOffset`; it does not move the route. The operator then adds the
+shadow's Raft IDs as learners to the source leader, waits for catch-up, changes membership,
+switches the route, activates the shadow and sets the source to `Draining`. Watch:
+
+```sh
+kubectl -n match-eu-1 get symboldeployment -o custom-columns='NAME:.metadata.name,STATE:.spec.desiredState,OFFSET:.spec.raftIdOffset,PHASE:.status.phase,LEADER:.status.leaderPod'
+kubectl -n match-eu-1 get symbolroute <symbol> -o jsonpath='{.status.phase} {.spec.activeDeploymentRef} {.status.leaderAddr}{"\n"}'
+kubectl -n match-control logs deploy/match-operator --tail=100 | grep -E 'migration|learner|membership|cutover|rollback'
+```
+
+To roll back before deleting the source PVCs:
+
+```sh
+kubectl -n match-eu-1 patch symbolroute <symbol> --type=merge -p '{"spec":{"state":"Rollback"}}'
+```
+
+The operator adds the source voters back as learners to the target leader, waits for catch-up,
+switches the route back, reactivates the source and disables the target. The source PVCs are the
+copy that lets this reverse path work.
+
+### Retention window
+
+An orphaned shard PVC is labeled by the renderer and marked with
+`matching.io/retain-until` (Unix seconds) or `manual`. The operator deletes it after the configured
+window; a shard that reappears before the deadline clears the marker. Inspect and tune with:
+
+```sh
+kubectl -n match-eu-1 get pvc -l matching.io/shard=<shard> \
+  -o custom-columns='NAME:.metadata.name,UNTIL:.metadata.annotations.matching\\.io/retain-until'
+# Operator deployment: --retention-seconds N (0 means mark manual, never auto-delete).
+kubectl -n match-control logs deploy/match-operator --tail=100 | grep -E 'retention|deleted PVC'
+```
+
+Only PVCs labeled `app.kubernetes.io/managed-by=match-engine-operator` and
+`matching.io/shard` participate.
+
 ### Drop a shard
 
 Dropping removes the shard, its deployments, and routes that point at them from the **manager
@@ -541,18 +672,19 @@ shard must be stopped first; the API returns `409 shard_not_idle` and names the 
 
 > **Important: the manager does not delete Kubernetes resources.**
 > A successful `drop` only removes catalog records. The StatefulSet, pods, Services, ConfigMap,
-> PDB and NetworkPolicy remain until the operator prunes them. PVCs are deleted only if you chose
-> `retainStorage: false` and then run the returned `delete-storage` step. A **reserved** shard that
-> never materialized has no Kubernetes objects to clean up; after the catalog 404, there is nothing
-> else to delete.
+> PDB and NetworkPolicy remain until the operator prunes them. With `retainStorage: true`, the
+> operator marks the orphaned PVCs and deletes them after `--retention-seconds` (or leaves a
+> `manual` marker when it is `0`). With `retainStorage: false`, run the returned `delete-storage`
+> step immediately. A **reserved** shard that never materialized has no Kubernetes objects to
+> clean up; after the catalog 404, there is nothing else to delete.
 
 The expected end state depends on what the shard contained:
 
 | Shard at drop | After the operator applies the steps |
 |---|---|
 | Reserved (`0` deployments, never materialized) | No StatefulSet/pods/Services/ConfigMap/PDB/NetworkPolicy/PVCs existed; only the catalog record disappears. |
-| Materialized, `retainStorage: true` | Workload and shard objects are gone; the four `data-<shard>-0..3` PVCs remain Bound/Released so the shard can be restored. |
-| Materialized, `retainStorage: false` | Workload and shard objects are gone; the PVCs/PVs are gone too. This is irreversible. |
+| Materialized, `retainStorage: true` | Workload and shard objects are gone; the four `data-<shard>-0..3` PVCs remain and are marked with a retention deadline. |
+| Materialized, `retainStorage: false` | Workload and shard objects are gone; the PVCs/PVs are gone after the explicit `delete-storage` step. This is irreversible. |
 
 
 #### 1. Save the catalog and manifests
@@ -785,12 +917,13 @@ status honest and never changes engine state.
 | `kubernetes_api` 404 in CRD mode | The five `matching.io` CRDs are not installed. Run `cargo run -- crds \| kubectl apply -f -`. |
 | CRD manager starts with an empty catalog | No CRs exist in the listed namespaces, or list/watch RBAC is missing. Restore with `crd-restore` or create symbols/shards through the API. |
 | Operator has no Lease holder | Check `kubectl -n match-control get lease match-engine-operator`; verify the `match-operator` ServiceAccount has `coordination.k8s.io/leases` permissions and the pod token is mounted. |
-| Operator cannot apply workloads | Check the `match-operator` ClusterRole for StatefulSet/Service/ConfigMap/PDB/NetworkPolicy create/update/delete and pods list/patch. |
+| Operator cannot apply workloads | Check the `match-operator` ClusterRole for StatefulSet/Service/ConfigMap/PDB/NetworkPolicy create/update/delete, pods list/watch/patch/delete, and CR `patch`/`update` for migration. |
 | Route status stays Pending | The operator could not reach `<pod>.<shard>-headless.<ns>.svc:httpPort/health` or no engine reports a leader. Check readiness, the NetworkPolicy and the console cluster view. |
 | Leader Service has no endpoints | Only dedicated shards get a leader Service. Check `SymbolDeployment.status.leaderPod`; the operator removes `matching.io/role=leader` when no leader is reported. |
 | Operator pruned objects unexpectedly | Check the `--namespace` scope and that the shard still exists in its CRDs. Objects without the managed-by label are never pruned; PVCs are never pruned by the operator. |
 | `ImagePullBackOff` / old engine console without the symbol header | The image was rebuilt but the pod was not recreated. Use `imagePullPolicy: IfNotPresent`, then `kubectl -n match-eu-1 rollout restart statefulset/<shard>` and wait for `/ready`. |
 | `409 restart_required` on add/stop/start | The shard is containers mode with other active engines; use supervisor mode, an empty shard, or explicitly opt into `allowRestart`. |
+| Stop shows `Disabled` but the symbol container is still running | The manager only wrote desired state. Check `kubectl -n match-control logs deploy/match-operator` for a StatefulSet apply error. An adopted StatefulSet can keep `kubectl-client-side-apply` list ownership; a container removal then fails SSA validation (`containers[0].image: Required value`). Operator v6+ retries that StatefulSet with a merge patch automatically. Confirm the rollout with `kubectl -n match-eu-1 get sts <shard> -o jsonpath='{.status.updatedReplicas}'` and the operator `deleted one outdated pod` logs. |
 | `409 shard_not_idle` on drop | Stop every symbol in the shard first; the error names the active ones. Apply the updated ConfigMap before retrying. |
 | Drop returned `200` but pods/StatefulSet still exist | The manager only wrote desired state. Prune with the manifests saved before the drop: `kubectl -n match-eu-1 delete -f /tmp/<shard>-manifests.json --ignore-not-found`. |
 | Reserved shard drop shows no PVCs or workloads | Expected: a reserved shard never materialized. Verify the catalog returns `404` and no object with the shard name exists; there is nothing else to clean up. |

@@ -1558,7 +1558,7 @@ mod tests {
         assert_eq!(migration["targetHttpPort"], 21041);
         let steps = migration["steps"].as_array().unwrap();
         assert!(steps.iter().any(|step| step["action"] == "cutover-route"));
-        assert!(steps.iter().any(|step| step["action"] == "drain-source"));
+        assert!(steps.iter().any(|step| step["action"] == "rollback"));
     }
 
     #[tokio::test]

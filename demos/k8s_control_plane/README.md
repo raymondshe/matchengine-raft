@@ -86,6 +86,8 @@ cargo run -- plan --shard fx-eu-01 --scenario upgrade --wire-version 8
 cargo run -- seed --out examples
 ```
 
+The GUI polls `/api/v1/catalog` and the selected shard every 2 seconds, pauses while a modal is open or the tab is hidden, and shows a `live` / `stale` indicator. The shard table uses the same polling to show `rolling…`, `stopping…` and the rollout banner without a manual refresh. While a containers-mode roll is active, the banner shows a percentage (updated pods / replicas), a progress bar, and separate updated/ready counts; 100% can briefly show `finalizing` until every pod is ready.
+
 The demo catalog contains three shards:
 
 | Shard | Class | Processes | Symbols |
@@ -207,9 +209,25 @@ The operator also drives the engine lifecycle once the workload exists:
   deadlock.
 - **Fast termination** — the engine binary handles SIGTERM/SIGINT as PID 1, so a containers-mode
   pod drains immediately instead of waiting for Kubernetes' 60-second grace period and SIGKILL.
+- **Retention** — orphaned shard PVCs are labeled and annotated with
+  `matching.io/retain-until`; the operator deletes them after `--retention-seconds` (or marks
+  `manual` when zero) and clears the marker if the shard returns.
+- **PVC labels** — the StatefulSet's `volumeClaimTemplates` deliberately carries no labels because
+  that field is immutable on an existing StatefulSet; the operator labels each shard PVC after
+  creation with `matching.io/shard`, `matching.io/cell` and the placement labels used by retention
+  and the GUI. This is what lets an existing fleet be adopted without recreating its storage.
+- **Adopted StatefulSet migration** — objects created with `kubectl apply` keep
+  `kubectl-client-side-apply` ownership of list entries such as containers. If server-side apply
+  fails validation while removing a container, the operator retries that StatefulSet with a merge
+  patch, which replaces the container array as a whole. This is the path that makes stopping one
+  symbol in a packed containers shard work after a brownfield adoption.
+- **Migration** — a `Shadow` deployment with a non-overlapping `raftIdOffset` is added to the
+  source leader as a learner; after catch-up the operator changes membership, switches the route,
+  activates the target and drains the source. Route `state: Rollback` reverses the process.
 
-The operator ServiceAccount needs `pods/delete` in addition to list/watch/patch; `deploy/rbac.yaml`
-includes it. `--dry-run` skips bootstrap, rollout, status and label actions.
+The operator ServiceAccount needs `pods/delete`, PVC list/patch/delete, and CR `patch`/`update` in
+addition to list/watch; `deploy/rbac.yaml` includes them. `--dry-run` skips bootstrap, rollout,
+retention, migration, status and label actions.
 
 ## Manager API
 
@@ -385,7 +403,12 @@ route, slot/ports and PVC stay; the response returns the operator steps:
 - **Containers mode:** the target is the last active engine in the shard: prune the StatefulSet and
   pods, keep the PVC. If other engines are active, the request returns `409 restart_required`
   because removing a container recreates every pod; pass `{"allowRestart": true}` to accept the
-  one-voter-at-a-time roll.
+  one-voter-at-a-time roll. The GUI reads the `restart_required` error code, asks for a second
+  confirmation, and retries with `allowRestart: true`. The other engines keep quorum while losing
+  one voter at a time; their PVCs are untouched. For a zero-impact stop, move the symbol to a
+  supervisor-mode shard first. While the operator reports `Progressing`, the GUI shows a rollout
+  banner and disables start/stop; a containers-mode row reads `stopping…` or `rolling…` until every
+  pod has the new template, rather than implying the container is already gone.
 
 `freeSlots` does not increase and the slot is not reused while the data is retained. Disabled rows
 remain visible as `stopped` with a **start** button. Starting is the symmetric operation:
@@ -575,16 +598,16 @@ workspace or CI yet. To add it, mirror the `demos/order_system` CI steps in
 ## Deliberate limitations
 
 - The reference operator applies/prunes workloads, labels the dedicated-shard leader, writes
-  status, bootstraps/configures Raft groups (`/init`, learners, membership, `ConfigureSymbol`) and
-  runs quorum-safe containers-mode add/start/stop rolls. Retention-window PVC deletion and
-  cross-shard cutover/drain/rollback remain explicit follow-ups; `drop-shard` and `migrate` return
-  plans for those steps.
+  status, bootstraps/configures Raft groups (`/init`, learners, membership, `ConfigureSymbol`),
+  runs quorum-safe containers-mode add/start/stop rolls, executes PVC retention and performs
+  cross-shard cutover/rollback with `raftIdOffset`.
 - No admission webhooks, finalizers or multi-version CRD conversion. The CRD schema uses
   preserve-unknown fields; typed schemas are a follow-up.
 - Supervisor mode is implemented as a reference pod agent (`src/bin/match_supervisor.rs`); it
   manages children under the shared container CPU/memory limit with bounded restart backoff,
-  max-child backpressure and orphan cleanup. Per-process cgroups and rotating per-child log files
-  remain future work; the current log boundary is the kubelet's container log rotation.
+  max-child backpressure, orphan cleanup, opt-in per-child cgroup v2 placement and optional
+  rotating per-child logs. Cgroup writes are fail-open when the pod cannot delegate a writable
+  subtree; validate that on a Linux node with delegation before relying on per-process limits.
 - Status is synthesized for the demo; there is no per-process status endpoint in the engine yet
   (phase 2 in the design doc). CRD status writes are rate-limited coalescing writes, not a full
   operator status controller.

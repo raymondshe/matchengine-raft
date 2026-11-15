@@ -94,6 +94,7 @@ fn deployment(
             generation: 1,
             shard_ref: shard_ref.to_string(),
             placement: Placement { slot, http_port },
+            raft_id_offset: 0,
             image: None,
             resources: None,
             config_hash: String::new(),
@@ -237,6 +238,7 @@ pub fn demo_bundles() -> Vec<ShardBundle> {
                 packing: crate::model::Packing {
                     mode: crate::model::PackingMode::Containers,
                     max_processes_per_pod: 4,
+                    ..Default::default()
                 },
                 image: crate::DEFAULT_IMAGE.to_string(),
                 release: Default::default(),
@@ -279,6 +281,7 @@ pub fn demo_bundles() -> Vec<ShardBundle> {
                 packing: crate::model::Packing {
                     mode: crate::model::PackingMode::Containers,
                     max_processes_per_pod: 1,
+                    ..Default::default()
                 },
                 image: crate::DEFAULT_IMAGE.to_string(),
                 release: Default::default(),

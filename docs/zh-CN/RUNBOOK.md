@@ -200,7 +200,8 @@ open http://127.0.0.1:8099/
   防止新 symbol 复用旧数据。
 - 引擎数据位于 PVC `data-<shard>-<pod>` 内的 `/data/<symbol>-<pod>`。删除 shard 时
   `retainStorage: true` 会保留这些 PVC；`false` 会删除它们。
-- 管理器从不 apply 工作负载，也不删除 PVC。如果应用返回步骤前目录丢失，请按名称检查集群并手动清理。
+- 管理器从不 apply 工作负载，也不直接删除 PVC；operator 负责 prune，并在保留窗口到期后删除
+  孤儿 PVC。如果应用返回步骤前目录丢失，请按名称检查集群并手动清理。
 
 ### 各组件位置
 
@@ -321,7 +322,7 @@ Operator 负责：
 
 - **Apply/prune** 渲染出的 ConfigMap、Services、PDB、NetworkPolicy 和 StatefulSet。Prune 只处理带
   `app.kubernetes.io/managed-by=match-engine-operator` 标签的对象；渲染失败的 shard 不会被 prune。
-  Operator 永远不删除 PVC。
+  Shard PVC 默认保留，只有孤儿 PVC 超过保留窗口才会被删除。
 - **Leader Service 标签**：dedicated shard 中由引擎报告为 leader 的 Pod 获得
   `matching.io/role=leader`，其他 Pod 移除该标签；`<shard>-leader` Service 通过它选择 leader。
 - **状态/条件**：从每个 Pod 的 `/health` 读取 `SymbolShard`、`SymbolDeployment`、
@@ -332,12 +333,18 @@ Operator 负责：
 - **Containers 滚动**：先替换 Pending Pod；删除运行中 Pod 前检查其承载的每个进程仍保有健康多数；
   只有删除后仍满足 quorum 才转移 leader。因此 operator 的 ServiceAccount 还需要 `pods/delete`
   权限（`deploy/rbac.yaml` 已包含）。
+- **保留窗口**：孤儿 shard PVC 会获得 `matching.io/retain-until`（Unix 截止时间或 `manual`）；
+  到期后 operator 删除 PVC，shard 重新出现则清除标记。`--retention-seconds` 控制窗口（`0` 表示
+  只标记、不自动删除）。
+- **迁移**：带非重叠 `raftIdOffset` 的 `Shadow` deployment 会作为 learner 加入源组，追平后切换
+  membership、路由，激活目标并把源置为 `Draining`；把路由 `state` 改为 `Rollback` 可反向恢复。
+  Operator 需要 CR 的 `patch`/`update` 权限。
 
-`--dry-run` 只记录期望数量，不 apply、不写状态、不 bootstrap、不滚动。保留窗口到期后的 PVC
-删除和跨 shard cutover/drain/rollback 仍是后续工作；`drop-shard` 和 `migrate` 目前只返回步骤计划。
+`--dry-run` 只记录期望数量，不 apply、不写状态、不 bootstrap、不滚动、不执行保留操作。
 
 管理器需要能访问引擎 Pod 以提供控制台代理。渲染出的 NetworkPolicy 允许来自带
 `matching.io/role=control-plane` 标签命名空间的 HTTP；如果 GUI 部署在其他命名空间，请保留该标签。
+同一 cell 内的引擎 Pod 也允许跨 shard 访问全部端口，用于迁移。
 
 端口转发到工作站：
 
@@ -349,6 +356,81 @@ kubectl -n match-control port-forward deploy/match-manager 8099:8099
 如果管理器运行在工作站而不是集群内，可用
 `cargo run --manifest-path demos/k8s_control_plane/Cargo.toml -- serve --engine-console-host 127.0.0.1`
 把控制台代理指向回环地址；端口仍来自目录中的 placement。
+
+#### 接管已有集群（brownfield）
+
+当引擎和 PVC 已经存在、但管理器还没切换到 CRD 模式时，使用本流程。目标是先精确还原现有
+placement，接管对象，确认无误后才让 operator 改动工作负载。接管完成前保持
+`--retention-seconds 0`。先构建一次 demo 二进制，确保下面的命令可用：
+
+```sh
+cargo build --manifest-path demos/k8s_control_plane/Cargo.toml \
+  --bin k8s-control-plane --bin match-operator
+```
+
+1. **备份现状。** 不要在 CR 目录为空或不完整时启动 operator：现有 StatefulSet 带有
+   `app.kubernetes.io/managed-by=match-engine-operator`，空目录会触发 prune。
+
+   ```sh
+   mkdir -p /tmp/match-adopt
+   kubectl -n match-eu-1 get sts,deploy,svc,cm,pdb,networkpolicy,pvc -o yaml \
+     > /tmp/match-adopt/fleet.yaml
+   kubectl -n match-eu-1 get pvc -o wide > /tmp/match-adopt/pvc.txt
+   kubectl -n match-eu-1 get pods -o wide > /tmp/match-adopt/pods-before.txt
+   ```
+
+   记录每个 symbol 的 `orderbook_sequence` 和 `orderbook_orders` 基线，并保存旧管理器的目录：
+   `curl -s http://127.0.0.1:8099/api/v1/catalog > /tmp/match-adopt/catalog.json`。
+
+2. **重建并校验目录。** 旧管理器目录与 live placement 一致时可直接复用；否则从
+   StatefulSet、ConfigMap 和 symbol 配置重建。现有 deployment 的 `raftIdOffset` 设为 `0`，
+   清空 `status`，然后校验并恢复：
+
+   ```sh
+   k8s-control-plane validate --data /tmp/match-adopt/catalog.json
+   k8s-control-plane crd-restore --input /tmp/match-adopt/catalog.json --namespace match-eu-1
+   ```
+
+3. **先 diff 再接管。** 渲染完整期望对象并与 live 对象对比：
+
+   ```sh
+   k8s-control-plane render --data /tmp/match-adopt/catalog.json --all --profile local \
+     > /tmp/match-adopt/rendered.json
+   kubectl apply --server-side --dry-run=server -f /tmp/match-adopt/rendered.json
+   ```
+
+   旧集群的预期差异只有 operator 自有字段（`--id-offset`、supervisor 的
+   `--max-processes`）、同 cell NetworkPolicy 规则和 PVC 标签。已有 StatefulSet 无法修改
+   `volumeClaimTemplates` 的标签；operator 会在 PVC 创建后补标签，因此不要把标签加回模板。
+   operator 使用 force-apply，会接管原先由 `kubectl-client-side-apply` 管理的字段。
+
+4. **谨慎启动 operator。** 第一次使用独立 Lease 名和 `--retention-seconds 0`，可先 dry-run：
+
+   ```sh
+   match-operator --namespace match-eu-1 --lease-namespace match-control \
+     --lease-name match-engine-operator-adopt --profile local --resync-seconds 10 --dry-run
+   ```
+
+   确认期望对象数量和没有待 prune 的工作负载后，去掉 `--dry-run` 启动。观察
+   `reconcile complete` 以及 `SymbolShard`/`SymbolDeployment` 的 phase。第一次 apply 只更新
+   StatefulSet 模板，已有 Pod 不会自动重启，直到触发滚动。如果被接管的 StatefulSet 仍带有
+   client-side list 所有权，删除容器时 server-side apply 可能校验失败；operator 会自动改用
+   merge patch 重试该 StatefulSet，完整替换容器数组。
+
+5. **有计划地升级镜像。** 新模板带有 `--id-offset`，旧引擎二进制不认识该参数。先构建并发布
+   包含 `--id-offset` 和 SIGTERM 处理的镜像，修改 CR 的 `shard.spec.image`，让 operator 对
+   containers 模式 shard 逐个 Pod 滚动。supervisor shard 的滚动控制器会跳过；先转移其中每个
+   symbol 的 leader，再逐 Pod 删除。
+
+6. **验证接管结果。** 确认所有 `SymbolShard`、`SymbolDeployment`、`SymbolRoute` 都是 `Ready`，
+   PVC 仍为 `Bound` 且带有 `matching.io/shard`，保存的 `orderbook_sequence`/`orderbook_orders`
+   未变化。然后把管理器切到 CRD 模式（`--crd --no-seed --crd-namespace match-eu-1`），并确认
+   `/api/v1/health` 返回 `"store":"crd"`。
+
+7. **安全回滚。** 修改目录前先把 operator 缩到 0，避免删除或编辑 CR 时 prune 工作负载。用
+   `kubectl apply --server-side --force-conflicts` 恢复备份的工作负载 YAML，或把
+   `shard.spec.image` 改回旧镜像让 operator 滚动回去。接管和回滚都不会删除 PVC；只有保留窗口
+   到期后才会删除孤儿 PVC。
 
 ### 创建目录并 apply shard
 
@@ -505,25 +587,61 @@ kubectl -n match-control logs deploy/match-operator --tail=100 | grep -E 'delete
 都是新 revision 且容器 Ready 后，空 Raft 组才执行 `/init`，否则进程从 PVC 恢复；只有观测配置
 与期望不同才应用 `ConfigureSymbol`。Containers shard 中最后一个活跃引擎的停止/启动是零影响的。
 
+### 迁移 symbol 与回滚
+
+`POST /api/v1/symbols/{name}/migrate` 在目标 shard 创建带非重叠 `raftIdOffset` 的 shadow
+`SymbolDeployment`，不会立即移动路由。Operator 随后把 shadow 的 Raft ID 作为 learner 加入源
+leader，等待追平，切换 membership 和路由，激活目标并将源置为 `Draining`。观察：
+
+```sh
+kubectl -n match-eu-1 get symboldeployment -o custom-columns='NAME:.metadata.name,STATE:.spec.desiredState,OFFSET:.spec.raftIdOffset,PHASE:.status.phase,LEADER:.status.leaderPod'
+kubectl -n match-eu-1 get symbolroute <symbol> -o jsonpath='{.status.phase} {.spec.activeDeploymentRef} {.status.leaderAddr}{"\n"}'
+kubectl -n match-control logs deploy/match-operator --tail=100 | grep -E 'migration|learner|membership|cutover|rollback'
+```
+
+在删除源 PVC 之前回滚：
+
+```sh
+kubectl -n match-eu-1 patch symbolroute <symbol> --type=merge -p '{"spec":{"state":"Rollback"}}'
+```
+
+Operator 会把源 voter 重新作为 learner 加入目标 leader，追平后切回 membership、恢复源路由、
+重新激活源并禁用目标。源 PVC 是回滚路径保留的数据副本。
+
+### 保留窗口
+
+渲染器会给 shard PVC 打标签；孤儿 PVC 会获得 `matching.io/retain-until`（Unix 秒或 `manual`）。
+Operator 在窗口到期后删除；shard 在到期前重新出现会清除标记。检查：
+
+```sh
+kubectl -n match-eu-1 get pvc -l matching.io/shard=<shard> \
+  -o custom-columns='NAME:.metadata.name,UNTIL:.metadata.annotations.matching\\.io/retain-until'
+kubectl -n match-control logs deploy/match-operator --tail=100 | grep -E 'retention|deleted PVC'
+```
+
+只有同时带 `app.kubernetes.io/managed-by=match-engine-operator` 和 `matching.io/shard` 标签的
+PVC 会参与保留/删除。`--retention-seconds 0` 只写 `manual` 标记，不自动删除。
+
 ### 删除 shard
 
 删除只会从**管理器目录**移除 shard、其 deployments，以及指向这些 deployments 的 routes。
 仍被其他 shard 的 deployment 引用的 symbol 会保留。删除前必须停止 shard 中的每个引擎；否则 API
 返回 `409 shard_not_idle` 并列出活跃 symbol。
 
-> **重要：管理器不会删除 Kubernetes 资源。**
+> **重要：管理器不会直接删除 Kubernetes 资源。**
 > `drop` 成功只删除目录记录。StatefulSet、Pod、Service、ConfigMap、PDB 和 NetworkPolicy 会一直
-> 保留，直到运维人员执行 prune。只有选择 `retainStorage: false` 并执行返回的 `delete-storage`
-> 步骤后，PVC 才会被删除。**Reserved** shard 从未真正创建过工作负载时，没有任何 Kubernetes
-> 对象需要清理；目录返回 404 后即可结束。
+> 保留，直到 operator prune。`retainStorage: true` 时，operator 会给孤儿 PVC 写入保留截止时间，
+> 到期后删除；`--retention-seconds 0` 只写 `manual` 标记。`retainStorage: false` 时请执行返回的
+> `delete-storage` 步骤立即删除。**Reserved** shard 从未真正创建过工作负载时，没有任何
+> Kubernetes 对象需要清理；目录返回 404 后即可结束。
 
 删除后的预期状态取决于 shard 内容：
 
 | 删除时的 shard | 运维执行步骤后的状态 |
 |---|---|
 | Reserved（`0` 个 deployment，从未物化） | 从未存在 StatefulSet/Pod/Service/ConfigMap/PDB/NetworkPolicy/PVC；只有目录记录消失。 |
-| 已物化，`retainStorage: true` | 工作负载和 shard 对象消失；四个 `data-<shard>-0..3` PVC 保留为 Bound/Released，以便恢复 shard。 |
-| 已物化，`retainStorage: false` | 工作负载和 shard 对象消失；PVC/PV 也消失。此操作不可逆。 |
+| 已物化，`retainStorage: true` | 工作负载和 shard 对象消失；四个 `data-<shard>-0..3` PVC 保留并带保留截止时间，到期后由 operator 删除。 |
+| 已物化，`retainStorage: false` | 工作负载和 shard 对象消失；执行 `delete-storage` 步骤后 PVC/PV 也消失。此操作不可逆。 |
 
 #### 1. 保存目录和 manifests
 
@@ -751,6 +869,7 @@ JSON 模式下，任何管理器滚动前先导出目录；如果文件丢失，
 | Operator 意外 prune 对象 | 检查 `--namespace` 作用域和 shard CR 是否仍存在。没有 managed-by 标签的对象永远不会被 prune；operator 永远不删除 PVC。 |
 | `ImagePullBackOff` / 引擎控制台没有 symbol 标题 | 镜像已重建但 Pod 未重建。使用 `imagePullPolicy: IfNotPresent`，然后 `kubectl -n match-eu-1 rollout restart statefulset/<shard>` 并等待 `/ready`。 |
 | 添加/停止/启动返回 `409 restart_required` | shard 是 containers 模式且还有其他活跃引擎；改用 supervisor shard、空 shard，或显式允许 `allowRestart`。 |
+| 停止后显示 `Disabled`，但 symbol 容器仍在运行 | 管理器只写期望状态。检查 `kubectl -n match-control logs deploy/match-operator` 是否有 StatefulSet apply 错误。被接管的 StatefulSet 可能保留 `kubectl-client-side-apply` 的 list 所有权，删除容器时 SSA 校验会失败（`containers[0].image: Required value`）。Operator v6+ 会自动对该 StatefulSet 改用 merge patch 重试。用 `kubectl -n match-eu-1 get sts <shard> -o jsonpath='{.status.updatedReplicas}'` 和 operator 的 `deleted one outdated pod` 日志确认滚动。 |
 | 删除返回 `409 shard_not_idle` | 先停止 shard 中所有 symbol；错误会列出活跃项。Apply 更新后的 ConfigMap 后重试。 |
 | `drop` 返回 `200` 但 Pod/StatefulSet 仍存在 | 管理器只写期望状态。用删除前保存的 manifests 执行 `kubectl -n match-eu-1 delete -f /tmp/<shard>-manifests.json --ignore-not-found`。 |
 | Reserved shard 删除后没有 PVC 或工作负载 | 正常：reserved shard 从未物化。确认目录返回 `404` 且没有同名对象即可。 |

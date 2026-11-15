@@ -248,6 +248,7 @@ pub fn place_symbol(
             generation: 1,
             shard_ref: shard.name.clone(),
             placement: Placement { slot, http_port },
+            raft_id_offset: 0,
             image: None,
             resources: None,
             config_hash: String::new(),
@@ -362,6 +363,29 @@ pub fn migrate_symbol(
         .http_base_port
         .checked_add(slot)
         .ok_or_else(|| ApiError::bad_request("port_range", "target shard HTTP port overflow"))?;
+    let source_shard = catalog
+        .shards
+        .get(&source.spec.shard_ref)
+        .cloned()
+        .ok_or_else(|| {
+            ApiError::conflict(
+                "source_shard_missing",
+                format!(
+                    "source deployment {} points at missing shard {}",
+                    source.name, source.spec.shard_ref
+                ),
+            )
+        })?;
+    let raft_id_offset = source
+        .spec
+        .raft_id_offset
+        .saturating_add(u64::from(source_shard.spec.replicas));
+    if source_shard.spec.cell != target.spec.cell {
+        return Err(ApiError::bad_request(
+            "migration_cell",
+            "source and target shards must be in the same cell; cross-cell migration uses a gateway cutover",
+        ));
+    }
     let shadow_name = format!("{symbol_name}-shadow");
     if catalog.deployments.contains_key(&shadow_name) {
         return Err(ApiError::conflict(
@@ -378,6 +402,7 @@ pub fn migrate_symbol(
             generation: symbol.spec.generation,
             shard_ref: target.name.clone(),
             placement: Placement { slot, http_port },
+            raft_id_offset,
             image: None,
             resources: None,
             config_hash: String::new(),
@@ -416,10 +441,9 @@ pub fn migrate_symbol(
         source.namespace,
         source.spec.placement.http_port
     );
-    let target_addr = format!(
-        "{}-0.{}-headless.{}:{}",
-        target.name, target.name, target.namespace, http_port
-    );
+    let target_ids: Vec<u64> = (0..target.spec.replicas)
+        .map(|pod| raft_id_offset + u64::from(pod))
+        .collect();
     Ok(MigrationPlan {
         symbol: symbol_name.to_string(),
         source_shard: source.spec.shard_ref.clone(),
@@ -433,49 +457,41 @@ pub fn migrate_symbol(
             MigrationStep {
                 action: "apply-target-shard".to_string(),
                 detail: format!(
-                    "render and apply shard {}; wait for the new {symbol_name} container on all {} pods",
-                    target.name, target.spec.replicas
-                ),
-            },
-            MigrationStep {
-                action: "init-shadow".to_string(),
-                detail: format!(
-                    "POST {target_addr}/init with the {} target voters: {}",
-                    voters.len(),
-                    voters.join(", ")
+                    "render and apply shard {}; start the shadow with Raft IDs {:?} and leave it uninitialised",
+                    target.name, target_ids
                 ),
             },
             MigrationStep {
                 action: "add-learners".to_string(),
                 detail: format!(
-                    "POST the target voters as learners to the source leader at {source_addr}; wait for catch-up"
+                    "operator POSTs {:?} as learners to the source leader (for example {source_addr}); wait for the target applied indexes to catch up",
+                    target_ids
                 ),
             },
             MigrationStep {
                 action: "change-membership".to_string(),
                 detail: format!(
-                    "POST {source_addr}/change-membership with the {} target voters after the shadow catches up",
-                    voters.len()
+                    "operator POSTs the source leader's /change-membership with {:?} after catch-up",
+                    target_ids
                 ),
             },
             MigrationStep {
                 action: "cutover-route".to_string(),
                 detail: format!(
-                    "patch SymbolRoute {} activeDeploymentRef={}, previousDeploymentRef={}, state=Cutover, then Active",
+                    "operator patches SymbolRoute {} activeDeploymentRef={}, previousDeploymentRef={}, state=Active, then disables the source deployment; source PVCs stay for rollback",
                     symbol_name, shadow_name, source.name
                 ),
             },
             MigrationStep {
-                action: "drain-source".to_string(),
+                action: "rollback".to_string(),
                 detail: format!(
-                    "stop routing to {} and remove its container after the retention window",
-                    source.name
+                    "patch SymbolRoute {symbol_name} state=Rollback to add the source voters back as learners, restore the source route and disable the shadow"
                 ),
             },
         ],
         notes: vec![
             "the source route is unchanged until the operator performs cutover".to_string(),
-            "the target deployment is desiredState=Shadow and consumes a target shard slot"
+            "the target deployment is desiredState=Shadow with a non-overlapping raftIdOffset and consumes a target shard slot"
                 .to_string(),
             "slots are not reused while the source data is retained".to_string(),
         ],
@@ -1438,13 +1454,14 @@ mod tests {
         assert_eq!(shadow.spec.shard_ref, "fx-eu-02");
         assert_eq!(shadow.spec.placement.slot, 0);
         assert_eq!(shadow.spec.desired_state, DeploymentState::Shadow);
+        assert_eq!(shadow.spec.raft_id_offset, 4);
         assert_eq!(
             catalog.routes["eurusd"].spec.active_deployment_ref,
             "eurusd-g1"
         );
         assert_eq!(catalog.shard_processes("fx-eu-02"), 1);
         assert!(plan.steps.iter().any(|step| step.action == "cutover-route"));
-        assert!(plan.steps.iter().any(|step| step.action == "drain-source"));
+        assert!(plan.steps.iter().any(|step| step.action == "rollback"));
     }
 
     #[test]

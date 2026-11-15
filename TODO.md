@@ -26,9 +26,9 @@ The Kubernetes control-plane design and reference demo are complete (§18): rese
 shards, create-symbol/migrate planning, a zero-impact supervisor pod agent, and a containers-mode
 restart guard. The reference manager has both a JSON demo store and a CRD-backed desired-state
 store that writes through the Kubernetes API server (etcd underneath). The Lease-elected operator
-now also executes bootstrap/config/membership and quorum-safe containers add/start/stop rolls;
-per-process isolation, retention-window deletion, migration cutover and production manager
-security remain.
+also executes bootstrap/config/membership, quorum-safe containers rolls, PVC retention and
+cross-shard cutover/rollback; production manager security and live cgroup-delegation validation
+remain.
 
 Priority key: **P0** = known correctness/security defect, do next; **P1** = correctness coverage,
 measurement and production readiness; **P2** = important but not blocking; **P3** = later/optional.
@@ -42,16 +42,13 @@ readers resume from `(log_index, ordinal)` and dedupe on `event_id`. A local-lea
 overtake an unfinished write, so read-after-write is not a guarantee; clients that need it must
 await the write response.
 
-The Kubernetes control plane is a new feature workstream, not a defect (§18).
-Bootstrap/config/membership execution and containers add/start/stop rolls are done; the remaining
-production lifecycle items are below.
+The Kubernetes control plane is a new feature workstream, not a defect (§18). The full reference
+lifecycle is implemented: bootstrap/config/membership, containers add/start/stop rolls, opt-in
+per-child cgroups/log rotation, PVC retention and cross-shard cutover/rollback. Residual evidence
+gaps are the second-host and Linux cgroup-delegation checks below.
 
-**P1 - remaining production control-plane work**
-
-- **Production lifecycle completion.** Per-process cgroups and optional rotating per-child logs
-  (today the pod/container limit and kubelet log rotation are the boundary), retention-window
-  deletion, and migration cutover/drain/rollback. These need a durable retention record and a
-  cross-shard cutover state machine; see §18.
+**P1 - CI wiring only.** The control-plane lifecycle is complete; wire the standalone
+`demos/k8s_control_plane` crate into CI (fmt, Clippy and tests).
 
 The remaining P2 evidence gaps are second-host behaviour, not code paths: the four OrbStack
 containers share one kernel, host and clock, and the Aeron multicast run is loopback within one
@@ -73,6 +70,10 @@ dispatch remains.
 3. **Keep docs synchronized (§10).** This is an ongoing gate: `AGENTS.md`, READMEs,
    `docs/PERFORMANCE.md`, `docs/API.md` and this file must move with storage/wire/read-policy
    changes.
+
+Residual supervisor isolation evidence: validate opt-in per-child cgroups and rotating logs on a
+Linux node that actually delegates a writable cgroup v2 subtree (the OrbStack pod does not). The
+supervisor is intentionally fail-open and reports `isolationError` when delegation is unavailable.
 
 **P3 - later, in impact order**
 
@@ -1313,20 +1314,31 @@ Remaining (priority order is top to bottom within each tier):
   processes configured and routed, `rollalt` stopped, re-added, and image/config rolls completed.
   The engine's SIGTERM handler makes containers-mode pod termination prompt instead of waiting for
   the 60s grace period.
-- [x] **P1** Supervisor resilience: exponential restart backoff with a cumulative restart count,
-  `--max-processes` backpressure, PID-file orphan cleanup after a supervisor SIGKILL, and tests
-  for add/remove, crash restart, backpressure and orphan cleanup. Per-process cgroups and
-  rotating per-child logs remain deliberate follow-ups: the current boundary is the pod/container
-  limit plus kubelet log rotation.
-- [ ] **P1** Retention window and automated deletion: `drop-shard` returns the keep/delete PVC
-  steps but the operator does not execute them. This needs a durable retained-shard record (CR or
-  annotation/tombstone) because deleting the shard CR removes the only catalog pointer, plus a
-  configurable window, a verified PVC-release operation and a guard against shard-name reuse while
-  retained PVCs exist.
-- [ ] **P1** Migration execution: a `promote`/cutover state machine that validates the cross-shard
-  `previousDeploymentRef`, adds the target voters as learners, waits for catch-up, switches the
-  route, drains/removes the old deployment, retains/deletes source data and supports rollback.
-  `migrate` currently creates the shadow and plan only.
+- [x] **P1** Supervisor resilience and isolation: exponential restart backoff with a cumulative
+  restart count, `--max-processes` backpressure, PID-file orphan cleanup after a supervisor
+  SIGKILL, opt-in per-child cgroup v2 placement (`cgroupRoot`, `childMemoryMax`, `childCpuMax`,
+  fail-open without delegation), optional rotating per-child logs (`logDir`, `logMaxBytes`,
+  `logMaxFiles`, mirrored to the container log), and tests for add/remove, crash restart,
+  backpressure, orphan cleanup, cgroup files and rotation.
+- [x] **P1** Retention window and automated deletion: the operator treats orphaned shard PVCs as
+  retained records (`matching.io/retain-until`/`retained-at` annotations), starts a configurable
+  timer (`--retention-seconds`), clears the marker if the shard returns, and deletes expired
+  PVCs. Live proof on OrbStack: deleting the target shard CR marked four PVCs and deleted them
+  after 60s while the source PVCs stayed Bound.
+- [x] **P1** Migration execution: `raftIdOffset` gives a shadow a non-overlapping Raft ID range;
+  the shadow remains uninitialised and the operator adds its IDs as learners to the source leader,
+  waits for catch-up, changes membership, switches the route, drains the source, and supports
+  `state: Rollback` to move voters and the route back. Live proof on OrbStack: source `mig-a` to
+  target `mig-b`, cutover Ready on the target, then rollback Ready on the source with the order
+  placed during the migration still present. Cross-shard NetworkPolicy peers and CR spec-patch
+  RBAC are included.
+- [x] **P1** Brownfield adoption: reconstruct a full CR catalog from a running fleet, adopt the
+  existing StatefulSets/PVCs, and upgrade the image through the operator without data loss. Live
+  proof on OrbStack `match-eu-1`: 4 shards and 7 symbols restored as CRs, 16 pods rolled to
+  `matchengine-raft:k8s-operator-v2` (containers mode via the operator, supervisor shard one pod
+  at a time after leadership transfer), all PVCs stayed Bound and operator-labeled, and every
+  `orderbook_sequence`/`orderbook_orders` read was unchanged. The procedure is in
+  `docs/RUNBOOK.md` under "Adopt an existing fleet".
 - [ ] **P1** Wire the standalone `demos/k8s_control_plane` crate into CI (fmt, Clippy, tests). The
   root cluster suite already covers the supervisor; the demo crate is outside the workspace.
 - [ ] **P2** Production manager: OIDC/RBAC, approvals, idempotency keys, namespace-qualified

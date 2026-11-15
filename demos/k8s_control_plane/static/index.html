@@ -36,6 +36,11 @@
   h1 { font-size: 17px; margin: 0; letter-spacing: 0.4px; }
   h1 span { color: var(--accent); }
   .tag { font: 11px/1 var(--mono); color: var(--muted); border: 1px solid var(--border); border-radius: 999px; padding: 5px 9px; }
+  .tag.live { display: inline-flex; align-items: center; gap: 6px; color: var(--good); border-color: #24513a; }
+  .tag.live::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; animation: live-pulse 1.6s ease-in-out infinite; }
+  .tag.live.stale { color: var(--warn); border-color: #4a3a1e; }
+  .tag.live.stale::before { animation: none; opacity: .45; }
+  @keyframes live-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .25; } }
   .stats { display: flex; gap: 16px; margin-left: auto; flex-wrap: wrap; }
   .stat { text-align: right; }
   .stat b { display: block; font: 600 18px/1.1 var(--mono); }
@@ -107,6 +112,8 @@
   .issue { border-left: 3px solid var(--bad); background: #1d1418; padding: 8px 10px; border-radius: 0 7px 7px 0; font-size: 12px; }
   .issue.warning { border-left-color: var(--warn); background: #1d1a12; }
   .issue code { color: var(--muted); font: 10px/1.4 var(--mono); margin-right: 8px; }
+  .rollout-progress { height: 6px; margin: 8px 0 5px; border-radius: 999px; background: var(--border); overflow: hidden; }
+  .rollout-progress > span { display: block; height: 100%; background: var(--warn); transition: width .35s ease; }
   pre {
     background: #0a0f14; border: 1px solid var(--border); border-radius: 10px;
     padding: 14px; overflow: auto; max-height: 62vh; font: 11.5px/1.5 var(--mono);
@@ -162,7 +169,8 @@
 <body>
 <header>
   <h1>match<span>engine</span> · control plane</h1>
-  <span class="tag">demo</span>
+  <span class="tag" id="storeMode" title="desired-state backend">demo</span>
+  <span class="tag live" id="liveState" title="auto-refreshing every 2 seconds">live</span>
   <span id="validation" class="badge">validating…</span>
   <div class="stats" id="stats"></div>
 </header>
@@ -188,6 +196,7 @@
       <button class="danger" id="dropShardBtn" type="button" title="Stop every engine before dropping the shard" disabled>drop shard</button>
     </div>
     <div id="issueBox"></div>
+    <div id="rolloutBanner" class="issue warning" style="display:none; margin-bottom:10px"></div>
     <div class="tabs">
       <button class="tab active" data-tab="overview">overview</button>
       <button class="tab" data-tab="plan">reconcile plan</button>
@@ -460,7 +469,10 @@ async function api(path, options) {
   const body = await response.json().catch(() => ({}));
   if (!response.ok) {
     const issues = (body.issues || []).map((i) => i.code + ": " + i.message).join("; ");
-    throw new Error(body.message || body.error || ("HTTP " + response.status) + (issues ? " — " + issues : ""));
+    const error = new Error(body.message || body.error || ("HTTP " + response.status) + (issues ? " — " + issues : ""));
+    error.code = body.error || ("http_" + response.status);
+    error.status = response.status;
+    throw error;
   }
   return body;
 }
@@ -548,6 +560,24 @@ function renderOverview() {
   const validation = detail.shardValidation || detail.validation || {};
   const errors = (validation.errors || []).length;
   const warnings = (validation.warnings || []).length;
+  const progress = shard.status?.rollout;
+  const containers = shard.spec.packing.mode === "containers";
+  const rollout = containers && (shard.status?.conditions || []).some((condition) =>
+    condition.type === "Progressing" && condition.status === "True");
+  const percent = progress ? Math.min(100, Math.max(0, Number(progress.percent) || 0)) : null;
+  const banner = $("rolloutBanner");
+  if (rollout) {
+    banner.style.display = "block";
+    banner.innerHTML = `<b>Operator rollout in progress${percent === null ? "" : ` · ${esc(percent)}%`}</b>
+      ${progress ? `<div class="rollout-progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${esc(percent)}"><span style="width:${esc(percent)}%"></span></div>
+      <span class="muted">${esc(progress.updatedReplicas)}/${esc(progress.replicas)} pods updated · ${esc(progress.readyReplicas)}/${esc(progress.replicas)} ready${percent === 100 && !progress.complete ? " · finalizing" : ""}</span>` : ""}
+      <div>A containers-mode start/stop changes the StatefulSet pod template, so the operator replaces all
+      ${esc(shard.spec.replicas)} pods one at a time and waits for quorum between replacements. This can take a few
+      minutes; start/stop is disabled until the shard settles.</div>`;
+  } else {
+    banner.style.display = "none";
+    banner.innerHTML = "";
+  }
   $("overviewCards").innerHTML = `
     <div class="card"><h3>Shard</h3><dl class="kv">
       <dt>cell</dt><dd>${esc(shard.spec.cell)}</dd>
@@ -584,17 +614,21 @@ function renderOverview() {
     const entry = consoles[deployment.spec.symbolRef];
     const state = deployment.spec.desiredState || "Active";
     const disabled = state === "Disabled";
-    const stateClass = disabled ? "" : state === "Shadow" || state === "Draining" ? "warn" : "ok";
-    const action = state === "Active"
-      ? `<button class="danger" type="button" data-stop="${esc(deployment.spec.symbolRef)}" title="Gracefully stop this engine; data and slot are retained">stop</button>`
-      : state === "Disabled"
-        ? `<button class="primary" type="button" data-start="${esc(deployment.spec.symbolRef)}" title="Re-enable this engine from its retained data directory">start</button>`
-        : "";
+    const pct = percent === null ? "" : ` ${percent}%`;
+    const stateText = disabled ? (rollout ? `stopping…${pct}` : "stopped") : (rollout ? `rolling…${pct}` : state);
+    const stateClass = rollout ? "warn" : disabled ? "" : state === "Shadow" || state === "Draining" ? "warn" : "ok";
+    const action = rollout
+      ? `<button type="button" disabled title="Operator rollout in progress; wait for the shard to settle">waiting…</button>`
+      : state === "Active"
+        ? `<button class="danger" type="button" data-stop="${esc(deployment.spec.symbolRef)}" title="Gracefully stop this engine; data and slot are retained">stop</button>`
+        : state === "Disabled"
+          ? `<button class="primary" type="button" data-start="${esc(deployment.spec.symbolRef)}" title="Re-enable this engine from its retained data directory">start</button>`
+          : "";
     return `
     <tr class="${disabled ? "disabled-row" : ""}">
       <td class="mono">${esc(deployment.spec.symbolRef)}</td>
       <td class="mono">${esc(deployment.name)}</td>
-      <td><span class="badge ${stateClass}">${esc(disabled ? "stopped" : state)}</span></td>
+      <td><span class="badge ${stateClass}">${esc(stateText)}</span></td>
       <td class="mono">${esc(deployment.spec.placement.slot)}</td>
       <td class="mono">${esc(deployment.spec.placement.httpPort)}</td>
       <td class="mono">${esc(deployment.spec.placement.httpPort + 1000)}</td>
@@ -725,7 +759,7 @@ async function adopt() {
 
 async function shutdownSymbol(name, allowRestart = false) {
   if (!allowRestart) {
-    const ok = confirm(`Stop ${name}?\n\nThe engine receives SIGTERM, its data directory and slot are retained, and no other engine is restarted.`);
+    const ok = confirm(`Stop ${name}?\n\nThe engine receives SIGTERM, its data directory and slot are retained. If this symbol shares a containers-mode shard with active engines, you will be asked to confirm a rolling restart of the other engines.`);
     if (!ok) return;
   }
   try {
@@ -745,7 +779,7 @@ async function shutdownSymbol(name, allowRestart = false) {
     await loadPlan();
     loadAudit();
   } catch (error) {
-    if (!allowRestart && String(error.message).includes("restart_required")) {
+    if (!allowRestart && error.code === "restart_required") {
       const ok = confirm(`${name} shares a containers-mode shard with other active engines.\n\nRemoving its container recreates every pod and restarts the other engines one voter at a time. Continue?`);
       if (ok) return shutdownSymbol(name, true);
       return;
@@ -776,7 +810,7 @@ async function startSymbol(name, allowRestart = false) {
     await loadPlan();
     loadAudit();
   } catch (error) {
-    if (!allowRestart && String(error.message).includes("restart_required")) {
+    if (!allowRestart && error.code === "restart_required") {
       const ok = confirm(`${name} shares a containers-mode shard with other active engines.\n\nAdding its container back recreates every pod and restarts the other engines one voter at a time. Continue?`);
       if (ok) return startSymbol(name, true);
       return;
@@ -1078,6 +1112,14 @@ async function boot() {
   bind();
   try {
     catalog = await api("/api/v1/catalog");
+    const health = await api("/api/v1/health").catch(() => null);
+    const mode = $("storeMode");
+    if (health && health.store) {
+      mode.textContent = health.store === "crd" ? "crd" : "demo";
+      mode.title = health.store === "crd"
+        ? `desired state stored as matching.io CRDs in ${health.cell || "the cluster"}; reconciled by the operator`
+        : "local JSON demo store";
+    }
     renderHeader();
     const shards = Object.keys(catalog.shards || {});
     selected = shards[0];
@@ -1086,7 +1128,60 @@ async function boot() {
     loadAudit();
   } catch (error) {
     toast("cannot load catalog: " + error.message, true);
+  } finally {
+    startLiveRefresh();
   }
+}
+
+const LIVE_REFRESH_MS = 2000;
+let liveTimer = null;
+let liveRefreshing = false;
+let liveTicks = 0;
+
+function setLive(ok, text = "live") {
+  const el = $("liveState");
+  if (!el) return;
+  el.textContent = text;
+  el.className = ok ? "tag live" : "tag live stale";
+  el.title = ok
+    ? `auto-refreshing every ${LIVE_REFRESH_MS / 1000} seconds`
+    : "auto-refresh failed; showing the last successful snapshot";
+}
+
+function livePaused() {
+  return document.visibilityState !== "visible" || Boolean(document.querySelector(".modal.open"));
+}
+
+async function refreshLive() {
+  if (liveRefreshing || livePaused()) return;
+  liveRefreshing = true;
+  try {
+    catalog = await api("/api/v1/catalog");
+    const shards = Object.keys(catalog.shards || {});
+    if (!selected || !catalog.shards?.[selected]) selected = shards[0] || null;
+    renderHeader();
+    renderShards();
+    if (selected) {
+      await loadDetail();
+      if (liveTicks % 3 === 0 && document.querySelector("#tab-plan.active")) await loadPlan();
+    }
+    loadAudit();
+    liveTicks += 1;
+    setLive(true);
+  } catch (_) {
+    setLive(false, "stale");
+  } finally {
+    liveRefreshing = false;
+  }
+}
+
+function startLiveRefresh() {
+  setLive(true);
+  clearInterval(liveTimer);
+  liveTimer = setInterval(refreshLive, LIVE_REFRESH_MS);
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") refreshLive();
+  });
 }
 
 boot();
