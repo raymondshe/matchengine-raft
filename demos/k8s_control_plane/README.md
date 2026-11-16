@@ -18,9 +18,9 @@ etcd directly.
 
 ![Kubernetes control plane manager GUI](../../docs/kubernetes-control-plane.png)
 
-The reference manager GUI: shard catalog, per-shard packing mode, validation, reconcile plan,
-manifests, audit and engine-console links. The selected `fx-sup-01` shard is supervisor-mode and
-hosts two symbols added without restarting the existing engine processes.
+The reference manager GUI: shard catalog, per-shard packing mode, validation, a read-only preview
+plan tab, image upgrade, manifests, audit and engine-console links. The selected `fx-sup-01` shard
+is supervisor-mode and hosts two symbols added without restarting the existing engine processes.
 
 ```
 demos/k8s_control_plane/
@@ -233,8 +233,9 @@ The operator also drives the engine lifecycle once the workload exists:
   activates the target and drains the source. Route `state: Rollback` reverses the process.
 
 The operator ServiceAccount needs `pods/delete`, PVC list/patch/delete, and CR `patch`/`update` in
-addition to list/watch; `deploy/rbac.yaml` includes them. `--dry-run` skips bootstrap, rollout,
-retention, migration, status and label actions.
+addition to list/watch; `deploy/rbac.yaml` includes them. The manager ServiceAccount additionally
+gets read-only `nodes`/`pods` `get,list` for the upgrade image inventory. `--dry-run` skips
+bootstrap, rollout, retention, migration, status and label actions.
 
 ## Manager API
 
@@ -243,6 +244,7 @@ retention, migration, status and label actions.
 | `GET` | `/` | embedded GUI |
 | `GET` | `/api/v1/health` | catalog counts and validation summary |
 | `GET` | `/api/v1/catalog` | full catalog plus validation report |
+| `GET` | `/api/v1/images?shard={name}` | selectable engine images from `Node.status.images` and running engine pods, merged with catalog references; marks the shard's configured (`current`) and running (`runningHere`) image |
 | `GET` | `/api/v1/shards` | shard list with per-pod CPU/memory requests, `slots`, `freeSlots`, phase and paused state |
 | `POST` | `/api/v1/shards` | reserve an empty shard from a `SymbolShard` body |
 | `POST` | `/api/v1/shards/{name}/upgrade` | write `spec.image` and `spec.release` to a shard; rejects incompatible releases and per-deployment image overrides; the operator performs the one-pod-at-a-time roll |
@@ -437,9 +439,18 @@ supervisor children before and after.
 
 ### Upgrade a shard image
 
-The shard detail **plan** tab has an **Upgrade image** button (and the manager exposes the same
+The shard detail **upgrade** tab has an **Upgrade** button (and the manager exposes the same
 action as an API call). It writes the target image and release to the `SymbolShard`; the operator
-owns the rollout. Use a digest-pinned image:
+owns the rollout. The **Target image** control is a picker backed by
+`GET /api/v1/images?shard=<name>`: it lists engine images cached on Kubernetes nodes
+(`Node.status.images`) and images used by running engine pods, with tags, short digests, node counts
+and `● running here` / `◆ configured` markers. Choosing an entry fills the digest-pinned reference;
+a reference that is not cached can still be typed into the collapsed **Custom image reference**
+field. The separate **preview plan** tab simulates the operator's reconcile steps from a synthetic
+observation and never writes desired state. The manager
+reads nodes and engine-labeled pods read-only (`deploy/rbac.yaml`); if that listing fails the picker
+falls back to catalog references and shows the warning. The inventory refreshes every 15 seconds,
+and the selected target survives the 2-second live catalog refresh. Use a digest-pinned image:
 
 ```bash
 curl -s -X POST http://127.0.0.1:8099/api/v1/shards/fx-eu-01/upgrade \
@@ -511,8 +522,8 @@ irreversible.
 `fresh`, `ready`, `degraded`, `leader-loss`, `config-drift`, `upgrade`. They are synthesized
 from the catalog, not read from a cluster, so the GUI and `plan` work offline. The synthesized
 image for every scenario except `upgrade` is the shard's `spec.image`; `upgrade` uses the older
-demo image so the rolling-restart path can be exercised. The GUI labels the plan tab as a scenario
-simulator; use **overview** for the operator's live rollout status.
+demo image so the rolling-restart path can be exercised. The GUI labels the **upgrade** tab as a
+scenario preview; use **overview** for the operator's live rollout status.
 
 ## What the renderer emits
 

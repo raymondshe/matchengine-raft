@@ -650,8 +650,17 @@ copy that lets this reverse path work.
 
 ### Upgrade a shard image (compatible release)
 
-Use the manager plan tab's **Upgrade image** button, or the API, to write a new image and release
-to one `SymbolShard`. The operator does the rollout; do not patch the StatefulSet directly.
+Use the manager **upgrade** tab's **Upgrade** button, or the API, to write a new image and
+release to one `SymbolShard`. The operator does the rollout; do not patch the StatefulSet directly.
+The **preview plan** tab is read-only and simulates the operator's reconcile steps.
+
+The **Target image** dropdown lists engine images already cached on a Kubernetes node and images
+used by running engine pods, with tags, short digests, `● running here` and `◆ configured`
+markers. Picking one fills the digest-pinned reference; an image that is not cached can still be
+typed into the collapsed **Custom image reference** field. `GET /api/v1/images?shard=<name>`
+returns the same inventory, and
+falls back to catalog references with a `warning` when the manager cannot list nodes or pods. The
+manager only reads nodes and engine-labeled pods (`deploy/rbac.yaml`); it never mutates workloads.
 
 ```sh
 curl -s -X POST http://127.0.0.1:8099/api/v1/shards/fx-eu-01/upgrade \

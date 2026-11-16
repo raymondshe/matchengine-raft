@@ -611,8 +611,16 @@ Operator 会把源 voter 重新作为 learner 加入目标 leader，追平后切
 
 ### 兼容版本镜像升级
 
-在管理器 plan 页使用 **Upgrade image**，或直接调用 API，把新镜像和 release 写入单个
-`SymbolShard`。滚动由 operator 执行，不要直接 patch StatefulSet。
+在管理器 **upgrade** 页使用 **Upgrade**，或直接调用 API，把新镜像和 release 写入单个
+`SymbolShard`。滚动由 operator 执行，不要直接 patch StatefulSet。**preview plan** 页是只读的，
+只模拟 operator 的 reconcile 步骤。
+
+**Target image** 下拉框列出 Kubernetes 节点已缓存（`Node.status.images`）以及正在运行的引擎
+Pod 使用的镜像，显示 tag、短 digest、`● running here` 和 `◆ configured` 标记；选择后自动填入
+digest 固定的引用。未缓存的镜像仍可在折叠的 **Custom image reference** 中手动输入。
+`GET /api/v1/images?shard=<name>` 返回同一份清单；管理器无法 list 节点或 Pod 时退回目录中的
+镜像引用并返回 `warning`。管理器只读节点和带引擎标签的 Pod（见 `deploy/rbac.yaml`），不会修改
+工作负载。
 
 ```sh
 curl -s -X POST http://127.0.0.1:8099/api/v1/shards/fx-eu-01/upgrade \

@@ -224,8 +224,9 @@ Implications:
   client-side ownership in addition to the operator's server-side apply fields. This is metadata,
   not engine state.
 - **No direct etcd clients.** The manager/operator ServiceAccounts have RBAC only for the five CRDs,
-  their status subresources and the Kubernetes resources the operator manages. A direct etcd
-  connection is unsupported and would bypass the API server's validation, watch and audit paths.
+  their status subresources, the Kubernetes resources the operator manages and the manager's
+  read-only `nodes`/`pods` image inventory. A direct etcd connection is unsupported and would
+  bypass the API server's validation, watch and audit paths.
 
 ## 8. Backup and restore
 

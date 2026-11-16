@@ -1455,6 +1455,14 @@ version; it does not gate same-version rolling. Until that lands, an image chang
 `wireVersion`/`snapshotVersion` is stop-the-world. Read the target versions from signed image
 metadata or the release catalog, not from the tag.
 
+The **upgrade** tab's **Target image** dropdown is populated by read-only
+`GET /api/v1/images?shard=<name>`, which merges the images Kubernetes nodes already cache
+(`Node.status.images`) with the images running engine pods use, and marks the shard's configured
+(`current`) and actually running (`runningHere`) image. The manager needs `nodes`/`pods` `get,list`
+(see `deploy/rbac.yaml`); it never mutates workloads. A failed cluster listing returns the catalog
+references plus a `warning`, and an image not present in the cache can still be typed into the
+reference field.
+
 Stop-the-world procedure:
 
 1. Acquire the shard operation lock and verify a recent backup.

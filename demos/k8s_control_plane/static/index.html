@@ -102,6 +102,31 @@
   button.danger { border-color: #5c2a2e; color: var(--warn); }
   label.field { display: flex; flex-direction: column; gap: 5px; color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: 1px; }
   .plan-summary { color: var(--muted); margin-bottom: 12px; font-family: var(--mono); font-size: 12px; }
+  .image-select { min-width: 330px; max-width: 480px; }
+  .image-hint { color: var(--muted); font: 11px/1.6 var(--mono); margin: -4px 0 0; overflow-wrap: anywhere; }
+  .image-hint b { color: var(--accent); font-weight: 600; }
+  .upgrade-card { display: grid; gap: 14px; }
+  .upgrade-card h3 { margin: 0 0 6px; }
+  .upgrade-sub { margin: 0; color: var(--muted); font-size: 12px; line-height: 1.6; max-width: 62ch; }
+  .upgrade-form { display: flex; gap: 12px; flex-wrap: wrap; align-items: flex-end; }
+  .upgrade-image-field { flex: 1 1 360px; min-width: 280px; }
+  .upgrade-image-field .image-select { width: 100%; max-width: none; }
+  .upgrade-form button { height: 32px; }
+  .advanced { margin-top: 16px; border: 1px solid var(--border); border-radius: 10px; background: var(--panel); padding: 0 14px; }
+  .advanced.plain { margin: 0; padding: 0 12px; background: transparent; }
+  .advanced > summary {
+    cursor: pointer; padding: 11px 0; font: 11px/1.4 var(--mono);
+    letter-spacing: 0.6px; text-transform: uppercase; color: var(--muted); list-style: none;
+  }
+  .advanced > summary::-webkit-details-marker { display: none; }
+  .advanced > summary::before { content: "▸ "; color: var(--accent); }
+  .advanced[open] > summary::before { content: "▾ "; }
+  .advanced > summary:hover { color: var(--text); }
+  .advanced[open] > summary { border-bottom: 1px solid var(--border); margin-bottom: 14px; }
+  .advanced.plain[open] > summary { margin-bottom: 10px; }
+  .advanced.plain .field input { width: 100%; }
+  .advanced-note { color: var(--muted); font-size: 11.5px; line-height: 1.6; margin: 0; max-width: 70ch; }
+  .advanced .plan-summary { margin-top: 12px; }
   .step { display: grid; grid-template-columns: 26px minmax(0, 1fr); gap: 10px; padding: 10px 0; border-bottom: 1px solid var(--border); }
   .step:last-child { border-bottom: none; }
   .step .num { font: 11px/1.6 var(--mono); color: var(--muted); }
@@ -202,7 +227,8 @@
     <div id="capacityBanner" class="issue" style="display:none; margin-bottom:10px"></div>
     <div class="tabs">
       <button class="tab active" data-tab="overview">overview</button>
-      <button class="tab" data-tab="plan">reconcile plan</button>
+      <button class="tab" data-tab="upgrade" title="Write a target image and release; the operator rolls one pod at a time">upgrade</button>
+      <button class="tab" data-tab="plan" title="Preview the operator's reconcile steps from a synthetic observation">preview plan</button>
       <button class="tab" data-tab="manifests">manifests</button>
       <button class="tab" data-tab="objects">objects</button>
     </div>
@@ -225,14 +251,43 @@
       </div>
     </div>
 
-    <div class="panel" id="tab-plan">
-      <div class="issue warning" style="margin:0 0 12px">
-        Scenario simulator: this plan uses the selected synthetic observation plus the current CRD
-        catalog. It does not read live pod containers; the operator is the live reconciler. <b>Build
-        plan</b> is read-only; <b>Upgrade image</b> writes the shard spec and lets the operator roll
-        pods. Use <b>overview</b> for actual rollout status.
+    <div class="panel" id="tab-upgrade">
+      <div class="card upgrade-card">
+        <div>
+          <h3>Upgrade image</h3>
+          <p class="upgrade-sub">Writes <span class="mono">spec.image</span> and
+            <span class="mono">spec.release</span>. The operator rolls one pod at a time; see
+            <b>overview</b> for live progress.</p>
+        </div>
+        <div class="upgrade-form">
+          <label class="field upgrade-image-field">Target image
+            <select id="targetImageSelect" class="image-select" title="Engine images cached on a Kubernetes node or currently running in this shard"></select>
+          </label>
+          <label class="field">Wire
+            <input id="wireVersion" type="number" min="1" value="7" style="width:84px" title="Target wire format version">
+          </label>
+          <label class="field">Snapshot
+            <input id="snapshotVersion" type="number" min="1" value="11" style="width:90px" title="Target snapshot format version">
+          </label>
+          <label class="field">Mixed version
+            <select id="mixedSafe" title="Allow peers on different wire/snapshot versions during the rollout"><option value="false">no</option><option value="true">yes</option></select>
+          </label>
+          <button class="primary" id="upgradeBtn" title="Write the target image and release to the shard CR; the operator rolls pods one at a time">Upgrade</button>
+        </div>
+        <div class="image-hint" id="imageHint">—</div>
+        <details class="advanced plain" id="customImageDetails">
+          <summary>Custom image reference</summary>
+          <label class="field">Image reference
+            <input id="targetImage" size="52" spellcheck="false" placeholder="repository@sha256:… or repository:tag">
+          </label>
+        </details>
       </div>
-      <div class="actions">
+    </div>
+
+    <div class="panel" id="tab-plan">
+      <p class="advanced-note">Uses the selected synthetic observation and the CRD catalog, not
+        live containers. The plan is read-only.</p>
+      <div class="actions" style="margin-top:12px">
         <label class="field">Observation
           <select id="scenario">
             <option value="fresh">fresh (nothing bootstrapped)</option>
@@ -243,20 +298,7 @@
             <option value="upgrade">older image</option>
           </select>
         </label>
-        <label class="field">Target image
-          <input id="targetImage" size="42" spellcheck="false">
-        </label>
-        <label class="field">Target wire
-          <input id="wireVersion" type="number" min="1" value="7" style="width:80px">
-        </label>
-        <label class="field">Target snapshot
-          <input id="snapshotVersion" type="number" min="1" value="11" style="width:90px">
-        </label>
-        <label class="field">Mixed-version safe
-          <select id="mixedSafe"><option value="false">no</option><option value="true">yes</option></select>
-        </label>
         <button class="primary" id="planBtn">Build plan</button>
-        <button class="primary" id="upgradeBtn" title="Write the target image and release to the shard CR; the operator rolls pods one at a time">Upgrade image</button>
         <button id="adoptBtn" title="Demo only: write the selected simulated observation into catalog status; does not execute the plan or change workloads">Apply simulated status</button>
       </div>
       <div class="plan-summary" id="planSummary">—</div>
@@ -473,6 +515,11 @@ let selected = null;
 let detail = null;
 let manifestList = null;
 let loadedPlan = null;
+let imageInventory = null;
+let imageInventoryShard = null;
+let imageInventoryAt = 0;
+let imageLoading = false;
+let imageRenderKey = "";
 
 async function api(path, options) {
   const response = await fetch(path, options);
@@ -742,6 +789,176 @@ async function loadPlan() {
   }
 }
 
+function planVisible() {
+  return Boolean(document.querySelector("#tab-plan.active"));
+}
+
+const IMAGE_REFRESH_MS = 15000;
+
+function shortDigest(digest) {
+  return String(digest || "").replace(/^sha256:/, "").slice(0, 12);
+}
+
+function imageTagLabel(image) {
+  if (image.tag) return image.tag;
+  if ((image.tags || []).length) return image.tags[0];
+  if (image.digest) return shortDigest(image.digest);
+  return image.reference;
+}
+
+function imageShortLabel(image) {
+  const tag = imageTagLabel(image);
+  return image.digest && image.tag ? `${tag} (${shortDigest(image.digest)})` : tag;
+}
+
+function parseImageReference(reference) {
+  const value = String(reference || "").trim();
+  const at = value.indexOf("@");
+  if (at >= 0) {
+    return { reference: value, tag: null, tags: [], digest: value.slice(at + 1), nodes: 0, runningPods: 0, runningHere: false, current: true };
+  }
+  const slash = value.lastIndexOf("/");
+  const colon = value.lastIndexOf(":");
+  if (colon > slash) {
+    const tag = value.slice(colon + 1);
+    return { reference: value, tag, tags: [tag], digest: null, nodes: 0, runningPods: 0, runningHere: false, current: true };
+  }
+  return { reference: value, tag: null, tags: [], digest: null, nodes: 0, runningPods: 0, runningHere: false, current: true };
+}
+
+function imageMatches(image, reference) {
+  const value = String(reference || "").trim();
+  if (!value) return false;
+  if (image.reference === value) return true;
+  const at = value.indexOf("@");
+  if (at >= 0) return Boolean(image.digest) && image.digest === value.slice(at + 1);
+  const slash = value.lastIndexOf("/");
+  const colon = value.lastIndexOf(":");
+  const tag = colon > slash ? value.slice(colon + 1) : "";
+  return Boolean(tag) && (image.tags || []).includes(tag);
+}
+
+function imageOptionLabel(image) {
+  const parts = [imageTagLabel(image)];
+  if ((image.tags || []).length > 1) parts[0] += ` (+${image.tags.length - 1} tags)`;
+  if (!image.runningHere) {
+    if (image.digest && image.tag) parts.push(shortDigest(image.digest));
+    if (image.nodes) parts.push(`${image.nodes} node${image.nodes === 1 ? "" : "s"}`);
+    else if (image.sizeBytes) parts.push(`${Math.round(image.sizeBytes / 1024 / 1024)} MB`);
+    else if (!image.runningPods) parts.push("not cached");
+  }
+  if (image.runningHere) parts.push("running here");
+  else if (image.runningPods) {
+    const shards = image.runningShards || [];
+    parts.push(shards.length ? `running on ${shards.join(", ")}` : `${image.runningPods} pod${image.runningPods === 1 ? "" : "s"}`);
+  }
+  if (image.current && !image.runningHere) parts.push("◆ configured");
+  return `${image.runningHere ? "● " : ""}${parts.join(" · ")}`;
+}
+
+function renderImageOptions() {
+  const select = $("targetImageSelect");
+  if (!select || !detail?.shard) return;
+  const items = (imageInventory?.items || []).slice();
+  const current = imageInventory?.current || detail.shard.spec.image || "";
+  if (current && !items.some((image) => image.current || imageMatches(image, current))) {
+    items.unshift(parseImageReference(current));
+  }
+  const reference = $("targetImage").value.trim();
+  const matched = items.find((image) => imageMatches(image, reference)) || items.find((image) => image.current && !reference);
+  const key = JSON.stringify([detail.shard.name, current, reference, items.map((image) => [image.reference, imageOptionLabel(image)])]);
+  if (key !== imageRenderKey) {
+    const options = items.map((image) => `<option value="${esc(image.reference)}">${esc(imageOptionLabel(image))}</option>`);
+    if (!matched) options.push(`<option value="__custom">custom reference — use the field above</option>`);
+    select.innerHTML = options.join("") || `<option value="">no cached images</option>`;
+    select.value = matched ? matched.reference : reference ? "__custom" : "";
+    imageRenderKey = key;
+  }
+  const running = items.filter((image) => image.runningHere);
+  const configured = items.find((image) => image.current);
+  $("imageHint").innerHTML = [
+    running.length
+      ? `running on ${esc(detail.shard.name)}: ${running.map((image) => `<b>${esc(imageShortLabel(image))}</b>`).join(" + ")}`
+      : "no running pod image observed for this shard",
+    configured ? `configured: <b>${esc(imageShortLabel(configured))}</b>` : "",
+    imageInventory?.warning ? `cluster inventory: ${esc(imageInventory.warning)}` : "",
+  ].filter(Boolean).join(" · ");
+}
+
+async function loadImages(force = false) {
+  if (!selected || imageLoading) return;
+  if (!force && imageInventoryShard === selected && Date.now() - imageInventoryAt < IMAGE_REFRESH_MS) {
+    renderImageOptions();
+    return;
+  }
+  const requested = selected;
+  imageLoading = true;
+  try {
+    const inventory = await api(`/api/v1/images?shard=${encodeURIComponent(requested)}`);
+    if (requested !== selected) return;
+    imageInventory = inventory;
+    imageInventoryShard = requested;
+    imageInventoryAt = Date.now();
+    renderImageOptions();
+  } catch (error) {
+    if (requested !== selected) return;
+    imageInventory = null;
+    imageInventoryShard = null;
+    $("imageHint").textContent = `image inventory unavailable: ${error.message}`;
+  } finally {
+    imageLoading = false;
+  }
+}
+
+function syncImageSelect() {
+  const select = $("targetImageSelect");
+  if (!select) return;
+  const items = imageInventory?.items || [];
+  const reference = $("targetImage").value.trim();
+  const matched = items.find((image) => imageMatches(image, reference));
+  if (matched) {
+    select.value = matched.reference;
+  } else if (reference) {
+    if (![...select.options].some((option) => option.value === "__custom")) {
+      select.insertAdjacentHTML("beforeend", `<option value="__custom">custom reference — use the field above</option>`);
+    }
+    select.value = "__custom";
+  } else {
+    const current = items.find((image) => image.current);
+    select.value = current ? current.reference : "";
+  }
+}
+
+function syncUpgradeTargets() {
+  const image = detail.shard.spec.image;
+  const wire = String(detail.shard.spec.release.wireVersion);
+  const snapshot = String(detail.shard.spec.release.snapshotVersion);
+  const mixed = detail.shard.spec.release.mixedVersionSafe ? "true" : "false";
+  const shardChanged = $("targetImage").dataset.shard !== detail.shard.name;
+  const fields = [
+    ["targetImage", image],
+    ["wireVersion", wire],
+    ["snapshotVersion", snapshot],
+    ["mixedSafe", mixed],
+  ];
+  if (shardChanged) {
+    imageInventory = null;
+    imageInventoryShard = null;
+    imageInventoryAt = 0;
+    imageRenderKey = "";
+  }
+  for (const [id, value] of fields) {
+    const field = $(id);
+    if (shardChanged || !field.value || field.value === field.dataset.autoValue) {
+      field.value = value;
+      field.dataset.autoValue = value;
+    }
+  }
+  $("targetImage").dataset.shard = detail.shard.name;
+  renderImageOptions();
+  loadImages();
+}
+
 async function loadDetail() {
   detail = await api(`/api/v1/shards/${encodeURIComponent(selected)}?scenario=${encodeURIComponent($("scenario").value)}`);
   $("shardName").textContent = detail.shard.name;
@@ -753,7 +970,7 @@ async function loadDetail() {
   $("dropShardBtn").title = active.length > 0
     ? "Stop every engine in this shard before dropping it"
     : "Drop this shard from the catalog and choose whether to keep its PVCs";
-  $("targetImage").value = detail.shard.spec.image;
+  syncUpgradeTargets();
   $("objectsPre").textContent = JSON.stringify(detail, null, 2);
   renderOverview();
   renderIssues(detail.shardValidation || detail.validation);
@@ -763,7 +980,7 @@ async function loadShard() {
   if (!selected) return;
   try {
     await loadDetail();
-    await loadPlan();
+    if (planVisible()) await loadPlan();
   } catch (error) {
     toast(error.message, true);
   }
@@ -815,7 +1032,6 @@ async function upgradeShard() {
     renderHeader();
     renderShards();
     await loadDetail();
-    await loadPlan();
     loadAudit();
   } catch (error) {
     toast(error.message, true);
@@ -833,7 +1049,7 @@ async function adopt() {
     renderHeader();
     renderShards();
     await loadDetail();
-    await loadPlan();
+    if (planVisible()) await loadPlan();
   } catch (error) {
     toast(error.message, true);
   }
@@ -858,7 +1074,7 @@ async function shutdownSymbol(name, allowRestart = false) {
     renderHeader();
     renderShards();
     await loadDetail();
-    await loadPlan();
+    if (planVisible()) await loadPlan();
     loadAudit();
   } catch (error) {
     if (!allowRestart && error.code === "restart_required") {
@@ -889,7 +1105,7 @@ async function startSymbol(name, allowRestart = false) {
     renderHeader();
     renderShards();
     await loadDetail();
-    await loadPlan();
+    if (planVisible()) await loadPlan();
     loadAudit();
   } catch (error) {
     if (!allowRestart && error.code === "restart_required") {
@@ -1048,7 +1264,7 @@ async function submitSymbol(event) {
     renderHeader();
     renderShards();
     await loadDetail();
-    await loadPlan();
+    if (planVisible()) await loadPlan();
     loadAudit();
   } catch (error) {
     toast(error.message, true);
@@ -1130,7 +1346,7 @@ async function submitShard(event) {
     renderHeader();
     renderShards();
     await loadDetail();
-    await loadPlan();
+    if (planVisible()) await loadPlan();
     loadAudit();
   } catch (error) {
     toast(error.message, true);
@@ -1172,10 +1388,24 @@ function bind() {
       document.querySelectorAll(".tab").forEach((t) => t.classList.toggle("active", t === tab));
       document.querySelectorAll(".panel").forEach((p) => p.classList.toggle("active", p.id === "tab-" + tab.dataset.tab));
       if (tab.dataset.tab === "manifests" && !manifestList) loadManifests();
+      if (tab.dataset.tab === "plan") loadPlan();
     });
   });
   $("planBtn").addEventListener("click", loadPlan);
   $("upgradeBtn").addEventListener("click", upgradeShard);
+  $("targetImageSelect").addEventListener("change", () => {
+    const value = $("targetImageSelect").value;
+    if (value === "__custom") {
+      $("customImageDetails").open = true;
+      $("targetImage").focus();
+      return;
+    }
+    if (!value) return;
+    $("targetImage").value = value;
+    $("targetImage").dataset.shard = detail?.shard?.name || "";
+    loadPlan();
+  });
+  $("targetImage").addEventListener("input", syncImageSelect);
   $("adoptBtn").addEventListener("click", adopt);
   $("renderBtn").addEventListener("click", loadManifests);
   $("profile").addEventListener("change", loadManifests);
@@ -1246,7 +1476,7 @@ async function refreshLive() {
     renderShards();
     if (selected) {
       await loadDetail();
-      if (liveTicks % 3 === 0 && document.querySelector("#tab-plan.active")) await loadPlan();
+      if (liveTicks % 3 === 0 && planVisible()) await loadPlan();
     }
     loadAudit();
     liveTicks += 1;

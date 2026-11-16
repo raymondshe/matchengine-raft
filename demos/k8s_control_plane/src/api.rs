@@ -1,9 +1,10 @@
 //! Manager API.
 //!
 //! This is the read/validate/plan surface a real manager would expose in front of the catalog.
-//! It deliberately has no Kubernetes client: the operator owns cluster mutation. The demo adds
-//! two convenience endpoints (`/simulate`, `POST /bundles`) so the GUI can be exercised without
-//! a cluster or a database.
+//! It never mutates Kubernetes directly: the operator owns cluster mutation. The manager does
+//! read node image caches and engine pods so the upgrade picker can list valid local images. The
+//! demo adds two convenience endpoints (`/simulate`, `POST /bundles`) so the GUI can be exercised
+//! without a cluster or a database.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, OnceLock};
@@ -53,6 +54,7 @@ pub fn router_with_options(store: Arc<Store>, console: ConsoleOptions) -> Router
         .route("/console/", get(crate::gui::index))
         .route("/api/v1/health", get(health))
         .route("/api/v1/catalog", get(catalog))
+        .route("/api/v1/images", get(images))
         .route("/api/v1/cells", get(cells))
         .route("/api/v1/shards", get(shards).post(create_shard))
         .route("/api/v1/shards/{name}", get(shard_detail))
@@ -105,6 +107,25 @@ async fn health(State(store): State<Arc<Store>>) -> Json<Value> {
         "errors": report.errors.len(),
         "warnings": report.warnings.len(),
     }))
+}
+
+#[derive(Debug, Deserialize)]
+struct ImagesQuery {
+    #[serde(default)]
+    shard: Option<String>,
+}
+
+/// Engine images the upgrade picker can offer.
+///
+/// The CRD backend also lists node-cached images and running engine pods (read-only). Other
+/// backends return the references recorded in the catalog.
+async fn images(
+    State(store): State<Arc<Store>>,
+    Query(query): Query<ImagesQuery>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(json!(
+        store.available_images(query.shard.as_deref()).await?
+    )))
 }
 
 fn counts(catalog: &Catalog) -> Value {
@@ -1207,6 +1228,29 @@ mod tests {
             .find(|i| i["name"] == "me-btcusdt")
             .expect("dedicated shard");
         assert_eq!(dedicated["processes"], 1);
+    }
+
+    #[tokio::test]
+    async fn images_endpoint_marks_the_current_catalog_image() {
+        let (status, body) = get_json("/api/v1/images?shard=fx-eu-01").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["current"], crate::DEFAULT_IMAGE);
+        assert_eq!(body["repository"], "registry.example.com/matchengine-raft");
+        let items = body["items"].as_array().unwrap();
+        let current = items
+            .iter()
+            .find(|item| item["current"] == true)
+            .expect("current image is listed");
+        assert_eq!(current["reference"], crate::DEFAULT_IMAGE);
+        assert_eq!(current["tag"], "1.4.0-nonroot");
+        assert_eq!(current["runningHere"], false);
+    }
+
+    #[tokio::test]
+    async fn images_endpoint_rejects_an_unknown_shard() {
+        let (status, body) = get_json("/api/v1/images?shard=nope").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"], "shard_not_found");
     }
 
     #[tokio::test]

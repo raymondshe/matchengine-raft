@@ -2842,11 +2842,7 @@ fn shard_rollout_status(replicas: u16, updated: u32, ready: u32) -> ShardRollout
     let replicas = u32::from(replicas);
     let updated = updated.min(replicas);
     let ready = ready.min(replicas);
-    let percent = if replicas == 0 {
-        100
-    } else {
-        ((updated * 100) / replicas) as u8
-    };
+    let percent = (updated * 100).checked_div(replicas).unwrap_or(100) as u8;
     ShardRolloutStatus {
         updated_replicas: updated,
         ready_replicas: ready,
@@ -3323,6 +3319,10 @@ mod tests {
         let done = shard_rollout_status(4, 4, 4);
         assert_eq!(done.percent, 100);
         assert!(done.complete);
+
+        let reserved = shard_rollout_status(0, 0, 0);
+        assert_eq!(reserved.percent, 100);
+        assert!(reserved.complete);
     }
 
     #[test]

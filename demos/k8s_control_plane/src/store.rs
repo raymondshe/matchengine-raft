@@ -5,7 +5,7 @@
 //! second copy of desired state. The demo keeps one JSON document so it can restart without a
 //! database while preserving the same object model.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::bundle::ShardBundle;
 use crate::error::ApiError;
+use crate::images::{ImageChoice, ImageInventory};
 use crate::model::{Cell, SymbolDeployment, SymbolRoute, SymbolShard, TradingSymbol};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -145,6 +146,17 @@ pub trait CatalogStore: Send + Sync {
 
     /// Persist `after`, given the cache state in `before`.
     async fn persist(&self, before: &Catalog, after: &Catalog) -> Result<(), ApiError>;
+
+    /// List images cached by Kubernetes nodes and used by running engine pods.
+    ///
+    /// Backends without a Kubernetes client return an empty inventory; the manager still offers
+    /// the references recorded in the catalog.
+    async fn cluster_images(
+        &self,
+        _repositories: &BTreeSet<String>,
+    ) -> Result<Vec<ImageChoice>, ApiError> {
+        Ok(Vec::new())
+    }
 }
 
 /// No-op backend used by tests and the offline demo.
@@ -287,6 +299,49 @@ impl Store {
 
     pub fn mode(&self) -> &'static str {
         self.backend.mode()
+    }
+
+    /// Engine images available for an upgrade: catalog references plus node-cached and running
+    /// images reported by the Kubernetes API. A cluster listing failure degrades to catalog
+    /// references with a warning instead of failing the GUI.
+    pub async fn available_images(&self, shard: Option<&str>) -> Result<ImageInventory, ApiError> {
+        let catalog = self.snapshot();
+        let current = match shard {
+            Some(name) => Some(
+                catalog
+                    .shards
+                    .get(name)
+                    .ok_or_else(|| {
+                        ApiError::not_found("shard_not_found", format!("unknown shard {name}"))
+                    })?
+                    .spec
+                    .image
+                    .clone(),
+            ),
+            None => None,
+        };
+        let repositories = crate::images::catalog_repositories(&catalog);
+        let mut entries: BTreeMap<String, ImageChoice> = crate::images::catalog_images(&catalog)
+            .into_iter()
+            .map(|image| (image.reference.clone(), image))
+            .collect();
+        let mut warning = None;
+        match self.backend.cluster_images(&repositories).await {
+            Ok(images) => crate::images::merge_cluster(&mut entries, images),
+            Err(error) => warning = Some(error.to_string()),
+        }
+        let mut items: Vec<ImageChoice> = entries.into_values().collect();
+        crate::images::annotate(&mut items, current.as_deref(), shard);
+        let repository = current
+            .as_deref()
+            .and_then(crate::images::parse_image)
+            .map(|image| image.repository);
+        Ok(ImageInventory {
+            items,
+            current,
+            repository,
+            warning,
+        })
     }
 
     pub fn snapshot(&self) -> Catalog {

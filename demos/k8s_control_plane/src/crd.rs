@@ -856,6 +856,13 @@ impl CatalogStore for CrdCatalogStore {
         }
         Ok(())
     }
+
+    async fn cluster_images(
+        &self,
+        repositories: &BTreeSet<String>,
+    ) -> Result<Vec<crate::images::ImageChoice>, ApiError> {
+        crate::images::cluster_images(&self.client, repositories).await
+    }
 }
 
 fn apply_watch_object(

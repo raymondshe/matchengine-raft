@@ -33,6 +33,12 @@ rules:
       - symboldeployments/status
       - symbolroutes/status
     verbs: ["get", "update", "patch"]
+  # Read-only image inventory for the manager's upgrade picker. The manager lists nodes to read
+  # `status.images` (cached tags/digests) and engine-labeled pods to learn what is running.
+  # It never creates, updates or deletes pods.
+  - apiGroups: [""]
+    resources: ["nodes", "pods"]
+    verbs: ["get", "list"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

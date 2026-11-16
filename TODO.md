@@ -1388,9 +1388,18 @@ Remaining (priority order is top to bottom within each tier):
   noisy-neighbour detection and hot-symbol promotion remain follow-ups.
 - [x] **P1** Shard image-upgrade action: `POST /api/v1/shards/{name}/upgrade` writes `spec.image`
   and `spec.release`, returns `changed:false` for a no-op, and rejects incompatible releases,
-  per-deployment image overrides and paused shards before writing. The GUI plan tab exposes
-  **Upgrade image**; the operator performs the one-pod-at-a-time rollout and the release/capacity
+  per-deployment image overrides and paused shards before writing. The GUI **upgrade** tab exposes
+  one **Upgrade** action; a separate read-only **preview plan** tab simulates reconcile steps. The
+  operator performs the one-pod-at-a-time rollout and the release/capacity
   gates remain authoritative.
+- [x] **P1** Cluster image inventory and upgrade picker: `GET /api/v1/images?shard={name}` merges
+  catalog references with `Node.status.images` and running engine pods, normalizes tags/digests,
+  marks the configured (`current`) and running (`runningHere`) images, and degrades to catalog
+  references with a warning when the cluster listing fails. The upgrade tab's **Target image** is a
+  dropdown (tag, short digest, node count, `● running here`, `◆ configured`) with a collapsed
+  custom-reference fallback; a selected target survives the live refresh. `deploy/rbac.yaml` adds
+  read-only `nodes`/`pods` list for the manager. Tests cover image parsing, tag/digest merge, the
+  annotation flags and the API.
 - [ ] **P2** End-to-end operator smoke script/runbook: containers, supervisor, reserved,
   migration, brownfield adoption, digest pinning, stop/start and rollback flows are live-validated;
   make them repeatable with assertions for the rendered template, rollout percentage, leader
