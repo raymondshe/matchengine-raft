@@ -927,7 +927,7 @@ pending.
 | `src/main.rs` | `--market-data-*` flags and env equivalents, following `--match-event-log` (§20 config block) |
 | `src/network/api.rs` | `marketdata_status` read key (gate state, last published position, queue depth, shadow divergence counter) |
 | `tests/cluster/test_market_data.rs` | **new**: embedded driver, subscriber, failover, resync and shadow-book equivalence tests |
-| `benches/market_data.rs` | **new**: tap cost with the feed on/off, shadow-book update cost, end-to-end latency |
+| `match_engine/benches/market_data.rs` | **new**: tap cost with the feed on/off, shadow-book update cost, end-to-end latency |
 
 The hot path records only what the operation already knows:
 
@@ -1057,7 +1057,7 @@ snapshot resync.
 - the market-data task must be able to fall behind arbitrarily without changing apply latency —
   demonstrated by a test that stalls the publisher while submitting writes.
 
-**Benchmarks** (extend `benches/matchengine.rs` or add `benches/market_data.rs`): tap cost per
+**Benchmarks** (extend `match_engine/benches/matchengine.rs` or add `match_engine/benches/market_data.rs`): tap cost per
 mutation and per apply batch with the feed on and off, shadow-book update cost (deltas × depth),
 snapshot cost vs N, and end-to-end apply → offer → subscriber latency p50/p99/p999 over IPC and
 loopback UDP, plus offers/s at saturation. The JSONL sink is the baseline. **No numbers are claimed

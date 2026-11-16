@@ -1,6 +1,6 @@
 # etcd storage used by the Kubernetes control plane
 
-This note describes the etcd keyspace used by the `demos/k8s_control_plane` reference
+This note describes the etcd keyspace used by the `k8s_control_plane` reference
 deployment. It is a logical map of what the Kubernetes API server persists; neither the
 manager nor the operator opens an etcd client.
 
@@ -256,6 +256,6 @@ kubectl -n match-eu-1 get sts,svc,cm,pdb,networkpolicy,pvc
 For a catalog export:
 
 ```sh
-cargo run --manifest-path demos/k8s_control_plane/Cargo.toml -- \
+cargo run --manifest-path k8s_control_plane/Cargo.toml -- \
   crd-backup --out /tmp/crd-catalog.json
 ```

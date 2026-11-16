@@ -1,0 +1,119 @@
+# Least-privilege RBAC for the CRD-backed manager.
+#
+# Apply the CRDs first:
+#   cargo run --manifest-path k8s_control_plane/Cargo.toml -- crds \
+#     | kubectl apply -f -
+#
+# The manager needs list/watch to rebuild its cache, create/update/delete for desired state and
+# the /status subresource for the demo's simulated observations. It never talks to etcd directly.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: match-manager
+  namespace: match-control
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: match-manager-crd
+rules:
+  - apiGroups: ["matching.io"]
+    resources:
+      - cells
+      - symbolshards
+      - tradingsymbols
+      - symboldeployments
+      - symbolroutes
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["matching.io"]
+    resources:
+      - cells/status
+      - symbolshards/status
+      - tradingsymbols/status
+      - symboldeployments/status
+      - symbolroutes/status
+    verbs: ["get", "update", "patch"]
+  # Read-only image inventory for the manager's upgrade picker. The manager lists nodes to read
+  # `status.images` (cached tags/digests) and engine-labeled pods to learn what is running.
+  # It never creates, updates or deletes pods.
+  - apiGroups: [""]
+    resources: ["nodes", "pods"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: match-manager-crd
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: match-manager-crd
+subjects:
+  - kind: ServiceAccount
+    name: match-manager
+    namespace: match-control
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: match-operator
+  namespace: match-control
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: match-operator
+rules:
+  - apiGroups: ["matching.io"]
+    resources:
+      - cells
+      - symbolshards
+      - tradingsymbols
+      - symboldeployments
+      - symbolroutes
+    verbs: ["get", "list", "watch", "patch", "update"]
+  - apiGroups: ["matching.io"]
+    resources:
+      - cells/status
+      - symbolshards/status
+      - tradingsymbols/status
+      - symboldeployments/status
+      - symbolroutes/status
+    verbs: ["get", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "watch", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["services", "configmaps"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["apps"]
+    resources: ["statefulsets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["policy"]
+    resources: ["poddisruptionbudgets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: match-operator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: match-operator
+subjects:
+  - kind: ServiceAccount
+    name: match-operator
+    namespace: match-control

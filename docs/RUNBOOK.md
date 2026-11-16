@@ -1,5 +1,9 @@
 # Runbook
 
+> Engine commands below run from `match_engine/` or with
+> `--manifest-path match_engine/Cargo.toml` from the repository root. Run the orchestration scripts
+> from the repository root; standalone projects have their own manifests.
+
 ## Start a cluster
 
 ### Quick Start with Test Script
@@ -160,14 +164,14 @@ Adding a node to a cluster involves 3 steps:
 
 ## Kubernetes control plane (OrbStack demo)
 
-The Kubernetes control plane is the standalone manager in `demos/k8s_control_plane` plus the
+The Kubernetes control plane is the standalone manager in `k8s_control_plane` plus the
 engine image's supervisor binary. It is a **desired-state writer**, not a Kubernetes controller: it
 validates/places symbols, renders manifests, and returns operator steps. The operator (you) still
 applies ConfigMaps/workloads and performs PVC operations.
 
 Read [KUBERNETES_CONTROL_PLANE.md](./KUBERNETES_CONTROL_PLANE.md) for the design and
 [KUBERNETES_LOCAL_TESTING.md](./KUBERNETES_LOCAL_TESTING.md) for the test tiers. The reference demo
-details are in [`demos/k8s_control_plane/README.md`](../demos/k8s_control_plane/README.md).
+details are in [`k8s_control_plane/README.md`](../k8s_control_plane/README.md).
 
 > This is the local OrbStack reference tier. The manager writes desired state and returns operator
 > steps; it is **not** a Kubernetes controller. You still apply ConfigMaps/workloads and perform
@@ -233,12 +237,12 @@ The reference OrbStack deployment used during validation (2026-11-14):
 ### Build the images
 
 ```sh
-# Engine + supervisor (must be rebuilt after changes under web/console/)
-docker build -f docker/k8s.Dockerfile -t matchengine-raft:k8s-nonroot .
+# Engine + supervisor (must be rebuilt after changes under match_engine/web/console/)
+docker build -f match_engine/docker/k8s.Dockerfile -t matchengine-raft:k8s-nonroot match_engine
 
 # Manager API + embedded GUI
-docker build -f demos/k8s_control_plane/Dockerfile \
-  -t matchengine-k8s-control-plane:local demos/k8s_control_plane
+docker build -f k8s_control_plane/Dockerfile \
+  -t matchengine-k8s-control-plane:local k8s_control_plane
 
 docker images | grep -E 'matchengine-raft|matchengine-k8s-control-plane'
 ```
@@ -272,9 +276,9 @@ Desired state lives in `matching.io` CRDs and is persisted by the Kubernetes API
 manager never connects to etcd directly. Install the CRDs and RBAC first:
 
 ```sh
-cargo run --manifest-path demos/k8s_control_plane/Cargo.toml -- crds \
+cargo run --manifest-path k8s_control_plane/Cargo.toml -- crds \
   | kubectl apply -f -
-kubectl apply -f demos/k8s_control_plane/deploy/rbac.yaml
+kubectl apply -f k8s_control_plane/deploy/rbac.yaml
 ```
 
 The manager pod must use the `match-manager` ServiceAccount and mount its token. The demo manifest
@@ -306,9 +310,9 @@ bootstrap, configuration and containers-mode rollouts. Install the CRDs and RBAC
 two-replica operator Deployment (Lease handover):
 
 ```sh
-kubectl apply -f demos/k8s_control_plane/deploy/crds.yaml
-kubectl apply -f demos/k8s_control_plane/deploy/rbac.yaml
-kubectl apply -f demos/k8s_control_plane/deploy/operator.yaml
+kubectl apply -f k8s_control_plane/deploy/crds.yaml
+kubectl apply -f k8s_control_plane/deploy/rbac.yaml
+kubectl apply -f k8s_control_plane/deploy/operator.yaml
 kubectl -n match-control rollout status deploy/match-operator --timeout=120s
 
 # Only the Lease holder reconciles.
@@ -321,7 +325,7 @@ For a local binary run, use `--namespace` to scope watches/pruning to one namesp
 Lease:
 
 ```sh
-cargo run --manifest-path demos/k8s_control_plane/Cargo.toml --bin match-operator -- \
+cargo run --manifest-path k8s_control_plane/Cargo.toml --bin match-operator -- \
   --namespace match-eu-1 \
   --lease-namespace match-control --lease-name match-engine-operator \
   --profile local --resync-seconds 10
@@ -371,7 +375,7 @@ kubectl -n match-control port-forward deploy/match-manager 8099:8099
 ```
 
 When the manager runs on the workstation instead of in the cluster, point the console proxy at
-loopback with `cargo run --manifest-path demos/k8s_control_plane/Cargo.toml -- serve
+loopback with `cargo run --manifest-path k8s_control_plane/Cargo.toml -- serve
 --engine-console-host 127.0.0.1`; ports still come from each deployment's catalog placement.
 
 #### Adopt an existing fleet (brownfield)
@@ -382,7 +386,7 @@ operator change anything. Keep `--retention-seconds 0` until the adoption is ver
 demo binaries once so the commands below resolve:
 
 ```sh
-cargo build --manifest-path demos/k8s_control_plane/Cargo.toml \
+cargo build --manifest-path k8s_control_plane/Cargo.toml \
   --bin k8s-control-plane --bin match-operator
 ```
 
@@ -931,7 +935,7 @@ informers. No PVC is needed for desired state. Back up before upgrades or destru
 
 ```sh
 # Selective catalog export (JSON, desired state only).
-cargo run --manifest-path demos/k8s_control_plane/Cargo.toml -- \
+cargo run --manifest-path k8s_control_plane/Cargo.toml -- \
   crd-backup --out /tmp/crd-catalog.json
 
 # Cluster-wide backup covers all CRs too.
@@ -943,7 +947,7 @@ then recover engine PVCs. `crd-restore` validates the JSON and writes the CRs th
 server:
 
 ```sh
-cargo run --manifest-path demos/k8s_control_plane/Cargo.toml -- \
+cargo run --manifest-path k8s_control_plane/Cargo.toml -- \
   crd-restore --input /tmp/crd-catalog.json
 ```
 
@@ -1021,11 +1025,11 @@ Full demo wipe (deletes all engine data, retained PVCs and CRDs included):
 
 ```sh
 # Export CRD desired state first if you may restore it later and use CRD mode.
-cargo run --manifest-path demos/k8s_control_plane/Cargo.toml -- \
+cargo run --manifest-path k8s_control_plane/Cargo.toml -- \
   crd-backup --out /tmp/crd-catalog.json || true
 kubectl delete namespace match-control
 kubectl delete namespace match-eu-1
-kubectl delete -f demos/k8s_control_plane/deploy/crds.yaml --ignore-not-found
+kubectl delete -f k8s_control_plane/deploy/crds.yaml --ignore-not-found
 ```
 
 Safe teardown that keeps data:

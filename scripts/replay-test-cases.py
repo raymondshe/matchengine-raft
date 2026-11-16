@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Replay the checked-in tests/replay cases into a running engine.
+"""Replay the checked-in match_engine/tests/replay cases into a running engine.
 
 The replay fixtures assume a fresh engine sequence and a fresh book. This
 driver clears the demo book at the start of each pass, keeps every case in one
@@ -140,7 +140,7 @@ def adjust_request(request, sequence_offset, price_offset):
 
 
 def replay_case(port, case, delay):
-    path = ROOT / "tests" / "replay" / case / "orders.jsonl"
+    path = ROOT / "match_engine" / "tests" / "replay" / case / "orders.jsonl"
     lines = [line.strip() for line in path.read_text().splitlines()]
     lines = [line for line in lines if line and not line.startswith("#")]
     price_offset = PRICE_OFFSETS.get(case, 0.0)

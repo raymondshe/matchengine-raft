@@ -1,5 +1,8 @@
 # 测试
 
+> 下方的引擎命令在 `match_engine/` 下执行，或在仓库根目录使用
+> `--manifest-path match_engine/Cargo.toml`。独立项目使用各自的 manifest。
+
 ## 测试套件
 
 `cargo test` 会构建一个集成测试目标（`tests/cluster`）以及库内单元测试。
@@ -14,7 +17,7 @@
 | `tests/cluster/test_restart.rs` | 完整节点重启后通过日志重放恢复，以及通过快照 + 更新的 WAL 尾部恢复订单簿、序列号、事件窗口和幂等表；另含 2000 单大日志重放和多分块（约 120 KB）快照启动 |
 | `tests/cluster/test_match_results.rs` | 以 `--match-event-log` 启动的节点按日志顺序记录 rest/fill/cancel 事件，同时 `/write` 响应保持不变；第二个节点验证止损触发、GTD 过期和新增的 `/read` 键 |
 | `tests/cluster/test_market_data.rs` | 以 `--market-data-log` 启动的节点发布重置快照、每个 taker 一条成交消息、BBO、批后深度总量和一根已收盘 K 线；断言同时检查 `market_seq` 锚点与 `/read marketdata_status` 计数器 |
-| `demos/market_data_system` | 流名称解析与载荷、WebSocket 快照/合并/组合流/控制错误、单连接承载多个 symbol 并用实时 `UNSUBSCRIBE`/`SUBSCRIBE` 切换，以及嵌入式 Aeron 引擎→服务→WebSocket 测试（`aeron` feature） |
+| `market_data_system` | 流名称解析与载荷、WebSocket 快照/合并/组合流/控制错误、单连接承载多个 symbol 并用实时 `UNSUBSCRIBE`/`SUBSCRIBE` 切换，以及嵌入式 Aeron 引擎→服务→WebSocket 测试（`aeron` feature） |
 | `tests/cluster/test_events.rs` | `/write` 返回事件、`/events` 游标分页、`client_order_id` 重试不重复下单、`--max-events` 淘汰与 `/events/status` 计数、长轮询在并发写入时唤醒或在超时后返回空页、gRPC `StreamEvents` 推送成交与空闲心跳、bridge sidecar 发布事件并记录游标 |
 | `tests/cluster/test_membership.rs` | 杀掉当前领导者：存活的投票节点接管已提交订单簿并接受新写入；写入后加入的学习者通过普通日志复制追赶、晋升成员并从自己的节点写入 |
 | `tests/cluster/test_late_join.rs` | 带过期快照/WAL 的节点被移出集群、错过 40 次写入（期间领导者生成快照并 purge），再以学习者身份重新加入并从活动集群追赶 |
@@ -29,15 +32,15 @@
 | `tests/cluster/test_feature_matrix.rs` | 通过 `/write` 发送每种已宣传的订单类型并断言返回的事件类型；覆盖挂单 → 改单 → 部分成交 → 撤单以及到期/止损生命周期，证明正常操作使用显式事件而非拒绝；同时校验畸形请求体和未知 read key |
 | `tests/cluster/test_client.rs` | 类型化的无领导者/HTTP 边缘错误、连接被丢弃后的重试/退避，以及领导者故障切换后向新领导者的转发 |
 | `tests/cluster/test_failure.rs` | Raft 核心停止、注入的 WAL `ENOSPC`/`EIO`、写流期间 SIGKILL 和学习者快照安装期间 SIGKILL 时 fail-stop；两个 SIGKILL 用例启动真实二进制 |
-| `tests/replay/*/run.sh` | Shell 驱动的回放矩阵，覆盖 GTC、IOC、FOK、GTD、Day、市价、Post-Only、冰山单、止损市价单、止损限价单、改单、撤单、撮合/吃单扣费、quote 扣费和费用溢出场景；每个用例对比生成的事件序列与已检入的 `expected-events.jsonl` |
-| `fuzz/` | `cargo-fuzz` 目标：`OrderBook::execute_order`、WAL 字节解码、快照字节/内容解码和行情 wire 解码；每夜的定时工作流构建四个目标并做一次冒烟运行 |
+| `match_engine/tests/replay/*/run.sh` | Shell 驱动的回放矩阵，覆盖 GTC、IOC、FOK、GTD、Day、市价、Post-Only、冰山单、止损市价单、止损限价单、改单、撤单、撮合/吃单扣费、quote 扣费和费用溢出场景；每个用例对比生成的事件序列与已检入的 `expected-events.jsonl` |
+| `match_engine/fuzz/` | `cargo-fuzz` 目标：`OrderBook::execute_order`、WAL 字节解码、快照字节/内容解码和行情 wire 解码；每夜的定时工作流构建四个目标并做一次冒烟运行 |
 
-回放用例不属于 `cargo test`；用 `./tests/replay/run-all.sh` 运行全部，或用
-`./tests/replay/<case>/run.sh` 运行单个用例。它们使用 HTTP 端口 `24211-24226`（gRPC
+回放用例不属于 `cargo test`；用 `./match_engine/tests/replay/run-all.sh` 运行全部，或用
+`./match_engine/tests/replay/<case>/run.sh` 运行单个用例。它们使用 HTTP 端口 `24211-24226`（gRPC
 `25211-25226`），每个用例一个端口，并把生成的撮合事件 JSONL 与仓库中的参考文件对比。
-用例矩阵和重新生成步骤见 `tests/replay/README.md`。
+用例矩阵和重新生成步骤见 `match_engine/tests/replay/README.md`。
 
-模糊测试目标是独立的 nightly crate，见 `fuzz/README.md` 和 `.github/workflows/fuzz.yml`。
+模糊测试目标是独立的 nightly crate，见 `match_engine/fuzz/README.md` 和 `.github/workflows/fuzz.yml`。
 
 所有集成测试都使用唯一的临时数据目录。集群测试固定使用端口 `21001-21003`（gRPC
 `22001-22003`），快照测试使用 `21101-21103`，重启测试使用 `21201-21205`，撮合结果测试使用
@@ -71,10 +74,10 @@ cargo run --release --example replay_orders_events -- \
   --events-limit 100
 ```
 
-运行全部用例的 `/events` 版本：`./tests/replay/run-all.sh events`。
+运行全部用例的 `/events` 版本：`./match_engine/tests/replay/run-all.sh events`。
 
-仓库在 `tests/replay/` 下为每种订单类型或生命周期操作提供一个用例目录，每个目录包含
+仓库在 `match_engine/tests/replay/` 下为每种订单类型或生命周期操作提供一个用例目录，每个目录包含
 `orders.jsonl`、`expected-events.jsonl`、`run.sh` 和场景 README。矩阵覆盖 GTC、IOC、FOK、
 GTD、Day、市价、Post-Only、冰山单、止损市价单、止损限价单、改单、撤单、撮合/吃单扣费、
-quote 资产扣费和费用溢出。用 `./tests/replay/run-all.sh` 运行全部，或用
-`./tests/replay/<case>/run.sh` 运行单个用例。
+quote 资产扣费和费用溢出。用 `./match_engine/tests/replay/run-all.sh` 运行全部，或用
+`./match_engine/tests/replay/<case>/run.sh` 运行单个用例。

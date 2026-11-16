@@ -2,8 +2,8 @@ target
 *.log
 logs/
 my_db
-fuzz/target
-fuzz/corpus
-fuzz/artifacts
-fuzz/coverage
+match_engine/fuzz/target
+match_engine/fuzz/corpus
+match_engine/fuzz/artifacts
+match_engine/fuzz/coverage
 .archify/

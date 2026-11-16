@@ -121,7 +121,7 @@ It performs:
 On 2026-11-11 this passed on the OrbStack 7.2.12 aarch64 kernel: 220 lib + 3 bridge + 74 cluster
 tests, 2 async-WAL tests, the allocation check, and both pinned e2e modes. The measured numbers
 are in [`docs/PERFORMANCE.md`](./PERFORMANCE.md#linux-container-pinned-pass-2026-11-11). The Linux
-`apply_path --check` first exposed a one-time 3-allocation blank baseline; `benches/apply_path.rs`
+`apply_path --check` first exposed a one-time 3-allocation blank baseline; `match_engine/benches/apply_path.rs`
 now warms up 64 blank entries before resetting the counter.
 
 This covers the Linux build, the four-voter no-fsync tests, the allocator checks and the
@@ -135,7 +135,7 @@ and a loopback multicast group; see below.
 `scripts/aeron-linux-lab.sh` runs the market-data transport checks in a separate
 `matchengine-aeron-lab` container. It builds the engine with `--features market-data-aeron` and
 the demo with `--features aeron`, including
-`demos/market_data_system/src/bin/aeron_driver.rs` — a small supervised driver that exposes the
+`market_data_system/src/bin/aeron_driver.rs` — a small supervised driver that exposes the
 same Aeron C media driver as `aeronmd`.
 
 ```shell
@@ -166,7 +166,7 @@ the OrbStack toolchain image currently ships CMake 3.25 from Debian.
 
 ## Image
 
-`docker/linux.Dockerfile` builds:
+`match_engine/docker/linux.Dockerfile` builds:
 
 - `matchengine-raft:linux` — Debian slim runtime with the release binary,
   `iptables`, `iproute2`, `curl` and `procps`;

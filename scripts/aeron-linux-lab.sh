@@ -69,7 +69,7 @@ ensure_image() {
         log "building $IMAGE"
         DOCKER_BUILDKIT=${DOCKER_BUILDKIT:-1} \
             docker build --platform linux/amd64 \
-                -f docker/linux.Dockerfile --target toolchain -t "$IMAGE" .
+                -f match_engine/docker/linux.Dockerfile --target toolchain -t "$IMAGE" match_engine
     fi
 }
 
@@ -84,7 +84,7 @@ ensure_container() {
             -v "$REGISTRY_VOLUME:/usr/local/cargo/registry" \
             -v "$TARGET_VOLUME:/target" \
             -e CARGO_TARGET_DIR=/target \
-            -w /src \
+            -w /src/match_engine \
             "$IMAGE" sleep infinity >/dev/null
     fi
     docker exec "$CONTAINER" true
@@ -106,7 +106,7 @@ build_binaries() {
 
     log "building market-data service and aeron_driver"
     docker exec "$CONTAINER" cargo build --release \
-        --manifest-path demos/market_data_system/Cargo.toml --features aeron
+        --manifest-path /src/market_data_system/Cargo.toml --features aeron
 }
 
 clean_lab() {

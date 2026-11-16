@@ -5,7 +5,7 @@ Status: **implemented as a reference service.** Two systems are specified here:
 1. the **matchengine** gains only the Aeron publication adapter (U7 of
    [`MARKET_DATA_PLAN.md`](./MARKET_DATA_PLAN.md)) and broadcasts its existing deterministic feed
    on Aeron **multicast**;
-2. a **separate market-data system** (its own crate and process, like `demos/order_system/`) subscribes to those
+2. a **separate market-data system** (its own crate and process, like `order_system/`) subscribes to those
    Aeron streams, rebuilds the derived state and serves **Binance-style WebSocket streams** to
    browsers and other clients.
 
@@ -21,7 +21,7 @@ isolated on their own thread.
 
 Last updated: 2026-11-05.
 
-Reference implementation: `demos/market_data_system/` (Aeron ingestion via rusteron 0.2.13 plus a
+Reference implementation: `market_data_system/` (Aeron ingestion via rusteron 0.2.13 plus a
 JSONL fallback; Binance-style WebSocket service; multi-symbol per instance with one shared hub).
 
 Related documents: [`MARKET_DATA_PLAN.md`](./MARKET_DATA_PLAN.md) (the implemented feed),
@@ -246,7 +246,7 @@ and only lightly extended here.
   it only consumes.
 - **Frames:** the existing wire v7 format, unchanged (golden-tested with a strict reference
   decoder). The market-data system reuses `wire::decode` from the engine crate via a path
-  dependency, exactly like `demos/order_system/` reuses the client.
+  dependency, exactly like `order_system/` reuses the client.
 - **Backpressure:** the processor task is off the matching path and *may* slow down; per the
   Aeron design's §17 rule, a stalled publication slows the processor, the bounded tap queue fills
   and the feed degrades to `GAP` while consensus continues. `apply` latency is independent of the
@@ -281,7 +281,7 @@ and only lightly extended here.
 
 ### 4.3 Market-data system — ingestion from Aeron
 
-The market-data system is the new crate `demos/market_data_system/` (sibling of `demos/order_system/`, own `Cargo.toml`, binary
+The market-data system is the new crate `market_data_system/` (sibling of `order_system/`, own `Cargo.toml`, binary
 `matchengine-marketdata`), depending on `matchengine-raft` by path (for `wire`, `MarketMessage`
 and the record types), `rusteron-client`, `actix-web`/`actix-ws` and `tokio`.
 
@@ -973,7 +973,7 @@ from streams; the durable source is the engine's replicated event log, not the f
 | Sync contract | snapshot + buffered diffs, Binance rules 3–6 as literal test cases, gap → resync + re-snapshot, empty-book snapshot (`lastUpdateId` 0) then first `U == 1` |
 | Payloads | golden JSON for every stream (incl. fee fields, `Fixed` decimal strings); extension fields stable |
 | Limits | ping/pong timeout, 24 h rotation, connection cap, FIFO overflow → 1013, latest-value conflation under burst |
-| End-to-end | `demos/market_data_system/tests/ws.rs` drives snapshots, conflation, combined streams, control errors, two symbols held on one connection and a symbol switch on the same socket; `tests/aeron.rs` (feature `aeron`) publishes engine wire frames over IPC to a `tokio-tungstenite` client. A full place/fill/amend/cancel + forced-gap + leadership-change scenario is still open |
+| End-to-end | `market_data_system/tests/ws.rs` drives snapshots, conflation, combined streams, control errors, two symbols held on one connection and a symbol switch on the same socket; `tests/aeron.rs` (feature `aeron`) publishes engine wire frames over IPC to a `tokio-tungstenite` client. A full place/fill/amend/cancel + forced-gap + leadership-change scenario is still open |
 | Bench | engine: tap/publication cost with the feed on/off (gates "matching does not regress"); service: `ws_fanout` — N connections × `bookTicker`/`depth@100ms`, serialize-once reuse, per-connection send cost, assembler memory |
 
 ## 15. Performance budget
@@ -1031,7 +1031,7 @@ identical frames still emit identical messages; no matching-path change.
 3. Streams: `@trade`, `@sweep`, `@bookTicker`, `@depth@speed`, `@depth5/10/20@speed`,
    `@kline_<interval>`, `@status`, `@lifecycle`.
 4. Tests: the §14 service rows driven by `ChannelSource`, plus the end-to-end embedded-driver
-   integration with a real WS client; CI gains the crate's fmt/clippy/test jobs (as `demos/order_system/` has).
+   integration with a real WS client; CI gains the crate's fmt/clippy/test jobs (as `order_system/` has).
 
 **Acceptance:** a browser-style client maintains a correct local book through
 place/fill/amend/cancel, a forced gap and an engine leadership change, using only Binance rules

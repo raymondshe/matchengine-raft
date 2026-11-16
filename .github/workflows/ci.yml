@@ -15,30 +15,30 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Format
         run: |
-          cargo fmt --all -- --check
-          cargo fmt --manifest-path fuzz/Cargo.toml -- --check
+          cargo fmt --manifest-path match_engine/Cargo.toml --all -- --check
+          cargo fmt --manifest-path match_engine/fuzz/Cargo.toml -- --check
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --manifest-path match_engine/Cargo.toml --all-targets -- -D warnings
       - name: Test
-        run: cargo test
+        run: cargo test --manifest-path match_engine/Cargo.toml
       - name: Demo format
-        run: cargo fmt --manifest-path demos/order_system/Cargo.toml -- --check
+        run: cargo fmt --manifest-path order_system/Cargo.toml -- --check
       - name: Demo clippy
-        run: cargo clippy --manifest-path demos/order_system/Cargo.toml --all-targets -- -D warnings
+        run: cargo clippy --manifest-path order_system/Cargo.toml --all-targets -- -D warnings
       - name: Demo test
-        run: cargo test --manifest-path demos/order_system/Cargo.toml --locked
+        run: cargo test --manifest-path order_system/Cargo.toml --locked
       - name: Market-data format
-        run: cargo fmt --manifest-path demos/market_data_system/Cargo.toml -- --check
+        run: cargo fmt --manifest-path market_data_system/Cargo.toml -- --check
       - name: Market-data clippy
-        run: cargo clippy --manifest-path demos/market_data_system/Cargo.toml --all-targets -- -D warnings
+        run: cargo clippy --manifest-path market_data_system/Cargo.toml --all-targets -- -D warnings
       - name: Market-data test
-        run: cargo test --manifest-path demos/market_data_system/Cargo.toml --locked
+        run: cargo test --manifest-path market_data_system/Cargo.toml --locked
 
   k8s-control-plane:
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: demos/k8s_control_plane
+        working-directory: k8s_control_plane
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -61,9 +61,9 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: Async WAL clippy
-        run: cargo clippy --all-targets --features async-wal -- -D warnings
+        run: cargo clippy --manifest-path match_engine/Cargo.toml --all-targets --features async-wal -- -D warnings
       - name: Async WAL crash recovery
-        run: cargo test --features async-wal --test cluster async_wal --locked
+        run: cargo test --manifest-path match_engine/Cargo.toml --features async-wal --test cluster async_wal --locked
 
   profiling:
     runs-on: ubuntu-latest
@@ -74,9 +74,9 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: Profiling clippy
-        run: cargo clippy --all-targets --features profiling -- -D warnings
+        run: cargo clippy --manifest-path match_engine/Cargo.toml --all-targets --features profiling -- -D warnings
       - name: Runtime metrics test
-        run: cargo test --features profiling --test cluster metrics_exposes_data_server_and_runtime_stats --locked
+        run: cargo test --manifest-path match_engine/Cargo.toml --features profiling --test cluster metrics_exposes_data_server_and_runtime_stats --locked
 
   # bench-regression:
   #     runs-on: ubuntu-latest
@@ -103,9 +103,9 @@ jobs:
       - name: Install Aeron system libraries
         run: sudo apt-get update && sudo apt-get install -y libbsd-dev uuid-dev
       - name: Engine Aeron sink test
-        run: cargo test --features market-data-aeron --lib market_data::aeron --locked
+        run: cargo test --manifest-path match_engine/Cargo.toml --features market-data-aeron --lib market_data::aeron --locked
       - name: Market-data Aeron end-to-end test
-        run: cargo test --manifest-path demos/market_data_system/Cargo.toml --features aeron --test aeron --locked
+        run: cargo test --manifest-path market_data_system/Cargo.toml --features aeron --test aeron --locked
 
   msrv:
     runs-on: ubuntu-latest
@@ -114,6 +114,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.89.0
       - uses: Swatinem/rust-cache@v2
       - name: Check MSRV
-        run: cargo check --all-targets --locked
+        run: cargo check --manifest-path match_engine/Cargo.toml --all-targets --locked
       - name: Check control-plane MSRV
-        run: cargo check --manifest-path demos/k8s_control_plane/Cargo.toml --all-targets --locked
+        run: cargo check --manifest-path k8s_control_plane/Cargo.toml --all-targets --locked

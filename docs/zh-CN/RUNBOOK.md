@@ -1,5 +1,8 @@
 # 运行手册
 
+> 下方的引擎命令在 `match_engine/` 下执行，或在仓库根目录使用
+> `--manifest-path match_engine/Cargo.toml`。编排脚本在仓库根目录运行；独立项目使用各自的 manifest。
+
 ## 启动集群
 
 ### 使用测试脚本快速启动
@@ -157,13 +160,13 @@ curl -X POST -H "Content-Type: application/json" \
 
 ## Kubernetes 控制平面（OrbStack 演示）
 
-Kubernetes 控制平面由 `demos/k8s_control_plane` 中的独立管理器，以及引擎镜像中的 supervisor
+Kubernetes 控制平面由 `k8s_control_plane` 中的独立管理器，以及引擎镜像中的 supervisor
 组成。它是一个**期望状态写入器**，不是 Kubernetes 控制器：负责校验/放置 symbol、渲染
 manifests，并返回运维步骤。ConfigMap/工作负载的 apply 和 PVC 操作仍由运维人员完成。
 
 设计见 [KUBERNETES_CONTROL_PLANE.md](../KUBERNETES_CONTROL_PLANE.md)，测试层级见
 [KUBERNETES_LOCAL_TESTING.md](../KUBERNETES_LOCAL_TESTING.md)，参考实现见
-[`demos/k8s_control_plane/README.md`](../../demos/k8s_control_plane/README.md)。
+[`k8s_control_plane/README.md`](../../k8s_control_plane/README.md)。
 
 > 这里描述的是本地 OrbStack 参考环境。管理器只写期望状态并返回操作步骤，**不是** Kubernetes
 > 控制器。`delete-storage` 步骤不可逆。
@@ -229,12 +232,12 @@ Raft 端口始终是 `httpPort + 1000`。一个 `SymbolShard` 是四个 Pod。Su
 ### 构建镜像
 
 ```sh
-# 引擎 + supervisor（修改 web/console/ 后必须重建）
-docker build -f docker/k8s.Dockerfile -t matchengine-raft:k8s-nonroot .
+# 引擎 + supervisor（修改 match_engine/web/console/ 后必须重建）
+docker build -f match_engine/docker/k8s.Dockerfile -t matchengine-raft:k8s-nonroot match_engine
 
 # Manager API + 内嵌 GUI
-docker build -f demos/k8s_control_plane/Dockerfile \
-  -t matchengine-k8s-control-plane:local demos/k8s_control_plane
+docker build -f k8s_control_plane/Dockerfile \
+  -t matchengine-k8s-control-plane:local k8s_control_plane
 
 docker images | grep -E 'matchengine-raft|matchengine-k8s-control-plane'
 ```
@@ -268,9 +271,9 @@ kubectl -n match-control rollout status deploy/match-manager --timeout=120s
 [`docs/ETCD_STORAGE.md`](../ETCD_STORAGE.md)。先安装 CRD 和 RBAC：
 
 ```sh
-cargo run --manifest-path demos/k8s_control_plane/Cargo.toml -- crds \
+cargo run --manifest-path k8s_control_plane/Cargo.toml -- crds \
   | kubectl apply -f -
-kubectl apply -f demos/k8s_control_plane/deploy/rbac.yaml
+kubectl apply -f k8s_control_plane/deploy/rbac.yaml
 ```
 
 管理器 Pod 必须使用 `match-manager` ServiceAccount 并挂载 token。演示 manifest 当前设置
@@ -299,9 +302,9 @@ Operator 是真正执行 apply/prune、状态写入、引擎 bootstrap/配置和
 先安装 CRD、RBAC，再部署两个副本的 operator Deployment（演示 Lease 交接）：
 
 ```sh
-kubectl apply -f demos/k8s_control_plane/deploy/crds.yaml
-kubectl apply -f demos/k8s_control_plane/deploy/rbac.yaml
-kubectl apply -f demos/k8s_control_plane/deploy/operator.yaml
+kubectl apply -f k8s_control_plane/deploy/crds.yaml
+kubectl apply -f k8s_control_plane/deploy/rbac.yaml
+kubectl apply -f k8s_control_plane/deploy/operator.yaml
 kubectl -n match-control rollout status deploy/match-operator --timeout=120s
 
 # 只有 Lease 持有者执行 reconcile。
@@ -313,7 +316,7 @@ kubectl -n match-control logs deploy/match-operator --tail=20
 本地运行二进制时，用 `--namespace` 把 watch/prune 限制在一个命名空间，并使用本地 Lease：
 
 ```sh
-cargo run --manifest-path demos/k8s_control_plane/Cargo.toml --bin match-operator -- \
+cargo run --manifest-path k8s_control_plane/Cargo.toml --bin match-operator -- \
   --namespace match-eu-1 \
   --lease-namespace match-control --lease-name match-engine-operator \
   --profile local --resync-seconds 10
@@ -355,7 +358,7 @@ kubectl -n match-control port-forward deploy/match-manager 8099:8099
 ```
 
 如果管理器运行在工作站而不是集群内，可用
-`cargo run --manifest-path demos/k8s_control_plane/Cargo.toml -- serve --engine-console-host 127.0.0.1`
+`cargo run --manifest-path k8s_control_plane/Cargo.toml -- serve --engine-console-host 127.0.0.1`
 把控制台代理指向回环地址；端口仍来自目录中的 placement。
 
 #### 接管已有集群（brownfield）
@@ -365,7 +368,7 @@ placement，接管对象，确认无误后才让 operator 改动工作负载。�
 `--retention-seconds 0`。先构建一次 demo 二进制，确保下面的命令可用：
 
 ```sh
-cargo build --manifest-path demos/k8s_control_plane/Cargo.toml \
+cargo build --manifest-path k8s_control_plane/Cargo.toml \
   --bin k8s-control-plane --bin match-operator
 ```
 
@@ -871,7 +874,7 @@ reserved，本来就没有工作负载需要 prune；目录返回 `404` 就是�
 
 ```sh
 # 选择性导出目录（JSON，只包含期望状态）。
-cargo run --manifest-path demos/k8s_control_plane/Cargo.toml -- \
+cargo run --manifest-path k8s_control_plane/Cargo.toml -- \
   crd-backup --out /tmp/crd-catalog.json
 
 # 集群级备份：etcd 快照同样覆盖所有 CR；具体命令取决于托管 Kubernetes 提供商。
@@ -881,7 +884,7 @@ cargo run --manifest-path demos/k8s_control_plane/Cargo.toml -- \
 JSON 并通过 API server 写回 CRD：
 
 ```sh
-cargo run --manifest-path demos/k8s_control_plane/Cargo.toml -- \
+cargo run --manifest-path k8s_control_plane/Cargo.toml -- \
   crd-restore --input /tmp/crd-catalog.json
 ```
 
@@ -958,11 +961,11 @@ JSON 模式下，任何管理器滚动前先导出目录；如果文件丢失，
 
 ```sh
 # 如果使用 CRD 模式且以后可能需要恢复，先导出期望状态。
-cargo run --manifest-path demos/k8s_control_plane/Cargo.toml -- \
+cargo run --manifest-path k8s_control_plane/Cargo.toml -- \
   crd-backup --out /tmp/crd-catalog.json || true
 kubectl delete namespace match-control
 kubectl delete namespace match-eu-1
-kubectl delete -f demos/k8s_control_plane/deploy/crds.yaml --ignore-not-found
+kubectl delete -f k8s_control_plane/deploy/crds.yaml --ignore-not-found
 ```
 
 保留数据的安全清理：

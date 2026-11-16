@@ -1,5 +1,9 @@
 # Market-data egress — implementation plan
 
+> Engine commands below run from `match_engine/` or with
+> `--manifest-path match_engine/Cargo.toml`; market-data-system commands use
+> `market_data_system/Cargo.toml` from the repository root.
+
 Status: **implemented for U1–U6, U8 and the U11–U14 reference service; U7 deferred; U9, U10 and U15 partial.** Design rationale lives in
 [`AERON_SOLUTION.md`](./AERON_SOLUTION.md) Part II (§11–26). This file turns that design into
 ordered, testable units of work. The consumer side of U7 — a **separate market-data system** that
@@ -178,7 +182,7 @@ Order and parallelism: **U9 first** (small, unblocks both sides). After U9, **U1
 U14 builds on U11–U13; only **U15** needs U10 and U14 together. Deferred P2/P3 work is listed
 after the units.
 
-**Reference implementation:** `demos/market_data_system/` implements U11–U14 (JSONL and Aeron
+**Reference implementation:** `market_data_system/` implements U11–U14 (JSONL and Aeron
 sources, assembler, 100/1000 ms conflation, Binance-style WS, limits, health/metrics). It is
 multi-symbol: one instance runs a feed/state per `--symbol` and shares one WebSocket hub, so a
 connection can hold several symbols' streams and switch symbols with live
@@ -243,9 +247,9 @@ with the feature off; `cargo bench --bench matchengine` shows no regression with
 
 The consumer side begins: a new crate that turns Aeron frames into assembled state.
 
-- New crate `marketdata/` (sibling of `demos/order_system/`, own `Cargo.toml`), binary
+- New crate `marketdata/` (sibling of `order_system/`, own `Cargo.toml`), binary
   `matchengine-marketdata`, CLI per `MARKET_DATA_WEBSOCKET.md` §13.2, CI fmt/Clippy/test jobs like
-  `demos/order_system/` has (FP-S1).
+  `order_system/` has (FP-S1).
 - `FrameSource` trait (`Sourced::{Message, Loss}`) with a channel-backed source for driverless
   tests and `AeronSource`: one subscription per stream id, fragment reassembly, `wire::decode`, a
   dedicated subscriber thread owning the `!Send` handles, a bounded handoff queue whose overflow
@@ -327,7 +331,7 @@ Prove the whole path and record the numbers.
   through place/fill/amend/cancel, a forced gap, and a leadership change — the client's
   connection stays up across the failover. A two-symbol case switches `UNSUBSCRIBE`/`SUBSCRIBE`
   on one socket and asserts `LIST_SUBSCRIPTIONS` and one connection in `/metrics` (implemented in
-  `demos/market_data_system/tests/ws.rs`).
+  `market_data_system/tests/ws.rs`).
 - Benchmarks (FP-T4): engine tap/publication cost with the feed on/off (the
   "matching must not regress" gate) and the service `ws_fanout` bench (N connections ×
   `bookTicker`/`depth@100ms`, serialize-once reuse, per-connection send cost, assembler memory).
@@ -412,7 +416,7 @@ PARTIAL_BAR|BAR_CLOSE`; bit 4 reserved), `market_seq`, `log_index`, `ordinal`, b
 | U8 | **done** | deterministic `(market_seq, sub_seq)` across replicas; all mutations sequenced; auto GTD purge; one TRADE per taker; wire v7 encoder + reference decoder |
 | U9 | **partial** | `start_with_sink` seam done; per-entry empty depth deltas and bar quote volume still open (the service derives contiguity and kline `q`) |
 | U10 | **partial** | `AeronSink` (rusteron 0.2.13, embedded/external driver, one publication per stream, blocking publisher task, periodic reset snapshot, idle heartbeat, stream-2010 request subscription) and the external-driver runbook are done; Linux external-driver IPC and loopback-multicast fan-out are validated by `scripts/aeron-linux-lab.sh` (2026-11-11), while a real multi-host fabric and the leadership-scoped publication lifecycle remain open |
-| U11 | **done (demo)** | `demos/market_data_system/`: `FrameSource` (JSONL + Aeron + channel), per-symbol feeds, assembler, dedupe/watermark/gap policy, caches |
+| U11 | **done (demo)** | `market_data_system/`: `FrameSource` (JSONL + Aeron + channel), per-symbol feeds, assembler, dedupe/watermark/gap policy, caches |
 | U12 | **done (demo)** | shared WS hub: serialize-once broadcast, 100/1000 ms conflation, snapshot-on-subscribe, Binance payloads, multi-symbol keys |
 | U13 | **done (demo)** | Binance client protocol: raw/combined endpoints, live `SUBSCRIBE`/`UNSUBSCRIBE` across symbols on one connection, 1024-stream cap, ping/pong, 24 h rotation |
 | U14 | **partial** | health/readiness, metrics, graceful shutdown, stateless multi-instance design; per-instance parity test and `/metrics` runbook still open |

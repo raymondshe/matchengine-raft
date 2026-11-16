@@ -88,8 +88,8 @@ write_config() {
     esac
 }
 
-cargo build
-cargo build --manifest-path demos/order_system/Cargo.toml
+cargo build --manifest-path match_engine/Cargo.toml
+cargo build --manifest-path order_system/Cargo.toml
 
 if [ -z "${DEMO_PAIR_DATA_DIR:-}" ]; then
     rm -rf "$DATA_DIR"
@@ -97,7 +97,7 @@ fi
 mkdir -p "$DATA_DIR/spot" "$DATA_DIR/perp" "$DATA_DIR/logs"
 
 echo "Starting Spot engine on $SPOT_ADDR (gRPC $SPOT_GRPC)"
-./target/debug/matchengine-raft \
+./match_engine/target/debug/matchengine-raft \
     --id 1 \
     --http-addr "$SPOT_ADDR" \
     --data-dir "$DATA_DIR/spot" \
@@ -107,7 +107,7 @@ echo "Starting Spot engine on $SPOT_ADDR (gRPC $SPOT_GRPC)"
 SPOT_PID=$!
 
 echo "Starting Perpetual engine on $PERP_ADDR (gRPC $PERP_GRPC)"
-./target/debug/matchengine-raft \
+./match_engine/target/debug/matchengine-raft \
     --id 1 \
     --http-addr "$PERP_ADDR" \
     --data-dir "$DATA_DIR/perp" \
@@ -157,7 +157,7 @@ echo "Logs:             $DATA_DIR/logs"
 echo "Press Ctrl-C to stop the demo and both engines."
 echo
 
-./demos/order_system/target/debug/matchengine-raft-demo \
+./order_system/target/debug/matchengine-raft-demo \
     --addr "$DEMO_ADDR" \
     --engine "$SPOT_ADDR" \
     --engine-id 1 \

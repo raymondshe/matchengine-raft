@@ -1,5 +1,8 @@
 # Operational console (WebUI) design
 
+> Engine commands below run from `match_engine/` or with
+> `--manifest-path match_engine/Cargo.toml` from the repository root.
+
 Status: **implemented** — the embedded `/console/` UI, node/cluster APIs, guarded
 transfer/election/snapshot/purge/runtime-config actions and the gRPC `TransferLeader` RPC are in
 place. Streaming updates, sparklines and guarded membership/bootstrap actions remain future work.
@@ -200,7 +203,7 @@ and can still be used by external monitoring.
 Module layout:
 
 - `src/network/console.rs` — routes, cluster aggregation, action validation and embedded assets.
-- `web/console/index.html`, `web/console/app.js`, `web/console/app.css` — static UI.
+- `match_engine/web/console/index.html`, `match_engine/web/console/app.js`, `match_engine/web/console/app.css` — static UI.
 - `tests/cluster/test_console.rs` — aggregate, action and transfer integration tests.
 
 ### 6.2 Node snapshot
@@ -435,7 +438,7 @@ message TransferLeaderResponse { bytes payload = 1; }
 
 ### 6.6 Static assets
 
-- Store assets in `web/console/index.html`, `web/console/app.js`, `web/console/app.css` and embed
+- Store assets in `match_engine/web/console/index.html`, `match_engine/web/console/app.js`, `match_engine/web/console/app.css` and embed
   them with `include_str!` in `src/network/console.rs`. This keeps the binary self-contained and
   avoids runtime path/package issues.
 - No external CDN, fonts, images or analytics. The console must work on an isolated network.
@@ -461,9 +464,8 @@ message TransferLeaderResponse { bytes payload = 1; }
 
 ### 7.2 Layout
 
-A static HTML layout preview is at
-[`OPERATIONAL_CONSOLE_LAYOUT.html`](./OPERATIONAL_CONSOLE_LAYOUT.html). It uses illustrative data
-and no JavaScript; it is a visual reference for the implementation, not production code.
+A static HTML layout preview with illustrative data and no JavaScript was used as the visual
+reference for the implementation; it is not production code.
 
 - Top bar: product/version, node id, cluster leader, health/ready chips, auto-refresh toggle,
   "last updated" age.
@@ -604,7 +606,7 @@ produce a very large response. Scalar keys only in the first version.
 
 ### M0 — Backend foundation (done)
 
-1. Add the `TransferLeader` RPC to `proto/raft.proto`, the gRPC client/server and the
+1. Add the `TransferLeader` RPC to `match_engine/proto/raft.proto`, the gRPC client/server and the
    `RaftNetworkV2` implementation.
 2. Extract a reusable node-snapshot collector from the health code; add
    `GET /console/api/node` and `GET /console/api/cluster`.

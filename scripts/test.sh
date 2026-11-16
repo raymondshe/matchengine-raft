@@ -115,7 +115,7 @@ kill_node() {
 
 start_node() {
     mkdir -p logs
-    nohup ./target/debug/matchengine-raft  --id $1 --http-addr 127.0.0.1:2100$1 > logs/n$1.log 2>&1 &
+    nohup ./match_engine/target/debug/matchengine-raft  --id $1 --http-addr 127.0.0.1:2100$1 > logs/n$1.log 2>&1 &
 }
 
 change_membership () {

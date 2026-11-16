@@ -7,10 +7,10 @@
 ╚═╝     ╚═╝╚═╝  ╚═╝   ╚═╝    ╚═════╝╚═╝  ╚═╝╚══════╝╚═╝  ╚═══╝ ╚═════╝ ╚═╝╚═╝  ╚═══╝╚══════╝    ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝        ╚═╝
 ```
 
-# Match Engine Raft
+# ⚡ Matchengine Raft
 
 <p align="center">
-  <img src="MatchEngineRaft.png" alt="Match Engine Raft logo" width="360">
+  <img src="./match_engine/MatchEngineRaft.png" alt="Matchengine Raft logo" width="380">
 </p>
 
 [![CI](https://github.com/raymondshe/matchengine-raft/actions/workflows/ci.yml/badge.svg)](https://github.com/raymondshe/matchengine-raft/actions/workflows/ci.yml)
@@ -20,114 +20,54 @@
 [![Market-data wire v7](https://img.shields.io/badge/marketdata%20wire-v7-blue.svg)](./docs/MARKET_DATA_PLAN.md)
 [![WAL fsync: configurable](https://img.shields.io/badge/WAL%20fsync-configurable-blue.svg)](./docs/STORAGE.md)
 
-A Raft-replicated matching engine in Rust for teams that need deterministic execution, configurable durability and a live market-data path — without treating the engine as a black box.
+🚀 A Raft-replicated matching engine in Rust for teams that need deterministic execution,
+configurable durability and a live market-data path — without treating the engine as a black box.
 
-> **WAL durability is configurable.** `RAFT_WAL_FSYNC_MS` controls WAL fsync:
+> 📌 **WAL durability is configurable.** `RAFT_WAL_FSYNC_MS` controls WAL fsync:
 > **unset** = no fsync (default, fastest; a crash can lose acknowledged writes and the cluster
 > requires at least 4 voters), **`0`** = fsync every append (strongest durability), **`N > 0`** =
 > periodic fsync every N ms (bounds the loss window to roughly N ms). See
 > [Storage](./docs/STORAGE.md) for the recovery contract.
 
-**Why teams pick it**
+**✨ Why teams pick it**
 
-- **Deterministic execution** — price-time matching where `apply` reads no wall clock; replaying the log reproduces the book exactly.
-- **Configurable durability** — a hand-written segmented WAL with selectable fsync policy, atomic snapshots and snapshot + WAL-tail recovery, all exercised by restart and failure tests.
-- **Raft-native** — OpenRaft 0.10 over gRPC with Pre-Vote, leadership transfer, learner catch-up and chunked snapshot install.
-- **Exact 18-decimal fixed point** — no `f64` in the matching path; prices, quantities and fees survive the API, events, snapshots and feeds.
-- **Live data, not batch** — the deterministic feed is published over Aeron (one exclusive publication per stream) and served as Binance-style WebSocket streams with 100/1000 ms depth conflation and horizontal scale-out.
-- **Operable** — embedded console, `/health` + `/ready`, metrics, replay tools and a standalone order-desk demo.
-- **Kubernetes fleet control** — a reference manager + supervisor for thousands of single-symbol engines, with zero-impact symbol lifecycle, restart guards and storage-aware shard drops.
+- 🎯 **Deterministic execution** — price-time matching where `apply` reads no wall clock; replaying the log reproduces the book exactly.
+- 🛡️ **Configurable durability** — a hand-written segmented WAL with selectable fsync policy, atomic snapshots and snapshot + WAL-tail recovery, all exercised by restart and failure tests.
+- 🧭 **Raft-native** — OpenRaft 0.10 over gRPC with Pre-Vote, leadership transfer, learner catch-up and chunked snapshot install.
+- 🔢 **Exact 18-decimal fixed point** — no `f64` in the matching path; prices, quantities and fees survive the API, events, snapshots and feeds.
+- 📡 **Live data, not batch** — the deterministic feed is published over Aeron (one exclusive publication per stream) and served as Binance-style WebSocket streams with 100/1000 ms depth conflation and horizontal scale-out.
+- 🧰 **Operable** — embedded console, `/health` + `/ready`, metrics, replay tools and a standalone order-desk demo.
+- ☸️ **Kubernetes fleet control** — a reference manager + supervisor for thousands of single-symbol engines, with zero-impact symbol lifecycle, restart guards and storage-aware shard drops.
 
-| Area | Today |
-|---|---|
-| Execution | Deterministic price-time matching; `apply` reads no wall clock |
-| Durability | Segmented WAL + atomic snapshots; `RAFT_WAL_FSYNC_MS` (default: no fsync, 4 voters); snapshot every 100k entries or 30 minutes |
-| Replication | Raft peer RPCs over gRPC |
-| Market data | Aeron egress on streams 2001–2007 plus stream 2010 snapshot requests + Binance-style WebSocket service |
-| Symbol model | One symbol per process/cluster, configured and locked through Raft |
-| Fleet control | Kubernetes control-plane reference: CRD-backed desired state (etcd via the API server), manager + supervisor + Lease-elected operator; zero-impact symbol lifecycle and storage-aware shard drop across thousands of single-symbol engines, four-pod shards and cells |
-| Numeric model | Exact 18-decimal fixed point through matching, events, snapshots and feeds |
-| Observability | Embedded console, health/readiness endpoints and metrics |
-| Public edge | Bounded request/snapshot limits; loopback or private-network deployment |
+## 🧩 Four projects, one stack
 
-## Table of Contents
+| Project | What it is | Start here |
+|---|---|---|
+| 🦀 **match_engine** | Raft-replicated, deterministic matching engine: order book, WAL/snapshots, gRPC Raft, event log, market-data feed and operational console | [`match_engine/README.md`](./match_engine/README.md) |
+| ☸️ **k8s_control_plane** | CRD-backed manager, Lease-elected operator, renderer and GUI for single-symbol engine fleets | [`k8s_control_plane/README.md`](./k8s_control_plane/README.md) |
+| 📡 **market_data_system** | Standalone Aeron/JSONL consumer serving Binance-style WebSocket market data | [`market_data_system/README.md`](./market_data_system/README.md) |
+| 🧾 **order_system** | Standalone order-entry WebUI and demo freeze/settlement estimates | [`order_system/README.md`](./order_system/README.md) |
 
-- [Features](#features)
-- [Architecture Overview](#architecture-overview)
-- [Getting Started](#getting-started)
-- [Running the Cluster](#running-the-cluster)
-- [Operational Console](#operational-console)
-- [Demo Order Desk](#demo-order-desk)
-- [Market-Data System over Aeron](#market-data-system-over-aeron)
-- [Kubernetes Control Plane](#kubernetes-control-plane)
-- [Security and Deployment Boundary](#security-and-deployment-boundary)
-- [Project Structure](#project-structure)
-- [Storage and Matching](#storage-and-matching)
-- [API Reference](#api-reference)
-- [Testing](#testing)
-- [Performance and Current Limits](#performance-and-current-limits)
-- [Contact](#contact)
+```text
+.
+├── match_engine/          # engine crate, benches, examples, tests, fuzz, console assets and Dockerfiles
+├── k8s_control_plane/     # manager API/GUI, operator and CRDs
+├── market_data_system/    # WebSocket market-data service
+├── order_system/          # demo order desk
+├── docs/                  # cross-project design, API, runbook and performance notes
+├── scripts/               # cluster, lab and demo orchestration
+└── .github/workflows/     # CI, fuzz and benchmark workflows
+```
 
-## Features
+## 🏗️ Architecture
 
-Everything below is implemented in this repository and exercised by tests; the links point at the code.
-
-**Matching engine**
-- **Price-time priority order book** with GTC, IOC, FOK, GTD, Day, market, market-to-limit, post-only, iceberg, stop-market, stop-limit, trailing-stop and pegged orders, plus self-trade prevention.
-- **Amend and cancel** with deterministic priority rules: same-price reductions keep time priority; price or size increases re-queue under a new sequence.
-- **Asset-aware fee deduction** with maker/taker rates, rebates and exact notional accounting; crypto/FX default to received-asset fees, ETF/equity always settle in quote.
-- **Base or quote volume** with tick/lot enforcement, quote-limit normalization and quote-budget market sweeps.
-- **Exact 18-decimal fixed point** from API input through matching, events, snapshots and the market-data feed — no `f64` arithmetic in the matching path.
-
-**Durability and recovery**
-- **Raft-replicated state machine** with durable membership and application state; WAL fsync is configurable.
-- **Segmented, checksummed WAL** with `RAFT_WAL_FSYNC_MS`: unset = no fsync (default; requires at least 4 voters), `0` = every append, `N > 0` = periodic every N ms; torn-tail recovery. `--max-wal-append-bytes` (default 8 MiB) splits one apply batch into byte-bounded writes under one disk lock and one fsync.
-- **Prototype async WAL** (feature-gated, off by default): `append` defers fsync to a Tokio worker and fires `IOFlushed` only when durable; includes pending-entry reads and crash-recovery tests. Build with `--features async-wal`; run with `--async-wal` and `RAFT_WAL_FSYNC_MS=0`.
-- **Four-voter no-fsync floor**: `/init` and `/change-membership` reject fewer than four voters, and writes return `503` until four voters exist, so a committed entry stays on at least three nodes.
-- **Atomic snapshots** written by temp file → fsync → rename → directory fsync, with checksum validation before install. Cached snapshot bytes are shared as `Arc<[u8]>`, and a received snapshot streams into a validated staging file instead of an unbounded memory buffer.
-- **Snapshot policy for real workloads**: every 100,000 applied entries or 30 minutes when newer entries exist, configurable with `--snapshot-interval-ms`.
-- **Snapshot + WAL-tail recovery** that restores the latest snapshot, event window and idempotency map, then replays only newer log entries.
-- **gRPC replication** with bidirectional `stream_append`, chunked snapshot transfer, Pre-Vote elections, leadership transfer and independent per-peer channels.
-
-**APIs and data feeds**
-- **Durable match-event feed** at `POST /events` with cursor pagination, long-poll (`wait_ms`), retention limits, `client_order_id` idempotency, gRPC `StreamEvents` streaming and a reference MQ bridge sidecar; replay-safe retries.
-- **Deterministic market-data feed** with leader gating, shadow book, BBO, depth snapshots/deltas, lifecycle events, OHLC bars and a compact binary wire format with a reference decoder. The feature-gated **Aeron** egress publishes it on streams 2001–2007 with one exclusive publication per stream, an idle STATUS heartbeat and a stream-2010 snapshot-request path.
-- **Standalone market-data system** at `demos/market_data_system/`: consumes the feed over Aeron or JSONL and serves Binance-style WebSocket streams. One instance serves several symbols from a shared hub; clients hold a per-connection subscription set, switch symbols with live `UNSUBSCRIBE`/`SUBSCRIBE`, and scale horizontally without adding engine work. Late joiners request an immediate snapshot from the engine; `/ready` also expires on a missing frame/heartbeat.
-- **Flexible read consistency**: local reads, linearizable leader reads with local-lease reads by default and `ReadIndex` fallback, and linearizable follower reads; `GET /read-policy/status` reports lease hits and fallbacks.
-- **Local-lease reads by default**: leader-consistent reads use OpenRaft's caller-side lease cache (`local_lease`) for `/linearizable_read`, `/events`, gRPC `StreamEvents` and `/get_linearizer`, falling back to the core lease path and then `ReadIndex` when the lease is stale. The 4-node benchmark measured 11-36% higher read throughput and ~40% lower 64-reader p50/p99 than the core lease path. Set `--read-policy read_index` to force a fresh quorum round, or `lease` for the core path. Lease reads require bounded clock drift (NTP/PTP).
-- **Leader-aware Rust client** that tracks and forwards requests to the current leader, with configurable timeouts, transient retry/backoff and typed API/no-leader errors; retries are at-least-once, so use `client_order_id` for idempotent write retries.
-- **Operational APIs** for initialization, membership changes, metrics, event status and market-data status.
-- **Batch writes** at `POST /write_batch`: multiple requests in one Raft entry and one WAL append, with per-request sequences and continuous event ordinals.
-- **P99-aware write admission**: each node caps concurrent `/write` and `/write_batch` requests at 1,024 by default, returns `429` on overflow, and exposes current/peak/admitted/rejected counters at `/admission/status`.
-
-**Operational visibility**
-- **Embedded WebUI console** at `/console/`: cluster health, Raft leadership and replication, storage/event/feed state, a leader-only event viewer and diagnostics — no build step or external assets. The applied `BASE/QUOTE` trading symbol is the page hero.
-- **Guarded Raft actions**: graceful leadership transfer over the gRPC `TransferLeader` RPC, a best-effort Pre-Vote election request, and snapshot triggering, with confirmation, action locking and audit logs.
-- **Standalone demo order desk** at `demos/order_system/`: a separate process and crate that places real orders and shows the full book, symbol configuration, a cursor-following `/events` tape and labelled demo estimates of the order-system freeze plus maker/taker fee settlement, with a demo-only linear perpetual/leverage overlay; reuses the console theme.
-- **Health and readiness probes**: `/health` reports the gRPC listener, Raft core and WAL/state-machine frontier; `/ready` additionally requires a known leader, and `/pretrade/status` reports symbol/provisioning readiness reasons, making them suitable for orchestrators and pre-trade gates.
-
-**Kubernetes fleet control (production shape)**
-- **One control plane for thousands of single-symbol engines** — each symbol keeps its own process and four-voter Raft group; a 2,000-symbol fleet is 8,000 engine processes and, at 20 processes per pod, 100 four-pod shards (400 pods), partitioned into cells. Packing cuts pods and Kubernetes objects, not the per-symbol Raft groups.
-- **Zero-impact supervisor mode** — one supervisor container per pod reads `processes.json` and starts/stops individual children; adding, stopping or starting a symbol leaves every other engine's PID, listener and data directory untouched. The OrbStack validation kept all pod UIDs and restart counts unchanged while adding and cycling children.
-- **Explicit containers blast-radius guard** — a non-empty containers shard returns `409 restart_required`; `allowRestart` opts into a one-voter-at-a-time pod roll, so a routine add cannot silently restart the fleet.
-- **Complete lifecycle with storage decisions** — graceful shutdown/start reuses the same deployment, slot/ports and PVC and recovers WAL/snapshot without a new `/init`; an idle shard can be dropped with `retainStorage` keeping the PVCs for restore or deleting them irreversibly.
-- **CRD-backed desired state** — five `matching.io` CRDs (`TradingSymbol`, `SymbolShard`, `SymbolDeployment`, `SymbolRoute`, `Cell`) with status subresources; the manager writes through the Kubernetes API server, rebuilds its cache from informers, uses `resourceVersion` concurrency and rate-limits status writes. etcd persists the CRs; the manager never connects to etcd directly, and engine WAL/events never go there.
-- **Lease-elected cell operator** — watches the CRDs, server-side-applies/prunes the StatefulSet/Services/PDB/NetworkPolicy/ConfigMap, labels the dedicated-shard leader for the leader Service, and writes shard/deployment/route/symbol status and conditions. Watches trigger immediate reconciliation; a Kubernetes Lease serializes replicas.
-- **Desired-state manager, not a hand-run YAML pile** — catalog validation, lowest-free slot and `httpBasePort + slot` allocation, rendered StatefulSet/Services/PDB/NetworkPolicy/ConfigMap, reconcile bootstrap/upgrade plans, audit and an engine-console proxy across many shards and cells.
-- **Production Kubernetes primitives** — four-voter shards, one PVC per pod, PDB, NetworkPolicy, headless gRPC services, health/readiness probes, non-root images and leader-aware routing metadata. The reference manager, supervisor and Lease-elected operator are implemented here; the operator also runs bootstrap/config/membership, quorum-safe containers add/start/stop rolls, PVC retention and cross-shard cutover/rollback.
-
-See [Kubernetes Control Plane](#kubernetes-control-plane) for the runnable demo and [the design](./docs/KUBERNETES_CONTROL_PLANE.md) for the production operator contract.
-
-**Built to be trusted**
-- **Bounded public edge**: request-body, read-key, event-page, idempotency-key and snapshot-size limits, with malformed input rejected before Raft.
-- **Explicit internal-service contract**: loopback or trusted private networks, gateway-owned TLS/authentication, plus startup warnings for non-loopback binds.
-- **Fail-fast transport health**: if the gRPC listener dies, `run()` stops the node and returns an error instead of leaving a half-healthy HTTP API serving peers that cannot reach it.
-- **Correctness evidence**: randomized differential tests against a reference model, explicit order-type conformance cases, deterministic replay checks and cluster recovery tests.
-- **One symbol per process/cluster** for isolated resources and failure domains; scale horizontally by running one deployment per symbol.
-
-## Architecture Overview
-
-This project extends the [example-raft-kv](https://github.com/datafuselabs/openraft/tree/main/example-raft-kv) with persistent storage and a gRPC transport. The software architecture is shown first, followed by the runtime architecture with the four-voter engine cluster, the order-desk tier shared by user ID, and the market-data fan-out. For an interactive, source-linked view of the engine internals, open the [interactive architecture diagram](./docs/matchengine-raft-architecture.html).
+This project extends the
+[example-raft-kv](https://github.com/datafuselabs/openraft/tree/main/example-raft-kv) with
+persistent storage, a gRPC transport and a live market-data path. The software architecture is
+shown first, followed by the runtime architecture with the four-voter engine cluster, the
+order-desk tier shared by user ID, and the market-data fan-out. For an interactive, source-linked
+view of the engine internals, open the
+[interactive architecture diagram](./docs/matchengine-raft-architecture.html).
 
 <p align="center"><strong>Software architecture</strong></p>
 
@@ -143,8 +83,8 @@ This project extends the [example-raft-kv](https://github.com/datafuselabs/openr
 
 <p align="center"><em>Four-voter engine cluster, order-desk tier shared by user ID, and the leader-gated Aeron feed fanned out to stateless market-data instances.</em></p>
 
-Peer-to-peer Raft RPCs use gRPC on `port + 1000`. The public application and management API
-stays on the `--http-addr` listener. Raft RPCs are not part of the HTTP JSON API.
+Peer-to-peer Raft RPCs use gRPC on `port + 1000`. The public application and management API stays
+on the `--http-addr` listener. Raft RPCs are not part of the HTTP JSON API.
 
 Set `RAFT_CORE_WORKERS` to a positive worker count to run OpenRaft's RaftCore and state-machine
 worker on a dedicated multi-threaded runtime, isolated from the HTTP, gRPC and market-data tasks;
@@ -156,83 +96,108 @@ path, and fall back to `ReadIndex` when the lease is stale. Set `--read-policy r
 `MATCHENGINE_READ_POLICY=read_index`) to force a fresh quorum round, or `lease` for the core path.
 Lease reads require bounded clock drift between nodes; `/read` remains a local, possibly stale read.
 
-Market-data egress is off the consensus path: the tap is a bounded `try_send`, so a slow
-subscriber can never block `apply`. The feature-gated `AeronSink` publishes the same wire-v7
-messages on streams 2001–2007 from a dedicated publisher thread, with one exclusive publication
-per stream; the JSONL sink remains available for debugging.
+Market-data egress is off the consensus path: the tap is a bounded `try_send`, so a slow subscriber
+can never block `apply`. The feature-gated `AeronSink` publishes the same wire-v7 messages on
+streams 2001–2007 from a dedicated publisher thread, with one exclusive publication per stream; the
+JSONL sink remains available for debugging.
 
-### Key Components
+## 🧪 Features
 
-1. **RaftStorage Implementation** ([`store/`](./src/store/))
-   - Raft log entries in a segmented write-ahead log (`log/*.wal`)
-   - Vote and purge marker in an atomically rewritten `log/state` file
-   - State machine in memory, made durable by atomic `snapshot/current.snap` files
+✅ Everything below is implemented in this repository and exercised by tests.
 
-2. **Network Layer** ([`network/`](./src/network/))
-   - gRPC Raft RPCs (`src/network/grpc/`) for replication, voting and snapshot streaming
-   - Separate replication, heartbeat and snapshot channels per peer
-   - Management APIs for cluster administration
+**🧩 Matching engine**
+- **Price-time priority order book** with GTC, IOC, FOK, GTD, Day, market, market-to-limit, post-only, iceberg, stop-market, stop-limit, trailing-stop and pegged orders, plus self-trade prevention.
+- **Amend and cancel** with deterministic priority rules: same-price reductions keep time priority; price or size increases re-queue under a new sequence.
+- **Asset-aware fee deduction** with maker/taker rates, rebates and exact notional accounting; crypto/FX default to received-asset fees, ETF/equity always settle in quote.
+- **Base or quote volume** with tick/lot enforcement, quote-limit normalization and quote-budget market sweeps.
+- **Exact 18-decimal fixed point** from API input through matching, events, snapshots and the market-data feed — no `f64` arithmetic in the matching path.
 
-3. **Matching Engine** ([`order_book/`](./src/order_book/))
-   - Price-time priority order book with bids and asks
-   - Order types: GTC, IOC, FOK, GTD, Day, market-to-limit, post-only, iceberg, stop-market, stop-limit, trailing-stop and pegged; STP modes
-   - Deterministic expiry (`PurgeExpired` carries the timestamps through the log) and stop
-     election on the replicated last trade price
-   - The order book is the replicated state machine: deterministic `apply`, no clocks
-   - `OrderBook::execute_order` is the full lifecycle; `place_order` is a fills-only wrapper
+**🛡️ Durability and recovery**
+- **Raft-replicated state machine** with durable membership and application state; WAL fsync is configurable.
+- **Segmented, checksummed WAL** with `RAFT_WAL_FSYNC_MS`: unset = no fsync (default; requires at least 4 voters), `0` = every append, `N > 0` = periodic every N ms; torn-tail recovery. `--max-wal-append-bytes` (default 8 MiB) splits one apply batch into byte-bounded writes under one disk lock and one fsync.
+- **Prototype async WAL** (feature-gated, off by default): `append` defers fsync to a Tokio worker and fires `IOFlushed` only when durable; includes pending-entry reads and crash-recovery tests. Build with `--features async-wal`; run with `--async-wal` and `RAFT_WAL_FSYNC_MS=0`.
+- **Four-voter no-fsync floor**: `/init` and `/change-membership` reject fewer than four voters, and writes return `503` until four voters exist, so a committed entry stays on at least three nodes.
+- **Atomic snapshots** written by temp file → fsync → rename → directory fsync, with checksum validation before install. Cached snapshot bytes are shared as `Arc<[u8]>`, and a received snapshot streams into a validated staging file instead of an unbounded memory buffer.
+- **Snapshot policy for real workloads**: every 100,000 applied entries or 30 minutes when newer entries exist, configurable with `--snapshot-interval-ms`.
+- **Snapshot + WAL-tail recovery** that restores the latest snapshot, event window and idempotency map, then replays only newer log entries.
+- **gRPC replication** with bidirectional `stream_append`, chunked snapshot transfer, Pre-Vote elections, leadership transfer and independent per-peer channels.
 
-4. **Market-Data Egress** ([`market_data/`](./src/market_data/))
-   - `apply` hands match events and a depth journal to a bounded tap (`try_send`; matching never waits)
-   - A leader-gated tokio task keeps a shadow book, derives BBO/OHLC bars and encodes wire v7
-   - Keys are `(symbol_id, stream_id, market_seq, sub_seq)`; one uncapped `TRADE` per taker
-   - JSONL sink for debugging; the feature-gated `AeronSink` publishes streams 2001–2007 with one exclusive publication per stream
+**🔌 APIs and data feeds**
+- **Durable match-event feed** at `POST /events` with cursor pagination, long-poll (`wait_ms`), retention limits, `client_order_id` idempotency, gRPC `StreamEvents` streaming and a reference MQ bridge sidecar; replay-safe retries.
+- **Deterministic market-data feed** with leader gating, shadow book, BBO, depth snapshots/deltas, lifecycle events, OHLC bars and a compact binary wire format with a reference decoder. The feature-gated **Aeron** egress publishes it on streams 2001–2007 with one exclusive publication per stream, an idle STATUS heartbeat and a stream-2010 snapshot-request path.
+- **Standalone market-data system** at [`market_data_system/`](./market_data_system/): consumes the feed over Aeron or JSONL and serves Binance-style WebSocket streams. One instance serves several symbols from a shared hub; clients hold a per-connection subscription set, switch symbols with live `UNSUBSCRIBE`/`SUBSCRIBE`, and scale horizontally without adding engine work. Late joiners request an immediate snapshot from the engine; `/ready` also expires on a missing frame/heartbeat.
+- **Flexible read consistency**: local reads, linearizable leader reads with local-lease reads by default and `ReadIndex` fallback, and linearizable follower reads; `GET /read-policy/status` reports lease hits and fallbacks.
+- **Local-lease reads by default**: leader-consistent reads use OpenRaft's caller-side lease cache (`local_lease`) for `/linearizable_read`, `/events`, gRPC `StreamEvents` and `/get_linearizer`, falling back to the core lease path and then `ReadIndex` when the lease is stale. The 4-node benchmark measured 11-36% higher read throughput and ~40% lower 64-reader p50/p99 than the core lease path. Set `--read-policy read_index` to force a fresh quorum round, or `lease` for the core path. Lease reads require bounded clock drift (NTP/PTP).
+- **Leader-aware Rust client** that tracks and forwards requests to the current leader, with configurable timeouts, transient retry/backoff and typed API/no-leader errors; retries are at-least-once, so use `client_order_id` for idempotent write retries.
+- **Operational APIs** for initialization, membership changes, metrics, event status and market-data status.
+- **Batch writes** at `POST /write_batch`: multiple requests in one Raft entry and one WAL append, with per-request sequences and continuous event ordinals.
+- **P99-aware write admission**: each node caps concurrent `/write` and `/write_batch` requests at 1,024 by default, returns `429` on overflow, and exposes current/peak/admitted/rejected counters at `/admission/status`.
 
-## Getting Started
+**📊 Operational visibility**
+- **Embedded WebUI console** at `/console/`: cluster health, Raft leadership and replication, storage/event/feed state, a leader-only event viewer and diagnostics — no build step or external assets. The applied `BASE/QUOTE` trading symbol is the page hero.
+- **Guarded Raft actions**: graceful leadership transfer over the gRPC `TransferLeader` RPC, a best-effort Pre-Vote election request, and snapshot triggering, with confirmation, action locking and audit logs.
+- **Standalone demo order desk** at [`order_system/`](./order_system/): a separate process and crate that places real orders and shows the full book, symbol configuration, a cursor-following `/events` tape and labelled demo estimates of the order-system freeze plus maker/taker fee settlement, with a demo-only linear perpetual/leverage overlay; reuses the console theme.
+- **Health and readiness probes**: `/health` reports the gRPC listener, Raft core and WAL/state-machine frontier; `/ready` additionally requires a known leader, and `/pretrade/status` reports symbol/provisioning readiness reasons, making them suitable for orchestrators and pre-trade gates.
 
-### Prerequisites
+**☸️ Kubernetes fleet control (production shape)**
+- **One control plane for thousands of single-symbol engines** — each symbol keeps its own process and four-voter Raft group; a 2,000-symbol fleet is 8,000 engine processes and, at 20 processes per pod, 100 four-pod shards (400 pods), partitioned into cells. Packing cuts pods and Kubernetes objects, not the per-symbol Raft groups.
+- **Zero-impact supervisor mode** — one supervisor container per pod reads `processes.json` and starts/stops individual children; adding, stopping or starting a symbol leaves every other engine's PID, listener and data directory untouched. The OrbStack validation kept all pod UIDs and restart counts unchanged while adding and cycling children.
+- **Explicit containers blast-radius guard** — a non-empty containers shard returns `409 restart_required`; `allowRestart` opts into a one-voter-at-a-time pod roll, so a routine add cannot silently restart the fleet.
+- **Complete lifecycle with storage decisions** — graceful shutdown/start reuses the same deployment, slot/ports and PVC and recovers WAL/snapshot without a new `/init`; an idle shard can be dropped with `retainStorage` keeping the PVCs for restore or deleting them irreversibly.
+- **CRD-backed desired state** — five `matching.io` CRDs (`TradingSymbol`, `SymbolShard`, `SymbolDeployment`, `SymbolRoute`, `Cell`) with status subresources; the manager writes through the Kubernetes API server, rebuilds its cache from informers, uses `resourceVersion` concurrency and rate-limits status writes. etcd persists the CRs; the manager never connects to etcd directly, and engine WAL/events never go there.
+- **Lease-elected cell operator** — watches the CRDs, server-side-applies/prunes the StatefulSet/Services/PDB/NetworkPolicy/ConfigMap, labels the dedicated-shard leader for the leader Service, and writes shard/deployment/route/symbol status and conditions. Watches trigger immediate reconciliation; a Kubernetes Lease serializes replicas.
+- **Desired-state manager, not a hand-run YAML pile** — catalog validation, lowest-free slot and `httpBasePort + slot` allocation, rendered StatefulSet/Services/PDB/NetworkPolicy/ConfigMap, reconcile bootstrap/upgrade plans, audit and an engine-console proxy across many shards and cells.
+- **Production Kubernetes primitives** — four-voter shards, one PVC per pod, PDB, NetworkPolicy, headless gRPC services, health/readiness probes, non-root images and leader-aware routing metadata. The reference manager, supervisor and Lease-elected operator are implemented here; the operator also runs bootstrap/config/membership, quorum-safe containers add/start/stop rolls, PVC retention and cross-shard cutover/rollback.
 
-- Rust 1.89 or later (edition 2024; `actix-web` and `tonic` set the floor)
-- Cargo
+See [the Kubernetes control-plane demo](./k8s_control_plane/README.md) for the runnable
+implementation and [the design](./docs/KUBERNETES_CONTROL_PLANE.md) for the production operator
+contract.
 
-`protoc` is not required: the build script uses `protoc-bin-vendored` to compile
-`proto/raft.proto`.
+**✅ Built to be trusted**
+- **Bounded public edge**: request-body, read-key, event-page, idempotency-key and snapshot-size limits, with malformed input rejected before Raft.
+- **Explicit internal-service contract**: loopback or trusted private networks, gateway-owned TLS/authentication, plus startup warnings for non-loopback binds.
+- **Fail-fast transport health**: if the gRPC listener dies, `run()` stops the node and returns an error instead of leaving a half-healthy HTTP API serving peers that cannot reach it.
+- **Correctness evidence**: randomized differential tests against a reference model, explicit order-type conformance cases, deterministic replay checks and cluster recovery tests.
+- **One symbol per process/cluster** for isolated resources and failure domains; scale horizontally by running one deployment per symbol.
 
-### Building
+## 🚀 Quick start
+
+### Run the engine
 
 ```shell
-cargo build
+cd match_engine
+cargo build --release
+cargo run --release --bin matchengine-raft -- --id 1 --http-addr 127.0.0.1:21001
 ```
 
-> **Note**: Append `--release` for production builds, but this project is primarily intended as an example and not recommended for production use without further hardening.
+`protoc` is not required: the build script vendors it. Rust 1.89 or later is required (edition 2024).
 
-## Running the Cluster
-
-Start a local four-node cluster with `./scripts/test-cluster.sh`; use `--nodes N`, `--base-port`,
-`--keep` and `--no-fsync` to control it, and the `status`/`stop` commands to manage a kept cluster.
-Manual startup, ports, membership changes, helper scripts and recovery drills are documented in the
-[runbook](./docs/RUNBOOK.md).
-
-For a four-container Linux lab on OrbStack Free (personal/non-commercial), see
-[OrbStack Linux lab](./docs/ORBSTACK_LAB.md).
-
-## Operational Console
-
-Every node serves an embedded operational console at `/console/`. It shows cluster health, Raft
-leadership and replication, durable storage and event/feed state, and offers guarded leadership
-actions. See [`docs/OPERATIONAL_CONSOLE.md`](./docs/OPERATIONAL_CONSOLE.md) for the design and
-[`docs/OPERATIONAL_CONSOLE_LAYOUT.html`](./docs/OPERATIONAL_CONSOLE_LAYOUT.html) for the layout
-mockup.
-
-![Operational console](./docs/operational-console.png)
-
-## Demo Order Desk
-
-`demos/order_system/` is a standalone order-entry WebUI for a running node. It is a separate crate and process;
-the engine binary and its routes are unchanged. It calls the public HTTP API through the
-leader-aware client and reuses the console theme. Start an initialized engine, then run:
+### Start a local cluster
 
 ```shell
-cargo run --manifest-path demos/order_system/Cargo.toml -- \
+./scripts/test-cluster.sh
+```
+
+The script builds, starts a four-node cluster, initialises it, adds learners, changes membership
+and reads the book back from every node. Use `--nodes N`, `--base-port`, `--keep`, `--no-fsync`,
+`status` and `stop` to control it. See the [runbook](./docs/RUNBOOK.md) for manual startup,
+membership changes, failure drills and recovery.
+
+### Run the demos
+
+```shell
+./scripts/demo-pair.sh             # two engines + order desk
+./scripts/market-data-system.sh    # two engines + market-data WebSocket service
+```
+
+## 🧾 Demo order desk
+
+[`order_system/`](./order_system/) is a standalone order-entry WebUI for a running node. It is a
+separate crate and process; the engine binary and its routes are unchanged. It calls the public HTTP
+API through the leader-aware client and reuses the console theme.
+
+```shell
+cargo run --manifest-path order_system/Cargo.toml -- \
   --addr 127.0.0.1:24300 --engine 127.0.0.1:24301 --engine-id 1
 ```
 
@@ -241,60 +206,49 @@ Open <http://127.0.0.1:24300/demo/>. Tabs cover the order ticket, the full order
 
 ![Demo order desk](./docs/demo-order-desk.png)
 
-See [`demos/order_system/README.md`](./demos/order_system/README.md) for the demo flow and
+See [`order_system/README.md`](./order_system/README.md) for the demo flow and
 [`docs/DEMO_ORDER_SYSTEM.md`](./docs/DEMO_ORDER_SYSTEM.md) for the design.
 
-## Market-Data System over Aeron
+## 📡 Market-data system over Aeron
 
-`demos/market_data_system/` is the live distribution tier. The engine publishes
-its deterministic feed through the feature-gated `AeronSink` on streams
-2001–2007; one exclusive publication per stream and a dedicated publisher
-thread keep a large depth snapshot from head-of-line-blocking trades. Aeron
-multicast fans the same bytes out to any number of stateless service instances,
-so the engine's publish cost is independent of WebSocket clients.
+[`market_data_system/`](./market_data_system/) is the live distribution tier. The engine publishes
+its deterministic feed through the feature-gated `AeronSink` on streams 2001–2007; one exclusive
+publication per stream and a dedicated publisher thread keep a large depth snapshot from
+head-of-line-blocking trades. Aeron multicast fans the same bytes out to any number of stateless
+service instances, so the engine's publish cost is independent of WebSocket clients.
 
-The service keeps a shadow book per symbol, conflates diff depth at 100/1000 ms,
-pushes a snapshot on subscribe, serializes each stream message once and fans it
-out through bounded per-connection queues. The test page uses one WebSocket and
-switches symbols with live `UNSUBSCRIBE`/`SUBSCRIBE`:
+The service keeps a shadow book per symbol, conflates diff depth at 100/1000 ms, pushes a snapshot
+on subscribe, serializes each stream message once and fans it out through bounded per-connection
+queues. The test page uses one WebSocket and switches symbols with live `UNSUBSCRIBE`/`SUBSCRIBE`:
 
-![Market-data WebSocket test page"](./docs/market-data-system.png)
+![Market-data WebSocket test page](./docs/market-data-system.png)
 
 **Why it is fast and live-safe**
 
-- `apply` never waits on a subscriber: the tap is a bounded `try_send`, and a
-  full queue drops frames and emits `GAP` while consensus continues.
-- One exclusive Aeron publication per stream; a depth snapshot cannot block a
-  trade or status stream.
+- `apply` never waits on a subscriber: the tap is a bounded `try_send`, and a full queue drops frames and emits `GAP` while consensus continues.
+- One exclusive Aeron publication per stream; a depth snapshot cannot block a trade or status stream.
 - One JSON encode per stream message, shared as `Bytes` across every subscriber.
-- An idle STATUS heartbeat keeps `@status` alive when the book is quiet; a late
-  joiner can request an immediate reset snapshot on stream 2010 instead of
-  waiting for the periodic broadcast.
-- 100/1000 ms depth conflation and latest-value collapse for `bookTicker` and
-  partial depth, so bursts do not multiply socket writes.
-- Deterministic `(symbol_id, stream_id, market_seq, sub_seq)` keys make
-  failover, restart and multi-instance fan-out content-identical.
-- Stateless instances rebuild from a periodic reset snapshot plus deltas and
-  scale horizontally behind a load balancer.
-- The feed path is load-tested at 500k fills/s (495k fills/s, zero drops at the
-  8,192-frame tap queue).
+- An idle STATUS heartbeat keeps `@status` alive when the book is quiet; a late joiner can request an immediate reset snapshot on stream 2010 instead of waiting for the periodic broadcast.
+- 100/1000 ms depth conflation and latest-value collapse for `bookTicker` and partial depth, so bursts do not multiply socket writes.
+- Deterministic `(symbol_id, stream_id, market_seq, sub_seq)` keys make failover, restart and multi-instance fan-out content-identical.
+- Stateless instances rebuild from a periodic reset snapshot plus deltas and scale horizontally behind a load balancer.
+- The feed path is load-tested at 500k fills/s (495k fills/s, zero drops at the 8,192-frame tap queue).
 
-Run it with `./scripts/market-data-system.sh` (two engines over Aeron IPC) and
-open <http://127.0.0.1:24800/>. For the Linux external-driver and multicast
-validation, run `./scripts/aeron-linux-lab.sh`. See
-[`demos/market_data_system/README.md`](./demos/market_data_system/README.md)
+Run it with `./scripts/market-data-system.sh` (two engines over Aeron IPC) and open
+<http://127.0.0.1:24800/>. For the Linux external-driver and multicast validation, run
+`./scripts/aeron-linux-lab.sh`. See [`market_data_system/README.md`](./market_data_system/README.md)
 and [`docs/MARKET_DATA_WEBSOCKET.md`](./docs/MARKET_DATA_WEBSOCKET.md).
 
-## Kubernetes Control Plane
+## ☸️ Kubernetes control plane
 
 The engine trades one symbol per process, so a multi-symbol deployment is a fleet of independent
-Raft clusters. `demos/k8s_control_plane/` is the reference control plane: it models four-pod
-`SymbolShard`s that pack several single-symbol engine processes per pod, validates placement and
-ports, renders the StatefulSet/Services/PDB/NetworkPolicy set, and plans bootstrap, membership,
-routing and same-version upgrades. The manager API/GUI owns the symbol catalog, RBAC, approvals
-and the allowlisted engine-console proxy. It can reserve empty shards, place a new symbol into a
-reserved or existing shard with the next free slot/port, and prepare a shadow migration plan for
-an existing symbol. Supervisor-mode shards add a symbol by changing only the ConfigMap, so
+Raft clusters. [`k8s_control_plane/`](./k8s_control_plane/) is the reference control plane: it
+models four-pod `SymbolShard`s that pack several single-symbol engine processes per pod, validates
+placement and ports, renders the StatefulSet/Services/PDB/NetworkPolicy set, and plans bootstrap,
+membership, routing and same-version upgrades. The manager API/GUI owns the symbol catalog, RBAC,
+approvals and the allowlisted engine-console proxy. It can reserve empty shards, place a new symbol
+into a reserved or existing shard with the next free slot/port, and prepare a shadow migration plan
+for an existing symbol. Supervisor-mode shards add a symbol by changing only the ConfigMap, so
 existing engine processes keep running; containers-mode additions require an explicit restart
 opt-in.
 
@@ -315,7 +269,7 @@ of single-symbol engines and their four-voter process instances across shards an
 [Design and CRDs](./docs/KUBERNETES_CONTROL_PLANE.md) ·
 [etcd storage](./docs/ETCD_STORAGE.md) ·
 [Local test plan](./docs/KUBERNETES_LOCAL_TESTING.md) ·
-[Reference demo](./demos/k8s_control_plane/README.md)
+[Reference demo](./k8s_control_plane/README.md)
 
 ![Kubernetes control plane manager GUI](./docs/kubernetes-control-plane.png)
 
@@ -323,7 +277,7 @@ The manager GUI: shard catalog, supervisor/containers packing modes, validation,
 manifests, audit and engine-console links. The selected `fx-sup-01` shard is supervisor-mode and
 hosts `eurgbp` and `nzdusd`; both were added without restarting the running engines.
 
-## Security and Deployment Boundary
+## 🔒 Security and deployment boundary
 
 The HTTP API and the gRPC Raft listener (HTTP port + 1000) are **plaintext and unauthenticated by
 design**. This is an internal matching engine, not an internet-facing gateway: run it only on
@@ -349,34 +303,7 @@ Malformed JSON and invalid fields return `400`; oversized bodies return `413`. T
 `client_order_id` dedupe map retains at most 262,144 records, so the key bound also bounds its
 memory.
 
-## Project Structure
-
-Top-level layout: `src/` (engine), `proto/` (gRPC schema), `examples/` (replay and dump tools),
-`demos/` (order desk, market-data system and Kubernetes control plane) and `tests/cluster/`
-(integration tests). See [Project structure](./docs/PROJECT_STRUCTURE.md) for the full tree.
-
-## Storage and Matching
-
-The engine uses a segmented WAL and atomic snapshots. Order types, amendments, match-result
-delivery and the market-data feed are documented separately:
-
-- [Storage: WAL, snapshots, recovery and dump tools](./docs/STORAGE.md)
-- [Matching: order types and amendment rules](./docs/MATCHING.md)
-- [Match-result delivery](./docs/MATCH_RESULTS.md)
-- [Market-data feed plan](./docs/MARKET_DATA_PLAN.md)
-
-## API Reference
-
-The HTTP application/admin APIs and the gRPC Raft service are documented in
-[API reference](./docs/API.md). Main routes: `/write`, `/write_batch`, `/read`,
-`/linearizable_read`, `/follower_read`, `/events`, `/read-policy/status`, `/admission/status`, `/health`, `/ready`, `/metrics` and `/console/`.
-
-## Testing
-
-`cargo test` runs the cluster integration suite. Test ports, replay cases, dump tools and the
-failure matrix are documented in [Testing](./docs/TESTING.md).
-
-## Performance and Current Limits
+## 📊 Performance
 
 Headline numbers from the reference machine (Apple M4, Rust 1.93.1, release bench profile). Book-only
 rows exclude HTTP, Raft and WAL; replicated rows use four in-process loopback voters with WAL fsync
@@ -425,22 +352,35 @@ voters), `0` = every append, `N > 0` = periodic. See [Storage](./docs/STORAGE.md
 contract and [production decisions](./docs/PERFORMANCE.md#production-configuration-decisions-2026-11-08)
 for the trade-offs.
 
-The full benchmark methodology, storage-path details and optimization history are in
-[PERFORMANCE.md](./docs/PERFORMANCE.md). Snapshot **v11** and wire **v7** are breaking changes;
-see [DECIMAL.md](./docs/DECIMAL.md). Known gaps and the roadmap are tracked in
-[TODO.md](./TODO.md).
+## 📚 Documentation and testing
 
-## Contact
+- [Engine README](./match_engine/README.md) — build/run, engine configuration and internals.
+- [API](./docs/API.md) — HTTP application/admin routes and the gRPC Raft service.
+- [Storage](./docs/STORAGE.md) — WAL, snapshots, recovery and dump tools.
+- [Matching](./docs/MATCHING.md) — order types and amendment rules.
+- [Match-result delivery](./docs/MATCH_RESULTS.md) — events, cursors and idempotency.
+- [Testing](./docs/TESTING.md) — cluster suite, replay matrix and failure tests.
+- [Performance](./docs/PERFORMANCE.md) — measured baselines and methodology.
+- [Runbook](./docs/RUNBOOK.md) — cluster, upgrade, migration and recovery procedures.
+- [Third-party investigations](./docs/THIRD_PARTY_INVESTIGATION.md) — external engine reviews.
+- [TODO](./TODO.md) — current priorities and roadmap.
+
+```shell
+cargo test --manifest-path match_engine/Cargo.toml --locked
+cargo test --manifest-path k8s_control_plane/Cargo.toml --locked
+cargo test --manifest-path market_data_system/Cargo.toml --locked
+cargo test --manifest-path order_system/Cargo.toml --locked
+```
+
+## 📬 Contact and credits
 
 - Google Chat: [rshen.sy@gmail.com](https://chat.google.com/u/0/dm/rshen.sy@gmail.com)
+- This project is a fork from
+  [example-raft-kv](https://github.com/datafuselabs/openraft/tree/main/example-raft-kv) in the
+  [OpenRaft](https://github.com/datafuselabs/openraft) project.
+- Special thanks to the Databend community and Zhang Yanpo for their support.
 
-## Credits
-
-This project is a fork from [example-raft-kv](https://github.com/datafuselabs/openraft/tree/main/example-raft-kv) in the [OpenRaft](https://github.com/datafuselabs/openraft) project.
-
-Special thanks to the Databend community and Zhang Yanpo for their support.
-
-## License
+## 📄 License
 
 MIT — see [`LICENSE`](./LICENSE).
 

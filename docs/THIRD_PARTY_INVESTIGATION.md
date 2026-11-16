@@ -1,6 +1,6 @@
 # Third-party matching-engine investigations
 
-Four external matching-engine projects were reviewed for design ideas, benchmark methodology and
+Five external matching-engine projects were reviewed for design ideas, benchmark methodology and
 failure modes. This document consolidates the separate reports into one reference.
 
 | Project | Revision | License | Primary value to us |
@@ -9,14 +9,17 @@ failure modes. This document consolidates the separate reports into one referenc
 | [wasif-exe/wire](https://github.com/wasif-exe/wire) | `abd2bf2` (2026-10-19) | MIT | Low-level layout/allocator/MPMC ideas and a cautionary benchmark case |
 | [llc-993/matching-core](https://github.com/llc-993/matching-core) | `2cb21c0` (2026-01-03) | No license file exposed | Feature breadth, WAL/snapshot attempt, integration/benchmark caution |
 | [flash1-dev/matching-engine-benchmark](https://github.com/flash1-dev/matching-engine-benchmark) | `424e4e5` (2026-10-16) | MIT (vendored parts have their own licenses) | 249-engine differential benchmark, consensus oracle, conformance battery, worst-case methodology |
+| [ronitgupta138/Apex-Matching-Engine](https://github.com/ronitgupta138/Apex-Matching-Engine) | `a31909c` (2026-11-13) | MIT | Readable Java/Spring teaching engine; a case study in documentation-vs-code and benchmark scope |
 
-Review date: 2026-11-01, re-reviewed 2026-11-04, benchmark review added 2026-11-10. The review used
-the public READMEs, `PLAN.md`, the benchmark's reports and the key source files listed in the
-references; the 2026-11-04 pass added AsthaMishra's `matching-core/optimization_notes.md`, and the
-2026-11-10 pass added Part IV. Tests were not executed here. No code was copied; all four projects
-are reference material only. The performance-specific verdicts (what transfers to matchengine-raft
-and what does not) live in [`docs/PERFORMANCE.md`](./PERFORMANCE.md) ("External optimization
-notes").
+Review date: 2026-11-01, re-reviewed 2026-11-04, benchmark review added 2026-11-10, Apex review
+added 2026-11-16. The review used the public READMEs, `PLAN.md`, the benchmark's reports and the key
+source files listed in the references; the 2026-11-04 pass added AsthaMishra's
+`matching-core/optimization_notes.md`, and the 2026-11-10 pass added Part IV. Tests for the other
+four projects were not executed here. For Apex, the engine/model classes were compiled directly and
+a local harness reran its benchmark shape plus a same-price cancellation probe on 2026-11-16 (Apple
+M4, OpenJDK 25); its Spring test suite was not run. No code was copied; all five projects are
+reference material only. The performance-specific verdicts (what transfers to matchengine-raft and
+what does not) live in [`docs/PERFORMANCE.md`](./PERFORMANCE.md) ("External optimization notes").
 
 ## Part I - AsthaMishra/matching-engine
 
@@ -614,7 +617,7 @@ correctness and measurement improvements land before any structural experiment.
    scheduled-send, dispatch-lag and service percentiles, and the 10k/30k/50k/80k rows plus the
    caveat are in [`docs/PERFORMANCE.md`](./PERFORMANCE.md#open-loop-write-latency-2026-11-10).
 2. Evaluate a treap, sorted vector or heap hybrid only as a book-only A/B on our workloads. Done:
-   `benches/sorted_book.rs` compares a sorted-vector ladder; it wins match/cancel/amend-volume but
+   `match_engine/benches/sorted_book.rs` compares a sorted-vector ladder; it wins match/cancel/amend-volume but
    loses price-move amend and BBO advance, so it is not adopted. A tree/heap hybrid remains a
    book-only option only if a sparse-level fast path is measured.
 3. Re-pin the benchmark to current `HEAD` and, if the adapter can be published, ship the
@@ -647,29 +650,235 @@ open-loop latency and sorted-vector experiments are also recorded. The remaining
 external-adapter publication and the manual Linux pinned/Aeron validation, not a new data
 structure.
 
-## Part V - Comparison with matchengine-raft
+## Part V - ronitgupta138/Apex-Matching-Engine
 
-| Dimension | AsthaMishra | Wire v9 | llc-993/matching-core | matchengine-raft |
-|---|---|---|---|---|
-| Topology | Single node | Single node, benchmark kernels | Single-node library + Disruptor pipeline | Raft-replicated cluster |
-| Durability | None | No WAL on matching path | WAL/snapshot attempt without fsync/atomicity | Segmented WAL + atomic snapshots + recovery |
-| Symbol model | Multi-symbol sharded; single-book OUCH path | One flat book, 65k slots | Symbol-sharded routers; Direct book per symbol | One symbol per process/cluster |
-| Book | Flat array + bitmap + `Vec` level | Flat array + linked-list levels | BTreeMap/Slab/AHashMap (Direct); BTreeMap/SmallVec (Advanced); SOA prototype unused | `BTreeMap` price/sequence |
-| Price/quantity | Cents, `u32` | `u32` price index, `u32` shares | `i64` price/size | 18-decimal `Fixed` `i128` |
-| Order types | Limit/Market/IOC/FOK | Single-fill primitive | Advertised many; exchange Direct only GTC/IOC/FokBudget | GTC/IOC/FOK/GTD/Day/market/post-only/iceberg/stop |
-| User/STP | Cancel-resting STP | None in matcher | No STP; Advanced cancel ignores uid | No trader id; fees/assets modeled |
-| Events | In-process stream; global trade id | One `MarketEvent` per fill | Trade/Reject/Reduce only | Replicated event window; deterministic ids |
-| Protocol | OUCH/ITCH + REST | No integrated order entry | Library only | HTTP JSON + gRPC Raft |
-| Tests | Unit/proptest/fuzz (stale target) | Unit per kernel; no v9 integration | Tests present; no pipeline/consensus integration observed | Unit/property/conformance/integration/restart/snapshot/fees |
-| Benchmarks | Criterion/ITCH/tail | Pinned-core microbenchmarks | AdvancedOrderBook TPS; estimated memory; flawed Criterion cases | e2e/batch/feed/storage/P0 benchmarks |
-| FlashOne survey (Part IV) | 5.60 M/s, with fix; bounded-domain flat array | Not listed in the roster | 7.14 M/s, as shipped; new/cancel/modify ABI only | 7.20 M/s, fastest B-tree; "with fix" at the old pin, fixed at `HEAD` |
+### 1. What it is
+
+A compact Java 21 / Spring Boot 3.3.5 continuous double auction engine. The repository is MIT
+licensed, was created on 2026-10-04 and last pushed on 2026-11-13 (`a31909c`); it had 69 stars,
+five open issues and four open pull requests when reviewed. The main code is 19 classes and about
+900 lines:
+
+- `engine/OrderBook`: the per-symbol book and matching loop.
+- `service/MatchingEngineService`: symbol-to-book map, order placement, cancel and market-data
+  queries.
+- `controller/`: REST endpoints for orders, depth, trades and symbols.
+- `service/MarketBroadcaster` and `config/WebSocketConfig`: STOMP/WebSocket market data.
+- `simulator/MarketSimulationBot`: a scheduled market-maker bot, enabled by default.
+- `model/`, `dto/`: `BigDecimal` prices, `long` quantities, order/trade/depth records.
+
+The package is a Spring Boot demo: Docker multi-stage build, Actuator health/metrics, H2/JPA and
+PostgreSQL dependencies, a test suite and a benchmark-shaped JUnit test. It has no persistence,
+consensus, replication or recovery.
+
+The open issues are a useful map of what is not implemented in `main`: LMAX Disruptor evaluation
+(#1), a primitive `LongObjectHashMap` index (#2), binary WebSocket market data (#3), a
+multi-threaded stress test with cancels (#4) and a CI benchmark regression check (#5). Treat the
+deeper `docs/` pages as design proposals, not as a description of the current code.
+
+### 2. Order book and matching
+
+The book is deliberately simple:
+
+- `bids` is a `TreeMap<BigDecimal, ArrayDeque<Order>>` with reverse ordering; `asks` is the same
+  tree in ascending order.
+- `orderIndex` is a `ConcurrentHashMap<Long, Order>` for lookup.
+- A **fair** `ReentrantLock(true)` guards `processOrder`, `cancelOrder` and `getMarketDepth` per
+  symbol.
+- `tradeHistory` is an unbounded `Collections.synchronizedList`.
+- Matching walks the opposite tree in price order, stops when a limit would cross, and executes
+  FIFO inside each `ArrayDeque`. The maker sets the execution price. A market residual is marked
+  `CANCELLED`; a limit residual rests.
+
+The basic price-time-priority path is correct and easy to follow. The important gaps are structural:
+
+- **Cancel is O(n), not O(1).** `ArrayDeque.remove(order)` scans from the head. The README and book
+  docs claim O(1) cancellation. A local probe with 100,000 orders resting at one price, cancelling
+  the middle element, measured about 199k cancels/s (p50 4.8 us, p99 14.5 us); the same harness
+  with one order per price level measured about 8.2M cancels/s (p50 0.083 us). The benchmark shape
+  never exposes this because it rarely builds a deep queue at one price.
+- **The order index never shrinks.** Filled and cancelled orders stay in `orderIndex`; every order
+  ever submitted is retained. `tradeHistory` is also unbounded. There is no eviction, compaction or
+  retention policy, so a long-running process grows without bound.
+- **Depth is computed under the matching lock.** `getMarketDepth` streams every order in each
+  selected level to sum remaining quantity. That is O(orders at the level), not the lock-free
+  `ConcurrentSkipListMap` / O(log P) design described in `docs/L2_Market_Depth_Loom_Concurrency.md`.
+- **The fair lock serializes all matching, cancel and depth operations.** A depth query blocks
+  matching and vice versa. Fairness adds handoff cost without a latency benefit for this workload.
+- **The response, trades and depth are not one atomic snapshot.** `placeOrder` matches under the
+  book lock, releases it, then takes the lock again for a depth snapshot. Another order can arrive
+  between the two, so the HTTP response, trade list and broadcast depth need not describe the same
+  instant.
+- **No STP, risk checks, tick/lot rules or amend.** Only `LIMIT` and `MARKET` exist; there is no
+  IOC/FOK/GTD/Day, stop, iceberg, post-only or market-to-limit order. There is no self-trade
+  prevention, price band, maximum order size, tick/lot rounding or symbol whitelist. Bean
+  Validation covers required fields and quantity ≥ 1; the only price check is that a `LIMIT` price
+  is greater than zero.
+- **Non-deterministic identity and time.** Order and trade ids are process-local `AtomicLong`s;
+  `Order.createdAt` and `Trade.executedAt` use `Instant.now()`. Replaying the same requests cannot
+  reproduce ids or timestamps, and a restart loses the id generators.
+- **Index insertion precedes matching.** A duplicate explicit order id could overwrite the index
+  entry of a resting order while that order remains in the book. The REST path never supplies ids,
+  so this is not reachable through the API today, but the invariant is unguarded.
+- **Reads create books.** `getMarketDepth` and `getRecentTrades` call `getOrCreateOrderBook`, so an
+  unknown-symbol GET creates an empty book and `getActiveSymbols` pre-populates five symbols even
+  when empty.
+
+### 3. Runtime, API and persistence
+
+- **REST:** `POST /api/orders`, `GET`/`DELETE /api/orders/{symbol}/{id}`,
+  `GET /api/market/depth/{symbol}`, `/api/market/trades/{symbol}` and `/api/market/symbols`.
+- **CORS and auth:** controllers use `@CrossOrigin(origins = "*")`; there is no authentication,
+  authorization, rate limit or idempotency key. Retrying a POST creates another order. Any symbol
+  string creates a new book, so an unauthenticated client can grow the symbol map without bound.
+- **WebSocket:** Spring's simple STOMP broker with SockJS, allowed origin patterns `*`. The
+  broadcaster sends a full 15-level depth snapshot after **every** order and cancel, and one message
+  per trade. There is no conflation, throttling or drop policy; a failed send is logged at debug and
+  discarded.
+- **Documented but absent:** `docs/STOMP_WebSocket_Order_Stream.md` describes 50 ms periodic top-20
+  depth, FlatBuffers/binary payloads and an authenticated `/user/queue/orders` private feed. The
+  code has none of these: it uses JSON, the simple broker, no user destinations and no security.
+- **Simulator:** `application.yml` sets `trade.simulator.enabled: ${SIMULATOR_ENABLED:true}` and
+  `docker-compose.yml` sets `SIMULATOR_ENABLED: "true"`. The bot injects BTC-USD bids/asks every
+  four seconds and occasionally a market order. A deployment that wants only client order flow must
+  set `SIMULATOR_ENABLED=false`; the default demo has background liquidity and trades.
+- **No durability:** JPA, H2 and the PostgreSQL driver are dependencies and a datasource is
+  configured, but there are no entities or repositories. All state is in memory and is lost on
+  restart. There is no WAL, snapshot, replay, Raft or other replication.
+- **Deployment:** the Dockerfile is a multi-stage build and runs as a non-root user, which is good.
+  It does not set ZGC, heap sizing beyond `MaxRAMPercentage`, CPU affinity or other low-latency JVM
+  options, despite the benchmark docs' ZGC claims.
+
+### 4. Claims vs code
+
+The README is mostly honest at a high level; several deeper `docs/` pages describe a different
+engine. Where they conflict, the code wins:
+
+| Claim | Where | Current code |
+|---|---|---|
+| 1.24M orders/s, p50 0.62 us, ZGC 0 ms | `docs/benchmarks/Million_Order_Per_Second_Benchmark.md` | 100k sequential LIMIT orders on a shallow book, no ZGC flags, no assertion; a local rerun of the same shape measured 2.08M ops/s, p50 0.17 us on an M4/JDK 25 — a different machine and still not end-to-end |
+| 420k orders/s, p50 0.12 ms | `docs/benchmarks/Sub_Millisecond_Latency_Profile.md` | no committed harness reproduces it; internally inconsistent with the 1.24M claim |
+| 50,000+ orders/s, sub-millisecond | README | conservative; not a measurement of the REST/STOMP path |
+| `ConcurrentSkipListMap`, lock-free read paths, O(log P) depth | `docs/L2_Market_Depth_Loom_Concurrency.md` | `TreeMap` + fair `ReentrantLock`; depth sums under the lock |
+| Doubly linked FIFO with O(1) detach; atomic cancel/replace amend | `docs/orderbook/Order_Cancellation_Deterministic_Semantics.md` | `ArrayDeque.remove(order)` scans the queue; there is no amend method or endpoint |
+| Java 21 Loom / virtual threads | benchmark docs | no `Thread.ofVirtual` or virtual-thread configuration; the Disruptor evaluation is still an open issue |
+| LMAX Disruptor / lock-free ring buffer | benchmark docs | no Disruptor dependency; issue #1 |
+| Binary WebSocket / FlatBuffers | STOMP docs | JSON over Spring's simple STOMP broker; issue #3 |
+| Primitive `LongObjectHashMap` | issue #2 / docs | `ConcurrentHashMap<Long, Order>` |
+| Authenticated `/user/queue/orders` | STOMP docs | no Spring Security, no user destinations, no private feed |
+| 50 ms periodic top-20 depth | STOMP docs | full 15-level depth on every mutation |
+| ZGC pauses < 0.4 ms | `docs/benchmarks/Worst_Case_Jitter_Distribution.md` | no ZGC selection or GC metrics in the image or benchmark |
+
+Some of these pages label themselves as an "Architectural specification and design document", so
+they are best read as a roadmap. The README's architecture diagram is closer to reality: it names a
+`ReentrantLock` and a navigable red-black tree.
+
+### 5. Testing and benchmarks
+
+The suite is small: four `OrderBookMatchingTest` cases (exact limit match, partial fills/FIFO,
+cancel, market order), two integration tests (health, submit/fetch) and one benchmark-shaped JUnit
+test. There are no tests for FOK/IOC/stops/STP, invalid prices, duplicate ids, deep same-price
+queues, concurrency, restart or persistence. CI runs `mvn clean verify`; the benchmark prints
+numbers but asserts nothing, so it cannot catch a regression.
+
+The committed benchmark:
+
+- warms up 20,000 orders, then discards the book;
+- submits 100,000 LIMIT orders with prices around 60,000 ±50 and alternating sides;
+- creates the order before the timer and times only `processOrder`;
+- sorts per-order latencies and prints p50/p90/p99/p99.9;
+- uses one thread, a shallow/empty book, no cancels or amends, no HTTP/JSON/STOMP and no GC or JVM
+  reporting.
+
+A local rerun of that shape measured about 2.08M ops/s, p50 0.167 us, p99 1.25 us, p99.9 4.96 us
+and a 6.49 ms max on an Apple M4 with OpenJDK 25. That number is not evidence of exchange
+throughput: it measures an in-memory book with a narrow price range and alternating flow, on
+different hardware, with order construction outside the timer. The harness was ad hoc and is not
+checked in; treat these numbers as a local cross-check, not a reproducible benchmark. A same-price
+cancellation probe is a better stress case: with 100,000 resting orders at one price, cancelling
+middle elements measured about 199k/s (p50 4.8 us, p99 14.5 us), versus about 8.2M/s when each
+price level holds one order. The gap is the `ArrayDeque.remove` scan the O(1) claim hides.
+
+### 6. Findings and risks
+
+- **Good basic semantics, narrow scope.** Price-time priority, maker pricing, partial fills, market
+  residual cancellation and status transitions work for the two supported order types.
+- **No self-trade prevention.** A user can trade with their own resting order; there is no owner
+  check, STP mode or self-trade event.
+- **No idempotency.** A client retry after a timeout creates a second order; there is no
+  `client_order_id` equivalent or dedupe map.
+- **No edge controls.** CORS `*`, no auth, no rate limit, arbitrary symbol creation and a
+  default-on market-maker bot are acceptable for a demo and unacceptable for an exposed service.
+- **Unbounded memory.** Every order stays in `orderIndex`; every trade stays in `tradeHistory`;
+  neither has retention or eviction. A long-running demo grows until the JVM heap is exhausted.
+- **No durability or consensus.** A restart loses the book, ids, trades and simulator history. The
+  JPA/H2 dependencies do not change that; they are unused for the engine.
+- **Latency claims are not product measurements.** The benchmark is book-only, shallow, sequential
+  and not asserted; the docs' 1.24M/420k/50k figures conflict with each other and with the code.
+- **The depth/feed path shares the matching lock.** Depth snapshots and the full-snapshot broadcast
+  add work to the request path instead of a shadow-book/feed task. Under load this trades tail
+  latency for implementation simplicity.
+- **No risk or validation layer.** Bean Validation covers required fields and quantity ≥ 1, but
+  there is no symbol whitelist, tick/lot, max quantity, price band, duplicate-id or user balance
+  check.
+
+### 7. Strengths and lessons
+
+The project is a readable, well-packaged teaching demo. The model/engine/service/controller split is
+clear, the basic FIFO and L2 depth logic is compact, Docker and CI are present, and the MIT license
+makes it easy to study. The README's badges and diagrams are polished; the deep docs are a useful
+feature checklist even where they describe planned work.
+
+For matchengine-raft, the lessons are mostly confirmations:
+
+- **Keep claims code-backed.** Mark planned versus implemented explicitly; the deep docs here
+  describe Loom, Disruptor, FlatBuffers, lock-free reads and ZGC that `main` does not contain. Our
+  docs should continue to separate measured behavior from design notes.
+- **Benchmark the real shape.** A shallow, alternating, book-only loop cannot justify an exchange
+  throughput claim. Deep same-price queues, cancels/amends, the HTTP/WS path, GC and an asserted
+  regression bound are all required; our `book_replay`, `replay_mix` and `apply_path --check` cover
+  the first part, and `e2e` covers the integration path.
+- **Use fixed-point and deterministic identity.** `BigDecimal` price keys and `Instant.now()` on
+  the matching path are simple to write and impossible to replay; our 18-decimal `Fixed` and
+  `(log_index, ordinal)` event ids are the right trade.
+- **Bound the state.** Remove filled/cancelled orders from lookup indexes and cap trade/event
+  history; a demo can leak and a production process cannot.
+- **Do not put the feed on the matching lock.** Snapshot depth after the lock is released, or better,
+  build it from a shadow book as our market-data task does.
+- **Protect the edge.** CORS `*`, no auth, no idempotency and default-on simulation are demo
+  choices; our gateway-owned TLS/auth, bounded request limits, admission gate and `client_order_id`
+  dedupe are the production equivalents.
+
+No code should be adopted from this repository. Treat it as a readable Spring teaching reference
+and a cautionary example of benchmark/documentation drift, not as a low-latency or production
+engine.
+
+## Part VI - Comparison with matchengine-raft
+
+| Dimension | AsthaMishra | Wire v9 | llc-993/matching-core | Apex | matchengine-raft |
+|---|---|---|---|---|---|
+| Topology | Single node | Single node, benchmark kernels | Single-node library + Disruptor pipeline | Single-node Spring Boot service | Raft-replicated cluster |
+| Durability | None | No WAL on matching path | WAL/snapshot attempt without fsync/atomicity | None (JPA/H2 dependencies unused) | Segmented WAL + atomic snapshots + recovery |
+| Symbol model | Multi-symbol sharded; single-book OUCH path | One flat book, 65k slots | Symbol-sharded routers; Direct book per symbol | Multi-symbol map, one fair lock per book | One symbol per process/cluster |
+| Book | Flat array + bitmap + `Vec` level | Flat array + linked-list levels | BTreeMap/Slab/AHashMap (Direct); BTreeMap/SmallVec (Advanced); SOA prototype unused | `TreeMap` + `ArrayDeque` + fair lock | `BTreeMap` price/sequence |
+| Price/quantity | Cents, `u32` | `u32` price index, `u32` shares | `i64` price/size | `BigDecimal` price, `long` quantity | 18-decimal `Fixed` `i128` |
+| Order types | Limit/Market/IOC/FOK | Single-fill primitive | Advertised many; exchange Direct only GTC/IOC/FokBudget | Limit/Market only | GTC/IOC/FOK/GTD/Day/market/post-only/iceberg/stop/market-to-limit/trailing/peg + STP |
+| User/STP | Cancel-resting STP | None in matcher | No STP; Advanced cancel ignores uid | User id on orders/trades; no STP or balances | `owner_id` + STP modes; fees/assets modeled |
+| Events | In-process stream; global trade id | One `MarketEvent` per fill | Trade/Reject/Reduce only | REST response + STOMP trade/depth; process-local ids | Replicated event window; deterministic ids |
+| Protocol | OUCH/ITCH + REST | No integrated order entry | Library only | HTTP JSON + STOMP/WebSocket | HTTP JSON + gRPC Raft |
+| Tests | Unit/proptest/fuzz (stale target) | Unit per kernel; no v9 integration | Tests present; no pipeline/consensus integration observed | 4 unit + 2 integration; benchmark not asserted | Unit/property/conformance/integration/restart/snapshot/fees |
+| Benchmarks | Criterion/ITCH/tail | Pinned-core microbenchmarks | AdvancedOrderBook TPS; estimated memory; flawed Criterion cases | 100k shallow sequential limits; docs claim 1.24M QPS | e2e/batch/feed/storage/P0 benchmarks |
+| FlashOne survey (Part IV) | 5.60 M/s, with fix; bounded-domain flat array | Not listed in the roster | 7.14 M/s, as shipped; new/cancel/modify ABI only | Not listed in the roster | 7.20 M/s, fastest B-tree; "with fix" at the old pin, fixed at `HEAD` |
 
 Our engine is stronger on semantics, durability, exactness and recovery. Astha is stronger on
 single-node hot-path layout, binary gateway work and measurement scope. Wire is stronger on
 low-level allocator/MPMC experiments and honest scope disclosure, but its v9 matching kernel is
 narrower than its name suggests. llc-993 is the broadest feature skeleton, but its advanced order
 types are not wired into the exchange, its WAL/snapshot is not crash-safe, and its benchmark numbers
-measure a separate `AdvancedOrderBook`, not the product pipeline.
+measure a separate `AdvancedOrderBook`, not the product pipeline. Apex is the clearest teaching
+implementation of the five and the easiest to read, but it is a Spring demo with no durability,
+risk, STP or production edge, and its docs claim concurrency and benchmark behaviour the code does
+not implement.
 
 On the FlashOne benchmark's matching-only ABI, our `BTreeMap` core is the fastest B-tree entry and
 within about 8% of the fastest Rust engine. That is a useful external validation of the price ladder
@@ -678,7 +887,7 @@ and the basic FIFO loop; it is not a validation of the replicated product path. 
 `Amend` would be wrong. Its "conforming" verdict is scoped to limit new/cancel/modify and IOC; it
 does not exercise FOK, stops, icebergs, fees, persistence or consensus.
 
-## Part VI - Consolidated takeaways
+## Part VII - Consolidated takeaways
 
 ### Adopt
 
@@ -686,7 +895,7 @@ does not exercise FOK, stops, icebergs, fees, persistence or consensus.
    closed-loop/timer notes and warm/cold p50/p99 reporting.
 2. **A pure order-book replay benchmark.** Done: `book_replay`, `replay_mix` and `level_book` keep
    Raft/HTTP out of the book-only numbers.
-3. **Fuzzing.** Done: `fuzz/` builds targets for the order book, WAL, snapshot and wire decoders;
+3. **Fuzzing.** Done: `match_engine/fuzz/` builds targets for the order book, WAL, snapshot and wire decoders;
    keep them buildable.
 4. **Worst-case scenario matrix (benchmark-derived).** Done:
    `cargo bench --bench book_replay -- --matrix` builds the four calibrated shapes, samples
@@ -712,7 +921,7 @@ does not exercise FOK, stops, icebergs, fees, persistence or consensus.
 ### Adapt / evaluate later
 
 - A treap, sorted-vector or heap-hybrid price ladder, only after a book-only A/B on our workloads.
-  Done for the sorted vector: `benches/sorted_book.rs` shows level-grouping wins but loses on
+  Done for the sorted vector: `match_engine/benches/sorted_book.rs` shows level-grouping wins but loses on
   price-move amend and BBO advancement, so it is not adopted. A tree/heap hybrid remains a
   book-only option only if a sparse-level fast path is measured; the external `lcv3` treap lead is
   not sufficient evidence on its own.
@@ -740,6 +949,21 @@ does not exercise FOK, stops, icebergs, fees, persistence or consensus.
 - **Do not ship an unintegrated optimized book.** If a book cannot serialize its state or is not
   reachable from the exchange, it is a prototype, not a production path.
 
+### Apex-specific takeaways
+
+- **Separate the demo from the engine story.** A small Spring service is a good way to demonstrate
+  order flow, but it is not evidence of exchange latency. Keep the demo tier, API adapter and
+  matching core clearly labelled in docs.
+- **Do not market a book-only microbenchmark as engine throughput.** The Apex benchmark times a
+  shallow, alternating limit-order loop with order construction outside the timer; it does not
+  include HTTP, STOMP, cancels, deep queues or GC. Our `book_replay`/`e2e` split is the right shape.
+- **Bound order and trade state.** `orderIndex` and `tradeHistory` grow forever. Real engines need
+  removal on fill/cancel and a retention policy for trade/event history.
+- **Keep the feed off the matching lock.** Full-depth broadcast after every mutation amplifies the
+  request path; a shadow book and asynchronous feed task are required for tail latency.
+- **Make planned work explicit.** The Apex `docs/` describe Loom, Disruptor, FlatBuffers and
+  lock-free maps that are not in `main`. Mark design notes as planned and link them to issues.
+
 ### Avoid
 
 - Calling a one-fill primitive a matching engine, or comparing its cycles to a full exchange stack.
@@ -753,6 +977,13 @@ does not exercise FOK, stops, icebergs, fees, persistence or consensus.
   worse for single-operation latency and removed it (their Optimization 7 -> 9).
 - Global process-local trade ids; our deterministic `(log_index, ordinal)` ids are required for
   replication and replay.
+- `BigDecimal` price keys, a fair `ReentrantLock` per book and `ArrayDeque.remove` on the matching
+  and cancel path; they are readable and slow.
+- Unbounded order/trade retention, plus full-depth broadcasts on the request thread.
+- Benchmarks that run as ordinary tests without assertions, or an empty-book microbenchmark
+  presented as exchange throughput.
+- Docs that describe Loom, Disruptor, FlatBuffers, lock-free maps or ZGC without the matching code,
+  dependency or JVM flags.
 - Copying a project's code or claims without a license/buildable test evidence. AsthaMishra and
   llc-993 have no license file; Wire's fuzz/README claims need verification.
 - Feature matrices that are only demonstrated through a separate book type, or benchmark numbers
@@ -819,6 +1050,34 @@ exact 18-decimal values, fees/assets and the existing property/conformance/integ
 - <https://github.com/wasif-exe/wire/blob/main/wire-exchange/src/simd_cancel.rs>
 - <https://github.com/wasif-exe/wire/blob/main/wire-alloc/src/lib.rs>
 - <https://github.com/wasif-exe/wire/blob/main/wire-mpmc/src/lib.rs>
+
+### ronitgupta138/Apex-Matching-Engine
+
+- <https://github.com/ronitgupta138/Apex-Matching-Engine>
+- <https://github.com/ronitgupta138/Apex-Matching-Engine/blob/main/README.md>
+- <https://github.com/ronitgupta138/Apex-Matching-Engine/blob/main/src/main/java/com/tradematching/engine/OrderBook.java>
+- <https://github.com/ronitgupta138/Apex-Matching-Engine/blob/main/src/main/java/com/tradematching/service/MatchingEngineService.java>
+- <https://github.com/ronitgupta138/Apex-Matching-Engine/blob/main/src/main/java/com/tradematching/model/Order.java>
+- <https://github.com/ronitgupta138/Apex-Matching-Engine/blob/main/src/main/java/com/tradematching/dto/OrderRequest.java>
+- <https://github.com/ronitgupta138/Apex-Matching-Engine/blob/main/src/main/java/com/tradematching/service/MarketBroadcaster.java>
+- <https://github.com/ronitgupta138/Apex-Matching-Engine/blob/main/src/main/java/com/tradematching/config/WebSocketConfig.java>
+- <https://github.com/ronitgupta138/Apex-Matching-Engine/blob/main/src/main/java/com/tradematching/simulator/MarketSimulationBot.java>
+- <https://github.com/ronitgupta138/Apex-Matching-Engine/blob/main/src/main/resources/application.yml>
+- <https://github.com/ronitgupta138/Apex-Matching-Engine/blob/main/src/test/java/com/tradematching/engine/OrderBookBenchmark.java>
+- <https://github.com/ronitgupta138/Apex-Matching-Engine/blob/main/src/test/java/com/tradematching/engine/OrderBookMatchingTest.java>
+- <https://github.com/ronitgupta138/Apex-Matching-Engine/blob/main/docs/benchmarks/Million_Order_Per_Second_Benchmark.md>
+- <https://github.com/ronitgupta138/Apex-Matching-Engine/blob/main/docs/benchmarks/Sub_Millisecond_Latency_Profile.md>
+- <https://github.com/ronitgupta138/Apex-Matching-Engine/blob/main/docs/benchmarks/Sub_Microsecond_Matching_Latency.md>
+- <https://github.com/ronitgupta138/Apex-Matching-Engine/blob/main/docs/benchmarks/Orders_Per_Second_Throughput.md>
+- <https://github.com/ronitgupta138/Apex-Matching-Engine/blob/main/docs/benchmarks/Worst_Case_Jitter_Distribution.md>
+- <https://github.com/ronitgupta138/Apex-Matching-Engine/blob/main/docs/orderbook/Order_Cancellation_Deterministic_Semantics.md>
+- <https://github.com/ronitgupta138/Apex-Matching-Engine/blob/main/docs/L2_Market_Depth_Loom_Concurrency.md>
+- <https://github.com/ronitgupta138/Apex-Matching-Engine/blob/main/docs/STOMP_WebSocket_Order_Stream.md>
+- <https://github.com/ronitgupta138/Apex-Matching-Engine/issues/1> (Disruptor evaluation)
+- <https://github.com/ronitgupta138/Apex-Matching-Engine/issues/2> (primitive order index)
+- <https://github.com/ronitgupta138/Apex-Matching-Engine/issues/3> (binary WebSocket feed)
+- <https://github.com/ronitgupta138/Apex-Matching-Engine/issues/4> (multi-threaded stress test)
+- <https://github.com/ronitgupta138/Apex-Matching-Engine/issues/5> (benchmark CI regression)
 
 ### flash1-dev/matching-engine-benchmark
 

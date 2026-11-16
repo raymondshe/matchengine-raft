@@ -16,7 +16,7 @@ mounted on the HTTP JSON listener:
 - `AppendStream` (bidirectional pipelined appends)
 - `TransferLeader` (graceful leadership handoff used by the console)
 
-See `proto/raft.proto`. Unary append/vote use `RPCOption::soft_ttl`, snapshots stream in
+See `match_engine/proto/raft.proto`. Unary append/vote use `RPCOption::soft_ttl`, snapshots stream in
 OpenRaft-configured chunks (3 MiB default, 8 MiB cap), and both message directions are capped at
 64 MiB. `Unavailable` maps to
 `RPCError::Unreachable`, timeouts to `RPCError::Timeout`, and other statuses to

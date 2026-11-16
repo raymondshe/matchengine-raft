@@ -1,5 +1,9 @@
 # Testing
 
+> Engine commands below run from `match_engine/` or with
+> `--manifest-path match_engine/Cargo.toml` from the repository root. The standalone projects have
+> their own manifests (`order_system/`, `market_data_system/`, `k8s_control_plane/`).
+
 ## Test suite
 
 `cargo test` builds one integration target (`tests/cluster`) plus unit tests in the library.
@@ -14,7 +18,7 @@
 | `tests/cluster/test_restart.rs` | Full node restart recovering the order book, sequence, event window and idempotency map via WAL replay and via snapshot + newer WAL tail; also 2k-order large-log replay and a multi-chunk (~120 KB) snapshot boot |
 | `tests/cluster/test_match_results.rs` | A node started with `--match-event-log` records rest/fill/cancel events in log order while the `/write` response stays unchanged; a second node checks stop triggers, GTD expiry and the new `/read` keys |
 | `tests/cluster/test_market_data.rs` | A node started with `--market-data-log` publishes a reset snapshot, one trade message per taker, BBO, post-entry depth totals and a closed OHLC bar; the assertions check `market_seq` anchors and `/read marketdata_status` counters |
-| `demos/market_data_system` | Stream parsing and payloads, WebSocket snapshots/conflation/combined streams/control errors, multiple symbols on one connection with live `UNSUBSCRIBE`/`SUBSCRIBE`, and an embedded-Aeron engine→service→WebSocket test (feature `aeron`) |
+| `market_data_system` | Stream parsing and payloads, WebSocket snapshots/conflation/combined streams/control errors, multiple symbols on one connection with live `UNSUBSCRIBE`/`SUBSCRIBE`, and an embedded-Aeron engine→service→WebSocket test (feature `aeron`) |
 | `tests/cluster/test_events.rs` | `/write` returns events, `/events` pages by cursor, `client_order_id` retries do not duplicate an order, `--max-events` eviction is visible in `/events/status`, long-poll wakes on a racing write or returns an empty page at the deadline, gRPC `StreamEvents` streams a fill and an idle heartbeat, and the bridge sidecar publishes events and checkpoints its cursor |
 | `tests/cluster/test_membership.rs` | Kill the elected leader: a surviving voter takes over with the committed book and accepts new writes. A learner added after the writes catches up through normal log replication, is promoted, and writes through its own node |
 | `tests/cluster/test_late_join.rs` | A node with a stale snapshot/WAL is removed, misses 40 writes while the leader snapshots and purges, then rejoins as a learner and catches up from the live cluster |
@@ -29,15 +33,15 @@
 | `tests/cluster/test_feature_matrix.rs` | Sends one order of every advertised type through `/write` and asserts the returned event kinds; follows rest → amend → partial fill → cancel and expiry/stop lifecycles, proving accepted actions emit explicit events rather than rejections; checks malformed bodies and unknown read keys |
 | `tests/cluster/test_client.rs` | Typed no-leader and HTTP edge errors, retry/backoff after a dropped connection, and forwarding to the new leader after failover |
 | `tests/cluster/test_failure.rs` | Fail-stop when the Raft core stops, injected WAL `ENOSPC`/`EIO`, SIGKILL during a write stream and SIGKILL during a learner snapshot install; the SIGKILL cases spawn the real binary |
-| `tests/replay/*/run.sh` | Shell-driven replay matrix for GTC, IOC, FOK, GTD, Day, market, post-only, iceberg, stop-market, stop-limit, amend, cancel, maker/taker fee, quote-fee and fee-overflow scenarios; each case compares the generated event sequence against its checked-in `expected-events.jsonl` |
-| `fuzz/` | `cargo-fuzz` targets for `OrderBook::execute_order`, WAL byte decoding, snapshot byte/content decoding and market-data wire decoding; the nightly scheduled workflow builds all four and runs a smoke pass |
+| `match_engine/tests/replay/*/run.sh` | Shell-driven replay matrix for GTC, IOC, FOK, GTD, Day, market, post-only, iceberg, stop-market, stop-limit, amend, cancel, maker/taker fee, quote-fee and fee-overflow scenarios; each case compares the generated event sequence against its checked-in `expected-events.jsonl` |
+| `match_engine/fuzz/` | `cargo-fuzz` targets for `OrderBook::execute_order`, WAL byte decoding, snapshot byte/content decoding and market-data wire decoding; the nightly scheduled workflow builds all four and runs a smoke pass |
 
 The replay cases are not part of `cargo test`; run the whole matrix with
-`./tests/replay/run-all.sh`, or one case with `./tests/replay/<case>/run.sh`. They use HTTP ports
+`./match_engine/tests/replay/run-all.sh`, or one case with `./match_engine/tests/replay/<case>/run.sh`. They use HTTP ports
 `24211-24226` (gRPC `25211-25226`), one per case, and compare the generated match-event JSONL with
-the checked-in reference. See `tests/replay/README.md` for the case matrix and regeneration steps.
+the checked-in reference. See `match_engine/tests/replay/README.md` for the case matrix and regeneration steps.
 
-The fuzz targets are a separate nightly-only crate; see `fuzz/README.md` and
+The fuzz targets are a separate nightly-only crate; see `match_engine/fuzz/README.md` and
 `.github/workflows/fuzz.yml`.
 
 Every integration test uses a unique temporary data directory and a unique checked-in base port.
@@ -78,10 +82,10 @@ cargo run --release --example replay_orders_events -- \
   --events-limit 100
 ```
 
-Run the whole replay matrix through the API source with `./tests/replay/run-all.sh events`.
+Run the whole replay matrix through the API source with `./match_engine/tests/replay/run-all.sh events`.
 
-Checked-in cases live under `tests/replay/`: one directory per order type or lifecycle
+Checked-in cases live under `match_engine/tests/replay/`: one directory per order type or lifecycle
 operation, each with `orders.jsonl`, `expected-events.jsonl`, `run.sh` and a scenario README. The
 matrix covers GTC, IOC, FOK, GTD, Day, market, post-only, iceberg, stop-market, stop-limit, amend,
 cancel, maker/taker fee deduction, quote-asset fees and fee overflow. Run everything with
-`./tests/replay/run-all.sh`, or one case with `./tests/replay/<case>/run.sh`.
+`./match_engine/tests/replay/run-all.sh`, or one case with `./match_engine/tests/replay/<case>/run.sh`.

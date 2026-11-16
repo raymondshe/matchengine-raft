@@ -266,7 +266,7 @@ step 8.
 - No new market-data fields are required: `LifecycleRecord` already carries the event kind,
   sequence, price/volume, fees and optional reason. The new order-type fields live in the Raft log
   and snapshot, not in the market-data records.
-- Update the strict reference decoder, golden round-trip tests, `demos/market_data_system` and the
+- Update the strict reference decoder, golden round-trip tests, `market_data_system` and the
   wire-version test. Old consumers must be upgraded with the engine; the stream is version-gated.
 
 ### 6.3 API

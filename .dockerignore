@@ -1,9 +1,0 @@
-# Build context for the Linux container image.
-# Keep the macOS target tree, VCS metadata and standalone demo/fuzz crates out.
-target
-.git
-logs
-demos
-fuzz
-*.log
-.archify

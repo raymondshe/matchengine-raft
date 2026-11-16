@@ -404,7 +404,7 @@ The P1 quick wins were validated with:
 - `cargo test` — 55 cluster/integration tests passed;
 - `test_health`, `test_snapshot`, `test_late_join`, `test_cluster` — passed with the new
   readiness gate and heartbeat configuration;
-- `cargo test --manifest-path demos/market_data_system/Cargo.toml` — 6 WebSocket tests passed;
+- `cargo test --manifest-path market_data_system/Cargo.toml` — 6 WebSocket tests passed;
 - `cargo clippy --all-targets -- -D warnings` — clean;
 - `cargo fmt --all -- --check` — clean.
 

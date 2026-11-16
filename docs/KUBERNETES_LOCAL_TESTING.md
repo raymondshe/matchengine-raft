@@ -74,10 +74,10 @@ Build the engine image once. OrbStack Kubernetes can use it directly; k3d needs 
 import.
 
 ```sh
-docker build -f docker/linux.Dockerfile -t matchengine-raft:k8s .
+docker build -f match_engine/docker/linux.Dockerfile -t matchengine-raft:k8s match_engine
 ```
 
-The lab image runs as **root** (there is no `USER` in `docker/linux.Dockerfile`). For a test that
+The lab image runs as **root** (there is no `USER` in `match_engine/docker/linux.Dockerfile`). For a test that
 matches the production security context, build a small non-root wrapper and use it in the
 manifests:
 

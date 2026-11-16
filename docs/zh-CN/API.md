@@ -15,7 +15,7 @@ Raft 节点间 RPC 仅由 `--http-addr` 端口 + 1000 上的 gRPC 提供；HTTP 
 - `AppendStream`（双向流水线追加）
 - `TransferLeader`（控制台使用的优雅领导者交接）
 
-定义见 `proto/raft.proto`。一元 append/vote 使用 `RPCOption::soft_ttl`，快照按 OpenRaft
+定义见 `match_engine/proto/raft.proto`。一元 append/vote 使用 `RPCOption::soft_ttl`，快照按 OpenRaft
 配置的分块大小传输（默认 3 MiB，上限 8 MiB），双向消息上限均为 64 MiB；`Unavailable` 映射为
 `RPCError::Unreachable`，超时映射为
 `RPCError::Timeout`，其他状态映射为 `RPCError::Network`。

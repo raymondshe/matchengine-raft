@@ -43,8 +43,8 @@ fi
 mkdir -p "$DATA_DIR" "$EUR_AERON_DIR" "$BTC_AERON_DIR"
 
 # rusteron is feature-gated; the first build downloads precompiled static libs.
-cargo build --features market-data-aeron
-cargo build --manifest-path demos/market_data_system/Cargo.toml --features aeron
+cargo build --manifest-path match_engine/Cargo.toml --features market-data-aeron
+cargo build --manifest-path market_data_system/Cargo.toml --features aeron
 
 start_engine() {
     id=$1
@@ -52,7 +52,7 @@ start_engine() {
     name=$3
     aeron_dir=$4
     echo "Starting $name engine on $addr (Aeron IPC, snapshots every 5s)"
-    ./target/debug/matchengine-raft \
+    ./match_engine/target/debug/matchengine-raft \
         --id "$id" \
         --http-addr "$addr" \
         --data-dir "$DATA_DIR/engine-$name" \
@@ -117,7 +117,7 @@ configure_symbol "$BTC_ADDR" "BTC/USDT" \
     '{"ConfigureSymbol":{"config":{"symbol_id":1,"base_asset":{"code":"BTC","class":"crypto","decimals":8},"quote_asset":{"code":"USDT","class":"stablecoin","decimals":2},"price_decimals":2,"price_tick":"0.01","base_lot":"0.00000001","fee_asset_policy":"received"}}}'
 
 echo "Starting market-data system on $DEMO_ADDR"
-./demos/market_data_system/target/debug/matchengine-marketdata \
+./market_data_system/target/debug/matchengine-marketdata \
     --addr "$DEMO_ADDR" \
     --aeron-channel "aeron:ipc" \
     --aeron-channel "aeron:ipc" \

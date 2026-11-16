@@ -1,5 +1,9 @@
 # Performance measurements
 
+> Engine benchmark commands below run from `match_engine/` or with
+> `--manifest-path match_engine/Cargo.toml` from the repository root. Standalone-project benchmarks
+> use their own manifests.
+
 Measured on **2026-10-30** (runtime flavor A/B and P0 offloads: **2026-10-31**; measurement scope and RSS: **2026-11-01**; book p50/p99 and the pinned-core approximation: **2026-11-04**; end-to-end/storage rerun with the OpenRaft quick wins: **2026-11-06**; realistic-mix replay: **2026-11-06**; dedicated Raft runtime: **2026-11-06**; WAL fsync Tokio rerun: **2026-11-07**; four-node no-fsync cluster: **2026-11-07**; write concurrency/batching sweep: **2026-11-08**; async WAL prototype: **2026-11-08**; production configuration decisions: **2026-11-08**; write admission control: **2026-11-09**; pre-connected write concurrency: **2026-11-09**; sustained single-node CPU profile: **2026-11-09**; benchmark regression gate: **2026-11-09**; read-path benchmark: **2026-11-08**; OpenRaft minimal-benchmark comparison: **2026-11-08**; WebSocket fan-out: **2026-11-10**; open-loop e2e, current-HEAD book re-pin and sorted-vector A/B: **2026-11-10**; apply-path inline buffers, affinity A/B and per-level rerun: **2026-11-10**; local lease-read experiment and dependency upgrade: **2026-11-10**; follower-read linearizer hop: **2026-11-11**; Linux container pinned pass: **2026-11-11**) on the reference development machine:
 
 - Apple M4 (`arm64`)
@@ -23,7 +27,7 @@ cargo bench --bench cluster_e2e -- --rounds 2 --concurrency-only  # 1/8/64/256/1
 cargo bench --bench cluster_e2e -- --rounds 4 --concurrency-only --clients 256,512,1024,2048 --max-inflight-writes 1024 --preconnect  # pre-connected admission sweep
 cargo bench --bench read_e2e -- --policy both  # local /read, /linearizable_read, follower /follower_read and /events; ReadIndex vs local_lease (or --policy local_lease)
 cargo bench --bench feed_load     # market-data feed at 50k/500k fills/s
-cargo bench --manifest-path demos/market_data_system/Cargo.toml --bench ws_fanout -- --clients 64 --updates 10000 --rate 20000  # WebSocket fan-out
+cargo bench --manifest-path market_data_system/Cargo.toml --bench ws_fanout -- --clients 64 --updates 10000 --rate 20000  # WebSocket fan-out
 cargo bench --bench storage       # WAL append/read/recovery
 RAFT_WAL_FSYNC_MS=0 MATCHENGINE_ASYNC_WAL=1 cargo bench --features async-wal --bench storage  # prototype async WAL
 cargo bench --bench p0_bench -- duplicate|read|snapshot  # P0 lock/scan A/B
@@ -74,7 +78,7 @@ Loopback HTTP and local disk are part of the measured path where stated. Run-to-
 not a confidence interval; the e2e runtime A/B uses four alternating runs, and the four-node
 cluster section reports three fresh rounds.
 
-The book benches share `benches/bench_support`: each round clones the state before
+The book benches share `match_engine/benches/bench_support`: each round clones the state before
 `Instant::now()` and drops the mutated state after the duration is recorded, so setup and teardown
 are outside the timer. "Warm" means the clone immediately precedes the timed operation; "cold"
 means a 64 MiB read-modify-write sweep runs between the clone and the timed operation. Warm and
@@ -311,7 +315,7 @@ workflow. A third-party re-pin is the benchmark maintainer's call.
 
 ## Realistic-mix replay benchmark (2026-11-06)
 
-`cargo bench --bench replay_mix` is the load analogue of `tests/replay`: it replays a deterministic
+`cargo bench --bench replay_mix` is the load analogue of `match_engine/tests/replay`: it replays a deterministic
 100,000-operation fixture through `OrderBook` directly (no HTTP, Raft, WAL, snapshot or
 market-data feed) and reports whole-replay percentiles plus per-operation p50/p99/max by operation
 kind. The fixture is generated at startup from a fixed-seed LCG rather than checked in, so the
@@ -1087,7 +1091,7 @@ not APFS; this is a Linux-kernel check, not a bare-metal disk baseline.
 
 The Linux `apply_path --check` initially failed the blank row with 3 calls / 4,143 bytes: a
 one-time runtime/lock initialization attributed to the first entry after the counter reset.
-`benches/apply_path.rs` now warms up 64 blank entries before reset; blank is 0 calls on Linux and
+`match_engine/benches/apply_path.rs` now warms up 64 blank entries before reset; blank is 0 calls on Linux and
 the other rows match the macOS ceilings (rest 3.17, cancel 3.00, fill 4.00, batch blank 1.02,
 batch rest 3.19 allocs/entry).
 
@@ -1142,7 +1146,7 @@ runs on the off-thread processor and does not touch `apply`.
 
 ## WebSocket fan-out (2026-11-10)
 
-`cargo bench --manifest-path demos/market_data_system/Cargo.toml --bench ws_fanout --
+`cargo bench --manifest-path market_data_system/Cargo.toml --bench ws_fanout --
 --clients N --updates M --rate R` starts the reference service on a channel source,
 connects N loopback WebSocket clients to `@bookTicker`, and publishes M BBO updates at R/s.
 The hub serializes each payload once and fans the same `Bytes` out to every connection.
@@ -1645,7 +1649,7 @@ The measurement rules transferred regardless of layout and are now implemented:
 
 - **Warm and cold are separate, and setup/drop are outside the timed window.** Their `iter_custom`
   lesson - dropping a 100,000-slot book inside the timer produced ~960 µs uniformly at every depth -
-  is enforced by `benches/bench_support`: clone before `Instant::now()`, drop after the duration is
+  is enforced by `match_engine/benches/bench_support`: clone before `Instant::now()`, drop after the duration is
   recorded, and a 64 MiB eviction sweep between clone and op for the cold rows. The tables label
   warm and cold separately.
 - **Percentiles, not just best-of-5.** `book_replay` and `level_book` report warm p50/p99 over every
@@ -1655,7 +1659,7 @@ The measurement rules transferred regardless of layout and are now implemented:
   production-like signal because it carries a real add/cancel/modify mix. `cargo bench --bench
   replay_mix` replays a deterministic 100,000-operation add/cancel/amend/stop/iceberg/taker
   fixture with fees and reports warm/cold whole-replay percentiles plus per-operation p50/p99;
-  see the realistic-mix section above. `tests/replay` remains correctness-only.
+  see the realistic-mix section above. `match_engine/tests/replay` remains correctness-only.
 - **Scheduler noise is now measurable.** `cargo bench --bench e2e -- --pin <cpu>` pins the process on
   Linux; on this macOS host the current-thread run was the closest approximation and showed no
   change (see "Pinned-core pass"). The 2026-11-11 OrbStack container run added the Linux pinning

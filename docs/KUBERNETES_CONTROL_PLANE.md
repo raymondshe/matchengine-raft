@@ -2,7 +2,7 @@
 
 Status: **reference implementation** — the manager API/GUI, CRD-backed desired state, validator,
 renderer and Lease-elected cell operator live in
-[`demos/k8s_control_plane/`](../demos/k8s_control_plane/README.md). Residual hardening is live
+[`k8s_control_plane/`](../k8s_control_plane/README.md). Residual hardening is live
 cgroup-delegation validation and production manager security; supervisor cgroups/log rotation,
 PVC retention and cross-shard cutover/rollback are implemented.
 Last updated: 2026-11-15.
@@ -530,7 +530,7 @@ Notes:
 - The liveness probe must not be `/ready`: a follower in a healthy cluster is ready, but a leader
   election or a bootstrap can make `/ready` fail temporarily; restarting pods during an election
   makes it worse.
-- The container runs as UID/GID `10001`, not root. The lab image in `docker/linux.Dockerfile`
+- The container runs as UID/GID `10001`, not root. The lab image in `match_engine/docker/linux.Dockerfile`
   runs as root, so build a separate non-root image for Kubernetes (create the user, `chown` the
   data mount, `USER 10001`); `fsGroup` makes the PVC writable. If the image cannot be changed yet,
   omit `runAsNonRoot`/`runAsUser` for a test only and treat it as a blocker for production.
@@ -1526,7 +1526,7 @@ Details:
   a dedicated restore/import tool exists, treat logical snapshots as data exports, not as a
   one-step restore.
 - If a logical restore is required, the supported direction is to replay the deterministic order
-  input into a new cluster (the replay examples in `tests/replay/` and `examples/replay_orders`)
+  input into a new cluster (the replay examples in `match_engine/tests/replay/` and `match_engine/examples/replay_orders`)
   and verify the resulting book/events, or to add a restore tool as an engine change (§13).
 - Test restores monthly; record the result in `Backup.status` and alert when it is stale.
 
@@ -2082,7 +2082,7 @@ operation queue, audit. Canary in staging.
 **Phase 6 — multi-cell and scale (ongoing).** Cell placement, 100+ shard load test, Prometheus
 sharding, chaos (node/zone loss, noisy neighbour), DR game day, GitOps.
 
-**Reference implementation.** [`demos/k8s_control_plane/`](../demos/k8s_control_plane/README.md)
+**Reference implementation.** [`k8s_control_plane/`](../k8s_control_plane/README.md)
 implements the phase 1 renderer, the phase 2 bootstrap/membership/upgrade decisions (as a
 reviewable plan rather than a controller), a read/write manager API/GUI, a CRD-backed store and a
 Lease-elected cell operator that bootstraps its cache from list/watch, server-side-applies/prunes
@@ -2199,7 +2199,7 @@ deploy/
   helm/match-engine-manager/      # manager API, GUI, Postgres, OIDC
   crds/                           # TradingSymbol, SymbolDeployment, SymbolRoute, SymbolShard,
                                   # Cell, ClusterTemplate, Backup, Operation
-  examples/
+  k8s_control_plane/examples/
     dedicated-shard/              # one symbol, four pods
     packed-containers/            # N containers per pod, one symbol each
     packed-supervisor/            # supervisor spawns N processes per pod

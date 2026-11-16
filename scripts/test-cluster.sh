@@ -10,6 +10,7 @@ set -eu
 
 # Always run from the repository root.
 cd "$(dirname "$0")/.."
+ROOT=$(pwd)
 
 ACTION=start
 NODES=4
@@ -50,8 +51,8 @@ Options:
                          The default directory is wiped on start; an explicit
                          directory is kept unless --fresh is passed.
   -l, --log-dir DIR      Per-node log directory (default logs).
-  -b, --binary PATH      Binary to run (default target/debug/matchengine-raft).
-      --release          Build/run target/release/matchengine-raft.
+  -b, --binary PATH      Binary to run (default match_engine/target/debug/matchengine-raft).
+      --release          Build/run match_engine/target/release/matchengine-raft.
       --build            Run cargo build before starting (default).
       --no-build         Use an existing binary.
       --fresh            Wipe --data-dir before starting.
@@ -215,9 +216,9 @@ esac
 
 if [ -z "$BINARY" ]; then
     if [ "$RELEASE" -eq 1 ]; then
-        BINARY=./target/release/matchengine-raft
+        BINARY=./match_engine/target/release/matchengine-raft
     else
-        BINARY=./target/debug/matchengine-raft
+        BINARY=./match_engine/target/debug/matchengine-raft
     fi
 fi
 
@@ -474,9 +475,9 @@ esac
 
 if [ "$BUILD" -eq 1 ]; then
     if [ "$RELEASE" -eq 1 ]; then
-        cargo build --release
+        cargo build --manifest-path "$ROOT/match_engine/Cargo.toml" --release
     else
-        cargo build
+        cargo build --manifest-path "$ROOT/match_engine/Cargo.toml"
     fi
 fi
 [ -x "$BINARY" ] || die "binary not found or not executable: $BINARY (run without --no-build)"

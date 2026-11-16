@@ -632,7 +632,7 @@ Example freeze requirements (ignoring buffers and rounding):
 | Linear perp, 1 BTC at 50,000 USDT, 10x | `Quote` | 5,000 USDT margin + fee + buffer |
 | Inverse perp, fee in BTC, 10x | `Base` | BTC margin + BTC fee + buffer |
 
-The standalone demo order desk (`demos/order_system/src/freeze.rs`) implements a labelled **demo estimate** of the
+The standalone demo order desk (`order_system/src/freeze.rs`) implements a labelled **demo estimate** of the
 cash/spot rows above and of the **linear quote-margined perpetual** row: it derives the freeze,
 maker/taker settlement legs and, for a perpetual ticket, the leverage, position side, notional,
 initial margin and quote fee from the replicated `SymbolConfig`, the order fields and the fee rates.
@@ -757,7 +757,7 @@ Examples:
   `0.002` of the matched volume).
 - Under the default `Received` policy the buyer taker pays in base and the seller maker in quote.
   The same overflowing fill reports `error = ["notional_overflow", "maker_fee_overflow"]` with an
-  exact `taker_fee` and an unavailable `maker_fee`. `tests/replay/fee_overflow_base_orders/` pins
+  exact `taker_fee` and an unavailable `maker_fee`. `match_engine/tests/replay/fee_overflow_base_orders/` pins
   this shape.
 
 `MatchErrors` is a copyable bitmask internally, one `u8` in the snapshot and on the wire, and a

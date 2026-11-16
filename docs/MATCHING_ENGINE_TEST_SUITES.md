@@ -1,5 +1,8 @@
 # Public matching-engine test suites: inventory and port backlog
 
+> Engine commands below run from `match_engine/` or with
+> `--manifest-path match_engine/Cargo.toml` from the repository root.
+
 Date: 2026-11-10 · Baseline: `master` at the schema-v11 order-type batch
 
 This document records the public matching-engine test suites reviewed for this
@@ -105,7 +108,7 @@ After the batches in section 5:
 |---|---:|---|
 | `src/` unit tests | 219 | Order-book algorithms, fees, property traces, protocol/storage units, heartbeat/request codecs |
 | `tests/cluster/` integration tests | 72 | Raft, HTTP/gRPC, persistence, events, failover, market data, provisioning |
-| `tests/replay/` cases | 16 | End-to-end order-type lifecycles against checked-in expected events |
+| `match_engine/tests/replay/` cases | 16 | End-to-end order-type lifecycles against checked-in expected events |
 | `src/order_book/conformance_tests.rs` | 35 | Explicit edge cases the randomized suite should not have to rediscover |
 
 The replay matrix already covers limit, market, IOC, FOK, GTD, Day, post-only,
@@ -340,7 +343,7 @@ count for this repository is reproducible with:
 ```sh
 cargo test --lib -- --list | tail -1
 cargo test --test cluster -- --list | tail -1
-ls -d tests/replay/*/ | wc -l
+ls -d match_engine/tests/replay/*/ | wc -l
 ```
 
 The first two lines report the number of unit and cluster tests; the third

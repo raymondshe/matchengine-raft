@@ -8,7 +8,7 @@
             "type": "lldb",
             "request": "launch",
             "name": "matchengine-raft",
-            "program": "${workspaceFolder}/target/debug/matchengine-raft",
+            "program": "${workspaceFolder}/match_engine/target/debug/matchengine-raft",
             "args": ["--id", "1", "--http-addr", "127.0.0.1:21001" ],
             "cwd": "${workspaceFolder}",
             "env": {
@@ -23,6 +23,7 @@
             "cargo": {
                 "args": [
                     "test",
+                    "--manifest-path", "match_engine/Cargo.toml",
                     "--no-run",
                     "--lib",
                     "--package=matchengine-raft"
@@ -42,6 +43,7 @@
             "cargo": {
                 "args": [
                     "build",
+                    "--manifest-path", "match_engine/Cargo.toml",
                     "--bin=matchengine-raft",
                     "--package=matchengine-raft"
                 ],
@@ -60,6 +62,7 @@
             "cargo": {
                 "args": [
                     "test",
+                    "--manifest-path", "match_engine/Cargo.toml",
                     "--no-run",
                     "--bin=matchengine-raft",
                     "--package=matchengine-raft"
@@ -79,6 +82,7 @@
             "cargo": {
                 "args": [
                     "test",
+                    "--manifest-path", "match_engine/Cargo.toml",
                     "--no-run",
                     "--test=cluster",
                     "--package=matchengine-raft"

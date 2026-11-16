@@ -93,7 +93,7 @@ Notes:
     kernels. Use OrbStack machines, Lima or Apple container for per-node kernels.
   * Build the Linux binary in the container; the macOS target/debug binary is
     Mach-O and cannot run in these containers.
-  * The image is built from docker/linux.Dockerfile. The repository is mounted
+  * The image is built from match_engine/docker/linux.Dockerfile. The repository is mounted
     at /src for `cargo` commands, with cargo registry/target in named volumes.
   * An explicit --fsync also passes RAFT_WAL_FSYNC_MS=0 into a `cargo` container.
 EOF
@@ -277,9 +277,9 @@ build_runtime_image() {
         return 0
     fi
     if [ "$BUILD" = always ] || ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
-        echo "building $IMAGE from docker/linux.Dockerfile"
+        echo "building $IMAGE from match_engine/docker/linux.Dockerfile"
         DOCKER_BUILDKIT=${DOCKER_BUILDKIT:-1} \
-            docker build -f docker/linux.Dockerfile -t "$IMAGE" .
+            docker build -f match_engine/docker/linux.Dockerfile -t "$IMAGE" match_engine
     fi
 }
 
@@ -290,9 +290,9 @@ build_builder_image() {
         return 0
     fi
     if [ "$BUILD" = always ] || ! docker image inspect "$BUILDER_IMAGE" >/dev/null 2>&1; then
-        echo "building $BUILDER_IMAGE from docker/linux.Dockerfile"
+        echo "building $BUILDER_IMAGE from match_engine/docker/linux.Dockerfile"
         DOCKER_BUILDKIT=${DOCKER_BUILDKIT:-1} \
-            docker build -f docker/linux.Dockerfile --target toolchain -t "$BUILDER_IMAGE" .
+            docker build -f match_engine/docker/linux.Dockerfile --target toolchain -t "$BUILDER_IMAGE" match_engine
     fi
 }
 
@@ -586,7 +586,7 @@ run_cargo() {
         -v matchengine-raft-cargo-registry:/usr/local/cargo/registry \
         -v matchengine-raft-cargo-target:/target \
         -e CARGO_TARGET_DIR=/target \
-        -w /src \
+        -w /src/match_engine \
         "$BUILDER_IMAGE" cargo "$@"
 }
 
