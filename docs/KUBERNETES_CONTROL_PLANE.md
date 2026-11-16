@@ -161,9 +161,17 @@ metrics endpoint or bridge exists) PodMonitors. The operator is also the compone
 `ConfigureSymbol` write. It uses a Kubernetes `Lease` so only one replica reconciles at a time; the
 reference implementation performs Lease election, CRD watches, server-side apply/prune, leader
 labels, status/route conditions, bootstrap/config/membership execution, quorum-safe
-containers-mode add/start/stop rolls, PVC retention and cross-shard cutover/rollback. Per-child
+containers-mode add/start/stop rolls, supervisor image/resource rolls, PVC retention and
+cross-shard cutover/rollback. Per-child
 cgroups and rotating logs are opt-in supervisor features; cgroups fail open when the pod cannot
-delegate a cgroup v2 subtree.
+delegate a cgroup v2 subtree. Every rendered pod records its applied wire/snapshot versions as
+annotations; before a containers image change the operator compares that release with
+`SymbolShard.spec.release` and blocks the rollout with
+`status.releaseBlock`/`ReleaseCompatible=False` when a one-pod-at-a-time roll would mix
+incompatible peers. Same-version rolls and targets marked `mixedVersionSafe` proceed normally.
+Before applying a StatefulSet it also computes the rendered per-pod and aggregate requests against
+node allocatable minus other workloads; a pod that cannot fit is skipped and recorded in
+`status.capacityBlock`/`CapacityAvailable=False` instead of creating Pending pods.
 
 **Manager API + GUI.** The global configuration manager. Desired state lives in the catalog CRDs
 (`TradingSymbol`, `SymbolShard`, `SymbolDeployment`, `SymbolRoute`, `Cell`) and is persisted by the
@@ -1289,7 +1297,7 @@ spec:
   configHash: "sha256:..."
   desiredState: Active       # Active | Shadow | Draining | Disabled
 status:
-  phase: Ready               # Pending | Bootstrapped | Ready | Degraded | Failed
+  phase: Ready               # Pending | Bootstrapped | Ready | Progressing | Degraded | Failed
   leaderPod: fx-eu-01-0
   leaderAddr: fx-eu-01-0.fx-eu-01-headless.match-eu-1.svc.cluster.local:21001
   ready: true
@@ -1666,12 +1674,13 @@ pod and HTTP port.
 ### 8.1 Backend
 
 Recommendation: **Rust + Axum** (same language as the engine), **kube-rs** for the Kubernetes API,
-**CRDs for desired state** (etcd persisted by the API server), **sqlx + Postgres** for
+**CRDs for desired state** (etcd persisted by the API server), **optional sqlx + Postgres** for
 approvals/audit/operations and read models, **OpenAPI** for the typed client, and **SSE/WebSocket**
 for live status. Deploy 2–3 replicas behind a Service; writes use a PostgreSQL advisory lock or a
 Kubernetes `Lease` so only one replica performs a mutation at a time. Reads can be served by all.
-Never open an etcd client and never put engine WAL/snapshot, order-book, match-event or market-data
-payloads in etcd.
+Postgres is not required: the live reference manager runs with no database and keeps audit in
+memory. Never open an etcd client and never put engine WAL/snapshot, order-book, match-event or
+market-data payloads in etcd.
 
 The manager does not proxy trading traffic. It is a control plane only.
 

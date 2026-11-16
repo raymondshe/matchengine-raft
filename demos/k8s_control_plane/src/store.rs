@@ -1,8 +1,9 @@
 //! In-memory catalog with optional JSON persistence.
 //!
-//! Production uses Postgres for the global catalog and Kubernetes CRs as the desired-state
-//! contract (see the design doc §8). The demo keeps one JSON document so it can restart without
-//! a database while preserving the same object model.
+//! The live deployment keeps desired state in the `matching.io/v1` CRDs (etcd via the Kubernetes
+//! API server). Postgres is optional for audit/approval history and read models; it is not a
+//! second copy of desired state. The demo keeps one JSON document so it can restart without a
+//! database while preserving the same object model.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

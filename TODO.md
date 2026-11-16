@@ -1,6 +1,6 @@
 # TODO
 
-Last reviewed: 2026-11-14. This is the working roadmap; see `AGENTS.md` for commands and the
+Last reviewed: 2026-11-16. This is the working roadmap; see `AGENTS.md` for commands and the
 current branch state.
 
 **Current baseline:** the OpenRaft 0.10 port, durable WAL/snapshot storage and exact scale-18
@@ -27,76 +27,94 @@ shards, create-symbol/migrate planning, a zero-impact supervisor pod agent, and 
 restart guard. The reference manager has both a JSON demo store and a CRD-backed desired-state
 store that writes through the Kubernetes API server (etcd underneath). The Lease-elected operator
 also executes bootstrap/config/membership, quorum-safe containers rolls, PVC retention and
-cross-shard cutover/rollback; production manager security and live cgroup-delegation validation
-remain.
+cross-shard cutover/rollback. The `match-eu-1` reference fleet is adopted into CRD/operator
+management with digest-pinned images, a live GUI, rollout percentages and zero validation warnings.
+Production manager security, operator-driven supervisor rolls, capacity preflight and live
+cgroup-delegation validation remain.
 
 Priority key: **P0** = known correctness/security defect, do next; **P1** = correctness coverage,
 measurement and production readiness; **P2** = important but not blocking; **P3** = later/optional.
 
 ## Top priorities
 
-Last prioritised 2026-11-15, after the operator lifecycle validation on OrbStack. There are no
-known P0 or P1 defects. The local-lease semantic risk is covered by the delivery contract: client
-retries are at-least-once and use `client_order_id` for replicated dedupe, while downstream event
-readers resume from `(log_index, ordinal)` and dedupe on `event_id`. A local-lease cache hit may
-overtake an unfinished write, so read-after-write is not a guarantee; clients that need it must
-await the write response.
+Last prioritised 2026-11-15, after the live `match-eu-1` adoption, digest-pinned image rollout,
+control-plane GUI live refresh/rollout progress, reconcile-plan fixes, etcd storage documentation
+and the standalone control-plane CI job. There are no known P0 defects; the P1 item is the
+capacity/scheduling preflight below. The local-lease semantic risk stays covered by the delivery
+contract: client retries are at-least-once and use `client_order_id` for replicated dedupe, while
+downstream event readers resume from `(log_index, ordinal)` and dedupe on `event_id`. A local-lease
+cache hit may overtake an unfinished write, so read-after-write is not a guarantee; clients that
+need it must await the write response.
 
-The Kubernetes control plane is a new feature workstream, not a defect (§18). The full reference
-lifecycle is implemented: bootstrap/config/membership, containers add/start/stop rolls, opt-in
-per-child cgroups/log rotation, PVC retention and cross-shard cutover/rollback. Residual evidence
-gaps are the second-host and Linux cgroup-delegation checks below.
+**P1 - control-plane safety gaps**
 
-**P1 - CI wiring only.** The control-plane lifecycle is complete; wire the standalone
-`demos/k8s_control_plane` crate into CI (fmt, Clippy and tests).
+None open. Capacity and scheduling preflight is implemented: the operator sums rendered per-pod and
+aggregate requests, subtracts the shard's own current pods, compares against node allocatable, and
+records `status.capacityBlock`/`CapacityAvailable=False` instead of leaving the StatefulSet apply to
+create Pending pods.
 
-The remaining P2 evidence gaps are second-host behaviour, not code paths: the four OrbStack
-containers share one kernel, host and clock, and the Aeron multicast run is loopback within one
-network namespace. The pinned-core `e2e` container run is done; only the bare-metal workflow
-dispatch remains.
+**P2 - production readiness, in impact order**
 
-**P2 - evidence and operational follow-ups**
-
-1. **Validate on a second Linux host (§16 and §6).** One second-host lab should cover both
-   remaining production-topology gaps:
-   - default `local_lease`: rerun the read/write A/B, force a stale lease so the `ReadIndex`
-     fallback and `/read-policy/status` counters are observed under bounded clock skew, and keep
-     the at-least-once/idempotent consumer contract intact;
-   - Aeron multicast across a real multi-host fabric with independent service instances and a
-     non-loopback NIC, rather than the current single-host `lo` validation.
-2. **Dispatch the Linux bare-metal pinned-core `e2e` workflow (§8).** The OrbStack container run
-   already covers the pinned short check in both fsync modes; this is the last pinned-host row.
-   Low effort when a Linux runner is available.
-3. **Keep docs synchronized (§10).** This is an ongoing gate: `AGENTS.md`, READMEs,
-   `docs/PERFORMANCE.md`, `docs/API.md` and this file must move with storage/wire/read-policy
-   changes.
-
-Residual supervisor isolation evidence: validate opt-in per-child cgroups and rotating logs on a
-Linux node that actually delegates a writable cgroup v2 subtree (the OrbStack pod does not). The
-supervisor is intentionally fail-open and reports `isolationError` when delegation is unavailable.
+1. **Repeatable end-to-end operator acceptance.** Turn the live containers/supervisor/reserved/
+   migration/adoption flows into a script or runbook with assertions for digest pinning, rollout
+   percentage, stop/start, failure recovery and rollback. The flows are live-validated; the
+   repeatable harness is the remaining gap.
+2. **Production manager identity and governance.** OIDC/RBAC, approvals, idempotency keys,
+   namespace-qualified paths, pagination and dry-run diffs. Desired state stays in CRDs; audit and
+   read models stay outside etcd.
+3. **Manager deployment packaging.** Checked-in Deployment/Service/RBAC/Pod Security/NetworkPolicy,
+   Helm/Kustomize, image publication/digest pinning and CRD/etcd backup integration.
+4. **Gateway integration.** Leader-aware routing from `SymbolRoute.status`, shadow/cutover/drain,
+   retries, a canary path and a tested client cutover.
+5. **Observability.** A Prometheus text bridge for the engine's JSON `/metrics`, alert rules,
+   dashboards, log shipping and operator reconciliation/rollout metrics.
+6. **Backup/restore execution.** `VolumeGroupSnapshot`/`VolumeSnapshot` for engine PVCs, etcd/CRD
+   backup and selective restore, checksums and a restore test.
+7. **Security.** Manager OIDC, console-proxy authorization, destructive-action approvals,
+   NetworkPolicy tests and Pod Security Standards.
+8. **Scale and soak the CRD path.** Thousands of symbols/CRs across shards and cells, status
+   churn, API-server/etcd size, manager informer memory and operator workqueue latency.
+9. **Remaining engine-topology evidence.** Second-host `local_lease`/Aeron multicast validation
+   and the bare-metal pinned-core `e2e` workflow. These are production-topology measurements,
+   not code paths.
+10. **Keep docs synchronized.** `AGENTS.md`, READMEs, `docs/PERFORMANCE.md`, `docs/API.md`,
+    `docs/ETCD_STORAGE.md` and this file must move with storage, wire, read-policy and
+    control-plane changes.
+11. **Validate opt-in supervisor cgroups and rotating logs on a Linux node** that delegates a
+    writable cgroup v2 subtree. OrbStack does not, so the supervisor currently reports
+    `isolationError` and fails open.
 
 **P3 - later, in impact order**
 
-4. Expose `purge_batch_size` and `max_in_snapshot_log_to_keep` with the snapshot policy (§16).
-5. Evaluate bounded admission waiting/backpressure against the current fail-fast `429` (§8).
-6. Benchmark `STREAM_APPEND_CHANNEL_SIZE` as a standalone transport constant (§16).
-7. Replace market-data leader-watcher metrics polling with OpenRaft `on_leader_change` callbacks
-   (§16).
-8. Optional transport work: peer preconnect, larger HTTP/2 frames and snapshot compression (§16).
-9. Productionize async WAL only after the second-host Linux multi-node A/B and pipelining work
-   from item 1 (§16).
-10. Evaluate a binary order-entry path (§14).
-11. Evaluate real ITCH-style replay data and custom MPMC/SIMD/io_uring work (§14).
-12. Evaluate the Aeron Raft transport only if a measured transport bottleneck appears (§4).
-13. Engine-level derivative support (instrument kind, leverage/margin fields) (§13).
-14. Custom reserve replenishment and stop-protection collars when the product requires them (§5).
-15. Consider protobuf/Avro on the public HTTP API; Raft RPCs stay postcard (§5).
-16. Decide whether to rename the remaining mixed-style modules before 1.0 (§10).
-17. Add AON and order-mask conformance cases when those behaviours land; STP coverage exists and
-    multi-symbol remains deployment-level isolation (§17).
+1. **GUI plan refinements.** The overview is live; keep the plan tab explicitly scenario-based and
+   add migration/promote forms, approvals, filters/pagination, diff/rollback and SSE/WebSocket
+   updates.
+2. CLI `create-shard`, `create-symbol` and `migrate` commands for automation.
+3. OpenAPI client, admission validation/defaulting and schema tests beyond the CRD YAML.
+4. Multi-cell federation: cell registration/capacity, CR projection and cross-cell migration.
+5. Stop-the-world incompatible upgrade execution; containers-mode same-version/image rolling is
+   implemented, while supervisor rolling is the P1 item above and the release compatibility gate is
+   P2.
+6. Operator metrics, troubleshooting, capacity planning and disaster-recovery documentation.
+7. Engine follow-ups from §4-§14: snapshot-policy exposure, bounded admission, the stream-append
+   benchmark, leader-watch callbacks, peer preconnect/larger frames/snapshot compression, async
+   WAL, a binary order-entry path, ITCH-style replay, Aeron Raft transport, derivative fields,
+   reserve replenishment/collars, protobuf/Avro on the public API, module renaming and AON/order
+   mask coverage when those behaviours land.
 
 The detailed checkboxes and evidence for each item remain in the sections below. The earlier
 "recently completed" summary is kept for context.
+
+**Recently completed (2026-11-15/16):** the `match-eu-1` fleet was adopted into CRD/operator
+management; all 16 pods now use a digest-pinned engine image; supervisor pods were rolled one at a
+time with leader transfers; the manager gained 2-second live refresh, rollout percentages and a
+scenario-simulator label; the reconcile plan now uses the shard's configured image; the etcd key
+map is documented; the live catalog reports zero validation warnings; the standalone
+control-plane crate now has a dedicated fmt/Clippy/test CI job plus a Rust 1.89 MSRV check; the
+operator blocks incompatible image rolls through the release compatibility gate; supervisor
+image/resource changes roll one pod at a time with per-child quorum gates; the manager has a
+shard image-upgrade action with no-op and incompatibility checks; and `fx-eu-01` was rolled to a
+new digest through that action while staying `Ready`.
 
 **Recently completed (2026-11-06/10):** configurable WAL fsync with a measured A/B matrix,
 best-effort WAL recovery, the four-voter no-fsync floor (`test_min_voters.rs`), the optional
@@ -1214,7 +1232,7 @@ reported 7.20 M/s book-only; the full review and competitor taxonomy are in
   `SelfTradePrevented` conformance and integration coverage; multi-symbol remains deployment-level
   isolation (§2).
 
-## 18. Kubernetes control plane and supervisor (2026-11-14)
+## 18. Kubernetes control plane and supervisor (2026-11-14, updated 2026-11-15)
 
 Design: [`docs/KUBERNETES_CONTROL_PLANE.md`](./docs/KUBERNETES_CONTROL_PLANE.md). Local tiers:
 [`docs/KUBERNETES_LOCAL_TESTING.md`](./docs/KUBERNETES_LOCAL_TESTING.md). Reference demo:
@@ -1224,13 +1242,13 @@ process; a `SymbolShard` is four pods and each process is its own four-voter Raf
 reference manager's JSON catalog is a demo/interchange format; production desired state should be
 CRDs persisted by the Kubernetes API server (etcd underneath), with audit kept outside etcd.
 
-Done (2026-11-14):
+Done:
 
 - [x] **P1** Design and local-test docs: CRD-shaped catalog, `SymbolShard`/`SymbolDeployment`/
   `SymbolRoute`, slot/port ownership, four-voter bootstrap, storage/PVC, NetworkPolicy, probes,
   upgrades, backups and migration.
 - [x] **P1** Reference manager crate with model, bundle, validation, renderer, reconcile planner,
-  JSON store, Axum API, embedded GUI and CLI; 123 lib + 2 bin tests.
+  JSON store, Axum API, embedded GUI and CLI; 148 lib + bin tests.
 - [x] **P1** CRD-backed desired state: five CRDs (`TradingSymbol`, `SymbolShard`,
   `SymbolDeployment`, `SymbolRoute`, `Cell`) with status subresources, printer columns, generated
   YAML and schema tests; `CatalogStore`/`CrdCatalogStore` writing through the Kubernetes API
@@ -1339,8 +1357,44 @@ Remaining (priority order is top to bottom within each tier):
   at a time after leadership transfer), all PVCs stayed Bound and operator-labeled, and every
   `orderbook_sequence`/`orderbook_orders` read was unchanged. The procedure is in
   `docs/RUNBOOK.md` under "Adopt an existing fleet".
-- [ ] **P1** Wire the standalone `demos/k8s_control_plane` crate into CI (fmt, Clippy, tests). The
-  root cluster suite already covers the supervisor; the demo crate is outside the workspace.
+- [x] **P1** Digest-pinned production images and supervisor aggregate sizing: all four shards now
+  use `matchengine-raft@sha256:...`; `Packing.resourcesSizedForAggregate` records the supervisor
+  aggregate review. The live `match-eu-1` catalog reports zero validation warnings.
+- [x] **P2** Live control-plane GUI: 2-second catalog/shard polling with a `live`/`stale` indicator,
+  modal-aware pause, rollout percentage/progress bar and disabled start/stop while a rollout is
+  active. The plan tab is labeled as a scenario simulator and `Apply simulated status` confirms
+  that it writes status only.
+- [x] **P2** Reconcile-plan correctness: simulated observations use the shard's configured image,
+  so a ready shard at a pinned digest no longer reports a false four-pod upgrade; a regression test
+  covers the fixed-image case.
+- [x] **P2** etcd storage documentation: `docs/ETCD_STORAGE.md` records the live `/registry` key
+  layout, CR/status behavior, built-in objects, inventory sizes, write churn and backup boundaries.
+- [x] **P1** Wire the standalone `demos/k8s_control_plane` crate into CI: a dedicated
+  `k8s-control-plane` job runs fmt, Clippy and `cargo test --locked`, and the `msrv` job checks the
+  crate with Rust 1.89. The root cluster suite still covers the supervisor.
+- [x] **P1** Operator release compatibility gate: rendered pods carry wire/snapshot annotations;
+  a changed image is rolled only when the applied release matches the target or the target is
+  `mixedVersionSafe`. Incompatible or unannotated fleets are blocked in
+  `ShardStatus.releaseBlock`/`ReleaseCompatible=False` without deleting pods. Unit tests cover
+  same-version, incompatible, mixed-safe, missing-metadata and mixed-release cases.
+- [x] **P1** Operator-driven supervisor pod rollout for image/resource changes: the generalized
+  shard rollout controller replaces supervisor pods one at a time, transfers child leaders and
+  waits for every active child on the replacement pod to retain quorum before the next deletion.
+  The same release-compatibility gate and rollout percentage apply to both packing modes.
+- [x] **P1** Capacity, scheduling preflight and packing policy: the operator now validates rendered
+  per-pod and aggregate requests against node allocatable before applying a StatefulSet, subtracts
+  the shard's own current pods, and blocks with `status.capacityBlock`/`CapacityAvailable=False`
+  instead of creating Pending pods. Tenant/owner placement, quotas, capacity accounting,
+  noisy-neighbour detection and hot-symbol promotion remain follow-ups.
+- [x] **P1** Shard image-upgrade action: `POST /api/v1/shards/{name}/upgrade` writes `spec.image`
+  and `spec.release`, returns `changed:false` for a no-op, and rejects incompatible releases,
+  per-deployment image overrides and paused shards before writing. The GUI plan tab exposes
+  **Upgrade image**; the operator performs the one-pod-at-a-time rollout and the release/capacity
+  gates remain authoritative.
+- [ ] **P2** End-to-end operator smoke script/runbook: containers, supervisor, reserved,
+  migration, brownfield adoption, digest pinning, stop/start and rollback flows are live-validated;
+  make them repeatable with assertions for the rendered template, rollout percentage, leader
+  transfer, readiness and data continuity.
 - [ ] **P2** Production manager: OIDC/RBAC, approvals, idempotency keys, namespace-qualified
   paths, pagination and dry-run diffs. Desired state stays in CRDs; use Postgres/object storage
   only for audit, a query/read model or long-term history, not as a second source of truth.
@@ -1355,27 +1409,23 @@ Remaining (priority order is top to bottom within each tier):
 - [ ] **P2** Backup/restore execution: `VolumeGroupSnapshot`/`VolumeSnapshot` integration for
   engine PVCs, plus etcd/CRD backup and selective CR restore; a backup agent, checksums and a
   restore test. The demo plans backups but does not run them.
-- [ ] **P2** Capacity and packing policy: tenant/owner placement, quotas, capacity accounting,
-  noisy-neighbour detection and hot-symbol promotion. Auto placement currently chooses the most
-  packed zero-impact shard.
-- [ ] **P2** End-to-end operator smoke on OrbStack: the containers-mode path (create CRs, apply,
-  bootstrap four voters, configure, add/stop/re-add a symbol, image/config roll, inspect status)
-  is live-validated; add a repeatable script/runbook and repeat the same flow for a supervisor
-  shard and a reserved-to-materialized transition.
 - [ ] **P2** Security: manager OIDC and console-proxy authorization, approvals for destructive
   actions, NetworkPolicy tests and Pod Security Standards. The demo manager has no auth.
 - [ ] **P2** Scale and soak the CRD path: thousands of symbols/CRs across shards and cells, status
   churn, API-server/etcd size and backup/restore, manager informer memory and operator workqueue
   latency. No real engine load is required.
-- [ ] **P3** GUI: live cluster status instead of simulated observations, migration/promote forms,
-  approvals, filters/pagination, diff/rollback and SSE/WebSocket updates.
+- [ ] **P2** Validate opt-in supervisor cgroups and rotating logs on a Linux node that delegates a
+  writable cgroup v2 subtree; the OrbStack pod does not, so the supervisor reports
+  `isolationError` and fails open.
+- [ ] **P3** GUI: the overview is live and the plan tab is a labeled scenario simulator. Add
+  migration/promote forms, approvals, filters/pagination, diff/rollback and SSE/WebSocket updates.
 - [ ] **P3** CLI `create-shard`, `create-symbol` and `migrate` commands for automation; the
   API/GUI are implemented today.
 - [ ] **P3** OpenAPI client, admission validation/defaulting and schema tests beyond the CRD YAML
   delivered with the P1 store.
 - [ ] **P3** Multi-cell federation: cell registration/capacity, CR projection and cross-cell
   migration. The demo has one cell.
-- [ ] **P3** Operator-driven rolling upgrades and stop-the-world incompatible upgrades; the
-  reconcile planner already returns the sequence, but execution is operator work.
+- [ ] **P3** Stop-the-world incompatible upgrade execution: the release gate is implemented and
+  supervisor rolling is P1; executing the coordinated stop-the-world cutover remains.
 - [ ] **P3** Documentation: operator metrics, troubleshooting, capacity planning and disaster
-  recovery; keep the design and local test plan aligned as the operator lands.
+  recovery; keep the design, etcd map and local test plan aligned as the operator lands.

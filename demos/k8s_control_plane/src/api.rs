@@ -56,6 +56,7 @@ pub fn router_with_options(store: Arc<Store>, console: ConsoleOptions) -> Router
         .route("/api/v1/cells", get(cells))
         .route("/api/v1/shards", get(shards).post(create_shard))
         .route("/api/v1/shards/{name}", get(shard_detail))
+        .route("/api/v1/shards/{name}/upgrade", post(upgrade_shard))
         .route("/api/v1/shards/{name}/drop", post(drop_shard))
         .route("/api/v1/shards/{name}/manifests", get(manifests))
         .route(
@@ -255,6 +256,33 @@ async fn create_symbol(
         })
         .await?;
     Ok(Json(json!({ "placement": placement })))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpgradeShardRequest {
+    image: String,
+    release: Release,
+}
+
+async fn upgrade_shard(
+    State(store): State<Arc<Store>>,
+    Path(name): Path<String>,
+    Json(request): Json<UpgradeShardRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let mut upgrade = None;
+    store
+        .mutate(|catalog| {
+            upgrade = Some(provision::upgrade_shard(
+                catalog,
+                &name,
+                request.image,
+                request.release,
+            )?);
+            Ok(())
+        })
+        .await?;
+    Ok(Json(json!({ "upgrade": upgrade })))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1179,6 +1207,33 @@ mod tests {
             .find(|i| i["name"] == "me-btcusdt")
             .expect("dedicated shard");
         assert_eq!(dedicated["processes"], 1);
+    }
+
+    #[tokio::test]
+    async fn upgrade_shard_endpoint_updates_image_and_release() {
+        let app = app();
+        let (status, body) = post_json_to(
+            app.clone(),
+            "/api/v1/shards/fx-eu-01/upgrade",
+            json!({
+                "image": "matchengine-raft@sha256:abc",
+                "release": {
+                    "wireVersion": 7,
+                    "snapshotVersion": 11,
+                    "mixedVersionSafe": false
+                }
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["upgrade"]["changed"], true);
+        let (status, detail) = get_json_from(app, "/api/v1/shards/fx-eu-01").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            detail["shard"]["spec"]["image"],
+            "matchengine-raft@sha256:abc"
+        );
+        assert_eq!(detail["shard"]["spec"]["release"]["wireVersion"], 7);
     }
 
     #[tokio::test]

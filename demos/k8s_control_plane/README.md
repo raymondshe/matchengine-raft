@@ -202,12 +202,14 @@ The operator also drives the engine lifecycle once the workload exists:
   adds missing learners, changes membership to the desired voter set, and applies
   `ConfigureSymbol` on the leader. A route publishes `leaderAddr` only after the applied symbol
   config matches the desired `TradingSymbol`.
-- **Containers rolls** — it compares each pod's `controller-revision-hash` with the StatefulSet
-  `updateRevision`, replaces non-running (for example Pending) pods first, and only deletes a
-  running pod after checking that every process it hosts retains a healthy Raft quorum. A leader
-  pod is transferred only when its removal is already quorum-safe; the deletion happens on the
-  next reconcile. This handles adding, removing and re-adding containers without a bootstrap
-  deadlock.
+- **Shard rolls** — for both containers and supervisor shards, it compares each pod's
+  `controller-revision-hash` with the StatefulSet `updateRevision`, replaces non-running (for
+  example Pending) pods first, and only deletes a running pod after checking that every process it
+  hosts retains a healthy Raft quorum. In supervisor mode every active child on the pod must remain
+  quorate and both child deployments must be ready before the next deletion. A leader pod is
+  transferred only when its removal is already quorum-safe; the deletion happens on the next
+  reconcile. This handles image/resource changes as well as adding, removing and re-adding
+  containers without a bootstrap deadlock.
 - **Fast termination** — the engine binary handles SIGTERM/SIGINT as PID 1, so a containers-mode
   pod drains immediately instead of waiting for Kubernetes' 60-second grace period and SIGKILL.
 - **Retention** — orphaned shard PVCs are labeled and annotated with
@@ -222,6 +224,10 @@ The operator also drives the engine lifecycle once the workload exists:
   fails validation while removing a container, the operator retries that StatefulSet with a merge
   patch, which replaces the container array as a whole. This is the path that makes stopping one
   symbol in a packed containers shard work after a brownfield adoption.
+- **Release compatibility** — the operator annotates each pod with the applied wire/snapshot
+  versions. Before an image change in a containers shard it compares that release with
+  `SymbolShard.spec.release`; an incompatible roll is blocked in `status.releaseBlock` rather than
+  mixing peers. Same-version rolls and targets with `mixedVersionSafe: true` proceed.
 - **Migration** — a `Shadow` deployment with a non-overlapping `raftIdOffset` is added to the
   source leader as a learner; after catch-up the operator changes membership, switches the route,
   activates the target and drains the source. Route `state: Rollback` reverses the process.
@@ -239,6 +245,7 @@ retention, migration, status and label actions.
 | `GET` | `/api/v1/catalog` | full catalog plus validation report |
 | `GET` | `/api/v1/shards` | shard list with per-pod CPU/memory requests, `slots`, `freeSlots`, phase and paused state |
 | `POST` | `/api/v1/shards` | reserve an empty shard from a `SymbolShard` body |
+| `POST` | `/api/v1/shards/{name}/upgrade` | write `spec.image` and `spec.release` to a shard; rejects incompatible releases and per-deployment image overrides; the operator performs the one-pod-at-a-time roll |
 | `POST` | `/api/v1/shards/{name}/drop` | drop an idle shard; `retainStorage` (default `true`) keeps the PVCs so it can be brought up again, `false` deletes them |
 | `GET` | `/api/v1/shards/{name}` | shard detail, deployments, symbols, routes, simulated observation, `slots`/`freeSlots`/`empty`, a shard-scoped `shardValidation`, and per-process `engineConsoles` (`url` and `proxyUrl`) |
 | `GET/POST` | `/api/v1/shards/{name}/processes/{symbol}/pods/{pod}/console/*` | reverse proxy to that engine's `/console/` assets, JSON APIs and guarded actions; `/init`, `/write`, `/read` and Raft RPCs are never reachable |
@@ -428,6 +435,41 @@ call `/init` or `ConfigureSymbol` again unless the data directory was deleted. T
 Use `kubectl -n match-eu-1 exec <pod> -- curl -s http://127.0.0.1:9090/processes` to verify
 supervisor children before and after.
 
+### Upgrade a shard image
+
+The shard detail **plan** tab has an **Upgrade image** button (and the manager exposes the same
+action as an API call). It writes the target image and release to the `SymbolShard`; the operator
+owns the rollout. Use a digest-pinned image:
+
+```bash
+curl -s -X POST http://127.0.0.1:8099/api/v1/shards/fx-eu-01/upgrade \
+  -H 'content-type: application/json' \
+  -d '{"image":"matchengine-raft@sha256:<digest>",
+       "release":{"wireVersion":7,"snapshotVersion":11,"mixedVersionSafe":false}}'
+```
+
+The response reports `changed:false` when the shard already has that image/release. The endpoint
+rejects three cases before writing anything:
+
+- `409 release_incompatible` — the current `spec.release` cannot roll to the target under
+  `Release::can_roll_to`. Use the stop-the-world procedure in `docs/RUNBOOK.md` instead of forcing
+  a mixed-version roll.
+- `409 deployment_image_override` — one or more `SymbolDeployment`s in the shard pin their own
+  `spec.image`. Update or clear those first so the shard has one image.
+- `409 shard_paused` / `422` validation — resume the shard or fix the catalog.
+
+On success the shard moves to `Pending` and `status.rollout` reports progress. The operator applies
+the new StatefulSet template, then replaces pods one at a time, transfers a leader only when the
+removal is quorum-safe, and waits for every active engine on the replacement pod to be ready. The
+GUI shows the rollout bar. If the live pods' release annotations conflict with the target, the
+roll stops at `status.releaseBlock`/`ReleaseCompatible=False` with no pods deleted. The capacity
+preflight can also stop the apply at `status.capacityBlock`/`CapacityAvailable=False` when the
+rendered per-pod or aggregate requests do not fit the nodes.
+
+Keep `mixedVersionSafe: false` unless the new image explicitly supports mixed peers. An image that
+crosses wire or snapshot versions is a stop-the-world change: disable routes, stop the shard, then
+apply the image/release and start the shard again.
+
 ### Dropping a shard
 
 Dropping is only allowed after every engine in the shard is stopped. The **drop shard** button is
@@ -579,7 +621,7 @@ Errors block rendering; warnings do not.
 ```bash
 cargo fmt --manifest-path demos/k8s_control_plane/Cargo.toml -- --check
 cargo clippy --manifest-path demos/k8s_control_plane/Cargo.toml --all-targets -- -D warnings
-cargo test --manifest-path demos/k8s_control_plane/Cargo.toml
+cargo test --manifest-path demos/k8s_control_plane/Cargo.toml --locked
 ```
 
 The suite covers the CRD model, validation rules, renderer output (including the stable supervisor
@@ -598,9 +640,10 @@ leader handoff. The root crate adds `tests/cluster/test_supervisor.rs` (add/remo
 restart backoff, max-child backpressure, orphan cleanup) and `tests/cluster/test_shutdown.rs`
 (prompt SIGTERM shutdown of the real engine process).
 
-The crate is standalone (`[workspace]` in its `Cargo.toml`) and is not wired into the root
-workspace or CI yet. To add it, mirror the `demos/order_system` CI steps in
-`.github/workflows/ci.yml`.
+The crate is standalone (`[workspace]` in its `Cargo.toml`) but has a dedicated
+`k8s-control-plane` job in `.github/workflows/ci.yml` that runs fmt, Clippy and
+`cargo test --locked`. The `msrv` job also runs `cargo check --all-targets --locked` against this
+crate on Rust 1.89.
 
 ## Deliberate limitations
 

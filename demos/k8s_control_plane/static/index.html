@@ -64,6 +64,7 @@
   .chip.packed { color: var(--accent); border-color: var(--accent-dim); }
   .chip.bad { color: var(--bad); border-color: #5c2a2e; }
   .chip.good { color: var(--good); border-color: #24513a; }
+  .chip.warn { color: var(--warn); border-color: #4a3a1e; }
   section.content { padding: 22px 26px 60px; overflow: auto; }
   .headline { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
   .headline h2 { margin: 0; font: 600 21px/1.2 var(--mono); }
@@ -197,6 +198,8 @@
     </div>
     <div id="issueBox"></div>
     <div id="rolloutBanner" class="issue warning" style="display:none; margin-bottom:10px"></div>
+    <div id="releaseBanner" class="issue" style="display:none; margin-bottom:10px"></div>
+    <div id="capacityBanner" class="issue" style="display:none; margin-bottom:10px"></div>
     <div class="tabs">
       <button class="tab active" data-tab="overview">overview</button>
       <button class="tab" data-tab="plan">reconcile plan</button>
@@ -225,8 +228,9 @@
     <div class="panel" id="tab-plan">
       <div class="issue warning" style="margin:0 0 12px">
         Scenario simulator: this plan uses the selected synthetic observation plus the current CRD
-        catalog. It does not read live pod containers; the operator is the live reconciler. Use
-        <b>overview</b> for actual rollout status.
+        catalog. It does not read live pod containers; the operator is the live reconciler. <b>Build
+        plan</b> is read-only; <b>Upgrade image</b> writes the shard spec and lets the operator roll
+        pods. Use <b>overview</b> for actual rollout status.
       </div>
       <div class="actions">
         <label class="field">Observation
@@ -252,6 +256,7 @@
           <select id="mixedSafe"><option value="false">no</option><option value="true">yes</option></select>
         </label>
         <button class="primary" id="planBtn">Build plan</button>
+        <button class="primary" id="upgradeBtn" title="Write the target image and release to the shard CR; the operator rolls pods one at a time">Upgrade image</button>
         <button id="adoptBtn" title="Demo only: write the selected simulated observation into catalog status; does not execute the plan or change workloads">Apply simulated status</button>
       </div>
       <div class="plan-summary" id="planSummary">—</div>
@@ -516,7 +521,7 @@ function renderShards() {
     const phase = shard.status?.phase || "Pending";
     const empty = all.length === 0;
     const allStopped = deployments.length === 0 && stopped > 0;
-    const phaseClass = phase === "Ready" ? "good" : phase === "Degraded" || phase === "Failed" ? "bad" : "";
+    const phaseClass = phase === "Ready" ? "good" : phase === "Degraded" || phase === "Failed" ? "bad" : phase === "Progressing" ? "warn" : "";
     const meta = `${esc(shard.spec.cell)} · ${esc(shard.spec.replicas)} voters · ${deployments.length} process${deployments.length === 1 ? "" : "es"}${stopped ? ` · ${stopped} stopped` : ""}`;
     const symbolChip = allStopped ? "all stopped" : empty ? "no symbols" : esc(symbols.join(", "));
     const phaseChip = allStopped ? "Disabled" : empty ? "reserved" : esc(phase);
@@ -566,9 +571,10 @@ function renderOverview() {
   const errors = (validation.errors || []).length;
   const warnings = (validation.warnings || []).length;
   const progress = shard.status?.rollout;
-  const containers = shard.spec.packing.mode === "containers";
-  const rollout = containers && (shard.status?.conditions || []).some((condition) =>
+  const packing = shard.spec.packing.mode;
+  const progressing = (shard.status?.conditions || []).some((condition) =>
     condition.type === "Progressing" && condition.status === "True");
+  const rollout = progressing && (packing === "containers" || (packing === "supervisor" && progress && !progress.complete));
   const percent = progress ? Math.min(100, Math.max(0, Number(progress.percent) || 0)) : null;
   const banner = $("rolloutBanner");
   if (rollout) {
@@ -576,12 +582,41 @@ function renderOverview() {
     banner.innerHTML = `<b>Operator rollout in progress${percent === null ? "" : ` · ${esc(percent)}%`}</b>
       ${progress ? `<div class="rollout-progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${esc(percent)}"><span style="width:${esc(percent)}%"></span></div>
       <span class="muted">${esc(progress.updatedReplicas)}/${esc(progress.replicas)} pods updated · ${esc(progress.readyReplicas)}/${esc(progress.replicas)} ready${percent === 100 && !progress.complete ? " · finalizing" : ""}</span>` : ""}
-      <div>A containers-mode start/stop changes the StatefulSet pod template, so the operator replaces all
-      ${esc(shard.spec.replicas)} pods one at a time and waits for quorum between replacements. This can take a few
-      minutes; start/stop is disabled until the shard settles.</div>`;
+      <div>${packing === "supervisor"
+        ? "A supervisor image or resource change replaces the StatefulSet template, so the operator replaces pods one at a time and waits for every child on the replacement pod before continuing."
+        : `A containers-mode start/stop changes the StatefulSet pod template, so the operator replaces all ${esc(shard.spec.replicas)} pods one at a time and waits for quorum between replacements.`}
+      This can take a few minutes; start/stop is disabled until the shard settles.</div>`;
   } else {
     banner.style.display = "none";
     banner.innerHTML = "";
+  }
+  const releaseBlock = shard.status?.releaseBlock;
+  const releaseBanner = $("releaseBanner");
+  if (releaseBlock) {
+    const current = releaseBlock.currentWireVersion == null
+      ? "unknown"
+      : `wire v${releaseBlock.currentWireVersion}/snapshot v${releaseBlock.currentSnapshotVersion}`;
+    releaseBanner.style.display = "block";
+    releaseBanner.innerHTML = `<b>Release rollout blocked · ${esc(releaseBlock.reason)}</b>
+      <div>Current ${esc(current)} → target wire v${esc(releaseBlock.targetWireVersion)}/snapshot
+      v${esc(releaseBlock.targetSnapshotVersion)}. ${esc(releaseBlock.message)}. No pods were deleted;
+      plan a stop-the-world upgrade or set the target release to mixed-version safe.</div>`;
+  } else {
+    releaseBanner.style.display = "none";
+    releaseBanner.innerHTML = "";
+  }
+  const capacityBlock = shard.status?.capacityBlock;
+  const capacityBanner = $("capacityBanner");
+  if (capacityBlock) {
+    const cpu = (Number(capacityBlock.perPodCpuMillis) / 1000).toFixed(2);
+    const memory = (Number(capacityBlock.perPodMemoryBytes) / 1024 / 1024).toFixed(0);
+    capacityBanner.style.display = "block";
+    capacityBanner.innerHTML = `<b>Capacity preflight blocked the StatefulSet apply · ${esc(capacityBlock.reason)}</b>
+      <div>${esc(capacityBlock.message)}. The desired pod requests ${esc(cpu)} CPU / ${esc(memory)} MiB per pod.
+      Free the requested capacity or lower the shard resources; the operator retries automatically.</div>`;
+  } else {
+    capacityBanner.style.display = "none";
+    capacityBanner.innerHTML = "";
   }
   $("overviewCards").innerHTML = `
     <div class="card"><h3>Shard</h3><dl class="kv">
@@ -743,6 +778,45 @@ async function loadManifests() {
     $("manifestHint").textContent = !active.length
       ? `${manifestList.items.length} objects · ${all.length ? "all processes are stopped: no StatefulSet until an explicit re-enable, the PVCs are retained" : "reserved shard: no StatefulSet until a symbol is bound"}`
       : `${manifestList.items.length} objects · kubectl apply -f works with this List`;
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+async function upgradeShard() {
+  const image = $("targetImage").value.trim();
+  const wire = Number($("wireVersion").value);
+  const snapshot = Number($("snapshotVersion").value);
+  const mixed = $("mixedSafe").value === "true";
+  if (!image) {
+    toast("target image is required", true);
+    return;
+  }
+  if (!Number.isInteger(wire) || wire < 1 || !Number.isInteger(snapshot) || snapshot < 1) {
+    toast("target wire and snapshot versions must be positive integers", true);
+    return;
+  }
+  const ok = confirm(`Upgrade ${selected} to ${image}?\n\nThis writes the shard spec; the operator replaces pods one at a time with leader transfer and quorum checks. Incompatible wire/snapshot releases are rejected unless the target is marked mixed-version safe.`);
+  if (!ok) return;
+  try {
+    const result = await api(`/api/v1/shards/${encodeURIComponent(selected)}/upgrade`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        image,
+        release: { wireVersion: wire, snapshotVersion: snapshot, mixedVersionSafe: mixed },
+      }),
+    });
+    const upgrade = result.upgrade;
+    toast(upgrade.changed
+      ? `image upgrade requested · ${upgrade.mode} · wire v${upgrade.release.wireVersion} / snapshot v${upgrade.release.snapshotVersion}`
+      : "image and release are already current");
+    catalog = await api("/api/v1/catalog");
+    renderHeader();
+    renderShards();
+    await loadDetail();
+    await loadPlan();
+    loadAudit();
   } catch (error) {
     toast(error.message, true);
   }
@@ -1101,6 +1175,7 @@ function bind() {
     });
   });
   $("planBtn").addEventListener("click", loadPlan);
+  $("upgradeBtn").addEventListener("click", upgradeShard);
   $("adoptBtn").addEventListener("click", adopt);
   $("renderBtn").addEventListener("click", loadManifests);
   $("profile").addEventListener("change", loadManifests);

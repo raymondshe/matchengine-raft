@@ -39,6 +39,17 @@ mod tests {
         assert!(INDEX.contains("does not read live pod containers"));
         assert!(INDEX.contains("Apply simulated status"));
         assert!(INDEX.contains("does not change desired state"));
+        assert!(INDEX.contains("id=\"releaseBanner\""));
+        assert!(INDEX.contains("Release rollout blocked"));
+        assert!(INDEX.contains("No pods were deleted"));
+        assert!(INDEX.contains("supervisor image or resource change"));
+        assert!(INDEX.contains("id=\"capacityBanner\""));
+        assert!(INDEX.contains("Capacity preflight blocked"));
+        assert!(INDEX.contains("Free the requested capacity"));
+        assert!(INDEX.contains("id=\"upgradeBtn\""));
+        assert!(INDEX.contains("Upgrade image"));
+        assert!(INDEX.contains("writes the shard spec"));
+        assert!(INDEX.contains("upgradeShard"));
     }
 
     #[test]

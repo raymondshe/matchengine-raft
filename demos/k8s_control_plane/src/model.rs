@@ -103,6 +103,8 @@ pub enum Phase {
     Pending,
     Bootstrapped,
     Ready,
+    /// A planned one-pod-at-a-time rollout is replacing pods while the shard stays quorate.
+    Progressing,
     Degraded,
     Failed,
     Running,
@@ -414,6 +416,41 @@ impl Default for Release {
     }
 }
 
+impl Release {
+    /// Whether `target` can roll one pod at a time from this release.
+    pub fn can_roll_to(&self, target: &Release) -> bool {
+        (self.wire_version == target.wire_version
+            && self.snapshot_version == target.snapshot_version)
+            || target.mixed_version_safe
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReleaseBlock {
+    pub reason: String,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_wire_version: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_snapshot_version: Option<u16>,
+    pub target_wire_version: u16,
+    pub target_snapshot_version: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CapacityBlock {
+    pub reason: String,
+    pub message: String,
+    pub per_pod_cpu_millis: u64,
+    pub per_pod_memory_bytes: u64,
+    pub cluster_cpu_millis: u64,
+    pub cluster_memory_bytes: u64,
+    pub free_cpu_millis: u64,
+    pub free_memory_bytes: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StorageSpec {
@@ -642,6 +679,10 @@ pub struct ShardStatus {
     pub nodes: Vec<ShardNodeStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rollout: Option<ShardRolloutStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_block: Option<ReleaseBlock>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capacity_block: Option<CapacityBlock>,
     #[serde(default)]
     pub conditions: Vec<Condition>,
 }

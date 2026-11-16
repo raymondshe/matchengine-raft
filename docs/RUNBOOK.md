@@ -648,6 +648,72 @@ The operator adds the source voters back as learners to the target leader, waits
 switches the route back, reactivates the source and disables the target. The source PVCs are the
 copy that lets this reverse path work.
 
+### Upgrade a shard image (compatible release)
+
+Use the manager plan tab's **Upgrade image** button, or the API, to write a new image and release
+to one `SymbolShard`. The operator does the rollout; do not patch the StatefulSet directly.
+
+```sh
+curl -s -X POST http://127.0.0.1:8099/api/v1/shards/fx-eu-01/upgrade \
+  -H 'content-type: application/json' \
+  -d '{"image":"matchengine-raft@sha256:<digest>",
+       "release":{"wireVersion":7,"snapshotVersion":11,"mixedVersionSafe":false}}'
+```
+
+The image must be digest-pinned. The endpoint returns `changed:false` when the shard already has
+that image and release. It refuses to write when:
+
+- the target release is incompatible with the current `spec.release`
+  (`409 release_incompatible`);
+- a `SymbolDeployment` in the shard pins its own `spec.image`
+  (`409 deployment_image_override`);
+- the shard is paused (`409 shard_paused`) or the mutated catalog fails validation (`422`).
+
+After a successful write, watch progress and the safety gates:
+
+```sh
+kubectl -n match-eu-1 get symbolshard fx-eu-01 \
+  -o jsonpath='{.status.phase}{" "}{.status.rollout}{"\n"}'
+kubectl -n match-eu-1 get symbolshard fx-eu-01 \
+  -o jsonpath='{.status.releaseBlock}{" | "}{.status.capacityBlock}{"\n"}'
+kubectl -n match-eu-1 get pods -l matching.io/cluster=fx-eu-01 \
+  -o custom-columns='NAME:.metadata.name,IMAGE:.spec.containers[0].image,READY:.status.containerStatuses[*].ready'
+```
+
+The operator applies the new template and replaces pods one at a time, transferring a leader only
+when the removal is already quorum-safe and waiting for all active engines on the replacement pod.
+While pods are being replaced the shard reports `phase: Progressing`; when every pod is updated and
+ready it returns to `Ready` with `Progressing=False/Settled`.
+A blocked roll leaves the pods untouched: `ReleaseCompatible=False` means the live pods report a
+different wire/snapshot release than the target, and `CapacityAvailable=False` means the rendered
+requests do not fit the nodes. Fix the metadata or free capacity; the next reconcile retries.
+Same-version rollouts and same-version image changes are not blocked.
+
+### Incompatible image upgrade (stop-the-world)
+
+When an image change would cross the wire or snapshot version, the operator does **not** roll pods.
+It writes `SymbolShard.status.releaseBlock` with `reason: stop_the_world_required` (or
+`release_metadata_missing`/`mixed_release`) and leaves `ReleaseCompatible=False`. Do not delete
+pods manually while old and new versions are mixed. A fleet adopted before release annotations
+existed should first apply the same image with the new template (a metadata-only roll) so pods
+record their wire/snapshot versions; then change the image/release.
+
+1. Back up the CR catalog and take a volume-group snapshot of the shard's four PVCs.
+2. Disable the affected `SymbolRoute`s at the gateway. Stop every symbol in the shard, or scale the
+   StatefulSet to zero after disabling the routes, so no old-version process remains.
+3. Patch `spec.image` and `spec.release` together on the `SymbolShard`:
+   ```sh
+   kubectl -n match-eu-1 patch symbolshard <shard> --type=merge \
+     -p '{"spec":{"image":"<new-image>@sha256:<digest>","release":{"wireVersion":8,"snapshotVersion":12,"mixedVersionSafe":false}}}'
+   ```
+4. Recreate the StatefulSet (or start the symbols) so every pod starts with the new release at
+   once. The engines recover their own WAL/snapshot and rejoin the same four-voter group.
+5. Verify `/ready`, a leader, the applied index and the order book; then re-enable the routes.
+
+The block clears on the next reconcile once the shard has one consistent release and no pending
+image change. `mixedVersionSafe` is only valid when the target image explicitly supports mixed
+peers; do not use it to bypass a real format change.
+
 ### Retention window
 
 An orphaned shard PVC is labeled by the renderer and marked with
@@ -923,6 +989,7 @@ status honest and never changes engine state.
 | Operator pruned objects unexpectedly | Check the `--namespace` scope and that the shard still exists in its CRDs. Objects without the managed-by label are never pruned; PVCs are never pruned by the operator. |
 | `ImagePullBackOff` / old engine console without the symbol header | The image was rebuilt but the pod was not recreated. Use `imagePullPolicy: IfNotPresent`, then `kubectl -n match-eu-1 rollout restart statefulset/<shard>` and wait for `/ready`. |
 | `409 restart_required` on add/stop/start | The shard is containers mode with other active engines; use supervisor mode, an empty shard, or explicitly opt into `allowRestart`. |
+| Image update is blocked with `ReleaseCompatible=False` | The target wire/snapshot release is incompatible with the applied pod annotations, or the pods lack annotations. Inspect `SymbolShard.status.releaseBlock`; plan a stop-the-world upgrade, or set `spec.release.mixedVersionSafe: true` only when the target image can tolerate mixed peers. |
 | Stop shows `Disabled` but the symbol container is still running | The manager only wrote desired state. Check `kubectl -n match-control logs deploy/match-operator` for a StatefulSet apply error. An adopted StatefulSet can keep `kubectl-client-side-apply` list ownership; a container removal then fails SSA validation (`containers[0].image: Required value`). Operator v6+ retries that StatefulSet with a merge patch automatically. Confirm the rollout with `kubectl -n match-eu-1 get sts <shard> -o jsonpath='{.status.updatedReplicas}'` and the operator `deleted one outdated pod` logs. |
 | `409 shard_not_idle` on drop | Stop every symbol in the shard first; the error names the active ones. Apply the updated ConfigMap before retrying. |
 | Drop returned `200` but pods/StatefulSet still exist | The manager only wrote desired state. Prune with the manifests saved before the drop: `kubectl -n match-eu-1 delete -f /tmp/<shard>-manifests.json --ignore-not-found`. |

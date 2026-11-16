@@ -105,7 +105,11 @@ Stores the shard's pod-template inputs and observed status:
 - `spec.raft` read policy, snapshot interval and WAL fsync mode;
 - `spec.release` wire/snapshot versions and `spec.upgrade.strategy`;
 - `status.phase`, conditions, per-pod readiness, symbol list and leader/lag projection;
-- `status.rollout` with `percent`, `updatedReplicas`, `readyReplicas`, `replicas`, `complete`.
+- `status.rollout` with `percent`, `updatedReplicas`, `readyReplicas`, `replicas`, `complete`;
+- `status.releaseBlock` when an image roll is waiting for a stop-the-world or metadata fix;
+  `ReleaseCompatible` is the matching condition;
+- `status.capacityBlock` when rendered pod requests do not fit current node/allocatable capacity;
+  `CapacityAvailable` is the matching condition.
 
 `SymbolShard.spec` does **not** own slots or ports per symbol; that belongs to `SymbolDeployment`.
 

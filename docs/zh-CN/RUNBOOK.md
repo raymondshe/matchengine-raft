@@ -609,6 +609,63 @@ kubectl -n match-eu-1 patch symbolroute <symbol> --type=merge -p '{"spec":{"stat
 Operator 会把源 voter 重新作为 learner 加入目标 leader，追平后切回 membership、恢复源路由、
 重新激活源并禁用目标。源 PVC 是回滚路径保留的数据副本。
 
+### 兼容版本镜像升级
+
+在管理器 plan 页使用 **Upgrade image**，或直接调用 API，把新镜像和 release 写入单个
+`SymbolShard`。滚动由 operator 执行，不要直接 patch StatefulSet。
+
+```sh
+curl -s -X POST http://127.0.0.1:8099/api/v1/shards/fx-eu-01/upgrade \
+  -H 'content-type: application/json' \
+  -d '{"image":"matchengine-raft@sha256:<digest>",
+       "release":{"wireVersion":7,"snapshotVersion":11,"mixedVersionSafe":false}}'
+```
+
+镜像必须使用 digest 固定。若 shard 已经是该镜像和 release，返回 `changed:false`。以下情况不会写入：
+
+- 目标 release 与当前 `spec.release` 不兼容（`409 release_incompatible`）；
+- shard 内有 `SymbolDeployment` 单独固定了 `spec.image`（`409 deployment_image_override`）；
+- shard 处于 paused（`409 shard_paused`），或修改后的目录校验失败（`422`）。
+
+写入成功后观察进度和安全门：
+
+```sh
+kubectl -n match-eu-1 get symbolshard fx-eu-01 \
+  -o jsonpath='{.status.phase}{" "}{.status.rollout}{"\n"}'
+kubectl -n match-eu-1 get symbolshard fx-eu-01 \
+  -o jsonpath='{.status.releaseBlock}{" | "}{.status.capacityBlock}{"\n"}'
+kubectl -n match-eu-1 get pods -l matching.io/cluster=fx-eu-01 \
+  -o custom-columns='NAME:.metadata.name,IMAGE:.spec.containers[0].image,READY:.status.containerStatuses[*].ready'
+```
+
+Operator 先 apply 新模板，再逐个替换 Pod：只有删除后仍满足 quorum 时才转移 leader，并等待替换
+Pod 上所有活跃子进程就绪。被阻止时不会删除 Pod：`ReleaseCompatible=False` 表示存活 Pod 上报的
+wire/snapshot 版本与目标不一致；`CapacityAvailable=False` 表示渲染后的 requests 放不下。修正元数据
+或释放容量后，下一次 reconcile 会自动重试。同版本滚动和同版本镜像变更不会被阻止。
+
+### 不兼容镜像升级（stop-the-world）
+
+当镜像变更跨越 wire 或 snapshot 版本时，operator 不会滚动 Pod，而是写入
+`SymbolShard.status.releaseBlock`（`stop_the_world_required`，或
+`release_metadata_missing`/`mixed_release`）并保持 `ReleaseCompatible=False`。不要在旧/新版本
+混合时手动删除 Pod。对于尚未写入 release 注解的已接管集群，先用相同镜像和新模板做一次
+metadata-only 滚动，让 Pod 记录 wire/snapshot 版本，然后再修改镜像/release。
+
+1. 备份 CR 目录，并对该 shard 的四个 PVC 做 volume-group 快照。
+2. 在网关禁用受影响的 `SymbolRoute`；停止 shard 内所有 symbol，或在禁用路由后把 StatefulSet
+   缩到 0，确保没有旧版本进程继续运行。
+3. 同时 patch `spec.image` 和 `spec.release`：
+   ```sh
+   kubectl -n match-eu-1 patch symbolshard <shard> --type=merge \
+     -p '{"spec":{"image":"<new-image>@sha256:<digest>","release":{"wireVersion":8,"snapshotVersion":12,"mixedVersionSafe":false}}}'
+   ```
+4. 重新创建 StatefulSet 或启动 symbol，让所有 Pod 直接以新版本启动。引擎会从自己的
+   WAL/snapshot 恢复并重新加入同一个四 voter 组。
+5. 验证 `/ready`、leader、applied index 和订单簿，然后重新启用路由。
+
+当下一次 reconcile 看到一致的 release 且没有待处理镜像变更时，阻断会自动清除。
+`mixedVersionSafe` 只能在目标镜像明确支持混合版本时使用，不能用它绕过真实的格式变更。
+
 ### 保留窗口
 
 渲染器会给 shard PVC 打标签；孤儿 PVC 会获得 `matching.io/retain-until`（Unix 秒或 `manual`）。
@@ -870,6 +927,7 @@ JSON 模式下，任何管理器滚动前先导出目录；如果文件丢失，
 | Operator 意外 prune 对象 | 检查 `--namespace` 作用域和 shard CR 是否仍存在。没有 managed-by 标签的对象永远不会被 prune；operator 永远不删除 PVC。 |
 | `ImagePullBackOff` / 引擎控制台没有 symbol 标题 | 镜像已重建但 Pod 未重建。使用 `imagePullPolicy: IfNotPresent`，然后 `kubectl -n match-eu-1 rollout restart statefulset/<shard>` 并等待 `/ready`。 |
 | 添加/停止/启动返回 `409 restart_required` | shard 是 containers 模式且还有其他活跃引擎；改用 supervisor shard、空 shard，或显式允许 `allowRestart`。 |
+| 镜像更新被 `ReleaseCompatible=False` 阻止 | 目标 wire/snapshot 版本与 Pod 上记录的已应用版本不兼容，或 Pod 缺少版本注解。检查 `SymbolShard.status.releaseBlock`；规划 stop-the-world 升级，或仅在目标镜像能容忍混合版本时设置 `spec.release.mixedVersionSafe: true`。 |
 | 停止后显示 `Disabled`，但 symbol 容器仍在运行 | 管理器只写期望状态。检查 `kubectl -n match-control logs deploy/match-operator` 是否有 StatefulSet apply 错误。被接管的 StatefulSet 可能保留 `kubectl-client-side-apply` 的 list 所有权，删除容器时 SSA 校验会失败（`containers[0].image: Required value`）。Operator v6+ 会自动对该 StatefulSet 改用 merge patch 重试。用 `kubectl -n match-eu-1 get sts <shard> -o jsonpath='{.status.updatedReplicas}'` 和 operator 的 `deleted one outdated pod` 日志确认滚动。 |
 | 删除返回 `409 shard_not_idle` | 先停止 shard 中所有 symbol；错误会列出活跃项。Apply 更新后的 ConfigMap 后重试。 |
 | `drop` 返回 `200` 但 Pod/StatefulSet 仍存在 | 管理器只写期望状态。用删除前保存的 manifests 执行 `kubectl -n match-eu-1 delete -f /tmp/<shard>-manifests.json --ignore-not-found`。 |

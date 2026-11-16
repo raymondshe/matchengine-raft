@@ -604,6 +604,9 @@ fn stateful_set(ctx: &Ctx<'_>) -> Value {
                     "labels": labels_value(&pod_labels),
                     "annotations": {
                         "matching.io/config-render": "demos/k8s_control_plane",
+                        "matching.io/release-wire": ctx.shard.spec.release.wire_version.to_string(),
+                        "matching.io/release-snapshot": ctx.shard.spec.release.snapshot_version.to_string(),
+                        "matching.io/release-mixed-safe": ctx.shard.spec.release.mixed_version_safe.to_string(),
                     },
                 },
                 "spec": pod_spec,
@@ -838,6 +841,9 @@ fn supervisor_stateful_set(ctx: &Ctx<'_>) -> Value {
                     "labels": labels_value(&pod_labels),
                     "annotations": {
                         "matching.io/config-render": "demos/k8s_control_plane",
+                        "matching.io/release-wire": ctx.shard.spec.release.wire_version.to_string(),
+                        "matching.io/release-snapshot": ctx.shard.spec.release.snapshot_version.to_string(),
+                        "matching.io/release-mixed-safe": ctx.shard.spec.release.mixed_version_safe.to_string(),
                     },
                 },
                 "spec": pod_spec,
@@ -949,10 +955,7 @@ fn container(ctx: &Ctx<'_>, deployment: &SymbolDeployment, symbol: &TradingSymbo
 /// Same-version restarts are always safe. A different wire/snapshot version is stop-the-world
 /// unless the target release declares mixed-version support.
 pub fn rolling_upgrade_safe(shard: &SymbolShard, target_release: &crate::model::Release) -> bool {
-    let current = &shard.spec.release;
-    (current.wire_version == target_release.wire_version
-        && current.snapshot_version == target_release.snapshot_version)
-        || target_release.mixed_version_safe
+    shard.spec.release.can_roll_to(target_release)
 }
 
 #[cfg(test)]
@@ -965,6 +968,17 @@ mod tests {
             .iter()
             .find(|o| o["kind"] == kind)
             .unwrap_or_else(|| panic!("missing {kind}"))
+    }
+
+    #[test]
+    fn statefulset_template_records_release_annotations() {
+        let catalog = demo_catalog();
+        let objects = render_shard(&catalog, "fx-eu-01", &RenderOptions::default()).unwrap();
+        let annotations =
+            &object(&objects, "StatefulSet")["spec"]["template"]["metadata"]["annotations"];
+        assert_eq!(annotations["matching.io/release-wire"], "7");
+        assert_eq!(annotations["matching.io/release-snapshot"], "11");
+        assert_eq!(annotations["matching.io/release-mixed-safe"], "false");
     }
 
     #[test]

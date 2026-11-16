@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::ApiError;
 use crate::model::{
-    DeploymentState, PackingMode, Phase, Placement, RouteSpec, RouteState, ShardStatus,
+    DeploymentState, PackingMode, Phase, Placement, Release, RouteSpec, RouteState, ShardStatus,
     SymbolDeployment, SymbolRoute, SymbolShard, TradingSymbol, dns_label,
 };
 use crate::store::Catalog;
@@ -177,6 +177,152 @@ pub fn create_empty_shard(
         ),
     );
     Ok(shard)
+}
+
+/// Result of changing a shard's image and release.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpgradeShardResult {
+    pub shard: String,
+    pub image: String,
+    pub release: Release,
+    /// `containers` or `supervisor`.
+    pub mode: String,
+    pub changed: bool,
+    pub steps: Vec<LifecycleStep>,
+    pub notes: Vec<String>,
+}
+
+/// Write a new image/release to a shard. The operator owns the actual pod rollout.
+pub fn upgrade_shard(
+    catalog: &mut Catalog,
+    shard_name: &str,
+    image: String,
+    release: Release,
+) -> Result<UpgradeShardResult, ApiError> {
+    let shard = catalog.shards.get(shard_name).cloned().ok_or_else(|| {
+        ApiError::not_found("shard_not_found", format!("unknown shard {shard_name}"))
+    })?;
+    if shard.spec.paused {
+        return Err(ApiError::conflict(
+            "shard_paused",
+            format!("shard {shard_name} is paused; resume it before changing the image"),
+        ));
+    }
+    let image = image.trim().to_string();
+    if image.is_empty() {
+        return Err(ApiError::bad_request(
+            "image",
+            "target image must not be empty",
+        ));
+    }
+    if release.wire_version == 0 || release.snapshot_version == 0 {
+        return Err(ApiError::bad_request(
+            "release",
+            "wireVersion and snapshotVersion must be greater than zero",
+        ));
+    }
+    let overrides: Vec<String> = catalog
+        .deployments
+        .values()
+        .filter(|deployment| {
+            deployment.spec.shard_ref == shard_name && deployment.spec.image.is_some()
+        })
+        .map(|deployment| deployment.name.clone())
+        .collect();
+    if !overrides.is_empty() {
+        return Err(ApiError::conflict(
+            "deployment_image_override",
+            format!(
+                "shard {shard_name} has per-deployment image overrides ({}); update or clear them before a shard-wide upgrade",
+                overrides.join(", ")
+            ),
+        ));
+    }
+    if !shard.spec.release.can_roll_to(&release) {
+        return Err(ApiError::conflict(
+            "release_incompatible",
+            format!(
+                "current wire v{}/snapshot v{} cannot roll to target wire v{}/snapshot v{}; use a stop-the-world upgrade or set mixedVersionSafe only when the target image supports mixed peers",
+                shard.spec.release.wire_version,
+                shard.spec.release.snapshot_version,
+                release.wire_version,
+                release.snapshot_version
+            ),
+        ));
+    }
+
+    let changed = shard.spec.image != image || shard.spec.release != release;
+    let mode = if shard.spec.packing.mode == PackingMode::Supervisor {
+        "supervisor"
+    } else {
+        "containers"
+    };
+    if !changed {
+        return Ok(UpgradeShardResult {
+            shard: shard.name,
+            image,
+            release,
+            mode: mode.to_string(),
+            changed: false,
+            steps: Vec::new(),
+            notes: vec!["the shard already has this image and release".to_string()],
+        });
+    }
+
+    let mut candidate = catalog.clone();
+    if let Some(target) = candidate.shards.get_mut(shard_name) {
+        target.spec.image = image.clone();
+        target.spec.release = release.clone();
+        target.status.phase = Phase::Pending;
+        target.status.rollout = None;
+        target.status.release_block = None;
+        target.status.capacity_block = None;
+        target.status.conditions.clear();
+    }
+    let report = validate_catalog(&candidate);
+    if !report.is_ok() {
+        return Err(ApiError::unprocessable(report));
+    }
+
+    *catalog = candidate;
+    catalog.audit(
+        "api",
+        "upgrade-shard",
+        shard_name,
+        format!(
+            "{} on shard {}; release wire v{} snapshot v{} mixedSafe={}",
+            image,
+            shard_name,
+            release.wire_version,
+            release.snapshot_version,
+            release.mixed_version_safe
+        ),
+    );
+
+    Ok(UpgradeShardResult {
+        shard: shard_name.to_string(),
+        image,
+        release,
+        mode: mode.to_string(),
+        changed: true,
+        steps: vec![
+            LifecycleStep {
+                action: "update-statefulset".to_string(),
+                detail: "operator applies the new image and release to the StatefulSet pod template".to_string(),
+            },
+            LifecycleStep {
+                action: "rollout".to_string(),
+                detail: format!(
+                    "operator replaces {shard_name} pods one at a time with leader transfer and quorum/child-readiness checks; progress is in SymbolShard.status.rollout"
+                ),
+            },
+        ],
+        notes: vec![
+            "the operator release gate still blocks the rollout if the live pods report an incompatible release"
+                .to_string(),
+        ],
+    })
 }
 
 /// Place a new symbol in an explicit or automatically selected shard.
@@ -1481,6 +1627,82 @@ mod tests {
             .packing
             .mode = PackingMode::Supervisor;
         catalog
+    }
+
+    #[test]
+    fn upgrade_shard_writes_image_and_release() {
+        let mut catalog = demo_catalog();
+        let release = Release {
+            wire_version: 7,
+            snapshot_version: 11,
+            mixed_version_safe: false,
+        };
+        let result = upgrade_shard(
+            &mut catalog,
+            "fx-eu-01",
+            "matchengine-raft@sha256:abc".to_string(),
+            release.clone(),
+        )
+        .unwrap();
+        assert!(result.changed);
+        assert_eq!(
+            catalog.shards["fx-eu-01"].spec.image,
+            "matchengine-raft@sha256:abc"
+        );
+        assert_eq!(catalog.shards["fx-eu-01"].spec.release, release);
+        assert_eq!(catalog.shards["fx-eu-01"].status.phase, Phase::Pending);
+    }
+
+    #[test]
+    fn upgrade_shard_is_a_noop_for_the_current_image_and_release() {
+        let mut catalog = demo_catalog();
+        let shard = catalog.shards["fx-eu-01"].clone();
+        let result = upgrade_shard(
+            &mut catalog,
+            "fx-eu-01",
+            shard.spec.image,
+            shard.spec.release,
+        )
+        .unwrap();
+        assert!(!result.changed);
+        assert!(result.steps.is_empty());
+        assert_eq!(
+            result.notes[0],
+            "the shard already has this image and release"
+        );
+        assert_eq!(catalog.shards["fx-eu-01"].status.phase, shard.status.phase);
+    }
+
+    #[test]
+    fn upgrade_shard_rejects_incompatible_release() {
+        let mut catalog = demo_catalog();
+        let err = upgrade_shard(
+            &mut catalog,
+            "fx-eu-01",
+            "matchengine-raft@sha256:abc".to_string(),
+            Release {
+                wire_version: 8,
+                snapshot_version: 12,
+                mixed_version_safe: false,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "release_incompatible");
+    }
+
+    #[test]
+    fn upgrade_shard_rejects_per_deployment_image_override() {
+        let mut catalog = demo_catalog();
+        catalog.deployments.get_mut("eurusd-g1").unwrap().spec.image =
+            Some("matchengine-raft@sha256:override".to_string());
+        let err = upgrade_shard(
+            &mut catalog,
+            "fx-eu-01",
+            "matchengine-raft@sha256:abc".to_string(),
+            Release::default(),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "deployment_image_override");
     }
 
     #[test]

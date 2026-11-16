@@ -13,7 +13,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use futures::StreamExt;
 use k8s_openapi::api::apps::v1::StatefulSet;
 use k8s_openapi::api::coordination::v1::{Lease, LeaseSpec};
-use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Pod};
+use k8s_openapi::api::core::v1::{Node, PersistentVolumeClaim, Pod};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{MicroTime, ObjectMeta};
 use k8s_openapi::jiff::Timestamp;
 use kube::Client;
@@ -29,19 +29,21 @@ use tracing::{debug, info, warn};
 use crate::api::{format_bytes, format_cpu};
 use crate::crd::{self, CrdKind, DEFAULT_NAMESPACE, ObjectKey};
 use crate::model::{
-    Condition, DeploymentState, DeploymentStatus, PackingMode, Phase, RouteState, RouteStatus,
-    ShardClass, ShardNodeStatus, ShardRolloutStatus, ShardStatus, ShardSymbolStatus,
-    SymbolDeployment, SymbolRoute, SymbolShard, TradingSymbol, TradingSymbolStatus,
-    desired_config_hash,
+    CapacityBlock, Condition, DeploymentState, DeploymentStatus, PackingMode, Phase, Release,
+    ReleaseBlock, RouteState, RouteStatus, ShardClass, ShardNodeStatus, ShardRolloutStatus,
+    ShardStatus, ShardSymbolStatus, SymbolDeployment, SymbolRoute, SymbolShard, TradingSymbol,
+    TradingSymbolStatus, desired_config_hash,
 };
 use crate::render::{MANAGED_BY, Profile, RenderOptions, render_shard};
 use crate::store::Catalog;
-use crate::validate::per_pod_totals;
+use crate::validate::{parse_cpu_millis, parse_memory_bytes, per_pod_totals};
 
 const FIELD_MANAGER: &str = "match-engine-operator";
 const LEADER_LABEL: &str = "matching.io/role";
 const RETAIN_UNTIL_ANNOTATION: &str = "matching.io/retain-until";
 const RETAINED_AT_ANNOTATION: &str = "matching.io/retained-at";
+const RELEASE_WIRE_ANNOTATION: &str = "matching.io/release-wire";
+const RELEASE_SNAPSHOT_ANNOTATION: &str = "matching.io/release-snapshot";
 /// Maximum applied-index gap tolerated before promoting new voters.
 const MEMBERSHIP_CATCH_UP_LAG: u64 = 128;
 
@@ -115,6 +117,7 @@ pub async fn run(client: Client, options: OperatorOptions) -> Result<()> {
                 membership_changes = stats.membership_changes,
                 config_writes = stats.config_writes,
                 rollouts = stats.rollouts,
+                capacity_blocks = stats.capacity_blocks,
                 retention_marks = stats.retention_marks,
                 retention_deletes = stats.retention_deletes,
                 pvc_labels = stats.pvc_labels,
@@ -420,6 +423,7 @@ struct ReconcileStats {
     membership_changes: usize,
     config_writes: usize,
     rollouts: usize,
+    capacity_blocks: usize,
     retention_marks: usize,
     retention_deletes: usize,
     pvc_labels: usize,
@@ -518,9 +522,18 @@ async fn reconcile_once(client: &Client, options: &OperatorOptions) -> Result<Re
         }
     }
     stats.desired_objects = desired.len();
+    let capacity_blocks = if options.dry_run {
+        BTreeMap::new()
+    } else {
+        capacity_preflight(client, &desired, &view.catalog).await?
+    };
+    stats.capacity_blocks = capacity_blocks.len();
 
     if !options.dry_run {
         for (key, object) in &desired {
+            if key.kind == WorkloadKind::StatefulSet && capacity_blocks.contains_key(&key.name) {
+                continue;
+            }
             apply_object(client, key, object).await?;
             stats.applied += 1;
         }
@@ -550,8 +563,16 @@ async fn reconcile_once(client: &Client, options: &OperatorOptions) -> Result<Re
         stats.config_writes = actions.config_writes;
         stats.action_failures = actions.failures;
         stats.migration_actions = execute_migrations(client, &view, &observations, options).await?;
-        stats.rollouts = rollout_containers(client, &view.catalog, &observations).await?;
-        stats.status_writes = write_statuses(client, &view, &observations).await?;
+        let rollout = rollout_shards(client, &view.catalog, &observations).await?;
+        stats.rollouts = rollout.actions;
+        stats.status_writes = write_statuses(
+            client,
+            &view,
+            &observations,
+            &rollout.release_blocks,
+            &capacity_blocks,
+        )
+        .await?;
         label_leaders(client, &view.catalog, &observations).await?;
     } else {
         info!(
@@ -2040,15 +2061,260 @@ async fn reconcile_retention(
     Ok((marks, deletes))
 }
 
-async fn rollout_containers(
+#[derive(Default)]
+struct RolloutOutcome {
+    actions: usize,
+    release_blocks: BTreeMap<String, ReleaseBlock>,
+}
+
+async fn capacity_preflight(
+    client: &Client,
+    desired: &BTreeMap<WorkloadKey, Value>,
+    catalog: &Catalog,
+) -> Result<BTreeMap<String, CapacityBlock>> {
+    let nodes = Api::<Node>::all(client.clone())
+        .list(&ListParams::default())
+        .await
+        .context("list nodes for capacity preflight")?;
+    let pods = Api::<Pod>::all(client.clone())
+        .list(&ListParams::default())
+        .await
+        .context("list pods for capacity preflight")?;
+
+    let mut allocatable = BTreeMap::<String, (u64, u64)>::new();
+    for node in &nodes.items {
+        if node.spec.as_ref().and_then(|spec| spec.unschedulable) == Some(true) {
+            continue;
+        }
+        let Some(name) = node.metadata.name.as_deref() else {
+            continue;
+        };
+        let Some(quantities) = node
+            .status
+            .as_ref()
+            .and_then(|status| status.allocatable.as_ref())
+        else {
+            continue;
+        };
+        let cpu = quantities
+            .get("cpu")
+            .and_then(|quantity| parse_cpu_millis(&quantity.0).ok())
+            .unwrap_or(0);
+        let memory = quantities
+            .get("memory")
+            .and_then(|quantity| parse_memory_bytes(&quantity.0).ok())
+            .unwrap_or(0);
+        if cpu > 0 || memory > 0 {
+            allocatable.insert(name.to_string(), (cpu, memory));
+        }
+    }
+    if allocatable.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+
+    let mut node_used = BTreeMap::<String, (u64, u64)>::new();
+    let mut shard_used = BTreeMap::<String, BTreeMap<String, (u64, u64)>>::new();
+    for pod in &pods.items {
+        if pod
+            .status
+            .as_ref()
+            .and_then(|status| status.phase.as_deref())
+            .is_some_and(|phase| phase == "Succeeded" || phase == "Failed")
+        {
+            continue;
+        }
+        let Some(node) = pod.spec.as_ref().and_then(|spec| spec.node_name.as_deref()) else {
+            continue;
+        };
+        let (cpu, memory) = pod_requests(pod);
+        if cpu == 0 && memory == 0 {
+            continue;
+        }
+        let used = node_used.entry(node.to_string()).or_default();
+        used.0 = used.0.saturating_add(cpu);
+        used.1 = used.1.saturating_add(memory);
+        if let Some(shard) = pod
+            .metadata
+            .labels
+            .as_ref()
+            .and_then(|labels| labels.get("matching.io/cluster"))
+        {
+            let per_shard = shard_used.entry(shard.clone()).or_default();
+            let shard_node = per_shard.entry(node.to_string()).or_default();
+            shard_node.0 = shard_node.0.saturating_add(cpu);
+            shard_node.1 = shard_node.1.saturating_add(memory);
+        }
+    }
+
+    let blocks = capacity_blocks_for(desired, catalog, &allocatable, &node_used, &shard_used);
+    if !blocks.is_empty() {
+        warn!(
+            shards = blocks.len(),
+            "capacity preflight blocked StatefulSet apply"
+        );
+    }
+    Ok(blocks)
+}
+
+fn capacity_blocks_for(
+    desired: &BTreeMap<WorkloadKey, Value>,
+    catalog: &Catalog,
+    allocatable: &BTreeMap<String, (u64, u64)>,
+    node_used: &BTreeMap<String, (u64, u64)>,
+    shard_used: &BTreeMap<String, BTreeMap<String, (u64, u64)>>,
+) -> BTreeMap<String, CapacityBlock> {
+    let mut blocks = BTreeMap::new();
+    for (key, object) in desired {
+        if key.kind != WorkloadKind::StatefulSet {
+            continue;
+        }
+        let Some(shard) = catalog.shards.get(&key.name) else {
+            continue;
+        };
+        let (per_pod_cpu, per_pod_memory) = desired_pod_requests(object);
+        if per_pod_cpu == 0 && per_pod_memory == 0 {
+            continue;
+        }
+        let replicas = object
+            .pointer("/spec/replicas")
+            .and_then(Value::as_u64)
+            .unwrap_or(u64::from(shard.spec.replicas));
+        let cluster_cpu = per_pod_cpu.saturating_mul(replicas);
+        let cluster_memory = per_pod_memory.saturating_mul(replicas);
+        let empty = BTreeMap::new();
+        let current = shard_used.get(&key.name).unwrap_or(&empty);
+
+        let mut free_cpu = 0u64;
+        let mut free_memory = 0u64;
+        let mut max_free_cpu = 0u64;
+        let mut max_free_memory = 0u64;
+        for (node, (alloc_cpu, alloc_memory)) in allocatable {
+            let used = node_used.get(node).copied().unwrap_or_default();
+            let shard_used = current.get(node).copied().unwrap_or_default();
+            let other_cpu = used.0.saturating_sub(shard_used.0);
+            let other_memory = used.1.saturating_sub(shard_used.1);
+            let available_cpu = alloc_cpu.saturating_sub(other_cpu);
+            let available_memory = alloc_memory.saturating_sub(other_memory);
+            free_cpu = free_cpu.saturating_add(available_cpu);
+            free_memory = free_memory.saturating_add(available_memory);
+            max_free_cpu = max_free_cpu.max(available_cpu);
+            max_free_memory = max_free_memory.max(available_memory);
+        }
+
+        let block = |reason: &str, message: String| CapacityBlock {
+            reason: reason.to_string(),
+            message,
+            per_pod_cpu_millis: per_pod_cpu,
+            per_pod_memory_bytes: per_pod_memory,
+            cluster_cpu_millis: cluster_cpu,
+            cluster_memory_bytes: cluster_memory,
+            free_cpu_millis: free_cpu,
+            free_memory_bytes: free_memory,
+        };
+        if per_pod_cpu > max_free_cpu || per_pod_memory > max_free_memory {
+            blocks.insert(
+                key.name.clone(),
+                block(
+                    "pod_does_not_fit",
+                    format!(
+                        "one rendered pod requests {} CPU / {} memory, but the largest free node capacity is {} CPU / {} memory after excluding this shard",
+                        format_cpu(per_pod_cpu),
+                        format_bytes(per_pod_memory),
+                        format_cpu(max_free_cpu),
+                        format_bytes(max_free_memory)
+                    ),
+                ),
+            );
+            continue;
+        }
+        if cluster_cpu > free_cpu || cluster_memory > free_memory {
+            blocks.insert(
+                key.name.clone(),
+                block(
+                    "aggregate_capacity",
+                    format!(
+                        "{replicas} rendered pods request {} CPU / {} memory, but cluster free capacity is {} CPU / {} memory after excluding this shard",
+                        format_cpu(cluster_cpu),
+                        format_bytes(cluster_memory),
+                        format_cpu(free_cpu),
+                        format_bytes(free_memory)
+                    ),
+                ),
+            );
+        }
+    }
+    blocks
+}
+
+fn desired_pod_requests(object: &Value) -> (u64, u64) {
+    object
+        .pointer("/spec/template/spec/containers")
+        .and_then(Value::as_array)
+        .map(|containers| {
+            containers
+                .iter()
+                .fold((0u64, 0u64), |(cpu, memory), container| {
+                    let requests = container.pointer("/resources/requests");
+                    (
+                        cpu.saturating_add(
+                            requests
+                                .and_then(|requests| requests.get("cpu"))
+                                .and_then(Value::as_str)
+                                .and_then(|value| parse_cpu_millis(value).ok())
+                                .unwrap_or(0),
+                        ),
+                        memory.saturating_add(
+                            requests
+                                .and_then(|requests| requests.get("memory"))
+                                .and_then(Value::as_str)
+                                .and_then(|value| parse_memory_bytes(value).ok())
+                                .unwrap_or(0),
+                        ),
+                    )
+                })
+        })
+        .unwrap_or_default()
+}
+
+fn pod_requests(pod: &Pod) -> (u64, u64) {
+    pod.spec
+        .as_ref()
+        .map(|spec| {
+            spec.containers
+                .iter()
+                .fold((0u64, 0u64), |(cpu, memory), container| {
+                    let requests = container
+                        .resources
+                        .as_ref()
+                        .and_then(|resources| resources.requests.as_ref());
+                    (
+                        cpu.saturating_add(
+                            requests
+                                .and_then(|requests| requests.get("cpu"))
+                                .and_then(|quantity| parse_cpu_millis(&quantity.0).ok())
+                                .unwrap_or(0),
+                        ),
+                        memory.saturating_add(
+                            requests
+                                .and_then(|requests| requests.get("memory"))
+                                .and_then(|quantity| parse_memory_bytes(&quantity.0).ok())
+                                .unwrap_or(0),
+                        ),
+                    )
+                })
+        })
+        .unwrap_or_default()
+}
+
+async fn rollout_shards(
     client: &Client,
     catalog: &Catalog,
     observations: &Observations,
-) -> Result<usize> {
+) -> Result<RolloutOutcome> {
     let http = reqwest::Client::new();
-    let mut actions = 0;
+    let mut outcome = RolloutOutcome::default();
     for shard in catalog.shards.values() {
-        if shard.spec.paused || shard.spec.packing.mode != PackingMode::Containers {
+        if shard.spec.paused {
             continue;
         }
         let active: Vec<&SymbolDeployment> = catalog
@@ -2103,6 +2369,16 @@ async fn rollout_containers(
         if outdated.is_empty() {
             continue;
         }
+        if let Some(block) = release_block_for_pods(shard, &stateful_set, &pods.items) {
+            warn!(
+                shard = %shard.name,
+                reason = %block.reason,
+                message = %block.message,
+                "containers rollout blocked by release compatibility"
+            );
+            outcome.release_blocks.insert(shard.name.clone(), block);
+            continue;
+        }
         let leader_pods: BTreeSet<&str> = active
             .iter()
             .filter_map(|deployment| observations.get(&deployment.name))
@@ -2150,7 +2426,7 @@ async fn rollout_containers(
             break;
         }
         if transferred > 0 {
-            actions += transferred;
+            outcome.actions += transferred;
         }
         let Some((_, candidate_name)) = candidate else {
             continue;
@@ -2161,12 +2437,12 @@ async fn rollout_containers(
             .await
         {
             Ok(_) => {
-                actions += 1;
+                outcome.actions += 1;
                 info!(
                     shard = %shard.name,
                     pod = %candidate_name,
                     revision = %update_revision,
-                    "deleted one outdated pod for containers rollout"
+                    "deleted one outdated pod for shard rollout"
                 );
             }
             Err(kube::Error::Api(error)) if error.code == 404 => {}
@@ -2176,7 +2452,120 @@ async fn rollout_containers(
             }
         }
     }
-    Ok(actions)
+    Ok(outcome)
+}
+
+fn release_block_for_pods(
+    shard: &SymbolShard,
+    stateful_set: &StatefulSet,
+    pods: &[Pod],
+) -> Option<ReleaseBlock> {
+    let target_images: BTreeMap<&str, &str> = stateful_set
+        .spec
+        .template
+        .spec
+        .as_ref()
+        .map(|spec| {
+            spec.containers
+                .iter()
+                .filter_map(|container| {
+                    Some((
+                        container.name.as_str(),
+                        container
+                            .image
+                            .as_deref()
+                            .filter(|image| !image.is_empty())?,
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut image_changed = false;
+    for pod in pods
+        .iter()
+        .filter(|pod| pod.metadata.deletion_timestamp.is_none())
+    {
+        for container in pod
+            .spec
+            .as_ref()
+            .map(|spec| spec.containers.as_slice())
+            .unwrap_or_default()
+        {
+            if let Some(target_image) = target_images.get(container.name.as_str())
+                && container.image.as_deref() != Some(*target_image)
+            {
+                image_changed = true;
+            }
+        }
+    }
+    if !image_changed {
+        return None;
+    }
+
+    let target = &shard.spec.release;
+    let mut current: Option<(u16, u16)> = None;
+    let mut missing = false;
+    let mut mixed = false;
+    for pod in pods
+        .iter()
+        .filter(|pod| pod.metadata.deletion_timestamp.is_none())
+    {
+        let annotations = pod.metadata.annotations.as_ref();
+        let wire = annotations
+            .and_then(|annotations| annotations.get(RELEASE_WIRE_ANNOTATION))
+            .and_then(|value| value.parse::<u16>().ok());
+        let snapshot = annotations
+            .and_then(|annotations| annotations.get(RELEASE_SNAPSHOT_ANNOTATION))
+            .and_then(|value| value.parse::<u16>().ok());
+        let (Some(wire), Some(snapshot)) = (wire, snapshot) else {
+            missing = true;
+            continue;
+        };
+        match current {
+            Some(existing) if existing != (wire, snapshot) => mixed = true,
+            None => current = Some((wire, snapshot)),
+            Some(_) => {}
+        }
+    }
+
+    let block = |reason: &str, message: String| ReleaseBlock {
+        reason: reason.to_string(),
+        message,
+        current_wire_version: current.map(|(wire, _)| wire),
+        current_snapshot_version: current.map(|(_, snapshot)| snapshot),
+        target_wire_version: target.wire_version,
+        target_snapshot_version: target.snapshot_version,
+    };
+    if missing {
+        return Some(block(
+            "release_metadata_missing",
+            "one or more existing pods have no applied wire/snapshot annotations; cannot prove the image roll is compatible".to_string(),
+        ));
+    }
+    if mixed {
+        return Some(block(
+            "mixed_release",
+            "existing pods report more than one wire/snapshot release; inspect before rolling"
+                .to_string(),
+        ));
+    }
+    let (current_wire, current_snapshot) =
+        current.unwrap_or((target.wire_version, target.snapshot_version));
+    let current_release = Release {
+        wire_version: current_wire,
+        snapshot_version: current_snapshot,
+        mixed_version_safe: false,
+    };
+    if !current_release.can_roll_to(target) {
+        return Some(block(
+            "stop_the_world_required",
+            format!(
+                "current wire v{current_wire}/snapshot v{current_snapshot} is incompatible with target wire v{}/snapshot v{}; a one-pod-at-a-time roll would mix incompatible peers",
+                target.wire_version, target.snapshot_version
+            ),
+        ));
+    }
+    None
 }
 
 fn pod_running(pod: &Pod) -> bool {
@@ -2210,9 +2599,11 @@ fn pod_has_container(pod: &Pod, name: &str) -> bool {
 
 /// Returns true when removing `pod` leaves a healthy quorum for every active process it hosts.
 ///
-/// Processes whose container is absent from the pod (for example a symbol that is still being
-/// added) are unaffected by the removal. A process that is already below quorum blocks the roll
-/// because replacing one of its remaining members would make the loss worse.
+/// In containers mode, processes whose container is absent from the pod (for example a symbol
+/// that is still being added) are unaffected by the removal. In supervisor mode every active
+/// child is hosted by the supervisor container, so all of them must remain quorate. A process
+/// that is already below quorum blocks the roll because replacing one of its remaining members
+/// would make the loss worse.
 fn processes_tolerate_removal(
     shard: &SymbolShard,
     active: &[&SymbolDeployment],
@@ -2220,11 +2611,12 @@ fn processes_tolerate_removal(
     pod: &Pod,
 ) -> bool {
     let quorum = usize::from(shard.spec.replicas) / 2 + 1;
+    let supervisor = shard.spec.packing.mode == PackingMode::Supervisor;
     let Some(index) = pod_index(pod) else {
         return false;
     };
     for deployment in active {
-        if !pod_has_container(pod, &deployment.spec.symbol_ref) {
+        if !supervisor && !pod_has_container(pod, &deployment.spec.symbol_ref) {
             continue;
         }
         let Some(observation) = observations.get(&deployment.name) else {
@@ -2470,6 +2862,8 @@ fn shard_status(
     observations: &Observations,
     observed_generation: u64,
     rollout: Option<&ShardRolloutStatus>,
+    release_block: Option<&ReleaseBlock>,
+    capacity_block: Option<&CapacityBlock>,
 ) -> ShardStatus {
     let deployments = catalog.shard_deployments(&shard.name);
     let active: Vec<&SymbolDeployment> = deployments
@@ -2528,17 +2922,19 @@ fn shard_status(
                 .is_some_and(|observation| observation.ready && observation.configured)
         })
         .count();
+    let any_pod_ready = active.iter().any(|deployment| {
+        observations
+            .get(&deployment.name)
+            .is_some_and(|observation| observation.pods.iter().any(|pod| pod.ready))
+    });
+    let rollout_active = rollout.is_some_and(|rollout| !rollout.complete);
     let phase = if active.is_empty() {
         Phase::Reserved
     } else if ready_count == active.len() {
         Phase::Ready
-    } else if ready_count > 0
-        || active.iter().any(|deployment| {
-            observations
-                .get(&deployment.name)
-                .is_some_and(|observation| observation.pods.iter().any(|pod| pod.ready))
-        })
-    {
+    } else if rollout_active && any_pod_ready {
+        Phase::Progressing
+    } else if ready_count > 0 || any_pod_ready {
         Phase::Degraded
     } else {
         Phase::Pending
@@ -2555,10 +2951,32 @@ fn shard_status(
             },
         )
     };
-    let progress = if phase == Phase::Ready && rollout.is_none_or(|rollout| rollout.complete) {
+    let progress = if release_block.is_some() {
+        Condition::false_("Progressing", "ReleaseBlocked")
+    } else if capacity_block.is_some() {
+        Condition::false_("Progressing", "CapacityBlocked")
+    } else if phase == Phase::Ready && rollout.is_none_or(|rollout| rollout.complete) {
         Condition::false_("Progressing", "Settled")
     } else {
         Condition::true_("Progressing")
+    };
+    let release = match release_block {
+        Some(block) => Condition {
+            kind: "ReleaseCompatible".to_string(),
+            status: "False".to_string(),
+            reason: Some(block.reason.clone()),
+            message: Some(block.message.clone()),
+        },
+        None => Condition::true_("ReleaseCompatible"),
+    };
+    let capacity = match capacity_block {
+        Some(block) => Condition {
+            kind: "CapacityAvailable".to_string(),
+            status: "False".to_string(),
+            reason: Some(block.reason.clone()),
+            message: Some(block.message.clone()),
+        },
+        None => Condition::true_("CapacityAvailable"),
     };
     ShardStatus {
         observed_generation,
@@ -2573,7 +2991,9 @@ fn shard_status(
         symbols,
         nodes,
         rollout: rollout.cloned(),
-        conditions: vec![ready, progress],
+        release_block: release_block.cloned(),
+        capacity_block: capacity_block.cloned(),
+        conditions: vec![ready, progress, release, capacity],
     }
 }
 
@@ -2601,6 +3021,8 @@ async fn write_statuses(
     client: &Client,
     view: &CrdView,
     observations: &Observations,
+    release_blocks: &BTreeMap<String, ReleaseBlock>,
+    capacity_blocks: &BTreeMap<String, CapacityBlock>,
 ) -> Result<usize> {
     let catalog = &view.catalog;
     let rollouts = rollout_statuses(client, catalog).await?;
@@ -2616,6 +3038,8 @@ async fn write_statuses(
             observations,
             generation,
             rollouts.get(&shard.name),
+            release_blocks.get(&shard.name),
+            capacity_blocks.get(&shard.name),
         );
         writes += write_status(
             client,
@@ -2870,7 +3294,7 @@ mod tests {
             ("eurusd-g1".to_string(), observation(true, Some(0))),
             ("gbpusd-g1".to_string(), observation(true, Some(1))),
         ]);
-        let status = shard_status(&shard, &catalog, &observations, 3, None);
+        let status = shard_status(&shard, &catalog, &observations, 3, None, None, None);
         assert_eq!(status.observed_generation, 3);
         assert_eq!(status.phase, Phase::Ready);
         assert_eq!(status.members_per_process, 4);
@@ -2912,6 +3336,60 @@ mod tests {
     }
 
     #[test]
+    fn shard_rollout_reports_progressing_while_not_all_pods_are_ready() {
+        let catalog = demo_catalog();
+        let shard = catalog.shards["fx-eu-01"].clone();
+        let mut observations = Observations::new();
+        for name in ["eurusd-g1", "gbpusd-g1"] {
+            let deployment = catalog.deployments[name].clone();
+            let symbol = catalog.symbols[&deployment.spec.symbol_ref].clone();
+            let desired = desired_symbol_config(&symbol);
+            let pods = (0..shard.spec.replicas)
+                .map(|pod| {
+                    let up = pod != 3;
+                    PodObservation {
+                        pod,
+                        healthy: up,
+                        ready: up,
+                        is_leader: pod == 0,
+                        leader_id: Some(0),
+                        applied_index: Some(10),
+                        last_log_index: Some(10),
+                        symbol_config: Some(desired.clone()),
+                        error: None,
+                        ..PodObservation::default()
+                    }
+                })
+                .collect();
+            observations.insert(
+                name.to_string(),
+                deployment_observation(&shard, &deployment, pods, Some(&desired)),
+            );
+        }
+
+        let rolling = shard_rollout_status(4, 2, 2);
+        let status = shard_status(
+            &shard,
+            &catalog,
+            &observations,
+            1,
+            Some(&rolling),
+            None,
+            None,
+        );
+        assert_eq!(status.phase, Phase::Progressing);
+        assert!(
+            status
+                .conditions
+                .iter()
+                .any(|condition| { condition.kind == "Progressing" && condition.status == "True" })
+        );
+
+        let status = shard_status(&shard, &catalog, &observations, 1, None, None, None);
+        assert_eq!(status.phase, Phase::Degraded);
+    }
+
+    #[test]
     fn shard_nodes_are_ready_when_every_process_reports() {
         let catalog = demo_catalog();
         let shard = catalog.shards["fx-eu-01"].clone();
@@ -2939,14 +3417,22 @@ mod tests {
                 deployment_observation(&shard, &deployment, pods, Some(&desired)),
             );
         }
-        let status = shard_status(&shard, &catalog, &observations, 1, None);
+        let status = shard_status(&shard, &catalog, &observations, 1, None, None, None);
         assert_eq!(status.phase, Phase::Ready);
         assert_eq!(status.nodes.len(), 4);
         assert!(status.nodes.iter().all(|node| node.ready));
         assert_eq!(status.nodes[0].processes, 2);
 
         let rolling = shard_rollout_status(4, 2, 2);
-        let status = shard_status(&shard, &catalog, &observations, 1, Some(&rolling));
+        let status = shard_status(
+            &shard,
+            &catalog,
+            &observations,
+            1,
+            Some(&rolling),
+            None,
+            None,
+        );
         assert_eq!(status.phase, Phase::Ready);
         assert!(
             status
@@ -2957,7 +3443,7 @@ mod tests {
         );
 
         let done = shard_rollout_status(4, 4, 4);
-        let status = shard_status(&shard, &catalog, &observations, 1, Some(&done));
+        let status = shard_status(&shard, &catalog, &observations, 1, Some(&done), None, None);
         assert!(
             status
                 .conditions
@@ -3111,6 +3597,270 @@ mod tests {
         let catalog = demo_catalog();
         let deployments: Vec<&SymbolDeployment> = catalog.shard_deployments("me-btcusdt");
         assert_eq!(deployments.len(), 1);
+    }
+
+    fn release_stateful_set(image: &str) -> StatefulSet {
+        StatefulSet {
+            spec: k8s_openapi::api::apps::v1::StatefulSetSpec {
+                selector: k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector::default(),
+                service_name: Some("fx-eu-01-headless".to_string()),
+                template: k8s_openapi::api::core::v1::PodTemplateSpec {
+                    spec: Some(k8s_openapi::api::core::v1::PodSpec {
+                        containers: vec![k8s_openapi::api::core::v1::Container {
+                            name: "eurusd".to_string(),
+                            image: Some(image.to_string()),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    fn release_pod(name: &str, image: &str, wire: Option<u16>, snapshot: Option<u16>) -> Pod {
+        let mut annotations = std::collections::BTreeMap::new();
+        if let Some(wire) = wire {
+            annotations.insert(RELEASE_WIRE_ANNOTATION.to_string(), wire.to_string());
+        }
+        if let Some(snapshot) = snapshot {
+            annotations.insert(
+                RELEASE_SNAPSHOT_ANNOTATION.to_string(),
+                snapshot.to_string(),
+            );
+        }
+        Pod {
+            metadata: ObjectMeta {
+                name: Some(name.to_string()),
+                annotations: (!annotations.is_empty()).then_some(annotations),
+                ..Default::default()
+            },
+            spec: Some(k8s_openapi::api::core::v1::PodSpec {
+                containers: vec![k8s_openapi::api::core::v1::Container {
+                    name: "eurusd".to_string(),
+                    image: Some(image.to_string()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn release_gate_blocks_incompatible_image_rolls() {
+        let mut shard = demo_catalog().shards["fx-eu-01"].clone();
+        let old_image = "matchengine-raft:old";
+        let new_image = "matchengine-raft:new";
+        let set = release_stateful_set(new_image);
+
+        assert!(
+            release_block_for_pods(
+                &shard,
+                &release_stateful_set(old_image),
+                &[release_pod("fx-eu-01-0", old_image, None, None)]
+            )
+            .is_none(),
+            "a metadata-only template change does not need a release gate"
+        );
+        assert!(
+            release_block_for_pods(
+                &shard,
+                &set,
+                &[release_pod("fx-eu-01-0", old_image, Some(7), Some(11))]
+            )
+            .is_none(),
+            "same-version image rolls are allowed"
+        );
+
+        shard.spec.release.wire_version = 8;
+        let block = release_block_for_pods(
+            &shard,
+            &set,
+            &[release_pod("fx-eu-01-0", old_image, Some(7), Some(11))],
+        )
+        .expect("incompatible wire versions must block");
+        assert_eq!(block.reason, "stop_the_world_required");
+        assert_eq!(block.current_wire_version, Some(7));
+        assert_eq!(block.target_wire_version, 8);
+
+        shard.spec.release.mixed_version_safe = true;
+        assert!(
+            release_block_for_pods(
+                &shard,
+                &set,
+                &[release_pod("fx-eu-01-0", old_image, Some(7), Some(11))]
+            )
+            .is_none(),
+            "a target that declares mixed-version support may roll"
+        );
+    }
+
+    #[test]
+    fn release_gate_requires_metadata_for_image_changes() {
+        let mut shard = demo_catalog().shards["fx-eu-01"].clone();
+        shard.spec.release.wire_version = 8;
+        let set = release_stateful_set("matchengine-raft:new");
+        let block = release_block_for_pods(
+            &shard,
+            &set,
+            &[release_pod(
+                "fx-eu-01-0",
+                "matchengine-raft:old",
+                None,
+                None,
+            )],
+        )
+        .expect("missing release annotations must block an image change");
+        assert_eq!(block.reason, "release_metadata_missing");
+
+        let mixed = release_block_for_pods(
+            &shard,
+            &set,
+            &[
+                release_pod("fx-eu-01-0", "matchengine-raft:old", Some(7), Some(11)),
+                release_pod("fx-eu-01-1", "matchengine-raft:old", Some(6), Some(11)),
+            ],
+        )
+        .expect("mixed current releases must block");
+        assert_eq!(mixed.reason, "mixed_release");
+    }
+
+    #[test]
+    fn shard_status_surfaces_the_release_block() {
+        let catalog = demo_catalog();
+        let shard = catalog.shards["fx-eu-01"].clone();
+        let block = ReleaseBlock {
+            reason: "stop_the_world_required".to_string(),
+            message: "cannot mix wire versions".to_string(),
+            current_wire_version: Some(7),
+            current_snapshot_version: Some(11),
+            target_wire_version: 8,
+            target_snapshot_version: 12,
+        };
+        let status = shard_status(
+            &shard,
+            &catalog,
+            &Observations::new(),
+            1,
+            None,
+            Some(&block),
+            None,
+        );
+        assert_eq!(status.release_block, Some(block));
+        assert!(status.conditions.iter().any(|condition| {
+            condition.kind == "ReleaseCompatible"
+                && condition.status == "False"
+                && condition.reason.as_deref() == Some("stop_the_world_required")
+        }));
+        assert!(status.conditions.iter().any(|condition| {
+            condition.kind == "Progressing"
+                && condition.status == "False"
+                && condition.reason.as_deref() == Some("ReleaseBlocked")
+        }));
+    }
+
+    #[test]
+    fn shard_status_surfaces_the_capacity_block() {
+        let catalog = demo_catalog();
+        let shard = catalog.shards["fx-eu-01"].clone();
+        let block = CapacityBlock {
+            reason: "pod_does_not_fit".to_string(),
+            message: "one rendered pod requests 1 CPU / 2Gi".to_string(),
+            per_pod_cpu_millis: 1000,
+            per_pod_memory_bytes: 2 * 1024 * 1024 * 1024,
+            cluster_cpu_millis: 4000,
+            cluster_memory_bytes: 8 * 1024 * 1024 * 1024,
+            free_cpu_millis: 500,
+            free_memory_bytes: 1024 * 1024 * 1024,
+        };
+        let status = shard_status(
+            &shard,
+            &catalog,
+            &Observations::new(),
+            1,
+            None,
+            None,
+            Some(&block),
+        );
+        assert_eq!(status.capacity_block, Some(block));
+        assert!(status.conditions.iter().any(|condition| {
+            condition.kind == "CapacityAvailable"
+                && condition.status == "False"
+                && condition.reason.as_deref() == Some("pod_does_not_fit")
+        }));
+        assert!(status.conditions.iter().any(|condition| {
+            condition.kind == "Progressing"
+                && condition.status == "False"
+                && condition.reason.as_deref() == Some("CapacityBlocked")
+        }));
+    }
+
+    #[test]
+    fn supervisor_rollout_waits_for_every_child_quorum() {
+        let catalog = demo_catalog();
+        let mut shard = catalog.shards["fx-eu-01"].clone();
+        shard.spec.packing.mode = PackingMode::Supervisor;
+        let eurgbp = catalog.deployments["eurusd-g1"].clone();
+        let nzdusd = catalog.deployments["gbpusd-g1"].clone();
+        let active = vec![&eurgbp, &nzdusd];
+        let pod = rollout_pod("fx-eu-01-0", "supervisor");
+
+        let healthy: Observations = rollout_observations(&eurgbp, [true; 4])
+            .into_iter()
+            .chain(rollout_observations(&nzdusd, [true; 4]))
+            .collect();
+        assert!(processes_tolerate_removal(&shard, &active, &healthy, &pod));
+
+        let one_child_unready: Observations =
+            rollout_observations(&eurgbp, [true, true, true, false])
+                .into_iter()
+                .chain(rollout_observations(&nzdusd, [true; 4]))
+                .collect();
+        assert!(
+            !processes_tolerate_removal(&shard, &active, &one_child_unready, &pod),
+            "a supervisor pod must not be replaced while any child would lose quorum"
+        );
+    }
+
+    #[test]
+    fn capacity_preflight_blocks_aggregate_and_per_pod_overcommit() {
+        let catalog = demo_catalog();
+        let objects = render_shard(&catalog, "fx-eu-01", &RenderOptions::default()).unwrap();
+        let stateful_set = objects
+            .into_iter()
+            .find(|object| object["kind"] == "StatefulSet")
+            .expect("rendered StatefulSet");
+        let key = workload_key(&stateful_set).expect("workload key");
+        let desired = BTreeMap::from([(key, stateful_set.clone())]);
+        let (cpu, memory) = desired_pod_requests(&stateful_set);
+        assert!(cpu > 0 && memory > 0);
+        let node = "node".to_string();
+        let full = BTreeMap::from([(node.clone(), (cpu * 4, memory * 4))]);
+
+        let existing = BTreeMap::from([(node.clone(), (cpu * 4, memory * 4))]);
+        let shard_existing = BTreeMap::from([("fx-eu-01".to_string(), existing.clone())]);
+        assert!(
+            capacity_blocks_for(&desired, &catalog, &full, &existing, &shard_existing).is_empty(),
+            "the shard's own current pods must not count against its replacement capacity"
+        );
+
+        let other = BTreeMap::from([(node.clone(), (cpu * 3, memory * 3 + 1))]);
+        let block = capacity_blocks_for(&desired, &catalog, &full, &other, &BTreeMap::new())
+            .remove("fx-eu-01")
+            .expect("per-pod overcommit must block");
+        assert_eq!(block.reason, "pod_does_not_fit");
+        assert_eq!(block.per_pod_memory_bytes, memory);
+
+        let other = BTreeMap::from([(node, (cpu * 3, memory * 3))]);
+        let block = capacity_blocks_for(&desired, &catalog, &full, &other, &BTreeMap::new())
+            .remove("fx-eu-01")
+            .expect("aggregate overcommit must block");
+        assert_eq!(block.reason, "aggregate_capacity");
+        assert_eq!(block.cluster_memory_bytes, memory * 4);
     }
 
     fn rollout_pod(name: &str, container: &str) -> Pod {
