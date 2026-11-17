@@ -369,6 +369,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
+        // A changed market-data configuration is part of the child command line.
+        // Restart the affected child so it starts publishing without a manual
+        // removal/re-add; leave children whose placement changed untouched.
+        let mut market_data_restarts = Vec::new();
+        for spec in &desired {
+            if let Some(managed) = children.get(&spec.name)
+                && managed.spec.market_data != spec.market_data
+            {
+                info!(
+                    process = %spec.name,
+                    "market-data configuration changed; restarting child"
+                );
+                market_data_restarts.push(spec.name.clone());
+            }
+        }
+        for name in market_data_restarts {
+            if let Some(mut managed) = children.remove(&name) {
+                terminate(&mut managed.child).await;
+                for task in managed.logs.drain(..) {
+                    task.abort();
+                }
+            }
+            remove_pid_file(&state_dir, &name);
+            backoff.remove(&name);
+            restart_counts.remove(&name);
+        }
+
         // Start missing children, up to the cap.
         for spec in desired.iter().filter(|spec| allowed.contains(&spec.name)) {
             if children.contains_key(&spec.name) {

@@ -71,6 +71,33 @@ fn write_processes(path: &std::path::Path, processes: &[(&str, u16)]) {
     .unwrap();
 }
 
+fn write_processes_with_market_data(
+    path: &std::path::Path,
+    processes: &[(&str, u16, Option<Value>)],
+) {
+    let processes: Vec<Value> = processes
+        .iter()
+        .enumerate()
+        .map(|(slot, (name, port, market_data))| {
+            let mut process = json!({
+                "name": name,
+                "slot": slot,
+                "httpPort": port,
+                "raftPort": port + 1000,
+            });
+            if let Some(market_data) = market_data {
+                process["marketData"] = market_data.clone();
+            }
+            process
+        })
+        .collect();
+    std::fs::write(
+        path,
+        serde_json::to_vec_pretty(&json!({ "processes": processes })).unwrap(),
+    )
+    .unwrap();
+}
+
 async fn status(client: &Client, addr: &str) -> Option<Value> {
     client
         .get(format!("http://{addr}/processes"))
@@ -146,6 +173,82 @@ async fn wait_for_file(path: &std::path::Path, timeout: Duration) -> bool {
         sleep(Duration::from_millis(50)).await;
     }
     false
+}
+
+#[tokio::test]
+async fn changing_market_data_restarts_only_the_affected_child() {
+    let dir = temp_dir();
+    std::fs::create_dir_all(&dir).unwrap();
+    let config = dir.join("processes.json");
+    let engine = script(&dir);
+    write_processes(&config, &[("alpha", 39191), ("beta", 39192)]);
+    let addr = "127.0.0.1:39190";
+
+    let mut supervisor = start_supervisor(&dir, &config, &engine, addr, &[]).await;
+    let client = Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .unwrap();
+    assert!(
+        wait_for(&client, addr, &["alpha", "beta"], Duration::from_secs(10)).await,
+        "children did not start"
+    );
+    assert!(
+        wait_for_file(&dir.join("alpha.pid"), Duration::from_secs(5)).await,
+        "alpha did not write its pid"
+    );
+    assert!(
+        wait_for_file(&dir.join("beta.pid"), Duration::from_secs(5)).await,
+        "beta did not write its pid"
+    );
+    let alpha_before = read_pid(&dir.join("alpha.pid")).expect("alpha pid");
+    let beta_before = read_pid(&dir.join("beta.pid")).expect("beta pid");
+
+    let market_data = json!({
+        "channel": "aeron:udp?endpoint=239.1.2.1:24001|ttl=1",
+        "dir": "/dev/shm/test-alpha",
+        "embedded": true,
+        "heartbeatMs": 1000,
+        "statusEvery": 10,
+        "streamBase": 2001,
+    });
+    write_processes_with_market_data(
+        &config,
+        &[("alpha", 39191, Some(market_data)), ("beta", 39192, None)],
+    );
+
+    let start = Instant::now();
+    let alpha_after = loop {
+        let current = read_pid(&dir.join("alpha.pid"));
+        if let Some(current) = current
+            && current != alpha_before
+            && process_alive(current)
+        {
+            break current;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "alpha did not restart after its market-data configuration changed"
+        );
+        sleep(Duration::from_millis(100)).await;
+    };
+    let beta_after = read_pid(&dir.join("beta.pid")).expect("beta pid after change");
+    assert_eq!(
+        beta_after, beta_before,
+        "beta restarted when alpha's market-data configuration changed"
+    );
+    assert_ne!(alpha_after, alpha_before, "alpha kept its old pid");
+    assert_eq!(
+        unsafe { libc::kill(beta_before, 0) },
+        0,
+        "beta is not alive"
+    );
+
+    unsafe {
+        libc::kill(supervisor.id().unwrap() as i32, libc::SIGTERM);
+    }
+    let _ = tokio::time::timeout(Duration::from_secs(10), supervisor.wait()).await;
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[tokio::test]
