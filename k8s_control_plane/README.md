@@ -668,16 +668,24 @@ the catalog's HTTP ports. The direct pod URL remains in the shard detail payload
 
 ## 🌐 Local ingress for demo hosts
 
-The renderer emits class-less `Ingress` objects for order-system shards and market-data services.
-On OrbStack nothing serves them by default: there is no cloud LoadBalancer, NodePorts are not
-reachable from macOS, and binding port 80 needs root. Install the bundled controller and publish it
-through the Docker front door:
+The renderer emits class-less `Ingress` objects for order-system shards and market-data services;
+`deploy/web-ingress.yaml` adds the control-plane console (`console.match-eu-1.example`), the
+engine-console origin (`engine.match-eu-1.example`) and the order-system selector
+(`orders.match-eu-1.example`). On OrbStack nothing serves them by default: there is no cloud
+LoadBalancer, NodePorts are not reachable from macOS, and binding port 80 needs root. Install the
+bundled controller and publish it through the Docker front door:
 
 ```bash
 kubectl apply -f deploy/ingress-nginx.yaml
 kubectl -n ingress-nginx rollout status deploy/ingress-nginx-controller --timeout=180s
+kubectl apply -f deploy/web-ingress.yaml
 ../scripts/ingress-frontdoor.sh start
 ```
+
+Then open `http://console.match-eu-1.example/` for the control plane,
+`http://engine.match-eu-1.example/` for the engine-console index, or
+`http://orders.match-eu-1.example/` for the order-shard selector. The order shards keep their
+`users-<n>.orders.match-eu-1.example/demo/` hosts.
 
 `deploy/ingress-nginx.yaml` is a single-controller ingress-nginx install that watches Ingresses
 without a class, so the existing objects need no annotation. `scripts/ingress-frontdoor.sh` writes an

@@ -1,0 +1,105 @@
+# Demo web ingress for the control-plane console, the engine consoles and the
+# order-system selector.
+#
+# The market-data and order-system shard Ingresses are rendered from their
+# CRDs. The manager is not a CRD, so its console and the engine-console proxy
+# need a small static Ingress. These are plaintext demo hosts behind the local
+# ingress-nginx controller and front door; TLS and authentication remain P1
+# production work.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: match-manager-console
+  namespace: match-control
+  labels:
+    app.kubernetes.io/name: match-manager
+    app.kubernetes.io/part-of: matchengine
+spec:
+  rules:
+    - host: console.match-eu-1.example
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: match-manager
+                port:
+                  name: http
+---
+# Engine consoles are served by the manager's per-pod console proxy. The
+# manager rewrites the console assets to this same /api/v1 prefix, so a stable
+# engine host only needs the API path. Open a console at:
+#   http://engine.match-eu-1.example/api/v1/shards/<shard>/processes/<symbol>/pods/<pod>/console/
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: match-manager-engine-console
+  namespace: match-control
+  labels:
+    app.kubernetes.io/name: match-manager
+    app.kubernetes.io/part-of: matchengine
+spec:
+  rules:
+    - host: engine.match-eu-1.example
+      http:
+        paths:
+          - path: /api/v1
+            pathType: Prefix
+            backend:
+              service:
+                name: match-manager
+                port:
+                  name: http
+---
+# A friendly engine root: land on the control-plane engine view, where each
+# process has its console link.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: match-manager-engine-index
+  namespace: match-control
+  labels:
+    app.kubernetes.io/name: match-manager
+    app.kubernetes.io/part-of: matchengine
+  annotations:
+    nginx.ingress.kubernetes.io/temporal-redirect: "http://console.match-eu-1.example/?view=engine"
+spec:
+  rules:
+    - host: engine.match-eu-1.example
+      http:
+        paths:
+          - path: /
+            pathType: Exact
+            backend:
+              service:
+                name: match-manager
+                port:
+                  name: http
+---
+# The order system is sharded by user ID; each shard keeps its own
+# users-<n>.orders.match-eu-1.example WebUI. The base host lands on the
+# control-plane order-systems view so users can pick their shard instead of
+# choosing a pod or service IP.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: orders-index
+  namespace: match-control
+  labels:
+    app.kubernetes.io/name: match-manager
+    app.kubernetes.io/part-of: matchengine
+  annotations:
+    nginx.ingress.kubernetes.io/temporal-redirect: "http://console.match-eu-1.example/?view=ordersystem"
+spec:
+  rules:
+    - host: orders.match-eu-1.example
+      http:
+        paths:
+          - path: /
+            pathType: Exact
+            backend:
+              service:
+                name: match-manager
+                port:
+                  name: http

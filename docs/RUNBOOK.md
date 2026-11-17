@@ -536,23 +536,42 @@ the manager and its proxy returns `409 process_disabled`.
 ### Reach the demo ingress hosts
 
 The renderer emits one class-less `Ingress` per order-system shard and per market-data service, with
-Hosts such as `users-0.orders.match-eu-1.example` and `ws-fx-eu-02.match-eu-1.example`. OrbStack has
-no cloud provider, so those Ingresses get no address on their own, and macOS needs root to bind
-port 80. The local demo therefore installs one ingress-nginx controller and publishes its ClusterIP
-through a tiny Docker front door:
+Hosts such as `users-0.orders.match-eu-1.example` and `ws-fx-eu-02.match-eu-1.example`.
+`k8s_control_plane/deploy/web-ingress.yaml` adds the control-plane console, the engine-console proxy
+and the order-system selector hosts. OrbStack has no cloud provider, so those Ingresses get no
+address on their own, and macOS needs root to bind port 80. The local demo therefore installs one
+ingress-nginx controller and publishes its ClusterIP through a tiny Docker front door:
 
 ```sh
 # One class-less controller for every Ingress (demo namespaces included)
 kubectl apply -f k8s_control_plane/deploy/ingress-nginx.yaml
 kubectl -n ingress-nginx rollout status deploy/ingress-nginx-controller --timeout=180s
 
+# Control-plane console, engine-console origin and order-system selector
+kubectl apply -f k8s_control_plane/deploy/web-ingress.yaml
+
 # Publish the controller on the Mac's 127.0.0.1:80 (Docker can bind port 80 without root)
 ./scripts/ingress-frontdoor.sh start
 
-# The shard links and market-data hosts now resolve through OrbStack DNS + the front door
+# The console, shard links and market-data hosts now resolve through OrbStack DNS + the front door
+curl -s -o /dev/null -w '%{http_code}\n' http://console.match-eu-1.example/
 curl -s -o /dev/null -w '%{http_code}\n' http://users-0.orders.match-eu-1.example/demo/
 curl -s -o /dev/null -w '%{http_code}\n' http://ws-fx-eu-02.match-eu-1.example/
 ```
+
+The static web hosts are:
+
+| Host | What it serves |
+|---|---|
+| `console.match-eu-1.example` | Control-plane GUI, manager API and the per-pod engine-console proxy. |
+| `engine.match-eu-1.example` | Stable engine-console origin. The root redirects to `console.match-eu-1.example/?view=engine`; open a console at `http://engine.match-eu-1.example/api/v1/shards/<shard>/processes/<symbol>/pods/<pod>/console/`. |
+| `orders.match-eu-1.example` | Order-system selector. It redirects to `console.match-eu-1.example/?view=ordersystem`; each user shard keeps its own `users-<n>.orders.match-eu-1.example/demo/` WebUI. |
+| `users-<n>.orders.match-eu-1.example` | One order-system user shard (order entry stays here). |
+| `fast-ws-*.match-eu-1.example`, `ws-fx-eu-02.match-eu-1.example` | Market-data fast/terminal WebSocket hosts. |
+
+The manager and order hosts are still plaintext and unauthenticated in the demo. The `orders` base
+host is a selector, not a user-ID-routing gateway; routing a user to the correct shard from one host
+remains the P1 gateway item.
 
 After the rollout, every Ingress shows the controller ClusterIP in `ADDRESS`:
 

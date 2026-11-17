@@ -2002,10 +2002,14 @@ async function boot() {
     selected = shards[0];
     renderShards();
     await loadShard();
-    const initialView = location.hash === "#marketdata-fast" ? "marketdata-fast"
-      : location.hash === "#marketdata-terminal" || location.hash === "#marketdata" ? "marketdata-terminal"
-        : location.hash === "#ordersystem" ? "ordersystem"
-          : "engine";
+    const requestedView = new URLSearchParams(location.search).get("view");
+    const initialView = requestedView === "ordersystem" || requestedView === "marketdata-fast"
+      || requestedView === "marketdata-terminal" || requestedView === "engine"
+      ? requestedView
+      : location.hash === "#marketdata-fast" ? "marketdata-fast"
+        : location.hash === "#marketdata-terminal" || location.hash === "#marketdata" ? "marketdata-terminal"
+          : location.hash === "#ordersystem" ? "ordersystem"
+            : "engine";
     setView(initialView);
     loadAudit();
   } catch (error) {

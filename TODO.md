@@ -159,7 +159,9 @@ run as production evidence for them.
   drain, retries and a canary path. No gateway is deployed in the demo.
 - [ ] **P1** Manager deployment packaging: checked-in Deployment/Service/RBAC/Pod Security/
   NetworkPolicy, Helm/Kustomize, image digest pinning/publishing and etcd/CRD backup integration.
-  No PVC is needed for desired state; an optional volume is only for audit/export caches.
+  No PVC is needed for desired state; an optional volume is only for audit/export caches. The
+  console, engine-console proxy and order selector now have checked-in Ingress hosts
+  (`deploy/web-ingress.yaml`); the workload and packaging manifests remain.
 - [ ] **P1** Order-system public edge: TLS, authentication, rate limits and NetworkPolicy for the
   per-shard WebUI and `/demo/api`; the demo currently exposes plaintext HTTP with no auth. Keep
   order entry in the order system and the manager's role to linking only.
@@ -307,6 +309,14 @@ Completed work is summarised here; detailed evidence, measurements and implement
 in git history and the linked docs. For the full history, check out `TODO.md` from an earlier commit
 (`git log -- TODO.md`).
 
+- **2026-11-17** — Control-plane, engine-console and order-selector domains:
+  `k8s_control_plane/deploy/web-ingress.yaml` publishes `console.match-eu-1.example` (manager GUI,
+  API and per-pod engine-console proxy), `engine.match-eu-1.example` (stable engine-console origin;
+  the root redirects to `console.match-eu-1.example/?view=engine`) and
+  `orders.match-eu-1.example` (order-system selector; the root redirects to
+  `?view=ordersystem`), while each order shard keeps its `users-<n>.orders.match-eu-1.example`
+  WebUI. The GUI accepts `?view=engine|ordersystem|marketdata-terminal|marketdata-fast`, so the
+  redirects open the intended view. Manager and operator are on `operator-v79`.
 - **2026-11-17** — Repeatable operator acceptance harness:
   `scripts/operator-acceptance.sh` drives `run`/`render`/`cleanup` against the live OrbStack fleet
   and asserts rendered templates, readiness, order write/read, explicit leadership transfer,
