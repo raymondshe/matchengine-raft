@@ -2646,21 +2646,49 @@ async fn rollout_shards(
             .status
             .as_ref()
             .and_then(|status| status.update_revision.clone());
-        let current_revision = stateful_set
-            .status
-            .as_ref()
-            .and_then(|status| status.current_revision.clone());
         let Some(update_revision) = update_revision else {
             continue;
         };
-        if Some(&update_revision) == current_revision.as_ref() {
-            continue;
-        }
+        // Do not compare status.currentRevision with updateRevision here: with
+        // `updateStrategy: OnDelete` the StatefulSet controller can report both as the new
+        // revision while every pod still runs the previous template. The pod revision/image
+        // comparison below is the authoritative check.
         let pods = Api::<Pod>::namespaced(client.clone(), namespace)
             .list(&ListParams::default().labels(&format!("matching.io/cluster={}", shard.name)))
             .await
             .with_context(|| format!("list pods for rollout {}", shard.name))?;
         if pods.items.is_empty() {
+            continue;
+        }
+        // Serialize the roll at the pod level. A terminating pod still counts as healthy in
+        // the observation until it disappears, so deleting a second outdated pod in the same
+        // window can take a second voter down before the replacement is ready. Wait for the
+        // in-flight pod to terminate, then for its replacement to become Ready.
+        if pods
+            .items
+            .iter()
+            .any(|pod| pod.metadata.deletion_timestamp.is_some())
+        {
+            info!(
+                shard = %shard.name,
+                "waiting for the in-flight rollout pod to terminate"
+            );
+            continue;
+        }
+        if pods.items.iter().any(|pod| {
+            pod.metadata.deletion_timestamp.is_none()
+                && pod
+                    .metadata
+                    .labels
+                    .as_ref()
+                    .and_then(|labels| labels.get("controller-revision-hash"))
+                    .is_some_and(|revision| revision == &update_revision)
+                && !pod_ready(pod)
+        }) {
+            info!(
+                shard = %shard.name,
+                "waiting for the rollout replacement to become ready"
+            );
             continue;
         }
         let mut outdated: Vec<&Pod> = pods
@@ -2883,6 +2911,17 @@ fn pod_running(pod: &Pod) -> bool {
         .as_ref()
         .and_then(|status| status.phase.as_deref())
         .is_some_and(|phase| phase == "Running")
+}
+
+fn pod_ready(pod: &Pod) -> bool {
+    pod.status
+        .as_ref()
+        .and_then(|status| status.conditions.as_ref())
+        .is_some_and(|conditions| {
+            conditions
+                .iter()
+                .any(|condition| condition.type_ == "Ready" && condition.status == "True")
+        })
 }
 
 fn pod_index(pod: &Pod) -> Option<u8> {
@@ -4510,6 +4549,31 @@ mod tests {
         )]));
         assert_eq!(pod_index(&pod), Some(2));
         assert!(!pod_running(&pod));
+    }
+
+    #[test]
+    fn pod_ready_reads_the_ready_condition() {
+        use k8s_openapi::api::core::v1::{PodCondition, PodStatus};
+
+        let mut pod = rollout_pod("fx-eu-01-0", "eurusd");
+        assert!(!pod_ready(&pod));
+        pod.status = Some(PodStatus {
+            conditions: Some(vec![PodCondition {
+                type_: "Ready".to_string(),
+                status: "True".to_string(),
+                ..PodCondition::default()
+            }]),
+            ..PodStatus::default()
+        });
+        assert!(pod_ready(&pod));
+        if let Some(conditions) = pod
+            .status
+            .as_mut()
+            .and_then(|status| status.conditions.as_mut())
+        {
+            conditions[0].status = "False".to_string();
+        }
+        assert!(!pod_ready(&pod));
     }
 
     fn market_data_service() -> MarketDataService {
