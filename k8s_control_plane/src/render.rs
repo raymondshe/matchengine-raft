@@ -2224,7 +2224,7 @@ pub fn render_order_system(
                 target.label.clone()
             },
             engine,
-            engine_id: 1 + deployment.spec.raft_id_offset,
+            engine_id: deployment.spec.raft_id_offset,
             product: target.product,
         });
     }
@@ -2841,6 +2841,30 @@ mod tests {
                 .filter(|arg| *arg == "--user-id-min")
                 .count()
         );
+
+        // The target dials pod 0, whose node ID is the deployment's Raft ID
+        // offset (the pod ordinal is added by `--id $(POD_ORDINAL)`).
+        let config_map = objects
+            .iter()
+            .find(|object| object["kind"] == "ConfigMap")
+            .expect("order-system ConfigMap");
+        let targets: Value = serde_json::from_str(
+            config_map["data"]["targets.json"]
+                .as_str()
+                .expect("targets.json"),
+        )
+        .expect("targets JSON");
+        let targets = targets["targets"].as_array().expect("targets array");
+        assert_eq!(2, targets.len());
+        for target in targets {
+            assert_eq!(0, target["engineId"]);
+            assert!(
+                target["engine"]
+                    .as_str()
+                    .is_some_and(|engine| engine.contains("-0.")),
+                "target dials pod 0: {target}"
+            );
+        }
 
         catalog.order_systems.get_mut("orders").unwrap().spec.paused = true;
         let paused = render_order_system(&catalog, "orders", None).unwrap();
