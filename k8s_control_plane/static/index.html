@@ -426,8 +426,10 @@
             and can target every engine shard and trading symbol. Open a shard's
             <strong>Demo order desk</strong> link to place and manage orders there; the manager does not proxy
             order entry. The links use each
-            shard's Ingress host; without an ingress controller or DNS, port-forward the shard and open
-            <span class="mono">/demo/</span>.</p>
+            shard's Ingress host. On OrbStack, install
+            <span class="mono">k8s_control_plane/deploy/ingress-nginx.yaml</span> and run
+            <span class="mono">scripts/ingress-frontdoor.sh start</span>; otherwise port-forward the shard
+            and open <span class="mono">/demo/</span>.</p>
         </div>
       </div>
       <div id="orderSystemRows"></div>

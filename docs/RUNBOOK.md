@@ -533,6 +533,43 @@ open 'http://127.0.0.1:8099/api/v1/shards/fx-sup-01/processes/eurgbp/pods/0/cons
 The console's cluster tab must report four reachable peers. A stopped engine has no console link in
 the manager and its proxy returns `409 process_disabled`.
 
+### Reach the demo ingress hosts
+
+The renderer emits one class-less `Ingress` per order-system shard and per market-data service, with
+Hosts such as `users-0.orders.match-eu-1.example` and `ws-fx-eu-02.match-eu-1.example`. OrbStack has
+no cloud provider, so those Ingresses get no address on their own, and macOS needs root to bind
+port 80. The local demo therefore installs one ingress-nginx controller and publishes its ClusterIP
+through a tiny Docker front door:
+
+```sh
+# One class-less controller for every Ingress (demo namespaces included)
+kubectl apply -f k8s_control_plane/deploy/ingress-nginx.yaml
+kubectl -n ingress-nginx rollout status deploy/ingress-nginx-controller --timeout=180s
+
+# Publish the controller on the Mac's 127.0.0.1:80 (Docker can bind port 80 without root)
+./scripts/ingress-frontdoor.sh start
+
+# The shard links and market-data hosts now resolve through OrbStack DNS + the front door
+curl -s -o /dev/null -w '%{http_code}\n' http://users-0.orders.match-eu-1.example/demo/
+curl -s -o /dev/null -w '%{http_code}\n' http://ws-fx-eu-02.match-eu-1.example/
+```
+
+After the rollout, every Ingress shows the controller ClusterIP in `ADDRESS`:
+
+```sh
+kubectl get ingress -A
+```
+
+The front door keeps the `Host` header, forwards WebSocket upgrades, and targets the controller
+Service by ClusterIP, so it survives controller pod restarts. Re-run `start` after the controller
+Service is recreated (its ClusterIP changes); `status` checks the container and the listening port,
+and `stop` removes it. If port 80 is already taken, pass another port:
+`./scripts/ingress-frontdoor.sh start 8080`.
+
+This is demo plumbing, not a production gateway: it serves plaintext HTTP with no authentication,
+TLS termination, rate limits or NetworkPolicy for the public hosts. Use the platform ingress or
+gateway for production, and see the P1 public-edge items in `TODO.md`.
+
 ### Add a symbol
 
 Add a symbol to a **supervisor** shard with the GUI or:
@@ -833,8 +870,9 @@ directly; a user-ID-routing edge is a follow-up. The manager **order systems** t
 targets, HPA bounds, readiness and a **WebUI** link per shard
 (`http://<shard>.<spec.ingress>/demo/`, `https` with `tlsSecret`), and has an **upgrade** action.
 Order entry happens in the order-system WebUI; the manager neither renders an order ticket nor
-proxies orders. In a local demo without an ingress controller, port-forward a shard and open
-`http://127.0.0.1:<port>/demo/`.
+proxies orders. For the shard Hosts to load in the local demo, install the ingress controller and
+front door described in [Reach the demo ingress hosts](#reach-the-demo-ingress-hosts); without
+them, port-forward a shard and open `http://127.0.0.1:<port>/demo/` instead.
 
 ### Retention window
 
@@ -1040,28 +1078,85 @@ engine's data is gone and it must be initialized and configured from scratch.
 
 **CRD mode (recommended).** Desired state lives in the `matching.io` CRDs, so a manager rollout or
 pod replacement has no catalog to lose: the new pod lists the CRDs and rebuilds its cache from
-informers. No PVC is needed for desired state. Back up before upgrades or destructive operations:
+informers. No PVC is needed for desired state.
+
+Use the backup CLI before upgrades or destructive operations. It writes one self-verifying bundle:
+`catalog.json` (CRD desired state), `backup.json` (snapshot names, indexes and checksums),
+`SHA256SUMS` (every bundle file) and optionally `etcd.snapshot.db` (an externally produced
+`etcdctl snapshot save` file). The tool never connects to etcd directly.
+
+Prerequisites: the CSI snapshot controller and a `VolumeSnapshotClass`; for group mode also the
+`VolumeGroupSnapshot` CRDs/controller. Apply `deploy/rbac.yaml` for the `match-backup`
+ServiceAccount (or run with an equivalent kubeconfig).
 
 ```sh
-# Selective catalog export (JSON, desired state only).
-cargo run --manifest-path k8s_control_plane/Cargo.toml -- \
-  crd-backup --out /tmp/crd-catalog.json
+# One group snapshot per shard, plus the full CRD catalog and an optional etcd snapshot.
+cargo run --manifest-path k8s_control_plane/Cargo.toml --bin k8s-control-plane -- \
+  backup fx-eu-01 \
+  --namespace match-eu-1 \
+  --mode volume-group \
+  --volume-group-snapshot-class fast-ssd-vg \
+  --etcd-snapshot /var/backups/etcd-20261117.db \
+  --out /var/backups/fx-eu-01-20261117T120000Z
 
-# Cluster-wide backup covers all CRs too.
-# etcd snapshot procedure depends on the managed Kubernetes provider.
+# Drivers without group snapshots: one VolumeSnapshot per PVC.
+cargo run --manifest-path k8s_control_plane/Cargo.toml --bin k8s-control-plane -- \
+  backup fx-eu-01 --namespace match-eu-1 --mode volume \
+  --volume-snapshot-class csi-snap \
+  --out /var/backups/fx-eu-01-20261117T120000Z
 ```
 
-Restore is selective and ordered: restore CRs first, then let the operator materialize workloads,
-then recover engine PVCs. `crd-restore` validates the JSON and writes the CRs through the API
-server:
+Verification is on by default: each snapshot is restored into a temporary PVC, every file is hashed
+through a short-lived verification pod, and the hashes are recorded in `backup.json`. Use
+`--no-verify` only for an emergency; it records no content checksums. `--verify-image` selects the
+checksum image (default `busybox:1.36`). In a cluster without CSI snapshot support, `--crd-only`
+still writes the checksummed CRD/etcd bundle so desired-state restore and drills work.
+
+Verify an existing bundle without touching the cluster:
 
 ```sh
-cargo run --manifest-path k8s_control_plane/Cargo.toml -- \
-  crd-restore --input /tmp/crd-catalog.json
+cargo run --manifest-path k8s_control_plane/Cargo.toml --bin k8s-control-plane -- \
+  backup-verify --input /var/backups/fx-eu-01-20261117T120000Z
 ```
 
-Audit/action history is not part of CRDs. Use the external audit store for that. Engine data lives
-on the PVCs and is backed up separately with `VolumeSnapshot`/`VolumeGroupSnapshot`.
+Run a restore drill. It restores every snapshot into a temporary PVC, compares the recorded file
+hashes, then deletes the temporary claims; it never writes CRDs or touches live PVCs:
+
+```sh
+cargo run --manifest-path k8s_control_plane/Cargo.toml --bin k8s-control-plane -- \
+  restore --input /var/backups/fx-eu-01-20261117T120000Z --drill
+```
+
+Selective CRD restore expands direct dependencies (cell, shard, symbols, deployments, routes,
+market-data and order-system references) and merges the selected objects over the current catalog;
+it never deletes objects that are absent from the backup. Status fields are not restored.
+
+```sh
+cargo run --manifest-path k8s_control_plane/Cargo.toml --bin k8s-control-plane -- \
+  restore --input /var/backups/fx-eu-01-20261117T120000Z \
+  --shard fx-eu-01 --apply-crds
+```
+
+`--cell`, `--symbol`, `--market-data-service` and `--order-system` select narrower scopes. Restore
+CRDs first, let the operator materialize workloads, then recover engine PVCs. Volume restore creates
+new PVCs with a `restore-` prefix (never overwriting live `data-*` claims), verifies the recorded
+hashes and keeps them for the operator cutover:
+
+```sh
+cargo run --manifest-path k8s_control_plane/Cargo.toml --bin k8s-control-plane -- \
+  restore --input /var/backups/fx-eu-01-20261117T120000Z \
+  --restore-volumes --target-namespace match-eu-1
+```
+
+A full cluster restore still requires all four PVCs from the same snapshot set, the same node IDs
+and a controlled StatefulSet cutover; restoring a subset of voters over newer committed state is
+unsupported. The etcd snapshot is checksum-verified and preserved in the bundle, but restoring etcd
+is the provider's control-plane procedure, not this tool. Snapshots are crash-consistent; the
+reference CLI does not quiesce writes, so drain the gateway route first when a quiesced backup is
+required. Copy the bundle to object storage after creation; the output directory is a staging path,
+not a retention system.
+
+Audit/action history is not part of CRDs. Use the external audit store for that.
 
 **JSON demo fallback.** `serve --state /data/catalog.json` still works for local demos. The
 reference manifest uses an `emptyDir`, so a Deployment rollout reseeds the 3-shard demo catalog and

@@ -237,11 +237,17 @@ Implications:
 - A **cluster etcd snapshot** captures the CRDs, CRs, Deployments, StatefulSets, Services,
   ConfigMaps, PDBs, NetworkPolicies, Pod/PVC metadata, Leases and RBAC. It does not contain the
   bytes inside the engine PVCs.
-- `crd-backup`/`crd-restore` export desired state only (the five CR kinds). They do not include
-  status, built-in workloads, Leases, RBAC or PVC data. After a CR restore, let the operator
-  re-materialize workloads and recover engines from their PVCs.
-- For a full engine restore, use `VolumeGroupSnapshot` over all four PVCs of a shard (or the
-  storage-specific equivalent) and restore the CR catalog separately.
+- `crd-backup`/`crd-restore` export desired state only. They do not include status, built-in
+  workloads, Leases, RBAC or PVC data. The newer `backup` command writes a checksummed bundle
+  (`catalog.json`, `backup.json`, `SHA256SUMS`, optional `etcd.snapshot.db`) and also captures
+  `VolumeGroupSnapshot`/`VolumeSnapshot` volume data. `backup-verify` checks the bundle;
+  `restore --drill` restores and hashes the snapshots; `restore --apply-crds` merges a selective
+  CRD subset and `--restore-volumes` creates prefixed PVCs. Apply `deploy/rbac.yaml` for the
+  `match-backup` ServiceAccount. The tool never connects to etcd directly, so an etcd snapshot must
+  be produced externally and is preserved/checksummed, not restored, by the CLI.
+- For a full engine restore, restore all four PVCs of a shard from the same snapshot set (or the
+  storage-specific equivalent) and restore the CR catalog separately. A cluster without CSI
+  snapshot support can use `backup --crd-only` for the desired-state layer.
 - Never restore an old etcd snapshot over a live cluster just to recover one symbol; use selective
   CR restore and the normal operator reconciliation path.
 
@@ -257,9 +263,13 @@ kubectl -n match-control get lease match-engine-operator -o yaml
 kubectl -n match-eu-1 get sts,svc,cm,pdb,networkpolicy,pvc
 ```
 
-For a catalog export:
+For a catalog or complete shard backup:
 
 ```sh
-cargo run --manifest-path k8s_control_plane/Cargo.toml -- \
+cargo run --manifest-path k8s_control_plane/Cargo.toml --bin k8s-control-plane -- \
   crd-backup --out /tmp/crd-catalog.json
+
+cargo run --manifest-path k8s_control_plane/Cargo.toml --bin k8s-control-plane -- \
+  backup fx-eu-01 --volume-group-snapshot-class fast-ssd-vg \
+  --out /var/backups/fx-eu-01-20261117
 ```

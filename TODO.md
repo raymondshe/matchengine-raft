@@ -22,16 +22,19 @@ over-capacity renders, retains PVCs and performs cross-shard cutover/rollback. T
 live refresh, release/capacity banners, a cluster image picker and a read-only preview plan. The
 market-data tier lives under one **market data** top-level view with **terminal** and **fast**
 sub-tabs, and images roll through `POST /api/v1/market-data-services/{name}/upgrade` with a
-source-shard wire-version check. The `match-eu-1` reference fleet runs digest-pinned images. There are no known P0 defects.
+source-shard wire-version check. The `OrderSystem` CRD renders four user-ID shards, each with its
+own Deployment/Service/PDB/Ingress/HPA (min 1) and `maxUnavailable:0` image rolls; the manager links
+each shard to its own order desk instead of proxying order entry. The `match-eu-1` reference fleet
+runs digest-pinned images. There are no known P0 defects.
 
 Priority key: **P0** = known correctness/security defect, do next; **P1** = production safety and
 operability; **P2** = evidence, scale and important non-blocking work; **P3** = later/optional.
 
 ## Top priorities
 
-Last prioritised 2026-11-17, after the native arm64 market-data rollout, the terminal/fast tab
-split and the stateless market-data image upgrade. The local-lease semantic risk stays covered by
-the delivery contract:
+Last prioritised 2026-11-17, after the order-system HPA/rolling-update rollout, per-shard order
+desk links, the native arm64 market-data rollout, the terminal/fast tab split and the stateless
+market-data image upgrade. The local-lease semantic risk stays covered by the delivery contract:
 client retries are at-least-once and use `client_order_id` for replicated dedupe, while downstream
 event readers resume from `(log_index, ordinal)` and dedupe on `event_id`. A local-lease cache hit
 may overtake an unfinished write, so read-after-write is not a guarantee; clients that need it must
@@ -39,9 +42,11 @@ await the write response.
 
 **P1 - production safety and operability, in execution order**
 
-1. **Backup and restore execution.** Run `VolumeSnapshot`/`VolumeGroupSnapshot` for engine PVCs plus
-   CRD/etcd backup and selective restore, with checksums and a restore drill. The demo plans
-   backups but has never restored one: this is the largest data-loss exposure.
+1. **Backup and restore validation.** The CLI now captures `VolumeGroupSnapshot`/`VolumeSnapshot` for
+   engine PVCs, writes a checksummed CRD/etcd bundle and runs selective restore plus a restore
+   drill. The remaining exposure is live evidence: run the drill on a CSI snapshot-capable
+   cluster, schedule backups, upload bundles to object storage and alert on stale drills. The local
+   demo has no snapshot CRDs, so this path is code-tested but not yet cluster-validated.
 2. **Manager identity, authorization and approvals.** One auth model covering OIDC/RBAC,
    console-proxy authorization, destructive-action approvals, namespace-qualified paths,
    idempotency keys, pagination and dry-run diffs, plus NetworkPolicy tests and Pod Security
@@ -54,12 +59,15 @@ await the write response.
    still depends on a local image, an `emptyDir` and a port-forward.
 5. **Observability and HPA metrics.** Add a Prometheus text bridge for the engine's JSON
    `/metrics`, operator reconcile/rollout metrics, alert rules, dashboards and log shipping. Install
-   a metrics-server or Prometheus adapter so the market-data HPAs can report CPU and actually
-   scale; today the targets show `<unknown>` and only the min-1 floor is enforced.
+   a metrics-server or Prometheus adapter so the market-data HPAs and the four order-system HPAs can
+   report CPU and actually scale; today the targets show `<unknown>` and only the min-1 floor is
+   enforced.
 6. **Gateway and public-edge integration.** Route from `SymbolRoute.status` with shadow/cutover/
    drain, retries and a canary path, then run a tested client cutover. Terminate TLS for the
-   terminal market-data host, authenticate and rate-limit WebSocket clients, keep Aeron internal,
-   and document the gateway/Ingress boundary. No gateway is deployed in the demo.
+   terminal market-data host and the order-system WebUI/API, authenticate and rate-limit WebSocket
+   and order clients, keep Aeron internal, and document the gateway/Ingress boundary. The demo now
+   runs a local ingress-nginx controller plus a Docker front door on port 80, but that is
+   plaintext demo plumbing, not a production gateway.
 7. **Market-data production readiness.** Validate Profile A on a multi-node multicast-capable
    CNI/VPC (Cilium/Isovalent or Multus plus AWS Transit Gateway); the default EKS VPC CNI cannot run
    it. Define the topology rule for multiple replicas/subscribers on one node: two pods joining the
@@ -115,8 +123,11 @@ await the write response.
 
 ### Control plane
 
-- [ ] **P1** Backup/restore execution: `VolumeGroupSnapshot`/`VolumeSnapshot` for engine PVCs, plus
-  etcd/CRD backup and selective restore; a backup agent, checksums and a restore test.
+- [ ] **P1** Backup/restore validation: the `backup`/`backup-verify`/`restore --drill` CLI is
+  implemented in `src/backup.rs` with `VolumeGroupSnapshot`/`VolumeSnapshot`, checksummed
+  CRD/etcd bundles, selective `--apply-crds` and prefixed PVC restore. Remaining: run the drill on
+  a CSI snapshot-capable cluster, add the scheduled backup/upload path and record the first signed
+  drill result.
 - [ ] **P1** Production manager: OIDC/RBAC, approvals, idempotency keys, namespace-qualified paths,
   pagination and dry-run diffs. Desired state stays in CRDs; use Postgres/object storage only for
   audit, a query/read model or long-term history, not as a second source of truth.
@@ -125,9 +136,13 @@ await the write response.
   No PVC is needed for desired state; an optional volume is only for audit/export caches.
 - [ ] **P1** Gateway integration: leader-aware routing from `SymbolRoute.status`, shadow/cutover/
   drain, retries and a canary path. No gateway is deployed in the demo.
+- [ ] **P1** Order-system public edge: TLS, authentication, rate limits and NetworkPolicy for the
+  per-shard WebUI and `/demo/api`; the demo currently exposes plaintext HTTP with no auth. Keep
+  order entry in the order system and the manager's role to linking only.
 - [ ] **P1** Observability: a Prometheus text bridge for the engine's JSON `/metrics`, alert rules,
-  dashboards and log shipping, plus a metrics-server/Prometheus adapter so the market-data HPAs can
-  report CPU and scale; the console's peer view is covered by the NetworkPolicy rule.
+  dashboards and log shipping, plus a metrics-server/Prometheus adapter so the market-data and
+  order-system HPAs can report CPU and scale; the console's peer view is covered by the
+  NetworkPolicy rule.
 - [ ] **P1** Security: manager OIDC and console-proxy authorization, approvals for destructive
   actions, NetworkPolicy tests and Pod Security Standards. The demo manager has no auth.
 - [ ] **P1** End-to-end operator smoke script/runbook: containers, supervisor, reserved, migration,
@@ -142,10 +157,16 @@ await the write response.
 - [ ] **P2** Validate opt-in supervisor cgroups and rotating logs on a Linux node that delegates a
   writable cgroup v2 subtree; OrbStack does not, so the supervisor reports `isolationError` and
   fails open.
-- [ ] **P2** Order-system user-routing edge: map user IDs to their shard range behind one host so clients do not choose a shard URL manually, and add auth/rate limits per user. The shards themselves and per-shard APIs are live.
+- [ ] **P2** Order-system user-routing edge: map user IDs to their shard range behind one host so
+  clients do not choose a shard URL manually, and add per-user auth/rate limits. The four shards,
+  per-shard APIs/WebUI links, HPAs and rolling image updates are live; the shared host and per-user
+  authorization remain.
+- [ ] **P2** Scheduled backups and retention: run `backup` from a CronJob with the `match-backup`
+  ServiceAccount, upload the bundle to object storage, enforce a retention window, alert when the
+  newest bundle or restore drill is stale, and record the drill result.
 - [ ] **P3** GUI: the overview is live, the upgrade tab is a single action and the preview plan tab
-  is a read-only simulator. Add migration/promote forms, approvals, filters/pagination,
-  diff/rollback and SSE/WebSocket updates.
+  is a read-only simulator. Add order-system create/edit and image-rollback actions,
+  migration/promote forms, approvals, filters/pagination, diff/rollback and SSE/WebSocket updates.
 - [ ] **P3** CLI `create-shard`, `create-symbol` and `migrate` commands for automation; the API/GUI
   are implemented today.
 - [ ] **P3** OpenAPI client, admission validation/defaulting and schema tests beyond the CRD YAML
@@ -185,7 +206,8 @@ shard services and the global terminal service are live; see History. Remaining 
   implemented. Add a rollback action that restores the previous image.
 - [ ] **P2** Rollout and availability: canary policy, PDB verification, drain-aware image upgrades
   and a tested rollback path that restores subscriber capacity without touching matching. HPA CPU
-  metrics need a metrics server or Prometheus adapter; this is tracked as a P1 in Top priorities.
+  metrics for the market-data and order-system HPAs need a metrics server or Prometheus adapter;
+  this is tracked as a P1 in Top priorities.
 - [ ] **P2** Aeron feed hardening: characterize the image-registration race and the single-node
   multi-subscriber behavior; make source startup readiness-gated (or add a per-source generation)
   so a stale feed is detected and rebuilt without log spam. Keep the 5-30 s re-subscribe watchdog as
@@ -267,6 +289,18 @@ Completed work is summarised here; detailed evidence, measurements and implement
 in git history and the linked docs. For the full history, check out `TODO.md` from an earlier commit
 (`git log -- TODO.md`).
 
+- **2026-11-17** — Local ingress path for the demo hosts: `k8s_control_plane/deploy/ingress-nginx.yaml`
+  installs one class-less ingress-nginx controller so the rendered order-system and market-data
+  Ingresses get an address, and `scripts/ingress-frontdoor.sh` publishes its ClusterIP on the Mac's
+  port 80 through an `nginx:alpine` Docker front door (macOS needs root to bind 80; NodePorts are not
+  host-reachable). The four **Demo order desk** links, shard health and market-data hosts now load
+  directly; the controller is plaintext demo plumbing, not a production gateway.
+- **2026-11-17** — Executable shard backup and restore: `backup` captures a `VolumeGroupSnapshot`
+  or per-PVC `VolumeSnapshot`s, writes `catalog.json`/`backup.json`/`SHA256SUMS` plus an optional
+  etcd snapshot, verifies by restoring and hashing every file, and `restore --drill` repeats the
+  check. `restore --apply-crds` performs dependency-aware selective CRD merge without deleting
+  unrelated objects; `--restore-volumes` creates prefixed PVCs and verifies checksums. Adds the
+  `match-backup` RBAC and runbook.
 - **2026-11-17** — Order-system multi-target/user sharding: one arm64 image, `--targets` JSON for
   every engine/symbol, user-ID ranges, `OrderSystem` CRD/renderer/operator/status, four live
   `users-*` shards in Kubernetes, control-plane **order systems** tab, and verified cross-symbol
@@ -274,8 +308,9 @@ in git history and the linked docs. For the full history, check out `TODO.md` fr
 - **2026-11-17** — Order-system HPA and rolling updates: per-shard `autoscaling/v2` HPA with a
   one-replica floor, Deployment replica count left to the HPA, paused scale-to-zero,
   `POST /api/v1/order-systems/{name}/upgrade` with a GUI **upgrade** action, `maxUnavailable: 0`
-  one-surge shard rolls, and per-shard links to the order-system WebUI (order entry stays in the
-  order system; the manager no longer proxies orders).
+  one-surge shard rolls, per-shard links to the order-system WebUI (order entry stays in the order
+  system; the manager no longer proxies orders), and an architecture diagram that includes the
+  order-system tier.
 - **2026-11-17** — Native arm64 engine and market-data images; four fast-only shard services plus
   a global terminal service spanning every shard feed; per-feed-group channels and wildcard
   market-data receiver binds; one **market data** GUI view with **terminal** and **fast** sub-tabs;

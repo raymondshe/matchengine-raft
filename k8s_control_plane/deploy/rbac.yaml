@@ -128,3 +128,63 @@ subjects:
   - kind: ServiceAccount
     name: match-operator
     namespace: match-control
+---
+# Backup/restore executor (`k8s-control-plane backup` / `restore`). Run it as a Job or CronJob
+# with this ServiceAccount. It reads the catalog CRDs, creates CSI snapshots, restores snapshots
+# into temporary PVCs for verification, and writes desired state only when restore --apply-crds
+# is requested.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: match-backup
+  namespace: match-control
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: match-backup
+rules:
+  - apiGroups: ["matching.io"]
+    resources:
+      - cells
+      - symbolshards
+      - tradingsymbols
+      - symboldeployments
+      - symbolroutes
+      - marketdataservices
+      - ordersystems
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  - apiGroups: ["snapshot.storage.k8s.io"]
+    resources: ["volumesnapshots"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+  - apiGroups: ["snapshot.storage.k8s.io"]
+    resources: ["volumesnapshotclasses"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["groupsnapshot.storage.k8s.io"]
+    resources: ["volumegroupsnapshots"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+  - apiGroups: ["groupsnapshot.storage.k8s.io"]
+    resources: ["volumegroupsnapshotclasses"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: match-backup
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: match-backup
+subjects:
+  - kind: ServiceAccount
+    name: match-backup
+    namespace: match-control

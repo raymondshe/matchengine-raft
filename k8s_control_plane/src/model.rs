@@ -1519,6 +1519,7 @@ pub struct BackupSpec {
 pub enum BackupMode {
     #[default]
     VolumeGroup,
+    Volume,
     Logical,
 }
 

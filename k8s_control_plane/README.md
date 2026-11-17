@@ -40,8 +40,10 @@ k8s_control_plane/
 ├── src/api.rs         Axum manager API
 ├── src/gui.rs         embedded single-page GUI
 ├── src/main.rs        serve | render | validate | plan | seed | crds | crd-backup | crd-restore
+│                      backup | backup-verify | restore
 ├── src/bin/match_operator.rs  cell operator binary
-├── deploy/            generated CRDs, least-privilege RBAC and the operator Deployment
+├── deploy/            generated CRDs, least-privilege RBAC, the operator Deployment and the
+│                      local demo ingress controller (ingress-nginx.yaml)
 └── examples/          demo ShardBundle JSON files
 ```
 
@@ -74,6 +76,11 @@ cargo run --bin match-operator -- \
 # Export/restore a CRD catalog (pass KUBECONFIG or run in-cluster)
 cargo run -- crd-backup --out /tmp/crd-catalog.json
 cargo run -- crd-restore --input /tmp/crd-catalog.json
+
+# Executable shard backup with volume snapshots and checksums
+cargo run --bin k8s-control-plane -- backup fx-eu-01 \
+  --volume-group-snapshot-class fast-ssd-vg \
+  --out /tmp/fx-eu-01-backup
 
 # Render a shard (JSON List; kubectl accepts it directly)
 cargo run -- render --shard fx-eu-01 --profile local > fx.json
@@ -181,18 +188,34 @@ manifests, event data or engine payloads in CRs.
 
 ### Backup and restore
 
-`crd-backup` exports the live CRD catalog as the same JSON format used by the demo. `crd-restore`
-validates it and writes the objects back through the API server:
+`backup` writes one self-verifying bundle: `catalog.json` (all seven CRDs), `backup.json`
+(snapshot names, per-file SHA-256 checksums, restore tests), `SHA256SUMS`, and an optional
+externally produced etcd snapshot. It creates a CSI `VolumeGroupSnapshot`, or one `VolumeSnapshot`
+per PVC with `--mode volume`, then restores each snapshot into a temporary PVC and hashes every
+file through a short-lived pod. `--no-verify` skips that proof and is for emergencies only. Use `--crd-only` when the cluster has
+no CSI snapshot support; it still writes and verifies the checksummed CRD/etcd bundle.
 
 ```sh
-cargo run -- crd-backup --out /tmp/crd-catalog.json
-cargo run -- crd-restore --input /tmp/crd-catalog.json
+cargo run --bin k8s-control-plane -- backup fx-eu-01 \
+  --namespace match-eu-1 \
+  --volume-group-snapshot-class fast-ssd-vg \
+  --etcd-snapshot /var/backups/etcd-20261117.db \
+  --out /var/backups/fx-eu-01-20261117
+cargo run --bin k8s-control-plane -- backup-verify --input /var/backups/fx-eu-01-20261117
+cargo run --bin k8s-control-plane -- restore --input /var/backups/fx-eu-01-20261117 --drill
 ```
 
-The backup is selective (desired state only); audit and engine PVC data are separate. An etcd
-snapshot covers all CRs in the cluster, while `crd-backup` is useful for a single catalog export
-and for comparing against the operator's view. Restore order is: CRs first, then workloads, then
-PVCs/engine recovery.
+`restore` verifies the bundle and defaults to a read-only plan. `--apply-crds` merges a selective
+CRD subset (`--cell`, `--shard`, `--symbol`, `--market-data-service`, `--order-system`) over the
+current catalog without deleting unrelated objects. `--restore-volumes` creates new prefixed PVCs
+from the snapshots, verifies recorded checksums, and keeps live `data-*` claims untouched.
+`--drill` restores, verifies and deletes temporary PVCs; it never writes CRDs. Apply
+`deploy/rbac.yaml` for the `match-backup` ServiceAccount. The bundle includes the etcd snapshot
+checksum but does not restore etcd; use the provider's control-plane runbook for that.
+
+Older `crd-backup` / `crd-restore` commands remain available for a catalog-only export. Audit and
+engine PVC data are separate. Restore order is: CRs first, then workloads, then PVCs/engine
+recovery.
 
 ## ☸️ Cell operator
 
@@ -638,6 +661,29 @@ The ports still come from each deployment's placement, so this works when local 
 the catalog's HTTP ports. The direct pod URL remains in the shard detail payload as
 `engineConsoles[].url` for `kubectl port-forward` use; the GUI uses `proxyUrl`.
 
+## 🌐 Local ingress for demo hosts
+
+The renderer emits class-less `Ingress` objects for order-system shards and market-data services.
+On OrbStack nothing serves them by default: there is no cloud LoadBalancer, NodePorts are not
+reachable from macOS, and binding port 80 needs root. Install the bundled controller and publish it
+through the Docker front door:
+
+```bash
+kubectl apply -f deploy/ingress-nginx.yaml
+kubectl -n ingress-nginx rollout status deploy/ingress-nginx-controller --timeout=180s
+../scripts/ingress-frontdoor.sh start
+```
+
+`deploy/ingress-nginx.yaml` is a single-controller ingress-nginx install that watches Ingresses
+without a class, so the existing objects need no annotation. `scripts/ingress-frontdoor.sh` writes an
+`nginx:alpine` proxy config that keeps the `Host` header and WebSocket upgrades, and publishes it on
+`127.0.0.1:80`. The controller Service stays `ClusterIP`; re-run `start` if that Service is
+recreated. Use `status` and `stop` for lifecycle checks, or pass another host port
+(`start 8080`) when 80 is taken.
+
+This path is for the local demo only. It terminates no TLS, performs no authentication or rate
+limiting, and is not a substitute for the production gateway.
+
 ## 🧠 What the planner decides
 
 `reconcile::plan_shard` returns a plan, not a mutation. The order is:
@@ -723,8 +769,10 @@ crate on Rust 1.89.
 - Status is synthesized for the demo; there is no per-process status endpoint in the engine yet
   (phase 2 in the design doc). CRD status writes are rate-limited coalescing writes, not a full
   operator status controller.
-- Engine PVC backups are planned but not executed; the demo has no `VolumeGroupSnapshot`
-  integration. CRD backup/restore is implemented.
+- Engine PVC backup/restore is implemented in the `backup`/`restore` CLI, but the local demo has no
+  CSI `VolumeSnapshot`/`VolumeGroupSnapshot` CRDs or snapshot driver, so only the checksummed
+  CRD/etcd bundle path is live-validated. Validate the volume path on a snapshot-capable cluster.
+  CRD backup/restore is implemented and live-tested.
 - No authentication or authorization. The real manager and operator sit behind the platform's
   SSO and RBAC; the public engine edge remains plaintext behind the gateway.
 - The demo audit log is in-memory. Production audit belongs in an append-only store, not etcd.

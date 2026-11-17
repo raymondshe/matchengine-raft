@@ -10,12 +10,14 @@
 //! - preflight/placement validation ([`validate`]),
 //! - deterministic StatefulSet/Service/PDB/NetworkPolicy rendering ([`render`]),
 //! - a manager API and GUI ([`api`]),
-//! - a CRD-backed store with informer-cache refresh ([`crd`]), and
-//! - the operator's bootstrap/upgrade decision logic ([`reconcile`]).
+//! - a CRD-backed store with informer-cache refresh ([`crd`]),
+//! - the operator's bootstrap/upgrade decision logic ([`reconcile`]), and
+//! - checksummed volume/CRD backups, selective restores and restore drills ([`backup`]).
 //!
 //! The engine remains single-symbol per process. Packing is N engine containers per pod.
 
 pub mod api;
+pub mod backup;
 pub mod bundle;
 pub mod crd;
 pub mod error;

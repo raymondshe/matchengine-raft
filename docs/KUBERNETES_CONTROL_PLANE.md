@@ -657,7 +657,7 @@ Until it exists, the FQDN-as-bind-address form above is the recommended template
   - `N > 0`: periodic fsync; a middle ground for cost-sensitive symbols.
 - Back up the whole process directory, not just `snapshot/current.snap`: the snapshot file plus
   the WAL segments plus `log/state` (vote and `last_purged`) are required for a consistent
-  restore. See §7.5 for group snapshots and the write-quiesce step.
+  restore. See §7.5 for group snapshots, checksummed bundles and restore drills.
 - Never run two pods with the same node ID against the same data directory. The StatefulSet
   ordinal + per-pod PVC enforces this.
 
@@ -1218,8 +1218,9 @@ status:
   conditions: [...]
 ```
 
-`restore` is deliberately not an Operation kind yet: there is no supported one-step cluster
-restore tool (§7.5). A restore is a runbook/volume operation until that tool exists.
+`restore` is deliberately not an Operation kind yet: the reference CLI executes selective CRD
+merge and volume restore/drill (§7.5), while a one-step whole-cluster cutover remains a runbook
+operation.
 
 `Backup` records the group snapshot and, per process, the indexes, checksums and restore test:
 
@@ -1230,7 +1231,7 @@ metadata:
   name: fx-eu-01-20261113t0200z
 spec:
   shardRef: fx-eu-01
-  mode: volume-group       # volume-group | logical
+  mode: volume-group       # volume-group | volume | logical
   volumeGroupSnapshotClass: fast-ssd-vg
   destination: s3://match-backups/eu-1/fx-eu-01/
   quiesce: true
@@ -1257,6 +1258,15 @@ status:
       s3Prefix: s3://match-backups/eu-1/fx-eu-01/gbpusd/
       restoreTestedAt: "2026-11-13T03:12:00Z"
 ```
+
+The reference CLI writes a self-verifying bundle instead of relying on the `Backup` object alone:
+`catalog.json` (all seven CRD kinds), `backup.json` (snapshot names, per-PVC/process checksums and
+restore tests), `SHA256SUMS` and an optional externally produced etcd snapshot. `backup` creates
+one `VolumeGroupSnapshot` (or one `VolumeSnapshot` per PVC), restores each snapshot into a
+temporary PVC, hashes every file and records the result. `backup-verify` checks the bundle, and
+`restore --drill` repeats the restore and hash comparison before deleting the temporary claims.
+Snapshots are crash-consistent; the CLI does not quiesce writes, so drain the gateway route first
+when a quiesced point is required.
 
 The desired-state catalog lives in the seven CRDs (etcd via the API server). Postgres stores
 approvals, audit events and read-model caches; it is not a second desired-state source of truth.
@@ -1490,36 +1500,47 @@ per-shard downtime and a tested rollback plan.
 
 A shard backup has two layers:
 
-1. **Volume group snapshot (primary).** Quiesce the shard's write path (pause the gateway route or
-   cut over to another generation), wait for in-flight writes to drain, trigger one CSI
-   `VolumeGroupSnapshot` covering all four PVCs, then resume. A group snapshot is one operation
-   across the group (cross-volume consistency still depends on the CSI driver); four independent
-   `VolumeSnapshot`s are only crash-consistent per volume and may capture different log indexes. If
-   the driver has no group snapshot, quiesce writes and accept that the volumes may not be perfectly
-   aligned, or use per-process logical backups.
-2. **Per-process logical export (portable).** For each process, trigger a snapshot, then copy
-   `snapshot/current.snap`, the WAL segments and `log/state` (vote and `last_purged`). `log/state`
-   is required: a snapshot plus WAL without it is not a complete process directory. Upload with
-   sha256 and indexes; this is for cross-cluster replay and investigation, not a one-step cluster
-   restore.
+1. **Volume snapshot (primary, implemented).** `k8s-control-plane backup` creates one CSI
+   `VolumeGroupSnapshot` covering every PVC carrying `matching.io/shard=<shard>`, or one
+   `VolumeSnapshot` per PVC when the driver has no group API. A group snapshot is one operation
+   across the group (cross-volume consistency still depends on the CSI driver); independent
+   snapshots are crash-consistent per volume and may capture different log indexes. The CLI does
+   not quiesce writes: drain the gateway route or cut over to another generation first when a
+   quiesced point is required.
+2. **Per-process logical export (portable, design only).** For each process, trigger a snapshot,
+   then copy `snapshot/current.snap`, the WAL segments and `log/state` (vote and `last_purged`).
+   `log/state` is required: a snapshot plus WAL without it is not a complete process directory.
+   Upload with sha256 and indexes; this is for cross-cluster replay and investigation, not a
+   one-step cluster restore. `backup --mode logical` is rejected until an exporter exists.
 
 Details:
 
+- The bundle contains `catalog.json` (all CRD desired state), `backup.json`, `SHA256SUMS` and an
+  optional externally produced etcd snapshot. The CLI never connects to etcd directly.
+- Verification is on by default: each snapshot is restored into a temporary PVC, every file is
+  hashed through a short-lived pod and the result is recorded in `backup.json`. `backup-verify`
+  checks every bundle checksum; `restore --drill` repeats the restore/hash comparison and cleans
+  up. Test restores monthly and alert when the last drill is stale.
 - Cap snapshot concurrency (one or two processes at a time) so a large cold symbol cannot stall
-  the shard. Each `Backup` record carries per-process log/snapshot indexes, `lastPurged`, checksums
-  and a restore-test timestamp (§6.5).
-- The operator triggers a snapshot through the console action or a dedicated admin API, per
-  process/port. A `backup-agent` sidecar with the PVC mounted uploads after the files settle.
+  the shard. The CLI snapshots a shard as one group or one claim per PVC; a per-process scheduler
+  remains an operator follow-up.
 - **RPO:** with no fsync, a whole-cluster crash can lose the unsynced tail, so RPO is greater than
   zero even though a single node loss loses nothing committed. With fsync every append (`0`),
   acknowledged writes are durable on each voter's PVC; restoring the last volume snapshot loses
   every write after that snapshot, so RPO = time since the last successful snapshot. Periodic fsync
   (`N > 0`) adds up to N ms.
-- **Restore for a whole cluster (only supported full restore today):** restore all four PVCs from
-  the same group snapshot, start the four pods with the same node IDs, and let Raft recover. Do not
-  restore a subset of voters from an older snapshot while the others hold newer committed entries;
-  Raft will not rewind committed log entries. Restore all four to the same point, or create a new
-  cluster.
+- **Restore for a whole cluster:** restore all four PVCs from the same group snapshot, start the
+  four pods with the same node IDs, and let Raft recover. `restore --restore-volumes` creates new
+  prefixed PVCs and never overwrites live `data-*` claims, so the StatefulSet cutover is explicit.
+  Do not restore a subset of voters from an older snapshot while the others hold newer committed
+  entries; Raft will not rewind committed log entries. Restore all four to the same point, or
+  create a new cluster.
+- **Selective desired-state restore:** `restore --cell/--shard/--symbol/--market-data-service/
+  --order-system --apply-crds` expands direct dependencies and merges the selected objects over
+  the current catalog. It never deletes objects absent from the backup, and status fields are not
+  restored.
+- **etcd:** the bundle records and checksums an operator-supplied etcd snapshot. Restoring etcd is
+  the provider's control-plane procedure, not this tool.
 - **Logical snapshot restore:** a `current.snap` copy alone is not a complete cluster restore. A
   fresh Raft group initialised with `/init` has an empty log and does not know the snapshot's
   applied index; starting it from a copied state-machine file is not a supported migration. Until
@@ -1528,7 +1549,6 @@ Details:
 - If a logical restore is required, the supported direction is to replay the deterministic order
   input into a new cluster (the replay examples in `match_engine/tests/replay/` and `match_engine/examples/replay_orders`)
   and verify the resulting book/events, or to add a restore tool as an engine change (§13).
-- Test restores monthly; record the result in `Backup.status` and alert when it is stale.
 
 ### 7.6 Failure handling
 
@@ -1778,8 +1798,9 @@ GET    /api/v1/health, /metrics
 
 List endpoints use server-side pagination and label filters. Mutation endpoints require an
 `Idempotency-Key`; responses include the `Operation` name. Updates use the CR's
-`metadata.resourceVersion` for optimistic concurrency. `restore` is absent until a supported
-restore tool exists; a restore request today returns `501` with the runbook reference.
+`metadata.resourceVersion` for optimistic concurrency. The HTTP API still has no restore
+operation; restore is the `k8s-control-plane restore` CLI (§7.5), which verifies checksums and
+defaults to a read-only plan unless `--apply-crds` or `--restore-volumes` is passed.
 
 The reference demo implements the local workflow subset: `POST /api/v1/shards`,
 `POST /api/v1/shards/{shard}/drop`, `POST /api/v1/symbols`,
@@ -2018,7 +2039,10 @@ shards, targets, HPA bounds, per-shard readiness and a **WebUI** link per shard
 button. Order entry stays in the order system: the control plane does not render an order ticket
 and does not proxy `/orders` or book state. A user-ID routing gateway in front of the per-shard
 Services (exact modulo or range routing) remains a P2 follow-up; today clients open the shard WebUI
-or select the shard URL directly.
+or select the shard URL directly. In the OrbStack demo, the rendered Ingresses are served by the
+bundled ingress-nginx controller plus a Docker front door on port 80
+(`k8s_control_plane/deploy/ingress-nginx.yaml`, `scripts/ingress-frontdoor.sh`); that path is
+plaintext demo plumbing, and TLS/authentication/rate limits remain production-edge work.
 
 ## 10. Security and multi-tenancy
 

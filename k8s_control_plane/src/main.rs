@@ -12,14 +12,16 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use serde_json::json;
 
 use matchengine_k8s_control_plane::api;
+use matchengine_k8s_control_plane::backup;
 use matchengine_k8s_control_plane::bundle::{ShardBundle, demo_bundles};
-use matchengine_k8s_control_plane::model::Release;
+use matchengine_k8s_control_plane::model::{BackupMode, Release};
 use matchengine_k8s_control_plane::reconcile::{Scenario, plan_shard, simulate, summarize};
 use matchengine_k8s_control_plane::render::{Profile, RenderOptions, as_list, render_shard};
 use matchengine_k8s_control_plane::store::{Catalog, Store, demo_catalog};
@@ -63,7 +65,7 @@ enum Command {
         #[arg(long, env = "ENGINE_CONSOLE_HOST")]
         engine_console_host: Option<String>,
     },
-    /// Print the six catalog CustomResourceDefinitions as YAML.
+    /// Print the seven catalog CustomResourceDefinitions as YAML.
     Crds {
         /// Write here instead of stdout.
         #[arg(long)]
@@ -87,6 +89,91 @@ enum Command {
         #[arg(long)]
         input: PathBuf,
         /// Namespace used for CRs whose model namespace is empty.
+        #[arg(
+            long,
+            default_value = "match-eu-1",
+            env = "CONTROL_PLANE_CRD_NAMESPACE"
+        )]
+        namespace: String,
+    },
+    /// Create a volume-snapshot + CRD/etcd backup bundle for one shard.
+    Backup {
+        shard: String,
+        /// Bundle directory. Defaults to backups/<shard>-<unix-seconds>.
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// `volume-group` uses the Kubernetes VolumeGroupSnapshot API; `volume` creates one
+        /// VolumeSnapshot per PVC.
+        #[arg(long, value_parser = ["volume-group", "volume"], default_value = "volume-group")]
+        mode: String,
+        /// Namespace containing the shard's PVCs.
+        #[arg(
+            long,
+            default_value = "match-eu-1",
+            env = "CONTROL_PLANE_CRD_NAMESPACE"
+        )]
+        namespace: String,
+        #[arg(long, default_value = "")]
+        volume_group_snapshot_class: String,
+        #[arg(long, default_value = "")]
+        volume_snapshot_class: String,
+        /// Write only the CRD/etcd bundle; skip volume snapshots.
+        #[arg(long)]
+        crd_only: bool,
+        /// Externally produced `etcdctl snapshot save` file to include in the bundle.
+        #[arg(long)]
+        etcd_snapshot: Option<PathBuf>,
+        /// Skip the snapshot restore/hash verification.
+        #[arg(long)]
+        no_verify: bool,
+        #[arg(long, default_value = "busybox:1.36")]
+        verify_image: String,
+        #[arg(long, default_value_t = 300)]
+        timeout_secs: u64,
+        #[arg(long)]
+        overwrite: bool,
+    },
+    /// Verify every checksum and the catalog in a backup bundle.
+    BackupVerify {
+        #[arg(long)]
+        input: PathBuf,
+    },
+    /// Verify and selectively restore a backup bundle. Without an action it only verifies.
+    Restore {
+        #[arg(long)]
+        input: PathBuf,
+        #[arg(long)]
+        cell: Vec<String>,
+        #[arg(long)]
+        shard: Vec<String>,
+        #[arg(long)]
+        symbol: Vec<String>,
+        #[arg(long)]
+        market_data_service: Vec<String>,
+        #[arg(long)]
+        order_system: Vec<String>,
+        /// Write the selected CRD objects through the manager's CRD store.
+        #[arg(long, conflicts_with = "drill")]
+        apply_crds: bool,
+        /// Restore snapshots into temporary PVCs, verify checksums and clean up. Never writes CRDs.
+        #[arg(long)]
+        drill: bool,
+        /// Restore snapshots into new PVCs and keep them.
+        #[arg(long)]
+        restore_volumes: bool,
+        /// Namespace for restored PVCs. Defaults to the bundle's source namespace.
+        #[arg(long)]
+        target_namespace: Option<String>,
+        /// Prefix for restored PVC names; keeps live PVCs untouched.
+        #[arg(long, default_value = "restore-")]
+        volume_prefix: String,
+        /// Keep drill PVCs for inspection.
+        #[arg(long)]
+        keep: bool,
+        #[arg(long, default_value = "busybox:1.36")]
+        verify_image: String,
+        #[arg(long, default_value_t = 300)]
+        timeout_secs: u64,
         #[arg(
             long,
             default_value = "match-eu-1",
@@ -158,6 +245,15 @@ enum Command {
         #[arg(long = "bundle")]
         bundles: Vec<PathBuf>,
     },
+}
+
+fn sanitize_id(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string()
 }
 
 #[tokio::main]
@@ -254,6 +350,210 @@ async fn main() -> Result<()> {
                 catalog.deployments.len(),
                 catalog.routes.len()
             );
+            Ok(())
+        }
+        Command::Backup {
+            shard,
+            out,
+            mode,
+            namespace,
+            volume_group_snapshot_class,
+            volume_snapshot_class,
+            crd_only,
+            etcd_snapshot,
+            no_verify,
+            verify_image,
+            timeout_secs,
+            overwrite,
+        } => {
+            let mode = match mode.as_str() {
+                "volume" => BackupMode::Volume,
+                _ => BackupMode::VolumeGroup,
+            };
+            let client = kube::Client::try_default()
+                .await
+                .map_err(|error| anyhow::anyhow!("load Kubernetes client: {error}"))?;
+            let store = Store::crd(namespace.clone(), false)
+                .await
+                .map_err(|error| anyhow::anyhow!("open CRD catalog: {error}"))?;
+            let catalog = store.snapshot();
+            let shard_spec = catalog
+                .shards
+                .get(&shard)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("unknown shard {shard}"))?;
+            let id = format!(
+                "{shard}-{}",
+                matchengine_k8s_control_plane::store::now_epoch()
+            );
+            let out = out.unwrap_or_else(|| PathBuf::from("backups").join(&id));
+            let snapshot_options = backup::SnapshotOptions {
+                namespace: namespace.clone(),
+                shard: shard.clone(),
+                backup_id: id.clone(),
+                mode,
+                volume_group_snapshot_class: volume_group_snapshot_class.clone(),
+                volume_snapshot_class: volume_snapshot_class.clone(),
+                verify: !no_verify,
+                verify_image,
+                timeout: Duration::from_secs(timeout_secs),
+            };
+            let mut manifest = backup::BackupManifest::new(
+                id.clone(),
+                &namespace,
+                &shard_spec,
+                mode,
+                &catalog,
+                &volume_group_snapshot_class,
+                &volume_snapshot_class,
+            );
+            if !crd_only {
+                let snapshots =
+                    backup::create_volume_snapshots(&client, &catalog, &snapshot_options).await?;
+                manifest.volume_group_snapshot =
+                    snapshots.volume_group_snapshot.unwrap_or_default();
+                manifest.volumes = snapshots.volumes;
+            }
+            let manifest = backup::write_bundle(
+                &out,
+                &catalog,
+                manifest,
+                etcd_snapshot.as_deref(),
+                overwrite,
+            )?;
+            let objects = manifest.counts.cells
+                + manifest.counts.shards
+                + manifest.counts.symbols
+                + manifest.counts.deployments
+                + manifest.counts.routes
+                + manifest.counts.market_data_services
+                + manifest.counts.order_systems;
+            println!(
+                "backup {id}: {} volume(s), {objects} objects, checksums {}",
+                manifest.volumes.len(),
+                out.join(backup::CHECKSUMS_FILE).display()
+            );
+            if let Some(etcd) = &manifest.etcd {
+                println!(
+                    "etcd snapshot: {} ({} bytes, sha256 {})",
+                    etcd.path, etcd.bytes, etcd.sha256
+                );
+            }
+            println!("bundle: {}", out.display());
+            Ok(())
+        }
+        Command::BackupVerify { input } => {
+            let bundle = backup::verify_bundle(&input)?;
+            println!(
+                "verified backup {}: shard {}, {} volume(s), catalog {}",
+                bundle.manifest.id,
+                bundle.manifest.shard,
+                bundle.manifest.volumes.len(),
+                bundle.manifest.catalog.sha256
+            );
+            Ok(())
+        }
+        Command::Restore {
+            input,
+            cell,
+            shard,
+            symbol,
+            market_data_service,
+            order_system,
+            apply_crds,
+            drill,
+            restore_volumes,
+            target_namespace,
+            volume_prefix,
+            keep,
+            verify_image,
+            timeout_secs,
+            namespace,
+        } => {
+            let bundle = backup::verify_bundle(&input)?;
+            let selection = backup::RestoreSelection {
+                cells: cell.into_iter().collect(),
+                shards: shard.into_iter().collect(),
+                symbols: symbol.into_iter().collect(),
+                market_data_services: market_data_service.into_iter().collect(),
+                order_systems: order_system.into_iter().collect(),
+            };
+            let plan = backup::plan_restore(&bundle, &selection)?;
+            println!(
+                "backup {}: catalog {}, {} cells, {} shards, {} symbols, {} volumes",
+                bundle.manifest.id,
+                plan.crd_sha256,
+                plan.counts.cells,
+                plan.counts.shards,
+                plan.counts.symbols,
+                plan.volumes
+            );
+            if drill {
+                let target = target_namespace.unwrap_or_else(|| bundle.manifest.namespace.clone());
+                let options = backup::VolumeRestoreOptions {
+                    target_namespace: target,
+                    prefix: format!("drill-{}-", sanitize_id(&bundle.manifest.id)),
+                    drill: true,
+                    keep,
+                    verify_image,
+                    timeout: Duration::from_secs(timeout_secs),
+                };
+                let client = kube::Client::try_default()
+                    .await
+                    .map_err(|error| anyhow::anyhow!("load Kubernetes client: {error}"))?;
+                let volumes = backup::restore_volumes(&client, &bundle.manifest, &options).await?;
+                if volumes.is_empty() {
+                    println!(
+                        "restore drill passed: catalog verified; the bundle has no volume snapshots"
+                    );
+                } else {
+                    println!(
+                        "restore drill passed: {} PVC(s) mounted and hashed; desired state not changed",
+                        volumes.len()
+                    );
+                }
+                return Ok(());
+            }
+            if apply_crds {
+                let store = Store::crd(namespace.clone(), false)
+                    .await
+                    .map_err(|error| anyhow::anyhow!("open CRD catalog: {error}"))?;
+                let current = store.snapshot();
+                let selected = backup::select_catalog(&bundle.catalog, &selection)?;
+                let merged = backup::merge_catalog(&current, &selected);
+                let report = validate_catalog(&merged);
+                if !report.is_ok() {
+                    bail!(
+                        "merged catalog validation failed:
+{}",
+                        report.to_text()
+                    );
+                }
+                store
+                    .commit(merged)
+                    .await
+                    .map_err(|error| anyhow::anyhow!("restore CRDs: {error}"))?;
+                println!("restored CRDs from backup {}", bundle.manifest.id);
+            }
+            if restore_volumes {
+                let target = target_namespace.unwrap_or_else(|| bundle.manifest.namespace.clone());
+                let options = backup::VolumeRestoreOptions {
+                    target_namespace: target,
+                    prefix: volume_prefix,
+                    drill: false,
+                    keep: true,
+                    verify_image,
+                    timeout: Duration::from_secs(timeout_secs),
+                };
+                let client = kube::Client::try_default()
+                    .await
+                    .map_err(|error| anyhow::anyhow!("load Kubernetes client: {error}"))?;
+                let volumes = backup::restore_volumes(&client, &bundle.manifest, &options).await?;
+                println!("restored {} PVC(s): {}", volumes.len(), volumes.join(", "));
+            }
+            if !apply_crds && !restore_volumes {
+                println!("verified only; pass --apply-crds, --restore-volumes or --drill");
+            }
             Ok(())
         }
         Command::Render {
@@ -499,6 +799,50 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backup_cli_parses_volume_mode_and_optional_classes() {
+        let cli = Cli::try_parse_from([
+            "k8s-control-plane",
+            "backup",
+            "fx-eu-01",
+            "--mode",
+            "volume",
+            "--volume-snapshot-class",
+            "csi-snap",
+            "--no-verify",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Backup {
+                shard,
+                mode,
+                volume_snapshot_class,
+                no_verify,
+                ..
+            } => {
+                assert_eq!(shard, "fx-eu-01");
+                assert_eq!(mode, "volume");
+                assert_eq!(volume_snapshot_class, "csi-snap");
+                assert!(no_verify);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn restore_cli_rejects_apply_and_drill_together() {
+        let error = Cli::try_parse_from([
+            "k8s-control-plane",
+            "restore",
+            "--input",
+            "backups/fx-eu-01",
+            "--apply-crds",
+            "--drill",
+        ])
+        .unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
 
     #[test]
     fn target_release_is_optional() {
