@@ -368,13 +368,29 @@ impl Feed {
     pub async fn run(mut self, mut source: BoxedSource, mut stop: watch::Receiver<bool>) {
         let mut fast = tokio::time::interval(Duration::from_millis(Speed::Ms100.millis()));
         let mut slow = tokio::time::interval(Duration::from_millis(Speed::Ms1000.millis()));
+        let mut snapshot_retry = tokio::time::interval(Duration::from_secs(5));
         fast.set_missed_tick_behavior(MissedTickBehavior::Skip);
         slow.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        snapshot_retry.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        // A fresh process has no cached book. Ask for a snapshot immediately,
+        // even before the first WebSocket subscriber, so readiness does not
+        // depend on a client joining.
+        self.request_snapshot("startup");
         loop {
             tokio::select! {
                 _ = stop.changed() => break,
                 _ = fast.tick() => self.flush(Speed::Ms100),
                 _ = slow.tick() => self.flush(Speed::Ms1000),
+                _ = snapshot_retry.tick() => {
+                    let seen = self
+                        .shared
+                        .lock()
+                        .expect("state lock")
+                        .snapshot_seen;
+                    if !seen {
+                        self.request_snapshot("startup-retry");
+                    }
+                }
                 item = source.next() => match item {
                     Some(Ok(message)) => self.apply(message),
                     Some(Err(error)) => tracing::warn!(%error, "market-data source error"),

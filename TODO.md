@@ -102,11 +102,13 @@ run as production evidence for them.
     and slow consumers through the Kubernetes deployment; measure per-instance encode/fan-out
     CPU, queue depth, gap/resync behavior and p99, and prove the engine's matching path is
     unaffected.
-11. **Market-data feed hardening.** Characterize the Aeron image-registration race and the
-    single-node multi-subscriber behavior. Make source startup readiness-gated (or add a
-    per-source generation) so a stale feed is detected and rebuilt without log spam, keep the
-    5-30 s re-subscribe watchdog as the fallback, and avoid restart loops when an engine feed is
-    genuinely down.
+11. **Market-data feed hardening.** Source startup now requests a snapshot immediately and retries
+    until one is seen, each symbol owns an embedded media driver, and the source restarts its own
+    driver/client after an idle period; the supervisor also restarts a child when its `marketData`
+    configuration changes. The single-node OrbStack lab still flips Aeron images when the fast and
+    global services subscribe to the same feed, so the remaining work is a relay/dual-publish or a
+    strict one-subscriber-per-group-per-node rule. Keep the 5-30 s watchdog as the fallback and
+    avoid restart loops when an engine feed is genuinely down.
 12. **Multi-host evidence.** Rerun the read/write A/B on a second host and a Linux multi-host
     four-voter cluster, force a stale lease so the `ReadIndex` fallback is observed, validate
     Aeron multicast across hosts, and dispatch the bare-metal pinned-core `e2e` workflow.
@@ -309,6 +311,14 @@ Completed work is summarised here; detailed evidence, measurements and implement
 in git history and the linked docs. For the full history, check out `TODO.md` from an earlier commit
 (`git log -- TODO.md`).
 
+- **2026-11-17** — Market-data feed hardening and supervisor child restart: the source requests a
+  snapshot at startup and retries until `snapshot_seen`; each symbol owns an embedded media driver
+  and restarts its driver/client after an idle period; the supervisor now restarts a child when
+  only its `marketData` configuration changes (new integration test). The market-data images v5/v6
+  were rolled and reverted: on the single-node lab the fast and global subscribers still flip the
+  Aeron image, so the services are back on v4 and the fast `fx-sup-01` row can still show waiting
+  until a relay/dual-publish or one-subscriber-per-group placement is implemented. nzdusd was
+  re-added to both market-data service specs and uses its own group `239.1.2.69:24032`.
 - **2026-11-17** — Market-data WebUI links and gateway reachability: the market-data tables
   now link to `spec.websocket.ingress` (for example
   `http://fast-ws-fx-eu-01.match-eu-1.example/`) instead of `http://127.0.0.1:<port>`, and use

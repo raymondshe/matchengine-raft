@@ -203,11 +203,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("--archive-dir cannot be combined with --replay-dir".into());
     }
 
-    // One embedded media driver lives for the whole process. It must stay in
-    // scope until the server and feeds shut down; dropping it here would kill
-    // the subscriptions immediately after setup.
-    #[cfg(feature = "aeron")]
-    let mut shared_driver: Option<rusteron_media_driver::testing::EmbeddedDriver> = None;
     let mut snapshot_requesters: HashMap<String, SnapshotRequester> = HashMap::new();
     let mut sources: Vec<(SymbolSpec, BoxedSource)> = if let Some(dir) = &opt.replay_dir {
         for spec in &symbols {
@@ -234,25 +229,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
             .collect()
     } else if !opt.aeron_channel.is_empty() {
-        // One media driver per process serves every symbol. Starting an embedded driver per
-        // symbol would fail: the second launch cannot own the same Aeron directory.
-        #[cfg(feature = "aeron")]
-        if opt.aeron_embedded_driver {
-            let dir = opt
-                .aeron_dir
-                .first()
-                .cloned()
-                .unwrap_or_else(|| "/dev/shm/aeron".to_string());
-            shared_driver = Some(
-                rusteron_media_driver::testing::EmbeddedDriver::launch_with(|context| {
-                    let dir = std::ffi::CString::new(dir.clone())
-                        .map_err(|_| rusteron_media_driver::AeronCError::from_code(-1))?;
-                    context.set_dir(dir.as_c_str())?;
-                    Ok(())
-                })
-                .map_err(|error| format!("start embedded driver: {error}"))?,
-            );
-        }
         let mut sources = Vec::with_capacity(symbols.len());
         for (index, spec) in symbols.iter().enumerate() {
             let channel = opt
@@ -260,22 +236,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .get(index)
                 .or_else(|| opt.aeron_channel.first())
                 .ok_or("--aeron-channel is empty")?;
-            #[cfg(feature = "aeron")]
-            let dir = shared_driver
-                .as_ref()
-                .map(|driver| driver.dir().to_string())
-                .or_else(|| {
-                    opt.aeron_dir
-                        .get(index)
-                        .or_else(|| opt.aeron_dir.first())
-                        .cloned()
-                });
-            #[cfg(not(feature = "aeron"))]
+            // Each symbol owns its embedded media driver and directory. A
+            // shared driver cannot reset a single symbol's stale Aeron image;
+            // per-symbol drivers also keep one receiver per group/port.
             let dir = opt
                 .aeron_dir
                 .get(index)
                 .or_else(|| opt.aeron_dir.first())
-                .cloned();
+                .cloned()
+                .unwrap_or_else(|| "/dev/shm/aeron".to_string());
+            let dir = Some(format!("{dir}-{}", spec.symbol));
             let stream_base = opt
                 .aeron_stream_base
                 .get(index)
@@ -286,9 +256,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 channel: channel.clone(),
                 stream_base,
                 dir,
-                #[cfg(feature = "aeron")]
-                embedded: opt.aeron_embedded_driver && shared_driver.is_none(),
-                #[cfg(not(feature = "aeron"))]
                 embedded: opt.aeron_embedded_driver,
             };
             let (source, requester) = aeron_source_for(&aeron, spec.symbol_id).await?;

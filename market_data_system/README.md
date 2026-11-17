@@ -265,7 +265,7 @@ For multicast, start one supervised driver per process, give the engine and
 each service its own `--aeron-dir`/`--aeron-channel`, and use the same
 `aeron:udp?endpoint=239.1.2.3:24001|interface=lo` channel. The script starts
 three drivers: one for the engine and one for each of two service instances.
-`--aeron-embedded-driver` starts **one** driver for the whole service process;
+`--aeron-embedded-driver` starts **one** driver per symbol (each symbol owns its Aeron directory and can restart its driver independently);
 pass a repeatable `--aeron-stream-base` aligned with `--symbol` when the symbols
 come from engine processes with different feed bases. For Kubernetes, put
 `|interface={pod_ip}` in the `MarketDataService` channel; the control-plane
@@ -442,7 +442,7 @@ even when entries in between did not touch the book.
 | `--aeron-channel` | unset | Aeron feed (requires `--features aeron`); repeat per symbol |
 | `--aeron-stream-base` | `2001` | first stream id per symbol; repeat once per `--symbol` |
 | `--aeron-dir` | `AERON_DIR` | media-driver directory; repeat per symbol |
-| `--aeron-embedded-driver` | off | embed one driver for the whole process (demos/tests) |
+| `--aeron-embedded-driver` | off | embed one driver per symbol (demos/tests) |
 | `--symbol` | required | `name:id:base:quote`, repeatable (e.g. `eurusd:0:EUR:USD`) |
 | `--bar-intervals-ms` | `1000,60000` | kline intervals (match the engines) |
 | `--max-connections` | `256` | per instance |

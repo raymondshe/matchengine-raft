@@ -93,17 +93,20 @@ fn run(
     ready: oneshot::Sender<io::Result<()>>,
 ) {
     match setup(channel, stream_base, dir.as_deref(), embedded, tx) {
-        Ok((_driver, aeron, subscriptions, tx, channel, request_stream, client_dir)) => {
+        Ok((driver, aeron, subscriptions, tx, channel, request_stream, client_dir)) => {
             let _ = ready.send(Ok(()));
             poll_loop(
+                driver,
+                Some(aeron),
                 subscriptions,
                 tx,
-                aeron,
                 channel,
                 stream_base,
                 request_stream,
                 client_dir,
                 request_rx,
+                embedded,
+                dir,
             );
         }
         Err(error) => {
@@ -220,7 +223,7 @@ fn add_subscriptions(
     Ok(subscriptions)
 }
 
-fn resubscribe(
+fn resubscribe_client(
     aeron: &mut Aeron,
     channel: &CString,
     stream_base: u16,
@@ -230,9 +233,6 @@ fn resubscribe(
     for subscription in subscriptions.drain(..) {
         let _ = subscription.close();
     }
-    // A subscription can be created successfully while its client conductor
-    // never links the image. Recreate the whole client, not just the
-    // subscriptions, so the conductor starts from a clean state.
     match new_client(dir) {
         Ok(fresh) => {
             *aeron = fresh;
@@ -242,7 +242,7 @@ fn resubscribe(
                     tracing::info!(
                         stream_base,
                         channel = %channel.to_string_lossy(),
-                        "Aeron feed re-subscribed"
+                        "Aeron client re-subscribed"
                     );
                 }
                 Err(error) => {
@@ -250,7 +250,7 @@ fn resubscribe(
                         %error,
                         stream_base,
                         channel = %channel.to_string_lossy(),
-                        "Aeron feed re-subscribe failed"
+                        "Aeron client re-subscribe failed"
                     );
                 }
             }
@@ -268,15 +268,19 @@ fn resubscribe(
 
 #[allow(clippy::too_many_arguments)]
 fn poll_loop(
+    mut driver: Option<EmbeddedDriver>,
+    mut aeron: Option<Aeron>,
     mut subscriptions: Vec<AeronSubscription>,
     tx: mpsc::Sender<Item>,
-    mut aeron: Aeron,
     channel: CString,
     stream_base: u16,
     request_stream: u16,
     client_dir: Option<String>,
     request_rx: std::sync::mpsc::Receiver<SnapshotRequest>,
+    embedded: bool,
+    dir: Option<String>,
 ) {
+    let _ = driver.as_ref();
     let mut request_publication: Option<AeronExclusivePublication> = None;
     let mut pending_request: Option<SnapshotRequest> = None;
     let mut last_message = Instant::now();
@@ -290,13 +294,21 @@ fn poll_loop(
 
         if let Some(request) = pending_request.take() {
             if request_publication.is_none() {
-                let publication = aeron
-                    .async_add_exclusive_publication(channel.as_c_str(), i32::from(request_stream))
-                    .and_then(|poller| poller.poll_blocking(Duration::from_secs(5)));
+                let publication = aeron.as_ref().map(|aeron| {
+                    aeron
+                        .async_add_exclusive_publication(
+                            channel.as_c_str(),
+                            i32::from(request_stream),
+                        )
+                        .and_then(|poller| poller.poll_blocking(Duration::from_secs(5)))
+                });
                 match publication {
-                    Ok(publication) => request_publication = Some(publication),
-                    Err(error) => {
+                    Some(Ok(publication)) => request_publication = Some(publication),
+                    Some(Err(error)) => {
                         tracing::warn!(%error, "create snapshot-request publication failed");
+                    }
+                    None => {
+                        // The source is restarting; keep the request pending.
                     }
                 }
             }
@@ -324,6 +336,9 @@ fn poll_loop(
                     tracing::debug!("snapshot request waiting for publication");
                     pending_request = Some(request);
                 }
+            } else {
+                // The source is restarting; keep the request for the new client.
+                pending_request = Some(request);
             }
         }
 
@@ -362,15 +377,58 @@ fn poll_loop(
                 stream_base,
                 channel = %channel.to_string_lossy(),
                 retry_secs = retry_after.as_secs(),
-                "Aeron feed idle; re-subscribing"
+                "Aeron feed idle; restarting media driver and client"
             );
-            resubscribe(
-                &mut aeron,
-                &channel,
-                stream_base,
-                client_dir.as_deref(),
-                &mut subscriptions,
-            );
+            request_publication = None;
+            if embedded {
+                for subscription in subscriptions.drain(..) {
+                    let _ = subscription.close();
+                }
+                // Drop the client before its driver, then let the old embedded
+                // driver release the Aeron directory before starting a new one.
+                aeron = None;
+                driver = None;
+                let _ = driver.as_ref();
+                std::thread::sleep(Duration::from_secs(1));
+                match setup(
+                    channel.to_string_lossy().into_owned(),
+                    stream_base,
+                    dir.as_deref(),
+                    embedded,
+                    tx.clone(),
+                ) {
+                    Ok((
+                        new_driver,
+                        new_aeron,
+                        new_subscriptions,
+                        _tx,
+                        _channel,
+                        _request,
+                        _dir,
+                    )) => {
+                        driver = new_driver;
+                        let _ = driver.as_ref();
+                        aeron = Some(new_aeron);
+                        subscriptions = new_subscriptions;
+                        tracing::info!(
+                            stream_base,
+                            channel = %channel.to_string_lossy(),
+                            "Aeron source restarted with a fresh media driver"
+                        );
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "Aeron source restart failed");
+                    }
+                }
+            } else if let Some(client) = aeron.as_mut() {
+                resubscribe_client(
+                    client,
+                    &channel,
+                    stream_base,
+                    client_dir.as_deref(),
+                    &mut subscriptions,
+                );
+            }
             last_message = Instant::now();
             retry_after = (retry_after * 2).min(Duration::from_secs(30));
         }
