@@ -26,6 +26,7 @@ pub use archive::archive_path;
 pub use archive::archive_source;
 pub use config::AeronSpec;
 pub use config::Config;
+pub use config::FeedProfile;
 pub use config::SymbolSpec;
 pub use server::RunningService;
 pub use server::start;

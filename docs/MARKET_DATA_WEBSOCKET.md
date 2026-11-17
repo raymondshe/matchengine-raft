@@ -19,7 +19,13 @@ side stays on its existing multi-thread runtime with one dedicated publication t
 market-data system is a new binary built on Tokio + `actix-web`/`actix-ws`, with Aeron handles
 isolated on their own thread.
 
-Last updated: 2026-11-05.
+For Kubernetes/AWS EKS deployment, **Profile A (direct Aeron multicast)** is the default
+implementation. It requires a multicast-capable platform: Cilium/Isovalent multicast or Multus with
+AWS Transit Gateway multicast; the default VPC CNI cannot carry it. Direct NATS from the engine and
+the per-pod Aeron bridge are fallbacks for clusters without validated pod multicast; see
+[`AERON_K8S_MESSAGE_BUS.md`](./AERON_K8S_MESSAGE_BUS.md).
+
+Last updated: 2026-11-16.
 
 Reference implementation: `market_data_system/` (Aeron ingestion via rusteron 0.2.13 plus a
 JSONL fallback; Binance-style WebSocket service; multi-symbol per instance with one shared hub).
@@ -91,9 +97,16 @@ explicitly (§2.6).
   (**300 connection attempts per 5 minutes**).
 - A connection is valid for **24 hours**; the server disconnects after that and clients are
   expected to reconnect and re-subscribe.
-- The server sends a **ping frame every 3 minutes**; if no **pong** is received within
-  **10 minutes**, the connection is dropped. Unsolicited pongs from clients are allowed.
+- The server sends a **ping frame every 20 seconds**; if no **pong** is received within
+  **one minute**, the connection is dropped. Unsolicited pongs from clients are allowed.
+- WebSocket connections accept at most **5 incoming messages per second** (PING, PONG or a JSON
+  control request); going over the limit disconnects the client.
 - Servers restart; clients must handle reconnect and re-synchronize state.
+- Binance has two protocol families: **WebSocket Streams** (push market data, the model here) and
+  the **WebSocket API** (`ws-api/v3`, request/response for trading, account and market-data
+  queries). SBE Market Data Streams are a binary variant of Streams with the same 1024-stream and
+  5-message limits. Binance does not define a separate fast/terminal socket; multi-symbol use is
+  one connection with up to 1024 streams, plus all-market aggregate streams.
 
 ### 2.2 Subscription protocol
 
@@ -143,6 +156,23 @@ Binance's documented procedure for maintaining a local book from the diff stream
 - `bookTicker`, partial-depth and kline payload shapes (with documented extensions).
 - Server ping / pong timeout / 24-hour lifetime / per-connection stream cap / close codes.
 - Snapshot + delta as the recovery model; updates carry **absolute quantities**, never increments.
+- Request ids that are 64-bit integers, alphanumeric strings of at most 36 characters, or `null`,
+  echoed unchanged; top-level `{"code","msg","id"}` errors; a 5 control-message-per-second limit.
+
+### 2.5.1 Our two server-enforced profiles
+
+The control protocol stays Binance-shaped, but the server separates use cases:
+
+| Profile | Endpoint | Symbol scope | Stream cap | Delivery |
+|---|---|---|---:|---|
+| **Fast** | `/ws/<symbol>@<stream>` | one symbol, fixed by the path | 32 | exact, no display conflation; API/algo clients |
+| **Terminal** | `/ws` + `SUBSCRIBE`, or `/stream?streams=...` | multi-symbol | 1024 | conflates `bookTicker`/partial depth to 100 ms by default; sequenced streams exact |
+
+Both profiles share one hub and one process, so every replica serves every configured symbol and a
+single terminal socket can hold all of them. A fast connection rejects a second symbol with error
+code `2` and points the client at `/stream`. Terminal clients should prefer conflatable streams for
+large symbol sets; a persistently slow consumer still gets close code `1013`, protecting the fast
+feed. This is our split, not a Binance contract.
 
 ### 2.6 What we deliberately do differently
 
@@ -151,7 +181,7 @@ Binance's documented procedure for maintaining a local book from the diff stream
 | Integer trade id `t` | `(L, t)` = (Raft log index, ordinal) | fills are identified by `EventId`; there is no separate replicated trade counter |
 | `aggTrade` id `a` | `@sweep` stream (one message per taker, all fills) in P1; price-grouped `@aggTrade` in P2 | one taker may sweep several price levels, which does not fit Binance's single-price aggregate shape |
 | REST snapshot required for depth sync | snapshot is pushed **on the WS at subscribe time**; an HTTP snapshot endpoint is optional parity | removes the REST round-trip and the snapshot/stream race for our clients; Binance rules still hold |
-| 1024 streams per connection | 1024 (configurable) | Binance parity; one connection can hold several symbols' streams |
+| 1024 streams per connection | 1024 terminal / 32 fast (configurable) | one terminal connection can hold several symbols; the fast profile is deliberately single-symbol |
 | Edge serves thousands of symbols | one symbol per engine deployment/cluster; one service instance aggregates several engines | engine contract stays one symbol per cluster; the service has one feed/state per configured symbol behind a shared hub |
 | `E`/`T` event times from the exchange | intake timestamps replicated in the log | the feed's rule: never a publish-time clock (§13 of the Aeron design) |
 | JSON only | JSON first; binary (wire v7 / an SBE-like format) is a later option | Binance itself now offers SBE streams; our wire v7 already exists on the Aeron edge |

@@ -112,6 +112,96 @@ mod tests {
     }
 
     #[test]
+    fn market_data_is_top_level_with_terminal_and_fast_subtabs() {
+        assert!(INDEX.contains("data-view=\"engine\""));
+        assert!(INDEX.contains("data-view=\"marketdata\""));
+        assert!(!INDEX.contains("data-view=\"marketdata-terminal\""));
+        assert!(!INDEX.contains("data-view=\"marketdata-fast\""));
+        assert!(INDEX.contains(">market data</button>"));
+        assert!(INDEX.contains("data-md-tab=\"terminal\""));
+        assert!(INDEX.contains("data-md-tab=\"fast\""));
+        assert!(INDEX.contains(">terminal market data</button>"));
+        assert!(INDEX.contains(">fast market data</button>"));
+        assert!(INDEX.contains("id=\"engineView\""));
+        assert!(INDEX.contains("id=\"marketDataView\""));
+        assert!(INDEX.contains("id=\"marketDataTerminalPanel\""));
+        assert!(INDEX.contains("id=\"marketDataFastPanel\""));
+        assert!(INDEX.contains("id=\"terminalMarketDataCards\""));
+        assert!(INDEX.contains("id=\"fastMarketDataCards\""));
+        assert!(INDEX.contains("id=\"terminalMarketDataRows\""));
+        assert!(INDEX.contains("id=\"fastMarketDataRows\""));
+        assert!(INDEX.contains("id=\"marketDataRefresh\""));
+        assert!(!INDEX.contains("id=\"terminalMarketDataView\""));
+        assert!(!INDEX.contains("id=\"fastMarketDataView\""));
+        assert!(!INDEX.contains("data-tab=\"marketdata\""));
+        assert!(INDEX.contains("function setView"));
+        assert!(INDEX.contains("function setMarketDataTab"));
+        assert!(INDEX.contains("function marketDataTabFromView"));
+        assert!(INDEX.contains("function loadMarketData"));
+        assert!(INDEX.contains("function renderMarketData"));
+        assert!(INDEX.contains("function renderMarketDataTable"));
+        assert!(INDEX.contains("function renderMarketDataCards"));
+        assert!(INDEX.contains("/api/v1/market-data-services"));
+        assert!(INDEX.contains("/manifests"));
+        assert!(INDEX.contains("lastFrameAgeMs"));
+        assert!(INDEX.contains("subscribers"));
+        assert!(INDEX.contains("wsPaths"));
+        assert!(INDEX.contains("/stream?streams=..."));
+        assert!(INDEX.contains("sourceShards"));
+        assert!(INDEX.contains("spec.autoscaling?.minReplicas"));
+        assert!(INDEX.contains("isMarketDataView"));
+        assert!(INDEX.contains("currentView === \"marketdata\""));
+        assert!(INDEX.contains("marketdata-terminal"));
+        assert!(INDEX.contains("marketdata-fast"));
+    }
+
+    #[test]
+    fn order_system_view_lists_user_shards_and_targets() {
+        assert!(INDEX.contains("data-view=\"ordersystem\""));
+        assert!(INDEX.contains(">order systems</button>"));
+        assert!(INDEX.contains("id=\"orderSystemView\""));
+        assert!(INDEX.contains("id=\"orderSystemCards\""));
+        assert!(INDEX.contains("id=\"orderSystemRows\""));
+        assert!(INDEX.contains("id=\"orderSystemRefresh\""));
+        assert!(INDEX.contains("function loadOrderSystems"));
+        assert!(INDEX.contains("function renderOrderSystems"));
+        assert!(INDEX.contains("/api/v1/order-systems"));
+        assert!(INDEX.contains("User-ID shards"));
+        assert!(INDEX.contains("Engine targets"));
+        assert!(INDEX.contains("currentView === \"ordersystem\""));
+        assert!(!INDEX.contains("orderTicketForm"));
+        assert!(!INDEX.contains("submitOrderTicket"));
+        assert!(!INDEX.contains("/shards/${encodeURIComponent(selection.shard.name)}/orders"));
+        assert!(INDEX.contains("function orderSystemWebuiUrl"));
+        assert!(INDEX.contains("/demo/"));
+        assert!(INDEX.contains("<th>Order desk</th>"));
+        assert!(INDEX.contains("Demo order desk"));
+        assert!(INDEX.contains("the manager does not proxy"));
+        assert!(INDEX.contains("data-order-upgrade="));
+        assert!(INDEX.contains("function upgradeOrderSystem"));
+        assert!(INDEX.contains("/upgrade`"));
+        assert!(INDEX.contains("hpa ${esc(minReplicas)}"));
+    }
+
+    #[test]
+    fn market_data_upgrade_uses_the_stateless_rolling_action() {
+        assert!(INDEX.contains("id=\"marketDataUpgradeModal\""));
+        assert!(INDEX.contains("id=\"marketDataUpgradeForm\""));
+        assert!(INDEX.contains("id=\"mdUpgradeImageSelect\""));
+        assert!(INDEX.contains("id=\"mdUpgradeWire\""));
+        assert!(INDEX.contains("id=\"mdUpgradeSnapshot\""));
+        assert!(INDEX.contains("data-md-upgrade="));
+        assert!(INDEX.contains("function openMarketDataUpgrade"));
+        assert!(INDEX.contains("function submitMarketDataUpgrade"));
+        assert!(INDEX.contains("/api/v1/images?marketDataService="));
+        assert!(INDEX.contains("encodeURIComponent(name)}/upgrade`"));
+        assert!(INDEX.contains("marketDataUpgradeName"));
+        assert!(INDEX.contains("operator rolling"));
+        assert!(INDEX.contains("sourceShards?.length"));
+        assert!(INDEX.contains("maxUnavailable: 0"));
+    }
+
+    #[test]
     fn live_refresh_updates_the_catalog_and_pauses_for_modals() {
         assert!(INDEX.contains("id=\"liveState\""));
         assert!(INDEX.contains("const LIVE_REFRESH_MS = 2000;"));

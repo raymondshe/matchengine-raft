@@ -164,6 +164,11 @@ Linux 外部媒体驱动和 multicast 验证见 `./scripts/aeron-linux-lab.sh`�
 [`market_data_system/README.md`](./market_data_system/README.md) 和
 [`docs/MARKET_DATA_WEBSOCKET.md`](./docs/MARKET_DATA_WEBSOCKET.md)。
 
+Kubernetes/AWS EKS 生产路径默认采用 **Profile A（引擎直接 Aeron 组播）**；需要支持组播的平台
+（Cilium/Isovalent multicast，或 Multus + AWS Transit Gateway multicast），默认 VPC CNI 无法承载。
+直接 NATS 和每引擎 Pod 的 Aeron bridge 是回退方案，见
+[`docs/AERON_K8S_MESSAGE_BUS.md`](./docs/AERON_K8S_MESSAGE_BUS.md)。
+
 ## ☸️ Kubernetes 控制平面
 
 引擎一个进程只交易一个 symbol，因此多 symbol 部署是多个独立 Raft 集群。
@@ -176,7 +181,7 @@ containers 模式需要显式允许重启。
 
 同一个控制平面支持单个 symbol 的优雅停启，保留 slot、端口和 PVC，并在不重新 `/init` 的情况下恢复
 WAL/snapshot；空闲 shard 可删除，并显式选择保留 PVC 或不可逆删除。期望状态可以使用 JSON demo store
-或 CRD 后端；后者通过 Kubernetes API server 写入五个 `matching.io` CRD（底层 etcd），并从 informer
+或 CRD 后端；后者通过 Kubernetes API server 写入六个 `matching.io` CRD（含 `MarketDataService`）（底层 etcd），并从 informer
 重建缓存。Lease 选举的 operator 监听 CRD、apply/prune 渲染出的工作负载、给 dedicated leader Pod 打标签、
 写入 shard/deployment/route 状态、bootstrap/config 每个 Raft 组、在 quorum 门禁下逐 Pod 滚动、执行 PVC
 保留窗口，并用不重叠的 Raft ID 范围完成跨 shard cutover/rollback。
@@ -240,6 +245,7 @@ payload/purge、async WAL 或 thin LTO，它们都没有超过默认配置。详
 - [事件交付](./docs/MATCH_RESULTS.md) — 事件、游标和幂等。
 - [测试](./docs/zh-CN/TESTING.md) — 集群测试、回放矩阵和故障测试。
 - [性能](./docs/PERFORMANCE.md) — 实测基线和测量方法。
+- [Kubernetes 行情消息总线](./docs/AERON_K8S_MESSAGE_BUS.md) — 行情消息总线、multicast 限制和扩展方案。
 - [Runbook](./docs/zh-CN/RUNBOOK.md) — 集群、升级、迁移和恢复流程。
 - [第三方调研](./docs/THIRD_PARTY_INVESTIGATION.md) — 外部引擎 review。
 - [TODO](./TODO.md) — 当前优先级和路线图。

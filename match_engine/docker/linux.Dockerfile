@@ -14,12 +14,16 @@ RUN apt-get update \
         pkg-config \
         libssl-dev \
         ca-certificates \
-        cmake \
         clang \
+        python3 \
+        python3-pip \
         libclang-dev \
         uuid-dev \
         libbsd-dev \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && python3 -m pip install --break-system-packages --no-cache-dir cmake==3.31.6
+
+RUN rustup component add rustfmt
 
 WORKDIR /src
 
@@ -38,6 +42,7 @@ RUN apt-get update \
         iproute2 \
         iptables \
         libssl3 \
+        libatomic1 \
         procps \
     && rm -rf /var/lib/apt/lists/*
 

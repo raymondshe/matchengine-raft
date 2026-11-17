@@ -33,12 +33,12 @@ launcher serves the public Binance-compatible catalogue; pass `--extensions`
 to add the engine's `@sweep`, `@status` and `@lifecycle` streams for internal
 diagnostics.
 
-The production transport is **Aeron**: each engine publishes one stream per
-product on a multicast/unicast channel (or IPC on one host), and each service
-instance subscribes independently. That gives low latency and horizontal
-scale-out — adding instances adds client capacity without adding engine work.
-The engine's JSONL `--market-data-log` feed is also supported as a driverless
-fallback for development.
+The reference implementation currently ships **Aeron** ingestion and the JSONL fallback. For
+Kubernetes/AWS EKS, **Profile A (direct Aeron multicast)** is the default implementation; it needs
+a multicast-capable platform (Cilium/Isovalent multicast, or Multus with AWS Transit Gateway
+multicast), and the default VPC CNI cannot carry it. Direct NATS and the per-pod bridge are
+fallbacks; the transport comparison and multicast caveats are in
+[`docs/AERON_K8S_MESSAGE_BUS.md`](../docs/AERON_K8S_MESSAGE_BUS.md).
 
 ```
 engine A (EUR/USD) ── AeronSink ── streams 2001..2007 ──┐
@@ -85,8 +85,8 @@ engine.
 ../scripts/market-data-system.sh
 ```
 
-It builds the engine with `--features market-data-aeron` and this crate with
-`--features aeron`, then starts two single-node engines with embedded media
+It builds the engine with `--features market-data-aeron,aeron-precompiled` and this crate with
+`--features aeron,aeron-precompiled`, then starts two single-node engines with embedded media
 drivers in separate directories: EUR/USD on `127.0.0.1:24801` and BTC/USDT on
 `127.0.0.1:24802`. One service on `127.0.0.1:24800` consumes both. Open the test
 page at `http://127.0.0.1:24800/` and switch symbols from the dropdown; the
@@ -100,22 +100,22 @@ symbol to its own multicast channel:
 
 ```shell
 # engine A: EUR/USD
-cargo run --release --features market-data-aeron -- \
+cargo run --release --features market-data-aeron,aeron-precompiled -- \
   --id 1 --http-addr 127.0.0.1:21001 \
-  --market-data-aeron-channel 'aeron:udp?endpoint=239.1.2.3:24001|interface=eth0' \
+  --market-data-aeron-channel 'aeron:udp?endpoint=239.1.2.3:24001' \
   --market-data-aeron-snapshot-every-ms 5000
 
 # engine B: BTC/USDT
-cargo run --release --features market-data-aeron -- \
+cargo run --release --features market-data-aeron,aeron-precompiled -- \
   --id 1 --http-addr 127.0.0.1:21002 \
-  --market-data-aeron-channel 'aeron:udp?endpoint=239.1.2.4:24001|interface=eth0' \
+  --market-data-aeron-channel 'aeron:udp?endpoint=239.1.2.4:24001' \
   --market-data-aeron-snapshot-every-ms 5000
 
 # service (repeat per instance / host); channels and dirs align with --symbol
-cargo run --release --manifest-path market_data_system/Cargo.toml --features aeron -- \
+cargo run --release --manifest-path market_data_system/Cargo.toml --features aeron,aeron-precompiled -- \
   --addr 127.0.0.1:24700 \
-  --aeron-channel 'aeron:udp?endpoint=239.1.2.3:24001|interface=eth0' \
-  --aeron-channel 'aeron:udp?endpoint=239.1.2.4:24001|interface=eth0' \
+  --aeron-channel 'aeron:udp?endpoint=239.1.2.3:24001' \
+  --aeron-channel 'aeron:udp?endpoint=239.1.2.4:24001' \
   --symbol eurusd:0:EUR:USD \
   --symbol btcusdt:1:BTC:USDT
 ```
@@ -159,7 +159,7 @@ inspected with the existing tooling and replayed without a media driver:
 
 ```shell
 # record while serving a live Aeron or JSONL source
-cargo run --manifest-path market_data_system/Cargo.toml --features aeron -- \
+cargo run --manifest-path market_data_system/Cargo.toml --features aeron,aeron-precompiled -- \
   --addr 127.0.0.1:24700 \
   --aeron-channel 'aeron:ipc' \
   --symbol eurusd:0:EUR:USD \
@@ -187,13 +187,13 @@ For a supervised driver instead of `--aeron-embedded-driver`:
 AERON_DIR=/dev/shm/aeron-$USER aeronmd
 
 # terminal 2: engine and service; the same directory is used on both sides
-AERON_DIR=/dev/shm/aeron-$USER cargo run --release --features market-data-aeron -- \
+AERON_DIR=/dev/shm/aeron-$USER cargo run --release --features market-data-aeron,aeron-precompiled -- \
   --id 1 --http-addr 127.0.0.1:21001 \
   --market-data-aeron-channel 'aeron:ipc' \
   --market-data-aeron-dir /dev/shm/aeron-$USER
 
 AERON_DIR=/dev/shm/aeron-$USER cargo run --manifest-path market_data_system/Cargo.toml \
-  --features aeron -- \
+  --features aeron,aeron-precompiled -- \
   --addr 127.0.0.1:24700 --aeron-channel 'aeron:ipc' \
   --aeron-dir /dev/shm/aeron-$USER --symbol eurusd:0:EUR:USD
 ```
@@ -223,8 +223,8 @@ snapshot remains the fallback if the request cannot be delivered.
 ### Linux external-driver/multicast validation
 
 `scripts/aeron-linux-lab.sh` automates the Linux validation on OrbStack. It
-builds the engine with `--features market-data-aeron` and the demo with
-`--features aeron`, then runs a separate driver process
+builds the engine with `--features market-data-aeron,aeron-precompiled` and the demo with
+`--features aeron,aeron-precompiled`, then runs a separate driver process
 (`market_data_system/src/bin/aeron_driver.rs`, a small Rust equivalent of
 `aeronmd` using the same Aeron C media driver) for two scenarios:
 
@@ -246,17 +246,17 @@ For the manual IPC check, use the helper binary instead of `aeronmd`:
 # terminal 1: supervised driver
 AERON_DIR=/dev/shm/aeron-ipc \
   cargo run --release --manifest-path market_data_system/Cargo.toml \
-    --features aeron --bin aeron_driver
+    --features aeron,aeron-precompiled --bin aeron_driver
 
 # terminal 2: engine
-AERON_DIR=/dev/shm/aeron-ipc cargo run --release --features market-data-aeron -- \
+AERON_DIR=/dev/shm/aeron-ipc cargo run --release --features market-data-aeron,aeron-precompiled -- \
   --id 1 --http-addr 127.0.0.1:21001 \
   --market-data-aeron-channel 'aeron:ipc' \
   --market-data-aeron-dir /dev/shm/aeron-ipc
 
 # terminal 3: service
 AERON_DIR=/dev/shm/aeron-ipc cargo run --release \
-  --manifest-path market_data_system/Cargo.toml --features aeron -- \
+  --manifest-path market_data_system/Cargo.toml --features aeron,aeron-precompiled -- \
   --addr 127.0.0.1:24700 --aeron-channel 'aeron:ipc' \
   --aeron-dir /dev/shm/aeron-ipc --symbol eurusd:0:EUR:USD
 ```
@@ -265,9 +265,19 @@ For multicast, start one supervised driver per process, give the engine and
 each service its own `--aeron-dir`/`--aeron-channel`, and use the same
 `aeron:udp?endpoint=239.1.2.3:24001|interface=lo` channel. The script starts
 three drivers: one for the engine and one for each of two service instances.
+`--aeron-embedded-driver` starts **one** driver for the whole service process;
+pass a repeatable `--aeron-stream-base` aligned with `--symbol` when the symbols
+come from engine processes with different feed bases. For Kubernetes, put
+`|interface={pod_ip}` in the `MarketDataService` channel; the control-plane
+renderer expands `{pod_ip}` to the pod's `POD_IP`. Do not use `interface=eth0`:
+the static Aeron build does not resolve the interface name and the publication
+stays backpressured. The process handles
+SIGTERM/SIGINT, stops the HTTP/WebSocket server gracefully and then stops an
+embedded driver, which is what the Kubernetes `preStop` drain relies on.
 
 Expected result: both service `/ready` endpoints return `200`, both `/metrics`
-counters advance for the same order flow, a WebSocket `@depth@100ms` client gets
+counters advance for the same order flow and now include a per-symbol
+`symbols` object (`ready`, `last_ts_ms`, `streams`, `subscribers`), a WebSocket `@depth@100ms` client gets
 a `depthSnapshot` immediately on subscribe (via stream 2010) rather than waiting
 for the periodic snapshot, and killing one service does not affect the other.
 
@@ -282,11 +292,24 @@ for the periodic snapshot, and killing one service does not affect the other.
 - The first stream-2010 request can arrive before its Aeron publication has
   connected. The source now keeps that request pending and retries it instead
   of dropping it; this was found during the validation.
+- A freshly created Aeron subscription can occasionally miss the image
+  registration race and receive no fragments. Each source now re-subscribes
+  after 5 s without a fragment, backing off to 30 s, and resets the watchdog on
+  the first message. This also recovers a feed after an engine leader transfer.
+  Engine publishers keep `interface={pod_ip}`; market-data receivers strip the
+  parameter and bind wildcard so several pods on one node can join the same
+  group.
+- **Kubernetes (2026-11-16):** a single-node OrbStack engine pod -> market-data
+  pod feed is live (`/ready` 200, `MarketDataService.status.phase=Ready`) when
+  the channel uses `interface={pod_ip}`; the control plane expands it to each
+  pod's `POD_IP`. `interface=eth0` starts but never emits multicast and the
+  engine publication stays backpressured. Cross-node Kubernetes multicast is
+  still unverified.
 
 This validates the external-driver and multicast **code paths on a single
 Linux host/network namespace**. Cross-host multicast on a real fabric remains a
 deployment-network check, not a code-path check. The embedded-driver path is
-also covered by `cargo test --features aeron --test aeron` on development hosts.
+also covered by `cargo test --features aeron,aeron-precompiled --test aeron` on development hosts.
 
 ### WebSocket fan-out benchmark
 
@@ -346,6 +369,58 @@ Raw URLs (`/ws/<stream>`), combined streams (`/stream?streams=a/b`, wrapped in
 `depth` and `kline`, ping/pong, a 24-hour connection lifetime, a 1024-stream
 cap, a 1024-message FIFO and close code 1013 for slow consumers are implemented.
 
+### Two WebSocket profiles
+
+Binance has two protocol families, not a fast/terminal split: **WebSocket
+Streams** (`wss://stream.binance.com`, market-data push, raw/combined, 1024
+streams and 5 client messages per second per connection) and the
+**WebSocket API** (`wss://ws-api.binance.com/ws-api/v3`, request/response for
+trading, account and market-data queries). SBE Market Data Streams are a binary
+variant of Streams with the same 1024/5 limits. Binance supports many symbols on
+one Streams connection (`SUBSCRIBE btcusdt@bookTicker`, `ethusdt@bookTicker`) and
+also offers all-market aggregate streams such as `!miniTicker@arr`; it does not
+define a separate terminal socket.
+
+We keep the Binance control protocol but enforce two server-side profiles:
+
+| Profile | Endpoint | Symbol scope | Stream cap | Delivery |
+|---|---|---|---:|---|
+| **Fast** | `/ws/<symbol>@<stream>` | exactly one symbol, fixed by the path | 32 | exact; no display conflation; intended for API/algo clients |
+| **Terminal** | `/ws` + `SUBSCRIBE`, or `/stream?streams=...` | multi-symbol | 1024 | conflates `bookTicker` and partial depth to `--terminal-conflation-ms` (default 100 ms); sequenced streams stay exact |
+
+Set `--fast-only` on a shard-local deployment to disable the terminal routes: `/ws` and
+`/stream?streams=...` return `404` (`{"code":"fast_only"}`), while
+`/ws/<symbol>@<stream>` keeps working. A global terminal deployment omits the flag and can
+subscribe to several shard feeds at once by repeating `--aeron-channel` and
+`--aeron-stream-base` per symbol.
+
+A fast connection rejects a `SUBSCRIBE` for a different symbol with Binance
+error code `2`; use `/stream` for multi-symbol. Terminal clients should prefer
+the conflatable streams for large symbol sets; a slow terminal consumer still
+gets close code `1013` rather than stalling the fast feed. All connections share
+one hub and one process, so every pod serves every configured symbol and one
+terminal socket can observe all of them.
+
+The control protocol also follows Binance's request-id rules (64-bit integer,
+alphanumeric string up to 36 characters, or `null`), echoes the id unchanged,
+returns top-level `{"code","msg","id"}` errors, and allows 5 client control
+messages per second.
+
+### Native arm64 image
+
+The rusteron 0.2.13 prebuilt Linux libraries are x86_64-only. For a native
+Apple Silicon/arm64 image, build Aeron from source (omit the
+`aeron-precompiled` feature) with CMake >= 3.30 and `rustfmt` present:
+
+```sh
+docker build --platform linux/arm64 \
+  -f market_data_system/docker/k8s.Dockerfile \
+  -t matchengine-marketdata:aeron-arm64 .
+```
+
+The Dockerfile installs CMake 3.31 and builds `--features aeron`. The
+`aeron-precompiled` feature remains available for macOS and Linux x86_64.
+
 ## 🧭 Depth synchronization
 
 Depth payloads use a 1-based update id (`market_seq + 1`). A subscribe-time
@@ -365,13 +440,16 @@ even when entries in between did not touch the book.
 | `--archive-dir` | unset | record consumed messages to `<dir>/<symbol>.jsonl` |
 | `--replay-dir` | unset | replay `<dir>/<symbol>.jsonl`; excludes live sources |
 | `--aeron-channel` | unset | Aeron feed (requires `--features aeron`); repeat per symbol |
-| `--aeron-stream-base` | `2001` | first stream id (shared by all symbols) |
+| `--aeron-stream-base` | `2001` | first stream id per symbol; repeat once per `--symbol` |
 | `--aeron-dir` | `AERON_DIR` | media-driver directory; repeat per symbol |
-| `--aeron-embedded-driver` | off | embed the driver (demos/tests) |
+| `--aeron-embedded-driver` | off | embed one driver for the whole process (demos/tests) |
 | `--symbol` | required | `name:id:base:quote`, repeatable (e.g. `eurusd:0:EUR:USD`) |
 | `--bar-intervals-ms` | `1000,60000` | kline intervals (match the engines) |
 | `--max-connections` | `256` | per instance |
-| `--max-streams` | `1024` | per connection (Binance parity) |
+| `--max-streams` | `1024` | terminal multi-symbol connection (Binance parity) |
+| `--fast-max-streams` | `32` | fast single-symbol connection |
+| `--fast-only` | off | disable `/ws` and `/stream`; serve only `/ws/<symbol>@<stream>` |
+| `--terminal-conflation-ms` | `100` | terminal conflation for latest-value streams; `0` disables |
 | `--queue` | `1024` | per-connection sequenced queue |
 | `--ping-secs` / `--pong-timeout-secs` | `180` / `600` | connection hygiene |
 | `--connection-lifetime-secs` | `86400` | forced reconnect |
@@ -417,7 +495,7 @@ the same messages through `jsonl_source`. The `aeron` feature adds an
 embedded-driver test that publishes engine wire frames over IPC and asserts they
 reach the WebSocket client, plus a stream-2010 request round-trip; the engine has
 matching `market_data::aeron` tests for publish/receive, the idle heartbeat and
-the stream-2010 subscription behind `--features market-data-aeron`.
+the stream-2010 subscription behind `--features market-data-aeron,aeron-precompiled`.
 `cargo bench --manifest-path market_data_system/Cargo.toml --bench ws_fanout`
 reports WebSocket fan-out (see [`docs/PERFORMANCE.md`](../docs/PERFORMANCE.md#websocket-fan-out-2026-11-10)).
 

@@ -14,8 +14,8 @@ ctrlc = { version = "3.5", optional = true }
 futures-util = "0.3"
 matchengine-raft = { path = "../match_engine" }
 # Optional Aeron transport. Pinned to 0.2.13: 0.2.14+ uses an unstable API.
-rusteron-client = { version = "=0.2.13", default-features = false, features = ["static", "precompile-rustls"], optional = true }
-rusteron-media-driver = { version = "=0.2.13", default-features = false, features = ["static", "precompile-rustls"], optional = true }
+rusteron-client = { version = "=0.2.13", default-features = false, features = ["static"], optional = true }
+rusteron-media-driver = { version = "=0.2.13", default-features = false, features = ["static"], optional = true }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 tokio-stream = "0.1.19"
@@ -35,6 +35,13 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 [features]
 # Ingest the engine feed over Aeron. `cargo run --features aeron -- --aeron-channel ...`
 aeron = ["dep:rusteron-client", "dep:rusteron-media-driver", "dep:ctrlc"]
+# Use the published macOS/Linux x86_64 Aeron binaries instead of a source build.
+# Native Linux arm64 images omit this feature and build Aeron with CMake >= 3.30.
+aeron-precompiled = [
+    "aeron",
+    "rusteron-client/precompile-rustls",
+    "rusteron-media-driver/precompile-rustls",
+]
 
 [dev-dependencies]
 tokio-tungstenite = "0.24"

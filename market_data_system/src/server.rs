@@ -17,11 +17,13 @@ use actix_web::http::StatusCode;
 use actix_web::web;
 use actix_web::web::Data;
 use serde::Deserialize;
+use serde_json::Value;
 use serde_json::json;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use crate::config::Config;
+use crate::config::FeedProfile;
 use crate::config::SymbolSpec;
 use crate::feed::Feed;
 use crate::feed::Registry;
@@ -30,6 +32,7 @@ use crate::feed::Stats;
 use crate::feed::SymbolRuntime;
 use crate::session;
 use crate::session::ConnectionGuard;
+use crate::session::FrameBudget;
 use crate::session::SessionCtx;
 use crate::source::BoxedSource;
 use crate::source::SnapshotRequester;
@@ -236,6 +239,12 @@ async fn info(state: Data<AppState>) -> HttpResponse {
         "bar_intervals_ms": state.config.bar_intervals_ms,
         "extensions": state.config.extensions,
         "lifecycle": state.config.lifecycle,
+        "fast_only": state.config.fast_only,
+        "profiles": if state.config.fast_only {
+            vec!["fast"]
+        } else {
+            vec!["fast", "terminal"]
+        },
         "streams": streams,
     }))
 }
@@ -262,6 +271,9 @@ async fn ready(state: Data<AppState>) -> HttpResponse {
                 "heartbeat_fresh": state
                     .heartbeat_deadline
                     .is_some_and(|deadline| std::time::Instant::now() <= deadline),
+                "last_ts_ms": state.last_ts_ms,
+                "epoch": state.epoch,
+                "leader_id": state.leader_id,
             }),
         );
     }
@@ -276,7 +288,24 @@ async fn ready(state: Data<AppState>) -> HttpResponse {
 #[get("/metrics")]
 async fn metrics(state: Data<AppState>) -> HttpResponse {
     let registry = state.registry.lock().expect("registry lock");
-    HttpResponse::Ok().json(state.stats.metrics_json(&registry))
+    let mut body = state.stats.metrics_json(&registry);
+    let mut symbols = serde_json::Map::new();
+    for (name, runtime) in state.symbols.iter() {
+        let shared = runtime.shared.lock().expect("state lock");
+        symbols.insert(
+            name.clone(),
+            json!({
+                "ready": shared.ready(),
+                "snapshot_seen": shared.snapshot_seen,
+                "depth_stale": shared.depth_stale,
+                "last_ts_ms": shared.last_ts_ms,
+                "streams": registry.symbol_streams(name),
+                "subscribers": registry.symbol_subscriptions(name),
+            }),
+        );
+    }
+    body["symbols"] = Value::Object(symbols);
+    HttpResponse::Ok().json(body)
 }
 
 #[get("/ws")]
@@ -285,7 +314,10 @@ async fn ws_bare(
     body: web::Payload,
     state: Data<AppState>,
 ) -> Result<HttpResponse, actix_web::Error> {
-    connect(req, body, state, false, Vec::new()).await
+    if state.config.fast_only {
+        return Ok(terminal_disabled());
+    }
+    connect(req, body, state, false, FeedProfile::Terminal, Vec::new()).await
 }
 
 #[get("/ws/{stream}")]
@@ -295,7 +327,15 @@ async fn ws_single(
     stream: web::Path<String>,
     state: Data<AppState>,
 ) -> Result<HttpResponse, actix_web::Error> {
-    connect(req, body, state, false, vec![stream.into_inner()]).await
+    connect(
+        req,
+        body,
+        state,
+        false,
+        FeedProfile::Fast,
+        vec![stream.into_inner()],
+    )
+    .await
 }
 
 #[derive(Deserialize)]
@@ -310,6 +350,9 @@ async fn ws_combined(
     query: web::Query<CombinedQuery>,
     state: Data<AppState>,
 ) -> Result<HttpResponse, actix_web::Error> {
+    if state.config.fast_only {
+        return Ok(terminal_disabled());
+    }
     let streams: Vec<String> = query
         .streams
         .split('/')
@@ -319,7 +362,14 @@ async fn ws_combined(
     if streams.is_empty() {
         return Ok(HttpResponse::BadRequest().json(json!({"error": "streams is required"})));
     }
-    connect(req, body, state, true, streams).await
+    connect(req, body, state, true, FeedProfile::Terminal, streams).await
+}
+
+fn terminal_disabled() -> HttpResponse {
+    HttpResponse::NotFound().json(json!({
+        "code": "fast_only",
+        "error": "terminal WebSocket disabled; use /ws/<symbol>@<stream>",
+    }))
 }
 
 async fn connect(
@@ -327,6 +377,7 @@ async fn connect(
     body: web::Payload,
     state: Data<AppState>,
     combined: bool,
+    profile: FeedProfile,
     initial: Vec<String>,
 ) -> Result<HttpResponse, actix_web::Error> {
     if state.stats.connections.load(Ordering::Relaxed) >= state.config.max_connections as u64 {
@@ -336,6 +387,29 @@ async fn connect(
     }
     let (response, session, stream) = actix_ws::handle(&req, body)?;
     state.stats.connections.fetch_add(1, Ordering::Relaxed);
+    match profile {
+        FeedProfile::Fast => state.stats.fast_connections.fetch_add(1, Ordering::Relaxed),
+        FeedProfile::Terminal => state
+            .stats
+            .terminal_connections
+            .fetch_add(1, Ordering::Relaxed),
+    };
+    // A fast connection is pinned to the symbol in its request path.
+    let restrict_symbol = (profile == FeedProfile::Fast)
+        .then(|| {
+            initial
+                .first()
+                .and_then(|name| crate::protocol::parse_stream(&state.config, name).ok())
+                .map(|spec| spec.symbol)
+        })
+        .flatten();
+    let frame_budget = (profile == FeedProfile::Terminal
+        && state.config.terminal_max_frames_per_second > 0)
+        .then(|| {
+            Arc::new(FrameBudget::new(
+                state.config.terminal_max_frames_per_second,
+            ))
+        });
     let ctx = SessionCtx {
         config: state.config.clone(),
         symbols: state.symbols.clone(),
@@ -343,9 +417,12 @@ async fn connect(
         stats: state.stats.clone(),
         stop: state.stop.subscribe(),
         combined,
+        profile,
+        restrict_symbol,
+        frame_budget,
         initial,
     };
-    let guard = ConnectionGuard(state.stats.clone());
+    let guard = ConnectionGuard::new(state.stats.clone(), profile);
     // `MessageStream` is not `Send` (it wraps the Actix payload), so the
     // session runs on this Actix worker's current-thread runtime.
     actix_web::rt::spawn(session::run(session, stream, ctx, guard));

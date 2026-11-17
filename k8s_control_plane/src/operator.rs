@@ -1,17 +1,18 @@
 //! Cell operator: Lease election, CRD watches, workload reconciliation and status.
 //!
-//! The operator is the only component that applies rendered workloads. It watches the five
-//! catalog CRDs, renders each shard through the same deterministic renderer as the manager,
-//! server-side-applies the desired StatefulSet/Services/PDB/NetworkPolicy/ConfigMap, prunes
-//! managed objects that are no longer desired, labels the dedicated-shard leader pod for the
-//! leader Service, and writes status/route conditions back through the CRD status subresource.
+//! The operator is the only component that applies rendered workloads. It watches the six
+//! catalog CRDs, renders each shard and market-data service through the same deterministic
+//! renderer as the manager, server-side-applies the desired StatefulSet/Deployment/Services/
+//! PDB/NetworkPolicy/ConfigMap, prunes managed objects that are no longer desired, labels the
+//! dedicated-shard leader pod for the leader Service, and writes status/route conditions back
+//! through the CRD status subresource.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use futures::StreamExt;
-use k8s_openapi::api::apps::v1::StatefulSet;
+use k8s_openapi::api::apps::v1::{Deployment, StatefulSet};
 use k8s_openapi::api::coordination::v1::{Lease, LeaseSpec};
 use k8s_openapi::api::core::v1::{Node, PersistentVolumeClaim, Pod};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{MicroTime, ObjectMeta};
@@ -29,12 +30,16 @@ use tracing::{debug, info, warn};
 use crate::api::{format_bytes, format_cpu};
 use crate::crd::{self, CrdKind, DEFAULT_NAMESPACE, ObjectKey};
 use crate::model::{
-    CapacityBlock, Condition, DeploymentState, DeploymentStatus, PackingMode, Phase, Release,
+    CapacityBlock, Condition, DeploymentState, DeploymentStatus, MarketDataService,
+    MarketDataSymbolStatus, OrderSystemShardStatus, OrderSystemStatus, PackingMode, Phase, Release,
     ReleaseBlock, RouteState, RouteStatus, ShardClass, ShardNodeStatus, ShardRolloutStatus,
     ShardStatus, ShardSymbolStatus, SymbolDeployment, SymbolRoute, SymbolShard, TradingSymbol,
-    TradingSymbolStatus, desired_config_hash,
+    TradingSymbolStatus, desired_config_hash, dns_label,
 };
-use crate::render::{MANAGED_BY, Profile, RenderOptions, render_shard};
+use crate::render::{
+    MANAGED_BY, MARKET_DATA_LABEL, ORDER_SYSTEM_LABEL, Profile, RenderOptions,
+    render_market_data_service, render_order_system, render_shard,
+};
 use crate::store::Catalog;
 use crate::validate::{parse_cpu_millis, parse_memory_bytes, per_pod_totals};
 
@@ -109,6 +114,8 @@ pub async fn run(client: Client, options: OperatorOptions) -> Result<()> {
         match reconcile_once(&client, &options).await {
             Ok(stats) => info!(
                 shards = stats.shards,
+                market_data_services = stats.market_data_services,
+                order_systems = stats.order_systems,
                 desired_objects = stats.desired_objects,
                 applied = stats.applied,
                 pruned = stats.pruned,
@@ -330,15 +337,21 @@ pub enum WorkloadKind {
     PodDisruptionBudget,
     NetworkPolicy,
     StatefulSet,
+    Deployment,
+    HorizontalPodAutoscaler,
+    Ingress,
 }
 
 impl WorkloadKind {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 8] = [
         Self::ConfigMap,
         Self::Service,
         Self::PodDisruptionBudget,
         Self::NetworkPolicy,
         Self::StatefulSet,
+        Self::Deployment,
+        Self::HorizontalPodAutoscaler,
+        Self::Ingress,
     ];
 
     fn from_kind(kind: &str) -> Option<Self> {
@@ -348,6 +361,9 @@ impl WorkloadKind {
             "PodDisruptionBudget" => Some(Self::PodDisruptionBudget),
             "NetworkPolicy" => Some(Self::NetworkPolicy),
             "StatefulSet" => Some(Self::StatefulSet),
+            "Deployment" => Some(Self::Deployment),
+            "HorizontalPodAutoscaler" => Some(Self::HorizontalPodAutoscaler),
+            "Ingress" => Some(Self::Ingress),
             _ => None,
         }
     }
@@ -369,6 +385,14 @@ impl WorkloadKind {
                 "networkpolicies",
             ),
             Self::StatefulSet => ("apps", "v1", "StatefulSet", "statefulsets"),
+            Self::Deployment => ("apps", "v1", "Deployment", "deployments"),
+            Self::HorizontalPodAutoscaler => (
+                "autoscaling",
+                "v2",
+                "HorizontalPodAutoscaler",
+                "horizontalpodautoscalers",
+            ),
+            Self::Ingress => ("networking.k8s.io", "v1", "Ingress", "ingresses"),
         };
         ApiResource {
             group: group.to_string(),
@@ -415,6 +439,8 @@ fn workload_key(value: &Value) -> Result<WorkloadKey> {
 #[derive(Debug, Default)]
 struct ReconcileStats {
     shards: usize,
+    market_data_services: usize,
+    order_systems: usize,
     desired_objects: usize,
     applied: usize,
     pruned: usize,
@@ -502,10 +528,14 @@ async fn reconcile_once(client: &Client, options: &OperatorOptions) -> Result<Re
     let view = load_view(client, options.namespace.as_deref()).await?;
     let mut stats = ReconcileStats {
         shards: view.catalog.shards.len(),
+        market_data_services: view.catalog.market_data_services.len(),
+        order_systems: view.catalog.order_systems.len(),
         ..ReconcileStats::default()
     };
     let mut desired = BTreeMap::<WorkloadKey, Value>::new();
     let mut failed_shards = BTreeSet::new();
+    let mut failed_market_data = BTreeSet::new();
+    let mut failed_order_systems = BTreeSet::new();
 
     for shard in view.catalog.shards.values() {
         match render_shard(&view.catalog, &shard.name, &render_options(shard, options)) {
@@ -518,6 +548,42 @@ async fn reconcile_once(client: &Client, options: &OperatorOptions) -> Result<Re
             Err(error) => {
                 warn!(shard = %shard.name, %error, "cannot render shard; skipping apply/prune");
                 failed_shards.insert(shard.name.clone());
+            }
+        }
+    }
+    for service in view.catalog.market_data_services.values() {
+        match render_market_data_service(&view.catalog, &service.name, None) {
+            Ok(objects) => {
+                for object in objects.into_iter().filter(|object| !object.is_null()) {
+                    let key = workload_key(&object)?;
+                    desired.insert(key, object);
+                }
+            }
+            Err(error) => {
+                warn!(
+                    service = %service.name,
+                    error = %format!("{error:?}"),
+                    "cannot render market-data service; skipping apply/prune"
+                );
+                failed_market_data.insert(service.name.clone());
+            }
+        }
+    }
+    for system in view.catalog.order_systems.values() {
+        match render_order_system(&view.catalog, &system.name, None) {
+            Ok(objects) => {
+                for object in objects.into_iter().filter(|object| !object.is_null()) {
+                    let key = workload_key(&object)?;
+                    desired.insert(key, object);
+                }
+            }
+            Err(error) => {
+                warn!(
+                    system = %system.name,
+                    error = %format!("{error:?}"),
+                    "cannot render order system; skipping apply/prune"
+                );
+                failed_order_systems.insert(system.name.clone());
             }
         }
     }
@@ -541,6 +607,8 @@ async fn reconcile_once(client: &Client, options: &OperatorOptions) -> Result<Re
             client,
             &desired,
             &failed_shards,
+            &failed_market_data,
+            &failed_order_systems,
             options.namespace.as_deref(),
         )
         .await?;
@@ -556,6 +624,8 @@ async fn reconcile_once(client: &Client, options: &OperatorOptions) -> Result<Re
     }
 
     let observations = observe_catalog(&view.catalog, options).await;
+    let market_data_observations = observe_market_data(client, &view.catalog, options).await;
+    let order_system_statuses = observe_order_systems(client, &view.catalog).await;
     if !options.dry_run {
         let actions = actuate_catalog(&view.catalog, &observations, options).await;
         stats.bootstraps = actions.bootstraps;
@@ -573,10 +643,26 @@ async fn reconcile_once(client: &Client, options: &OperatorOptions) -> Result<Re
             &capacity_blocks,
         )
         .await?;
+        stats.status_writes += write_market_data_statuses(
+            client,
+            &view,
+            &market_data_observations,
+            &failed_market_data,
+        )
+        .await?;
+        stats.status_writes += write_order_system_statuses(
+            client,
+            &view,
+            &order_system_statuses,
+            &failed_order_systems,
+        )
+        .await?;
         label_leaders(client, &view.catalog, &observations).await?;
     } else {
         info!(
             deployments = observations.len(),
+            market_data = market_data_observations.len(),
+            order_systems = order_system_statuses.len(),
             "dry-run: skipping status writes, leader labels and bootstrap/config actions"
         );
     }
@@ -633,6 +719,8 @@ async fn prune_objects(
     client: &Client,
     desired: &BTreeMap<WorkloadKey, Value>,
     failed_shards: &BTreeSet<String>,
+    failed_market_data: &BTreeSet<String>,
+    failed_order_systems: &BTreeSet<String>,
     namespace: Option<&str>,
 ) -> Result<usize> {
     let mut pruned = 0;
@@ -671,6 +759,24 @@ async fn prune_objects(
                 .as_ref()
                 .and_then(|labels| labels.get("matching.io/shard"))
                 .is_some_and(|shard| failed_shards.contains(shard))
+            {
+                continue;
+            }
+            if object
+                .metadata
+                .labels
+                .as_ref()
+                .and_then(|labels| labels.get(MARKET_DATA_LABEL))
+                .is_some_and(|service| failed_market_data.contains(service))
+            {
+                continue;
+            }
+            if object
+                .metadata
+                .labels
+                .as_ref()
+                .and_then(|labels| labels.get(ORDER_SYSTEM_LABEL))
+                .is_some_and(|system| failed_order_systems.contains(system))
             {
                 continue;
             }
@@ -815,6 +921,210 @@ async fn observe_catalog(catalog: &Catalog, options: &OperatorOptions) -> Observ
                 deployment_observation(shard, &deployment, pods, desired_config.as_ref()),
             );
         }
+    }
+    observations
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct MarketDataObservation {
+    pub replicas: u16,
+    pub ready_replicas: u16,
+    pub updated_replicas: u16,
+    pub available: bool,
+    pub symbols: Vec<MarketDataSymbolStatus>,
+    pub feed_ready: bool,
+    pub message: String,
+    pub error: Option<String>,
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Coarse last-frame age so an idle service does not rewrite CR status every reconcile.
+fn quantize_frame_age(age_ms: u64) -> u64 {
+    match age_ms {
+        0..=999 => 0,
+        1_000..=4_999 => 1_000,
+        5_000..=29_999 => 5_000,
+        30_000..=59_999 => 30_000,
+        _ => 60_000,
+    }
+}
+
+async fn observe_market_data(
+    client: &Client,
+    catalog: &Catalog,
+    options: &OperatorOptions,
+) -> BTreeMap<String, MarketDataObservation> {
+    let http = reqwest::Client::new();
+    let mut observations = BTreeMap::new();
+    for service in catalog.market_data_services.values() {
+        let namespace = namespace_or_default(&service.namespace);
+        let mut observation = MarketDataObservation::default();
+        let deployment_api = Api::<Deployment>::namespaced(client.clone(), namespace);
+        match deployment_api.get(&service.name).await {
+            Ok(deployment) => {
+                if let Some(status) = deployment.status {
+                    observation.replicas = status.replicas.unwrap_or(0).max(0) as u16;
+                    observation.ready_replicas = status.ready_replicas.unwrap_or(0).max(0) as u16;
+                    observation.updated_replicas =
+                        status.updated_replicas.unwrap_or(0).max(0) as u16;
+                    observation.available = status.conditions.as_ref().is_some_and(|conditions| {
+                        conditions.iter().any(|condition| {
+                            condition.type_.as_deref() == Some("Available")
+                                && condition.status.as_deref() == Some("True")
+                        })
+                    });
+                }
+            }
+            Err(kube::Error::Api(error)) if error.code == 404 => {
+                observation.message = "Deployment has not been created yet".to_string();
+                observations.insert(service.name.clone(), observation);
+                continue;
+            }
+            Err(error) => {
+                observation.error = Some(format!(
+                    "get Deployment {namespace}/{}: {error}",
+                    service.name
+                ));
+                observations.insert(service.name.clone(), observation);
+                continue;
+            }
+        }
+
+        let pod_api = Api::<Pod>::namespaced(client.clone(), namespace);
+        let selector = format!("{MARKET_DATA_LABEL}={}", service.name);
+        let pod = match pod_api.list(&ListParams::default().labels(&selector)).await {
+            Ok(mut list) => {
+                let has_ip = |pod: &Pod| {
+                    pod.status
+                        .as_ref()
+                        .and_then(|status| status.pod_ip.as_ref())
+                        .is_some()
+                };
+                let ready = list.items.iter().position(|pod| {
+                    has_ip(pod)
+                        && pod
+                            .status
+                            .as_ref()
+                            .and_then(|status| status.conditions.as_ref())
+                            .is_some_and(|conditions| {
+                                conditions.iter().any(|condition| {
+                                    condition.type_ == "Ready" && condition.status == "True"
+                                })
+                            })
+                });
+                // A not-ready pod is still the best diagnostic source: it reports which
+                // symbol has not seen a snapshot/heartbeat yet.
+                let running = list.items.iter().position(|pod| {
+                    has_ip(pod)
+                        && pod
+                            .status
+                            .as_ref()
+                            .and_then(|status| status.phase.as_deref())
+                            == Some("Running")
+                });
+                ready.or(running).map(|index| list.items.remove(index))
+            }
+            Err(error) => {
+                observation.error = Some(format!("list market-data pods in {namespace}: {error}"));
+                observations.insert(service.name.clone(), observation);
+                continue;
+            }
+        };
+
+        let Some(pod) = pod else {
+            observation.message = "no running market-data pod".to_string();
+            observations.insert(service.name.clone(), observation);
+            continue;
+        };
+        let Some(ip) = pod
+            .status
+            .as_ref()
+            .and_then(|status| status.pod_ip.as_deref())
+        else {
+            observation.message = "market-data pod has no IP".to_string();
+            observations.insert(service.name.clone(), observation);
+            continue;
+        };
+        let port = service.spec.websocket.port;
+        let ready = fetch_json(
+            &http,
+            &format!("http://{ip}:{port}/ready"),
+            options.observe_timeout,
+        )
+        .await;
+        let metrics = fetch_json(
+            &http,
+            &format!("http://{ip}:{port}/metrics"),
+            options.observe_timeout,
+        )
+        .await;
+        let now = now_ms();
+        let mut not_ready = Vec::new();
+        let mut symbols = Vec::new();
+        for name in service.spec.symbol_names() {
+            let ready_symbol = ready
+                .as_ref()
+                .and_then(|value| value.get("symbols"))
+                .and_then(|symbols| symbols.get(&name));
+            let ready = ready_symbol
+                .and_then(|value| value.get("ready"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let last_ts = ready_symbol
+                .and_then(|value| value.get("last_ts_ms"))
+                .and_then(Value::as_u64)
+                .or_else(|| {
+                    metrics
+                        .as_ref()
+                        .and_then(|value| value.get("symbols"))
+                        .and_then(|symbols| symbols.get(&name))
+                        .and_then(|value| value.get("last_ts_ms"))
+                        .and_then(Value::as_u64)
+                });
+            let age = last_ts
+                .filter(|ts| *ts > 0)
+                .map(|ts| quantize_frame_age(now.saturating_sub(ts)))
+                .unwrap_or(0);
+            let subscribers = metrics
+                .as_ref()
+                .and_then(|value| value.get("symbols"))
+                .and_then(|symbols| symbols.get(&name))
+                .and_then(|value| value.get("subscribers"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let drops = metrics
+                .as_ref()
+                .and_then(|value| value.get("gaps"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            if !ready {
+                not_ready.push(name.clone());
+            }
+            symbols.push(MarketDataSymbolStatus {
+                name,
+                ready,
+                feed_lag: age,
+                last_frame_age_ms: age,
+                subscribers,
+                drops,
+            });
+        }
+        observation.feed_ready = !symbols.is_empty() && symbols.iter().all(|symbol| symbol.ready);
+        observation.symbols = symbols;
+        if !observation.feed_ready {
+            observation.message = if not_ready.is_empty() {
+                "feed not ready".to_string()
+            } else {
+                format!("feed not ready for {}", not_ready.join(", "))
+            };
+        }
+        observations.insert(service.name.clone(), observation);
     }
     observations
 }
@@ -3013,6 +3323,256 @@ fn symbol_status(
     status
 }
 
+fn market_data_status(
+    service: &MarketDataService,
+    catalog: &Catalog,
+    observation: Option<&MarketDataObservation>,
+    render_failed: bool,
+) -> crate::model::MarketDataServiceStatus {
+    use crate::model::MarketDataServiceStatus;
+
+    let observation = observation.cloned().unwrap_or_default();
+    // HPA owns the live replica count; `spec.replicas` is only the upper bound
+    // when `autoscaling.maxReplicas` is unset. Use the Deployment's observed
+    // desired count so scaling to the HPA minimum of one reads as Ready.
+    let desired = observation.replicas.max(if service.spec.paused {
+        0
+    } else {
+        service.spec.min_replicas()
+    });
+    let image_pinned = service.spec.image.contains("@sha256:");
+    let release_compatible = service.spec.symbol_names().iter().all(|name| {
+        catalog
+            .deployments
+            .values()
+            .find(|deployment| deployment.spec.symbol_ref == *name)
+            .and_then(|deployment| catalog.shards.get(&deployment.spec.shard_ref))
+            .is_none_or(|shard| {
+                shard.spec.release.wire_version == service.spec.release.wire_version
+            })
+    });
+    let all_symbols_ready = observation.feed_ready;
+    let ready_replicas = observation.ready_replicas;
+    let mut conditions = Vec::new();
+    conditions.push(if ready_replicas > 0 || observation.available {
+        Condition::true_("Available")
+    } else {
+        Condition::false_("DeploymentUnavailable", "NoReadyReplicas")
+    });
+    conditions.push(if all_symbols_ready {
+        Condition::true_("FeedReady")
+    } else {
+        Condition::false_("FeedNotReady", "SymbolFeedUnavailable")
+    });
+    conditions.push(if image_pinned {
+        Condition::true_("ImagePinned")
+    } else {
+        Condition::false_("MutableImageTag", "ImageTagNotDigest")
+    });
+    conditions.push(if release_compatible {
+        Condition::true_("ReleaseCompatible")
+    } else {
+        Condition::false_("IncompatibleRelease", "WireVersionMismatch")
+    });
+    if service.spec.paused {
+        conditions.push(Condition::true_("Paused"));
+    }
+
+    let phase = if service.spec.paused {
+        Phase::Disabled
+    } else if render_failed || !release_compatible {
+        Phase::Failed
+    } else if ready_replicas == 0 {
+        if observation.replicas > 0 {
+            Phase::Degraded
+        } else {
+            Phase::Pending
+        }
+    } else if ready_replicas < desired {
+        Phase::Progressing
+    } else if !all_symbols_ready {
+        Phase::Degraded
+    } else {
+        Phase::Ready
+    };
+    let message = if service.spec.paused {
+        "paused by spec".to_string()
+    } else if render_failed {
+        "render rejected; see operator logs for the validation error".to_string()
+    } else if !release_compatible {
+        "market-data release does not match every engine shard wire version".to_string()
+    } else if let Some(error) = observation.error.as_deref() {
+        error.to_string()
+    } else if !observation.message.is_empty() {
+        observation.message.clone()
+    } else {
+        format!(
+            "{ready_replicas}/{desired} replicas ready; {} symbols ready",
+            observation
+                .symbols
+                .iter()
+                .filter(|symbol| symbol.ready)
+                .count()
+        )
+    };
+
+    MarketDataServiceStatus {
+        phase,
+        conditions,
+        replicas: observation.replicas,
+        ready_replicas,
+        symbols: observation.symbols,
+        message,
+    }
+}
+
+async fn observe_order_systems(
+    client: &Client,
+    catalog: &Catalog,
+) -> BTreeMap<String, OrderSystemStatus> {
+    let mut statuses = BTreeMap::new();
+    for system in catalog.order_systems.values() {
+        let namespace = namespace_or_default(&system.namespace);
+        let mut status = OrderSystemStatus {
+            phase: if system.spec.paused {
+                Phase::Disabled
+            } else {
+                Phase::Pending
+            },
+            message: String::new(),
+            ..OrderSystemStatus::default()
+        };
+        let mut desired = 0u16;
+        let mut ready = 0u16;
+        let mut pending = false;
+        let mut errors = Vec::new();
+        for shard in &system.spec.shards {
+            let name = dns_label(&format!("{}-{}", system.name, shard.name));
+            let api = Api::<Deployment>::namespaced(client.clone(), namespace);
+            let observation = match api.get(&name).await {
+                Ok(deployment) => {
+                    let shard_status = deployment.status.unwrap_or_default();
+                    let replicas = shard_status.replicas.unwrap_or(0).max(0) as u16;
+                    let ready_replicas = shard_status.ready_replicas.unwrap_or(0).max(0) as u16;
+                    desired = desired.saturating_add(replicas);
+                    ready = ready.saturating_add(ready_replicas);
+                    OrderSystemShardStatus {
+                        name: shard.name.clone(),
+                        replicas,
+                        ready_replicas,
+                    }
+                }
+                Err(kube::Error::Api(error)) if error.code == 404 => {
+                    pending = true;
+                    OrderSystemShardStatus {
+                        name: shard.name.clone(),
+                        replicas: 0,
+                        ready_replicas: 0,
+                    }
+                }
+                Err(error) => {
+                    errors.push(format!("{name}: {error}"));
+                    OrderSystemShardStatus {
+                        name: shard.name.clone(),
+                        replicas: 0,
+                        ready_replicas: 0,
+                    }
+                }
+            };
+            status.shards.push(observation);
+        }
+        status.replicas = desired;
+        status.ready_replicas = ready;
+        status.phase = if system.spec.paused {
+            Phase::Disabled
+        } else if !errors.is_empty() {
+            Phase::Degraded
+        } else if pending || desired == 0 {
+            Phase::Pending
+        } else if ready == desired {
+            Phase::Ready
+        } else if ready > 0 {
+            Phase::Progressing
+        } else {
+            Phase::Degraded
+        };
+        status.conditions = vec![Condition {
+            kind: "Available".to_string(),
+            status: if status.phase == Phase::Ready {
+                "True"
+            } else {
+                "False"
+            }
+            .to_string(),
+            reason: (status.phase != Phase::Ready).then(|| "ReplicasNotReady".to_string()),
+            message: Some(format!("{ready}/{desired} shard replicas ready")),
+        }];
+        status.message = if system.spec.paused {
+            "paused by spec".to_string()
+        } else if !errors.is_empty() {
+            errors.join("; ")
+        } else {
+            format!("{ready}/{desired} shard replicas ready")
+        };
+        statuses.insert(system.name.clone(), status);
+    }
+    statuses
+}
+
+async fn write_order_system_statuses(
+    client: &Client,
+    view: &CrdView,
+    statuses: &BTreeMap<String, OrderSystemStatus>,
+    failed: &BTreeSet<String>,
+) -> Result<usize> {
+    let mut writes = 0;
+    for system in view.catalog.order_systems.values() {
+        let mut status = statuses.get(&system.name).cloned().unwrap_or_default();
+        if failed.contains(&system.name) {
+            status.phase = Phase::Failed;
+            status.message =
+                "render rejected; see operator logs for the validation error".to_string();
+        }
+        writes += write_status(
+            client,
+            view,
+            CrdKind::OrderSystem,
+            &system.namespace,
+            &system.name,
+            &status,
+        )
+        .await?;
+    }
+    Ok(writes)
+}
+
+async fn write_market_data_statuses(
+    client: &Client,
+    view: &CrdView,
+    observations: &BTreeMap<String, MarketDataObservation>,
+    failed: &BTreeSet<String>,
+) -> Result<usize> {
+    let mut writes = 0;
+    for service in view.catalog.market_data_services.values() {
+        let status = market_data_status(
+            service,
+            &view.catalog,
+            observations.get(&service.name),
+            failed.contains(&service.name),
+        );
+        writes += write_status(
+            client,
+            view,
+            CrdKind::MarketData,
+            &service.namespace,
+            &service.name,
+            &status,
+        )
+        .await?;
+    }
+    Ok(writes)
+}
+
 async fn write_statuses(
     client: &Client,
     view: &CrdView,
@@ -3950,5 +4510,119 @@ mod tests {
         )]));
         assert_eq!(pod_index(&pod), Some(2));
         assert!(!pod_running(&pod));
+    }
+
+    fn market_data_service() -> MarketDataService {
+        use crate::model::{
+            MarketDataFeedGroup, MarketDataServiceSpec, MarketDataTransport, MarketDataWebSocket,
+        };
+        MarketDataService {
+            name: "btc-marketdata".to_string(),
+            namespace: "match-eu-1".to_string(),
+            spec: MarketDataServiceSpec {
+                cell: "eu-1".to_string(),
+                symbols: Vec::new(),
+                feed_groups: vec![MarketDataFeedGroup {
+                    name: "btc".to_string(),
+                    symbols: vec!["btcusdt".to_string()],
+                    stream_base: 2001,
+                    channel: None,
+                }],
+                image: "registry.example.com/matchengine-marketdata@sha256:abc".to_string(),
+                release: Default::default(),
+                replicas: 2,
+                transport: MarketDataTransport {
+                    channel: Some(
+                        "aeron:udp?endpoint=239.1.2.51:24001|interface={pod_ip}|ttl=1".to_string(),
+                    ),
+                    ..Default::default()
+                },
+                websocket: MarketDataWebSocket::default(),
+                autoscaling: Default::default(),
+                resources: None,
+                paused: false,
+            },
+            status: Default::default(),
+        }
+    }
+
+    fn market_data_observation(ready_replicas: u16, feed_ready: bool) -> MarketDataObservation {
+        MarketDataObservation {
+            replicas: 2,
+            ready_replicas,
+            updated_replicas: ready_replicas,
+            available: ready_replicas > 0,
+            feed_ready,
+            symbols: vec![MarketDataSymbolStatus {
+                name: "btcusdt".to_string(),
+                ready: feed_ready,
+                ..MarketDataSymbolStatus::default()
+            }],
+            ..MarketDataObservation::default()
+        }
+    }
+
+    #[test]
+    fn market_data_status_tracks_replicas_and_feed_readiness() {
+        let catalog = demo_catalog();
+        let service = market_data_service();
+        let ready = market_data_status(
+            &service,
+            &catalog,
+            Some(&market_data_observation(2, true)),
+            false,
+        );
+        assert_eq!(ready.phase, Phase::Ready);
+        assert_eq!(ready.ready_replicas, 2);
+        assert!(
+            ready
+                .conditions
+                .iter()
+                .any(|condition| { condition.kind == "FeedReady" && condition.status == "True" })
+        );
+
+        let warming = market_data_status(
+            &service,
+            &catalog,
+            Some(&market_data_observation(1, false)),
+            false,
+        );
+        assert_eq!(warming.phase, Phase::Progressing);
+
+        let degraded = market_data_status(
+            &service,
+            &catalog,
+            Some(&market_data_observation(2, false)),
+            false,
+        );
+        assert_eq!(degraded.phase, Phase::Degraded);
+
+        let mut no_pods = market_data_observation(0, false);
+        no_pods.replicas = 0;
+        let pending = market_data_status(&service, &catalog, Some(&no_pods), false);
+        assert_eq!(pending.phase, Phase::Pending);
+
+        let degraded = market_data_status(
+            &service,
+            &catalog,
+            Some(&market_data_observation(0, false)),
+            false,
+        );
+        assert_eq!(degraded.phase, Phase::Degraded);
+
+        let failed = market_data_status(&service, &catalog, None, true);
+        assert_eq!(failed.phase, Phase::Failed);
+
+        let mut paused = service.clone();
+        paused.spec.paused = true;
+        let disabled = market_data_status(&paused, &catalog, None, false);
+        assert_eq!(disabled.phase, Phase::Disabled);
+
+        let mut tagged = service;
+        tagged.spec.image = "matchengine-marketdata:aeron-lab".to_string();
+        let tagged = market_data_status(&tagged, &catalog, None, false);
+        assert!(tagged.conditions.iter().any(|condition| {
+            condition.kind == "MutableImageTag" && condition.status == "False"
+        }));
     }
 }

@@ -967,9 +967,9 @@ The global manager's cluster holds the catalog CRDs (`TradingSymbol`, `Cell`, `C
 Each cell holds the runtime CRDs (`SymbolDeployment`, `SymbolRoute`, `SymbolShard`, `Backup`,
 `Operation`) plus a namespaced projection of the `TradingSymbol` it is allowed to run. The manager
 projects a symbol into a cell and a shard; the cell operator never reaches back into the
-management cluster. The reference implementation currently installs the first five kinds
-(`Cell`, `TradingSymbol`, `SymbolShard`, `SymbolDeployment`, `SymbolRoute`); `ClusterTemplate`,
-`Backup` and `Operation` remain design-level contracts. See [`ETCD_STORAGE.md`](./ETCD_STORAGE.md)
+management cluster. The reference implementation currently installs six kinds
+(`Cell`, `TradingSymbol`, `SymbolShard`, `SymbolDeployment`, `SymbolRoute`,
+`MarketDataService`); `ClusterTemplate`, `Backup` and `Operation` remain design-level contracts. See [`ETCD_STORAGE.md`](./ETCD_STORAGE.md)
 for the actual etcd key map and live object inventory.
 
 There are two placement facts, and each has exactly one owner:
@@ -1258,7 +1258,7 @@ status:
       restoreTestedAt: "2026-11-13T03:12:00Z"
 ```
 
-The desired-state catalog lives in the five CRDs (etcd via the API server). Postgres stores
+The desired-state catalog lives in the seven CRDs (etcd via the API server). Postgres stores
 approvals, audit events and read-model caches; it is not a second desired-state source of truth.
 
 ### 6.6 Status conditions
@@ -1762,6 +1762,14 @@ GET    /api/v1/operations/{id}
 POST   /api/v1/operations/{id}/cancel
 GET    /api/v1/templates
 POST   /api/v1/templates
+GET    /api/v1/market-data-services
+POST   /api/v1/market-data-services
+POST   /api/v1/market-data-services/{name}/upgrade
+GET    /api/v1/order-systems
+POST   /api/v1/order-systems
+GET    /api/v1/order-systems/{name}
+GET    /api/v1/order-systems/{name}/manifests
+POST   /api/v1/order-systems/{name}/upgrade
 POST   /api/v1/dry-run                     validate, place, render manifests, no apply
 GET    /api/v1/audit?actor=&shard=&symbol=&from=&to=
 GET    /api/v1/stream                      SSE: shard/symbol status, operations, alerts
@@ -1775,9 +1783,11 @@ restore tool exists; a restore request today returns `501` with the runbook refe
 
 The reference demo implements the local workflow subset: `POST /api/v1/shards`,
 `POST /api/v1/shards/{shard}/drop`, `POST /api/v1/symbols`,
-`POST /api/v1/symbols/{symbol}/migrate`, `POST /api/v1/symbols/{symbol}/shutdown` and
-`POST /api/v1/symbols/{symbol}/start`. It resolves the namespace from the cell/shard and does not
-implement approvals, pagination, operations or a Kubernetes client.
+`POST /api/v1/symbols/{symbol}/migrate`, `POST /api/v1/symbols/{symbol}/shutdown`,
+`POST /api/v1/symbols/{symbol}/start`, the market-data service lifecycle and the order-system
+lifecycle (create, detail, manifests, image upgrade and per-shard WebUI links). It
+resolves the namespace from the cell/shard and does not implement approvals, pagination,
+operations or a Kubernetes client.
 
 ### 8.4 GUI
 
@@ -1941,7 +1951,25 @@ monitoring target count.
 ### 9.4 Market-data fan-out
 
 The engine's market-data sink and the standalone market-data system are separate from the
-matching cluster. For thousands of symbols:
+matching cluster. A separate `MarketDataService` CRD managed by the same manager/operator owns the
+fan-out Deployment/Service/PDB/NetworkPolicy/ConfigMap and its per-symbol status. The reference
+operator renders Profile A (direct Aeron multicast) with `maxUnavailable: 0`, a `preStop` drain and
+one surge pod, gates the service on the engine shard's wire version, and writes per-symbol
+readiness, last-frame age, subscribers and `GAP` counts. One `feedGroup` may carry its own
+`channel`, so a single global service can consume every shard's multicast group and serve one
+terminal socket across all symbols; shard-local services set `websocket.fastOnly` and expose only
+`/ws/<symbol>@<stream>`. `websocket.ingress` plus `tlsSecret` render an Ingress for
+`wss://` terminals. The manager exposes list/create, detail and read-only manifests endpoints plus
+one **market data** GUI view with **terminal** and **fast** sub-tabs. Market-data services are stateless:
+`POST /api/v1/market-data-services/{name}/upgrade` writes a new image and optional release, checks
+the target wire version against every source shard, and lets the operator roll the Deployment with
+`maxUnavailable: 0` and one surge pod; `GET /api/v1/images?marketDataService={name}` backs the
+per-service image picker. HPA/canary policy, ServiceMonitor
+and the NATS/bridge sources remain follow-ups; the transport choice, multicast constraints and
+scale-out profiles are designed in
+[`AERON_K8S_MESSAGE_BUS.md`](./AERON_K8S_MESSAGE_BUS.md).
+
+At fleet scale:
 
 - One process owns seven Aeron streams, `base..base+6`, default base `2001`. A packed pod must give
   each process a unique base (`2001 + 7 * slot`) and a unique `--market-data-aeron-stream-base`;
@@ -1962,6 +1990,35 @@ matching cluster. For thousands of symbols:
 - The WebSocket fan-out is the scaling bottleneck; scale market-data instances horizontally and
   shard symbols by connection.
 - Do not put market-data fan-out on the match-engine pods' CPU budget.
+
+### 9.5 Order systems
+
+Order entry is a separate stateless workload managed by the seventh CRD, `OrderSystem`. One
+`OrderSystem` owns a fixed set of user-ID shards (`spec.shards`, each an explicit
+`userIdMin..userIdMax`) and one target list (`spec.targets`). Every shard receives the complete
+target list, so any shard can place orders on every engine shard and symbol; the order system itself
+rejects a user outside its range with `409 user_shard` and carries `owner_id` on orders so cancel
+and amend cannot cross owners. The process symbol is traded by exactly one engine shard, so a target
+selects the engine, not a book.
+
+The operator renders an `OrderSystem` as a shared targets ConfigMap plus one
+Deployment/Service/PDB/Ingress/HPA per user shard. Deployments use
+`strategy: RollingUpdate` with `maxUnavailable: 0` and `maxSurge: 1`, a `preStop` drain and a
+readiness probe on `/health`. The HPA (`autoscaling/v2`) has a floor of one replica and defaults its
+ceiling to `spec.replicas`; `spec.autoscaling.minReplicas`/`maxReplicas`/`targetCpuUtilization`
+override that. The Deployment intentionally omits `spec.replicas` while the system is running so the
+HPA owns the replica count; a paused system sets it to zero and drops the HPA. CPU targets need a
+metrics-server or a Prometheus adapter; without one the HPA still enforces the one-replica floor.
+
+Order-system upgrades are stateless: `POST /api/v1/order-systems/{name}/upgrade` writes
+`spec.image`, validates the scoped catalog and lets the operator roll one shard at a time. There is
+no Raft quorum, leader transfer or wire-version gate. The manager **order systems** view lists
+shards, targets, HPA bounds, per-shard readiness and a **WebUI** link per shard
+(`http://<shard>.<spec.ingress>/demo/`, `https` when `spec.tlsSecret` is set), plus an **upgrade**
+button. Order entry stays in the order system: the control plane does not render an order ticket
+and does not proxy `/orders` or book state. A user-ID routing gateway in front of the per-shard
+Services (exact modulo or range routing) remains a P2 follow-up; today clients open the shard WebUI
+or select the shard URL directly.
 
 ## 10. Security and multi-tenancy
 
@@ -2147,7 +2204,10 @@ status. Bootstrap, membership and `ConfigureSymbol` execution remain the next op
 - Manager push (direct CR writes) vs pull agent per cell; network and security constraints.
 - GitOps as the production source of truth, or the manager database with Git as an audit export.
 - Hibernation policy for low-volume symbols and how clients are notified.
-- Whether market-data deployments are managed by the same CRD or a separate `MarketDataService`.
+- Market-data deployments use a separate `MarketDataService` CRD managed by the same
+  manager/operator, so fan-out scales independently of `SymbolShard`; Profile A multicast rendering,
+  per-symbol status and the manager view are implemented, with HPA/canary and the NATS/bridge
+  fallbacks still tracked in `TODO.md`.
 - Upgrade waves: same-version rolls are quick, but an incompatible upgrade is stop-the-world per
   shard; the manager must sequence thousands of maintenance windows and show the number of affected
   processes. Define the blast-radius policy.

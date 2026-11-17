@@ -186,38 +186,61 @@ pub fn kline_label(interval_ms: u64) -> String {
     }
 }
 
+/// Binance-compatible request id: a 64-bit signed integer, an alphanumeric
+/// string of at most 36 characters, or `null`. The value is echoed unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestId(pub serde_json::Value);
+
+impl<'de> Deserialize<'de> for RequestId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        match &value {
+            serde_json::Value::Number(number) if number.as_i64().is_some() => Ok(Self(value)),
+            serde_json::Value::String(text)
+                if text.len() <= 36 && text.chars().all(|ch| ch.is_ascii_alphanumeric()) =>
+            {
+                Ok(Self(value))
+            }
+            serde_json::Value::Null => Ok(Self(value)),
+            _ => Err(serde::de::Error::custom(
+                "request id must be a 64-bit integer, an alphanumeric string of at most 36 characters, or null",
+            )),
+        }
+    }
+}
+
 /// Binance-style control frames.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "method")]
 pub enum ControlMessage {
     #[serde(rename = "SUBSCRIBE")]
-    Subscribe { params: Vec<String>, id: u64 },
+    Subscribe { params: Vec<String>, id: RequestId },
     #[serde(rename = "UNSUBSCRIBE")]
-    Unsubscribe { params: Vec<String>, id: u64 },
+    Unsubscribe { params: Vec<String>, id: RequestId },
     #[serde(rename = "LIST_SUBSCRIPTIONS")]
-    List { id: u64 },
+    List { id: RequestId },
 }
 
 /// Renders an error reply for a control message.
-pub fn control_error(error: &ProtocolError, id: Option<u64>) -> Vec<u8> {
-    match id {
-        Some(id) => json!({"error": {"code": error.code, "msg": error.message}, "id": id})
-            .to_string()
-            .into_bytes(),
-        None => json!({"error": {"code": error.code, "msg": error.message}})
-            .to_string()
-            .into_bytes(),
+pub fn control_error(error: &ProtocolError, id: Option<&RequestId>) -> Vec<u8> {
+    let mut frame = json!({"code": error.code, "msg": error.message});
+    if let Some(id) = id {
+        frame["id"] = id.0.clone();
     }
+    frame.to_string().into_bytes()
 }
 
 /// Renders a successful `null` result.
-pub fn control_result(id: u64) -> Vec<u8> {
-    json!({"result": null, "id": id}).to_string().into_bytes()
+pub fn control_result(id: &RequestId) -> Vec<u8> {
+    json!({"result": null, "id": id.0}).to_string().into_bytes()
 }
 
 /// Renders a list-subscription result.
-pub fn control_list(id: u64, streams: &[String]) -> Vec<u8> {
-    json!({"result": streams, "id": id})
+pub fn control_list(id: &RequestId, streams: &[String]) -> Vec<u8> {
+    json!({"result": streams, "id": id.0})
         .to_string()
         .into_bytes()
 }
@@ -611,15 +634,47 @@ mod tests {
 
     #[test]
     fn control_replies_echo_the_id() {
-        assert_eq!(br#"{"id":7,"result":null}"#.to_vec(), control_result(7));
+        assert_eq!(
+            br#"{"id":7,"result":null}"#.to_vec(),
+            control_result(&RequestId(serde_json::json!(7)))
+        );
         let value = as_json(&control_error(
             &ProtocolError {
                 code: 0,
                 message: "unknown stream".to_string(),
             },
-            Some(9),
+            Some(&RequestId(serde_json::json!(9))),
         ));
-        assert_eq!(0, value["error"]["code"]);
+        assert_eq!(0, value["code"]);
+        assert_eq!("unknown stream", value["msg"]);
         assert_eq!(9, value["id"]);
+    }
+
+    #[test]
+    fn request_ids_accept_numbers_strings_and_null() {
+        let numeric: ControlMessage =
+            serde_json::from_str(r#"{"method":"LIST_SUBSCRIPTIONS","id":7}"#).unwrap();
+        let textual: ControlMessage =
+            serde_json::from_str(r#"{"method":"LIST_SUBSCRIPTIONS","id":"abc123"}"#).unwrap();
+        let null: ControlMessage =
+            serde_json::from_str(r#"{"method":"LIST_SUBSCRIPTIONS","id":null}"#).unwrap();
+        match numeric {
+            ControlMessage::List { id } => assert_eq!(id.0, serde_json::json!(7)),
+            _ => panic!("wrong variant"),
+        }
+        match textual {
+            ControlMessage::List { id } => assert_eq!(id.0, serde_json::json!("abc123")),
+            _ => panic!("wrong variant"),
+        }
+        match null {
+            ControlMessage::List { id } => assert_eq!(id.0, serde_json::Value::Null),
+            _ => panic!("wrong variant"),
+        }
+        assert!(
+            serde_json::from_str::<ControlMessage>(
+                r#"{"method":"LIST_SUBSCRIPTIONS","id":"has spaces"}"#
+            )
+            .is_err()
+        );
     }
 }

@@ -9,6 +9,7 @@
 use std::ffi::CString;
 use std::io;
 use std::time::Duration;
+use std::time::Instant;
 
 use rusteron_client::Aeron;
 use rusteron_client::AeronContext;
@@ -92,14 +93,16 @@ fn run(
     ready: oneshot::Sender<io::Result<()>>,
 ) {
     match setup(channel, stream_base, dir.as_deref(), embedded, tx) {
-        Ok((_driver, aeron, subscriptions, tx, channel, request_stream)) => {
+        Ok((_driver, aeron, subscriptions, tx, channel, request_stream, client_dir)) => {
             let _ = ready.send(Ok(()));
             poll_loop(
                 subscriptions,
                 tx,
                 aeron,
                 channel,
+                stream_base,
                 request_stream,
+                client_dir,
                 request_rx,
             );
         }
@@ -116,6 +119,7 @@ type Setup = (
     mpsc::Sender<Item>,
     CString,
     u16,
+    Option<String>,
 );
 
 fn setup(
@@ -149,9 +153,33 @@ fn setup(
         .or_else(|| dir.map(str::to_string))
         .or_else(|| std::env::var("AERON_DIR").ok());
 
+    let aeron = new_client(effective_dir.as_deref())?;
+
+    let channel = CString::new(channel).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("Aeron channel: {error}"),
+        )
+    })?;
+    let subscriptions = add_subscriptions(&aeron, &channel, stream_base, Duration::from_secs(5))?;
+    let request_stream = stream_base
+        .checked_add(request::STREAM_OFFSET)
+        .ok_or_else(|| io::Error::other("Aeron request stream id overflow"))?;
+    Ok((
+        driver,
+        aeron,
+        subscriptions,
+        tx,
+        channel,
+        request_stream,
+        effective_dir,
+    ))
+}
+
+fn new_client(dir: Option<&str>) -> io::Result<Aeron> {
     let context =
         AeronContext::new().map_err(|error| io::Error::other(format!("Aeron context: {error}")))?;
-    if let Some(dir) = effective_dir {
+    if let Some(dir) = dir {
         let dir = CString::new(dir).map_err(|error| {
             io::Error::new(io::ErrorKind::InvalidInput, format!("Aeron dir: {error}"))
         })?;
@@ -164,13 +192,15 @@ fn setup(
     aeron
         .start()
         .map_err(|error| io::Error::other(format!("Aeron start: {error}")))?;
+    Ok(aeron)
+}
 
-    let channel = CString::new(channel).map_err(|error| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("Aeron channel: {error}"),
-        )
-    })?;
+fn add_subscriptions(
+    aeron: &Aeron,
+    channel: &CString,
+    stream_base: u16,
+    timeout: Duration,
+) -> io::Result<Vec<AeronSubscription>> {
     let mut subscriptions = Vec::with_capacity(usize::from(STREAM_COUNT));
     for offset in 0..STREAM_COUNT {
         let stream = stream_base
@@ -183,26 +213,74 @@ fn setup(
                 Handlers::NONE,
                 Handlers::NONE,
             )
-            .and_then(|poller| poller.poll_blocking(Duration::from_secs(5)))
+            .and_then(|poller| poller.poll_blocking(timeout))
             .map_err(|error| io::Error::other(format!("subscribe to stream {stream}: {error}")))?;
         subscriptions.push(subscription);
     }
-    let request_stream = stream_base
-        .checked_add(request::STREAM_OFFSET)
-        .ok_or_else(|| io::Error::other("Aeron request stream id overflow"))?;
-    Ok((driver, aeron, subscriptions, tx, channel, request_stream))
+    Ok(subscriptions)
 }
 
+fn resubscribe(
+    aeron: &mut Aeron,
+    channel: &CString,
+    stream_base: u16,
+    dir: Option<&str>,
+    subscriptions: &mut Vec<AeronSubscription>,
+) {
+    for subscription in subscriptions.drain(..) {
+        let _ = subscription.close();
+    }
+    // A subscription can be created successfully while its client conductor
+    // never links the image. Recreate the whole client, not just the
+    // subscriptions, so the conductor starts from a clean state.
+    match new_client(dir) {
+        Ok(fresh) => {
+            *aeron = fresh;
+            match add_subscriptions(aeron, channel, stream_base, Duration::from_secs(2)) {
+                Ok(fresh) => {
+                    *subscriptions = fresh;
+                    tracing::info!(
+                        stream_base,
+                        channel = %channel.to_string_lossy(),
+                        "Aeron feed re-subscribed"
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        stream_base,
+                        channel = %channel.to_string_lossy(),
+                        "Aeron feed re-subscribe failed"
+                    );
+                }
+            }
+        }
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                stream_base,
+                channel = %channel.to_string_lossy(),
+                "Aeron client recreate failed"
+            );
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn poll_loop(
-    subscriptions: Vec<AeronSubscription>,
+    mut subscriptions: Vec<AeronSubscription>,
     tx: mpsc::Sender<Item>,
-    aeron: Aeron,
+    mut aeron: Aeron,
     channel: CString,
+    stream_base: u16,
     request_stream: u16,
+    client_dir: Option<String>,
     request_rx: std::sync::mpsc::Receiver<SnapshotRequest>,
 ) {
     let mut request_publication: Option<AeronExclusivePublication> = None;
     let mut pending_request: Option<SnapshotRequest> = None;
+    let mut last_message = Instant::now();
+    let mut retry_after = Duration::from_secs(5);
     loop {
         while let Ok(request) = request_rx.try_recv() {
             // Keep the newest request; a stale retry is not useful once a
@@ -271,6 +349,30 @@ fn poll_loop(
         }
         if tx.is_closed() {
             return;
+        }
+        if received > 0 {
+            last_message = Instant::now();
+            retry_after = Duration::from_secs(5);
+        } else if last_message.elapsed() >= retry_after {
+            // A freshly created subscription can occasionally miss the image
+            // registration race and never join the stream. Rebuild the
+            // subscriptions with backoff; this also recovers after an engine
+            // leader transfer. Blocking sleeps are fine in this blocking task.
+            tracing::warn!(
+                stream_base,
+                channel = %channel.to_string_lossy(),
+                retry_secs = retry_after.as_secs(),
+                "Aeron feed idle; re-subscribing"
+            );
+            resubscribe(
+                &mut aeron,
+                &channel,
+                stream_base,
+                client_dir.as_deref(),
+                &mut subscriptions,
+            );
+            last_message = Instant::now();
+            retry_after = (retry_after * 2).min(Duration::from_secs(30));
         }
         if received == 0 {
             // Blocking poll backoff: this function runs inside `spawn_blocking`,

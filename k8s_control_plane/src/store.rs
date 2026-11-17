@@ -16,7 +16,9 @@ use serde::{Deserialize, Serialize};
 use crate::bundle::ShardBundle;
 use crate::error::ApiError;
 use crate::images::{ImageChoice, ImageInventory};
-use crate::model::{Cell, SymbolDeployment, SymbolRoute, SymbolShard, TradingSymbol};
+use crate::model::{
+    Cell, MarketDataService, OrderSystem, SymbolDeployment, SymbolRoute, SymbolShard, TradingSymbol,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -44,6 +46,10 @@ pub struct Catalog {
     pub deployments: BTreeMap<String, SymbolDeployment>,
     #[serde(default)]
     pub routes: BTreeMap<String, SymbolRoute>,
+    #[serde(default)]
+    pub market_data_services: BTreeMap<String, MarketDataService>,
+    #[serde(default)]
+    pub order_systems: BTreeMap<String, OrderSystem>,
     #[serde(default)]
     pub audit: Vec<AuditEntry>,
     #[serde(default)]
@@ -119,6 +125,12 @@ impl Catalog {
         }
         for route in catalog.routes.values_mut() {
             route.status = Default::default();
+        }
+        for service in catalog.market_data_services.values_mut() {
+            service.status = Default::default();
+        }
+        for order_system in catalog.order_systems.values_mut() {
+            order_system.status = Default::default();
         }
         for symbol in catalog.symbols.values_mut() {
             symbol.status = Default::default();
@@ -320,9 +332,53 @@ impl Store {
             ),
             None => None,
         };
-        let repositories = crate::images::catalog_repositories(&catalog);
-        let mut entries: BTreeMap<String, ImageChoice> = crate::images::catalog_images(&catalog)
+        self.available_images_for(&catalog, current, shard).await
+    }
+
+    /// Market-data images available for an update. The current image is the service's configured
+    /// image; running market-data pods are annotated in the same inventory.
+    pub async fn available_market_data_images(
+        &self,
+        service_name: &str,
+    ) -> Result<ImageInventory, ApiError> {
+        let catalog = self.snapshot();
+        let service = catalog
+            .market_data_services
+            .get(service_name)
+            .ok_or_else(|| {
+                ApiError::not_found(
+                    "market_data_not_found",
+                    format!("unknown market-data service {service_name}"),
+                )
+            })?;
+        let current = Some(service.spec.image.clone());
+        self.available_images_for(&catalog, current, Some(service_name))
+            .await
+    }
+
+    async fn available_images_for(
+        &self,
+        catalog: &Catalog,
+        current: Option<String>,
+        key: Option<&str>,
+    ) -> Result<ImageInventory, ApiError> {
+        let repository = current
+            .as_deref()
+            .and_then(crate::images::parse_image)
+            .map(|image| image.repository);
+        // The engine picker must not offer market-data images (or vice versa); scope the
+        // inventory to the current image's repository when one is configured.
+        let repositories: BTreeSet<String> = match &repository {
+            Some(repository) => BTreeSet::from([repository.clone()]),
+            None => crate::images::catalog_repositories(catalog),
+        };
+        let mut entries: BTreeMap<String, ImageChoice> = crate::images::catalog_images(catalog)
             .into_iter()
+            .filter(|image| {
+                repository
+                    .as_ref()
+                    .is_none_or(|repository| &image.repository == repository)
+            })
             .map(|image| (image.reference.clone(), image))
             .collect();
         let mut warning = None;
@@ -331,11 +387,7 @@ impl Store {
             Err(error) => warning = Some(error.to_string()),
         }
         let mut items: Vec<ImageChoice> = entries.into_values().collect();
-        crate::images::annotate(&mut items, current.as_deref(), shard);
-        let repository = current
-            .as_deref()
-            .and_then(crate::images::parse_image)
-            .map(|image| image.repository);
+        crate::images::annotate(&mut items, current.as_deref(), key);
         Ok(ImageInventory {
             items,
             current,

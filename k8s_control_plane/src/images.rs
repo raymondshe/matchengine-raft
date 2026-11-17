@@ -173,6 +173,11 @@ pub fn catalog_repositories(catalog: &Catalog) -> BTreeSet<String> {
             repositories.insert(image.repository);
         }
     }
+    for service in catalog.market_data_services.values() {
+        if let Some(image) = parse_image(&service.spec.image) {
+            repositories.insert(image.repository);
+        }
+    }
     repositories
 }
 
@@ -192,6 +197,9 @@ pub fn merge_catalog(catalog: &Catalog, images: &mut BTreeMap<String, ImageChoic
         if let Some(reference) = deployment.spec.image.as_deref() {
             insert_reference(images, reference);
         }
+    }
+    for service in catalog.market_data_services.values() {
+        insert_reference(images, &service.spec.image);
     }
 }
 
@@ -268,10 +276,17 @@ pub async fn cluster_images(
         .list(&ListParams::default())
         .await
         .map_err(|error| ApiError::internal(format!("list nodes for images: {error}")))?;
-    let pods = Api::<Pod>::all(client.clone())
+    let mut pods = Api::<Pod>::all(client.clone())
         .list(&ListParams::default().labels("matching.io/cluster"))
         .await
         .map_err(|error| ApiError::internal(format!("list pods for images: {error}")))?;
+    let market_data_pods = Api::<Pod>::all(client.clone())
+        .list(&ListParams::default().labels("matching.io/market-data"))
+        .await
+        .map_err(|error| {
+            ApiError::internal(format!("list market-data pods for images: {error}"))
+        })?;
+    pods.items.extend(market_data_pods.items);
 
     let mut images = BTreeMap::<String, ImageChoice>::new();
     for node in &nodes.items {
@@ -352,6 +367,12 @@ pub async fn cluster_images(
                     .labels
                     .as_ref()
                     .and_then(|labels| labels.get("matching.io/shard"))
+            })
+            .or_else(|| {
+                pod.metadata
+                    .labels
+                    .as_ref()
+                    .and_then(|labels| labels.get("matching.io/market-data"))
             })
             .cloned()
             .or_else(|| pod.metadata.namespace.clone());

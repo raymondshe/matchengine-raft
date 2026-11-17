@@ -24,6 +24,8 @@ rules:
       - tradingsymbols
       - symboldeployments
       - symbolroutes
+      - marketdataservices
+      - ordersystems
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   - apiGroups: ["matching.io"]
     resources:
@@ -32,6 +34,8 @@ rules:
       - tradingsymbols/status
       - symboldeployments/status
       - symbolroutes/status
+      - marketdataservices/status
+      - ordersystems/status
     verbs: ["get", "update", "patch"]
   # Read-only image inventory for the manager's upgrade picker. The manager lists nodes to read
   # `status.images` (cached tags/digests) and engine-labeled pods to learn what is running.
@@ -71,6 +75,8 @@ rules:
       - tradingsymbols
       - symboldeployments
       - symbolroutes
+      - marketdataservices
+      - ordersystems
     verbs: ["get", "list", "watch", "patch", "update"]
   - apiGroups: ["matching.io"]
     resources:
@@ -79,6 +85,8 @@ rules:
       - tradingsymbols/status
       - symboldeployments/status
       - symbolroutes/status
+      - marketdataservices/status
+      - ordersystems/status
     verbs: ["get", "update", "patch"]
   - apiGroups: [""]
     resources: ["pods"]
@@ -93,13 +101,16 @@ rules:
     resources: ["services", "configmaps"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   - apiGroups: ["apps"]
-    resources: ["statefulsets"]
+    resources: ["statefulsets", "deployments"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["autoscaling"]
+    resources: ["horizontalpodautoscalers"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   - apiGroups: ["policy"]
     resources: ["poddisruptionbudgets"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   - apiGroups: ["networking.k8s.io"]
-    resources: ["networkpolicies"]
+    resources: ["networkpolicies", "ingresses"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]

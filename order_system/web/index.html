@@ -23,6 +23,7 @@
     <span class="chip" id="ready-chip">Ready <strong>—</strong></span>
     <span class="chip" id="symbol-chip">Symbol —</span>
     <span class="chip" id="backend-chip">Backend —</span>
+    <span class="chip" id="shard-chip">Users <strong>—</strong></span>
     <span class="muted mono" id="updated">not loaded</span>
     <button class="btn ghost" id="refresh-button" type="button">Refresh</button>
   </div>
@@ -190,6 +191,7 @@
                 <label class="field"><span>Stop price</span><div class="input-unit"><input id="ticket-stop" type="text" placeholder="0.00"><span class="unit">—</span></div></label>
                 <label class="field"><span>Display volume</span><div class="input-unit"><input id="ticket-display" type="text" placeholder="iceberg tranche"><span class="unit">base</span></div></label>
               </div>
+              <label class="field"><span>User ID</span><input id="ticket-user" type="number" min="0" step="1" value="1"></label>
               <label class="field"><span>Client order id</span><input id="ticket-client-id" type="text"></label>
             </details>
 

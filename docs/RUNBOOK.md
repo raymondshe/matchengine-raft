@@ -727,6 +727,115 @@ The block clears on the next reconcile once the shard has one consistent release
 image change. `mixedVersionSafe` is only valid when the target image explicitly supports mixed
 peers; do not use it to bypass a real format change.
 
+### Market-data service
+
+`MarketDataService` is a separate desired-state CRD for the standalone WebSocket fan-out tier. The
+operator renders Deployment/Service/PDB/NetworkPolicy/ConfigMap, an Ingress when
+`websocket.ingress` is set, and an HPA with a minimum of one replica. Profile A (direct Aeron
+multicast) is the only rendered transport. A shard-local service sets `websocket.fastOnly: true`
+and serves only `/ws/<symbol>@<stream>`; a global service declares one `feedGroup` per shard with
+its own `channel` and keeps the terminal `/ws` and `/stream?streams=...` routes.
+
+```sh
+curl -s -X POST http://127.0.0.1:8099/api/v1/market-data-services \
+  -H 'content-type: application/json' -d '{
+    "name": "me-btcusdt-marketdata",
+    "spec": {
+      "cell": "eu-1",
+      "image": "registry.example.com/matchengine-marketdata@sha256:...",
+      "replicas": 2,
+      "feedGroups": [{"name": "btc", "symbols": ["btcusdt"], "streamBase": 2001}],
+      "transport": {
+        "mode": "multicast",
+        "channel": "aeron:udp?endpoint=239.1.2.51:24001|interface={pod_ip}|ttl=1"
+      },
+      "websocket": {"port": 24800, "fastOnly": true,
+        "ingress": "fast-ws-me-btcusdt.match-eu-1.example"}
+    }
+  }'
+kubectl -n match-eu-1 get deploy,svc,pdb,networkpolicy | grep marketdata
+kubectl -n match-eu-1 get marketdataservice me-btcusdt-marketdata \
+  -o jsonpath='{.status.phase} {.status.readyReplicas}/{.status.replicas}{"\n"}'
+curl -s http://127.0.0.1:8099/api/v1/market-data-services/me-btcusdt-marketdata/manifests
+
+# Stateless image update: writes desired state, then the operator rolls the Deployment.
+curl -s -X POST http://127.0.0.1:8099/api/v1/market-data-services/me-btcusdt-marketdata/upgrade \
+  -H 'content-type: application/json' -d '{
+    "image": "registry.example.com/matchengine-marketdata@sha256:...",
+    "release": {"wireVersion": 7, "snapshotVersion": 11, "mixedVersionSafe": false}
+  }'
+curl -s 'http://127.0.0.1:8099/api/v1/images?marketDataService=me-btcusdt-marketdata'
+```
+
+The upgrade endpoint rejects a paused service and any release whose wire version differs from a
+source shard. `release` is optional; omit it to keep the current release and change only the image.
+The GUI exposes the same action from the **market data** view in its terminal and fast sub-tabs.
+
+Status conditions: `Available`, `FeedReady`, `ImagePinned` and `ReleaseCompatible`. A service in
+`Degraded` with `FeedNotReady` is running but has not seen a snapshot/heartbeat for a symbol; check
+the engine's `--market-data-aeron-*` flags, the odd multicast address, `|ttl=1` and the CNI's
+multicast forwarding. For a containers-mode shard, the renderer adds those flags automatically when
+a `MarketDataService` references the symbol; build the engine image with
+`--build-arg CARGO_FEATURES=market-data-aeron` and mount a writable `/dev/shm` (the renderer adds a
+memory emptyDir). Supervisor children receive the same flags through `processes.json`. The renderer keeps `interface={pod_ip}` on the engine publication and strips it from the market-data subscriber args so several pods on one node can subscribe to the same group. A `Failed` service means the renderer rejected the desired state (unknown
+symbol/deployment, wire-version mismatch or a non-multicast transport) — see the operator log.
+
+Do not point the market-data tier at the engine's WAL/snapshot PVCs or put feed payloads in CRDs.
+
+### Order systems
+
+`OrderSystem` is a separate CRD for stateless order-entry BFFs. `spec.shards` partitions users by
+inclusive numeric ranges; `spec.targets` lists engine symbols, and every shard receives the same
+target list, so any user shard can trade every engine process/symbol. The renderer builds one
+ConfigMap plus one Deployment/Service/PDB/HPA (and optional Ingress) per user shard, with engine HTTP
+addresses derived from the symbol deployment's pod-0 headless DNS.
+
+```sh
+curl -s -X POST http://127.0.0.1:8099/api/v1/order-systems   -H 'content-type: application/json' -d '{
+    "name": "orders",
+    "spec": {
+      "cell": "eu-1",
+      "image": "matchengine-order-system:arm64-v2",
+      "replicas": 1,
+      "autoscaling": {"minReplicas": 1, "maxReplicas": 2, "targetCpuUtilization": 70},
+      "port": 24300,
+      "targets": [
+        {"symbol": "gbpusd", "label": "GBP/USD"},
+        {"symbol": "btcusdt", "label": "BTC/USDT"}
+      ],
+      "shards": [
+        {"name": "users-0", "userIdMin": 0, "userIdMax": 499},
+        {"name": "users-1", "userIdMin": 500, "userIdMax": 999}
+      ],
+      "ingress": "orders.match-eu-1.example"
+    }
+  }'
+kubectl -n match-eu-1 get deploy,svc,pdb,hpa,ingress -l matching.io/order-system=orders
+```
+
+The HPA floor is always one replica; `maxReplicas: 0` derives the ceiling from `spec.replicas`.
+The running Deployment omits `spec.replicas` so the HPA owns the count, and a paused system scales
+to zero and drops its HPA. CPU targets need a metrics-server or a Prometheus adapter; without one
+the HPA reports `<unknown>` but still enforces the floor.
+
+Roll a new stateless image without touching Raft:
+
+```sh
+curl -s -X POST http://127.0.0.1:8099/api/v1/order-systems/orders/upgrade \
+  -H 'content-type: application/json' -d '{"image":"matchengine-order-system:arm64-v3"}'
+kubectl -n match-eu-1 rollout status deploy/orders-users-0
+```
+
+Each shard rolls independently with `maxUnavailable: 0` and `maxSurge: 1`; there is no quorum or
+leader-transfer gate. The BFF enforces the shard's user range (`409 user_shard`), sets `owner_id`
+on new orders, and rejects cancels/amends by a different user. Clients can still reach one shard
+directly; a user-ID-routing edge is a follow-up. The manager **order systems** tab lists shards,
+targets, HPA bounds, readiness and a **WebUI** link per shard
+(`http://<shard>.<spec.ingress>/demo/`, `https` with `tlsSecret`), and has an **upgrade** action.
+Order entry happens in the order-system WebUI; the manager neither renders an order ticket nor
+proxies orders. In a local demo without an ingress controller, port-forward a shard and open
+`http://127.0.0.1:<port>/demo/`.
+
 ### Retention window
 
 An orphaned shard PVC is labeled by the renderer and marked with

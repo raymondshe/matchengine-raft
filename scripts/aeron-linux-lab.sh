@@ -102,11 +102,11 @@ ensure_tools() {
 
 build_binaries() {
     log "building engine with market-data-aeron"
-    docker exec "$CONTAINER" cargo build --release --features market-data-aeron
+    docker exec "$CONTAINER" cargo build --release --features market-data-aeron,aeron-precompiled
 
     log "building market-data service and aeron_driver"
     docker exec "$CONTAINER" cargo build --release \
-        --manifest-path /src/market_data_system/Cargo.toml --features aeron
+        --manifest-path /src/market_data_system/Cargo.toml --features aeron,aeron-precompiled
 }
 
 clean_lab() {

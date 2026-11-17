@@ -11,7 +11,6 @@ use matchengine_raft::match_result::EventId;
 use matchengine_raft::network::api::MAX_EVENTS_PAGE;
 use matchengine_raft::order_book::SymbolConfig;
 
-use crate::freeze::Product;
 use crate::state::AmendTicket;
 use crate::state::ApiError;
 use crate::state::CancelTicket;
@@ -62,19 +61,37 @@ pub async fn css() -> HttpResponse {
 
 #[derive(Deserialize, Default)]
 pub struct ProductQuery {
-    pub product: Option<Product>,
+    /// Target id. The query key remains `product` for compatibility with the
+    /// existing WebUI and scripts.
+    #[serde(default, alias = "target")]
+    pub product: Option<String>,
 }
 
 impl ProductQuery {
-    fn product(&self) -> Product {
-        self.product.unwrap_or_default()
+    fn target(&self) -> &str {
+        self.product.as_deref().unwrap_or("")
     }
 }
 
 #[derive(Deserialize, Default)]
 pub struct StateQuery {
-    pub product: Option<Product>,
+    #[serde(default, alias = "target")]
+    pub product: Option<String>,
     pub depth: Option<usize>,
+}
+
+#[get("/health")]
+pub async fn health() -> HttpResponse {
+    HttpResponse::Ok().json(serde_json::json!({"status": "ok"}))
+}
+
+#[get("/ready")]
+pub async fn ready(app: Data<DemoApp>) -> HttpResponse {
+    let configured = app.backends();
+    if configured.targets.is_empty() {
+        return HttpResponse::ServiceUnavailable().json(serde_json::json!({"ready": false}));
+    }
+    HttpResponse::Ok().json(serde_json::json!({"ready": true, "targets": configured.targets.len()}))
 }
 
 #[get("/demo/api/backends")]
@@ -84,8 +101,8 @@ pub async fn backends(app: Data<DemoApp>) -> HttpResponse {
 
 #[get("/demo/api/state")]
 pub async fn state(app: Data<DemoApp>, query: Query<StateQuery>) -> HttpResponse {
-    let product = query.product.unwrap_or_default();
-    match app.state(product, query.depth.unwrap_or(20)).await {
+    let target = query.product.as_deref().unwrap_or("");
+    match app.state(target, query.depth.unwrap_or(20)).await {
         Ok(state) => HttpResponse::Ok().json(state),
         Err(error) => api_error(error),
     }
@@ -93,7 +110,8 @@ pub async fn state(app: Data<DemoApp>, query: Query<StateQuery>) -> HttpResponse
 
 #[derive(Deserialize, Default)]
 pub struct BookQuery {
-    pub product: Option<Product>,
+    #[serde(default, alias = "target")]
+    pub product: Option<String>,
     pub limit: Option<usize>,
 }
 
@@ -103,7 +121,10 @@ pub async fn book(app: Data<DemoApp>, query: Query<BookQuery>) -> HttpResponse {
     if limit == 0 {
         return api_error(ApiError::bad_request("limit must be at least 1"));
     }
-    match app.book(query.product.unwrap_or_default(), limit).await {
+    match app
+        .book(query.product.as_deref().unwrap_or(""), limit)
+        .await
+    {
         Ok(book) => HttpResponse::Ok().json(book),
         Err(error) => api_error(error),
     }
@@ -111,7 +132,8 @@ pub async fn book(app: Data<DemoApp>, query: Query<BookQuery>) -> HttpResponse {
 
 #[derive(Deserialize)]
 pub struct EventsQuery {
-    pub product: Option<Product>,
+    #[serde(default, alias = "target")]
+    pub product: Option<String>,
     pub after_log_index: Option<u64>,
     pub after_ordinal: Option<u32>,
     pub limit: Option<usize>,
@@ -135,7 +157,7 @@ pub async fn events(app: Data<DemoApp>, query: Query<EventsQuery>) -> HttpRespon
         )));
     }
     match app
-        .events(query.product.unwrap_or_default(), after, limit)
+        .events(query.product.as_deref().unwrap_or(""), after, limit)
         .await
     {
         Ok(page) => HttpResponse::Ok().json(page),
@@ -224,7 +246,7 @@ pub async fn configure_symbol(
         ));
     }
     match app
-        .configure_symbol(query.product(), body.into_inner())
+        .configure_symbol(query.target(), body.into_inner())
         .await
     {
         Ok(result) => HttpResponse::Ok().json(result),

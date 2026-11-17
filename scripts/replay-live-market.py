@@ -13,6 +13,11 @@ Usage:
     ./scripts/replay-live-market.py --interval 0.5
     ./scripts/replay-live-market.py --iterations 20
 
+Kubernetes demo (run this inside a pod that can reach the leader Service):
+    ./scripts/replay-live-market.py --skip-eur \
+      --btc-host me-btcusdt-leader --btc-port 21001 \
+      --btc-symbol-id 3 --btc-mid 50000 --btc-volume-decimals 5
+
 The script only uses Python's standard library. It expects the two engines from
 `./scripts/market-data-system.sh` on ports 24801 (EUR/USD) and 24802 (BTC/USDT).
 """
@@ -28,6 +33,7 @@ import urllib.request
 RNG = random.Random()
 
 EUR = {
+    "host": "127.0.0.1",
     "port": 24801,
     "symbol_id": 0,
     "decimals": 5,
@@ -41,6 +47,7 @@ EUR = {
     "trades_per_interval": 3,
 }
 BTC = {
+    "host": "127.0.0.1",
     "port": 24802,
     "symbol_id": 1,
     "decimals": 2,
@@ -55,9 +62,9 @@ BTC = {
 }
 
 
-def http_json(port, path, body, timeout=5.0):
+def http_json(port, path, body, timeout=5.0, host="127.0.0.1"):
     request = urllib.request.Request(
-        f"http://127.0.0.1:{port}{path}",
+        f"http://{host}:{port}{path}",
         data=json.dumps(body).encode(),
         headers={"Content-Type": "application/json"},
         method="POST",
@@ -67,7 +74,7 @@ def http_json(port, path, body, timeout=5.0):
 
 
 def read_depth(spec):
-    response = http_json(spec["port"], "/read", "orderbook_depth")
+    response = http_json(spec["port"], "/read", "orderbook_depth", host=spec["host"])
     payload = response.get("Ok")
     if isinstance(payload, str):
         return json.loads(payload)
@@ -89,7 +96,7 @@ def place(spec, side, price, volume, order_id, tif="GTC"):
             }
         }
     }
-    return http_json(spec["port"], "/write", body)
+    return http_json(spec["port"], "/write", body, host=spec["host"])
 
 
 def level_volume(levels, price):
@@ -182,10 +189,46 @@ def main():
     )
     parser.add_argument("--skip-eur", action="store_true")
     parser.add_argument("--skip-btc", action="store_true")
+    parser.add_argument(
+        "--btc-host",
+        default="127.0.0.1",
+        help="HTTP host for the BTC/USDT engine (default 127.0.0.1)",
+    )
+    parser.add_argument(
+        "--btc-port",
+        type=int,
+        default=24802,
+        help="HTTP port for the BTC/USDT engine (default 24802)",
+    )
+    parser.add_argument(
+        "--btc-symbol-id",
+        type=int,
+        default=1,
+        help="replicated symbol id for BTC/USDT (default 1; the Kubernetes demo uses 3)",
+    )
+    parser.add_argument(
+        "--btc-mid",
+        type=float,
+        default=60000.0,
+        help="mid price for the BTC ladder (default 60000)",
+    )
+    parser.add_argument(
+        "--btc-volume-decimals",
+        type=int,
+        default=8,
+        help="base-lot decimals for BTC volumes (default 8; Kubernetes demo uses 5)",
+    )
     parser.add_argument("--seed", type=int, default=7)
     args = parser.parse_args()
 
     RNG.seed(args.seed)
+    BTC["host"] = args.btc_host
+    BTC["port"] = args.btc_port
+    BTC["volume_decimals"] = args.btc_volume_decimals
+    BTC["symbol_id"] = args.btc_symbol_id
+    mid = args.btc_mid
+    BTC["bids"] = [f"{mid - 10 * (i + 1):.2f}" for i in range(10)]
+    BTC["asks"] = [f"{mid + 10 * (i + 1):.2f}" for i in range(10)]
     counter = [1000]
 
     def next_id():

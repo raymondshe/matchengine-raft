@@ -326,7 +326,8 @@ async fn unknown_streams_are_rejected() {
     .await
     .unwrap();
     let frame = next_json(&mut ws).await;
-    assert_eq!(0, frame["error"]["code"]);
+    assert_eq!(0, frame["code"]);
+    assert_eq!("unknown stream", frame["msg"]);
     assert_eq!(9, frame["id"]);
     running.shutdown().await;
 }
@@ -573,6 +574,124 @@ async fn one_connection_holds_two_symbols_at_once() {
     running.shutdown().await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fast_connection_is_single_symbol() {
+    let mut config = Config::for_test("127.0.0.1:0");
+    config.symbols.push(SymbolSpec {
+        symbol: "btcusdt".to_string(),
+        symbol_id: 1,
+        base_asset: "BTC".to_string(),
+        quote_asset: "USDT".to_string(),
+    });
+    let (eur_tx, eur_source) = channel_source(16);
+    let (btc_tx, btc_source) = channel_source(16);
+    let running = start(
+        config.clone(),
+        vec![
+            (config.symbols[0].clone(), eur_source),
+            (config.symbols[1].clone(), btc_source),
+        ],
+    )
+    .await
+    .unwrap();
+
+    let (mut ws, _) =
+        tokio_tungstenite::connect_async(format!("ws://{}/ws/eurusd@bookTicker", running.addr))
+            .await
+            .expect("connect");
+    // The fast profile is pinned to the symbol in the path.
+    ws.send(Message::text(
+        r#"{"method":"SUBSCRIBE","params":["btcusdt@bookTicker"],"id":1}"#,
+    ))
+    .await
+    .unwrap();
+    let error = next_json(&mut ws).await;
+    assert_eq!(2, error["code"], "{error}");
+    assert!(
+        error["msg"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("single-symbol"),
+        "{error}"
+    );
+    assert_eq!(1, error["id"]);
+
+    // Same-symbol streams are still allowed on the fast connection.
+    ws.send(Message::text(
+        r#"{"method":"SUBSCRIBE","params":["eurusd@trade"],"id":2}"#,
+    ))
+    .await
+    .unwrap();
+    assert_eq!(2, wait_result(&mut ws, 2).await["id"]);
+
+    let (_, metrics) = http_get(&running.addr, "/metrics").await;
+    let metrics: Value = serde_json::from_str(&metrics).unwrap();
+    assert_eq!(1, metrics["fast_connections"]);
+    assert_eq!(0, metrics["terminal_connections"]);
+
+    // A fast connection never reads the other symbol's feed.
+    let mut btc = bbo(3);
+    btc.symbol_id = 1;
+    btc_tx.send(Ok(btc)).await.unwrap();
+    let none = tokio::time::timeout(Duration::from_millis(200), ws.next()).await;
+    assert!(none.is_err(), "fast connection received another symbol");
+    drop(eur_tx);
+
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn terminal_conflates_latest_value_streams_but_fast_does_not() {
+    let mut config = Config::for_test("127.0.0.1:0");
+    config.terminal_conflation_ms = 1_000;
+    let (tx, source) = channel_source(16);
+    let running = start_single(config, source).await;
+
+    let (mut terminal, _) = tokio_tungstenite::connect_async(format!(
+        "ws://{}/stream?streams=eurusd@bookTicker",
+        running.addr
+    ))
+    .await
+    .expect("connect");
+    tx.send(Ok(bbo(2))).await.unwrap();
+    let first = next_json(&mut terminal).await;
+    // The feed's BBO update id is market_seq + 1, matching the other tests.
+    assert_eq!(3, first["data"]["u"], "{first}");
+
+    tx.send(Ok(bbo(3))).await.unwrap();
+    let dropped = tokio::time::timeout(Duration::from_millis(200), terminal.next()).await;
+    assert!(
+        dropped.is_err(),
+        "terminal profile should conflate the second bookTicker"
+    );
+
+    tokio::time::sleep(Duration::from_millis(1_050)).await;
+    tx.send(Ok(bbo(4))).await.unwrap();
+    let next = next_json(&mut terminal).await;
+    assert_eq!(5, next["data"]["u"], "{next}");
+
+    let (_, metrics) = http_get(&running.addr, "/metrics").await;
+    let metrics: Value = serde_json::from_str(&metrics).unwrap();
+    assert!(metrics["terminal_conflated"].as_u64().unwrap() >= 1);
+
+    // The fast profile is exact: two quick updates both arrive.
+    let (mut fast, _) =
+        tokio_tungstenite::connect_async(format!("ws://{}/ws/eurusd@bookTicker", running.addr))
+            .await
+            .expect("connect");
+    // Wait for the initial subscription before feeding the fast connection.
+    fast.send(Message::text(r#"{"method":"LIST_SUBSCRIPTIONS","id":10}"#))
+        .await
+        .unwrap();
+    assert_eq!(10, wait_result(&mut fast, 10).await["id"]);
+    tx.send(Ok(bbo(5))).await.unwrap();
+    assert_eq!(6, next_json(&mut fast).await["u"]);
+    tx.send(Ok(bbo(6))).await.unwrap();
+    assert_eq!(7, next_json(&mut fast).await["u"]);
+
+    running.shutdown().await;
+}
+
 async fn wait_result(ws: &mut Ws, id: u64) -> Value {
     loop {
         let frame = next_json(ws).await;
@@ -651,5 +770,40 @@ async fn repeated_idle_heartbeats_are_forwarded() {
             }
         }
     }
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fast_only_disables_terminal_endpoints() {
+    let mut config = Config::for_test("127.0.0.1:0");
+    config.fast_only = true;
+    let (tx, source) = channel_source(8);
+    tx.send(Ok(snapshot(0))).await.unwrap();
+    tx.send(Ok(heartbeat(1))).await.unwrap();
+    let running = start_single(config, source).await;
+    wait_ready(&running.addr).await;
+
+    let (status, body) = http_get(&running.addr, "/stream?streams=eurusd@bookTicker").await;
+    assert_eq!(404, status, "{body}");
+    assert!(body.contains("fast_only"), "{body}");
+    let (status, body) = http_get(&running.addr, "/ws").await;
+    assert_eq!(404, status, "{body}");
+
+    let (status, body) = http_get(&running.addr, "/info").await;
+    assert_eq!(200, status);
+    let info: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(true, info["fast_only"]);
+    assert_eq!(json!(["fast"]), info["profiles"]);
+
+    // The fast single-symbol endpoint stays available.
+    let (mut ws, _) =
+        tokio_tungstenite::connect_async(format!("ws://{}/ws/eurusd@bookTicker", running.addr))
+            .await
+            .expect("connect");
+    ws.send(Message::text(r#"{"method":"LIST_SUBSCRIPTIONS","id":10}"#))
+        .await
+        .unwrap();
+    assert_eq!(10, wait_result(&mut ws, 10).await["id"]);
+
     running.shutdown().await;
 }

@@ -78,6 +78,24 @@
   }
   .tab:hover { color: var(--text); }
   .tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+  .md-tab {
+    padding: 9px 14px; border: none; background: none; color: var(--muted);
+    cursor: pointer; font: 600 12px/1 var(--mono); border-bottom: 2px solid transparent;
+  }
+  .md-tab:hover { color: var(--text); }
+  .md-tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+  .md-panel { display: none; }
+  .md-panel.active { display: block; }
+  .views { display: flex; gap: 4px; align-items: center; }
+  .view {
+    padding: 7px 12px; border: 1px solid var(--border); background: var(--panel);
+    color: var(--muted); border-radius: 999px; font: 600 11px/1 var(--mono);
+    letter-spacing: .4px; text-transform: uppercase;
+  }
+  .view:hover { color: var(--text); border-color: var(--accent-dim); }
+  .view.active { color: #eafffd; background: var(--accent-dim); border-color: var(--accent); }
+  main.market-view { grid-template-columns: minmax(0, 1fr); }
+  main[hidden] { display: none; }
   .panel { display: none; }
   .panel.active { display: block; }
   .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 12px; }
@@ -88,6 +106,22 @@
   .kv dd { margin: 0; font-family: var(--mono); overflow-wrap: anywhere; }
   table { width: 100%; border-collapse: collapse; font-size: 12px; }
   th, td { text-align: left; padding: 8px 9px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  .table-scroll { overflow-x: auto; }
+  .market-table { width: 100%; min-width: 980px; table-layout: fixed; }
+  .market-table th, .market-table td { overflow-wrap: anywhere; }
+  .market-table th:nth-child(1), .market-table td:nth-child(1) { width: 17%; }
+  .market-table th:nth-child(2), .market-table td:nth-child(2) { width: 15%; }
+  .market-table th:nth-child(3), .market-table td:nth-child(3) { width: 9%; }
+  .market-table th:nth-child(4), .market-table td:nth-child(4) { width: 25%; }
+  .market-table th:nth-child(5), .market-table td:nth-child(5) { width: 24%; }
+  .market-table th:nth-child(6), .market-table td:nth-child(6) { width: 10%; }
+  .market-table .service-name { font: 600 13px/1.35 var(--mono); }
+  .market-table details { margin-top: 6px; }
+  .market-table details summary {
+    cursor: pointer; color: var(--muted); font-size: 10px; text-transform: uppercase;
+    letter-spacing: .5px;
+  }
+  .market-table details .mono { font-size: 10px; overflow-wrap: anywhere; }
   th { color: var(--muted); font-weight: 500; font-size: 10px; text-transform: uppercase; letter-spacing: 1px; }
   td.mono, .mono { font-family: var(--mono); }
   tr.disabled-row td { opacity: 0.55; }
@@ -198,9 +232,14 @@
   <span class="tag" id="storeMode" title="desired-state backend">demo</span>
   <span class="tag live" id="liveState" title="auto-refreshing every 2 seconds">live</span>
   <span id="validation" class="badge">validating…</span>
+  <nav class="views" aria-label="Control-plane sections">
+    <button class="view active" type="button" data-view="engine" aria-selected="true">matching engine</button>
+    <button class="view" type="button" data-view="marketdata" aria-selected="false" title="Terminal and fast WebSocket fan-out tiers">market data</button>
+    <button class="view" type="button" data-view="ordersystem" aria-selected="false" title="User-ID sharded order-entry services">order systems</button>
+  </nav>
   <div class="stats" id="stats"></div>
 </header>
-<main>
+<main id="engineView" class="workspace">
   <aside>
     <div class="aside-head">
       <h2>Symbol shards</h2>
@@ -322,6 +361,80 @@
     </div>
   </section>
 </main>
+
+<main id="marketDataView" class="workspace market-view" hidden>
+  <section class="content">
+    <div class="headline">
+      <h2>Market data</h2>
+      <span class="sub">terminal and fast WebSocket fan-out tiers</span>
+      <button id="marketDataRefresh" title="Reload the market-data service list" style="margin-left:auto">refresh</button>
+    </div>
+    <div class="tabs md-tabs" role="tablist" aria-label="Market-data tiers">
+      <button class="md-tab active" type="button" data-md-tab="terminal" role="tab" aria-selected="true">terminal market data</button>
+      <button class="md-tab" type="button" data-md-tab="fast" role="tab" aria-selected="false">fast market data</button>
+    </div>
+
+    <div id="marketDataTerminalPanel" class="md-panel active" role="tabpanel" aria-label="Terminal market data">
+      <div class="grid" id="terminalMarketDataCards" style="margin-bottom:14px"></div>
+      <div class="card">
+        <div class="aside-head">
+          <div>
+            <h3>Terminal services</h3>
+            <p class="muted" style="margin:0"><span class="mono">MarketDataService</span> objects with
+              <span class="mono">websocket.fastOnly=false</span>. A terminal client connects once to
+              <span class="mono">/stream?streams=...</span> or <span class="mono">/ws</span> and can
+              <span class="mono">SUBSCRIBE</span>/<span class="mono">UNSUBSCRIBE</span> every configured
+              symbol on that socket. The global service consumes every shard feed group.</p>
+          </div>
+        </div>
+        <div id="terminalMarketDataRows"></div>
+      </div>
+    </div>
+
+    <div id="marketDataFastPanel" class="md-panel" role="tabpanel" aria-label="Fast market data">
+      <div class="grid" id="fastMarketDataCards" style="margin-bottom:14px"></div>
+      <div class="card">
+        <div class="aside-head">
+          <div>
+            <h3>Fast services</h3>
+            <p class="muted" style="margin:0"><span class="mono">MarketDataService</span> objects with
+              <span class="mono">websocket.fastOnly=true</span>. Each connection is pinned to one symbol
+              through <span class="mono">/ws/&lt;symbol&gt;@&lt;stream&gt;</span>, with exact sequenced
+              delivery and no display conflation. Terminal <span class="mono">/ws</span> and
+              <span class="mono">/stream</span> routes are disabled on these services.</p>
+          </div>
+        </div>
+        <div id="fastMarketDataRows"></div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<main id="orderSystemView" class="workspace market-view" hidden>
+  <section class="content">
+    <div class="headline">
+      <h2>Order systems</h2>
+      <span class="sub">user-ID sharded order-entry BFFs</span>
+      <button id="orderSystemRefresh" title="Reload the order-system list" style="margin-left:auto">refresh</button>
+    </div>
+    <div class="grid" id="orderSystemCards" style="margin-bottom:14px"></div>
+    <div class="card">
+      <div class="aside-head">
+        <div>
+          <h3>Order-system services</h3>
+          <p class="muted" style="margin:0">Each user-ID shard has its own Deployment, Service and WebUI,
+            and can target every engine shard and trading symbol. Open a shard's
+            <strong>Demo order desk</strong> link to place and manage orders there; the manager does not proxy
+            order entry. The links use each
+            shard's Ingress host; without an ingress controller or DNS, port-forward the shard and open
+            <span class="mono">/demo/</span>.</p>
+        </div>
+      </div>
+      <div id="orderSystemRows"></div>
+    </div>
+  </section>
+</main>
+
 <div id="toast"></div>
 
 <div id="symbolModal" class="modal" aria-hidden="true">
@@ -504,6 +617,34 @@
   </div>
 </div>
 
+<div id="marketDataUpgradeModal" class="modal" aria-hidden="true">
+  <div class="modal-card">
+    <div class="modal-head">
+      <h2>Update market-data image</h2>
+      <button class="close" type="button" data-close="marketDataUpgradeModal" aria-label="Close">×</button>
+    </div>
+    <form id="marketDataUpgradeForm">
+      <p class="muted">Market-data pods are stateless, so the operator rolls the Deployment with
+        <span class="mono">maxUnavailable: 0</span> and one surge pod. The target wire version must
+        match every source shard; existing WebSocket connections drain through the preStop hook.</p>
+      <div class="form-grid">
+        <label class="field">Service<input id="mdUpgradeService" readonly></label>
+        <label class="field">Current image<input id="mdUpgradeCurrent" readonly></label>
+        <label class="field">Target image<select id="mdUpgradeImageSelect"></select></label>
+        <label class="field">Custom image<input id="mdUpgradeImage" autocomplete="off" spellcheck="false" placeholder="registry/...@sha256:..."></label>
+        <label class="field">Wire version<input id="mdUpgradeWire" type="number" min="1"></label>
+        <label class="field">Snapshot version<input id="mdUpgradeSnapshot" type="number" min="1"></label>
+      </div>
+      <p class="muted mono" id="mdUpgradeHint" style="overflow-wrap:anywhere"></p>
+      <div class="form-actions">
+        <span class="muted" id="mdUpgradeStatus"></span>
+        <button type="button" data-close="marketDataUpgradeModal">Cancel</button>
+        <button type="submit" class="primary" id="mdUpgradeSubmit">Update image</button>
+      </div>
+    </form>
+  </div>
+</div>
+
 <script>
 const $ = (id) => document.getElementById(id);
 const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (c) => ({
@@ -511,6 +652,7 @@ const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (c) => ({
 }[c]));
 
 let catalog = null;
+let currentView = "engine";
 let selected = null;
 let detail = null;
 let manifestList = null;
@@ -550,12 +692,422 @@ function renderHeader() {
     ["shards", counts.shards],
     ["symbols", counts.symbols],
     ["processes", counts.processes],
+    ["market data", counts.marketDataServices],
   ].map(([label, value]) => `<div class="stat"><b>${esc(value)}</b><small>${label}</small></div>`).join("");
   const errors = (catalog.validation?.errors || []).length;
   const warnings = (catalog.validation?.warnings || []).length;
   const badge = $("validation");
   badge.className = "badge " + (errors ? "err" : warnings ? "warn" : "ok");
   badge.textContent = errors ? errors + " errors" : warnings ? warnings + " warnings" : "catalog valid";
+}
+
+let marketDataItems = [];
+let marketDataLoading = false;
+let marketDataTab = "terminal";
+let orderSystemItems = [];
+let orderSystemLoading = false;
+
+function isMarketDataView(view) {
+  return view === "marketdata";
+}
+
+function setMarketDataTab(tab, updateHash = true) {
+  marketDataTab = tab === "fast" ? "fast" : "terminal";
+  document.querySelectorAll(".md-tab").forEach((button) => {
+    const active = button.dataset.mdTab === marketDataTab;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-selected", String(active));
+  });
+  $("marketDataTerminalPanel").classList.toggle("active", marketDataTab === "terminal");
+  $("marketDataFastPanel").classList.toggle("active", marketDataTab === "fast");
+  if (updateHash && currentView === "marketdata") {
+    history.replaceState(null, "", "#marketdata-" + marketDataTab);
+  }
+}
+
+function marketDataTabFromView(view) {
+  return view === "marketdata-fast" ? "fast" : "terminal";
+}
+
+function fastOnlyService(service) {
+  return Boolean(service.spec?.websocket?.fastOnly);
+}
+
+function terminalMarketDataItems() {
+  return marketDataItems.filter((service) => !fastOnlyService(service));
+}
+
+function fastMarketDataItems() {
+  return marketDataItems.filter(fastOnlyService);
+}
+
+function setView(view) {
+  const marketView = isMarketDataView(view) || view === "marketdata-terminal" || view === "marketdata-fast";
+  if (marketView) {
+    if (view !== "marketdata") setMarketDataTab(marketDataTabFromView(view), false);
+    currentView = "marketdata";
+  } else if (view === "ordersystem") {
+    currentView = "ordersystem";
+  } else {
+    currentView = "engine";
+  }
+  document.querySelectorAll(".view").forEach((button) => {
+    const active = button.dataset.view === currentView;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-selected", String(active));
+  });
+  $("engineView").hidden = currentView !== "engine";
+  $("marketDataView").hidden = currentView !== "marketdata";
+  $("orderSystemView").hidden = currentView !== "ordersystem";
+  if (currentView === "marketdata") {
+    setMarketDataTab(marketDataTab, false);
+    history.replaceState(null, "", "#marketdata-" + marketDataTab);
+    loadMarketData();
+  } else if (currentView === "ordersystem") {
+    history.replaceState(null, "", "#ordersystem");
+    loadOrderSystems();
+  } else {
+    history.replaceState(null, "", "#engine");
+  }
+}
+
+async function loadMarketData() {
+  if (marketDataLoading) return;
+  marketDataLoading = true;
+  try {
+    const result = await api("/api/v1/market-data-services");
+    marketDataItems = result.items || [];
+    renderMarketData();
+  } catch (error) {
+    const issue = `<div class="issue warning">cannot load market-data services: ${esc(error.message)}</div>`;
+    $("terminalMarketDataRows").innerHTML = issue;
+    $("fastMarketDataRows").innerHTML = issue;
+  } finally {
+    marketDataLoading = false;
+  }
+}
+
+function marketDataPhase(service) {
+  const phase = service.status?.phase || "";
+  if (phase) return phase;
+  return service.spec?.paused ? "Paused" : "Desired";
+}
+
+function renderMarketDataCards(items, kind, cardsId) {
+  const ready = items.filter((service) => marketDataPhase(service) === "Ready").length;
+  const symbols = items.reduce((count, service) => count + (service.status?.symbols || []).length, 0);
+  const readySymbols = items.reduce(
+    (count, service) => count + (service.status?.symbols || []).filter((symbol) => symbol.ready).length, 0);
+  const subscribers = items.reduce(
+    (count, service) => count + (service.status?.symbols || []).reduce((n, symbol) => n + Number(symbol.subscribers || 0), 0), 0);
+  const shards = new Set(items.flatMap((service) =>
+    (service.sources || []).map((source) => source.shard).filter(Boolean)));
+  $(cardsId).innerHTML = [
+    ["services", items.length, `${ready} ready`],
+    ["symbols", `${readySymbols}/${symbols}`, "feed-ready"],
+    ["subscribers", subscribers, "WebSocket"],
+    ["source shards", shards.size, kind === "terminal" ? "all feeds" : "one per shard"],
+  ].map(([label, value, note]) =>
+    `<div class="card"><h3>${esc(label)}</h3><div style="font:600 22px/1.1 var(--mono)">${esc(value)}</div><div class="muted">${esc(note)}</div></div>`
+  ).join("");
+}
+
+function renderMarketDataTable(items, kind, rowsId) {
+  const rows = items.map((service) => {
+    const spec = service.spec || {};
+    const status = service.status || {};
+    const mode = spec.transport?.mode || "multicast";
+    const groupChannels = [...new Set((spec.feedGroups || []).map((group) => group.channel).filter(Boolean))];
+    if (!groupChannels.length && spec.transport?.channel) groupChannels.push(spec.transport.channel);
+    const groups = (spec.feedGroups || []).map((group) =>
+      `${esc(group.name)}: ${(group.symbols || []).map(esc).join(", ") || "—"}`).join("<br>");
+    const symbols = (spec.symbols || []).map(esc).join(", ");
+    const sourceShards = [...new Set((service.sources || []).map((source) => source.shard).filter(Boolean))];
+    const sourceText = sourceShards.length
+      ? `<div class="muted">source: ${sourceShards.map(esc).join(", ")}</div>`
+      : "";
+    const channelDetails = groupChannels.length
+      ? `<details><summary>${groupChannels.length} channel${groupChannels.length === 1 ? "" : "s"}</summary>${groupChannels
+          .map((channel) => `<div class="mono">${esc(channel)}</div>`).join("")}</details>`
+      : "";
+    const replicas = status.replicas || spec.replicas || 0;
+    const ready = status.readyReplicas || 0;
+    const minReplicas = spec.autoscaling?.minReplicas ?? 1;
+    const maxReplicas = spec.autoscaling?.maxReplicas || spec.replicas || minReplicas;
+    const hpa = spec.paused
+      ? ""
+      : `<div class="muted">hpa ${esc(minReplicas)}–${esc(maxReplicas)} @ ${esc(spec.autoscaling?.targetCpuUtilization ?? 70)}% CPU</div>`;
+    const phase = marketDataPhase(service);
+    const phaseClass = phase === "Ready" ? "ok" : phase === "Failed" || phase === "Degraded" ? "err" : "warn";
+    const ws = spec.websocket?.port ? `:${spec.websocket.port}` : "—";
+    const webUi = spec.websocket?.port ? `http://127.0.0.1:${spec.websocket.port}/` : "";
+    const wsBase = spec.websocket?.ingress
+      ? `wss://${String(spec.websocket.ingress).replace(/\/$/, "")}`
+      : spec.websocket?.port
+        ? `ws://${service.name}.${service.namespace || ""}:${spec.websocket.port}`
+        : "";
+    const fastOnly = fastOnlyService(service);
+    const wsPaths = wsBase
+      ? `${kind === "terminal"
+          ? `<div class="muted mono" style="overflow-wrap:anywhere">terminal ${esc(wsBase)}/stream?streams=...</div>
+             <div class="muted mono" style="overflow-wrap:anywhere">raw ${esc(wsBase)}/ws</div>`
+          : `<div class="muted mono" style="overflow-wrap:anywhere">fast ${esc(wsBase)}/ws/&lt;symbol&gt;@&lt;stream&gt;</div>`}
+         ${fastOnly && kind === "terminal" ? `<div class="muted mono">terminal disabled (fast only)</div>` : ""}`
+      : "";
+    const symbolRows = (status.symbols || []).map((symbol) => {
+      const state = symbol.ready ? "ok" : "err";
+      const lag = symbol.lastFrameAgeMs ? `${Math.round(symbol.lastFrameAgeMs / 1000)}s` : "now";
+      return `<div class="mono"><span class="badge ${state}">${symbol.ready ? "ready" : "waiting"}</span>
+        ${esc(symbol.name)} · age ${esc(lag)} · subs ${esc(symbol.subscribers ?? 0)} · drops ${esc(symbol.drops ?? 0)}</div>`;
+    }).join("");
+    const message = status.message ? `<div class="muted">${esc(status.message)}</div>` : "";
+    const conditions = (status.conditions || [])
+      .filter((condition) => condition.status === "False")
+      .map((condition) => `<span class="badge err" title="${esc(condition.reason || "")}">${esc(condition.type)}</span>`)
+      .join(" ");
+    return `<tr>
+      <td><div class="service-name">${esc(service.name)}</div>${fastOnly ? ' <span class="badge">fast only</span>' : ' <span class="badge ok">terminal</span>'}
+        <div class="muted mono">${esc(service.namespace || "")} · ${esc(spec.cell || "—")}</div>
+        <a class="mono" href="/api/v1/market-data-services/${encodeURIComponent(service.name)}/manifests" target="_blank">manifests</a>
+        ${webUi ? `<div><a class="mono" href="${esc(webUi)}" target="_blank" rel="noopener" title="Open the local port-forward WebUI">web ui</a></div>` : ""}
+        <div style="margin-top:6px"><button type="button" data-md-upgrade="${esc(service.name)}" style="padding:4px 8px;font:11px/1.2 var(--mono)" title="Roll a new image on this stateless market-data service">upgrade</button></div></td>
+      <td><span class="badge">${esc(mode)}</span>${sourceText}${channelDetails}</td>
+      <td>${ready}/${replicas}${hpa}</td>
+      <td class="ws-cell">${esc(ws)}${spec.websocket?.ingress ? `<div class="muted mono">${esc(spec.websocket.ingress)}</div>` : ""}${wsPaths}</td>
+      <td class="feed-cell">${groups || symbols || "—"}${symbolRows ? `<div style="margin-top:6px">${symbolRows}</div>` : ""}</td>
+      <td><span class="badge ${phaseClass}">${esc(phase)}</span>${conditions}${message}</td>
+    </tr>`;
+  }).join("");
+  const empty = kind === "terminal"
+    ? `No terminal <span class="mono">MarketDataService</span> objects. Create one with
+       <span class="mono">websocket.fastOnly=false</span> to serve <span class="mono">/ws</span> and
+       <span class="mono">/stream?streams=...</span> across all shards.`
+    : `No fast <span class="mono">MarketDataService</span> objects. Set
+       <span class="mono">websocket.fastOnly=true</span> to serve only
+       <span class="mono">/ws/&lt;symbol&gt;@&lt;stream&gt;</span> per shard.`;
+  $(rowsId).innerHTML = rows
+    ? `<div class="table-scroll"><table class="market-table"><thead><tr><th>Service</th><th>Transport / source</th><th>Ready</th><th>${kind === "terminal" ? "Terminal" : "Fast"} WebSocket</th><th>Feed groups / symbols</th><th>Phase</th></tr></thead><tbody>${rows}</tbody></table></div>`
+    : `<div class="muted" style="padding:18px 0">${empty}</div>`;
+}
+
+function renderMarketData() {
+  const terminal = terminalMarketDataItems();
+  const fast = fastMarketDataItems();
+  renderMarketDataCards(terminal, "terminal", "terminalMarketDataCards");
+  renderMarketDataTable(terminal, "terminal", "terminalMarketDataRows");
+  renderMarketDataCards(fast, "fast", "fastMarketDataCards");
+  renderMarketDataTable(fast, "fast", "fastMarketDataRows");
+  document.querySelectorAll("[data-md-upgrade]").forEach((button) => {
+    button.addEventListener("click", () => openMarketDataUpgrade(button.dataset.mdUpgrade));
+  });
+}
+
+let marketDataUpgradeName = null;
+
+function marketDataServiceByName(name) {
+  return marketDataItems.find((service) => service.name === name) || null;
+}
+
+function selectMarketDataImage(reference) {
+  const select = $("mdUpgradeImageSelect");
+  const custom = $("mdUpgradeImage");
+  const known = [...select.options].some((option) => option.value === reference);
+  select.value = known ? reference : "__custom";
+  custom.value = known ? "" : (reference || "");
+  custom.disabled = select.value !== "__custom";
+}
+
+async function openMarketDataUpgrade(name) {
+  const service = marketDataServiceByName(name);
+  if (!service) return;
+  marketDataUpgradeName = name;
+  const spec = service.spec || {};
+  const release = spec.release || {};
+  $("mdUpgradeService").value = name;
+  $("mdUpgradeCurrent").value = spec.image || "";
+  $("mdUpgradeWire").value = release.wireVersion ?? 7;
+  $("mdUpgradeSnapshot").value = release.snapshotVersion ?? 11;
+  $("mdUpgradeImage").value = "";
+  $("mdUpgradeHint").textContent = "";
+  $("mdUpgradeStatus").textContent = "";
+  $("mdUpgradeSubmit").disabled = false;
+  const select = $("mdUpgradeImageSelect");
+  select.innerHTML = `<option value="">loading images…</option>`;
+  openModal("marketDataUpgradeModal");
+  try {
+    const inventory = await api(`/api/v1/images?marketDataService=${encodeURIComponent(name)}`);
+    const items = inventory.items || [];
+    select.innerHTML = items.map((image) => {
+      const labels = [image.tag || image.reference];
+      if (image.current) labels.push("current");
+      if (image.runningHere) labels.push("running here");
+      if (image.nodes) labels.push(`${image.nodes} node${image.nodes === 1 ? "" : "s"}`);
+      return `<option value="${esc(image.reference)}">${esc(labels.join(" · "))}</option>`;
+    }).join("") + `<option value="__custom">custom image…</option>`;
+    selectMarketDataImage(spec.image || "");
+    $("mdUpgradeHint").textContent = inventory.warning
+      ? `cluster inventory warning: ${inventory.warning}`
+      : `repository: ${inventory.repository || "—"}`;
+  } catch (error) {
+    select.innerHTML = `<option value="__custom">custom image…</option>`;
+    select.value = "__custom";
+    $("mdUpgradeImage").disabled = false;
+    $("mdUpgradeImage").value = spec.image || "";
+    $("mdUpgradeHint").textContent = `cannot load image inventory: ${error.message}`;
+  }
+}
+
+function syncMarketDataImageSelect() {
+  const custom = $("mdUpgradeImageSelect").value === "__custom";
+  $("mdUpgradeImage").disabled = !custom;
+  if (custom) $("mdUpgradeImage").focus();
+}
+
+function marketDataUpgradeTarget() {
+  const selected = $("mdUpgradeImageSelect").value;
+  return selected === "__custom" ? $("mdUpgradeImage").value.trim() : selected;
+}
+
+async function submitMarketDataUpgrade(event) {
+  event.preventDefault();
+  const name = marketDataUpgradeName;
+  if (!name) return;
+  const image = marketDataUpgradeTarget();
+  const wireVersion = Number($("mdUpgradeWire").value);
+  const snapshotVersion = Number($("mdUpgradeSnapshot").value);
+  if (!image) {
+    $("mdUpgradeStatus").textContent = "choose or enter a target image";
+    return;
+  }
+  if (!Number.isInteger(wireVersion) || wireVersion < 1
+    || !Number.isInteger(snapshotVersion) || snapshotVersion < 1) {
+    $("mdUpgradeStatus").textContent = "wire and snapshot versions must be positive integers";
+    return;
+  }
+  $("mdUpgradeSubmit").disabled = true;
+  $("mdUpgradeStatus").textContent = "updating desired state…";
+  try {
+    const result = await api(`/api/v1/market-data-services/${encodeURIComponent(name)}/upgrade`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        image,
+        release: { wireVersion, snapshotVersion, mixedVersionSafe: false },
+      }),
+    });
+    const upgrade = result.upgrade || {};
+    closeModal("marketDataUpgradeModal");
+    toast(upgrade.changed
+      ? `updated ${name}; operator rolling ${upgrade.sourceShards?.length || 0} source shard feed(s)`
+      : `${name} already uses this image and release`);
+    await loadMarketData();
+    loadAudit();
+  } catch (error) {
+    $("mdUpgradeStatus").textContent = error.message;
+    $("mdUpgradeSubmit").disabled = false;
+  }
+}
+
+async function loadOrderSystems() {
+  if (orderSystemLoading) return;
+  orderSystemLoading = true;
+  try {
+    const result = await api("/api/v1/order-systems");
+    orderSystemItems = result.items || [];
+    renderOrderSystems();
+  } catch (error) {
+    $("orderSystemRows").innerHTML = `<div class="issue warning">cannot load order systems: ${esc(error.message)}</div>`;
+  } finally {
+    orderSystemLoading = false;
+  }
+}
+
+function orderSystemWebuiUrl(spec, shardName) {
+  const ingress = String(spec?.ingress || "").trim().replace(/\.+$/, "");
+  if (!ingress || !shardName) return "";
+  const scheme = String(spec?.tlsSecret || "").trim() ? "https" : "http";
+  return `${scheme}://${shardName}.${ingress}/demo/`;
+}
+
+function renderOrderSystems() {
+  const ready = orderSystemItems.filter((system) => (system.status?.phase || "") === "Ready").length;
+  const shards = orderSystemItems.reduce((count, system) => count + (system.spec?.shards || []).length, 0);
+  const targets = orderSystemItems.reduce((count, system) => count + (system.spec?.targets || []).length, 0);
+  const replicas = orderSystemItems.reduce((count, system) =>
+    count + Number(system.status?.readyReplicas ?? 0), 0);
+  const cards = [
+    ["systems", orderSystemItems.length, `${ready} ready`],
+    ["user shards", shards, "ranges"],
+    ["engine targets", targets, "symbols"],
+    ["ready replicas", replicas, "all shards"],
+  ];
+  $("orderSystemCards").innerHTML = cards.map(([label, value, note]) =>
+    `<div class="card"><h3>${esc(label)}</h3><div style="font:600 22px/1.1 var(--mono)">${esc(value)}</div><div class="muted">${esc(note)}</div></div>`
+  ).join("");
+  const rows = orderSystemItems.map((system) => {
+    const spec = system.spec || {};
+    const status = system.status || {};
+    const shardRows = (spec.shards || []).map((shard) =>
+      `${esc(shard.name)}: ${esc(shard.userIdMin)}–${esc(shard.userIdMax)}`).join("<br>");
+    const targetRows = (spec.targets || []).map((target) =>
+      `${esc(target.label || target.symbol)} <span class="muted mono">${esc(target.symbol)}</span>`).join("<br>");
+    const phase = status.phase || (spec.paused ? "Paused" : "Pending");
+    const phaseClass = phase === "Ready" ? "ok" : phase === "Failed" || phase === "Degraded" ? "err" : "warn";
+    const serviceRows = (status.shards || []).map((shard) =>
+      `${esc(shard.name)} ${esc(shard.readyReplicas ?? 0)}/${esc(shard.replicas ?? 0)}`).join("<br>");
+    const webuiRows = (spec.shards || []).map((shard) => {
+      const url = orderSystemWebuiUrl(spec, shard.name);
+      return url
+        ? `<span class="muted">${esc(shard.name)}</span> <a class="mono" href="${esc(url)}" target="_blank" rel="noreferrer" title="${esc(url)}">Demo order desk</a>`
+        : `<span class="muted">${esc(shard.name)} —</span>`;
+    }).join("<br>");
+    const minReplicas = spec.autoscaling?.minReplicas ?? 1;
+    const maxReplicas = spec.autoscaling?.maxReplicas || spec.replicas || minReplicas;
+    const hpa = spec.paused
+      ? ""
+      : `<div class="muted">hpa ${esc(minReplicas)}–${esc(maxReplicas)} @ ${esc(spec.autoscaling?.targetCpuUtilization ?? 70)}% CPU</div>`;
+    return `<tr>
+      <td><div class="service-name">${esc(system.name)}</div>
+        <div class="muted mono">${esc(system.namespace || "")} · ${esc(spec.cell || "—")}</div>
+        <div class="muted mono" style="overflow-wrap:anywhere">${esc(spec.image || "")}</div>
+        <a class="mono" href="/api/v1/order-systems/${encodeURIComponent(system.name)}/manifests" target="_blank">manifests</a>
+        <div style="margin-top:6px"><button type="button" data-order-upgrade="${esc(system.name)}" style="padding:4px 8px;font:11px/1.2 var(--mono)" title="Roll a new image to every user shard">upgrade</button></div></td>
+      <td>${shardRows || "—"}</td>
+      <td>${targetRows || "—"}</td>
+      <td>${serviceRows || "—"}${hpa}</td>
+      <td>${webuiRows || "—"}</td>
+      <td><span class="badge ${phaseClass}">${esc(phase)}</span>
+        <div class="muted">${esc(status.message || "")}</div></td>
+    </tr>`;
+  }).join("");
+  $("orderSystemRows").innerHTML = rows
+    ? `<div class="table-scroll"><table class="market-table"><thead><tr><th>Service</th><th>User-ID shards</th><th>Engine targets</th><th>Ready</th><th>Order desk</th><th>Phase</th></tr></thead><tbody>${rows}</tbody></table></div>`
+    : `<div class="muted" style="padding:18px 0">No <span class="mono">OrderSystem</span> objects yet. Create one with
+       <span class="mono">POST /api/v1/order-systems</span>.</div>`;
+  document.querySelectorAll("[data-order-upgrade]").forEach((button) => {
+    button.addEventListener("click", () => upgradeOrderSystem(button.dataset.orderUpgrade));
+  });
+}
+
+async function upgradeOrderSystem(name) {
+  const system = orderSystemItems.find((item) => item.name === name);
+  if (!system) return;
+  const image = window.prompt(`Target image for ${name}`, system.spec?.image || "");
+  if (!image || image === system.spec?.image) return;
+  try {
+    const result = await api(`/api/v1/order-systems/${encodeURIComponent(name)}/upgrade`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ image: image.trim() }),
+    });
+    const upgrade = result.upgrade || {};
+    toast(upgrade.changed
+      ? `rolling ${name}: ${upgrade.shards?.length || 0} user shard(s)`
+      : `${name} already uses this image`);
+    await loadOrderSystems();
+  } catch (error) {
+    toast(error.message, true);
+  }
 }
 
 function renderShards() {
@@ -1383,6 +1935,9 @@ function bind() {
       document.querySelectorAll(".modal.open").forEach((modal) => closeModal(modal.id));
     }
   });
+  document.querySelectorAll(".view").forEach((button) => {
+    button.addEventListener("click", () => setView(button.dataset.view));
+  });
   document.querySelectorAll(".tab").forEach((tab) => {
     tab.addEventListener("click", () => {
       document.querySelectorAll(".tab").forEach((t) => t.classList.toggle("active", t === tab));
@@ -1392,6 +1947,13 @@ function bind() {
     });
   });
   $("planBtn").addEventListener("click", loadPlan);
+  $("marketDataRefresh").addEventListener("click", loadMarketData);
+  $("orderSystemRefresh").addEventListener("click", loadOrderSystems);
+  document.querySelectorAll(".md-tab").forEach((tab) => {
+    tab.addEventListener("click", () => setMarketDataTab(tab.dataset.mdTab));
+  });
+  $("mdUpgradeImageSelect").addEventListener("change", syncMarketDataImageSelect);
+  $("marketDataUpgradeForm").addEventListener("submit", submitMarketDataUpgrade);
   $("upgradeBtn").addEventListener("click", upgradeShard);
   $("targetImageSelect").addEventListener("change", () => {
     const value = $("targetImageSelect").value;
@@ -1438,6 +2000,11 @@ async function boot() {
     selected = shards[0];
     renderShards();
     await loadShard();
+    const initialView = location.hash === "#marketdata-fast" ? "marketdata-fast"
+      : location.hash === "#marketdata-terminal" || location.hash === "#marketdata" ? "marketdata-terminal"
+        : location.hash === "#ordersystem" ? "ordersystem"
+          : "engine";
+    setView(initialView);
     loadAudit();
   } catch (error) {
     toast("cannot load catalog: " + error.message, true);
@@ -1474,10 +2041,12 @@ async function refreshLive() {
     if (!selected || !catalog.shards?.[selected]) selected = shards[0] || null;
     renderHeader();
     renderShards();
-    if (selected) {
+    if (currentView === "engine" && selected) {
       await loadDetail();
       if (liveTicks % 3 === 0 && planVisible()) await loadPlan();
     }
+    if (currentView === "marketdata" && liveTicks % 3 === 0) await loadMarketData();
+    if (currentView === "ordersystem" && liveTicks % 3 === 0) await loadOrderSystems();
     loadAudit();
     liveTicks += 1;
     setLive(true);

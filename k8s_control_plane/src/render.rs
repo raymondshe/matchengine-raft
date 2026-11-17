@@ -12,8 +12,10 @@ use serde_json::{Value, json};
 use crate::bundle::ShardBundle;
 use crate::error::ApiError;
 use crate::model::{
-    Cell, DeploymentState, PackingMode, RAFT_PORT_OFFSET, Resources, ShardClass, SymbolDeployment,
-    SymbolShard, TradingSymbol, dns_label, port_name,
+    Cell, DeploymentState, MarketDataService, MarketDataTransportMode, OrderSystem,
+    OrderSystemProduct, PackingMode, RAFT_PORT_OFFSET, Resources, ShardClass, SymbolDeployment,
+    SymbolShard, TradingSymbol, aeron_channel_endpoint, dns_label, fingerprint, is_multicast_ipv4,
+    port_name,
 };
 use crate::store::Catalog;
 use crate::validate::validate_bundle;
@@ -62,8 +64,16 @@ struct Ctx<'a> {
     shard: &'a SymbolShard,
     cell: &'a Cell,
     deployments: Vec<(&'a SymbolDeployment, &'a TradingSymbol)>,
+    /// Engine-side market-data egress derived from a matching `MarketDataService`.
+    market_data: BTreeMap<String, MarketDataEgress>,
     opts: &'a RenderOptions,
     namespace: String,
+}
+
+#[derive(Debug, Clone)]
+struct MarketDataEgress {
+    channel: String,
+    stream_base: u16,
 }
 
 impl<'a> Ctx<'a> {
@@ -257,6 +267,52 @@ pub fn render_shard(
         return Err(ApiError::unprocessable(report));
     }
 
+    // Engine-side egress is derived from every MarketDataService that covers a
+    // symbol in this shard. A shard-specific (smaller) service wins over a
+    // global service so adding a cross-shard terminal feed cannot silently
+    // re-point an engine publication.
+    let mut market_data: BTreeMap<String, (usize, String, MarketDataEgress)> = BTreeMap::new();
+    for service in catalog.market_data_services.values() {
+        if service.spec.transport.mode != MarketDataTransportMode::Multicast {
+            continue;
+        }
+        let rank = service.spec.symbol_names().len();
+        for group in service.spec.effective_feed_groups() {
+            let channel = group
+                .channel
+                .as_deref()
+                .or(service.spec.transport.channel.as_deref());
+            let Some(channel) = channel else {
+                continue;
+            };
+            for symbol_name in &group.symbols {
+                if !deployments
+                    .iter()
+                    .any(|deployment| deployment.spec.symbol_ref == *symbol_name)
+                {
+                    continue;
+                }
+                let candidate = MarketDataEgress {
+                    channel: channel.to_string(),
+                    stream_base: group.stream_base,
+                };
+                let replace =
+                    market_data
+                        .get(symbol_name)
+                        .is_none_or(|(current_rank, current_name, _)| {
+                            (rank, service.name.as_str()) < (*current_rank, current_name.as_str())
+                        });
+                if replace {
+                    market_data
+                        .insert(symbol_name.clone(), (rank, service.name.clone(), candidate));
+                }
+            }
+        }
+    }
+    let market_data: BTreeMap<String, MarketDataEgress> = market_data
+        .into_iter()
+        .map(|(symbol, (_, _, egress))| (symbol, egress))
+        .collect();
     let ctx = Ctx {
         shard,
         cell,
@@ -271,6 +327,7 @@ pub fn render_shard(
                     .map(|symbol| (deployment, symbol))
             })
             .collect(),
+        market_data,
         opts,
         namespace: opts
             .namespace
@@ -327,13 +384,24 @@ fn config_map(ctx: &Ctx<'_>) -> Value {
         .deployments
         .iter()
         .map(|(deployment, symbol)| {
-            json!({
+            let mut process = json!({
                 "name": symbol.name,
                 "slot": deployment.spec.placement.slot,
                 "httpPort": deployment.spec.placement.http_port,
                 "raftPort": deployment.spec.placement.raft_port(),
                 "raftIdOffset": deployment.spec.raft_id_offset,
-            })
+            });
+            if let Some(egress) = ctx.market_data.get(&symbol.name) {
+                process["marketData"] = json!({
+                    "channel": egress.channel,
+                    "streamBase": egress.stream_base,
+                    "dir": format!("/dev/shm/aeron-{}", dns_label(&symbol.name)),
+                    "embedded": true,
+                    "heartbeatMs": 1000,
+                    "statusEvery": 10,
+                });
+            }
+            process
         })
         .collect();
     let supervisor_body = serde_json::to_string_pretty(&json!({
@@ -478,7 +546,7 @@ fn network_policy(ctx: &Ctx<'_>) -> Value {
     // The console's cluster view probes each peer's /console/api/node over HTTP, so shard
     // peers need HTTP ingress/egress in addition to Raft. This stays inside the shard's
     // own trust boundary; external HTTP remains limited to the control-plane namespaces.
-    json!({
+    let mut policy = json!({
         "apiVersion": "networking.k8s.io/v1",
         "kind": "NetworkPolicy",
         "metadata": metadata(ctx, &ctx.shard.name, &ctx.labels()),
@@ -507,6 +575,13 @@ fn network_policy(ctx: &Ctx<'_>) -> Value {
                         "app.kubernetes.io/name": "match-engine",
                         "matching.io/cluster-id": ctx.cell.spec.cluster_id
                     } } }],
+                },
+                {
+                    "from": [{ "podSelector": { "matchLabels": {
+                        "app.kubernetes.io/name": "match-order-system",
+                        "matching.io/cell": ctx.cell.name
+                    } } }],
+                    "ports": [{ "protocol": "TCP", "port": http_first, "endPort": http_last }],
                 },
             ],
             "egress": [
@@ -537,7 +612,47 @@ fn network_policy(ctx: &Ctx<'_>) -> Value {
                 },
             ],
         },
-    })
+    });
+    // Aeron market-data egress. NetworkPolicy is L3/L4; multicast group
+    // destinations are covered by the UDP port rule. Omit the rule entirely
+    // when the shard serves no market-data feed.
+    let ports = market_data_udp_ports(ctx);
+    if !ports.is_empty() {
+        // Receivers send Aeron status/NAK control messages back to the
+        // multicast control address (group + 1) on the same port. Without this
+        // ingress rule the publisher never learns about subscribers and its
+        // term buffer fills with backpressure.
+        policy["spec"]["ingress"]
+            .as_array_mut()
+            .expect("ingress array")
+            .push(json!({
+                "from": [{ "podSelector": { "matchLabels": {
+                    "app.kubernetes.io/name": "match-marketdata",
+                    "matching.io/cell": ctx.cell.name
+                } } }],
+                "ports": ports,
+            }));
+        policy["spec"]["egress"]
+            .as_array_mut()
+            .expect("egress array")
+            .push(json!({
+                "to": [{ "ipBlock": { "cidr": "0.0.0.0/0" } }],
+                "ports": ports,
+            }));
+    }
+    policy
+}
+
+fn market_data_udp_ports(ctx: &Ctx<'_>) -> Vec<Value> {
+    let ports: std::collections::BTreeSet<u16> = ctx
+        .market_data
+        .values()
+        .filter_map(|egress| aeron_channel_endpoint(&egress.channel).map(|(_, port)| port))
+        .collect();
+    ports
+        .into_iter()
+        .map(|port| json!({ "protocol": "UDP", "port": port }))
+        .collect()
 }
 
 fn stateful_set(ctx: &Ctx<'_>) -> Value {
@@ -552,12 +667,19 @@ fn stateful_set(ctx: &Ctx<'_>) -> Value {
 
     let pod_labels = ctx.labels();
 
+    let mut volumes = vec![json!({ "name": "tmp", "emptyDir": {} })];
+    if !ctx.market_data.is_empty() {
+        volumes.push(json!({
+            "name": "aeron",
+            "emptyDir": { "medium": "Memory", "sizeLimit": "256Mi" },
+        }));
+    }
     let mut pod_spec = json!({
         "automountServiceAccountToken": false,
         "terminationGracePeriodSeconds": 60,
         "securityContext": pod_security_context(ctx),
         "containers": containers,
-        "volumes": [{ "name": "tmp", "emptyDir": {} }],
+        "volumes": volumes,
     });
 
     if ctx.local() {
@@ -685,6 +807,7 @@ fn supervisor_stateful_set(ctx: &Ctx<'_>) -> Value {
             "value": format!("$(POD_NAME).{service}.$(POD_NAMESPACE).svc.cluster.local")
         }),
         json!({ "name": "RUST_LOG", "value": "info" }),
+        json!({ "name": "POD_IP", "valueFrom": { "fieldRef": { "fieldPath": "status.podIP" } } }),
     ];
     if let Some(value) = ctx.shard.spec.raft.wal_fsync.env_value() {
         env.push(json!({ "name": "RAFT_WAL_FSYNC_MS", "value": value }));
@@ -772,29 +895,32 @@ fn supervisor_stateful_set(ctx: &Ctx<'_>) -> Value {
             "periodSeconds": 10,
             "timeoutSeconds": 3,
         },
-        "volumeMounts": [
-            { "name": "data", "mountPath": "/data" },
-            { "name": "tmp", "mountPath": "/tmp" },
-            { "name": "config", "mountPath": "/etc/match", "readOnly": true },
-        ],
+        "volumeMounts": supervisor_volume_mounts(ctx),
     });
 
     let pod_labels = ctx.labels();
+    let mut volumes = vec![
+        json!({ "name": "tmp", "emptyDir": {} }),
+        json!({
+            "name": "config",
+            "configMap": {
+                "name": format!("{}-shard", ctx.shard.name),
+                "items": [{ "key": "processes.json", "path": "processes.json" }],
+            },
+        }),
+    ];
+    if !ctx.market_data.is_empty() {
+        volumes.push(json!({
+            "name": "aeron",
+            "emptyDir": { "medium": "Memory", "sizeLimit": "256Mi" },
+        }));
+    }
     let mut pod_spec = json!({
         "automountServiceAccountToken": false,
         "terminationGracePeriodSeconds": 60,
         "securityContext": pod_security_context(ctx),
         "containers": [supervisor],
-        "volumes": [
-            { "name": "tmp", "emptyDir": {} },
-            {
-                "name": "config",
-                "configMap": {
-                    "name": format!("{}-shard", ctx.shard.name),
-                    "items": [{ "key": "processes.json", "path": "processes.json" }],
-                },
-            },
-        ],
+        "volumes": volumes,
     });
 
     if ctx.local() {
@@ -860,6 +986,18 @@ fn supervisor_stateful_set(ctx: &Ctx<'_>) -> Value {
     })
 }
 
+fn supervisor_volume_mounts(ctx: &Ctx<'_>) -> Vec<Value> {
+    let mut mounts = vec![
+        json!({ "name": "data", "mountPath": "/data" }),
+        json!({ "name": "tmp", "mountPath": "/tmp" }),
+        json!({ "name": "config", "mountPath": "/etc/match", "readOnly": true }),
+    ];
+    if !ctx.market_data.is_empty() {
+        mounts.push(json!({ "name": "aeron", "mountPath": "/dev/shm" }));
+    }
+    mounts
+}
+
 fn pod_security_context(ctx: &Ctx<'_>) -> Value {
     if ctx.non_root() {
         json!({
@@ -893,9 +1031,60 @@ fn container(ctx: &Ctx<'_>, deployment: &SymbolDeployment, symbol: &TradingSymbo
             "value": format!("$(POD_NAME).{service}.$(POD_NAMESPACE).svc.cluster.local")
         }),
         json!({ "name": "RUST_LOG", "value": "info" }),
+        json!({ "name": "POD_IP", "valueFrom": { "fieldRef": { "fieldPath": "status.podIP" } } }),
     ];
     if let Some(value) = ctx.shard.spec.raft.wal_fsync.env_value() {
         env.push(json!({ "name": "RAFT_WAL_FSYNC_MS", "value": value }));
+    }
+
+    let mut args = vec![
+        json!("--id"),
+        json!("$(POD_ORDINAL)"),
+        json!("--id-offset"),
+        json!(deployment.spec.raft_id_offset.to_string()),
+        json!("--http-addr"),
+        json!(format!("$(POD_FQDN):{http_port}")),
+        json!("--data-dir"),
+        json!("/data"),
+        json!("--instance-prefix"),
+        json!(dns_label(&symbol.name)),
+        json!("--snapshot-interval-ms"),
+        json!(snapshot_ms.to_string()),
+        json!("--read-policy"),
+        json!(ctx.shard.spec.raft.read_policy.as_str()),
+        json!("--max-inflight-writes"),
+        json!(
+            ctx.shard
+                .spec
+                .quotas
+                .per_process
+                .max_inflight_writes
+                .to_string()
+        ),
+        json!("--max-events"),
+        json!(ctx.shard.spec.quotas.per_process.max_events.to_string()),
+    ];
+    if let Some(egress) = ctx.market_data.get(&symbol.name) {
+        args.extend([
+            json!("--market-data-aeron-channel"),
+            json!(egress.channel.replace("{pod_ip}", "$(POD_IP)")),
+            json!("--market-data-aeron-embedded-driver"),
+            json!("--market-data-aeron-dir"),
+            json!(format!("/dev/shm/aeron-{}", dns_label(&symbol.name))),
+            json!("--market-data-aeron-stream-base"),
+            json!(egress.stream_base.to_string()),
+            json!("--market-data-aeron-heartbeat-ms"),
+            json!("1000"),
+            json!("--market-data-status-every"),
+            json!("10"),
+        ]);
+    }
+    let mut volume_mounts = vec![
+        json!({ "name": "data", "mountPath": "/data" }),
+        json!({ "name": "tmp", "mountPath": "/tmp" }),
+    ];
+    if ctx.market_data.contains_key(&symbol.name) {
+        volume_mounts.push(json!({ "name": "aeron", "mountPath": "/dev/shm" }));
     }
 
     json!({
@@ -903,17 +1092,7 @@ fn container(ctx: &Ctx<'_>, deployment: &SymbolDeployment, symbol: &TradingSymbo
         "image": ctx.image(deployment),
         "imagePullPolicy": ctx.image_pull_policy(),
         "command": ["/usr/local/bin/matchengine-raft"],
-        "args": [
-            "--id", "$(POD_ORDINAL)",
-            "--id-offset", deployment.spec.raft_id_offset.to_string(),
-            "--http-addr", format!("$(POD_FQDN):{http_port}"),
-            "--data-dir", "/data",
-            "--instance-prefix", dns_label(&symbol.name),
-            "--snapshot-interval-ms", snapshot_ms.to_string(),
-            "--read-policy", ctx.shard.spec.raft.read_policy.as_str(),
-            "--max-inflight-writes", ctx.shard.spec.quotas.per_process.max_inflight_writes.to_string(),
-            "--max-events", ctx.shard.spec.quotas.per_process.max_events.to_string(),
-        ],
+        "args": args,
         "env": env,
         "ports": [
             { "name": port_name("http", slot), "containerPort": http_port, "protocol": "TCP" },
@@ -943,11 +1122,1150 @@ fn container(ctx: &Ctx<'_>, deployment: &SymbolDeployment, symbol: &TradingSymbo
             "readOnlyRootFilesystem": true,
             "capabilities": { "drop": ["ALL"] },
         },
+        "volumeMounts": volume_mounts,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Market-data service
+// ---------------------------------------------------------------------------
+
+/// Label that ties every rendered object to one `MarketDataService`.
+pub const MARKET_DATA_LABEL: &str = "matching.io/market-data";
+
+struct MarketDataCtx<'a> {
+    service: &'a MarketDataService,
+    cell: &'a Cell,
+    namespace: String,
+    /// Resolved symbols with the channel and stream base each one uses.
+    symbols: Vec<MarketDataSymbol<'a>>,
+}
+
+struct MarketDataSymbol<'a> {
+    symbol: &'a TradingSymbol,
+    stream_base: u16,
+    channel: String,
+}
+
+fn market_data_labels(ctx: &MarketDataCtx<'_>) -> BTreeMap<String, String> {
+    let mut labels = BTreeMap::new();
+    labels.insert(
+        "app.kubernetes.io/name".to_string(),
+        "match-marketdata".to_string(),
+    );
+    labels.insert(
+        "app.kubernetes.io/instance".to_string(),
+        ctx.service.name.clone(),
+    );
+    labels.insert(
+        "app.kubernetes.io/managed-by".to_string(),
+        MANAGED_BY.to_string(),
+    );
+    labels.insert(MARKET_DATA_LABEL.to_string(), ctx.service.name.clone());
+    labels.insert("matching.io/cell".to_string(), ctx.cell.name.clone());
+    labels.insert(
+        "matching.io/cluster-id".to_string(),
+        ctx.cell.spec.cluster_id.clone(),
+    );
+    labels
+}
+
+fn market_data_selector(ctx: &MarketDataCtx<'_>) -> BTreeMap<String, String> {
+    let mut labels = BTreeMap::new();
+    labels.insert(
+        "app.kubernetes.io/name".to_string(),
+        "match-marketdata".to_string(),
+    );
+    labels.insert(MARKET_DATA_LABEL.to_string(), ctx.service.name.clone());
+    labels
+}
+
+fn market_data_error(code: &str, object: &str, message: impl Into<String>) -> ApiError {
+    ApiError::unprocessable(crate::validate::Report {
+        errors: vec![crate::validate::Issue {
+            severity: crate::validate::Severity::Error,
+            code: code.to_string(),
+            object: object.to_string(),
+            message: message.into(),
+        }],
+        warnings: Vec::new(),
+    })
+}
+
+/// Market-data subscribers bind the wildcard address.
+///
+/// The engine publisher keeps `interface={pod_ip}` so multicast leaves its pod
+/// network namespace. A subscriber pinned to a pod IP creates an
+/// interface-specific IGMP membership; when a second subscriber on the same
+/// node joins the same group, one of them can miss the flow. Binding the
+/// wildcard address lets every subscriber receive a copy and is the multipod
+/// behaviour single-node labs and multi-tenant hosts need.
+fn aeron_receiver_channel(channel: &str) -> String {
+    channel
+        .split('|')
+        .filter(|part| !part.trim_start().starts_with("interface="))
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+fn market_data_config(ctx: &MarketDataCtx<'_>) -> Value {
+    let groups: Vec<Value> = ctx
+        .service
+        .spec
+        .effective_feed_groups()
+        .iter()
+        .map(|group| {
+            let symbols: Vec<Value> = group
+                .symbols
+                .iter()
+                .filter_map(|name| {
+                    ctx.symbols
+                        .iter()
+                        .find(|entry| &entry.symbol.name == name)
+                        .map(|entry| {
+                            json!({
+                                "name": entry.symbol.name,
+                                "symbolId": entry.symbol.spec.symbol_id,
+                                "base": entry.symbol.spec.base,
+                                "quote": entry.symbol.spec.quote,
+                                "streamBase": entry.stream_base,
+                                "channel": aeron_receiver_channel(&entry.channel),
+                            })
+                        })
+                })
+                .collect();
+            json!({
+                "name": group.name,
+                "streamBase": group.stream_base,
+                "channel": group
+                    .channel
+                    .clone()
+                    .or_else(|| ctx.service.spec.transport.channel.clone())
+                    .map(|channel| aeron_receiver_channel(&channel)),
+                "symbols": symbols,
+            })
+        })
+        .collect();
+    json!({
+        "service": ctx.service.name,
+        "cell": ctx.cell.name,
+        "release": ctx.service.spec.release,
+        "feedGroups": groups,
+        "transport": ctx.service.spec.transport,
+        "websocket": ctx.service.spec.websocket,
+        "paused": ctx.service.spec.paused,
+    })
+}
+
+fn market_data_config_map(ctx: &MarketDataCtx<'_>, config: &Value) -> Value {
+    let body = serde_json::to_string_pretty(config).unwrap_or_default();
+    json!({
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": {
+            "name": format!("{}-config", ctx.service.name),
+            "namespace": ctx.namespace,
+            "labels": labels_value(&market_data_labels(ctx)),
+        },
+        "data": { "marketdata.json": body },
+    })
+}
+
+fn market_data_resources(ctx: &MarketDataCtx<'_>) -> Resources {
+    ctx.service
+        .spec
+        .resources
+        .clone()
+        .unwrap_or_else(|| Resources::new("100m", "128Mi", "1000m", "512Mi"))
+}
+
+fn market_data_container(ctx: &MarketDataCtx<'_>) -> Value {
+    let ws = &ctx.service.spec.websocket;
+    let mut args = vec![json!("--addr"), json!(format!("0.0.0.0:{}", ws.port))];
+    for entry in &ctx.symbols {
+        args.push(json!("--symbol"));
+        args.push(json!(format!(
+            "{}:{}:{}:{}",
+            entry.symbol.name,
+            entry.symbol.spec.symbol_id,
+            entry.symbol.spec.base.code,
+            entry.symbol.spec.quote.code
+        )));
+    }
+    for entry in &ctx.symbols {
+        args.push(json!("--aeron-channel"));
+        args.push(json!(aeron_receiver_channel(
+            &entry.channel.replace("{pod_ip}", "$(POD_IP)")
+        )));
+    }
+    for entry in &ctx.symbols {
+        args.push(json!("--aeron-stream-base"));
+        args.push(json!(entry.stream_base.to_string()));
+    }
+    args.extend([
+        json!("--aeron-embedded-driver"),
+        json!("--aeron-dir"),
+        json!("/dev/shm/aeron"),
+        json!("--max-connections"),
+        json!(ws.max_connections.to_string()),
+        json!("--max-streams"),
+        json!(ws.max_streams_per_connection.to_string()),
+        json!("--queue"),
+        json!(ws.queue.to_string()),
+        json!("--fast-max-streams"),
+        json!(ws.fast_max_streams.to_string()),
+        json!("--terminal-conflation-ms"),
+        json!(ws.terminal_conflation_ms.to_string()),
+        json!("--heartbeat-timeout-secs"),
+        json!(ws.heartbeat_timeout_secs.to_string()),
+    ]);
+    if ws.fast_only {
+        args.push(json!("--fast-only"));
+    }
+    if ws.extensions {
+        args.push(json!("--extensions"));
+    }
+    let resources = market_data_resources(ctx);
+    json!({
+        "name": "market-data",
+        "image": ctx.service.spec.image,
+        "imagePullPolicy": "IfNotPresent",
+        "command": ["/usr/local/bin/matchengine-marketdata"],
+        "args": args,
+        "env": [
+            { "name": "RUST_LOG", "value": "info" },
+            { "name": "POD_NAME", "valueFrom": { "fieldRef": { "fieldPath": "metadata.name" } } },
+            { "name": "POD_NAMESPACE", "valueFrom": { "fieldRef": { "fieldPath": "metadata.namespace" } } },
+            { "name": "POD_IP", "valueFrom": { "fieldRef": { "fieldPath": "status.podIP" } } },
+        ],
+        "ports": [{ "name": "ws", "containerPort": ws.port, "protocol": "TCP" }],
+        "resources": resources_json(&resources),
+        "startupProbe": {
+            "httpGet": { "path": "/health", "port": "ws" },
+            "periodSeconds": 3,
+            "failureThreshold": 40,
+        },
+        // Keep the pod Ready even when an upstream symbol feed is stale: the
+        // WebSocket endpoint still accepts clients and reports per-symbol
+        // readiness in /ready. Feed readiness is a MarketDataService status
+        // condition, not a pod-availability gate.
+        "readinessProbe": {
+            "httpGet": { "path": "/health", "port": "ws" },
+            "periodSeconds": 5,
+            "failureThreshold": 3,
+        },
+        "livenessProbe": {
+            "httpGet": { "path": "/health", "port": "ws" },
+            "periodSeconds": 10,
+            "failureThreshold": 6,
+        },
+        "lifecycle": {
+            "preStop": {
+                "exec": { "command": ["/bin/sh", "-c", "sleep 10"] }
+            }
+        },
+        "securityContext": {
+            "allowPrivilegeEscalation": false,
+            "readOnlyRootFilesystem": true,
+            "capabilities": { "drop": ["ALL"] },
+        },
         "volumeMounts": [
-            { "name": "data", "mountPath": "/data" },
+            { "name": "aeron", "mountPath": "/dev/shm" },
+            { "name": "config", "mountPath": "/etc/marketdata", "readOnly": true },
             { "name": "tmp", "mountPath": "/tmp" },
         ],
     })
+}
+
+fn market_data_deployment(ctx: &MarketDataCtx<'_>, config: &Value) -> Value {
+    let labels = market_data_labels(ctx);
+    let selector = market_data_selector(ctx);
+    let config_hash = fingerprint(config);
+    let release = &ctx.service.spec.release;
+    let mut deployment = json!({
+        "apiVersion": "apps/v1",
+        "kind": "Deployment",
+        "metadata": {
+            "name": ctx.service.name,
+            "namespace": ctx.namespace,
+            "labels": labels_value(&labels),
+            "annotations": { "matching.io/config-hash": &config_hash },
+        },
+        "spec": {
+            "revisionHistoryLimit": 3,
+            "minReadySeconds": 5,
+            "progressDeadlineSeconds": 600,
+            "strategy": {
+                "type": "RollingUpdate",
+                "rollingUpdate": { "maxUnavailable": 0, "maxSurge": 1 }
+            },
+            "selector": { "matchLabels": labels_value(&selector) },
+            "template": {
+                "metadata": {
+                    "labels": labels_value(&labels),
+                    "annotations": {
+                        "matching.io/config-render": "k8s_control_plane",
+                        "matching.io/config-hash": &config_hash,
+                        "matching.io/release-wire": release.wire_version.to_string(),
+                        "matching.io/release-snapshot": release.snapshot_version.to_string(),
+                        "matching.io/release-mixed-safe": release.mixed_version_safe.to_string(),
+                    },
+                },
+                "spec": {
+                    "automountServiceAccountToken": false,
+                    "terminationGracePeriodSeconds": 45,
+                    "securityContext": {
+                        "runAsNonRoot": true,
+                        "runAsUser": 10001,
+                        "runAsGroup": 10001,
+                        "fsGroup": 10001,
+                        "fsGroupChangePolicy": "OnRootMismatch",
+                        "seccompProfile": { "type": "RuntimeDefault" },
+                    },
+                    "affinity": {
+                        "podAntiAffinity": {
+                            "preferredDuringSchedulingIgnoredDuringExecution": [{
+                                "weight": 100,
+                                "podAffinityTerm": {
+                                    "labelSelector": { "matchLabels": labels_value(&selector) },
+                                    "topologyKey": "kubernetes.io/hostname",
+                                },
+                            }],
+                        },
+                    },
+                    "containers": [market_data_container(ctx)],
+                    "volumes": [
+                        {
+                            "name": "aeron",
+                            "emptyDir": { "medium": "Memory", "sizeLimit": "256Mi" },
+                        },
+                        {
+                            "name": "config",
+                            "configMap": { "name": format!("{}-config", ctx.service.name) },
+                        },
+                        { "name": "tmp", "emptyDir": {} },
+                    ],
+                },
+            },
+        },
+    });
+    // The HPA owns the replica count; only pin it when the service is paused.
+    if ctx.service.spec.paused {
+        deployment["spec"]["replicas"] = json!(0);
+    }
+    deployment
+}
+
+fn market_data_service(ctx: &MarketDataCtx<'_>) -> Value {
+    let ws = &ctx.service.spec.websocket;
+    json!({
+        "apiVersion": "v1",
+        "kind": "Service",
+        "metadata": {
+            "name": ctx.service.name,
+            "namespace": ctx.namespace,
+            "labels": labels_value(&market_data_labels(ctx)),
+        },
+        "spec": {
+            "type": "ClusterIP",
+            "selector": labels_value(&market_data_selector(ctx)),
+            "ports": [{
+                "name": "ws",
+                "port": ws.port,
+                "targetPort": "ws",
+                "protocol": "TCP",
+                "appProtocol": "http",
+            }],
+        },
+    })
+}
+
+fn market_data_ingress(ctx: &MarketDataCtx<'_>) -> Value {
+    let ws = &ctx.service.spec.websocket;
+    let host = ws.ingress.trim();
+    let mut spec = json!({
+        "rules": [{
+            "host": host,
+            "http": {
+                "paths": [{
+                    "path": "/",
+                    "pathType": "Prefix",
+                    "backend": {
+                        "service": {
+                            "name": ctx.service.name,
+                            "port": { "name": "ws" },
+                        },
+                    },
+                }],
+            },
+        }],
+    });
+    if !ws.tls_secret.trim().is_empty() {
+        spec["tls"] = json!([{
+            "hosts": [host],
+            "secretName": ws.tls_secret,
+        }]);
+    }
+    json!({
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "Ingress",
+        "metadata": {
+            "name": ctx.service.name,
+            "namespace": ctx.namespace,
+            "labels": labels_value(&market_data_labels(ctx)),
+        },
+        "spec": spec,
+    })
+}
+
+fn market_data_pdb(ctx: &MarketDataCtx<'_>) -> Value {
+    let min_available = ctx.service.spec.min_replicas().saturating_sub(1);
+    json!({
+        "apiVersion": "policy/v1",
+        "kind": "PodDisruptionBudget",
+        "metadata": {
+            "name": format!("{}-marketdata", ctx.service.name),
+            "namespace": ctx.namespace,
+            "labels": labels_value(&market_data_labels(ctx)),
+        },
+        "spec": {
+            "minAvailable": min_available,
+            "selector": { "matchLabels": labels_value(&market_data_selector(ctx)) },
+        },
+    })
+}
+
+fn market_data_hpa(ctx: &MarketDataCtx<'_>) -> Value {
+    let spec = &ctx.service.spec;
+    let min_replicas = spec.min_replicas();
+    let max_replicas = spec.max_replicas();
+    json!({
+        "apiVersion": "autoscaling/v2",
+        "kind": "HorizontalPodAutoscaler",
+        "metadata": {
+            "name": ctx.service.name,
+            "namespace": ctx.namespace,
+            "labels": labels_value(&market_data_labels(ctx)),
+        },
+        "spec": {
+            "scaleTargetRef": {
+                "apiVersion": "apps/v1",
+                "kind": "Deployment",
+                "name": ctx.service.name,
+            },
+            "minReplicas": min_replicas,
+            "maxReplicas": max_replicas,
+            "metrics": [{
+                "type": "Resource",
+                "resource": {
+                    "name": "cpu",
+                    "target": {
+                        "type": "Utilization",
+                        "averageUtilization": spec.autoscaling.target_cpu_utilization,
+                    },
+                },
+            }],
+            "behavior": {
+                "scaleUp": {
+                    "stabilizationWindowSeconds": 30,
+                    "policies": [{ "type": "Percent", "value": 100, "periodSeconds": 30 }],
+                },
+                "scaleDown": {
+                    "stabilizationWindowSeconds": 300,
+                    "policies": [{ "type": "Percent", "value": 50, "periodSeconds": 60 }],
+                },
+            },
+        },
+    })
+}
+
+fn market_data_network_policy(ctx: &MarketDataCtx<'_>) -> Value {
+    let ws = &ctx.service.spec.websocket;
+    let transport = &ctx.service.spec.transport;
+    let mut aeron_ports = Vec::new();
+    for group in ctx.service.spec.effective_feed_groups() {
+        let channel = group.channel.as_deref().or(transport.channel.as_deref());
+        if let Some((_, port)) = channel.and_then(aeron_channel_endpoint)
+            && !aeron_ports.contains(&port)
+        {
+            aeron_ports.push(port);
+        }
+    }
+    if aeron_ports.is_empty() {
+        aeron_ports.push(24001);
+    }
+    let aeron_port_rules: Vec<Value> = aeron_ports
+        .iter()
+        .map(|port| json!({ "protocol": "UDP", "port": port }))
+        .collect();
+    let mut egress = vec![
+        json!({
+            "to": [{ "namespaceSelector": { "matchLabels": { "kubernetes.io/metadata.name": "kube-system" } } }],
+            "ports": [
+                { "protocol": "UDP", "port": 53 },
+                { "protocol": "TCP", "port": 53 },
+            ],
+        }),
+        json!({
+            "to": [{ "ipBlock": { "cidr": "0.0.0.0/0" } }],
+            "ports": aeron_port_rules.clone(),
+        }),
+        // Stream-2010 snapshot requests go directly to an engine pod's HTTP port.
+        json!({
+            "to": [{ "podSelector": { "matchLabels": {
+                "app.kubernetes.io/name": "match-engine",
+                "matching.io/cluster-id": ctx.cell.spec.cluster_id
+            } } }],
+        }),
+    ];
+    if transport.mode == MarketDataTransportMode::Nats {
+        egress.push(json!({
+            "to": [{ "ipBlock": { "cidr": "0.0.0.0/0" } }],
+            "ports": [{ "protocol": "TCP", "port": 4222 }],
+        }));
+    }
+    json!({
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "NetworkPolicy",
+        "metadata": {
+            "name": format!("{}-marketdata", ctx.service.name),
+            "namespace": ctx.namespace,
+            "labels": labels_value(&market_data_labels(ctx)),
+        },
+        "spec": {
+            "podSelector": { "matchLabels": labels_value(&market_data_selector(ctx)) },
+            "policyTypes": ["Ingress", "Egress"],
+            "ingress": [{
+                "from": [
+                    { "namespaceSelector": { "matchLabels": { "matching.io/role": "gateway" } } },
+                    { "namespaceSelector": { "matchLabels": { "matching.io/role": "observability" } } },
+                    { "namespaceSelector": { "matchLabels": { "matching.io/role": "control-plane" } } },
+                    { "podSelector": { "matchLabels": labels_value(&market_data_selector(ctx)) } },
+                ],
+                "ports": [{ "protocol": "TCP", "port": ws.port }],
+            }, {
+                "from": [{ "podSelector": { "matchLabels": {
+                    "app.kubernetes.io/name": "match-engine",
+                    "matching.io/cluster-id": ctx.cell.spec.cluster_id
+                } } }],
+                "ports": aeron_port_rules,
+            }],
+            "egress": egress,
+        },
+    })
+}
+
+/// Render one `MarketDataService` into the fan-out Deployment/Service/PDB/NetworkPolicy/ConfigMap.
+///
+/// Profile A (direct Aeron multicast) is the only transport rendered today. NATS and the
+/// per-pod bridge stay designed fallbacks: the market-data binary has no NATS source yet, so
+/// rendering them would produce pods that cannot serve a feed.
+///
+/// Fails with 422 when a symbol is missing, its shard release differs from the service release,
+/// or the Aeron channel is malformed/unsafe.
+pub fn render_market_data_service(
+    catalog: &Catalog,
+    name: &str,
+    namespace: Option<&str>,
+) -> Result<Vec<Value>, ApiError> {
+    let service = catalog.market_data_services.get(name).ok_or_else(|| {
+        ApiError::not_found("market_data_not_found", format!("unknown service {name}"))
+    })?;
+    let cell = catalog.cells.get(&service.spec.cell).ok_or_else(|| {
+        market_data_error(
+            "cell_missing",
+            name,
+            format!("cell {} is not registered", service.spec.cell),
+        )
+    })?;
+    if service.spec.transport.mode != MarketDataTransportMode::Multicast {
+        return Err(market_data_error(
+            "market_data_transport",
+            name,
+            "only the multicast transport profile is implemented; NATS/bridge remain fallbacks in docs/AERON_K8S_MESSAGE_BUS.md",
+        ));
+    }
+    let groups = service.spec.effective_feed_groups();
+    let mut channels = Vec::new();
+    for group in &groups {
+        let channel = group
+            .channel
+            .as_deref()
+            .or(service.spec.transport.channel.as_deref())
+            .ok_or_else(|| {
+                market_data_error(
+                    "market_data_channel",
+                    name,
+                    format!(
+                        "feed group {} needs its own channel or spec.transport.channel",
+                        group.name
+                    ),
+                )
+            })?;
+        if !channels.contains(&channel) {
+            channels.push(channel);
+        }
+    }
+    if channels.is_empty() {
+        return Err(market_data_error(
+            "market_data_channel",
+            name,
+            "multicast transport requires spec.transport.channel or per-group channels",
+        ));
+    }
+    for channel in channels {
+        let Some((host, _)) = aeron_channel_endpoint(channel) else {
+            return Err(market_data_error(
+                "market_data_channel",
+                name,
+                format!("cannot parse endpoint from Aeron channel {channel}"),
+            ));
+        };
+        if let Ok(address) = host.parse::<std::net::Ipv4Addr>()
+            && is_multicast_ipv4(&host)
+            && address.octets()[3] % 2 == 0
+        {
+            return Err(market_data_error(
+                "market_data_channel_even",
+                name,
+                format!(
+                    "Aeron requires an odd multicast data address; {host} has an even last octet"
+                ),
+            ));
+        }
+    }
+
+    let mut symbols = Vec::new();
+    for symbol_name in service.spec.symbol_names() {
+        let symbol = catalog.symbols.get(&symbol_name).ok_or_else(|| {
+            market_data_error(
+                "symbol_missing",
+                name,
+                format!("unknown symbol {symbol_name}"),
+            )
+        })?;
+        let deployment = catalog
+            .deployments
+            .values()
+            .find(|deployment| deployment.spec.symbol_ref == symbol_name)
+            .ok_or_else(|| {
+                market_data_error(
+                    "deployment_missing",
+                    name,
+                    format!("symbol {symbol_name} has no engine deployment"),
+                )
+            })?;
+        let shard = catalog
+            .shards
+            .get(&deployment.spec.shard_ref)
+            .ok_or_else(|| {
+                market_data_error(
+                    "shard_missing",
+                    name,
+                    format!(
+                        "deployment {} references unknown shard {}",
+                        deployment.name, deployment.spec.shard_ref
+                    ),
+                )
+            })?;
+        if shard.spec.release.wire_version != service.spec.release.wire_version {
+            return Err(market_data_error(
+                "market_data_release",
+                name,
+                format!(
+                    "market-data wire version {} does not match shard {} wire version {}",
+                    service.spec.release.wire_version, shard.name, shard.spec.release.wire_version
+                ),
+            ));
+        }
+        let channel = service.spec.channel_for(&symbol_name).ok_or_else(|| {
+            market_data_error(
+                "market_data_channel",
+                name,
+                format!("symbol {symbol_name} has no feed-group or transport channel"),
+            )
+        })?;
+        symbols.push(MarketDataSymbol {
+            symbol,
+            stream_base: service.spec.stream_base_for(&symbol_name),
+            channel,
+        });
+    }
+    if symbols.is_empty() {
+        return Err(market_data_error(
+            "market_data_symbols",
+            name,
+            "declare at least one symbol or feed group",
+        ));
+    }
+
+    let namespace = namespace
+        .map(str::to_string)
+        .filter(|namespace| !namespace.is_empty())
+        .unwrap_or_else(|| {
+            if service.namespace.is_empty() {
+                cell.namespace.clone()
+            } else {
+                service.namespace.clone()
+            }
+        });
+    let ctx = MarketDataCtx {
+        service,
+        cell,
+        namespace,
+        symbols,
+    };
+    let config = market_data_config(&ctx);
+    let mut objects = vec![
+        market_data_config_map(&ctx, &config),
+        market_data_deployment(&ctx, &config),
+        market_data_service(&ctx),
+        market_data_pdb(&ctx),
+        market_data_network_policy(&ctx),
+    ];
+    if !service.spec.websocket.ingress.trim().is_empty() {
+        objects.push(market_data_ingress(&ctx));
+    }
+    if !service.spec.paused {
+        objects.push(market_data_hpa(&ctx));
+    }
+    Ok(objects)
+}
+
+/// Label that ties every rendered object to one `OrderSystem`.
+pub const ORDER_SYSTEM_LABEL: &str = "matching.io/order-system";
+
+struct OrderSystemTargetResolved {
+    id: String,
+    label: String,
+    engine: String,
+    engine_id: u64,
+    product: OrderSystemProduct,
+}
+
+struct OrderSystemCtx<'a> {
+    system: &'a OrderSystem,
+    cell: &'a Cell,
+    namespace: String,
+    targets: Vec<OrderSystemTargetResolved>,
+}
+
+fn order_system_labels(ctx: &OrderSystemCtx<'_>, shard: Option<&str>) -> BTreeMap<String, String> {
+    let mut labels = BTreeMap::new();
+    labels.insert(
+        "app.kubernetes.io/name".to_string(),
+        "match-order-system".to_string(),
+    );
+    labels.insert(
+        "app.kubernetes.io/instance".to_string(),
+        ctx.system.name.clone(),
+    );
+    labels.insert(ORDER_SYSTEM_LABEL.to_string(), ctx.system.name.clone());
+    labels.insert("matching.io/cell".to_string(), ctx.cell.name.clone());
+    labels.insert(
+        "matching.io/cluster-id".to_string(),
+        ctx.cell.spec.cluster_id.clone(),
+    );
+    if let Some(shard) = shard {
+        labels.insert("matching.io/order-shard".to_string(), shard.to_string());
+    }
+    labels
+}
+
+fn order_system_config(ctx: &OrderSystemCtx<'_>) -> Value {
+    let targets: Vec<Value> = ctx
+        .targets
+        .iter()
+        .map(|target| {
+            json!({
+                "id": target.id,
+                "label": target.label,
+                "engine": target.engine,
+                "engineId": target.engine_id,
+                "product": target.product,
+            })
+        })
+        .collect();
+    json!({ "targets": targets })
+}
+
+fn order_system_config_map(ctx: &OrderSystemCtx<'_>, config: &Value) -> Value {
+    json!({
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": {
+            "name": format!("{}-config", ctx.system.name),
+            "namespace": ctx.namespace,
+            "labels": labels_value(&order_system_labels(ctx, None)),
+        },
+        "data": {
+            "targets.json": serde_json::to_string_pretty(config).unwrap_or_default(),
+        },
+    })
+}
+
+fn order_system_resources(ctx: &OrderSystemCtx<'_>) -> Resources {
+    ctx.system
+        .spec
+        .resources
+        .clone()
+        .unwrap_or_else(|| Resources::new("100m", "128Mi", "1000m", "512Mi"))
+}
+
+fn order_system_deployment(
+    ctx: &OrderSystemCtx<'_>,
+    shard: &crate::model::OrderSystemShard,
+    config: &Value,
+) -> Value {
+    let spec = &ctx.system.spec;
+    let name = dns_label(&format!("{}-{}", ctx.system.name, shard.name));
+    let labels = order_system_labels(ctx, Some(&shard.name));
+    let resources = order_system_resources(ctx);
+    let args = vec![
+        json!("--addr"),
+        json!(format!("0.0.0.0:{}", spec.port)),
+        json!("--targets"),
+        json!("/etc/order-system/targets.json"),
+        json!("--user-id-min"),
+        json!(shard.user_id_min.to_string()),
+        json!("--user-id-max"),
+        json!(shard.user_id_max.to_string()),
+    ];
+    let mut deployment = json!({
+        "apiVersion": "apps/v1",
+        "kind": "Deployment",
+        "metadata": {
+            "name": name,
+            "namespace": ctx.namespace,
+            "labels": labels_value(&labels),
+        },
+        "spec": {
+            "strategy": { "type": "RollingUpdate", "rollingUpdate": { "maxUnavailable": 0, "maxSurge": 1 } },
+            "selector": { "matchLabels": labels_value(&labels) },
+            "template": {
+                "metadata": {
+                    "labels": labels_value(&labels),
+                    "annotations": { "matching.io/config-hash": fingerprint(config) },
+                },
+                "spec": {
+                    "automountServiceAccountToken": false,
+                    "terminationGracePeriodSeconds": 20,
+                    "securityContext": {
+                        "runAsNonRoot": true,
+                        "runAsUser": 10001,
+                        "runAsGroup": 10001,
+                        "fsGroup": 10001,
+                        "seccompProfile": { "type": "RuntimeDefault" },
+                    },
+                    "containers": [{
+                        "name": "order-system",
+                        "image": spec.image,
+                        "imagePullPolicy": "IfNotPresent",
+                        "command": ["/usr/local/bin/matchengine-order-system"],
+                        "args": args,
+                        "env": [
+                            { "name": "RUST_LOG", "value": "info,actix_web=warn" },
+                            { "name": "POD_NAME", "valueFrom": { "fieldRef": { "fieldPath": "metadata.name" } } },
+                            { "name": "POD_NAMESPACE", "valueFrom": { "fieldRef": { "fieldPath": "metadata.namespace" } } },
+                        ],
+                        "ports": [{ "name": "http", "containerPort": spec.port, "protocol": "TCP" }],
+                        "resources": resources_json(&resources),
+                        "startupProbe": {
+                            "httpGet": { "path": "/health", "port": "http" },
+                            "periodSeconds": 3,
+                            "failureThreshold": 30,
+                        },
+                        "readinessProbe": {
+                            "httpGet": { "path": "/health", "port": "http" },
+                            "periodSeconds": 3,
+                            "failureThreshold": 3,
+                        },
+                        "livenessProbe": {
+                            "httpGet": { "path": "/health", "port": "http" },
+                            "periodSeconds": 10,
+                            "failureThreshold": 6,
+                        },
+                        "securityContext": {
+                            "allowPrivilegeEscalation": false,
+                            "readOnlyRootFilesystem": true,
+                            "capabilities": { "drop": ["ALL"] },
+                        },
+                        "volumeMounts": [
+                            { "name": "config", "mountPath": "/etc/order-system", "readOnly": true },
+                            { "name": "tmp", "mountPath": "/tmp" },
+                        ],
+                    }],
+                    "volumes": [
+                        { "name": "config", "configMap": { "name": format!("{}-config", ctx.system.name) } },
+                        { "name": "tmp", "emptyDir": {} },
+                    ],
+                },
+            },
+        },
+    });
+    // The HPA owns the replica count; only pin it when the system is paused.
+    if spec.paused {
+        deployment["spec"]["replicas"] = json!(0);
+    }
+    deployment
+}
+
+fn order_system_service(ctx: &OrderSystemCtx<'_>, shard: &crate::model::OrderSystemShard) -> Value {
+    let name = dns_label(&format!("{}-{}", ctx.system.name, shard.name));
+    let labels = order_system_labels(ctx, Some(&shard.name));
+    json!({
+        "apiVersion": "v1",
+        "kind": "Service",
+        "metadata": {
+            "name": name,
+            "namespace": ctx.namespace,
+            "labels": labels_value(&labels),
+        },
+        "spec": {
+            "type": "ClusterIP",
+            "selector": labels_value(&labels),
+            "ports": [{
+                "name": "http",
+                "port": ctx.system.spec.port,
+                "targetPort": "http",
+                "protocol": "TCP",
+                "appProtocol": "http",
+            }],
+        },
+    })
+}
+
+fn order_system_pdb(ctx: &OrderSystemCtx<'_>, shard: &crate::model::OrderSystemShard) -> Value {
+    let name = dns_label(&format!("{}-{}", ctx.system.name, shard.name));
+    let labels = order_system_labels(ctx, Some(&shard.name));
+    json!({
+        "apiVersion": "policy/v1",
+        "kind": "PodDisruptionBudget",
+        "metadata": {
+            "name": name,
+            "namespace": ctx.namespace,
+            "labels": labels_value(&labels),
+        },
+        "spec": {
+            "minAvailable": ctx.system.spec.min_replicas().saturating_sub(1),
+            "selector": { "matchLabels": labels_value(&labels) },
+        },
+    })
+}
+
+fn order_system_hpa(ctx: &OrderSystemCtx<'_>, shard: &crate::model::OrderSystemShard) -> Value {
+    let spec = &ctx.system.spec;
+    let name = dns_label(&format!("{}-{}", ctx.system.name, shard.name));
+    let labels = order_system_labels(ctx, Some(&shard.name));
+    json!({
+        "apiVersion": "autoscaling/v2",
+        "kind": "HorizontalPodAutoscaler",
+        "metadata": {
+            "name": name,
+            "namespace": ctx.namespace,
+            "labels": labels_value(&labels),
+        },
+        "spec": {
+            "scaleTargetRef": {
+                "apiVersion": "apps/v1",
+                "kind": "Deployment",
+                "name": name,
+            },
+            "minReplicas": spec.min_replicas(),
+            "maxReplicas": spec.max_replicas(),
+            "metrics": [{
+                "type": "Resource",
+                "resource": {
+                    "name": "cpu",
+                    "target": {
+                        "type": "Utilization",
+                        "averageUtilization": spec.autoscaling.target_cpu_utilization,
+                    },
+                },
+            }],
+            "behavior": {
+                "scaleUp": {
+                    "stabilizationWindowSeconds": 30,
+                    "policies": [{ "type": "Percent", "value": 100, "periodSeconds": 30 }],
+                },
+                "scaleDown": {
+                    "stabilizationWindowSeconds": 300,
+                    "policies": [{ "type": "Percent", "value": 50, "periodSeconds": 60 }],
+                },
+            },
+        },
+    })
+}
+
+fn order_system_ingress(
+    ctx: &OrderSystemCtx<'_>,
+    shard: &crate::model::OrderSystemShard,
+) -> Option<Value> {
+    let base = ctx.system.spec.ingress.trim().trim_end_matches('.');
+    if base.is_empty() {
+        return None;
+    }
+    let name = dns_label(&format!("{}-{}", ctx.system.name, shard.name));
+    let labels = order_system_labels(ctx, Some(&shard.name));
+    let host = format!("{}.{}", shard.name, base);
+    let mut spec = json!({
+        "rules": [{
+            "host": host,
+            "http": { "paths": [{
+                "path": "/",
+                "pathType": "Prefix",
+                "backend": { "service": { "name": name, "port": { "name": "http" } } },
+            }] },
+        }],
+    });
+    if !ctx.system.spec.tls_secret.trim().is_empty() {
+        spec["tls"] = json!([{ "hosts": [host], "secretName": ctx.system.spec.tls_secret }]);
+    }
+    Some(json!({
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "Ingress",
+        "metadata": {
+            "name": name,
+            "namespace": ctx.namespace,
+            "labels": labels_value(&labels),
+        },
+        "spec": spec,
+    }))
+}
+
+/// Render one `OrderSystem` into one ConfigMap and a Deployment/Service/PDB/Ingress
+/// set per user-ID shard. Every shard receives the same target list.
+pub fn render_order_system(
+    catalog: &Catalog,
+    name: &str,
+    namespace: Option<&str>,
+) -> Result<Vec<Value>, ApiError> {
+    let system = catalog.order_systems.get(name).ok_or_else(|| {
+        ApiError::not_found(
+            "order_system_not_found",
+            format!("unknown order system {name}"),
+        )
+    })?;
+    let cell = catalog.cells.get(&system.spec.cell).ok_or_else(|| {
+        market_data_error(
+            "order_system_cell",
+            name,
+            format!("cell {} is not registered", system.spec.cell),
+        )
+    })?;
+    if system.spec.image.trim().is_empty() {
+        return Err(market_data_error(
+            "order_system_image",
+            name,
+            "spec.image is required",
+        ));
+    }
+    if system.spec.port == 0 {
+        return Err(market_data_error(
+            "order_system_port",
+            name,
+            "spec.port must be greater than zero",
+        ));
+    }
+    if system.spec.shards.is_empty() {
+        return Err(market_data_error(
+            "order_system_shards",
+            name,
+            "declare at least one user-ID shard",
+        ));
+    }
+    let mut targets = Vec::new();
+    for target in &system.spec.targets {
+        let symbol = catalog.symbols.get(&target.symbol).ok_or_else(|| {
+            market_data_error(
+                "order_system_symbol",
+                name,
+                format!("unknown symbol {}", target.symbol),
+            )
+        })?;
+        let deployment = catalog
+            .deployments
+            .values()
+            .find(|deployment| deployment.spec.symbol_ref == target.symbol)
+            .ok_or_else(|| {
+                market_data_error(
+                    "order_system_deployment",
+                    name,
+                    format!("symbol {} has no engine deployment", target.symbol),
+                )
+            })?;
+        let shard = catalog
+            .shards
+            .get(&deployment.spec.shard_ref)
+            .ok_or_else(|| {
+                market_data_error(
+                    "order_system_shard",
+                    name,
+                    format!(
+                        "deployment {} references unknown shard {}",
+                        deployment.name, deployment.spec.shard_ref
+                    ),
+                )
+            })?;
+        let ns = if deployment.namespace.is_empty() {
+            system.namespace.clone()
+        } else {
+            deployment.namespace.clone()
+        };
+        let engine = format!(
+            "http://{}-0.{}-headless.{}.svc.cluster.local:{}",
+            shard.name, shard.name, ns, deployment.spec.placement.http_port
+        );
+        targets.push(OrderSystemTargetResolved {
+            id: symbol.name.clone(),
+            label: if target.label.trim().is_empty() {
+                symbol.name.clone()
+            } else {
+                target.label.clone()
+            },
+            engine,
+            engine_id: 1 + deployment.spec.raft_id_offset,
+            product: target.product,
+        });
+    }
+    if targets.is_empty() {
+        return Err(market_data_error(
+            "order_system_targets",
+            name,
+            "declare at least one engine/symbol target",
+        ));
+    }
+    let namespace = namespace
+        .map(str::to_string)
+        .filter(|namespace| !namespace.is_empty())
+        .or_else(|| {
+            if system.namespace.is_empty() {
+                Some(cell.namespace.clone())
+            } else {
+                Some(system.namespace.clone())
+            }
+        })
+        .unwrap_or_default();
+    let ctx = OrderSystemCtx {
+        system,
+        cell,
+        namespace,
+        targets,
+    };
+    let config = order_system_config(&ctx);
+    let mut objects = vec![order_system_config_map(&ctx, &config)];
+    for shard in &system.spec.shards {
+        objects.push(order_system_deployment(&ctx, shard, &config));
+        objects.push(order_system_service(&ctx, shard));
+        objects.push(order_system_pdb(&ctx, shard));
+        if !system.spec.paused {
+            objects.push(order_system_hpa(&ctx, shard));
+        }
+        if let Some(ingress) = order_system_ingress(&ctx, shard) {
+            objects.push(ingress);
+        }
+    }
+    Ok(objects)
 }
 
 /// Whether a shard is safe to roll one pod at a time for the target image.
@@ -1390,5 +2708,621 @@ mod tests {
         assert_eq!(slots["processes"][0]["name"], "eurusd");
         assert_eq!(slots["processes"][0]["raftPort"], 22001);
         assert_eq!(slots["processes"][1]["deploymentRef"], "gbpusd-g1");
+    }
+
+    fn demo_market_data(catalog: &mut Catalog, name: &str) -> crate::model::MarketDataService {
+        use crate::model::{
+            MarketDataFeedGroup, MarketDataService, MarketDataServiceSpec, MarketDataTransport,
+            MarketDataWebSocket,
+        };
+        let service = MarketDataService {
+            name: name.to_string(),
+            namespace: "match-eu-1".to_string(),
+            spec: MarketDataServiceSpec {
+                cell: "eu-1".to_string(),
+                symbols: Vec::new(),
+                feed_groups: vec![MarketDataFeedGroup {
+                    name: "btc".to_string(),
+                    symbols: vec!["btcusdt".to_string()],
+                    stream_base: 2001,
+                    channel: None,
+                }],
+                image: "registry.example.com/matchengine-marketdata@sha256:abc".to_string(),
+                release: Default::default(),
+                replicas: 2,
+                transport: MarketDataTransport {
+                    channel: Some(
+                        "aeron:udp?endpoint=239.1.2.51:24001|interface={pod_ip}|ttl=1".to_string(),
+                    ),
+                    ..Default::default()
+                },
+                websocket: MarketDataWebSocket {
+                    port: 24800,
+                    max_connections: 4096,
+                    ..Default::default()
+                },
+                autoscaling: Default::default(),
+                resources: None,
+                paused: false,
+            },
+            status: Default::default(),
+        };
+        catalog
+            .market_data_services
+            .insert(name.to_string(), service.clone());
+        service
+    }
+
+    #[test]
+    fn order_system_renders_hpa_and_rolling_shards() {
+        use crate::model::{
+            OrderSystem, OrderSystemAutoscaling, OrderSystemShard, OrderSystemSpec,
+            OrderSystemTarget,
+        };
+        let mut catalog = demo_catalog();
+        let system = OrderSystem {
+            name: "orders".to_string(),
+            namespace: "match-eu-1".to_string(),
+            spec: OrderSystemSpec {
+                cell: "eu-1".to_string(),
+                image: "matchengine-order-system:arm64-v2".to_string(),
+                replicas: 1,
+                autoscaling: OrderSystemAutoscaling {
+                    min_replicas: 1,
+                    max_replicas: 2,
+                    target_cpu_utilization: 70,
+                },
+                port: 24300,
+                targets: vec![
+                    OrderSystemTarget {
+                        symbol: "gbpusd".to_string(),
+                        label: "GBP/USD".to_string(),
+                        product: Default::default(),
+                    },
+                    OrderSystemTarget {
+                        symbol: "btcusdt".to_string(),
+                        label: "BTC/USDT".to_string(),
+                        product: Default::default(),
+                    },
+                ],
+                shards: vec![
+                    OrderSystemShard {
+                        name: "users-0".to_string(),
+                        user_id_min: 0,
+                        user_id_max: 499,
+                    },
+                    OrderSystemShard {
+                        name: "users-1".to_string(),
+                        user_id_min: 500,
+                        user_id_max: 999,
+                    },
+                ],
+                ingress: "orders.match-eu-1.example".to_string(),
+                tls_secret: String::new(),
+                resources: None,
+                paused: false,
+            },
+            status: Default::default(),
+        };
+        catalog.order_systems.insert(system.name.clone(), system);
+        let objects = render_order_system(&catalog, "orders", None).unwrap();
+        let hpas: Vec<&Value> = objects
+            .iter()
+            .filter(|object| object["kind"] == "HorizontalPodAutoscaler")
+            .collect();
+        assert_eq!(2, hpas.len());
+        assert_eq!(1, hpas[0]["spec"]["minReplicas"]);
+        assert_eq!(2, hpas[0]["spec"]["maxReplicas"]);
+        assert_eq!(
+            70,
+            hpas[0]["spec"]["metrics"][0]["resource"]["target"]["averageUtilization"]
+        );
+        let deployments: Vec<&Value> = objects
+            .iter()
+            .filter(|object| object["kind"] == "Deployment")
+            .collect();
+        assert_eq!(2, deployments.len());
+        // The HPA owns the replica count while the system is running.
+        assert!(deployments[0]["spec"].get("replicas").is_none());
+        assert_eq!(
+            0,
+            deployments[0]["spec"]["strategy"]["rollingUpdate"]["maxUnavailable"]
+        );
+        assert_eq!(
+            1,
+            deployments[0]["spec"]["strategy"]["rollingUpdate"]["maxSurge"]
+        );
+        assert_eq!(
+            1,
+            deployments[0]["spec"]["template"]["spec"]["containers"][0]["args"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|arg| *arg == "--user-id-min")
+                .count()
+        );
+
+        catalog.order_systems.get_mut("orders").unwrap().spec.paused = true;
+        let paused = render_order_system(&catalog, "orders", None).unwrap();
+        assert!(
+            paused
+                .iter()
+                .all(|object| object["kind"] != "HorizontalPodAutoscaler")
+        );
+        let deployments: Vec<&Value> = paused
+            .iter()
+            .filter(|object| object["kind"] == "Deployment")
+            .collect();
+        assert_eq!(0, deployments[0]["spec"]["replicas"]);
+    }
+
+    #[test]
+    fn global_market_data_service_uses_per_group_channels() {
+        use crate::model::{
+            MarketDataFeedGroup, MarketDataService, MarketDataServiceSpec, MarketDataTransport,
+            MarketDataWebSocket,
+        };
+        let mut catalog = demo_catalog();
+        let fx_channel = "aeron:udp?endpoint=239.1.2.65:24031|interface={pod_ip}|ttl=1";
+        let btc_channel = "aeron:udp?endpoint=239.1.2.51:24001|interface={pod_ip}|ttl=1";
+        let service = MarketDataService {
+            name: "global-marketdata".to_string(),
+            namespace: "match-eu-1".to_string(),
+            spec: MarketDataServiceSpec {
+                cell: "eu-1".to_string(),
+                symbols: Vec::new(),
+                feed_groups: vec![
+                    MarketDataFeedGroup {
+                        name: "fx-eu-01-eurusd".to_string(),
+                        symbols: vec!["eurusd".to_string()],
+                        stream_base: 2001,
+                        channel: Some(fx_channel.to_string()),
+                    },
+                    MarketDataFeedGroup {
+                        name: "fx-eu-01-gbpusd".to_string(),
+                        symbols: vec!["gbpusd".to_string()],
+                        stream_base: 2011,
+                        channel: Some(fx_channel.to_string()),
+                    },
+                    MarketDataFeedGroup {
+                        name: "me-btcusdt".to_string(),
+                        symbols: vec!["btcusdt".to_string()],
+                        stream_base: 2001,
+                        channel: Some(btc_channel.to_string()),
+                    },
+                ],
+                image: "registry.example.com/matchengine-marketdata@sha256:abc".to_string(),
+                release: Default::default(),
+                replicas: 2,
+                transport: MarketDataTransport::default(),
+                websocket: MarketDataWebSocket {
+                    port: 24804,
+                    ingress: "ws-fx-eu-02.match-eu-1.example".to_string(),
+                    ..Default::default()
+                },
+                autoscaling: Default::default(),
+                resources: None,
+                paused: false,
+            },
+            status: Default::default(),
+        };
+        catalog
+            .market_data_services
+            .insert(service.name.clone(), service);
+        let objects = render_market_data_service(&catalog, "global-marketdata", None).unwrap();
+        let kinds: Vec<&str> = objects
+            .iter()
+            .map(|object| object["kind"].as_str().unwrap())
+            .collect();
+        assert!(kinds.contains(&"Ingress"), "{kinds:?}");
+        let deployment = object(&objects, "Deployment");
+        let container = &deployment["spec"]["template"]["spec"]["containers"][0];
+        let args: Vec<&str> = container["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|arg| arg.as_str().unwrap())
+            .collect();
+        let channels: Vec<&str> = args
+            .iter()
+            .enumerate()
+            .filter(|(_, arg)| **arg == "--aeron-channel")
+            .map(|(index, _)| args[index + 1])
+            .collect();
+        assert_eq!(
+            vec![
+                "aeron:udp?endpoint=239.1.2.65:24031|ttl=1",
+                "aeron:udp?endpoint=239.1.2.65:24031|ttl=1",
+                "aeron:udp?endpoint=239.1.2.51:24001|ttl=1"
+            ],
+            channels
+        );
+        assert!(!args.contains(&"--fast-only"));
+        let config = object(&objects, "ConfigMap");
+        let config: Value =
+            serde_json::from_str(config["data"]["marketdata.json"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            config["feedGroups"][0]["channel"],
+            "aeron:udp?endpoint=239.1.2.65:24031|ttl=1"
+        );
+        assert_eq!(
+            config["feedGroups"][2]["channel"],
+            "aeron:udp?endpoint=239.1.2.51:24001|ttl=1"
+        );
+        assert_eq!(
+            config["feedGroups"][2]["symbols"][0]["channel"],
+            "aeron:udp?endpoint=239.1.2.51:24001|ttl=1"
+        );
+        let policy = object(&objects, "NetworkPolicy");
+        let ports: Vec<u64> = policy["spec"]["egress"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|rule| rule["ports"].as_array())
+            .flatten()
+            .filter_map(|port| port["port"].as_u64())
+            .collect();
+        assert!(
+            ports.contains(&24031) && ports.contains(&24001),
+            "{ports:?}"
+        );
+        let ingress = object(&objects, "Ingress");
+        assert_eq!(
+            ingress["spec"]["rules"][0]["host"],
+            "ws-fx-eu-02.match-eu-1.example"
+        );
+        assert_eq!(
+            ingress["spec"]["rules"][0]["http"]["paths"][0]["backend"]["service"]["name"],
+            "global-marketdata"
+        );
+    }
+
+    #[test]
+    fn fast_only_market_data_service_passes_the_flag() {
+        let mut catalog = demo_catalog();
+        let mut service = demo_market_data(&mut catalog, "fx-fast");
+        service.spec.websocket.fast_only = true;
+        service.spec.websocket.ingress = "fast-ws.example".to_string();
+        catalog
+            .market_data_services
+            .insert(service.name.clone(), service);
+        let objects = render_market_data_service(&catalog, "fx-fast", None).unwrap();
+        let deployment = object(&objects, "Deployment");
+        let args: Vec<&str> = deployment["spec"]["template"]["spec"]["containers"][0]["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|arg| arg.as_str().unwrap())
+            .collect();
+        assert!(args.contains(&"--fast-only"), "{args:?}");
+        let config = object(&objects, "ConfigMap");
+        let config: Value =
+            serde_json::from_str(config["data"]["marketdata.json"].as_str().unwrap()).unwrap();
+        assert_eq!(config["websocket"]["fastOnly"], true);
+        assert_eq!(
+            object(&objects, "Ingress")["spec"]["rules"][0]["host"],
+            "fast-ws.example"
+        );
+    }
+
+    #[test]
+    fn market_data_service_renders_the_fanout_objects() {
+        let mut catalog = demo_catalog();
+        demo_market_data(&mut catalog, "btc-marketdata");
+        let objects = render_market_data_service(&catalog, "btc-marketdata", None).unwrap();
+        let kinds: Vec<&str> = objects
+            .iter()
+            .map(|object| object["kind"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                "ConfigMap",
+                "Deployment",
+                "Service",
+                "PodDisruptionBudget",
+                "NetworkPolicy",
+                "HorizontalPodAutoscaler"
+            ]
+        );
+        let deployment = object(&objects, "Deployment");
+        assert_eq!(deployment["metadata"]["name"], "btc-marketdata");
+        // The HPA owns the replica count while the service is running.
+        assert!(deployment["spec"].get("replicas").is_none());
+        assert_eq!(
+            deployment["spec"]["strategy"]["rollingUpdate"]["maxUnavailable"],
+            0
+        );
+        assert_eq!(
+            deployment["spec"]["strategy"]["rollingUpdate"]["maxSurge"],
+            1
+        );
+        let container = &deployment["spec"]["template"]["spec"]["containers"][0];
+        let args: Vec<&str> = container["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|arg| arg.as_str().unwrap())
+            .collect();
+        assert!(args.contains(&"--symbol"), "{args:?}");
+        assert!(args.contains(&"btcusdt:3:BTC:USDT"), "{args:?}");
+        assert!(args.contains(&"--aeron-stream-base"), "{args:?}");
+        assert!(args.contains(&"2001"), "{args:?}");
+        assert!(args.contains(&"--aeron-embedded-driver"), "{args:?}");
+        assert!(args.contains(&"--aeron-dir"), "{args:?}");
+        assert!(args.contains(&"--fast-max-streams"), "{args:?}");
+        assert!(args.contains(&"--terminal-conflation-ms"), "{args:?}");
+        assert_eq!(container["ports"][0]["containerPort"], 24800);
+        assert_eq!(
+            container["lifecycle"]["preStop"]["exec"]["command"][2],
+            "sleep 10"
+        );
+        assert_eq!(container["resources"]["requests"]["cpu"], "100m");
+        let service = object(&objects, "Service");
+        assert_eq!(service["spec"]["ports"][0]["port"], 24800);
+        let pdb = object(&objects, "PodDisruptionBudget");
+        assert_eq!(pdb["spec"]["minAvailable"], 0);
+        let hpa = object(&objects, "HorizontalPodAutoscaler");
+        assert_eq!(hpa["spec"]["minReplicas"], 1);
+        assert_eq!(hpa["spec"]["maxReplicas"], 2);
+        assert_eq!(
+            hpa["spec"]["metrics"][0]["resource"]["target"]["averageUtilization"],
+            70
+        );
+        let policy = object(&objects, "NetworkPolicy");
+        assert_eq!(
+            policy["spec"]["egress"][1]["ports"][0]["port"], 24001,
+            "the multicast egress port comes from the channel"
+        );
+        assert!(
+            policy["spec"]["ingress"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|rule| rule["ports"].as_array().is_some_and(|ports| ports
+                    .iter()
+                    .any(|port| port["protocol"] == "UDP" && port["port"] == 24001))),
+            "engine multicast ingress is allowed: {policy:?}"
+        );
+        let config = object(&objects, "ConfigMap");
+        let data: Value =
+            serde_json::from_str(config["data"]["marketdata.json"].as_str().unwrap()).unwrap();
+        assert_eq!(data["feedGroups"][0]["symbols"][0]["symbolId"], 3);
+        assert_eq!(
+            deployment["spec"]["template"]["metadata"]["annotations"]["matching.io/config-hash"],
+            deployment["metadata"]["annotations"]["matching.io/config-hash"]
+        );
+    }
+
+    #[test]
+    fn engine_container_publishes_to_a_market_data_service() {
+        let mut catalog = demo_catalog();
+        demo_market_data(&mut catalog, "btc-marketdata");
+        let objects = render_shard(
+            &catalog,
+            "me-btcusdt",
+            &RenderOptions {
+                namespace: Some("match-eu-1".to_string()),
+                ..RenderOptions::default()
+            },
+        )
+        .unwrap();
+        let stateful_set = object(&objects, "StatefulSet");
+        let pod = &stateful_set["spec"]["template"]["spec"];
+        let container = &pod["containers"][0];
+        let args: Vec<&str> = container["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|arg| arg.as_str().unwrap())
+            .collect();
+        assert!(args.contains(&"--market-data-aeron-channel"), "{args:?}");
+        assert!(
+            args.contains(&"aeron:udp?endpoint=239.1.2.51:24001|interface=$(POD_IP)|ttl=1"),
+            "{args:?}"
+        );
+        assert!(
+            args.contains(&"--market-data-aeron-embedded-driver"),
+            "{args:?}"
+        );
+        assert!(
+            args.contains(&"--market-data-aeron-stream-base"),
+            "{args:?}"
+        );
+        assert!(args.contains(&"2001"), "{args:?}");
+        assert!(args.contains(&"--market-data-aeron-dir"), "{args:?}");
+        assert!(args.contains(&"/dev/shm/aeron-btcusdt"), "{args:?}");
+        assert!(
+            pod["volumes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|volume| volume["name"] == "aeron"),
+            "{pod:?}"
+        );
+        assert!(
+            container["volumeMounts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|mount| mount["name"] == "aeron" && mount["mountPath"] == "/dev/shm"),
+            "{container:?}"
+        );
+        let policy = object(&objects, "NetworkPolicy");
+        assert!(
+            policy["spec"]["egress"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|rule| rule["ports"].as_array().is_some_and(|ports| ports
+                    .iter()
+                    .any(|port| { port["protocol"] == "UDP" && port["port"] == 24001 }))),
+            "{policy:?}"
+        );
+        assert!(
+            policy["spec"]["ingress"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(
+                    |rule| rule["from"]
+                        .as_array()
+                        .is_some_and(|from| from.iter().any(
+                            |peer| peer["podSelector"]["matchLabels"]["app.kubernetes.io/name"]
+                                == "match-marketdata"
+                        ))
+                        && rule["ports"].as_array().is_some_and(|ports| ports
+                            .iter()
+                            .any(|port| { port["protocol"] == "UDP" && port["port"] == 24001 }))
+                ),
+            "{policy:?}"
+        );
+    }
+
+    #[test]
+    fn supervisor_children_receive_market_data_config() {
+        use crate::model::{
+            MarketDataFeedGroup, MarketDataService, MarketDataServiceSpec, MarketDataTransport,
+            MarketDataWebSocket,
+        };
+        let mut catalog = demo_catalog();
+        let shard = catalog.shards.get_mut("fx-eu-01").expect("fx-eu-01");
+        shard.spec.packing.mode = PackingMode::Supervisor;
+        shard.spec.packing.max_processes_per_pod = 4;
+        let service = MarketDataService {
+            name: "fx-eu-01-marketdata".to_string(),
+            namespace: "match-eu-1".to_string(),
+            spec: MarketDataServiceSpec {
+                cell: "eu-1".to_string(),
+                symbols: Vec::new(),
+                feed_groups: vec![
+                    MarketDataFeedGroup {
+                        name: "eurusd".to_string(),
+                        symbols: vec!["eurusd".to_string()],
+                        stream_base: 2001,
+                        channel: None,
+                    },
+                    MarketDataFeedGroup {
+                        name: "gbpusd".to_string(),
+                        symbols: vec!["gbpusd".to_string()],
+                        stream_base: 2011,
+                        channel: None,
+                    },
+                ],
+                image: "registry.example.com/matchengine-marketdata@sha256:abc".to_string(),
+                release: Default::default(),
+                replicas: 2,
+                transport: MarketDataTransport {
+                    channel: Some(
+                        "aeron:udp?endpoint=239.1.2.65:24031|interface={pod_ip}|ttl=1".to_string(),
+                    ),
+                    ..Default::default()
+                },
+                websocket: MarketDataWebSocket::default(),
+                autoscaling: Default::default(),
+                resources: None,
+                paused: false,
+            },
+            status: Default::default(),
+        };
+        catalog
+            .market_data_services
+            .insert(service.name.clone(), service);
+        let objects = render_shard(&catalog, "fx-eu-01", &RenderOptions::default()).unwrap();
+        let config = object(&objects, "ConfigMap");
+        let processes: Value =
+            serde_json::from_str(config["data"]["processes.json"].as_str().unwrap()).unwrap();
+        let rows = processes["processes"].as_array().unwrap();
+        let eurusd = rows.iter().find(|row| row["name"] == "eurusd").unwrap();
+        assert_eq!(eurusd["marketData"]["streamBase"], 2001);
+        assert_eq!(
+            eurusd["marketData"]["channel"],
+            "aeron:udp?endpoint=239.1.2.65:24031|interface={pod_ip}|ttl=1"
+        );
+        assert_eq!(eurusd["marketData"]["dir"], "/dev/shm/aeron-eurusd");
+        let gbpusd = rows.iter().find(|row| row["name"] == "gbpusd").unwrap();
+        assert_eq!(gbpusd["marketData"]["streamBase"], 2011);
+
+        let stateful_set = object(&objects, "StatefulSet");
+        let pod = &stateful_set["spec"]["template"]["spec"];
+        assert!(
+            pod["volumes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|volume| volume["name"] == "aeron"),
+            "{pod:?}"
+        );
+        let container = &pod["containers"][0];
+        assert!(
+            container["volumeMounts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|mount| mount["name"] == "aeron" && mount["mountPath"] == "/dev/shm"),
+            "{container:?}"
+        );
+        assert!(
+            container["env"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|env| env["name"] == "POD_IP"),
+            "{container:?}"
+        );
+    }
+
+    #[test]
+    fn paused_market_data_scales_to_zero() {
+        let mut catalog = demo_catalog();
+        let service = demo_market_data(&mut catalog, "btc-marketdata");
+        catalog
+            .market_data_services
+            .get_mut("btc-marketdata")
+            .unwrap()
+            .spec
+            .paused = true;
+        assert!(!service.spec.paused);
+        let objects = render_market_data_service(&catalog, "btc-marketdata", None).unwrap();
+        let deployment = object(&objects, "Deployment");
+        assert_eq!(deployment["spec"]["replicas"], 0);
+    }
+
+    #[test]
+    fn market_data_refuses_an_even_multicast_address() {
+        let mut catalog = demo_catalog();
+        demo_market_data(&mut catalog, "btc-marketdata");
+        catalog
+            .market_data_services
+            .get_mut("btc-marketdata")
+            .unwrap()
+            .spec
+            .transport
+            .channel = Some("aeron:udp?endpoint=239.1.2.50:24001|interface={pod_ip}|ttl=1".into());
+        let error = render_market_data_service(&catalog, "btc-marketdata", None).unwrap_err();
+        assert_eq!(error.status, axum::http::StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            error
+                .issues
+                .iter()
+                .any(|issue| issue.code == "market_data_channel_even")
+        );
+    }
+
+    #[test]
+    fn market_data_refuses_a_wire_version_mismatch() {
+        let mut catalog = demo_catalog();
+        let mut service = demo_market_data(&mut catalog, "btc-marketdata");
+        service.spec.release.wire_version = 6;
+        catalog
+            .market_data_services
+            .insert(service.name.clone(), service);
+        let error = render_market_data_service(&catalog, "btc-marketdata", None).unwrap_err();
+        assert!(
+            error
+                .issues
+                .iter()
+                .any(|issue| issue.code == "market_data_release")
+        );
     }
 }

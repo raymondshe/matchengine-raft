@@ -24,6 +24,7 @@ use matchengine_raft::order_book::Fixed;
 use matchengine_raft::order_book::OrderSide;
 
 use crate::config::Config;
+use crate::config::FeedProfile;
 use crate::config::SymbolSpec;
 use crate::feed::Registry;
 use crate::feed::SharedState;
@@ -48,15 +49,68 @@ pub struct SessionCtx {
     pub stats: Arc<Stats>,
     pub stop: watch::Receiver<bool>,
     pub combined: bool,
+    pub profile: FeedProfile,
+    /// Fast connections are pinned to the symbol in the request path.
+    pub restrict_symbol: Option<String>,
+    /// Terminal-only budget for conflatable display frames.
+    pub frame_budget: Option<Arc<FrameBudget>>,
     pub initial: Vec<String>,
 }
 
-/// Decrements the connection counter when the session ends.
-pub struct ConnectionGuard(pub Arc<Stats>);
+/// Fixed-window per-connection budget for terminal display frames.
+pub struct FrameBudget {
+    limit: u64,
+    window: Mutex<(Instant, u64)>,
+}
+
+impl FrameBudget {
+    pub fn new(limit: u64) -> Self {
+        Self {
+            limit,
+            window: Mutex::new((Instant::now(), 0)),
+        }
+    }
+
+    /// Returns false when this second's budget is exhausted.
+    pub fn allow(&self) -> bool {
+        if self.limit == 0 {
+            return true;
+        }
+        let mut window = self.window.lock().expect("frame budget lock");
+        let now = Instant::now();
+        if now.duration_since(window.0) >= Duration::from_secs(1) {
+            *window = (now, 0);
+        }
+        window.1 = window.1.saturating_add(1);
+        window.1 <= self.limit
+    }
+}
+
+/// Decrements the connection counters when the session ends.
+pub struct ConnectionGuard {
+    stats: Arc<Stats>,
+    profile: FeedProfile,
+}
+
+impl ConnectionGuard {
+    pub fn new(stats: Arc<Stats>, profile: FeedProfile) -> Self {
+        Self { stats, profile }
+    }
+}
 
 impl Drop for ConnectionGuard {
     fn drop(&mut self) {
-        self.0.connections.fetch_sub(1, Ordering::Relaxed);
+        self.stats.connections.fetch_sub(1, Ordering::Relaxed);
+        match self.profile {
+            FeedProfile::Fast => {
+                self.stats.fast_connections.fetch_sub(1, Ordering::Relaxed);
+            }
+            FeedProfile::Terminal => {
+                self.stats
+                    .terminal_connections
+                    .fetch_sub(1, Ordering::Relaxed);
+            }
+        }
     }
 }
 
@@ -69,7 +123,7 @@ pub async fn run(
 ) {
     let (out_tx, mut out_rx) = mpsc::channel::<Outbound>(ctx.config.queue.max(1));
     let mut subscriptions: HashMap<String, JoinHandle<()>> = HashMap::new();
-    let mut limiter = RateLimiter::new(10);
+    let mut limiter = RateLimiter::new(5);
     let mut close: Option<CloseReason> = None;
     let mut last_pong = Instant::now();
     let mut stop = ctx.stop.clone();
@@ -179,7 +233,29 @@ fn handle_control(
     };
     match control {
         ControlMessage::Subscribe { params, id } => {
-            if subscriptions.len().saturating_add(params.len()) > ctx.config.max_streams {
+            // Validate and deduplicate first so a mixed-symbol request is
+            // all-or-nothing and duplicate names do not consume the 1024-stream
+            // budget twice.
+            let specs: Vec<protocol::StreamSpec> = match params
+                .iter()
+                .map(|name| protocol::parse_stream(ctx.config.as_ref(), name))
+                .collect()
+            {
+                Ok(specs) => specs,
+                Err(error) => {
+                    send_control(out_tx, protocol::control_error(&error, Some(&id)));
+                    return;
+                }
+            };
+            let mut new_keys = std::collections::BTreeSet::new();
+            for spec in &specs {
+                if !subscriptions.contains_key(&spec.key) {
+                    new_keys.insert(spec.key.clone());
+                }
+            }
+            if subscriptions.len().saturating_add(new_keys.len())
+                > ctx.profile.max_streams(&ctx.config)
+            {
                 send_control(
                     out_tx,
                     protocol::control_error(
@@ -187,18 +263,18 @@ fn handle_control(
                             code: 2,
                             message: "subscription limit exceeded".to_string(),
                         },
-                        Some(id),
+                        Some(&id),
                     ),
                 );
                 return;
             }
             for name in &params {
                 if let Err(error) = subscribe(ctx, name, out_tx, subscriptions) {
-                    send_control(out_tx, protocol::control_error(&error, Some(id)));
+                    send_control(out_tx, protocol::control_error(&error, Some(&id)));
                     return;
                 }
             }
-            send_control(out_tx, protocol::control_result(id));
+            send_control(out_tx, protocol::control_result(&id));
         }
         ControlMessage::Unsubscribe { params, id } => {
             for name in &params {
@@ -211,12 +287,12 @@ fn handle_control(
                     task.abort();
                 }
             }
-            send_control(out_tx, protocol::control_result(id));
+            send_control(out_tx, protocol::control_result(&id));
         }
         ControlMessage::List { id } => {
             let mut keys: Vec<String> = subscriptions.keys().cloned().collect();
             keys.sort();
-            send_control(out_tx, protocol::control_list(id, &keys));
+            send_control(out_tx, protocol::control_list(&id, &keys));
         }
     }
 }
@@ -228,6 +304,15 @@ fn subscribe(
     subscriptions: &mut HashMap<String, JoinHandle<()>>,
 ) -> Result<(), ProtocolError> {
     let spec = protocol::parse_stream(&ctx.config, name)?;
+    if let Some(restrict) = &ctx.restrict_symbol
+        && &spec.symbol != restrict
+    {
+        return Err(ProtocolError {
+            code: 2,
+            message: "fast feed is single-symbol; use /stream for multi-symbol subscriptions"
+                .to_string(),
+        });
+    }
     let runtime = ctx
         .symbols
         .get(&spec.symbol.to_lowercase())
@@ -238,7 +323,7 @@ fn subscribe(
     if subscriptions.contains_key(&spec.key) {
         return Ok(());
     }
-    if subscriptions.len() >= ctx.config.max_streams {
+    if subscriptions.len() >= ctx.profile.max_streams(&ctx.config) {
         return Err(ProtocolError {
             code: 2,
             message: "subscription limit exceeded".to_string(),
@@ -298,8 +383,15 @@ fn subscribe(
     let latest = spec.is_latest_value();
     let combined = ctx.combined;
     let stats = ctx.stats.clone();
+    // Terminal display conflates latest-value streams; the fast profile stays exact.
+    let conflation = ctx
+        .profile
+        .is_terminal()
+        .then(|| Duration::from_millis(ctx.config.terminal_conflation_ms))
+        .filter(|interval| !interval.is_zero());
+    let budget = ctx.frame_budget.clone();
     let task = tokio::spawn(async move {
-        forward(guard, out, latest, combined, stats).await;
+        forward(guard, out, latest, combined, stats, conflation, budget).await;
     });
     subscriptions.insert(spec.key, task);
     Ok(())
@@ -330,8 +422,11 @@ async fn forward(
     latest_value: bool,
     combined: bool,
     stats: Arc<Stats>,
+    conflation: Option<Duration>,
+    budget: Option<Arc<FrameBudget>>,
 ) {
     let key = sub.key.clone();
+    let mut last_sent: Option<Instant> = None;
     let receiver = sub.receiver.as_mut().expect("receiver present");
     loop {
         match receiver.recv().await {
@@ -340,6 +435,21 @@ async fn forward(
                     while let Ok(newer) = receiver.try_recv() {
                         payload = newer;
                     }
+                }
+                if latest_value && let Some(interval) = conflation {
+                    let now = Instant::now();
+                    if last_sent.is_some_and(|last| now.duration_since(last) < interval) {
+                        stats.terminal_conflated.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                    last_sent = Some(now);
+                }
+                if latest_value
+                    && let Some(budget) = &budget
+                    && !budget.allow()
+                {
+                    stats.terminal_throttled.fetch_add(1, Ordering::Relaxed);
+                    continue;
                 }
                 if out
                     .try_send(Outbound::Frame(frame_bytes(combined, &key, payload)))

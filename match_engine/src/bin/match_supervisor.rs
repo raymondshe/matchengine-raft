@@ -108,6 +108,31 @@ struct Opt {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct MarketDataSpec {
+    /// Aeron channel, with an optional `{pod_ip}` placeholder the supervisor
+    /// expands from the `POD_IP` environment variable.
+    channel: String,
+    stream_base: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    dir: Option<String>,
+    #[serde(default)]
+    embedded: bool,
+    #[serde(default = "default_market_data_heartbeat_ms")]
+    heartbeat_ms: u64,
+    #[serde(default = "default_market_data_status_every")]
+    status_every: u64,
+}
+
+fn default_market_data_heartbeat_ms() -> u64 {
+    1_000
+}
+
+fn default_market_data_status_every() -> u64 {
+    10
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ProcessSpec {
     name: String,
     slot: u16,
@@ -115,6 +140,8 @@ struct ProcessSpec {
     raft_port: u16,
     #[serde(default)]
     raft_id_offset: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    market_data: Option<MarketDataSpec>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -657,9 +684,27 @@ async fn spawn_child(opt: &Opt, spec: &ProcessSpec) -> io::Result<SpawnedChild> 
         .arg("--max-inflight-writes")
         .arg(opt.max_inflight_writes.to_string())
         .arg("--max-events")
-        .arg(opt.max_events.to_string())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
+        .arg(opt.max_events.to_string());
+    if let Some(market_data) = &spec.market_data {
+        let pod_ip = std::env::var("POD_IP").unwrap_or_default();
+        let channel = market_data.channel.replace("{pod_ip}", &pod_ip);
+        command
+            .arg("--market-data-aeron-channel")
+            .arg(channel)
+            .arg("--market-data-aeron-stream-base")
+            .arg(market_data.stream_base.to_string())
+            .arg("--market-data-aeron-heartbeat-ms")
+            .arg(market_data.heartbeat_ms.to_string())
+            .arg("--market-data-status-every")
+            .arg(market_data.status_every.to_string());
+        if market_data.embedded {
+            command.arg("--market-data-aeron-embedded-driver");
+        }
+        if let Some(dir) = &market_data.dir {
+            command.arg("--market-data-aeron-dir").arg(dir);
+        }
+    }
+    command.stdout(Stdio::inherit()).stderr(Stdio::inherit());
     if let Ok(log) = std::env::var("RUST_LOG") {
         command.env("RUST_LOG", log);
     }
@@ -1079,6 +1124,35 @@ mod tests {
         assert_eq!(processes[0].raft_id_offset, 0);
         assert_eq!(processes[1].name, "gbpusd");
         assert_eq!(processes[1].raft_id_offset, 4);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn parses_market_data_child_config() {
+        let dir = temp_dir();
+        let path = dir.join("processes.json");
+        std::fs::write(
+            &path,
+            r#"{"processes":[{
+                "name":"eurgbp","slot":0,"httpPort":21101,"raftPort":22101,
+                "marketData":{
+                    "channel":"aeron:udp?endpoint=239.1.2.65:24031|interface={pod_ip}|ttl=1",
+                    "streamBase":2001,
+                    "dir":"/dev/shm/aeron-eurgbp",
+                    "embedded":true,
+                    "heartbeatMs":500,
+                    "statusEvery":5
+                }
+            }]}"#,
+        )
+        .unwrap();
+        let processes = read_config(&path).unwrap();
+        let market_data = processes[0].market_data.as_ref().expect("marketData");
+        assert_eq!(market_data.stream_base, 2001);
+        assert_eq!(market_data.dir.as_deref(), Some("/dev/shm/aeron-eurgbp"));
+        assert!(market_data.embedded);
+        assert_eq!(market_data.heartbeat_ms, 500);
+        assert_eq!(market_data.status_every, 5);
         let _ = std::fs::remove_dir_all(dir);
     }
 

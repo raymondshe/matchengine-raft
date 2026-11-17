@@ -44,13 +44,44 @@ pub const DEFAULT_EVENTS_LIMIT: usize = 500;
 pub const SCHEMA_VERSION: u8 = 2;
 const PERPETUAL_POLICY_HINT: &str =
     "linear perpetual requires fee_asset_policy=quote; configure the symbol before trading";
-const PERPETUAL_BACKEND_HINT: &str =
-    "perpetual backend is not configured; start the demo with --perp-engine <addr>";
+
+/// One configured order-system target. A target points at one engine
+/// cluster/process that serves exactly one trading symbol.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TargetSpec {
+    /// Stable stream/selection id, e.g. `gbpusd`.
+    pub id: String,
+    /// Display label, e.g. `GBP/USD`.
+    #[serde(default)]
+    pub label: String,
+    /// HTTP address of a running engine node.
+    pub engine: String,
+    /// Raft node id of the engine at `engine`.
+    #[serde(default = "default_engine_id")]
+    pub engine_id: u64,
+    /// Spot cash or the demo-only perpetual margin overlay.
+    #[serde(default)]
+    pub product: Product,
+}
+
+fn default_engine_id() -> u64 {
+    1
+}
+
+/// JSON file accepted by `--targets`: one entry per engine/symbol target.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TargetsFile {
+    pub targets: Vec<TargetSpec>,
+}
 
 /// One demo backend: a connection to a running engine node and the product
-/// whose own orderbook that engine serves. Spot and Perpetual are separate
-/// processes/clusters, so an order sequence is only unique within a backend.
+/// whose own orderbook that engine serves. Different targets/symbols are
+/// separate processes/clusters, so an order sequence is only unique within a
+/// target.
 pub struct EngineBackend {
+    pub id: String,
+    pub label: String,
     pub product: Product,
     pub engine_id: u64,
     pub http_addr: String,
@@ -61,12 +92,35 @@ pub struct EngineBackend {
 }
 
 impl EngineBackend {
-    fn new(product: Product, engine_id: u64, http_addr: String) -> Self {
-        let client = MatchEngineClient::new(engine_id, http_addr.clone());
+    fn new(target: TargetSpec) -> Self {
+        // `MatchEngineClient` adds the scheme itself; accept either form in
+        // target config and normalize to `host:port`.
+        let engine = target
+            .engine
+            .trim()
+            .trim_end_matches('/')
+            .strip_prefix("http://")
+            .or_else(|| {
+                target
+                    .engine
+                    .trim()
+                    .trim_end_matches('/')
+                    .strip_prefix("https://")
+            })
+            .unwrap_or_else(|| target.engine.trim().trim_end_matches('/'))
+            .to_string();
+        let client = MatchEngineClient::new(target.engine_id, engine.clone());
+        let label = if target.label.trim().is_empty() {
+            target.id.clone()
+        } else {
+            target.label
+        };
         Self {
-            product,
-            engine_id,
-            http_addr,
+            id: target.id,
+            label,
+            product: target.product,
+            engine_id: target.engine_id,
+            http_addr: target.engine,
             client,
             leverages: Mutex::new(HashMap::new()),
         }
@@ -74,6 +128,8 @@ impl EngineBackend {
 
     pub fn info(&self) -> BackendInfo {
         BackendInfo {
+            id: self.id.clone(),
+            label: self.label.clone(),
             product: self.product,
             engine_id: self.engine_id,
             http_addr: self.http_addr.clone(),
@@ -272,6 +328,7 @@ impl EngineBackend {
 
         Ok(FullBookResponse {
             schema_version: SCHEMA_VERSION,
+            target: self.id.clone(),
             product: self.product,
             market_seq: sequence,
             counts: BookCounts {
@@ -310,6 +367,7 @@ impl EngineBackend {
             .map_err(|error| ApiError::unavailable(error.to_string()))?;
         Ok(EventsPage {
             schema_version: SCHEMA_VERSION,
+            target: self.id.clone(),
             product: self.product,
             events: page.events,
             next_after: page.next_after,
@@ -368,14 +426,36 @@ impl EngineBackend {
         });
         Ok(FreezePreview {
             schema_version: SCHEMA_VERSION,
+            target: self.id.clone(),
             product,
             economics,
             reason,
         })
     }
 
+    async fn ensure_order_owner(&self, sequence: u64, user_id: u64) -> Result<(), ApiError> {
+        let orders: Vec<Order> = self.read_json("orderbook_orders").await?;
+        let stops: Vec<Order> = self.read_json("orderbook_stops").await?;
+        if let Some(order) = orders
+            .iter()
+            .chain(stops.iter())
+            .find(|order| order.sequence == sequence)
+            && order.owner_id != Some(user_id)
+        {
+            return Err(ApiError::conflict(
+                "not_order_owner",
+                format!(
+                    "order {sequence} belongs to user {}",
+                    order.owner_id.unwrap_or(0)
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     pub async fn cancel(&self, request: CancelTicket) -> Result<OrderResult, ApiError> {
         let sequence = request.sequence;
+        self.ensure_order_owner(sequence, request.user_id).await?;
         let mut order = Order::new(request.side, request.price, Fixed::ZERO, sequence);
         order.symbol_id = self.symbol_id().await?;
         let result = self.write(MatchEngineRequest::Cancel { order }).await?;
@@ -387,6 +467,8 @@ impl EngineBackend {
 
     pub async fn amend(&self, request: AmendTicket) -> Result<OrderResult, ApiError> {
         let old_sequence = request.sequence;
+        self.ensure_order_owner(old_sequence, request.user_id)
+            .await?;
         let leverage = self.take_leverage(old_sequence);
         let mut order = Order::new(request.side, request.price, Fixed::ZERO, old_sequence);
         order.symbol_id = self.symbol_id().await?;
@@ -422,7 +504,7 @@ impl EngineBackend {
 
     async fn write(&self, request: MatchEngineRequest) -> Result<OrderResult, ApiError> {
         match self.client.write(&request).await {
-            Ok(Ok(response)) => Ok(order_result(response, self.product)),
+            Ok(Ok(response)) => Ok(order_result(response, &self.id, self.product)),
             Ok(Err(error)) => Err(write_error(error)),
             Err(error) => Err(client_error(error)),
         }
@@ -466,45 +548,93 @@ impl EngineBackend {
     }
 }
 
-/// The demo server's two independent engine backends. Spot is required;
-/// Perpetual is optional so a single-engine spot-only demo still works.
+/// The demo server's engine targets. Each target is one symbol on one engine
+/// cluster; every user shard can select every target.
 pub struct DemoApp {
-    spot: EngineBackend,
-    perpetual: Option<EngineBackend>,
+    targets: Vec<EngineBackend>,
+    user_id_min: u64,
+    user_id_max: u64,
 }
 
 impl DemoApp {
-    pub fn new(engine_id: u64, engine_addr: String, perpetual: Option<(u64, String)>) -> Self {
+    pub fn new(targets: Vec<TargetSpec>) -> Self {
+        assert!(
+            !targets.is_empty(),
+            "at least one engine target is required"
+        );
         Self {
-            spot: EngineBackend::new(Product::Spot, engine_id, engine_addr),
-            perpetual: perpetual
-                .map(|(engine_id, addr)| EngineBackend::new(Product::Perpetual, engine_id, addr)),
+            targets: targets.into_iter().map(EngineBackend::new).collect(),
+            user_id_min: 0,
+            user_id_max: u64::MAX,
         }
+    }
+
+    /// Restrict this order-system instance to one user-ID range.
+    pub fn with_user_range(mut self, user_id_min: u64, user_id_max: u64) -> Self {
+        self.user_id_min = user_id_min;
+        self.user_id_max = user_id_max;
+        self
+    }
+
+    fn require_user(&self, user_id: u64) -> Result<(), ApiError> {
+        if !(self.user_id_min..=self.user_id_max).contains(&user_id) {
+            return Err(ApiError::conflict(
+                "user_shard",
+                format!(
+                    "user {user_id} belongs to another order-system shard (this shard covers {}..={})",
+                    self.user_id_min, self.user_id_max
+                ),
+            ));
+        }
+        Ok(())
     }
 
     pub fn backends(&self) -> BackendsState {
+        let targets: Vec<BackendInfo> = self.targets.iter().map(EngineBackend::info).collect();
         BackendsState {
-            spot: self.spot.info(),
-            perpetual: self.perpetual.as_ref().map(EngineBackend::info),
+            spot: targets
+                .iter()
+                .find(|target| target.product == Product::Spot)
+                .cloned(),
+            perpetual: targets
+                .iter()
+                .find(|target| target.product == Product::Perpetual)
+                .cloned(),
+            targets,
+            user_id_min: self.user_id_min,
+            user_id_max: self.user_id_max,
         }
     }
 
-    fn backend(&self, product: Product) -> Result<&EngineBackend, ApiError> {
-        match product {
-            Product::Spot => Ok(&self.spot),
-            Product::Perpetual => self
-                .perpetual
-                .as_ref()
-                .ok_or_else(|| ApiError::not_configured(PERPETUAL_BACKEND_HINT)),
+    fn backend(&self, target: &str) -> Result<&EngineBackend, ApiError> {
+        if target.is_empty() {
+            return self
+                .targets
+                .first()
+                .ok_or_else(|| ApiError::not_configured("no order-system target is configured"));
         }
+        self.targets
+            .iter()
+            .find(|backend| backend.id == target)
+            .ok_or_else(|| {
+                ApiError::bad_request(format!(
+                    "unknown order-system target {target}; configured targets: {}",
+                    self.targets
+                        .iter()
+                        .map(|backend| backend.id.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ))
+            })
     }
 
-    pub async fn state(&self, product: Product, depth: usize) -> Result<StateResponse, ApiError> {
-        let backend = self.backend(product)?;
+    pub async fn state(&self, target: &str, depth: usize) -> Result<StateResponse, ApiError> {
+        let backend = self.backend(target)?;
         let state = backend.state(depth).await?;
         Ok(StateResponse {
             schema_version: SCHEMA_VERSION,
-            product,
+            target: backend.id.clone(),
+            product: backend.product,
             backend: backend.info(),
             backends: self.backends(),
             node: state.node,
@@ -518,41 +648,45 @@ impl DemoApp {
         })
     }
 
-    pub async fn book(&self, product: Product, limit: usize) -> Result<FullBookResponse, ApiError> {
-        self.backend(product)?.book(limit).await
+    pub async fn book(&self, target: &str, limit: usize) -> Result<FullBookResponse, ApiError> {
+        self.backend(target)?.book(limit).await
     }
 
     pub async fn events(
         &self,
-        product: Product,
+        target: &str,
         after: Option<EventId>,
         limit: usize,
     ) -> Result<EventsPage, ApiError> {
-        self.backend(product)?.events(after, limit).await
+        self.backend(target)?.events(after, limit).await
     }
 
     pub async fn place(&self, ticket: PlaceTicket) -> Result<OrderResult, ApiError> {
-        self.backend(ticket.product)?.place(ticket).await
+        self.require_user(ticket.user_id)?;
+        self.backend(&ticket.target)?.place(ticket).await
     }
 
     pub async fn preview_freeze(&self, ticket: PlaceTicket) -> Result<FreezePreview, ApiError> {
-        self.backend(ticket.product)?.preview_freeze(ticket).await
+        self.require_user(ticket.user_id)?;
+        self.backend(&ticket.target)?.preview_freeze(ticket).await
     }
 
     pub async fn cancel(&self, request: CancelTicket) -> Result<OrderResult, ApiError> {
-        self.backend(request.product)?.cancel(request).await
+        self.require_user(request.user_id)?;
+        self.backend(&request.target)?.cancel(request).await
     }
 
     pub async fn amend(&self, request: AmendTicket) -> Result<OrderResult, ApiError> {
-        self.backend(request.product)?.amend(request).await
+        self.require_user(request.user_id)?;
+        self.backend(&request.target)?.amend(request).await
     }
 
     pub async fn configure_symbol(
         &self,
-        product: Product,
+        target: &str,
         config: SymbolConfig,
     ) -> Result<OrderResult, ApiError> {
-        self.backend(product)?.configure_symbol(config).await
+        self.backend(target)?.configure_symbol(config).await
     }
 }
 
@@ -628,9 +762,10 @@ fn depth_from_orders(orders: &[Order], side: OrderSide, levels: usize) -> Vec<De
     depth
 }
 
-fn order_result(response: ClientWriteResponse<C>, product: Product) -> OrderResult {
+fn order_result(response: ClientWriteResponse<C>, target: &str, product: Product) -> OrderResult {
     OrderResult {
         schema_version: SCHEMA_VERSION,
+        target: target.to_string(),
         product,
         sequence: response.data.sequence,
         log_index: response.log_id.index,
@@ -769,6 +904,7 @@ struct EngineState {
 #[derive(Serialize)]
 pub struct StateResponse {
     pub schema_version: u8,
+    pub target: String,
     pub product: Product,
     pub backend: BackendInfo,
     pub backends: BackendsState,
@@ -785,6 +921,8 @@ pub struct StateResponse {
 /// One configured engine backend and the product whose orderbook it serves.
 #[derive(Serialize, Clone)]
 pub struct BackendInfo {
+    pub id: String,
+    pub label: String,
     pub product: Product,
     pub engine_id: u64,
     pub http_addr: String,
@@ -794,8 +932,11 @@ pub struct BackendInfo {
 /// `--perp-engine`, in which case the UI disables the Perpetual product.
 #[derive(Serialize)]
 pub struct BackendsState {
-    pub spot: BackendInfo,
+    pub spot: Option<BackendInfo>,
     pub perpetual: Option<BackendInfo>,
+    pub targets: Vec<BackendInfo>,
+    pub user_id_min: u64,
+    pub user_id_max: u64,
 }
 
 #[derive(Serialize)]
@@ -876,6 +1017,7 @@ pub struct MarketDataState {
 #[derive(Serialize)]
 pub struct FullBookResponse {
     pub schema_version: u8,
+    pub target: String,
     pub product: Product,
     pub market_seq: u64,
     pub counts: BookCounts,
@@ -897,6 +1039,7 @@ pub struct BookCounts {
 #[derive(Serialize)]
 pub struct EventsPage {
     pub schema_version: u8,
+    pub target: String,
     pub product: Product,
     pub events: Vec<MatchEvent>,
     pub next_after: Option<EventId>,
@@ -908,6 +1051,7 @@ pub struct EventsPage {
 #[derive(Serialize)]
 pub struct OrderResult {
     pub schema_version: u8,
+    pub target: String,
     pub product: Product,
     pub sequence: Option<u64>,
     pub log_index: u64,
@@ -920,6 +1064,7 @@ pub struct OrderResult {
 #[derive(Serialize)]
 pub struct FreezePreview {
     pub schema_version: u8,
+    pub target: String,
     pub product: Product,
     pub economics: Option<OrderEconomics>,
     pub reason: Option<String>,
@@ -928,8 +1073,9 @@ pub struct FreezePreview {
 #[derive(Deserialize)]
 pub struct PlaceTicket {
     pub side: OrderSide,
+    pub user_id: u64,
     #[serde(default)]
-    pub product: Product,
+    pub target: String,
     #[serde(default)]
     pub leverage: Option<u32>,
     #[serde(rename = "type")]
@@ -964,6 +1110,7 @@ impl PlaceTicket {
         let taker_fee_rate = validate_fee_rate(self.taker_fee_rate, "taker_fee_rate")?;
 
         let mut order = Order::new(self.side, self.price.unwrap_or(Fixed::ZERO), self.volume, 0);
+        order.owner_id = Some(self.user_id);
         order.live = self.order_type;
         order.symbol_id = symbol_id;
         order.volume_unit = self.volume_unit;
@@ -979,8 +1126,9 @@ impl PlaceTicket {
 
 #[derive(Deserialize)]
 pub struct CancelTicket {
+    pub user_id: u64,
     #[serde(default)]
-    pub product: Product,
+    pub target: String,
     pub side: OrderSide,
     pub price: Fixed,
     pub sequence: u64,
@@ -988,8 +1136,9 @@ pub struct CancelTicket {
 
 #[derive(Deserialize)]
 pub struct AmendTicket {
+    pub user_id: u64,
     #[serde(default)]
-    pub product: Product,
+    pub target: String,
     pub side: OrderSide,
     pub price: Fixed,
     pub sequence: u64,
@@ -1004,6 +1153,16 @@ mod tests {
     use super::*;
 
     use matchengine_raft::order_book::FeeAssetPolicy;
+
+    fn target(id: &str, product: Product, engine_id: u64, engine: &str) -> TargetSpec {
+        TargetSpec {
+            id: id.to_string(),
+            label: id.to_uppercase(),
+            engine: engine.to_string(),
+            engine_id,
+            product,
+        }
+    }
 
     fn order(side: OrderSide, price: i128, volume: i128, sequence: u64) -> Order {
         Order::new(
@@ -1097,65 +1256,87 @@ mod tests {
     }
 
     #[test]
-    fn ticket_product_defaults_to_spot_and_accepts_perpetual_leverage() {
-        let spot: PlaceTicket =
-            serde_json::from_str(r#"{"side":"Buy","type":"Limit","volume":"1","price":"100"}"#)
-                .unwrap();
-        assert_eq!(Product::Spot, spot.product);
+    fn ticket_target_defaults_empty_and_accepts_perpetual_leverage() {
+        let spot: PlaceTicket = serde_json::from_str(
+            r#"{"side":"Buy","user_id":1,"type":"Limit","volume":"1","price":"100"}"#,
+        )
+        .unwrap();
+        assert_eq!("", spot.target);
         assert_eq!(None, spot.leverage);
 
         let perpetual: PlaceTicket = serde_json::from_str(
-            r#"{"side":"Sell","product":"perpetual","leverage":10,"type":"Limit","volume":"1","price":"100"}"#,
+            r#"{"side":"Sell","user_id":1,"target":"perpetual","leverage":10,"type":"Limit","volume":"1","price":"100"}"#,
         )
         .unwrap();
-        assert_eq!(Product::Perpetual, perpetual.product);
+        assert_eq!("perpetual", perpetual.target);
         assert_eq!(Some(10), perpetual.leverage);
     }
 
     #[test]
-    fn cancel_and_amend_tickets_default_to_spot() {
+    fn cancel_and_amend_tickets_default_target_and_keep_sequence() {
         let cancel: CancelTicket =
-            serde_json::from_str(r#"{"side":"Buy","price":"100","sequence":7}"#).unwrap();
-        assert_eq!(Product::Spot, cancel.product);
+            serde_json::from_str(r#"{"side":"Buy","user_id":1,"price":"100","sequence":7}"#)
+                .unwrap();
+        assert_eq!("", cancel.target);
         assert_eq!(7, cancel.sequence);
 
         let amend: AmendTicket = serde_json::from_str(
-            r#"{"product":"perpetual","side":"Sell","price":"100","sequence":8,"new_price":"101"}"#,
+            r#"{"target":"perpetual","side":"Sell","user_id":1,"price":"100","sequence":8,"new_price":"101"}"#,
         )
         .unwrap();
-        assert_eq!(Product::Perpetual, amend.product);
+        assert_eq!("perpetual", amend.target);
         assert_eq!(Some(Fixed::from_units(101)), amend.new_price);
     }
 
     #[test]
-    fn demo_app_reports_the_optional_perpetual_backend() {
-        let spot_only = DemoApp::new(1, "127.0.0.1:24401".to_string(), None);
-        let backends = spot_only.backends();
-        assert_eq!(Product::Spot, backends.spot.product);
-        assert_eq!("127.0.0.1:24401", backends.spot.http_addr);
-        assert!(backends.perpetual.is_none());
-        let error = match spot_only.backend(Product::Perpetual) {
-            Ok(_) => panic!("perpetual backend unexpectedly configured"),
-            Err(error) => error,
-        };
-        assert_eq!("not_configured", error.kind);
+    fn user_ranges_are_enforced_and_orders_carry_the_owner() {
+        let app = DemoApp::new(vec![target("spot", Product::Spot, 1, "127.0.0.1:24401")])
+            .with_user_range(100, 199);
+        assert!(app.require_user(100).is_ok());
+        assert!(app.require_user(199).is_ok());
+        assert!(app.require_user(99).is_err());
+        assert!(app.require_user(200).is_err());
 
-        let pair = DemoApp::new(
-            1,
-            "127.0.0.1:24401".to_string(),
-            Some((2, "127.0.0.1:24402".to_string())),
-        );
+        let ticket: PlaceTicket = serde_json::from_str(
+            r#"{"side":"Buy","user_id":150,"type":"Limit","volume":"1","price":"100"}"#,
+        )
+        .unwrap();
+        let order = ticket.build_order(0).unwrap();
+        assert_eq!(Some(150), order.owner_id);
+    }
+
+    #[test]
+    fn demo_app_reports_all_targets_and_their_products() {
+        let spot_only = DemoApp::new(vec![target("spot", Product::Spot, 1, "127.0.0.1:24401")]);
+        let backends = spot_only.backends();
+        let spot = backends.spot.expect("spot target");
+        assert_eq!("spot", spot.id);
+        assert_eq!("127.0.0.1:24401", spot.http_addr);
+        assert_eq!(1, backends.targets.len());
+        assert!(backends.perpetual.is_none());
+        assert!(spot_only.backend("perpetual").is_err());
+
+        let pair = DemoApp::new(vec![
+            target("spot", Product::Spot, 1, "127.0.0.1:24401"),
+            target("perpetual", Product::Perpetual, 2, "127.0.0.1:24402"),
+        ]);
         let backends = pair.backends();
-        let perpetual = backends.perpetual.expect("perpetual backend");
-        assert_eq!(Product::Perpetual, perpetual.product);
+        assert_eq!(2, backends.targets.len());
+        let perpetual = backends.perpetual.expect("perpetual target");
+        assert_eq!("perpetual", perpetual.id);
         assert_eq!(2, perpetual.engine_id);
         assert_eq!("127.0.0.1:24402", perpetual.http_addr);
     }
 
     #[test]
     fn each_backend_labels_its_orders_and_remembers_leverage() {
-        let spot = EngineBackend::new(Product::Spot, 1, "127.0.0.1:24401".to_string());
-        let perpetual = EngineBackend::new(Product::Perpetual, 1, "127.0.0.1:24402".to_string());
+        let spot = EngineBackend::new(target("spot", Product::Spot, 1, "127.0.0.1:24401"));
+        let perpetual = EngineBackend::new(target(
+            "perpetual",
+            Product::Perpetual,
+            1,
+            "127.0.0.1:24402",
+        ));
         let symbol = SymbolConfig::default();
         let mut resting = order(OrderSide::Buy, 100, 1, 7);
         resting.maker_fee_rate = "0.002".parse().unwrap();
@@ -1217,14 +1398,19 @@ mod tests {
     #[test]
     fn leverage_metadata_moves_with_an_amend_and_ignores_spot() {
         // The spot backend never records leverage, even if a client sends it.
-        let spot = EngineBackend::new(Product::Spot, 1, "127.0.0.1:24401".to_string());
+        let spot = EngineBackend::new(target("spot", Product::Spot, 1, "127.0.0.1:24401"));
         spot.remember_leverage(Some(7), 25);
         assert_eq!(None, spot.take_leverage(7));
 
         // The perpetual backend keys leverage by sequence: `take` removes it
         // (the amend path), and `restore` re-inserts it under the sequence the
         // engine assigned, so the tag survives a priority-losing amendment.
-        let perpetual = EngineBackend::new(Product::Perpetual, 1, "127.0.0.1:24402".to_string());
+        let perpetual = EngineBackend::new(target(
+            "perpetual",
+            Product::Perpetual,
+            1,
+            "127.0.0.1:24402",
+        ));
         perpetual.remember_leverage(Some(7), 25);
         let moved = perpetual.take_leverage(7);
         assert_eq!(Some(25), moved);
@@ -1236,23 +1422,23 @@ mod tests {
     #[test]
     fn perpetual_ticket_leverage_is_optional_and_must_be_an_integer() {
         let optional: PlaceTicket = serde_json::from_str(
-            r#"{"side":"Buy","product":"perpetual","type":"Limit","volume":"1","price":"100"}"#,
+            r#"{"side":"Buy","user_id":1,"target":"perpetual","type":"Limit","volume":"1","price":"100"}"#,
         )
         .unwrap();
-        assert_eq!(Product::Perpetual, optional.product);
+        assert_eq!("perpetual", optional.target);
         assert_eq!(None, optional.leverage);
 
         // An out-of-range integer still deserializes; `validate_product`
         // rejects it before any write is proposed.
         let zero: PlaceTicket = serde_json::from_str(
-            r#"{"side":"Buy","product":"perpetual","leverage":0,"type":"Limit","volume":"1","price":"100"}"#,
+            r#"{"side":"Buy","user_id":1,"target":"perpetual","leverage":0,"type":"Limit","volume":"1","price":"100"}"#,
         )
         .unwrap();
         assert_eq!(Some(0), zero.leverage);
 
         // A fractional leverage is a malformed ticket, not a rounded one.
         assert!(serde_json::from_str::<PlaceTicket>(
-            r#"{"side":"Buy","product":"perpetual","leverage":10.5,"type":"Limit","volume":"1","price":"100"}"#
+            r#"{"side":"Buy","target":"perpetual","leverage":10.5,"type":"Limit","volume":"1","price":"100"}"#
         )
         .is_err());
     }

@@ -103,9 +103,9 @@ jobs:
       - name: Install Aeron system libraries
         run: sudo apt-get update && sudo apt-get install -y libbsd-dev uuid-dev
       - name: Engine Aeron sink test
-        run: cargo test --manifest-path match_engine/Cargo.toml --features market-data-aeron --lib market_data::aeron --locked
+        run: cargo test --manifest-path match_engine/Cargo.toml --features market-data-aeron,aeron-precompiled --lib market_data::aeron --locked
       - name: Market-data Aeron end-to-end test
-        run: cargo test --manifest-path market_data_system/Cargo.toml --features aeron --test aeron --locked
+        run: cargo test --manifest-path market_data_system/Cargo.toml --features aeron,aeron-precompiled --test aeron --locked
 
   msrv:
     runs-on: ubuntu-latest

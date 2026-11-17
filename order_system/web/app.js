@@ -18,9 +18,9 @@ function emptyView() {
 }
 
 const state = {
-  product: "spot",
+  product: "",
   backends: null,
-  views: { spot: emptyView(), perpetual: emptyView() },
+  views: {},
   side: "Buy",
   paused: false,
   pageSize: 50,
@@ -42,8 +42,8 @@ for (const key of [
   "freeze", "symbolFormReady",
 ]) {
   Object.defineProperty(state, key, {
-    get() { return state.views[state.product][key]; },
-    set(value) { state.views[state.product][key] = value; },
+    get() { return (state.views[state.product] ||= emptyView())[key]; },
+    set(value) { (state.views[state.product] ||= emptyView())[key] = value; },
   });
 }
 
@@ -249,20 +249,29 @@ function nowLabel() {
   return `updated ${new Date().toLocaleTimeString()}`;
 }
 
+function backendFor(targetId) {
+  if (!state.backends) return null;
+  if (Array.isArray(state.backends.targets)) {
+    return state.backends.targets.find((target) => target.id === targetId) ?? null;
+  }
+  return state.backends[targetId] ?? null;
+}
+
 function productName(product = state.product) {
-  return product === "perpetual" ? "Perpetual" : "Spot";
+  const backend = backendFor(product);
+  return backend?.label || product || "—";
 }
 
 function activeBackend() {
-  return state.backends?.[state.product] ?? null;
+  return backendFor(state.product);
 }
 
 function pairLabel(product) {
-  const config = state.views[product].symbol?.config;
+  const config = state.views[product]?.symbol?.config;
   if (config) {
     return `${config.base_asset.code}/${config.quote_asset.code} · ${productName(product)}`;
   }
-  const backend = state.backends?.[product];
+  const backend = backendFor(product);
   return backend
     ? `${productName(product)} · ${backend.http_addr}`
     : `${productName(product)} · not configured`;
@@ -281,10 +290,13 @@ function renderPairSelect() {
     }
     return;
   }
-  const options = ["spot", "perpetual"].map((product) => ({
-    value: product,
-    label: pairLabel(product),
-    disabled: !state.backends[product],
+  const targets = Array.isArray(state.backends.targets)
+    ? state.backends.targets
+    : [state.backends.spot, state.backends.perpetual].filter(Boolean);
+  const options = targets.map((target) => ({
+    value: target.id,
+    label: pairLabel(target.id),
+    disabled: false,
   }));
   const signature = JSON.stringify(options);
   if (select.dataset.signature !== signature) {
@@ -298,25 +310,22 @@ function renderPairSelect() {
     }
     select.dataset.signature = signature;
   }
-  if (state.backends?.[state.product]) select.value = state.product;
+  if (!state.product && options.length) state.product = options[0].value;
+  if (options.some((item) => item.value === state.product)) select.value = state.product;
 }
 
 function renderBackendHint() {
   const hint = $("pair-hint");
   if (!hint) return;
-  const spot = state.backends?.spot;
-  const perpetual = state.backends?.perpetual;
-  if (!spot && !perpetual) {
-    hint.textContent = "Connecting to engine backends…";
+  const targets = Array.isArray(state.backends?.targets)
+    ? state.backends.targets
+    : [];
+  if (!targets.length) {
+    hint.textContent = "Connecting to engine targets…";
     return;
   }
-  if (!perpetual) {
-    hint.textContent = `Spot-only desk: ${pairLabel("spot")} on ${spot?.http_addr ?? "—"}.`;
-    return;
-  }
-  hint.textContent =
-    `Separate engines and orderbooks: ${pairLabel("spot")} on ${spot?.http_addr ?? "—"}; ` +
-    `${pairLabel("perpetual")} on ${perpetual.http_addr}.`;
+  hint.textContent = `${targets.length} engine target${targets.length === 1 ? "" : "s"}: ` +
+    targets.map((target) => `${target.label} on ${target.http_addr}`).join("; ");
 }
 
 function renderBackends() {
@@ -985,9 +994,10 @@ async function refreshState() {
   if (state.stateLoading.has(product) || document.hidden) return;
   state.stateLoading.add(product);
   try {
-    const response = await fetchJSON(`/demo/api/state?depth=20&product=${product}`);
+    const response = await fetchJSON(`/demo/api/state?depth=20&target=${product}`);
     if (product !== state.product) return;
     state.backends = response.backends || state.backends;
+    renderUserShard();
     state.node = response.node;
     state.symbol = response.symbol;
     state.book = response.book;
@@ -1032,19 +1042,23 @@ async function refreshBackends() {
     // The state poll also carries the backend metadata; keep trying there.
   }
   renderBackends();
+  renderUserShard();
   refreshPairLabels();
 }
 
 async function refreshPairLabels() {
   if (!state.backends) return;
-  const pending = ["spot", "perpetual"].filter(
-    (product) => state.backends[product] && !state.views[product].symbol,
-  );
+  const targets = Array.isArray(state.backends.targets) ? state.backends.targets : [];
+  const pending = targets
+    .map((target) => target.id)
+    .filter((id) => !state.views[id]?.symbol);
   if (!pending.length) return;
-  await Promise.all(pending.map(async (product) => {
+  await Promise.all(pending.map(async (target) => {
     try {
-      const response = await fetchJSON(`/demo/api/state?depth=0&product=${product}`);
-      if (response?.symbol) state.views[product].symbol = response.symbol;
+      const response = await fetchJSON(`/demo/api/state?depth=0&target=${target}`);
+      if (response?.symbol) {
+        (state.views[target] ||= emptyView()).symbol = response.symbol;
+      }
     } catch (_) {
       // Leave the address-based fallback label in place.
     }
@@ -1090,8 +1104,8 @@ async function refreshEvents(reset = false) {
     let resetOnce = false;
     for (let page = 0; page < 20; page += 1) {
       const query = cursor
-        ? `after_log_index=${cursor.log_index}&after_ordinal=${cursor.ordinal}&limit=${limit}&product=${product}`
-        : `limit=${limit}&product=${product}`;
+        ? `after_log_index=${cursor.log_index}&after_ordinal=${cursor.ordinal}&limit=${limit}&target=${product}`
+        : `limit=${limit}&target=${product}`;
       const response = await fetchJSON(`/demo/api/events?${query}`);
       if (product !== state.product) return;
       if (cursor && response.oldest_event_id && compareId(response.oldest_event_id, cursor) > 0) {
@@ -1145,7 +1159,7 @@ function pruneEvents() {
 async function loadFullBook() {
   const product = state.product;
   try {
-    const book = await fetchJSON(`/demo/api/book?product=${product}`);
+    const book = await fetchJSON(`/demo/api/book?target=${product}`);
     if (product !== state.product) return;
     state.fullBook = book;
     state.fullPage = 0;
@@ -1187,10 +1201,12 @@ function renderPending() {
 }
 
 function ticketProduct(product) {
-  if (product === "perpetual" && !state.backends?.perpetual) return;
+  const backend = backendFor(product);
+  if (!backend) return;
   const changed = state.product !== product;
   state.product = product;
-  const perpetual = product === "perpetual";
+  (state.views[product] ||= emptyView());
+  const perpetual = backend.product === "perpetual";
   renderPairSelect();
   $("pair-select").value = product;
   $("leverage-row").hidden = !perpetual;
@@ -1223,7 +1239,8 @@ function ticketLeverage() {
 }
 
 function renderTicketLabels() {
-  const perpetual = state.product === "perpetual";
+  const perpetual = activeBackend()?.product === "perpetual";
+  $("leverage-row").hidden = !perpetual;
   const type = $("ticket-type").value;
   const tif = $("ticket-tif").value;
   setText("ticket-subtitle", `${perpetual ? "Perpetual" : "Spot"} · ${type} · ${tif}`);
@@ -1239,13 +1256,13 @@ function renderTicketLabels() {
 function renderProductHint() {
   const hint = $("leverage-hint");
   setText("leverage-margin-asset", state.symbol?.config.quote_asset.code ?? "—");
-  if (state.product !== "perpetual") {
+  if (activeBackend()?.product !== "perpetual") {
     hint.hidden = true;
     hint.textContent = "";
     hint.classList.remove("warn");
     return;
   }
-  const backend = state.backends?.perpetual;
+  const backend = activeBackend();
   const policy = state.symbol?.config.fee_asset_policy;
   hint.hidden = false;
   if (!backend) {
@@ -1316,13 +1333,38 @@ function showResult(result, bad = false) {
   if (!(result.events || []).length) emptyRow(body, 6, "No events returned");
 }
 
+function renderUserShard() {
+  const min = state.backends?.user_id_min;
+  const max = state.backends?.user_id_max;
+  const chip = $("shard-chip");
+  if (chip) {
+    chip.innerHTML = min == null || max == null
+      ? "Users <strong>—</strong>"
+      : `Users <strong>${min}..${max}</strong>`;
+  }
+  const input = $("ticket-user");
+  if (input && min != null && max != null) {
+    const current = Number(input.value);
+    if (!Number.isInteger(current) || current < min || current > max) {
+      input.value = String(min);
+    }
+  }
+}
+
+function ticketUserId() {
+  return Number($("ticket-user").value);
+}
+
 function ticketBody(includeClientId = false) {
   const price = $("ticket-price").value.trim();
   const volume = $("ticket-volume").value.trim();
   if (!volume) return { error: "Volume is required" };
+  const userId = ticketUserId();
+  if (!Number.isInteger(userId) || userId < 0) return { error: "A non-negative integer user ID is required" };
   const body = {
     side: state.side,
-    product: state.product,
+    user_id: userId,
+    target: state.product,
     type: $("ticket-type").value,
     tif: $("ticket-tif").value,
     volume,
@@ -1331,7 +1373,7 @@ function ticketBody(includeClientId = false) {
     maker_fee_rate: $("ticket-maker").value.trim() || "0",
     taker_fee_rate: $("ticket-taker").value.trim() || "0",
   };
-  if (state.product === "perpetual") {
+  if (activeBackend()?.product === "perpetual") {
     body.leverage = ticketLeverage();
   }
   if (includeClientId) {
@@ -1449,7 +1491,8 @@ async function cancelOrder(order) {
   const product = state.product;
   try {
     const result = await postJSON("/demo/api/orders/cancel", {
-      product,
+      user_id: ticketUserId(),
+      target: product,
       side: order.side,
       price: order.price,
       sequence: order.sequence,
@@ -1472,7 +1515,8 @@ async function amendOrder(order) {
   if (!price && !volume) return;
   const product = state.product;
   const body = {
-    product,
+    user_id: ticketUserId(),
+    target: product,
     side: order.side,
     price: order.price,
     sequence: order.sequence,
@@ -1512,7 +1556,7 @@ async function submitSymbol(event) {
     fee_asset_policy: $("symbol-policy").value,
   };
   try {
-    const result = await postJSON(`/demo/api/symbol?product=${product}`, body);
+    const result = await postJSON(`/demo/api/symbol?target=${product}`, body);
     showResult(result);
     if (product === state.product) {
       state.symbolFormReady = false;

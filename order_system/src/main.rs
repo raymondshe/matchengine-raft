@@ -2,11 +2,18 @@ mod api;
 mod freeze;
 mod state;
 
+use std::fs;
+use std::path::PathBuf;
+
 use actix_web::App;
 use actix_web::HttpServer;
 use actix_web::middleware::Logger;
 use actix_web::web;
 use clap::Parser;
+
+use crate::freeze::Product;
+use crate::state::TargetSpec;
+use crate::state::TargetsFile;
 
 /// Standalone demo order desk for a running matchengine-raft node.
 #[derive(Parser, Debug)]
@@ -15,6 +22,11 @@ struct Opt {
     /// Address for the demo WebUI and its BFF API.
     #[arg(long, default_value = "127.0.0.1:24300")]
     addr: String,
+
+    /// JSON file with one target per engine/symbol. When omitted, the legacy
+    /// --engine/--perp-engine flags build `spot` and `perpetual` targets.
+    #[arg(long, env = "ORDER_TARGETS")]
+    targets: Option<PathBuf>,
 
     /// HTTP address of the running engine node that serves the Spot orderbook.
     #[arg(long, default_value = "127.0.0.1:24301")]
@@ -32,6 +44,14 @@ struct Opt {
     /// Raft node id of the engine at --perp-engine.
     #[arg(long, default_value_t = 1)]
     perp_engine_id: u64,
+
+    /// First user ID handled by this order-system shard (inclusive).
+    #[arg(long, default_value_t = 0)]
+    user_id_min: u64,
+
+    /// Last user ID handled by this order-system shard (inclusive).
+    #[arg(long, default_value_t = u64::MAX)]
+    user_id_max: u64,
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -47,11 +67,54 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    let perpetual = opt
-        .perp_engine
-        .clone()
-        .map(|addr| (opt.perp_engine_id, addr));
-    let app = state::DemoApp::new(opt.engine_id, opt.engine.clone(), perpetual);
+    if opt.user_id_min > opt.user_id_max {
+        anyhow::bail!("--user-id-min must be <= --user-id-max");
+    }
+    let targets = if let Some(path) = &opt.targets {
+        let raw = fs::read_to_string(path)
+            .map_err(|error| anyhow::anyhow!("read --targets {}: {error}", path.display()))?;
+        serde_json::from_str::<TargetsFile>(&raw)
+            .map_err(|error| anyhow::anyhow!("parse --targets {}: {error}", path.display()))?
+            .targets
+    } else {
+        let mut targets = vec![TargetSpec {
+            id: "spot".to_string(),
+            label: "Spot".to_string(),
+            engine: opt.engine.clone(),
+            engine_id: opt.engine_id,
+            product: Product::Spot,
+        }];
+        if let Some(engine) = opt.perp_engine.clone() {
+            targets.push(TargetSpec {
+                id: "perpetual".to_string(),
+                label: "Perpetual".to_string(),
+                engine,
+                engine_id: opt.perp_engine_id,
+                product: Product::Perpetual,
+            });
+        }
+        targets
+    };
+    if targets.is_empty() {
+        anyhow::bail!("at least one --targets entry is required");
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for target in &targets {
+        if target.id.trim().is_empty() || !seen.insert(target.id.clone()) {
+            anyhow::bail!("each target needs a non-empty unique id");
+        }
+        if target.engine.trim().is_empty() {
+            anyhow::bail!("target {} needs a non-empty engine address", target.id);
+        }
+    }
+    let app = state::DemoApp::new(targets).with_user_range(opt.user_id_min, opt.user_id_max);
+    let target_summary = app
+        .backends()
+        .targets
+        .iter()
+        .map(|target| format!("{}@{}", target.id, target.http_addr))
+        .collect::<Vec<_>>()
+        .join(", ");
     // The engine may still be starting or uninitialized; the page polls until it
     // is ready and shows the connection error until then.
     let app = web::Data::new(app);
@@ -66,6 +129,8 @@ async fn main() -> anyhow::Result<()> {
             .service(api::index)
             .service(api::js)
             .service(api::css)
+            .service(api::health)
+            .service(api::ready)
             .service(api::backends)
             .service(api::state)
             .service(api::book)
@@ -79,10 +144,8 @@ async fn main() -> anyhow::Result<()> {
     .bind(&opt.addr)?;
 
     println!(
-        "demo order desk: http://{}/demo/ (spot engine {}; perpetual engine {})",
-        opt.addr,
-        opt.engine,
-        opt.perp_engine.as_deref().unwrap_or("not configured")
+        "demo order desk: http://{}/demo/ (users {}..={}; targets {}; legacy spot engine {})",
+        opt.addr, opt.user_id_min, opt.user_id_max, target_summary, opt.engine
     );
     server.run().await?;
     Ok(())

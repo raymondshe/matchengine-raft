@@ -144,7 +144,7 @@ JSONL sink remains available for debugging.
 - **Zero-impact supervisor mode** — one supervisor container per pod reads `processes.json` and starts/stops individual children; adding, stopping or starting a symbol leaves every other engine's PID, listener and data directory untouched. The OrbStack validation kept all pod UIDs and restart counts unchanged while adding and cycling children.
 - **Explicit containers blast-radius guard** — a non-empty containers shard returns `409 restart_required`; `allowRestart` opts into a one-voter-at-a-time pod roll, so a routine add cannot silently restart the fleet.
 - **Complete lifecycle with storage decisions** — graceful shutdown/start reuses the same deployment, slot/ports and PVC and recovers WAL/snapshot without a new `/init`; an idle shard can be dropped with `retainStorage` keeping the PVCs for restore or deleting them irreversibly.
-- **CRD-backed desired state** — five `matching.io` CRDs (`TradingSymbol`, `SymbolShard`, `SymbolDeployment`, `SymbolRoute`, `Cell`) with status subresources; the manager writes through the Kubernetes API server, rebuilds its cache from informers, uses `resourceVersion` concurrency and rate-limits status writes. etcd persists the CRs; the manager never connects to etcd directly, and engine WAL/events never go there.
+- **CRD-backed desired state** — seven `matching.io` CRDs (`TradingSymbol`, `SymbolShard`, `SymbolDeployment`, `SymbolRoute`, `Cell`, `MarketDataService`, `OrderSystem`) with status subresources; the manager writes through the Kubernetes API server, rebuilds its cache from informers, uses `resourceVersion` concurrency and rate-limits status writes. etcd persists the CRs; the manager never connects to etcd directly, and engine WAL/events never go there.
 - **Lease-elected cell operator** — watches the CRDs, server-side-applies/prunes the StatefulSet/Services/PDB/NetworkPolicy/ConfigMap, labels the dedicated-shard leader for the leader Service, and writes shard/deployment/route/symbol status and conditions. Watches trigger immediate reconciliation; a Kubernetes Lease serializes replicas.
 - **Desired-state manager, not a hand-run YAML pile** — catalog validation, lowest-free slot and `httpBasePort + slot` allocation, rendered StatefulSet/Services/PDB/NetworkPolicy/ConfigMap, reconcile bootstrap/upgrade plans, audit and an engine-console proxy across many shards and cells.
 - **Production Kubernetes primitives** — four-voter shards, one PVC per pod, PDB, NetworkPolicy, headless gRPC services, health/readiness probes, non-root images and leader-aware routing metadata. The reference manager, supervisor and Lease-elected operator are implemented here; the operator also runs bootstrap/config/membership, quorum-safe containers add/start/stop rolls, PVC retention and cross-shard cutover/rollback.
@@ -239,6 +239,12 @@ Run it with `./scripts/market-data-system.sh` (two engines over Aeron IPC) and o
 `./scripts/aeron-linux-lab.sh`. See [`market_data_system/README.md`](./market_data_system/README.md)
 and [`docs/MARKET_DATA_WEBSOCKET.md`](./docs/MARKET_DATA_WEBSOCKET.md).
 
+For the Kubernetes/AWS EKS production path, **Profile A (direct Aeron multicast)** is the default
+implementation. It needs a multicast-capable platform (Cilium/Isovalent multicast, or Multus with
+AWS Transit Gateway multicast); the default VPC CNI cannot carry it. Direct NATS and the per-pod
+Aeron bridge are fallbacks. See
+[`docs/AERON_K8S_MESSAGE_BUS.md`](./docs/AERON_K8S_MESSAGE_BUS.md).
+
 ## ☸️ Kubernetes control plane
 
 The engine trades one symbol per process, so a multi-symbol deployment is a fleet of independent
@@ -255,7 +261,7 @@ opt-in.
 The same control plane supports graceful shutdown and start of one symbol, retaining its slot,
 ports and PVC and recovering its WAL/snapshot without a new `/init`. An idle shard can be dropped
 with an explicit choice to keep the PVCs for a later restore or delete them irreversibly. Desired
-state can use the JSON demo store or the CRD backend, which writes the five `matching.io` CRDs
+state can use the JSON demo store or the CRD backend, which writes the seven `matching.io` CRDs
 through the Kubernetes API server (etcd underneath) and refreshes its cache from informers. A
 Lease-elected operator watches the CRDs, applies/prunes the rendered workloads, labels dedicated
 leader pods, writes shard/deployment/route status, bootstraps/configures each Raft group, rolls
@@ -361,6 +367,7 @@ for the trade-offs.
 - [Match-result delivery](./docs/MATCH_RESULTS.md) — events, cursors and idempotency.
 - [Testing](./docs/TESTING.md) — cluster suite, replay matrix and failure tests.
 - [Performance](./docs/PERFORMANCE.md) — measured baselines and methodology.
+- [Market-data on Kubernetes](./docs/AERON_K8S_MESSAGE_BUS.md) — market-data message bus, multicast constraints and scale-out profiles.
 - [Runbook](./docs/RUNBOOK.md) — cluster, upgrade, migration and recovery procedures.
 - [Third-party investigations](./docs/THIRD_PARTY_INVESTIGATION.md) — external engine reviews.
 - [TODO](./TODO.md) — current priorities and roadmap.

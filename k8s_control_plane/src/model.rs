@@ -944,6 +944,492 @@ pub struct Observability {
 }
 
 // ---------------------------------------------------------------------------
+// Market data service
+// ---------------------------------------------------------------------------
+
+/// One standalone market-data/WebSocket deployment, managed independently of a `SymbolShard`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MarketDataService {
+    pub name: String,
+    #[serde(default)]
+    pub namespace: String,
+    pub spec: MarketDataServiceSpec,
+    #[serde(default)]
+    pub status: MarketDataServiceStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MarketDataServiceSpec {
+    pub cell: String,
+    /// Explicit symbol names when feed groups are not used.
+    #[serde(default)]
+    pub symbols: Vec<String>,
+    /// Bounded symbol sets with their own Aeron stream base and bus subject prefix.
+    #[serde(default)]
+    pub feed_groups: Vec<MarketDataFeedGroup>,
+    /// Digest-pinned market-data service image.
+    pub image: String,
+    #[serde(default)]
+    pub release: Release,
+    #[serde(default = "default_market_data_replicas")]
+    pub replicas: u16,
+    #[serde(default)]
+    pub transport: MarketDataTransport,
+    #[serde(default)]
+    pub websocket: MarketDataWebSocket,
+    /// Horizontal Pod Autoscaler policy. Enabled by default with a minimum of one replica.
+    #[serde(default)]
+    pub autoscaling: MarketDataAutoscaling,
+    /// Container resources for the fan-out tier. Defaults are sized for the WebSocket
+    /// service only and never share the match-engine pod budget.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resources: Option<Resources>,
+    #[serde(default)]
+    pub paused: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MarketDataAutoscaling {
+    #[serde(default = "default_market_data_min_replicas")]
+    pub min_replicas: u16,
+    /// Upper bound; `0` derives it from `spec.replicas`.
+    #[serde(default)]
+    pub max_replicas: u16,
+    #[serde(default = "default_market_data_target_cpu")]
+    pub target_cpu_utilization: u16,
+}
+
+impl Default for MarketDataAutoscaling {
+    fn default() -> Self {
+        Self {
+            min_replicas: default_market_data_min_replicas(),
+            max_replicas: 0,
+            target_cpu_utilization: default_market_data_target_cpu(),
+        }
+    }
+}
+
+impl MarketDataServiceSpec {
+    /// Every symbol this service serves, in declaration order, without duplicates.
+    pub fn symbol_names(&self) -> Vec<String> {
+        let mut names = Vec::new();
+        for group in &self.feed_groups {
+            for symbol in &group.symbols {
+                if !names.contains(symbol) {
+                    names.push(symbol.clone());
+                }
+            }
+        }
+        for symbol in &self.symbols {
+            if !names.contains(symbol) {
+                names.push(symbol.clone());
+            }
+        }
+        names
+    }
+
+    /// Feed groups, with an implicit group for `symbols` when none are declared.
+    pub fn effective_feed_groups(&self) -> Vec<MarketDataFeedGroup> {
+        if !self.feed_groups.is_empty() {
+            return self.feed_groups.clone();
+        }
+        if self.symbols.is_empty() {
+            return Vec::new();
+        }
+        vec![MarketDataFeedGroup {
+            name: "default".to_string(),
+            symbols: self.symbols.clone(),
+            stream_base: default_stream_base(),
+            channel: None,
+        }]
+    }
+
+    /// Effective HPA minimum, never below one.
+    pub fn min_replicas(&self) -> u16 {
+        self.autoscaling.min_replicas.max(1)
+    }
+
+    /// Effective HPA maximum. `0` means the configured replica count.
+    pub fn max_replicas(&self) -> u16 {
+        if self.autoscaling.max_replicas == 0 {
+            self.replicas.max(self.min_replicas())
+        } else {
+            self.autoscaling.max_replicas.max(self.min_replicas())
+        }
+    }
+
+    /// The stream base for one symbol from its feed group.
+    pub fn stream_base_for(&self, symbol: &str) -> u16 {
+        self.effective_feed_groups()
+            .into_iter()
+            .find(|group| group.symbols.iter().any(|name| name == symbol))
+            .map(|group| group.stream_base)
+            .unwrap_or_else(default_stream_base)
+    }
+
+    /// The Aeron channel for one symbol.
+    ///
+    /// A feed group may carry its own channel; otherwise the service-wide
+    /// `transport.channel` applies. This is what lets one global service
+    /// consume several shard multicast groups.
+    pub fn channel_for(&self, symbol: &str) -> Option<String> {
+        self.effective_feed_groups()
+            .into_iter()
+            .find(|group| group.symbols.iter().any(|name| name == symbol))
+            .and_then(|group| group.channel)
+            .or_else(|| self.transport.channel.clone())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MarketDataFeedGroup {
+    pub name: String,
+    #[serde(default)]
+    pub symbols: Vec<String>,
+    #[serde(default = "default_stream_base")]
+    pub stream_base: u16,
+    /// Optional Aeron channel for this group. When absent the service-wide
+    /// `transport.channel` is used, so single-shard services stay unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum MarketDataTransportMode {
+    /// One Aeron UDP multicast publication per stream; the default implementation.
+    #[default]
+    Multicast,
+    /// Direct NATS fallback for clusters without pod multicast.
+    Nats,
+    /// Aeron IPC terminated by a per-pod bridge before the durable bus.
+    Bridge,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MarketDataTransport {
+    #[serde(default)]
+    pub mode: MarketDataTransportMode,
+    /// Aeron multicast/unicast channel, e.g. `aeron:udp?endpoint=239.1.2.10:24001|interface={pod_ip}`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
+    /// NATS endpoint for the fallback profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nats_url: Option<String>,
+    /// NATS subject prefix for the fallback profile.
+    #[serde(default)]
+    pub subject_prefix: String,
+    /// NATS stream name for the fallback profile.
+    #[serde(default)]
+    pub stream: String,
+}
+
+impl Default for MarketDataTransport {
+    fn default() -> Self {
+        Self {
+            mode: MarketDataTransportMode::Multicast,
+            channel: None,
+            nats_url: None,
+            subject_prefix: String::new(),
+            stream: String::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MarketDataWebSocket {
+    #[serde(default = "default_market_data_port")]
+    pub port: u16,
+    #[serde(default)]
+    pub ingress: String,
+    #[serde(default)]
+    pub tls_secret: String,
+    #[serde(default = "default_market_data_connections")]
+    pub max_connections: usize,
+    #[serde(default = "default_market_data_streams")]
+    pub max_streams_per_connection: usize,
+    /// Per-connection sequenced queue capacity.
+    #[serde(default = "default_market_data_queue")]
+    pub queue: usize,
+    /// Maximum streams on a fast single-symbol connection.
+    #[serde(default = "default_market_data_fast_streams")]
+    pub fast_max_streams: usize,
+    /// Terminal display conflation window for latest-value streams, in milliseconds.
+    #[serde(default = "default_market_data_conflation")]
+    pub terminal_conflation_ms: u64,
+    /// Serve only the fast single-symbol profile (`/ws/<symbol>@<stream>`).
+    /// The terminal `/ws` and `/stream?streams=...` endpoints return 404.
+    #[serde(default)]
+    pub fast_only: bool,
+    /// Serve the engine extension streams (`@sweep`, `@status`, `@lifecycle`).
+    #[serde(default)]
+    pub extensions: bool,
+    /// Mark a symbol not ready when no frame/heartbeat arrives within this window.
+    #[serde(default = "default_market_data_heartbeat")]
+    pub heartbeat_timeout_secs: u64,
+}
+
+impl Default for MarketDataWebSocket {
+    fn default() -> Self {
+        Self {
+            port: default_market_data_port(),
+            ingress: String::new(),
+            tls_secret: String::new(),
+            max_connections: default_market_data_connections(),
+            max_streams_per_connection: default_market_data_streams(),
+            queue: default_market_data_queue(),
+            fast_max_streams: default_market_data_fast_streams(),
+            terminal_conflation_ms: default_market_data_conflation(),
+            fast_only: false,
+            extensions: false,
+            heartbeat_timeout_secs: default_market_data_heartbeat(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct MarketDataServiceStatus {
+    #[serde(default)]
+    pub phase: Phase,
+    #[serde(default)]
+    pub conditions: Vec<Condition>,
+    #[serde(default)]
+    pub replicas: u16,
+    #[serde(default)]
+    pub ready_replicas: u16,
+    #[serde(default)]
+    pub symbols: Vec<MarketDataSymbolStatus>,
+    #[serde(default)]
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct MarketDataSymbolStatus {
+    pub name: String,
+    #[serde(default)]
+    pub ready: bool,
+    #[serde(default)]
+    pub feed_lag: u64,
+    #[serde(default)]
+    pub last_frame_age_ms: u64,
+    /// Active per-symbol stream subscriptions across the observed pod.
+    #[serde(default)]
+    pub subscribers: u64,
+    /// Instance-wide `GAP` count; a per-symbol counter is a follow-up.
+    #[serde(default)]
+    pub drops: u64,
+}
+
+fn default_market_data_replicas() -> u16 {
+    2
+}
+
+fn default_market_data_port() -> u16 {
+    8080
+}
+
+fn default_market_data_connections() -> usize {
+    4096
+}
+
+fn default_market_data_streams() -> usize {
+    1024
+}
+
+fn default_market_data_queue() -> usize {
+    1024
+}
+
+fn default_market_data_heartbeat() -> u64 {
+    30
+}
+
+fn default_market_data_min_replicas() -> u16 {
+    1
+}
+
+fn default_market_data_target_cpu() -> u16 {
+    70
+}
+
+fn default_market_data_fast_streams() -> usize {
+    32
+}
+
+fn default_market_data_conflation() -> u64 {
+    100
+}
+
+fn default_stream_base() -> u16 {
+    2001
+}
+
+// ---------------------------------------------------------------------------
+// Order system
+// ---------------------------------------------------------------------------
+
+/// A stateless order-entry BFF managed by the control plane. Users are split
+/// into explicit ranges; each range gets its own Deployment and Service, and
+/// every shard can route to every engine target.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrderSystem {
+    pub name: String,
+    #[serde(default)]
+    pub namespace: String,
+    pub spec: OrderSystemSpec,
+    #[serde(default)]
+    pub status: OrderSystemStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrderSystemSpec {
+    pub cell: String,
+    pub image: String,
+    /// Replica baseline per user shard. HPA defaults to this as its maximum and
+    /// always enforces a minimum of one.
+    #[serde(default = "default_order_system_replicas")]
+    pub replicas: u16,
+    /// Horizontal Pod Autoscaler policy per user shard.
+    #[serde(default)]
+    pub autoscaling: OrderSystemAutoscaling,
+    /// BFF listen port inside every shard.
+    #[serde(default = "default_order_system_port")]
+    pub port: u16,
+    /// Engine/symbol targets available to every shard.
+    #[serde(default)]
+    pub targets: Vec<OrderSystemTarget>,
+    /// User-ID partitions. Every shard can place orders on every target.
+    #[serde(default)]
+    pub shards: Vec<OrderSystemShard>,
+    /// Optional Ingress base host; each shard gets `<shard>.<ingress>`.
+    #[serde(default)]
+    pub ingress: String,
+    #[serde(default)]
+    pub tls_secret: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resources: Option<Resources>,
+    #[serde(default)]
+    pub paused: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrderSystemAutoscaling {
+    #[serde(default = "default_order_system_min_replicas")]
+    pub min_replicas: u16,
+    /// Upper bound; `0` derives it from `spec.replicas`.
+    #[serde(default)]
+    pub max_replicas: u16,
+    #[serde(default = "default_order_system_target_cpu")]
+    pub target_cpu_utilization: u16,
+}
+
+impl Default for OrderSystemAutoscaling {
+    fn default() -> Self {
+        Self {
+            min_replicas: 1,
+            max_replicas: 0,
+            target_cpu_utilization: 70,
+        }
+    }
+}
+
+impl OrderSystemSpec {
+    pub fn min_replicas(&self) -> u16 {
+        self.autoscaling.min_replicas.max(1)
+    }
+
+    pub fn max_replicas(&self) -> u16 {
+        if self.autoscaling.max_replicas == 0 {
+            self.replicas.max(self.min_replicas())
+        } else {
+            self.autoscaling.max_replicas.max(self.min_replicas())
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrderSystemTarget {
+    /// Trading symbol name from the catalog.
+    pub symbol: String,
+    /// Optional display label; defaults to the symbol name.
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub product: OrderSystemProduct,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum OrderSystemProduct {
+    #[default]
+    Spot,
+    Perpetual,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrderSystemShard {
+    pub name: String,
+    pub user_id_min: u64,
+    pub user_id_max: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct OrderSystemStatus {
+    #[serde(default)]
+    pub phase: Phase,
+    #[serde(default)]
+    pub conditions: Vec<Condition>,
+    #[serde(default)]
+    pub replicas: u16,
+    #[serde(default)]
+    pub ready_replicas: u16,
+    #[serde(default)]
+    pub shards: Vec<OrderSystemShardStatus>,
+    #[serde(default)]
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct OrderSystemShardStatus {
+    pub name: String,
+    #[serde(default)]
+    pub replicas: u16,
+    #[serde(default)]
+    pub ready_replicas: u16,
+}
+
+pub fn default_order_system_replicas() -> u16 {
+    1
+}
+
+pub fn default_order_system_port() -> u16 {
+    24300
+}
+
+pub fn default_order_system_min_replicas() -> u16 {
+    1
+}
+
+pub fn default_order_system_target_cpu() -> u16 {
+    70
+}
+
+// ---------------------------------------------------------------------------
 // Operation, Backup, ClusterTemplate
 // ---------------------------------------------------------------------------
 
@@ -1150,12 +1636,47 @@ pub fn port_name(prefix: &str, slot: u16) -> String {
     name.chars().take(15).collect()
 }
 
+/// Parse the `endpoint=host:port` of an Aeron channel such as
+/// `aeron:udp?endpoint=239.1.2.51:24001|interface={pod_ip}|ttl=1`.
+pub fn aeron_channel_endpoint(channel: &str) -> Option<(String, u16)> {
+    let endpoint = channel.split('|').next()?.split("endpoint=").nth(1)?;
+    let (host, port) = endpoint.rsplit_once(':')?;
+    Some((host.to_string(), port.parse().ok()?))
+}
+
+/// One named `key=value` parameter from an Aeron channel's URI parameters.
+pub fn aeron_channel_param<'a>(channel: &'a str, key: &str) -> Option<&'a str> {
+    let query = channel.split_once('?')?.1;
+    query
+        .split('|')
+        .chain(query.split('&'))
+        .filter_map(|part| part.split_once('='))
+        .find(|(name, _)| *name == key)
+        .map(|(_, value)| value)
+}
+
+/// Whether the endpoint is an IPv4 multicast address (224.0.0.0/4).
+pub fn is_multicast_ipv4(host: &str) -> bool {
+    let Ok(address) = host.parse::<std::net::Ipv4Addr>() else {
+        return false;
+    };
+    address.is_multicast()
+}
+
 /// Stable fingerprint of the symbol configuration the operator applies through
 /// `ConfigureSymbol`. It is a non-cryptographic FNV-1a hash of the canonical JSON so the
 /// manager, the operator and `/read symbol_config` comparisons in tests agree without pulling
 /// in a hashing dependency.
 pub fn config_fingerprint(spec: &TradingSymbolSpec) -> String {
-    let bytes = serde_json::to_vec(spec).unwrap_or_default();
+    fingerprint(spec)
+}
+
+/// Non-cryptographic FNV-1a fingerprint of any serializable value.
+///
+/// Used for stable, cheap change detection (symbol configs, rendered ConfigMaps) without a
+/// hashing dependency.
+pub fn fingerprint<T: Serialize + ?Sized>(value: &T) -> String {
+    let bytes = serde_json::to_vec(value).unwrap_or_default();
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in bytes {
         hash ^= u64::from(byte);

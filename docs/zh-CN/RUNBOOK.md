@@ -929,7 +929,7 @@ JSON 模式下，任何管理器滚动前先导出目录；如果文件丢失，
 |---|---|
 | 管理器 Pod 重启后目录变成 3-shard 演示 | 仅 JSON 模式：`/data` 是 `emptyDir` 或未传 `--state`。改用 CRD 模式，或用保存的目录/bundle 重建；CRD 模式会从 CRD 重建。 |
 | CRD 模式返回 `kubernetes_api` 403 | 管理器 ServiceAccount 缺少 RBAC 或 token 未挂载。应用 `deploy/rbac.yaml`，设置 `serviceAccountName: match-manager` 和 `automountServiceAccountToken: true`。 |
-| CRD 模式返回 `kubernetes_api` 404 | 五个 `matching.io` CRD 未安装。运行 `cargo run -- crds \| kubectl apply -f -`。 |
+| CRD 模式返回 `kubernetes_api` 404 | 六个 `matching.io` CRD 未安装。运行 `cargo run -- crds \| kubectl apply -f -`。 |
 | CRD 管理器启动后目录为空 | 所列命名空间中没有 CR，或缺少 list/watch RBAC。用 `crd-restore` 恢复，或通过 API 创建 shard/symbol。 |
 | Operator 没有 Lease 持有者 | 检查 `kubectl -n match-control get lease match-engine-operator`；确认 `match-operator` ServiceAccount 有 `coordination.k8s.io/leases` 权限且 token 已挂载。 |
 | Operator 无法 apply 工作负载 | 检查 `match-operator` ClusterRole 是否有 StatefulSet/Service/ConfigMap/PDB/NetworkPolicy 的 create/update/delete，以及 Pod 的 list/watch/patch/delete（滚动需要 delete）。 |

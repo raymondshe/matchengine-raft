@@ -59,8 +59,9 @@ Important environment variables:
 - `MATCHENGINE_READ_POLICY`, `MATCHENGINE_MAX_INFLIGHT_WRITES` — defaults for the flags above.
 - `MATCHENGINE_ASYNC_WAL` — enables the prototype async WAL.
 
-Cargo features: `async-wal`, `market-data-aeron` (Aeron egress) and `profiling` (OpenRaft runtime
-histograms).
+Cargo features: `async-wal`, `market-data-aeron` (Aeron egress; add `aeron-precompiled` on macOS
+or Linux x86_64 to use the published binaries, or omit it for a native arm64 source build) and
+`profiling` (OpenRaft runtime histograms).
 
 ## 🧱 Engine internals
 
@@ -90,7 +91,7 @@ histograms).
 ```shell
 cargo test --locked
 cargo test --features async-wal --test cluster async_wal --locked
-cargo test --features market-data-aeron --lib market_data::aeron --locked
+cargo test --features market-data-aeron,aeron-precompiled --lib market_data::aeron --locked
 ```
 
 - [API reference](../docs/API.md)

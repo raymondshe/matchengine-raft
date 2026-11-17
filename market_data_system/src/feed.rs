@@ -174,6 +174,25 @@ impl Registry {
             .is_some_and(|sender| sender.receiver_count() > 0)
     }
 
+    /// Number of active stream subscriptions for one symbol.
+    pub fn symbol_subscriptions(&self, symbol: &str) -> u64 {
+        let prefix = format!("{symbol}@");
+        self.streams
+            .iter()
+            .filter(|(key, _)| key.starts_with(&prefix))
+            .map(|(_, sender)| sender.receiver_count() as u64)
+            .sum()
+    }
+
+    /// Number of live stream keys for one symbol.
+    pub fn symbol_streams(&self, symbol: &str) -> u64 {
+        let prefix = format!("{symbol}@");
+        self.streams
+            .keys()
+            .filter(|key| key.starts_with(&prefix))
+            .count() as u64
+    }
+
     /// Drops the sender when the last subscriber left.
     pub fn remove_if_unused(&mut self, key: &str) {
         if self
@@ -199,6 +218,10 @@ impl Registry {
 #[derive(Debug, Default)]
 pub struct Stats {
     pub connections: AtomicU64,
+    pub fast_connections: AtomicU64,
+    pub terminal_connections: AtomicU64,
+    pub terminal_conflated: AtomicU64,
+    pub terminal_throttled: AtomicU64,
     pub messages: AtomicU64,
     pub published: AtomicU64,
     pub resyncs: AtomicU64,
@@ -212,6 +235,10 @@ impl Stats {
     pub fn metrics_json(&self, registry: &Registry) -> serde_json::Value {
         json!({
             "connections": self.connections.load(Ordering::Relaxed),
+            "fast_connections": self.fast_connections.load(Ordering::Relaxed),
+            "terminal_connections": self.terminal_connections.load(Ordering::Relaxed),
+            "terminal_conflated": self.terminal_conflated.load(Ordering::Relaxed),
+            "terminal_throttled": self.terminal_throttled.load(Ordering::Relaxed),
             "streams": registry.streams.len(),
             "messages": self.messages.load(Ordering::Relaxed),
             "published": self.published.load(Ordering::Relaxed),

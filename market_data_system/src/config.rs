@@ -31,6 +31,38 @@ pub struct AeronSpec {
     pub embedded: bool,
 }
 
+/// WebSocket feed class.
+///
+/// Binance exposes one Streams protocol with raw/combined endpoints and a
+/// 1024-stream cap. We keep that protocol but split connections into two
+/// server-enforced classes: a fast single-symbol feed for API/algo clients and
+/// a terminal multi-symbol feed with display conflation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FeedProfile {
+    Fast,
+    Terminal,
+}
+
+impl FeedProfile {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Fast => "fast",
+            Self::Terminal => "terminal",
+        }
+    }
+
+    pub fn max_streams(self, config: &Config) -> usize {
+        match self {
+            Self::Fast => config.fast_max_streams,
+            Self::Terminal => config.max_streams,
+        }
+    }
+
+    pub fn is_terminal(self) -> bool {
+        self == Self::Terminal
+    }
+}
+
 /// Runtime configuration for one market-data instance.
 ///
 /// An instance serves one or more instruments. Each symbol has its own feed
@@ -47,8 +79,19 @@ pub struct Config {
     pub bar_intervals_ms: Vec<u64>,
     /// Maximum concurrent WebSocket connections.
     pub max_connections: usize,
-    /// Maximum streams per connection.
+    /// Maximum streams on a terminal (multi-symbol) connection. Binance allows 1024.
     pub max_streams: usize,
+    /// Maximum streams on a fast single-symbol connection.
+    pub fast_max_streams: usize,
+    /// Serve only the fast single-symbol profile. Terminal `/ws` and
+    /// `/stream?streams=...` endpoints return 404.
+    pub fast_only: bool,
+    /// Terminal display conflation window for latest-value streams
+    /// (`bookTicker`, partial depth). 0 disables conflation.
+    pub terminal_conflation_ms: u64,
+    /// Terminal per-connection frame budget for conflatable streams per second.
+    /// 0 disables the budget; sequenced streams are never throttled here.
+    pub terminal_max_frames_per_second: u64,
     /// Per-connection sequenced FIFO capacity.
     pub queue: usize,
     /// Whether the engine extension streams (`@sweep`, `@status`,
@@ -79,6 +122,12 @@ impl Config {
             max_connections: 256,
             // Binance allows up to 1024 streams on one connection.
             max_streams: 1_024,
+            // A fast connection carries one symbol; the full catalogue is ~16 streams.
+            fast_max_streams: 32,
+            fast_only: false,
+            // Terminal clients render at human speed; conflate latest-value streams.
+            terminal_conflation_ms: 100,
+            terminal_max_frames_per_second: 2_000,
             queue: 1_024,
             // Public defaults: only Binance-compatible streams are exposed.
             extensions: false,
@@ -109,6 +158,10 @@ impl Config {
     fn with_test_limits(mut self) -> Self {
         self.max_connections = 16;
         self.max_streams = 8;
+        self.fast_max_streams = 8;
+        self.fast_only = false;
+        self.terminal_conflation_ms = 100;
+        self.terminal_max_frames_per_second = 1_000;
         self.queue = 64;
         self.ping_interval = Duration::from_secs(30);
         self.pong_timeout = Duration::from_secs(60);

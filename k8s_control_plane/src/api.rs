@@ -24,12 +24,16 @@ use serde_json::{Value, json};
 
 use crate::bundle::ShardBundle;
 use crate::error::ApiError;
+use crate::model::dns_label;
 use crate::model::{
-    Cell, DeploymentState, Release, SymbolDeployment, SymbolRoute, SymbolShard, TradingSymbol,
+    Cell, DeploymentState, MarketDataService, OrderSystem, Release, SymbolDeployment, SymbolRoute,
+    SymbolShard, TradingSymbol,
 };
 use crate::provision::{self, CreateSymbolRequest};
 use crate::reconcile::{Action, PlanStep, ReconcilePlan, Scenario, ShardObservation, summarize};
-use crate::render::{Profile, RenderOptions, as_list, render_shard};
+use crate::render::{
+    Profile, RenderOptions, as_list, render_market_data_service, render_order_system, render_shard,
+};
 use crate::store::{AuditEntry, Catalog, Store};
 use crate::validate::{Report, per_pod_totals, validate_bundle, validate_catalog, validate_symbol};
 
@@ -84,6 +88,35 @@ pub fn router_with_options(store: Arc<Store>, console: ConsoleOptions) -> Router
         .route("/api/v1/symbols/{name}/start", post(start_symbol))
         .route("/api/v1/deployments", get(deployments))
         .route("/api/v1/routes", get(routes))
+        .route(
+            "/api/v1/market-data-services",
+            get(market_data_services).post(create_market_data_service),
+        )
+        .route(
+            "/api/v1/market-data-services/{name}",
+            get(market_data_service_detail),
+        )
+        .route(
+            "/api/v1/market-data-services/{name}/manifests",
+            get(market_data_manifests),
+        )
+        .route(
+            "/api/v1/market-data-services/{name}/upgrade",
+            post(upgrade_market_data),
+        )
+        .route(
+            "/api/v1/order-systems",
+            get(order_systems).post(create_order_system),
+        )
+        .route("/api/v1/order-systems/{name}", get(order_system_detail))
+        .route(
+            "/api/v1/order-systems/{name}/manifests",
+            get(order_system_manifests),
+        )
+        .route(
+            "/api/v1/order-systems/{name}/upgrade",
+            post(upgrade_order_system),
+        )
         .route("/api/v1/validate", get(validate))
         .route("/api/v1/bundles", post(upsert_bundle))
         .route("/api/v1/audit", get(audit))
@@ -110,22 +143,33 @@ async fn health(State(store): State<Arc<Store>>) -> Json<Value> {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ImagesQuery {
     #[serde(default)]
     shard: Option<String>,
+    #[serde(default)]
+    market_data_service: Option<String>,
 }
 
-/// Engine images the upgrade picker can offer.
+/// Images the engine or market-data upgrade picker can offer.
 ///
-/// The CRD backend also lists node-cached images and running engine pods (read-only). Other
-/// backends return the references recorded in the catalog.
+/// The CRD backend also lists node-cached images and running engine/market-data pods (read-only).
+/// Other backends return the references recorded in the catalog.
 async fn images(
     State(store): State<Arc<Store>>,
     Query(query): Query<ImagesQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    Ok(Json(json!(
-        store.available_images(query.shard.as_deref()).await?
-    )))
+    if query.shard.is_some() && query.market_data_service.is_some() {
+        return Err(ApiError::bad_request(
+            "images_query",
+            "pass either shard or marketDataService, not both",
+        ));
+    }
+    let inventory = match query.market_data_service.as_deref() {
+        Some(name) => store.available_market_data_images(name).await?,
+        None => store.available_images(query.shard.as_deref()).await?,
+    };
+    Ok(Json(json!(inventory)))
 }
 
 fn counts(catalog: &Catalog) -> Value {
@@ -140,6 +184,8 @@ fn counts(catalog: &Catalog) -> Value {
         "symbols": catalog.symbols.len(),
         "deployments": catalog.deployments.len(),
         "routes": catalog.routes.len(),
+        "marketDataServices": catalog.market_data_services.len(),
+        "orderSystems": catalog.order_systems.len(),
         "processes": active_processes,
     })
 }
@@ -157,6 +203,8 @@ fn catalog_value(catalog: &Catalog, report: &Report) -> Value {
         "symbols": catalog.symbols,
         "deployments": catalog.deployments,
         "routes": catalog.routes,
+        "marketDataServices": catalog.market_data_services,
+        "orderSystems": catalog.order_systems,
         "counts": counts(catalog),
         "validation": report,
     })
@@ -299,6 +347,50 @@ async fn upgrade_shard(
                 &name,
                 request.image,
                 request.release,
+            )?);
+            Ok(())
+        })
+        .await?;
+    Ok(Json(json!({ "upgrade": upgrade })))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpgradeMarketDataRequest {
+    image: String,
+    /// Omit to keep the service's current release while changing only the image.
+    #[serde(default)]
+    release: Option<Release>,
+}
+
+async fn upgrade_market_data(
+    State(store): State<Arc<Store>>,
+    Path(name): Path<String>,
+    Json(request): Json<UpgradeMarketDataRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let mut upgrade = None;
+    store
+        .mutate(|catalog| {
+            let release = request
+                .release
+                .clone()
+                .or_else(|| {
+                    catalog
+                        .market_data_services
+                        .get(&name)
+                        .map(|service| service.spec.release.clone())
+                })
+                .ok_or_else(|| {
+                    ApiError::not_found(
+                        "market_data_not_found",
+                        format!("unknown market-data service {name}"),
+                    )
+                })?;
+            upgrade = Some(provision::upgrade_market_data_service(
+                catalog,
+                &name,
+                request.image.clone(),
+                release,
             )?);
             Ok(())
         })
@@ -973,6 +1065,410 @@ async fn routes(State(store): State<Arc<Store>>) -> Json<Value> {
     }))
 }
 
+async fn market_data_services(State(store): State<Arc<Store>>) -> Json<Value> {
+    let catalog = store.snapshot();
+    let items: Vec<Value> = catalog
+        .market_data_services
+        .values()
+        .map(|service| {
+            let mut value = serde_json::to_value(service).unwrap_or(Value::Null);
+            value["sources"] = Value::Array(market_data_sources(&catalog, service));
+            value
+        })
+        .collect();
+    Json(json!({ "items": items }))
+}
+
+/// Engine shards that currently publish the symbols served by this fan-out tier.
+fn market_data_sources(catalog: &Catalog, service: &MarketDataService) -> Vec<Value> {
+    service
+        .spec
+        .symbol_names()
+        .into_iter()
+        .map(|symbol| {
+            let deployment = catalog
+                .deployments
+                .values()
+                .find(|deployment| deployment.spec.symbol_ref == symbol);
+            let shard =
+                deployment.and_then(|deployment| catalog.shards.get(&deployment.spec.shard_ref));
+            json!({
+                "symbol": symbol,
+                "deployment": deployment.map(|deployment| deployment.name.clone()),
+                "shard": shard.map(|shard| shard.name.clone()),
+                "namespace": deployment.map(|deployment| deployment.namespace.clone()),
+            })
+        })
+        .collect()
+}
+
+async fn create_market_data_service(
+    State(store): State<Arc<Store>>,
+    Json(mut service): Json<MarketDataService>,
+) -> Result<Json<Value>, ApiError> {
+    service.name = service.name.trim().to_string();
+    if service.name.is_empty() {
+        return Err(ApiError::bad_request(
+            "invalid_name",
+            "market-data service name is required",
+        ));
+    }
+    if service.spec.cell.trim().is_empty() {
+        return Err(ApiError::bad_request(
+            "cell_required",
+            "spec.cell is required",
+        ));
+    }
+    if service.spec.image.trim().is_empty() {
+        return Err(ApiError::bad_request(
+            "image_required",
+            "spec.image is required",
+        ));
+    }
+    if service.spec.replicas == 0 {
+        return Err(ApiError::bad_request(
+            "invalid_replicas",
+            "spec.replicas must be greater than zero",
+        ));
+    }
+    if service.spec.feed_groups.is_empty() && service.spec.symbols.is_empty() {
+        return Err(ApiError::bad_request(
+            "feed_group_required",
+            "declare at least one feed group or symbol",
+        ));
+    }
+    let mut group_names = BTreeSet::new();
+    for group in &service.spec.feed_groups {
+        if group.name.trim().is_empty() || !group_names.insert(group.name.clone()) {
+            return Err(ApiError::bad_request(
+                "invalid_feed_group",
+                "feed group names must be non-empty and unique",
+            ));
+        }
+    }
+    let name = service.name.clone();
+    store
+        .mutate(|catalog| {
+            if !catalog.cells.contains_key(&service.spec.cell) {
+                return Err(ApiError::bad_request(
+                    "unknown_cell",
+                    format!("cell {} is not in the catalog", service.spec.cell),
+                ));
+            }
+            let namespace = if !service.namespace.is_empty() {
+                service.namespace.clone()
+            } else {
+                catalog
+                    .cells
+                    .get(&service.spec.cell)
+                    .map(|cell| cell.namespace.clone())
+                    .unwrap_or_default()
+            };
+            service.namespace = namespace;
+            catalog
+                .market_data_services
+                .insert(name.clone(), service.clone());
+            // Run the same preflight as the GUI/validate endpoint so an invalid service
+            // (unknown symbol, even multicast address, overlapping stream bases, release
+            // mismatch) never reaches the CRD store.
+            let mut candidate = catalog.clone();
+            candidate
+                .market_data_services
+                .insert(name.clone(), service.clone());
+            let report = validate_catalog(&candidate);
+            let mut scope = BTreeSet::new();
+            scope.insert(name.clone());
+            let scoped = report.scoped(&scope);
+            if !scoped.is_ok() {
+                return Err(ApiError::unprocessable(scoped));
+            }
+            Ok(())
+        })
+        .await?;
+    Ok(Json(json!({ "marketDataService": service })))
+}
+
+async fn market_data_service_detail(
+    State(store): State<Arc<Store>>,
+    Path(name): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let catalog = store.snapshot();
+    let service = catalog.market_data_services.get(&name).ok_or_else(|| {
+        ApiError::not_found("market_data_not_found", format!("unknown service {name}"))
+    })?;
+    let report = validate_catalog(&catalog);
+    let mut scope = BTreeSet::new();
+    scope.insert(name.clone());
+    let (scheme, host) = if service.spec.websocket.ingress.is_empty() {
+        (
+            "ws",
+            format!(
+                "{}.{}.svc.cluster.local:{}",
+                service.name, service.namespace, service.spec.websocket.port
+            ),
+        )
+    } else {
+        (
+            "wss",
+            service
+                .spec
+                .websocket
+                .ingress
+                .trim_end_matches('/')
+                .to_string(),
+        )
+    };
+    let fast_endpoint = format!("{scheme}://{host}/ws/<symbol>@<stream>");
+    let terminal_endpoint =
+        format!("{scheme}://{host}/stream?streams=<symbol>@<stream>/<symbol>@<stream>");
+    let fast_only = service.spec.websocket.fast_only;
+    Ok(Json(json!({
+        "marketDataService": service,
+        "sources": market_data_sources(&catalog, service),
+        "endpoint": if fast_only {
+            fast_endpoint.clone()
+        } else {
+            format!("{scheme}://{host}/ws")
+        },
+        "endpoints": {
+            "fast": fast_endpoint,
+            "terminal": if fast_only { Value::Null } else { json!(terminal_endpoint) },
+        },
+        "validation": report.scoped(&scope),
+    })))
+}
+
+async fn market_data_manifests(
+    State(store): State<Arc<Store>>,
+    Path(name): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let catalog = store.snapshot();
+    let objects = render_market_data_service(&catalog, &name, None)?;
+    let mut list = as_list(objects);
+    list["metadata"] = json!({
+        "name": format!("{name}-manifests"),
+        "annotations": {
+            "matching.io/rendered-by": "k8s_control_plane",
+        },
+    });
+    Ok(Json(list))
+}
+
+async fn order_systems(State(store): State<Arc<Store>>) -> Json<Value> {
+    let catalog = store.snapshot();
+    Json(json!({
+        "items": catalog.order_systems.values().collect::<Vec<_>>(),
+    }))
+}
+
+async fn create_order_system(
+    State(store): State<Arc<Store>>,
+    Json(mut system): Json<OrderSystem>,
+) -> Result<Json<Value>, ApiError> {
+    system.name = system.name.trim().to_string();
+    if system.name.is_empty() {
+        return Err(ApiError::bad_request(
+            "invalid_name",
+            "order-system name is required",
+        ));
+    }
+    if system.spec.cell.trim().is_empty() {
+        return Err(ApiError::bad_request(
+            "cell_required",
+            "spec.cell is required",
+        ));
+    }
+    if system.spec.image.trim().is_empty() {
+        return Err(ApiError::bad_request(
+            "image_required",
+            "spec.image is required",
+        ));
+    }
+    if system.spec.replicas == 0 {
+        return Err(ApiError::bad_request(
+            "invalid_replicas",
+            "spec.replicas must be greater than zero",
+        ));
+    }
+    if system.spec.shards.is_empty() {
+        return Err(ApiError::bad_request(
+            "shard_required",
+            "declare at least one user-ID shard",
+        ));
+    }
+    if system.spec.targets.is_empty() {
+        return Err(ApiError::bad_request(
+            "target_required",
+            "declare at least one engine/symbol target",
+        ));
+    }
+    let name = system.name.clone();
+    store
+        .mutate(|catalog| {
+            if !catalog.cells.contains_key(&system.spec.cell) {
+                return Err(ApiError::bad_request(
+                    "unknown_cell",
+                    format!("cell {} is not in the catalog", system.spec.cell),
+                ));
+            }
+            if system.namespace.is_empty() {
+                system.namespace = catalog
+                    .cells
+                    .get(&system.spec.cell)
+                    .map(|cell| cell.namespace.clone())
+                    .unwrap_or_default();
+            }
+            catalog.order_systems.insert(name.clone(), system.clone());
+            let report = validate_catalog(catalog);
+            let mut scope = BTreeSet::new();
+            scope.insert(name.clone());
+            let scoped = report.scoped(&scope);
+            if !scoped.is_ok() {
+                return Err(ApiError::unprocessable(scoped));
+            }
+            Ok(())
+        })
+        .await?;
+    Ok(Json(json!({ "orderSystem": system })))
+}
+
+async fn order_system_detail(
+    State(store): State<Arc<Store>>,
+    Path(name): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let catalog = store.snapshot();
+    let system = catalog.order_systems.get(&name).ok_or_else(|| {
+        ApiError::not_found(
+            "order_system_not_found",
+            format!("unknown order system {name}"),
+        )
+    })?;
+    let report = validate_catalog(&catalog);
+    let mut scope = BTreeSet::new();
+    scope.insert(name.clone());
+    let base = system.spec.ingress.trim().trim_end_matches('.');
+    let shards: Vec<Value> = system
+        .spec
+        .shards
+        .iter()
+        .map(|shard| {
+            let service = dns_label(&format!("{}-{}", system.name, shard.name));
+            json!({
+                "name": shard.name,
+                "userIdMin": shard.user_id_min,
+                "userIdMax": shard.user_id_max,
+                "service": service,
+                "url": if base.is_empty() {
+                    format!("http://{service}.{}.svc.cluster.local:{}", system.namespace, system.spec.port)
+                } else {
+                    format!("https://{}.{base}", shard.name)
+                },
+            })
+        })
+        .collect();
+    Ok(Json(json!({
+        "orderSystem": system,
+        "shards": shards,
+        "validation": report.scoped(&scope),
+    })))
+}
+
+async fn order_system_manifests(
+    State(store): State<Arc<Store>>,
+    Path(name): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let catalog = store.snapshot();
+    let objects = render_order_system(&catalog, &name, None)?;
+    let mut list = as_list(objects);
+    list["metadata"] = json!({
+        "name": format!("{name}-manifests"),
+        "annotations": { "matching.io/rendered-by": "k8s_control_plane" },
+    });
+    Ok(Json(list))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpgradeOrderSystemRequest {
+    image: String,
+}
+
+async fn upgrade_order_system(
+    State(store): State<Arc<Store>>,
+    Path(name): Path<String>,
+    Json(request): Json<UpgradeOrderSystemRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let image = request.image.trim().to_string();
+    if image.is_empty() {
+        return Err(ApiError::bad_request(
+            "image_required",
+            "target image must not be empty",
+        ));
+    }
+    let mut result = Value::Null;
+    store
+        .mutate(|catalog| {
+            let system = catalog.order_systems.get(&name).cloned().ok_or_else(|| {
+                ApiError::not_found(
+                    "order_system_not_found",
+                    format!("unknown order system {name}"),
+                )
+            })?;
+            if system.spec.paused {
+                return Err(ApiError::conflict(
+                    "order_system_paused",
+                    format!("order system {name} is paused; resume it before changing the image"),
+                ));
+            }
+            if system.spec.image == image {
+                result = json!({
+                    "system": name,
+                    "image": image,
+                    "changed": false,
+                    "shards": system.spec.shards.iter().map(|shard| shard.name.clone()).collect::<Vec<_>>(),
+                    "steps": [],
+                    "notes": ["the order system already has this image"],
+                });
+                return Ok(());
+            }
+            if let Some(target) = catalog.order_systems.get_mut(&name) {
+                target.spec.image = image.clone();
+                target.status.phase = crate::model::Phase::Pending;
+                target.status.message =
+                    "image update requested; operator rolling the order-system shards".to_string();
+                target.status.conditions.clear();
+            }
+            let report = validate_catalog(catalog);
+            let mut scope = BTreeSet::new();
+            scope.insert(name.clone());
+            let scoped = report.scoped(&scope);
+            if !scoped.is_ok() {
+                return Err(ApiError::unprocessable(scoped));
+            }
+            catalog.audit(
+                "api",
+                "upgrade-order-system",
+                &name,
+                format!("{image} on order system {name}; rolling user shards"),
+            );
+            result = json!({
+                "system": name,
+                "image": image,
+                "changed": true,
+                "shards": system.spec.shards.iter().map(|shard| shard.name.clone()).collect::<Vec<_>>(),
+                "steps": [
+                    { "action": "update-deployments", "detail": "operator writes the new image to every user-shard Deployment" },
+                    { "action": "rolling-update", "detail": "each shard rolls with maxUnavailable: 0 and one surge pod; existing HTTP requests drain through termination" },
+                    { "action": "verify", "detail": "operator reports per-shard ready replicas in OrderSystem.status" }
+                ],
+                "notes": ["order-system shards are stateless; no Raft quorum or leader transfer is involved"],
+            });
+            Ok(())
+        })
+        .await?;
+    Ok(Json(json!({ "upgrade": result })))
+}
+
 async fn validate(State(store): State<Arc<Store>>) -> Json<Value> {
     let catalog = store.snapshot();
     let report = validate_catalog(&catalog);
@@ -1201,6 +1697,290 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["counts"]["symbols"], 3);
         assert_eq!(body["validation"]["errors"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn market_data_service_can_be_created_and_listed() {
+        let app = app();
+        let (status, body) = post_json_to(
+            app.clone(),
+            "/api/v1/market-data-services",
+            json!({
+                "name": "eu-1-feeds",
+                "spec": {
+                    "cell": "eu-1",
+                    "image": "registry.example.com/matchengine-marketdata@sha256:abc",
+                    "replicas": 2,
+                    "feedGroups": [{
+                        "name": "fx-a",
+                        "symbols": ["gbpusd"],
+                        "streamBase": 2001
+                    }],
+                    "transport": {
+                        "mode": "multicast",
+                        "channel": "aeron:udp?endpoint=239.1.2.11:24001|interface={pod_ip}|ttl=1"
+                    }
+                }
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["marketDataService"]["spec"]["replicas"], 2);
+        let (status, body) = get_json_from(app, "/api/v1/market-data-services").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["items"][0]["name"], "eu-1-feeds");
+        assert_eq!(body["items"][0]["namespace"], "match-eu-1");
+        assert_eq!(body["items"][0]["sources"][0]["symbol"], "gbpusd");
+        assert_eq!(body["items"][0]["sources"][0]["shard"], "fx-eu-01");
+    }
+
+    #[tokio::test]
+    async fn market_data_manifests_render_as_a_kubectl_list() {
+        let app = app();
+        let (status, body) = post_json_to(
+            app.clone(),
+            "/api/v1/market-data-services",
+            json!({
+                "name": "btc-marketdata",
+                "spec": {
+                    "cell": "eu-1",
+                    "image": "registry.example.com/matchengine-marketdata@sha256:abc",
+                    "replicas": 2,
+                    "feedGroups": [{
+                        "name": "btc",
+                        "symbols": ["btcusdt"],
+                        "streamBase": 2001
+                    }],
+                    "transport": {
+                        "mode": "multicast",
+                        "channel": "aeron:udp?endpoint=239.1.2.51:24001|interface={pod_ip}|ttl=1"
+                    }
+                }
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) = get_json_from(
+            app.clone(),
+            "/api/v1/market-data-services/btc-marketdata/manifests",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["kind"], "List");
+        let kinds: Vec<&str> = body["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|object| object["kind"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                "ConfigMap",
+                "Deployment",
+                "Service",
+                "PodDisruptionBudget",
+                "NetworkPolicy",
+                "HorizontalPodAutoscaler"
+            ]
+        );
+        let (status, body) =
+            get_json_from(app, "/api/v1/market-data-services/btc-marketdata").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["endpoint"],
+            "ws://btc-marketdata.match-eu-1.svc.cluster.local:8080/ws"
+        );
+        assert_eq!(
+            body["endpoints"]["fast"],
+            "ws://btc-marketdata.match-eu-1.svc.cluster.local:8080/ws/<symbol>@<stream>"
+        );
+        assert!(
+            body["endpoints"]["terminal"]
+                .as_str()
+                .unwrap()
+                .contains("/stream?streams=")
+        );
+    }
+
+    async fn create_btc_market_data(app: axum::Router) {
+        let (status, body) = post_json_to(
+            app,
+            "/api/v1/market-data-services",
+            json!({
+                "name": "btc-marketdata",
+                "spec": {
+                    "cell": "eu-1",
+                    "image": "registry.example.com/matchengine-marketdata@sha256:abc",
+                    "replicas": 2,
+                    "feedGroups": [{
+                        "name": "btc",
+                        "symbols": ["btcusdt"],
+                        "streamBase": 2001
+                    }],
+                    "transport": {
+                        "mode": "multicast",
+                        "channel": "aeron:udp?endpoint=239.1.2.51:24001|interface={pod_ip}|ttl=1"
+                    }
+                }
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    #[tokio::test]
+    async fn market_data_upgrade_updates_the_image_and_keeps_the_release() {
+        let app = app();
+        create_btc_market_data(app.clone()).await;
+
+        let (status, body) = post_json_to(
+            app.clone(),
+            "/api/v1/market-data-services/btc-marketdata/upgrade",
+            json!({ "image": "registry.example.com/matchengine-marketdata@sha256:def" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["upgrade"]["changed"], true);
+        assert_eq!(
+            body["upgrade"]["release"]["wireVersion"],
+            serde_json::Value::from(7)
+        );
+        assert_eq!(body["upgrade"]["sourceShards"][0], "me-btcusdt");
+
+        let (status, detail) =
+            get_json_from(app, "/api/v1/market-data-services/btc-marketdata").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            detail["marketDataService"]["spec"]["image"],
+            "registry.example.com/matchengine-marketdata@sha256:def"
+        );
+        assert_eq!(detail["marketDataService"]["status"]["phase"], "Pending");
+    }
+
+    #[tokio::test]
+    async fn market_data_upgrade_rejects_an_incompatible_wire_version() {
+        let app = app();
+        create_btc_market_data(app.clone()).await;
+
+        let (status, body) = post_json_to(
+            app,
+            "/api/v1/market-data-services/btc-marketdata/upgrade",
+            json!({
+                "image": "registry.example.com/matchengine-marketdata@sha256:def",
+                "release": {
+                    "wireVersion": 8,
+                    "snapshotVersion": 11,
+                    "mixedVersionSafe": false
+                }
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["error"], "release_incompatible");
+    }
+
+    #[tokio::test]
+    async fn market_data_image_inventory_uses_the_service_image() {
+        let app = app();
+        create_btc_market_data(app.clone()).await;
+
+        let (status, body) =
+            get_json_from(app, "/api/v1/images?marketDataService=btc-marketdata").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["current"],
+            "registry.example.com/matchengine-marketdata@sha256:abc"
+        );
+        assert_eq!(
+            body["repository"],
+            "registry.example.com/matchengine-marketdata"
+        );
+        assert!(body["items"].as_array().unwrap().iter().any(|image| {
+            image["current"] == true
+                && image["reference"] == "registry.example.com/matchengine-marketdata@sha256:abc"
+        }));
+        assert!(
+            body["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|image| image["repository"] == "registry.example.com/matchengine-marketdata")
+        );
+    }
+
+    #[tokio::test]
+    async fn order_system_can_be_created_rendered_and_upgraded() {
+        let app = app();
+        let (status, body) = post_json_to(
+            app.clone(),
+            "/api/v1/order-systems",
+            json!({
+                "name": "orders",
+                "spec": {
+                    "cell": "eu-1",
+                    "image": "matchengine-order-system:arm64",
+                    "replicas": 1,
+                    "autoscaling": {
+                        "minReplicas": 1,
+                        "maxReplicas": 2,
+                        "targetCpuUtilization": 70
+                    },
+                    "port": 24300,
+                    "targets": [
+                        {"symbol": "gbpusd", "label": "GBP/USD"},
+                        {"symbol": "btcusdt", "label": "BTC/USDT"}
+                    ],
+                    "shards": [
+                        {"name": "users-0", "userIdMin": 0, "userIdMax": 499},
+                        {"name": "users-1", "userIdMin": 500, "userIdMax": 999}
+                    ],
+                    "ingress": "orders.match-eu-1.example"
+                }
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, manifests) =
+            get_json_from(app.clone(), "/api/v1/order-systems/orders/manifests").await;
+        assert_eq!(status, StatusCode::OK, "{manifests}");
+        let kinds: Vec<&str> = manifests["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|object| object["kind"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            2,
+            kinds.iter().filter(|kind| **kind == "Deployment").count()
+        );
+        assert_eq!(
+            2,
+            kinds
+                .iter()
+                .filter(|kind| **kind == "HorizontalPodAutoscaler")
+                .count()
+        );
+        assert_eq!(2, kinds.iter().filter(|kind| **kind == "Ingress").count());
+
+        let (status, body) = post_json_to(
+            app.clone(),
+            "/api/v1/order-systems/orders/upgrade",
+            json!({"image": "matchengine-order-system:arm64-v2"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["upgrade"]["changed"], true);
+        assert_eq!(
+            body["upgrade"]["shards"],
+            serde_json::json!(["users-0", "users-1"])
+        );
+        let (status, detail) = get_json_from(app, "/api/v1/order-systems/orders").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            detail["orderSystem"]["spec"]["image"],
+            "matchengine-order-system:arm64-v2"
+        );
     }
 
     #[tokio::test]

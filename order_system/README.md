@@ -58,11 +58,30 @@ cargo run --manifest-path order_system/Cargo.toml -- \
 ```
 
 - `--addr`: demo WebUI/BFF address.
-- `--engine`: HTTP API address of the Spot engine node.
+- `--targets <file>`: JSON file with one target per engine/symbol. This is the multi-symbol mode:
+  every user shard can select every target.
+- `--engine`: HTTP API address of the legacy Spot engine target.
 - `--engine-id`: that node's Raft id.
-- `--perp-engine`: optional HTTP API address of a **second** engine for the Perpetual product. It
-  must differ from `--engine`; omit it to disable the Perpetual view.
+- `--perp-engine`: optional HTTP API address of a **second** engine for the legacy Perpetual target.
 - `--perp-engine-id`: the perpetual node's Raft id (default 1).
+- `--user-id-min` / `--user-id-max`: inclusive user-ID range enforced by this instance. Requests
+  for any other user fail with HTTP `409 user_shard`.
+
+`--targets` format:
+
+```json
+{"targets":[
+  {"id":"gbpusd","label":"GBP/USD","engine":"127.0.0.1:21002","engineId":1,"product":"spot"},
+  {"id":"btcusdt","label":"BTC/USDT","engine":"127.0.0.1:21001","engineId":1,"product":"spot"}
+]}
+```
+
+Every target is an independent engine process/cluster with its own symbol and book. The trading
+pair selector in the WebUI lists all targets; changing it switches the book, events, orders and
+freeze estimates without restarting the process. The same user shard can therefore place orders on
+every configured engine/symbol. The Kubernetes control plane renders one Deployment per user range
+and passes the same target list to each one. The control plane **order systems** page links each
+shard to this WebUI (`http://<shard>.<spec.ingress>/demo/`); it does not proxy order entry.
 
 Each engine must already be initialized and have a leader before its product accepts orders. The
 demo can start earlier; it shows a "no leader" banner per backend. Point each flag at a leader for

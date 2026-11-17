@@ -43,9 +43,9 @@ struct Opt {
     #[clap(long, env = "AERON_CHANNEL")]
     aeron_channel: Vec<String>,
 
-    /// First Aeron stream id; the seven feed streams are `base..base+6`.
-    #[clap(long, default_value_t = 2001)]
-    aeron_stream_base: u16,
+    /// First Aeron stream id per symbol; repeat once per `--symbol` (default 2001).
+    #[clap(long, value_name = "ID", default_value = "2001")]
+    aeron_stream_base: Vec<u16>,
 
     /// Aeron media-driver directory per symbol (one value is reused).
     #[clap(long, env = "AERON_DIR")]
@@ -63,9 +63,25 @@ struct Opt {
     #[clap(long, default_value_t = 256)]
     max_connections: usize,
 
-    /// Maximum streams per connection (Binance uses 1024).
+    /// Maximum streams on a terminal multi-symbol connection (Binance uses 1024).
     #[clap(long, default_value_t = 1024)]
     max_streams: usize,
+
+    /// Maximum streams on a fast single-symbol connection.
+    #[clap(long, default_value_t = 32)]
+    fast_max_streams: usize,
+
+    /// Serve only the fast single-symbol profile (disable `/ws` and `/stream`).
+    #[clap(long)]
+    fast_only: bool,
+
+    /// Terminal display conflation window for latest-value streams, in ms (0 disables).
+    #[clap(long, default_value_t = 100)]
+    terminal_conflation_ms: u64,
+
+    /// Terminal per-connection frame budget for conflatable streams per second (0 disables).
+    #[clap(long, default_value_t = 2000)]
+    terminal_max_frames_per_second: u64,
 
     /// Per-connection sequenced queue capacity.
     #[clap(long, default_value_t = 1024)]
@@ -158,7 +174,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.bar_intervals_ms = opt.bar_intervals_ms;
     }
     config.max_connections = opt.max_connections;
-    config.max_streams = opt.max_streams;
+    config.max_streams = opt.max_streams.max(1);
+    config.fast_max_streams = opt.fast_max_streams.max(1);
+    config.fast_only = opt.fast_only;
+    config.terminal_conflation_ms = opt.terminal_conflation_ms;
+    config.terminal_max_frames_per_second = opt.terminal_max_frames_per_second;
     config.queue = opt.queue.max(1);
     config.extensions = opt.extensions;
     config.lifecycle = opt.extensions && !opt.no_lifecycle;
@@ -183,6 +203,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("--archive-dir cannot be combined with --replay-dir".into());
     }
 
+    // One embedded media driver lives for the whole process. It must stay in
+    // scope until the server and feeds shut down; dropping it here would kill
+    // the subscriptions immediately after setup.
+    #[cfg(feature = "aeron")]
+    let mut shared_driver: Option<rusteron_media_driver::testing::EmbeddedDriver> = None;
     let mut snapshot_requesters: HashMap<String, SnapshotRequester> = HashMap::new();
     let mut sources: Vec<(SymbolSpec, BoxedSource)> = if let Some(dir) = &opt.replay_dir {
         for spec in &symbols {
@@ -209,6 +234,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
             .collect()
     } else if !opt.aeron_channel.is_empty() {
+        // One media driver per process serves every symbol. Starting an embedded driver per
+        // symbol would fail: the second launch cannot own the same Aeron directory.
+        #[cfg(feature = "aeron")]
+        if opt.aeron_embedded_driver {
+            let dir = opt
+                .aeron_dir
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "/dev/shm/aeron".to_string());
+            shared_driver = Some(
+                rusteron_media_driver::testing::EmbeddedDriver::launch_with(|context| {
+                    let dir = std::ffi::CString::new(dir.clone())
+                        .map_err(|_| rusteron_media_driver::AeronCError::from_code(-1))?;
+                    context.set_dir(dir.as_c_str())?;
+                    Ok(())
+                })
+                .map_err(|error| format!("start embedded driver: {error}"))?,
+            );
+        }
         let mut sources = Vec::with_capacity(symbols.len());
         for (index, spec) in symbols.iter().enumerate() {
             let channel = opt
@@ -216,15 +260,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .get(index)
                 .or_else(|| opt.aeron_channel.first())
                 .ok_or("--aeron-channel is empty")?;
+            #[cfg(feature = "aeron")]
+            let dir = shared_driver
+                .as_ref()
+                .map(|driver| driver.dir().to_string())
+                .or_else(|| {
+                    opt.aeron_dir
+                        .get(index)
+                        .or_else(|| opt.aeron_dir.first())
+                        .cloned()
+                });
+            #[cfg(not(feature = "aeron"))]
             let dir = opt
                 .aeron_dir
                 .get(index)
                 .or_else(|| opt.aeron_dir.first())
                 .cloned();
+            let stream_base = opt
+                .aeron_stream_base
+                .get(index)
+                .or_else(|| opt.aeron_stream_base.first())
+                .copied()
+                .unwrap_or(2001);
             let aeron = AeronSpec {
                 channel: channel.clone(),
-                stream_base: opt.aeron_stream_base,
+                stream_base,
                 dir,
+                #[cfg(feature = "aeron")]
+                embedded: opt.aeron_embedded_driver && shared_driver.is_none(),
+                #[cfg(not(feature = "aeron"))]
                 embedded: opt.aeron_embedded_driver,
             };
             let (source, requester) = aeron_source_for(&aeron, spec.symbol_id).await?;
@@ -268,9 +332,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     println!("Press Ctrl-C to stop.");
 
-    tokio::signal::ctrl_c().await?;
+    wait_for_shutdown_signal().await?;
     running.shutdown().await;
     Ok(())
+}
+
+async fn wait_for_shutdown_signal() -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(unix)]
+    {
+        let mut sigterm =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result?,
+            _ = sigterm.recv() => {}
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await?;
+        Ok(())
+    }
 }
 
 #[cfg(feature = "aeron")]

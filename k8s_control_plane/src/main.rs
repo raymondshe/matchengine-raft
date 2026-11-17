@@ -63,7 +63,7 @@ enum Command {
         #[arg(long, env = "ENGINE_CONSOLE_HOST")]
         engine_console_host: Option<String>,
     },
-    /// Print the five catalog CustomResourceDefinitions as YAML.
+    /// Print the six catalog CustomResourceDefinitions as YAML.
     Crds {
         /// Write here instead of stdout.
         #[arg(long)]

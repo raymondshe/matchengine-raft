@@ -14,17 +14,26 @@ RUN apt-get update \
         pkg-config \
         libssl-dev \
         ca-certificates \
-        cmake \
         clang \
+        python3 \
+        python3-pip \
         libclang-dev \
         uuid-dev \
         libbsd-dev \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && python3 -m pip install --break-system-packages --no-cache-dir cmake==3.31.6
+
+RUN rustup component add rustfmt
 
 WORKDIR /src
 COPY . .
 
-RUN cargo build --manifest-path Cargo.toml --release --bin matchengine-raft --bin match_supervisor
+# Optional features, e.g. `market-data-aeron` for a shard that publishes the
+# market-data feed. The default image stays lean.
+ARG CARGO_FEATURES=""
+RUN cargo build --manifest-path Cargo.toml --release \
+    ${CARGO_FEATURES:+--features "$CARGO_FEATURES"} \
+    --bin matchengine-raft --bin match_supervisor
 
 FROM debian:bookworm-slim AS runtime
 
@@ -33,6 +42,8 @@ RUN apt-get update \
         ca-certificates \
         curl \
         libssl3 \
+        libbsd0 \
+        libatomic1 \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 10001 matchengine \
     && useradd --uid 10001 --gid 10001 --no-create-home \

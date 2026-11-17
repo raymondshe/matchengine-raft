@@ -1,6 +1,6 @@
 //! CRD-backed desired state.
 //!
-//! The manager never talks to etcd. It writes the five catalog CRDs through the Kubernetes API
+//! The manager never talks to etcd. It writes the seven catalog CRDs through the Kubernetes API
 //! server, bootstraps its cache from list calls and keeps it fresh with one watcher per kind.
 //! Status is written through the CRD status subresource and is rate-limited; audit history stays
 //! in memory (an external append-only store in production) and is never persisted in etcd.
@@ -22,15 +22,17 @@ use tokio::time::Instant;
 use tracing::{debug, warn};
 
 use crate::error::ApiError;
-use crate::model::{Cell, SymbolDeployment, SymbolRoute, SymbolShard, TradingSymbol};
+use crate::model::{
+    Cell, MarketDataService, OrderSystem, SymbolDeployment, SymbolRoute, SymbolShard, TradingSymbol,
+};
 use crate::store::{Catalog, CatalogStore};
 
-/// CRD API group. The version is deliberately one shared version for all five kinds.
+/// CRD API group. The version is deliberately one shared version for all six kinds.
 pub const GROUP: &str = "matching.io";
 pub const VERSION: &str = "v1";
 pub const DEFAULT_NAMESPACE: &str = "match-eu-1";
 
-/// One of the five catalog CRDs.
+/// One of the seven catalog CRDs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum CrdKind {
     Cell,
@@ -38,15 +40,19 @@ pub enum CrdKind {
     Symbol,
     Deployment,
     Route,
+    MarketData,
+    OrderSystem,
 }
 
 impl CrdKind {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 7] = [
         Self::Cell,
         Self::Shard,
         Self::Symbol,
         Self::Deployment,
         Self::Route,
+        Self::MarketData,
+        Self::OrderSystem,
     ];
 
     pub fn kind(self) -> &'static str {
@@ -56,6 +62,8 @@ impl CrdKind {
             Self::Symbol => "TradingSymbol",
             Self::Deployment => "SymbolDeployment",
             Self::Route => "SymbolRoute",
+            Self::MarketData => "MarketDataService",
+            Self::OrderSystem => "OrderSystem",
         }
     }
 
@@ -66,6 +74,8 @@ impl CrdKind {
             Self::Symbol => "tradingsymbols",
             Self::Deployment => "symboldeployments",
             Self::Route => "symbolroutes",
+            Self::MarketData => "marketdataservices",
+            Self::OrderSystem => "ordersystems",
         }
     }
 
@@ -76,6 +86,8 @@ impl CrdKind {
             Self::Symbol => "tradingsymbol",
             Self::Deployment => "symboldeployment",
             Self::Route => "symbolroute",
+            Self::MarketData => "marketdataservice",
+            Self::OrderSystem => "ordersystem",
         }
     }
 
@@ -104,7 +116,7 @@ pub fn object_kind(object: &DynamicObject) -> Option<CrdKind> {
         .and_then(|types| CrdKind::from_kind(&types.kind))
 }
 
-/// Generate the five CustomResourceDefinition manifests.
+/// Generate the seven CustomResourceDefinition manifests.
 ///
 /// The schema deliberately preserves unknown fields inside `spec`/`status`: the manager already
 /// validates the catalog before writing it, and the exact typed CRD schema is a follow-up. The
@@ -264,6 +276,31 @@ pub fn route_object(route: &SymbolRoute, default_namespace: &str) -> DynamicObje
     )
 }
 
+pub fn market_data_service_object(
+    service: &MarketDataService,
+    default_namespace: &str,
+) -> DynamicObject {
+    object_with_spec_status(
+        CrdKind::MarketData,
+        &service.name,
+        &service.namespace,
+        &service.spec,
+        Some(&service.status),
+        default_namespace,
+    )
+}
+
+pub fn order_system_object(system: &OrderSystem, default_namespace: &str) -> DynamicObject {
+    object_with_spec_status(
+        CrdKind::OrderSystem,
+        &system.name,
+        &system.namespace,
+        &system.spec,
+        Some(&system.status),
+        default_namespace,
+    )
+}
+
 fn metadata_namespace(object: &DynamicObject, default_namespace: &str) -> String {
     object
         .metadata
@@ -333,7 +370,25 @@ pub fn route_from_object(object: &DynamicObject) -> Option<SymbolRoute> {
     })
 }
 
-/// Convert a catalog to the five CRD object sets, used for CRD/etcd backup and restore tests.
+pub fn market_data_service_from_object(object: &DynamicObject) -> Option<MarketDataService> {
+    Some(MarketDataService {
+        name: parse_name(object)?,
+        namespace: metadata_namespace(object, DEFAULT_NAMESPACE),
+        spec: parse_spec(object)?,
+        status: parse_status(object),
+    })
+}
+
+pub fn order_system_from_object(object: &DynamicObject) -> Option<OrderSystem> {
+    Some(OrderSystem {
+        name: parse_name(object)?,
+        namespace: metadata_namespace(object, DEFAULT_NAMESPACE),
+        spec: parse_spec(object)?,
+        status: parse_status(object),
+    })
+}
+
+/// Convert a catalog to the seven CRD object sets, used for CRD/etcd backup and restore tests.
 pub fn catalog_to_objects(catalog: &Catalog, default_namespace: &str) -> Vec<DynamicObject> {
     let mut objects = Vec::new();
     objects.extend(
@@ -365,6 +420,18 @@ pub fn catalog_to_objects(catalog: &Catalog, default_namespace: &str) -> Vec<Dyn
             .routes
             .values()
             .map(|route| route_object(route, default_namespace)),
+    );
+    objects.extend(
+        catalog
+            .market_data_services
+            .values()
+            .map(|service| market_data_service_object(service, default_namespace)),
+    );
+    objects.extend(
+        catalog
+            .order_systems
+            .values()
+            .map(|system| order_system_object(system, default_namespace)),
     );
     objects
 }
@@ -426,6 +493,20 @@ fn upsert_object(
                 catalog.routes.insert(route.name.clone(), route);
             }
         }
+        CrdKind::MarketData => {
+            if let Some(mut service) = market_data_service_from_object(object) {
+                service.namespace = namespace.clone();
+                catalog
+                    .market_data_services
+                    .insert(service.name.clone(), service);
+            }
+        }
+        CrdKind::OrderSystem => {
+            if let Some(mut system) = order_system_from_object(object) {
+                system.namespace = namespace.clone();
+                catalog.order_systems.insert(system.name.clone(), system);
+            }
+        }
     }
     debug!(?kind, name = ?object.metadata.name, namespace, "catalog cache upsert");
 }
@@ -450,6 +531,12 @@ fn remove_object(catalog: &mut Catalog, kind: CrdKind, object: &DynamicObject) {
         CrdKind::Route => {
             catalog.routes.remove(name);
         }
+        CrdKind::MarketData => {
+            catalog.market_data_services.remove(name);
+        }
+        CrdKind::OrderSystem => {
+            catalog.order_systems.remove(name);
+        }
     }
 }
 
@@ -460,6 +547,8 @@ fn remove_kind(catalog: &mut Catalog, kind: CrdKind) {
         CrdKind::Symbol => catalog.symbols.clear(),
         CrdKind::Deployment => catalog.deployments.clear(),
         CrdKind::Route => catalog.routes.clear(),
+        CrdKind::MarketData => catalog.market_data_services.clear(),
+        CrdKind::OrderSystem => catalog.order_systems.clear(),
     }
 }
 
@@ -949,7 +1038,7 @@ mod tests {
     #[test]
     fn manifests_have_status_subresources_and_namespacing() {
         let manifests = crd_manifests();
-        assert_eq!(manifests.len(), 5);
+        assert_eq!(manifests.len(), CrdKind::ALL.len());
         for manifest in manifests {
             assert_eq!(manifest["apiVersion"], "apiextensions.k8s.io/v1");
             assert_eq!(manifest["kind"], "CustomResourceDefinition");
@@ -973,8 +1062,56 @@ mod tests {
             );
         }
         let yaml = crd_manifest_yaml().unwrap();
-        assert_eq!(yaml.matches("kind: CustomResourceDefinition").count(), 5);
+        assert_eq!(
+            yaml.matches("kind: CustomResourceDefinition").count(),
+            CrdKind::ALL.len()
+        );
         assert!(yaml.contains("status: {}"));
+        assert!(yaml.contains("marketdataservices.matching.io"));
+    }
+
+    #[test]
+    fn market_data_service_round_trips_through_a_crd_object() {
+        use crate::model::{
+            MarketDataFeedGroup, MarketDataService, MarketDataServiceSpec, MarketDataTransport,
+            MarketDataTransportMode,
+        };
+
+        let service = MarketDataService {
+            name: "eu-1-feeds".to_string(),
+            namespace: "match-eu-1".to_string(),
+            spec: MarketDataServiceSpec {
+                cell: "eu-1".to_string(),
+                symbols: vec!["eurusd".to_string()],
+                feed_groups: vec![MarketDataFeedGroup {
+                    name: "fx-a".to_string(),
+                    symbols: vec!["eurusd".to_string()],
+                    stream_base: 2001,
+                    channel: Some(
+                        "aeron:udp?endpoint=239.1.2.11:24001|interface={pod_ip}|ttl=1".into(),
+                    ),
+                }],
+                image: "registry.example.com/matchengine-marketdata@sha256:abc".to_string(),
+                release: Default::default(),
+                replicas: 2,
+                transport: MarketDataTransport {
+                    mode: MarketDataTransportMode::Multicast,
+                    channel: Some("aeron:udp?endpoint=239.1.2.10:24001|interface={pod_ip}".into()),
+                    ..Default::default()
+                },
+                websocket: Default::default(),
+                autoscaling: Default::default(),
+                resources: None,
+                paused: false,
+            },
+            status: Default::default(),
+        };
+        let object = market_data_service_object(&service, DEFAULT_NAMESPACE);
+        let catalog = catalog_from_objects([object], DEFAULT_NAMESPACE);
+        assert_eq!(
+            catalog.market_data_services.get("eu-1-feeds"),
+            Some(&service)
+        );
     }
 
     #[test]
@@ -996,6 +1133,7 @@ mod tests {
         assert_eq!(restored.symbols, catalog.symbols);
         assert_eq!(restored.deployments, catalog.deployments);
         assert_eq!(restored.routes, catalog.routes);
+        assert_eq!(restored.market_data_services, catalog.market_data_services);
         // Audit is deliberately outside the CRDs.
         assert!(restored.audit.is_empty());
         assert_eq!(restored.next_audit_id, 0);

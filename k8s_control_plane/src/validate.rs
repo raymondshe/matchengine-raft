@@ -12,8 +12,9 @@ use serde::Serialize;
 
 use crate::bundle::ShardBundle;
 use crate::model::{
-    AssetClass, Cell, FeeAssetPolicy, FsyncMode, PackingMode, ShardClass, SymbolDeployment,
-    SymbolRoute, SymbolShard, TradingSymbol, WalFsync, dns_label,
+    AssetClass, Cell, FeeAssetPolicy, FsyncMode, MarketDataTransportMode, PackingMode, ShardClass,
+    SymbolDeployment, SymbolRoute, SymbolShard, TradingSymbol, WalFsync, aeron_channel_endpoint,
+    aeron_channel_param, dns_label, is_multicast_ipv4,
 };
 use crate::store::Catalog;
 
@@ -169,7 +170,507 @@ pub fn validate_catalog(catalog: &Catalog) -> Report {
         validate_shard(shard, &shard_symbols, &deployments, &routes, &mut report);
     }
     validate_symbol_ids(catalog, &mut report);
+    validate_market_data_services(catalog, &mut report);
+    validate_order_systems(catalog, &mut report);
     report
+}
+
+fn validate_market_data_services(catalog: &Catalog, report: &mut Report) {
+    let mut ws_ports: BTreeMap<(&str, u16), &str> = BTreeMap::new();
+    for service in catalog.market_data_services.values() {
+        let object = &service.name;
+        if service.name.trim().is_empty() {
+            report.error("market_data_name", object, "name must not be empty");
+        } else if dns_label(&service.name) != service.name || service.name.len() > 63 {
+            report.error(
+                "market_data_name",
+                object,
+                "name must be a lowercase DNS label of at most 63 characters (it is also a label value)",
+            );
+        }
+        if !catalog.cells.contains_key(&service.spec.cell) {
+            report.error(
+                "market_data_cell",
+                object,
+                format!("cell {} is not in the catalog", service.spec.cell),
+            );
+        }
+        if service.spec.image.trim().is_empty() {
+            report.error("market_data_image", object, "spec.image is required");
+        } else if !service.spec.image.contains("@sha256:") {
+            report.warn(
+                "market_data_image_tag",
+                object,
+                "pin the market-data image by digest in production; a mutable tag cannot gate upgrades",
+            );
+        }
+        if service.spec.replicas == 0 {
+            report.error(
+                "market_data_replicas",
+                object,
+                "replicas must be greater than zero",
+            );
+        }
+        if service.spec.autoscaling.min_replicas == 0 {
+            report.error(
+                "market_data_min_replicas",
+                object,
+                "autoscaling.minReplicas must be at least 1",
+            );
+        }
+        if service.spec.autoscaling.max_replicas != 0
+            && service.spec.autoscaling.max_replicas < service.spec.min_replicas()
+        {
+            report.error(
+                "market_data_max_replicas",
+                object,
+                "autoscaling.maxReplicas must be greater than or equal to minReplicas",
+            );
+        }
+        if !(1..=100).contains(&service.spec.autoscaling.target_cpu_utilization) {
+            report.error(
+                "market_data_target_cpu",
+                object,
+                "autoscaling.targetCpuUtilization must be between 1 and 100",
+            );
+        }
+        let cpu_request = service
+            .spec
+            .resources
+            .as_ref()
+            .map(|resources| resources.requests.cpu.as_str())
+            .unwrap_or("100m");
+        if cpu_request.is_empty() {
+            report.warn(
+                "market_data_hpa_cpu",
+                object,
+                "HPA CPU utilization needs a CPU request; the default is 100m",
+            );
+        }
+        let names = service.spec.symbol_names();
+        if names.is_empty() {
+            report.error(
+                "market_data_symbols",
+                object,
+                "declare at least one symbol or feed group",
+            );
+        }
+        let mut declared: Vec<&str> = Vec::new();
+        for group in &service.spec.feed_groups {
+            declared.extend(group.symbols.iter().map(String::as_str));
+        }
+        declared.extend(service.spec.symbols.iter().map(String::as_str));
+        let mut seen = BTreeSet::new();
+        for name in declared {
+            if !seen.insert(name) {
+                report.error(
+                    "market_data_symbol_duplicate",
+                    object,
+                    format!("symbol {name} is declared more than once"),
+                );
+            }
+        }
+        for name in &names {
+            if !catalog.symbols.contains_key(name) {
+                report.error(
+                    "market_data_symbol",
+                    object,
+                    format!("unknown symbol {name}"),
+                );
+                continue;
+            }
+            if let Some(deployment) = catalog
+                .deployments
+                .values()
+                .find(|deployment| deployment.spec.symbol_ref == *name)
+                && let Some(shard) = catalog.shards.get(&deployment.spec.shard_ref)
+                && shard.spec.release.wire_version != service.spec.release.wire_version
+            {
+                report.error(
+                    "market_data_release",
+                    object,
+                    format!(
+                        "market-data wire version {} does not match shard {} wire version {}",
+                        service.spec.release.wire_version,
+                        shard.name,
+                        shard.spec.release.wire_version
+                    ),
+                );
+            }
+        }
+
+        let mut group_names = BTreeSet::new();
+        let mut stream_ranges: Vec<(u16, u16, &str, &str)> = Vec::new();
+        let service_channel = service.spec.transport.channel.as_deref().unwrap_or("");
+        for group in &service.spec.effective_feed_groups() {
+            if group.name.trim().is_empty() || !group_names.insert(group.name.clone()) {
+                report.error(
+                    "market_data_feed_group",
+                    object,
+                    "feed group names must be non-empty and unique",
+                );
+            }
+            if group.symbols.is_empty() {
+                report.warn(
+                    "market_data_feed_group_empty",
+                    object,
+                    format!("feed group {} declares no symbols", group.name),
+                );
+            }
+            let first = group.stream_base;
+            let last = first.saturating_add(9);
+            let channel = group.channel.as_deref().unwrap_or(service_channel);
+            if first < 2001 || last == u16::MAX {
+                report.error(
+                    "market_data_stream_base",
+                    object,
+                    format!(
+                        "feed group {} stream base {first} is outside the engine range (>= 2001)",
+                        group.name
+                    ),
+                );
+            }
+            for (other_first, other_last, other_name, other_channel) in &stream_ranges {
+                if channel == *other_channel && first <= *other_last && *other_first <= last {
+                    report.error(
+                        "market_data_stream_overlap",
+                        object,
+                        format!(
+                            "feed group {} streams {first}-{last} on {channel} overlap {} streams {other_first}-{other_last}",
+                            group.name, other_name
+                        ),
+                    );
+                }
+            }
+            stream_ranges.push((first, last, group.name.as_str(), channel));
+        }
+
+        match service.spec.transport.mode {
+            MarketDataTransportMode::Multicast => {
+                let groups = service.spec.effective_feed_groups();
+                let mut channels: Vec<&str> = Vec::new();
+                for group in &groups {
+                    match group
+                        .channel
+                        .as_deref()
+                        .or(service.spec.transport.channel.as_deref())
+                    {
+                        Some(channel) => {
+                            if !channels.contains(&channel) {
+                                channels.push(channel);
+                            }
+                        }
+                        None => report.error(
+                            "market_data_channel",
+                            object,
+                            format!(
+                                "feed group {} needs its own channel or spec.transport.channel",
+                                group.name
+                            ),
+                        ),
+                    }
+                }
+                if channels.is_empty() && groups.is_empty() {
+                    report.error(
+                        "market_data_channel",
+                        object,
+                        "multicast transport requires spec.transport.channel",
+                    );
+                }
+                for channel in channels {
+                    let Some((host, _port)) = aeron_channel_endpoint(channel) else {
+                        report.error(
+                            "market_data_channel",
+                            object,
+                            format!("cannot parse endpoint from Aeron channel {channel}"),
+                        );
+                        continue;
+                    };
+                    if !is_multicast_ipv4(&host) {
+                        report.warn(
+                            "market_data_channel_unicast",
+                            object,
+                            format!(
+                                "{host} is not an IPv4 multicast address; Profile A expects 239.0.0.0/8"
+                            ),
+                        );
+                    } else if let Ok(address) = host.parse::<std::net::Ipv4Addr>()
+                        && address.octets()[3] % 2 == 0
+                    {
+                        report.error(
+                            "market_data_channel_even",
+                            object,
+                            format!(
+                                "Aeron requires an odd multicast data address; {host} has an even last octet"
+                            ),
+                        );
+                    }
+                    if aeron_channel_param(channel, "ttl").is_none() {
+                        report.warn(
+                            "market_data_channel_ttl",
+                            object,
+                            "set |ttl=1 (or higher) so multicast leaves the pod network namespace",
+                        );
+                    }
+                    match aeron_channel_param(channel, "interface") {
+                        Some("{pod_ip}") => {}
+                        Some("eth0") => report.warn(
+                            "market_data_channel_interface",
+                            object,
+                            "Aeron does not resolve interface=eth0 here; use interface={pod_ip} so each pod binds its own address",
+                        ),
+                        None => report.warn(
+                            "market_data_channel_interface",
+                            object,
+                            "set interface={pod_ip} so each pod binds its own address",
+                        ),
+                        Some(_) => {}
+                    }
+                }
+            }
+            MarketDataTransportMode::Nats => {
+                if service
+                    .spec
+                    .transport
+                    .nats_url
+                    .as_deref()
+                    .unwrap_or("")
+                    .is_empty()
+                {
+                    report.error(
+                        "market_data_nats_url",
+                        object,
+                        "NATS transport requires spec.transport.natsUrl",
+                    );
+                }
+            }
+            MarketDataTransportMode::Bridge => {}
+        }
+
+        if service.spec.websocket.port == 0 {
+            report.error(
+                "market_data_ws_port",
+                object,
+                "websocket.port must be greater than zero",
+            );
+        } else if let Some(previous) = ws_ports.insert(
+            (service.namespace.as_str(), service.spec.websocket.port),
+            service.name.as_str(),
+        ) {
+            report.error(
+                "market_data_ws_port_conflict",
+                object,
+                format!(
+                    "websocket port {} is already used by {previous} in namespace {}",
+                    service.spec.websocket.port, service.namespace
+                ),
+            );
+        }
+        if service.spec.websocket.max_connections == 0 {
+            report.error(
+                "market_data_ws_connections",
+                object,
+                "websocket.maxConnections must be greater than zero",
+            );
+        }
+        if service.spec.websocket.max_streams_per_connection == 0 {
+            report.error(
+                "market_data_ws_streams",
+                object,
+                "websocket.maxStreamsPerConnection must be greater than zero",
+            );
+        }
+    }
+
+    // The same symbol may be served by both its shard-local fast service and a
+    // global terminal service. They must consume the identical engine feed;
+    // otherwise the engine would publish on one channel while the other
+    // service subscribes elsewhere.
+    let mut feeds: BTreeMap<String, (String, String, u16)> = BTreeMap::new();
+    for service in catalog.market_data_services.values() {
+        if service.spec.transport.mode != MarketDataTransportMode::Multicast {
+            continue;
+        }
+        for group in service.spec.effective_feed_groups() {
+            let Some(channel) = group.channel.as_deref().or(service
+                .spec
+                .transport
+                .channel
+                .as_deref())
+            else {
+                continue;
+            };
+            for symbol in &group.symbols {
+                let feed = (service.name.clone(), channel.to_string(), group.stream_base);
+                if let Some(previous) = feeds.get(symbol)
+                    && (previous.1 != feed.1 || previous.2 != feed.2)
+                {
+                    report.error(
+                        "market_data_feed_conflict",
+                        &service.name,
+                        format!(
+                            "symbol {symbol} is fed by {} on {}:{} but {} declares {}:{}",
+                            previous.0, previous.1, previous.2, feed.0, feed.1, feed.2
+                        ),
+                    );
+                } else {
+                    feeds.insert(symbol.clone(), feed);
+                }
+            }
+        }
+    }
+}
+
+fn validate_order_systems(catalog: &Catalog, report: &mut Report) {
+    let mut ports: BTreeMap<(&str, u16), &str> = BTreeMap::new();
+    for system in catalog.order_systems.values() {
+        let object = &system.name;
+        if system.name.trim().is_empty()
+            || dns_label(&system.name) != system.name
+            || system.name.len() > 63
+        {
+            report.error(
+                "order_system_name",
+                object,
+                "name must be a lowercase DNS label of at most 63 characters",
+            );
+        }
+        if !catalog.cells.contains_key(&system.spec.cell) {
+            report.error(
+                "order_system_cell",
+                object,
+                format!("cell {} is not in the catalog", system.spec.cell),
+            );
+        }
+        if system.spec.image.trim().is_empty() {
+            report.error("order_system_image", object, "spec.image is required");
+        }
+        if system.spec.replicas == 0 {
+            report.error(
+                "order_system_replicas",
+                object,
+                "replicas must be greater than zero",
+            );
+        }
+        if system.spec.autoscaling.min_replicas == 0 {
+            report.error(
+                "order_system_min_replicas",
+                object,
+                "autoscaling.minReplicas must be at least 1",
+            );
+        }
+        if system.spec.autoscaling.max_replicas != 0
+            && system.spec.autoscaling.max_replicas < system.spec.min_replicas()
+        {
+            report.error(
+                "order_system_max_replicas",
+                object,
+                "autoscaling.maxReplicas must be greater than or equal to minReplicas",
+            );
+        }
+        if !(1..=100).contains(&system.spec.autoscaling.target_cpu_utilization) {
+            report.error(
+                "order_system_target_cpu",
+                object,
+                "autoscaling.targetCpuUtilization must be between 1 and 100",
+            );
+        }
+        if system.spec.port == 0 {
+            report.error(
+                "order_system_port",
+                object,
+                "port must be greater than zero",
+            );
+        } else if let Some(previous) =
+            ports.insert((system.namespace.as_str(), system.spec.port), object)
+        {
+            report.error(
+                "order_system_port_conflict",
+                object,
+                format!(
+                    "port {} is already used by {previous} in namespace {}",
+                    system.spec.port, system.namespace
+                ),
+            );
+        }
+        if system.spec.targets.is_empty() {
+            report.error(
+                "order_system_targets",
+                object,
+                "declare at least one engine/symbol target",
+            );
+        }
+        let mut seen_targets = BTreeSet::new();
+        for target in &system.spec.targets {
+            if !seen_targets.insert(target.symbol.clone()) {
+                report.error(
+                    "order_system_target_duplicate",
+                    object,
+                    format!("symbol {} is declared more than once", target.symbol),
+                );
+            }
+            if !catalog.symbols.contains_key(&target.symbol) {
+                report.error(
+                    "order_system_symbol",
+                    object,
+                    format!("unknown symbol {}", target.symbol),
+                );
+                continue;
+            }
+            if !catalog
+                .deployments
+                .values()
+                .any(|deployment| deployment.spec.symbol_ref == target.symbol)
+            {
+                report.error(
+                    "order_system_deployment",
+                    object,
+                    format!("symbol {} has no engine deployment", target.symbol),
+                );
+            }
+        }
+        let mut shard_names = BTreeSet::new();
+        let mut ranges: Vec<(u64, u64, &str)> = Vec::new();
+        for shard in &system.spec.shards {
+            if shard.name.trim().is_empty() || !shard_names.insert(shard.name.clone()) {
+                report.error(
+                    "order_system_shard",
+                    object,
+                    "shard names must be non-empty and unique",
+                );
+            }
+            if !shard.name.trim().is_empty() && dns_label(&shard.name) != shard.name {
+                report.error(
+                    "order_system_shard_name",
+                    object,
+                    format!("shard {} must be a lowercase DNS label", shard.name),
+                );
+            }
+            if shard.user_id_min > shard.user_id_max {
+                report.error(
+                    "order_system_user_range",
+                    object,
+                    format!(
+                        "shard {} has user_id_min {} greater than user_id_max {}",
+                        shard.name, shard.user_id_min, shard.user_id_max
+                    ),
+                );
+            }
+            for (other_min, other_max, other_name) in &ranges {
+                if shard.user_id_min <= *other_max && *other_min <= shard.user_id_max {
+                    report.error(
+                        "order_system_user_overlap",
+                        object,
+                        format!(
+                            "shard {} range {}-{} overlaps {other_name} range {other_min}-{other_max}",
+                            shard.name, shard.user_id_min, shard.user_id_max
+                        ),
+                    );
+                }
+            }
+            ranges.push((shard.user_id_min, shard.user_id_max, shard.name.as_str()));
+        }
+    }
 }
 
 fn validate_cell(cell: &Cell, shards: &[&SymbolShard], report: &mut Report) {
@@ -866,6 +1367,82 @@ mod tests {
     }
 
     #[test]
+    fn order_system_autoscaling_is_validated() {
+        use crate::model::{
+            OrderSystem, OrderSystemAutoscaling, OrderSystemShard, OrderSystemSpec,
+        };
+
+        let mut catalog = crate::store::demo_catalog();
+        let system = OrderSystem {
+            name: "orders".to_string(),
+            namespace: "match-eu-1".to_string(),
+            spec: OrderSystemSpec {
+                cell: "eu-1".to_string(),
+                image: "matchengine-order-system:arm64-v2".to_string(),
+                replicas: 1,
+                autoscaling: OrderSystemAutoscaling {
+                    min_replicas: 0,
+                    max_replicas: 0,
+                    target_cpu_utilization: 0,
+                },
+                port: 24300,
+                targets: vec![crate::model::OrderSystemTarget {
+                    symbol: "eurusd".to_string(),
+                    label: "EUR/USD".to_string(),
+                    product: Default::default(),
+                }],
+                shards: vec![OrderSystemShard {
+                    name: "users-0".to_string(),
+                    user_id_min: 0,
+                    user_id_max: 999,
+                }],
+                ingress: String::new(),
+                tls_secret: String::new(),
+                resources: None,
+                paused: false,
+            },
+            status: Default::default(),
+        };
+        catalog.order_systems.insert(system.name.clone(), system);
+        let report = validate_catalog(&catalog);
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|error| error.code == "order_system_min_replicas"),
+            "{}",
+            report.to_text()
+        );
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|error| error.code == "order_system_target_cpu"),
+            "{}",
+            report.to_text()
+        );
+
+        let autoscaling = &mut catalog
+            .order_systems
+            .get_mut("orders")
+            .unwrap()
+            .spec
+            .autoscaling;
+        autoscaling.min_replicas = 2;
+        autoscaling.max_replicas = 1;
+        autoscaling.target_cpu_utilization = 70;
+        let report = validate_catalog(&catalog);
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|error| error.code == "order_system_max_replicas"),
+            "{}",
+            report.to_text()
+        );
+    }
+
+    #[test]
     fn decimal_helpers() {
         assert_eq!(decimal_places("0.00001"), Some(5));
         assert_eq!(decimal_places("1"), Some(0));
@@ -1012,6 +1589,104 @@ mod tests {
         let report = validate_bundle(&bundle);
         assert!(
             report.errors.iter().any(|e| e.code == "dedicated_packing"),
+            "{}",
+            report.to_text()
+        );
+    }
+
+    fn market_data_service() -> crate::model::MarketDataService {
+        use crate::model::{
+            MarketDataFeedGroup, MarketDataService, MarketDataServiceSpec, MarketDataTransport,
+        };
+        MarketDataService {
+            name: "btc-marketdata".to_string(),
+            namespace: "match-eu-1".to_string(),
+            spec: MarketDataServiceSpec {
+                cell: "eu-1".to_string(),
+                symbols: Vec::new(),
+                feed_groups: vec![MarketDataFeedGroup {
+                    name: "btc".to_string(),
+                    symbols: vec!["btcusdt".to_string()],
+                    stream_base: 2001,
+                    channel: None,
+                }],
+                image: "registry.example.com/matchengine-marketdata@sha256:abc".to_string(),
+                release: Default::default(),
+                replicas: 2,
+                transport: MarketDataTransport {
+                    channel: Some(
+                        "aeron:udp?endpoint=239.1.2.51:24001|interface={pod_ip}|ttl=1".to_string(),
+                    ),
+                    ..Default::default()
+                },
+                websocket: Default::default(),
+                autoscaling: Default::default(),
+                resources: None,
+                paused: false,
+            },
+            status: Default::default(),
+        }
+    }
+
+    #[test]
+    fn market_data_services_validate_channel_and_symbols() {
+        let mut catalog = crate::store::demo_catalog();
+        catalog
+            .market_data_services
+            .insert("btc-marketdata".to_string(), market_data_service());
+        let report = validate_catalog(&catalog);
+        assert!(report.is_ok(), "{}", report.to_text());
+
+        catalog
+            .market_data_services
+            .get_mut("btc-marketdata")
+            .unwrap()
+            .spec
+            .transport
+            .channel = Some("aeron:udp?endpoint=239.1.2.50:24001|interface={pod_ip}".to_string());
+        let service = catalog
+            .market_data_services
+            .get_mut("btc-marketdata")
+            .unwrap();
+        service
+            .spec
+            .feed_groups
+            .push(crate::model::MarketDataFeedGroup {
+                name: "dup".to_string(),
+                symbols: vec!["btcusdt".to_string()],
+                stream_base: 2001,
+                channel: None,
+            });
+        let report = validate_catalog(&catalog);
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|issue| issue.code == "market_data_channel_even"),
+            "{}",
+            report.to_text()
+        );
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|issue| issue.code == "market_data_symbol_duplicate"),
+            "{}",
+            report.to_text()
+        );
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|issue| issue.code == "market_data_stream_overlap"),
+            "{}",
+            report.to_text()
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|issue| issue.code == "market_data_channel_ttl"),
             "{}",
             report.to_text()
         );

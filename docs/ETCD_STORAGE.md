@@ -26,7 +26,7 @@ paths as an operational map, not a stable API.
 
 ## 2. CRD definitions
 
-The five CRDs are cluster-scoped definitions stored at:
+The seven CRDs are cluster-scoped definitions stored at:
 
 ```text
 /registry/apiextensions.k8s.io/customresourcedefinitions/cells.matching.io
@@ -34,9 +34,10 @@ The five CRDs are cluster-scoped definitions stored at:
 /registry/apiextensions.k8s.io/customresourcedefinitions/tradingsymbols.matching.io
 /registry/apiextensions.k8s.io/customresourcedefinitions/symboldeployments.matching.io
 /registry/apiextensions.k8s.io/customresourcedefinitions/symbolroutes.matching.io
+/registry/apiextensions.k8s.io/customresourcedefinitions/marketdataservices.matching.io
 ```
 
-All five kinds are `matching.io/v1` and namespaced. Their status is exposed through the `/status`
+All six kinds are `matching.io/v1` and namespaced. Their status is exposed through the `/status`
 subresource. Kubernetes stores the status **inside the same object value** as the spec; `/status`
 is an API subresource, not a second etcd key. The broader design also names `ClusterTemplate`,
 `Backup` and `Operation`; those kinds are not installed by the reference implementation and
@@ -67,9 +68,11 @@ The live `match-eu-1` catalog is:
 /registry/matching.io/tradingsymbols/match-eu-1/usdjpy
 /registry/matching.io/symboldeployments/match-eu-1/{audusd,btcusdt,eurgbp,eurusd,gbpusd,nzdusd,usdjpy}-g1
 /registry/matching.io/symbolroutes/match-eu-1/{audusd,btcusdt,eurgbp,eurusd,gbpusd,nzdusd,usdjpy}
+/registry/matching.io/marketdataservices/match-eu-1/me-btcusdt-marketdata
 ```
 
-The live counts are 1 cell, 4 shards, 7 symbols, 7 deployments and 7 routes. Compact JSON for the
+The live counts are 1 cell, 4 shards, 7 symbols, 7 deployments, 7 routes and 1 market-data
+service. Compact JSON for the
 whole catalog is about 21 KB; individual objects are about 0.4–2.1 KB. Allow headroom for status,
 annotations and `managedFields`. Braces above are shorthand: each expanded name is a separate etcd
 key.
@@ -81,6 +84,7 @@ key.
 | `TradingSymbol` | `/registry/matching.io/tradingsymbols/match-eu-1/<name>` | 7 | ~4.1 KB |
 | `SymbolDeployment` | `/registry/matching.io/symboldeployments/match-eu-1/<name>` | 7 | ~4.8 KB |
 | `SymbolRoute` | `/registry/matching.io/symbolroutes/match-eu-1/<name>` | 7 | ~3.4 KB |
+| `MarketDataService` | `/registry/matching.io/marketdataservices/match-eu-1/<name>` | 1 | ~0.9 KB |
 
 These sizes are the API JSON bodies, not the exact etcd value size. The API server adds its storage
 envelope and may use protobuf; status and `managedFields` rewrite the whole value.
@@ -223,7 +227,7 @@ Implications:
 - **`managedFields` can be significant.** A StatefulSet adopted from `kubectl apply` can carry
   client-side ownership in addition to the operator's server-side apply fields. This is metadata,
   not engine state.
-- **No direct etcd clients.** The manager/operator ServiceAccounts have RBAC only for the five CRDs,
+- **No direct etcd clients.** The manager/operator ServiceAccounts have RBAC only for the seven CRDs,
   their status subresources, the Kubernetes resources the operator manages and the manager's
   read-only `nodes`/`pods` image inventory. A direct etcd connection is unsupported and would
   bypass the API server's validation, watch and audit paths.

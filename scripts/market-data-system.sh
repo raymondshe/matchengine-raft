@@ -43,8 +43,8 @@ fi
 mkdir -p "$DATA_DIR" "$EUR_AERON_DIR" "$BTC_AERON_DIR"
 
 # rusteron is feature-gated; the first build downloads precompiled static libs.
-cargo build --manifest-path match_engine/Cargo.toml --features market-data-aeron
-cargo build --manifest-path market_data_system/Cargo.toml --features aeron
+cargo build --manifest-path match_engine/Cargo.toml --features market-data-aeron,aeron-precompiled
+cargo build --manifest-path market_data_system/Cargo.toml --features aeron,aeron-precompiled
 
 start_engine() {
     id=$1

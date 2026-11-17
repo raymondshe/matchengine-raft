@@ -18,9 +18,14 @@ etcd directly.
 
 ![Kubernetes control plane manager GUI](../docs/kubernetes-control-plane.png)
 
-The reference manager GUI: shard catalog, per-shard packing mode, validation, a read-only preview
-plan tab, image upgrade, manifests, audit and engine-console links. The selected `fx-sup-01` shard
-is supervisor-mode and hosts two symbols added without restarting the existing engine processes.
+The reference manager GUI has two top-level views: **matching engine** (shard catalog, packing
+mode, validation, preview plan, image upgrade, manifests, audit and engine-console links) and
+**market data**. The market-data view has **terminal** (multi-symbol services with
+`websocket.fastOnly=false`) and **fast** (single-symbol shard services with
+`websocket.fastOnly=true`) second-level tabs. Both market-data tabs are independent of the
+selected shard.
+The selected `fx-sup-01` shard is supervisor-mode and hosts two symbols added without restarting
+the existing engine processes.
 
 ```
 k8s_control_plane/
@@ -86,7 +91,7 @@ cargo run -- plan --shard fx-eu-01 --scenario upgrade --wire-version 8
 cargo run -- seed --out examples
 ```
 
-The GUI polls `/api/v1/catalog` and the selected shard every 2 seconds, pauses while a modal is open or the tab is hidden, and shows a `live` / `stale` indicator. The shard table uses the same polling to show `rolling…`, `stopping…` and the rollout banner without a manual refresh. While a containers-mode roll is active, the banner shows a percentage (updated pods / replicas), a progress bar, and separate updated/ready counts; 100% can briefly show `finalizing` until every pod is ready.
+The GUI polls `/api/v1/catalog` and the selected shard every 2 seconds, refreshes the market-data list every sixth tick while either market-data view is active, pauses while a modal is open or the tab is hidden, and shows a `live` / `stale` indicator. The shard table uses the same polling to show `rolling…`, `stopping…` and the rollout banner without a manual refresh. While a containers-mode roll is active, the banner shows a percentage (updated pods / replicas), a progress bar, and separate updated/ready counts; 100% can briefly show `finalizing` until every pod is ready.
 
 The demo catalog contains three shards:
 
@@ -105,9 +110,41 @@ The manager has two persistence backends behind the `CatalogStore` abstraction:
 
 - **JSON/memory** (default): `serve` or `serve --state <file>` for the offline demo.
 - **CRD**: `serve --crd --crd-namespace <ns>` writes `TradingSymbol`, `SymbolShard`,
-  `SymbolDeployment`, `SymbolRoute` and `Cell` CRs through the Kubernetes API server. etcd stores
+  `SymbolDeployment`, `SymbolRoute`, `Cell` and `MarketDataService` CRs through the Kubernetes API server. etcd stores
   them underneath, but the manager never opens an etcd connection. The concrete key layout, live
   inventory and size/write guidance are in [`docs/ETCD_STORAGE.md`](../docs/ETCD_STORAGE.md).
+
+`MarketDataService` is rendered by the operator as a Deployment, Service, PDB, NetworkPolicy,
+ConfigMap, optional Ingress and `autoscaling/v2` HPA. The HPA defaults to **minReplicas 1**, maxReplicas from
+`spec.replicas` (or `spec.autoscaling.maxReplicas`) and 70% CPU; the cluster needs a metrics server
+for the CPU metric to resolve. The Deployment uses `maxUnavailable: 0` with one surge pod and a
+`preStop` drain, and the operator writes per-symbol readiness, last-frame age, subscribers and
+`GAP` counts to status. The
+service exposes a fast single-symbol profile (`/ws/<symbol>@<stream>`, 32 streams, exact delivery)
+and a terminal multi-symbol profile (`/stream?streams=...`, 1024 streams, 100 ms conflation of
+latest-value streams) on the same port; every replica serves every configured symbol. Set
+`spec.websocket.fastOnly: true` on shard-local services to render `--fast-only`, which disables
+the terminal routes. A global service can span shards by declaring one `feedGroup` per shard with
+its own `channel`; the renderer emits one `--aeron-channel` per symbol. `spec.websocket.ingress`
+and `tlsSecret` render a `networking.k8s.io/v1` Ingress for terminal `wss://` access. For a
+containers-mode shard, the renderer also adds the engine's `--market-data-aeron-*` egress flags and
+a memory-backed `/dev/shm`; the engine image must be built with
+`--build-arg CARGO_FEATURES=market-data-aeron`. Use `|interface={pod_ip}` in the
+`MarketDataService` channel; the renderer expands it to the pod's `POD_IP` for the engine
+publication. The market-data **subscriber** args strip the `interface` parameter so Aeron binds
+the wildcard address; this lets a shard fast service and the global service both receive the same
+group on a single-node lab. Do not hard-code `interface=eth0` on the publisher, which leaves the
+Aeron publication backpressured.
+Profile A (direct Aeron multicast) is the only rendered transport today; NATS and the per-pod
+bridge remain designed fallbacks. HPA/canary policy, ServiceMonitor and explicit WebSocket close
+reasons are still P1/P2 in `TODO.md`.
+
+Market-data pods are stateless. `POST /api/v1/market-data-services/{name}/upgrade` writes a new
+image (and optional release) to the CR; the operator rolls the Deployment with `maxUnavailable: 0`
+and one surge pod. The manager checks the target wire version against every source shard before
+committing, so an incompatible image is rejected without touching the running service. The
+**market data** GUI view exposes an **upgrade** button per service in its terminal and fast
+sub-tabs, backed by `GET /api/v1/images?marketDataService={name}`.
 
 Install the generated CRDs and least-privilege RBAC first:
 
@@ -131,7 +168,7 @@ A manager started with `--crd` and no existing objects seeds the built-in demo c
 
 | Data | Store |
 |---|---|
-| Desired state (`TradingSymbol`, `SymbolShard`, `SymbolDeployment`, `SymbolRoute`, `Cell`) | CRDs through the Kubernetes API server |
+| Desired state (`TradingSymbol`, `SymbolShard`, `SymbolDeployment`, `SymbolRoute`, `Cell`, `MarketDataService`) | CRDs through the Kubernetes API server |
 | Status/conditions/leader address | CRD `/status` subresource, rate-limited to one write per object per second |
 | Audit/action history | In-memory in the demo; production should use an append-only store, not etcd |
 | Engine WAL/snapshot/order book/events/market data | Engine PVC and feed, never CRDs/etcd |
@@ -159,7 +196,7 @@ PVCs/engine recovery.
 
 ## ☸️ Cell operator
 
-`match-operator` is the Lease-elected reconciler for a cell. It watches the five CRDs, renders
+`match-operator` is the Lease-elected reconciler for a cell. It watches the seven CRDs, renders
 each shard with the same deterministic renderer as the manager, and reconciles the result:
 
 - **Lease election** — `coordination.k8s.io/v1` Lease, default
@@ -231,6 +268,11 @@ The operator also drives the engine lifecycle once the workload exists:
 - **Migration** — a `Shadow` deployment with a non-overlapping `raftIdOffset` is added to the
   source leader as a learner; after catch-up the operator changes membership, switches the route,
   activates the target and drains the source. Route `state: Rollback` reverses the process.
+- **Order systems** — stateless `OrderSystem` shards are rendered as
+  Deployment/Service/PDB/Ingress/HPA. The HPA floor is one replica and its ceiling derives from
+  `spec.replicas` unless `spec.autoscaling` overrides it; the Deployment omits `spec.replicas`
+  while running so the HPA owns it and sets zero only while paused. An image change rolls each user
+  shard with `maxUnavailable: 0` and one surge pod. No Raft quorum or leader transfer is involved.
 
 The operator ServiceAccount needs `pods/delete`, PVC list/patch/delete, and CR `patch`/`update` in
 addition to list/watch; `deploy/rbac.yaml` includes them. The manager ServiceAccount additionally
@@ -244,7 +286,16 @@ bootstrap, rollout, retention, migration, status and label actions.
 | `GET` | `/` | embedded GUI |
 | `GET` | `/api/v1/health` | catalog counts and validation summary |
 | `GET` | `/api/v1/catalog` | full catalog plus validation report |
-| `GET` | `/api/v1/images?shard={name}` | selectable engine images from `Node.status.images` and running engine pods, merged with catalog references; marks the shard's configured (`current`) and running (`runningHere`) image |
+| `GET` | `/api/v1/images?shard={name}` or `?marketDataService={name}` | selectable images from `Node.status.images` and running engine/market-data pods, merged with catalog references; marks the configured (`current`) and running (`runningHere`) image |
+| `GET/POST` | `/api/v1/market-data-services` | list or upsert a `MarketDataService` desired-state object (feed groups, transport profile, image/release, replicas and WebSocket settings) |
+| `GET` | `/api/v1/market-data-services/{name}` | service detail with the WebSocket endpoint and scoped validation |
+| `GET` | `/api/v1/market-data-services/{name}/manifests` | read-only rendered Deployment/Service/PDB/NetworkPolicy/ConfigMap/Ingress/HPA list |
+| `POST` | `/api/v1/market-data-services/{name}/upgrade` | write `spec.image` and optional `spec.release` to a market-data service; validates the source-shard wire version and lets the operator roll the stateless Deployment |
+| `GET/POST` | `/api/v1/order-systems` | list or upsert an `OrderSystem`; each `spec.shards` entry is one user-ID range and `spec.targets` lists the engine symbols every shard may trade |
+| `GET` | `/api/v1/order-systems/{name}` | order-system detail with resolved shard services, user ranges and scoped validation |
+| `GET` | `/api/v1/order-systems/{name}/manifests` | rendered ConfigMap, and one Deployment/Service/PDB/Ingress/HPA per user shard |
+| — | `http://<shard>.<spec.ingress>/demo/` | the order system's own WebUI; the manager **order systems** table links each shard here and does not proxy order entry |
+| `POST` | `/api/v1/order-systems/{name}/upgrade` | write a new `spec.image`; the operator rolls the stateless user shards with `maxUnavailable: 0` one surge pod at a time |
 | `GET` | `/api/v1/shards` | shard list with per-pod CPU/memory requests, `slots`, `freeSlots`, phase and paused state |
 | `POST` | `/api/v1/shards` | reserve an empty shard from a `SymbolShard` body |
 | `POST` | `/api/v1/shards/{name}/upgrade` | write `spec.image` and `spec.release` to a shard; rejects incompatible releases and per-deployment image overrides; the operator performs the one-pod-at-a-time roll |

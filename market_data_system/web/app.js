@@ -15,10 +15,14 @@ const $ = (id) => document.getElementById(id);
 const state = {
   symbols: [],
   symbol: null,
+  // Shard-local services serve the fast single-symbol profile only.
+  fastOnly: false,
   ws: null,
   connected: false,
   // The symbol whose stream names are currently subscribed on the socket.
   subscribedSymbol: null,
+  // Symbols held on a multi-symbol terminal socket.
+  heldSymbols: new Set(),
   selected: new Set(DEFAULT_STREAMS),
   frames: [],
   trades: [],
@@ -118,6 +122,9 @@ function sendList() {
 }
 
 function defaultUrl() {
+  if (state.fastOnly && state.symbol) {
+    return `${wsBase()}/ws/${state.symbol}@bookTicker`;
+  }
   return `${wsBase()}/ws`;
 }
 
@@ -151,6 +158,7 @@ async function loadInfo() {
   try {
     const info = await (await fetch("/info")).json();
     state.symbols = Array.isArray(info.symbols) ? info.symbols : [];
+    state.fastOnly = Boolean(info.fast_only);
     // Honor the server's advertised catalogue: a public deployment exposes
     // only the Binance-compatible streams, while the demo enables extensions.
     const hasCatalogue = Array.isArray(info.streams) && info.streams.length > 0;
@@ -245,6 +253,10 @@ function setBookNote(text, warn) {
   $("book-note").className = `note${warn ? " warn" : ""}`;
 }
 
+function holdSymbols() {
+  return $("hold-symbols").checked;
+}
+
 function setSymbol(name) {
   if (!name || name === state.symbol) return;
   const previous = state.subscribedSymbol;
@@ -260,14 +272,25 @@ function setSymbol(name) {
   }
 
   const streams = [...state.selected];
-  if (previous && previous !== name) {
-    sendControl("UNSUBSCRIBE", streams.map((stream) => streamName(stream, previous)));
+  if (!holdSymbols()) {
+    for (const symbol of state.heldSymbols) {
+      if (symbol !== name) {
+        sendControl("UNSUBSCRIBE", streams.map((stream) => streamName(stream, symbol)));
+        state.heldSymbols.delete(symbol);
+      }
+    }
   }
   if (streams.length) {
     sendControl("SUBSCRIBE", streams.map((stream) => streamName(stream, name)));
   }
+  state.heldSymbols.add(name);
   state.subscribedSymbol = name;
-  setHint(`Switched to ${displaySymbol()} on the same connection (unsubscribed ${displaySymbol(previous)}, subscribed ${displaySymbol(name)}).`);
+  sendList();
+  setHint(
+    holdSymbols()
+      ? `Holding ${state.heldSymbols.size} symbols on one socket: ${[...state.heldSymbols].map(displaySymbol).join(", ")}.`
+      : `Switched to ${displaySymbol()} on the same connection (unsubscribed ${displaySymbol(previous)}, subscribed ${displaySymbol(name)}).`
+  );
 }
 
 function connect() {
@@ -296,12 +319,14 @@ function connect() {
       sendControl("SUBSCRIBE", streams.map((stream) => streamName(stream)));
     }
     state.subscribedSymbol = state.symbol;
-    setHint(`Connected; subscribed ${streams.length} stream(s) for ${displaySymbol()}.`);
+    state.heldSymbols = new Set([state.symbol]);
+    setHint(`Connected; subscribed ${streams.length} stream(s) for ${displaySymbol()}. Switch symbols to hold more on this one socket.`);
   });
   ws.addEventListener("message", (event) => handleFrame(event.data));
   ws.addEventListener("close", (event) => {
     state.connected = false;
     state.subscribedSymbol = null;
+    state.heldSymbols.clear();
     state.ws = null;
     setConnection(`closed (${event.code})`, "bad");
     $("connect").disabled = false;
@@ -317,6 +342,7 @@ function disconnect() {
   state.ws = null;
   state.connected = false;
   state.subscribedSymbol = null;
+  state.heldSymbols.clear();
   setConnection("disconnected", "");
   $("connect").disabled = false;
   $("disconnect").disabled = true;
@@ -370,13 +396,14 @@ function handleFrame(text) {
         setHint(`Control result (id ${data.id}) for ${displaySymbol()}.`);
       }
       break;
-    case "error": setHint(`Server error ${data.error?.code}: ${data.error?.msg}`, true); break;
+    case "error": setHint(`Server error ${data.code ?? data.error?.code}: ${data.msg ?? data.error?.msg}`, true); break;
   }
 }
 
 function kindOf(data) {
   if (!data || typeof data !== "object") return "unknown";
   if (data.e) return data.e;
+  if (data.code !== undefined && data.msg !== undefined) return "error";
   if (data.error) return "error";
   if (data.result !== undefined) return "result";
   if (data.bids && data.asks) return "partialDepth";
@@ -761,6 +788,17 @@ function clearAll() {
 
 function bind() {
   $("symbol").addEventListener("change", (event) => setSymbol(event.target.value));
+  $("hold-symbols").addEventListener("change", () => {
+    if (!holdSymbols() && state.ws && state.connected) {
+      for (const symbol of state.heldSymbols) {
+        if (symbol !== state.symbol) {
+          sendControl("UNSUBSCRIBE", [...state.selected].map((stream) => streamName(stream, symbol)));
+          state.heldSymbols.delete(symbol);
+        }
+      }
+      sendList();
+    }
+  });
   $("connect").addEventListener("click", connect);
   $("disconnect").addEventListener("click", disconnect);
   $("list").addEventListener("click", () => {

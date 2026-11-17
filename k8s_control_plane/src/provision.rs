@@ -325,6 +325,157 @@ pub fn upgrade_shard(
     })
 }
 
+/// Result of a market-data image update.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpgradeMarketDataResult {
+    pub service: String,
+    pub image: String,
+    pub release: Release,
+    /// Engine shards whose feeds this service consumes.
+    pub source_shards: Vec<String>,
+    pub changed: bool,
+    pub steps: Vec<LifecycleStep>,
+    pub notes: Vec<String>,
+}
+
+/// Write a new image/release to a `MarketDataService`.
+///
+/// Market-data pods are stateless, so the operator can roll the rendered Deployment with
+/// `maxUnavailable: 0` and one surge pod. The only compatibility gate is the feed wire version:
+/// every source shard must speak the same wire version as the market-data service.
+pub fn upgrade_market_data_service(
+    catalog: &mut Catalog,
+    service_name: &str,
+    image: String,
+    release: Release,
+) -> Result<UpgradeMarketDataResult, ApiError> {
+    let service = catalog
+        .market_data_services
+        .get(service_name)
+        .cloned()
+        .ok_or_else(|| {
+            ApiError::not_found(
+                "market_data_not_found",
+                format!("unknown market-data service {service_name}"),
+            )
+        })?;
+    if service.spec.paused {
+        return Err(ApiError::conflict(
+            "market_data_paused",
+            format!(
+                "market-data service {service_name} is paused; resume it before changing the image"
+            ),
+        ));
+    }
+    let image = image.trim().to_string();
+    if image.is_empty() {
+        return Err(ApiError::bad_request(
+            "image",
+            "target image must not be empty",
+        ));
+    }
+    if release.wire_version == 0 || release.snapshot_version == 0 {
+        return Err(ApiError::bad_request(
+            "release",
+            "wireVersion and snapshotVersion must be greater than zero",
+        ));
+    }
+
+    let mut source_shards = BTreeSet::new();
+    for symbol in service.spec.symbol_names() {
+        let Some(deployment) = catalog
+            .deployments
+            .values()
+            .find(|deployment| deployment.spec.symbol_ref == symbol)
+        else {
+            continue;
+        };
+        let Some(shard) = catalog.shards.get(&deployment.spec.shard_ref) else {
+            continue;
+        };
+        source_shards.insert(shard.name.clone());
+        if shard.spec.release.wire_version != release.wire_version {
+            return Err(ApiError::conflict(
+                "release_incompatible",
+                format!(
+                    "market-data wire v{} cannot read shard {} wire v{} for symbol {symbol}",
+                    release.wire_version, shard.name, shard.spec.release.wire_version
+                ),
+            ));
+        }
+    }
+
+    let changed = service.spec.image != image || service.spec.release != release;
+    if !changed {
+        return Ok(UpgradeMarketDataResult {
+            service: service_name.to_string(),
+            image,
+            release,
+            source_shards: source_shards.into_iter().collect(),
+            changed: false,
+            steps: Vec::new(),
+            notes: vec!["the service already has this image and release".to_string()],
+        });
+    }
+
+    let mut candidate = catalog.clone();
+    if let Some(target) = candidate.market_data_services.get_mut(service_name) {
+        target.spec.image = image.clone();
+        target.spec.release = release.clone();
+        target.status.phase = Phase::Pending;
+        target.status.message =
+            "image update requested; operator rolling the Deployment".to_string();
+        target.status.conditions.clear();
+    }
+    let report = validate_catalog(&candidate);
+    if !report.is_ok() {
+        return Err(ApiError::unprocessable(report));
+    }
+
+    *catalog = candidate;
+    catalog.audit(
+        "api",
+        "upgrade-market-data",
+        service_name,
+        format!(
+            "{} on market-data service {}; release wire v{} snapshot v{}; rolling update",
+            image, service_name, release.wire_version, release.snapshot_version
+        ),
+    );
+
+    Ok(UpgradeMarketDataResult {
+        service: service_name.to_string(),
+        image,
+        release,
+        source_shards: source_shards.into_iter().collect(),
+        changed: true,
+        steps: vec![
+            LifecycleStep {
+                action: "update-deployment".to_string(),
+                detail: "operator writes the new image and release to the market-data Deployment pod template"
+                    .to_string(),
+            },
+            LifecycleStep {
+                action: "rolling-update".to_string(),
+                detail: format!(
+                    "operator rolls {service_name} with maxUnavailable: 0 and one surge pod; existing WebSocket connections drain through the preStop hook"
+                ),
+            },
+            LifecycleStep {
+                action: "verify-feed".to_string(),
+                detail: "the new pod connects to every feed group and MarketDataService.status reports per-symbol readiness".to_string(),
+            },
+        ],
+        notes: vec![
+            "market-data services are stateless: no leader transfer, snapshot install or quorum gate is involved"
+                .to_string(),
+            "the renderer still requires the market-data wire version to match every source shard"
+                .to_string(),
+        ],
+    })
+}
+
 /// Place a new symbol in an explicit or automatically selected shard.
 pub fn place_symbol(
     catalog: &mut Catalog,
