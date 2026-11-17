@@ -309,6 +309,13 @@ Completed work is summarised here; detailed evidence, measurements and implement
 in git history and the linked docs. For the full history, check out `TODO.md` from an earlier commit
 (`git log -- TODO.md`).
 
+- **2026-11-17** — Market-data WebUI links and gateway reachability: the market-data tables
+  now link to `spec.websocket.ingress` (for example
+  `http://fast-ws-fx-eu-01.match-eu-1.example/`) instead of `http://127.0.0.1:<port>`, and use
+  `ws://`/`wss://` consistently. The front door labels the `ingress-nginx` namespace
+  `matching.io/role=gateway` so the rendered market-data and engine NetworkPolicies admit the
+  controller, and the demo terminal service keeps `websocket.tlsSecret` empty because the front
+  door publishes HTTP only. Manager `operator-v80`.
 - **2026-11-17** — Control-plane, engine-console and order-selector domains:
   `k8s_control_plane/deploy/web-ingress.yaml` publishes `console.match-eu-1.example` (manager GUI,
   API and per-pod engine-console proxy), `engine.match-eu-1.example` (stable engine-console origin;

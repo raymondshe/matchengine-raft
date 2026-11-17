@@ -688,11 +688,14 @@ Then open `http://console.match-eu-1.example/` for the control plane,
 `users-<n>.orders.match-eu-1.example/demo/` hosts.
 
 `deploy/ingress-nginx.yaml` is a single-controller ingress-nginx install that watches Ingresses
-without a class, so the existing objects need no annotation. `scripts/ingress-frontdoor.sh` writes an
-`nginx:alpine` proxy config that keeps the `Host` header and WebSocket upgrades, and publishes it on
-`127.0.0.1:80`. The controller Service stays `ClusterIP`; re-run `start` if that Service is
-recreated. Use `status` and `stop` for lifecycle checks, or pass another host port
-(`start 8080`) when 80 is taken.
+without a class, so the existing objects need no annotation. `scripts/ingress-frontdoor.sh` labels
+the `ingress-nginx` namespace `matching.io/role=gateway` (the rendered market-data and engine
+NetworkPolicies admit that role), writes an `nginx:alpine` proxy config that keeps the `Host`
+header and WebSocket upgrades, and publishes it on `127.0.0.1:80`. The controller Service stays
+`ClusterIP`; re-run `start` if that Service is recreated. Use `status` and `stop` for lifecycle
+checks, or pass another host port (`start 8080`) when 80 is taken. The front door is HTTP-only; keep
+a market-data service's `websocket.tlsSecret` empty in the demo so the controller does not redirect
+the `web ui` link to an unpublished 443.
 
 This path is for the local demo only. It terminates no TLS, performs no authentication or rate
 limiting, and is not a substitute for the production gateway.

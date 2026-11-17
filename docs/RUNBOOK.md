@@ -550,7 +550,9 @@ kubectl -n ingress-nginx rollout status deploy/ingress-nginx-controller --timeou
 # Control-plane console, engine-console origin and order-system selector
 kubectl apply -f k8s_control_plane/deploy/web-ingress.yaml
 
-# Publish the controller on the Mac's 127.0.0.1:80 (Docker can bind port 80 without root)
+# Publish the controller on the Mac's 127.0.0.1:80 (Docker can bind port 80 without root).
+# The script labels ingress-nginx with matching.io/role=gateway so the rendered market-data
+# and engine NetworkPolicies admit the controller.
 ./scripts/ingress-frontdoor.sh start
 
 # The console, shard links and market-data hosts now resolve through OrbStack DNS + the front door
@@ -584,6 +586,12 @@ Service by ClusterIP, so it survives controller pod restarts. Re-run `start` aft
 Service is recreated (its ClusterIP changes); `status` checks the container and the listening port,
 and `stop` removes it. If port 80 is already taken, pass another port:
 `./scripts/ingress-frontdoor.sh start 8080`.
+
+The front door publishes only plaintext HTTP. For the local demo, leave a market-data service's
+`spec.websocket.tlsSecret` empty; otherwise ingress-nginx redirects HTTP to HTTPS and the front
+door does not publish 443. The manager's **web ui** link uses `spec.websocket.ingress` (for example
+`http://fast-ws-fx-eu-01.match-eu-1.example/`), falling back to `127.0.0.1:<port>` only when no
+ingress is configured.
 
 This is demo plumbing, not a production gateway: it serves plaintext HTTP with no authentication,
 TLS termination, rate limits or NetworkPolicy for the public hosts. Use the platform ingress or

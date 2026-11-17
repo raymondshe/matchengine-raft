@@ -842,12 +842,16 @@ function renderMarketDataTable(items, kind, rowsId) {
     const phase = marketDataPhase(service);
     const phaseClass = phase === "Ready" ? "ok" : phase === "Failed" || phase === "Degraded" ? "err" : "warn";
     const ws = spec.websocket?.port ? `:${spec.websocket.port}` : "—";
-    const webUi = spec.websocket?.port ? `http://127.0.0.1:${spec.websocket.port}/` : "";
-    const wsBase = spec.websocket?.ingress
-      ? `wss://${String(spec.websocket.ingress).replace(/\/$/, "")}`
+    const wsScheme = String(spec.websocket?.tlsSecret || "").trim() ? "wss" : "ws";
+    const httpScheme = wsScheme === "wss" ? "https" : "http";
+    const webUi = spec.websocket?.ingress
+      ? `${httpScheme}://${String(spec.websocket.ingress).replace(/\/$/, "")}/`
       : spec.websocket?.port
-        ? `ws://${service.name}.${service.namespace || ""}:${spec.websocket.port}`
+        ? `http://127.0.0.1:${spec.websocket.port}/`
         : "";
+    const wsBase = spec.websocket?.ingress
+      ? `${wsScheme}://${String(spec.websocket.ingress).replace(/\/$/, "")}`
+      : "";
     const fastOnly = fastOnlyService(service);
     const wsPaths = wsBase
       ? `${kind === "terminal"
@@ -871,7 +875,7 @@ function renderMarketDataTable(items, kind, rowsId) {
       <td><div class="service-name">${esc(service.name)}</div>${fastOnly ? ' <span class="badge">fast only</span>' : ' <span class="badge ok">terminal</span>'}
         <div class="muted mono">${esc(service.namespace || "")} · ${esc(spec.cell || "—")}</div>
         <a class="mono" href="/api/v1/market-data-services/${encodeURIComponent(service.name)}/manifests" target="_blank">manifests</a>
-        ${webUi ? `<div><a class="mono" href="${esc(webUi)}" target="_blank" rel="noopener" title="Open the local port-forward WebUI">web ui</a></div>` : ""}
+        ${webUi ? `<div><a class="mono" href="${esc(webUi)}" target="_blank" rel="noopener" title="Open the market-data WebUI">web ui</a></div>` : ""}
         <div style="margin-top:6px"><button type="button" data-md-upgrade="${esc(service.name)}" style="padding:4px 8px;font:11px/1.2 var(--mono)" title="Roll a new image on this stateless market-data service">upgrade</button></div></td>
       <td><span class="badge">${esc(mode)}</span>${sourceText}${channelDetails}</td>
       <td>${ready}/${replicas}${hpa}</td>

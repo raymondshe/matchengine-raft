@@ -86,6 +86,9 @@ EOF
 start() {
   local port="${1:-80}"
   require_kubectl
+  # The rendered market-data and engine NetworkPolicies admit the gateway role. Label the
+  # controller namespace so the ingress controller can reach the feed/console ports.
+  kubectl label namespace "$NAMESPACE" matching.io/role=gateway --overwrite >/dev/null
   kubectl -n "$NAMESPACE" rollout status "deployment/$DEPLOYMENT" --timeout=180s >/dev/null
   local ip
   ip="$(controller_ip)"

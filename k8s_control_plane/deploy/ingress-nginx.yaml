@@ -14,6 +14,8 @@ metadata:
   name: ingress-nginx
   labels:
     app.kubernetes.io/name: ingress-nginx
+    # The rendered market-data and engine NetworkPolicies admit the gateway role.
+    matching.io/role: gateway
 ---
 apiVersion: v1
 kind: ServiceAccount
@@ -29,6 +31,8 @@ metadata:
   name: ingress-nginx
   labels:
     app.kubernetes.io/name: ingress-nginx
+    # The rendered market-data and engine NetworkPolicies admit the gateway role.
+    matching.io/role: gateway
 rules:
   - apiGroups: [""]
     resources: ["configmaps", "endpoints", "nodes", "pods", "secrets", "namespaces"]
@@ -64,6 +68,8 @@ metadata:
   name: ingress-nginx
   labels:
     app.kubernetes.io/name: ingress-nginx
+    # The rendered market-data and engine NetworkPolicies admit the gateway role.
+    matching.io/role: gateway
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
