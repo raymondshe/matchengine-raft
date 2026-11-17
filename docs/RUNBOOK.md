@@ -732,6 +732,11 @@ kubectl -n match-eu-1 get pods -l matching.io/cluster=fx-eu-01 \
 
 The operator applies the new template and replaces pods one at a time, transferring a leader only
 when the removal is already quorum-safe and waiting for all active engines on the replacement pod.
+It also waits for an in-flight pod to finish terminating and for its replacement to become `Ready`
+before deleting the next outdated pod, so a terminating pod cannot be counted as spare quorum. The
+roll trigger is the pod revision/image comparison, not `status.currentRevision`: with
+`updateStrategy: OnDelete` the StatefulSet controller can briefly report `currentRevision` equal to
+`updateRevision` while every pod still runs the old template.
 While pods are being replaced the shard reports `phase: Progressing`; when every pod is updated and
 ready it returns to `Ready` with `Progressing=False/Settled`.
 A blocked roll leaves the pods untouched: `ReleaseCompatible=False` means the live pods report a
@@ -763,6 +768,66 @@ record their wire/snapshot versions; then change the image/release.
 The block clears on the next reconcile once the shard has one consistent release and no pending
 image change. `mixedVersionSafe` is only valid when the target image explicitly supports mixed
 peers; do not use it to bypass a real format change.
+
+### Operator acceptance harness
+
+`scripts/operator-acceptance.sh` is the repeatable end-to-end check for the control plane. It
+creates its own `acc-*` shards in `match-eu-1`, drives the manager API and verifies the live
+Kubernetes objects and engine APIs; it never trusts the manager's simulated observation and never
+touches the demo fleet. Everything it creates is removed on exit unless `--keep` is given.
+
+```sh
+# Full matrix (about 15 minutes against the single-node OrbStack cluster).
+./scripts/operator-acceptance.sh
+
+# One or more phases.
+./scripts/operator-acceptance.sh run --phases containers,leader,roll
+./scripts/operator-acceptance.sh run --phases supervisor --keep
+
+# Read-only template checks against existing shards (containers, supervisor,
+# reserved) plus the order-system Deployments/HPAs.
+./scripts/operator-acceptance.sh render
+
+# Remove acceptance CRs, workloads and retained PVCs.
+./scripts/operator-acceptance.sh cleanup
+```
+
+Phases and evidence:
+
+| Phase | What it proves |
+|---|---|
+| `containers` | Reserved then containers render shape (StatefulSet, headless service, PDB, NetworkPolicy, ConfigMap), pod-FQDN bind/ports/ID offset, readiness, `/health`, `/read` and the first `/write`. |
+| `leader` | The console transfer action moves leadership to a named voter; every node reports the new leader; the sequence and book are identical on the new leader. |
+| `roll` | The digest-pinned reference from `/api/v1/images?shard=` rolls every pod; replacements are one at a time, ready pods never fall below quorum, the manager reports 0/33/66/100, the operator logs one deletion per pod and transfers leadership when needed; rolling back to the tag repeats the checks. The book survives both rolls. |
+| `stopstart` | Shutdown disables the route, removes the StatefulSet and pods but keeps the PVCs (UIDs unchanged); start recreates the StatefulSet from the same PVCs and the sequence/book survive. |
+| `supervisor` | The supervisor ConfigMap/`--max-processes` template; adding a second symbol updates `processes.json` and starts a child without restarting the first (PID continuity); stopping/restarting the second child leaves the first serving; the second child recovers its retained order. |
+| `reserved` | A shard with no process renders only ConfigMap/PDB/NetworkPolicy, reports `Reserved`, and drops with `mode: reserved` and no PVCs. |
+| `migration` | A shadow deployment uses `raftIdOffset = source offset + replicas`; the route transitions `Shadow → Cutover → Active`, the source drains, the target serves the same sequence/book and accepts a new write; patching `state: Rollback` restores the source voters, both orders and the post-cutover write, and disables the target. |
+| `adoption` | With the operator scaled to zero, the rendered manifests are applied by hand; after scaling the operator up it bootstraps the group without recreating the StatefulSet, PVCs or pods (UIDs compared) and the engine is usable. |
+
+`render` also asserts the order-system render: one Deployment/Service/PDB/Ingress and one HPA per
+user shard, a one-replica HPA floor with a 70% CPU target, `maxUnavailable: 0` with one surge pod,
+and no `spec.replicas` in the rendered Deployment (the HPA owns it). It checks the live HPAs keep
+their one-replica floor as well.
+
+The harness starts a manager port-forward on `18099` when the manager is not already reachable; use
+`--manager URL`, `--namespace`, `--control-namespace`, `--operator`, `--prefix`, `--base-port`,
+`--timeout` and `--roll-timeout` to point it elsewhere. `--phases` accepts
+`containers,leader,roll,stopstart,supervisor,reserved,migration,adoption`. The default symbol IDs
+are 91-95 and the default ports start at 26201, so a run does not collide with the demo fleet.
+
+`cleanup` removes every `acc-*` shard, deployment, route, symbol, workload and retained PVC. The
+local operator runs with `--retention-seconds 0`, so an orphaned PVC is marked `manual` instead of
+being deleted automatically; the harness deletes the labelled acceptance PVCs explicitly.
+
+The supervisor phase depends on kubelet ConfigMap propagation (up to about a minute per projected
+volume update), and each image roll waits for the terminating pod's grace period, so the full run
+takes about 15 minutes. The harness has no metrics-server dependency; HPA CPU scaling and CSI
+volume snapshots remain separate validation items.
+
+Latest run on the OrbStack demo (2026-11-17, `operator-v78`): all eight phases passed in 889s,
+including 0→1→2→3 pod replacement progress with 0/33/66/100 manager percentages in both roll
+directions and unchanged StatefulSet/PVC/pod UIDs during adoption.
 
 ### Market-data service
 

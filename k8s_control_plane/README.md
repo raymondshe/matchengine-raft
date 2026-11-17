@@ -268,8 +268,13 @@ The operator also drives the engine lifecycle once the workload exists:
   hosts retains a healthy Raft quorum. In supervisor mode every active child on the pod must remain
   quorate and both child deployments must be ready before the next deletion. A leader pod is
   transferred only when its removal is already quorum-safe; the deletion happens on the next
-  reconcile. This handles image/resource changes as well as adding, removing and re-adding
-  containers without a bootstrap deadlock.
+  reconcile. Before deleting the next pod it also waits for any in-flight rollout pod to disappear
+  and for every already-replaced pod to become `Ready`; a terminating pod still counts as healthy
+  in the observation, so without that gate one reconcile could take two voters down. The roll
+  trigger is the pod revision/image comparison, not `status.currentRevision`: with
+  `updateStrategy: OnDelete` the StatefulSet controller can briefly report `currentRevision` equal
+  to `updateRevision` while every pod still runs the old template. This handles image/resource
+  changes as well as adding, removing and re-adding containers without a bootstrap deadlock.
 - **Fast termination** — the engine binary handles SIGTERM/SIGINT as PID 1, so a containers-mode
   pod drains immediately instead of waiting for Kubernetes' 60-second grace period and SIGKILL.
 - **Retention** — orphaned shard PVCs are labeled and annotated with
@@ -747,6 +752,20 @@ second symbol, stopping it, re-adding it, image and config rolls, with the per-p
 leader handoff. The root crate adds `tests/cluster/test_supervisor.rs` (add/remove PID stability,
 restart backoff, max-child backpressure, orphan cleanup) and `tests/cluster/test_shutdown.rs`
 (prompt SIGTERM shutdown of the real engine process).
+
+`scripts/operator-acceptance.sh` is the repeatable live acceptance matrix for the whole control
+plane. `render` re-checks the containers, supervisor and reserved templates against existing
+shards without mutating anything, and asserts the order-system render (one Deployment/HPA per user
+shard, a one-replica HPA floor with a 70% CPU target, `maxUnavailable: 0` with one surge pod, and no
+Deployment `spec.replicas`); `run` creates private `acc-*` shards and exercises containers
+readiness/write, explicit leadership transfer, digest-pinned image roll and rollback (one-at-a-time
+pod replacements, quorum-safe readiness and manager 0/33/66/100 percentages), stop/start PVC and
+book continuity, supervisor zero-impact add/stop/start with child PID continuity, reserved
+create/drop, migration with a non-overlapping `raftIdOffset` and rollback, and brownfield adoption
+without recreating the StatefulSet, PVCs or pods. `cleanup` removes every acceptance CR, workload
+and retained PVC. The full eight-phase run against the OrbStack demo passed in 889s on
+`operator-v78`; the harness also found the rollout defects now covered by the serialization gate in
+the **Shard rolls** bullet.
 
 The crate is standalone (`[workspace]` in its `Cargo.toml`) but has a dedicated
 `k8s-control-plane` job in `.github/workflows/ci.yml` that runs fmt, Clippy and

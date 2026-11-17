@@ -17,10 +17,15 @@ RUN apt-get update \
 
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
+# Fetch dependencies in their own layer so source edits rebuild only the crate.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    cargo fetch --locked
+
 COPY src ./src
 COPY static ./static
 
-RUN cargo build --release --bin k8s-control-plane --bin match-operator
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    cargo build --release --bin k8s-control-plane --bin match-operator
 
 FROM debian:bookworm-slim AS runtime
 

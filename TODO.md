@@ -51,24 +51,21 @@ await the write response.
    console-proxy authorization, destructive-action approvals, namespace-qualified paths,
    idempotency keys, pagination and dry-run diffs, plus NetworkPolicy tests and Pod Security
    Standards. The demo manager currently has no auth.
-3. **Repeatable operator acceptance harness.** Script the containers/supervisor/reserved/migration/
-   adoption/digest-pinning/stop-start/rollback flows with assertions for the rendered template,
-   rollout percentage, leader transfer, readiness and data continuity.
-4. **Manager deployment packaging.** Check in Deployment/Service/RBAC/NetworkPolicy/Pod Security,
+3. **Manager deployment packaging.** Check in Deployment/Service/RBAC/NetworkPolicy/Pod Security,
    Helm/Kustomize, digest-pinned image publication and CRD/etcd backup integration. The live demo
    still depends on a local image, an `emptyDir` and a port-forward.
-5. **Observability and HPA metrics.** Add a Prometheus text bridge for the engine's JSON
+4. **Observability and HPA metrics.** Add a Prometheus text bridge for the engine's JSON
    `/metrics`, operator reconcile/rollout metrics, alert rules, dashboards and log shipping. Install
    a metrics-server or Prometheus adapter so the market-data HPAs and the four order-system HPAs can
    report CPU and actually scale; today the targets show `<unknown>` and only the min-1 floor is
    enforced.
-6. **Gateway and public-edge integration.** Route from `SymbolRoute.status` with shadow/cutover/
+5. **Gateway and public-edge integration.** Route from `SymbolRoute.status` with shadow/cutover/
    drain, retries and a canary path, then run a tested client cutover. Terminate TLS for the
    terminal market-data host and the order-system WebUI/API, authenticate and rate-limit WebSocket
    and order clients, keep Aeron internal, and document the gateway/Ingress boundary. The demo now
    runs a local ingress-nginx controller plus a Docker front door on port 80, but that is
    plaintext demo plumbing, not a production gateway.
-7. **Market-data production readiness.** Validate Profile A on a multi-node multicast-capable
+6. **Market-data production readiness.** Validate Profile A on a multi-node multicast-capable
    CNI/VPC (Cilium/Isovalent or Multus plus AWS Transit Gateway); the default EKS VPC CNI cannot run
    it. Define the topology rule for multiple replicas/subscribers on one node: two pods joining the
    same group on the single-node lab can transiently starve one feed, so prefer one subscriber per
@@ -288,6 +285,23 @@ shard services and the global terminal service are live; see History. Remaining 
 Completed work is summarised here; detailed evidence, measurements and implementation notes remain
 in git history and the linked docs. For the full history, check out `TODO.md` from an earlier commit
 (`git log -- TODO.md`).
+
+- **2026-11-17** — Repeatable operator acceptance harness:
+  `scripts/operator-acceptance.sh` drives `run`/`render`/`cleanup` against the live OrbStack fleet
+  and asserts rendered templates, readiness, order write/read, explicit leadership transfer,
+  digest-pinned image roll and rollback (one-pod-at-a-time replacements plus manager rollout
+  percentages), stop/start PVC and book continuity, supervisor zero-impact add/stop/start PID
+  continuity, reserved create/drop, cross-shard migration with a non-overlapping `raftIdOffset` and
+  rollback, and brownfield adoption without recreating the StatefulSet, PVCs or pods. `render` also
+  checks the order-system Deployments/HPAs (one-replica floor, 70% CPU target, `maxUnavailable: 0`
+  one-surge rollout and no Deployment `spec.replicas`). The full eight-phase run passed in 889s on
+  `operator-v78`; `cleanup` also removes retained acceptance PVCs after the catalog record is gone.
+  The harness found and fixed two rollout defects: terminating pods still counted as healthy, so the
+  operator could delete a second voter before the first replacement was ready, and the
+  `currentRevision == updateRevision` fast path could skip a rollback after an `OnDelete` template
+  change. The operator now serializes deletions on the in-flight pod and its Ready replacement, and
+  decides from pod revisions/images rather than the status fast path. The control-plane Dockerfile
+  fetches dependencies in a cached layer.
 
 - **2026-11-17** — Local ingress path for the demo hosts: `k8s_control_plane/deploy/ingress-nginx.yaml`
   installs one class-less ingress-nginx controller so the rendered order-system and market-data
