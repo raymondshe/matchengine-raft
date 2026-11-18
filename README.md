@@ -279,9 +279,10 @@ of single-symbol engines and their four-voter process instances across shards an
 
 ![Kubernetes control plane manager GUI](./docs/kubernetes-control-plane.png)
 
-The manager GUI: shard catalog, supervisor/containers packing modes, validation, reconcile plan,
-manifests, audit and engine-console links. The selected `fx-sup-01` shard is supervisor-mode and
-hosts `eurgbp` and `nzdusd`; both were added without restarting the running engines.
+The manager GUI's **matching engine** view: the live `fx-eu-01` shard hosts `eurusd` and
+`gbpusd`, both Ready, with per-pod requests, placement and release validation, per-process console
+links and observed leaders. The manager also has **market data** (terminal and fast WebSocket
+tiers) and **order systems** (user-ID shards, Demo order desk links and an image picker) views.
 
 ## 🔒 Security and deployment boundary
 
