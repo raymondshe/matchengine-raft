@@ -931,6 +931,12 @@ docker build --platform linux/arm64 -f market_data_system/docker/k8s.Dockerfile 
   -t matchengine-marketdata:aeron-arm64-v7 .
 ```
 
+The OrbStack lab uses local-only image tags. If the node hits `DiskPressure`, the kubelet image
+GC can remove tags that are not currently used by a container; pods then fall into
+`ImagePullBackOff` because there is no registry to pull from. Keep `docker system df` and the node's
+ephemeral-storage headroom healthy (prune builder cache and old tags), or publish the images to a
+local registry before a large rollout.
+
 Switch the CR (the renderer ignores per-group `channel` values in NATS mode):
 
 ```sh

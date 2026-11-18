@@ -72,7 +72,9 @@ write response.
    data path.
 5. **Manager deployment packaging.** Check in Deployment/Service/RBAC/NetworkPolicy/Pod Security,
    Helm/Kustomize, digest-pinned image publication and CRD/etcd backup integration. The demo still
-   depends on a local image, an `emptyDir` and a port-forward, which blocks a clean install.
+   depends on local-only image tags, an `emptyDir` and a port-forward, which blocks a clean install;
+   a `DiskPressure` image GC removed those tags during the 2026-11-18 rollout, so publish to a local
+   registry or add an explicit `docker save`/`load` step before the next fleet roll.
 6. **Market-data production readiness.** Couple symbol create/migrate/stop to both the fast and
    global symbol sets and the `SymbolRoute`, wait for the new feed before publishing and drain old
    WebSocket sessions. Profile N (direct NATS) is now the single-node fallback and removes the
