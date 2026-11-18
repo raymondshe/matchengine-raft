@@ -317,9 +317,28 @@ fn validate_market_data_services(catalog: &Catalog, report: &mut Report) {
                     format!("feed group {} declares no symbols", group.name),
                 );
             }
+            if service.spec.transport.mode == MarketDataTransportMode::Nats
+                && group.symbols.len() > 1
+            {
+                report.error(
+                    "market_data_nats_group",
+                    object,
+                    format!(
+                        "NATS feed group {} must contain exactly one symbol; the subject has no symbol token",
+                        group.name
+                    ),
+                );
+            }
             let first = group.stream_base;
             let last = first.saturating_add(9);
-            let channel = group.channel.as_deref().unwrap_or(service_channel);
+            // NATS subjects include the feed-group name, so two groups with
+            // the same stream base do not collide unless their names match
+            // (names are already checked to be unique above).
+            let channel = if service.spec.transport.mode == MarketDataTransportMode::Multicast {
+                group.channel.as_deref().unwrap_or(service_channel)
+            } else {
+                group.name.as_str()
+            };
             if first < 2001 || last == u16::MAX {
                 report.error(
                     "market_data_stream_base",
@@ -429,18 +448,24 @@ fn validate_market_data_services(catalog: &Catalog, report: &mut Report) {
                 }
             }
             MarketDataTransportMode::Nats => {
-                if service
+                let url = service
                     .spec
                     .transport
                     .nats_url
                     .as_deref()
                     .unwrap_or("")
-                    .is_empty()
-                {
+                    .trim();
+                if url.is_empty() {
                     report.error(
                         "market_data_nats_url",
                         object,
                         "NATS transport requires spec.transport.natsUrl",
+                    );
+                } else if !(url.starts_with("nats://") || url.starts_with("tls://")) {
+                    report.error(
+                        "market_data_nats_url",
+                        object,
+                        format!("NATS URL {url} must start with nats:// or tls://"),
                     );
                 }
             }
@@ -486,6 +511,31 @@ fn validate_market_data_services(catalog: &Catalog, report: &mut Report) {
     // global terminal service. They must consume the identical engine feed;
     // otherwise the engine would publish on one channel while the other
     // service subscribes elsewhere.
+    let mut nats_feeds: BTreeMap<String, (String, u16)> = BTreeMap::new();
+    for service in catalog.market_data_services.values() {
+        if service.spec.transport.mode != MarketDataTransportMode::Nats {
+            continue;
+        }
+        for group in service.spec.effective_feed_groups() {
+            for symbol in &group.symbols {
+                if let Some(previous) = nats_feeds.get(symbol) {
+                    if previous.1 != group.stream_base {
+                        report.error(
+                            "market_data_nats_stream_conflict",
+                            &service.name,
+                            format!(
+                                "symbol {symbol} uses NATS stream base {} in {} but {} in {}",
+                                previous.1, previous.0, group.stream_base, service.name
+                            ),
+                        );
+                    }
+                } else {
+                    nats_feeds.insert(symbol.clone(), (service.name.clone(), group.stream_base));
+                }
+            }
+        }
+    }
+
     let mut feeds: BTreeMap<String, (String, String, u16)> = BTreeMap::new();
     for service in catalog.market_data_services.values() {
         if service.spec.transport.mode != MarketDataTransportMode::Multicast {
@@ -1687,6 +1737,61 @@ mod tests {
                 .warnings
                 .iter()
                 .any(|issue| issue.code == "market_data_channel_ttl"),
+            "{}",
+            report.to_text()
+        );
+    }
+
+    #[test]
+    fn market_data_nats_requires_a_valid_url() {
+        let mut catalog = crate::store::demo_catalog();
+        let mut service = market_data_service();
+        service.spec.transport.mode = MarketDataTransportMode::Nats;
+        service.spec.transport.channel = None;
+        service.spec.transport.nats_url = None;
+        catalog
+            .market_data_services
+            .insert("btc-marketdata".to_string(), service);
+        let report = validate_catalog(&catalog);
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|issue| issue.code == "market_data_nats_url"),
+            "{}",
+            report.to_text()
+        );
+
+        catalog
+            .market_data_services
+            .get_mut("btc-marketdata")
+            .unwrap()
+            .spec
+            .transport
+            .nats_url = Some("http://nats:4222".to_string());
+        let report = validate_catalog(&catalog);
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|issue| issue.code == "market_data_nats_url"),
+            "{}",
+            report.to_text()
+        );
+
+        catalog
+            .market_data_services
+            .get_mut("btc-marketdata")
+            .unwrap()
+            .spec
+            .transport
+            .nats_url = Some("nats://nats:4222".to_string());
+        let report = validate_catalog(&catalog);
+        assert!(
+            !report
+                .errors
+                .iter()
+                .any(|issue| issue.code == "market_data_nats_url"),
             "{}",
             report.to_text()
         );

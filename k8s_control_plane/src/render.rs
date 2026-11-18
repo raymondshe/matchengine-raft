@@ -72,7 +72,16 @@ struct Ctx<'a> {
 
 #[derive(Debug, Clone)]
 struct MarketDataEgress {
-    channel: String,
+    mode: MarketDataTransportMode,
+    channel: Option<String>,
+    nats_url: Option<String>,
+    nats_subject_prefix: Option<String>,
+    stream_base: u16,
+}
+
+#[derive(Debug, Clone)]
+struct NatsFeed {
+    prefix: String,
     stream_base: u16,
 }
 
@@ -91,6 +100,14 @@ impl<'a> Ctx<'a> {
 
     fn supervisor(&self) -> bool {
         self.shard.spec.packing.mode == PackingMode::Supervisor
+    }
+
+    /// Whether any symbol in this shard publishes through Aeron and therefore
+    /// needs the in-memory media-driver volume.
+    fn uses_aeron(&self) -> bool {
+        self.market_data
+            .values()
+            .any(|egress| egress.mode == MarketDataTransportMode::Multicast)
     }
 
     fn storage_class(&self) -> String {
@@ -198,6 +215,58 @@ fn metadata(ctx: &Ctx<'_>, name: &str, labels: &BTreeMap<String, String>) -> Val
     })
 }
 
+/// Canonical NATS subject prefix (`md.<cell>.<feed-group>`) for one symbol.
+///
+/// Every NATS `MarketDataService` that covers a symbol must subscribe to the
+/// same prefix as the engine publisher. The smallest service wins (the same
+/// rank rule used for the engine egress), so a shard-local fast service and a
+/// global terminal service share one subject tree even when their local feed
+/// group names differ.
+fn nats_feed(catalog: &Catalog, cell: &str, symbol: &str) -> Option<NatsFeed> {
+    let mut best: Option<(usize, String, String, String, u16)> = None;
+    for service in catalog.market_data_services.values() {
+        if service.spec.paused
+            || service.spec.cell != cell
+            || service.spec.transport.mode != MarketDataTransportMode::Nats
+        {
+            continue;
+        }
+        let base = service
+            .spec
+            .transport
+            .subject_prefix
+            .trim()
+            .trim_end_matches('.');
+        let base = if base.is_empty() { "md" } else { base };
+        let rank = service.spec.symbol_names().len();
+        for group in service.spec.effective_feed_groups() {
+            if !group.symbols.iter().any(|name| name == symbol) {
+                continue;
+            }
+            let replace =
+                best.as_ref()
+                    .is_none_or(|(current_rank, current_name, current_group, _, _)| {
+                        (rank, service.name.as_str(), group.name.as_str())
+                            < (*current_rank, current_name.as_str(), current_group.as_str())
+                    });
+            if replace {
+                best = Some((
+                    rank,
+                    service.name.clone(),
+                    group.name.clone(),
+                    base.to_string(),
+                    group.stream_base,
+                ));
+            }
+            break;
+        }
+    }
+    best.map(|(_, _, group, base, stream_base)| NatsFeed {
+        prefix: format!("{base}.{cell}.{group}"),
+        stream_base,
+    })
+}
+
 /// Render every object for one shard. Returns 422 with the validation report when the catalog
 /// cannot produce a safe manifest set.
 pub fn render_shard(
@@ -273,7 +342,7 @@ pub fn render_shard(
     // re-point an engine publication.
     let mut market_data: BTreeMap<String, (usize, String, MarketDataEgress)> = BTreeMap::new();
     for service in catalog.market_data_services.values() {
-        if service.spec.transport.mode != MarketDataTransportMode::Multicast {
+        if service.spec.paused || service.spec.transport.mode == MarketDataTransportMode::Bridge {
             continue;
         }
         let rank = service.spec.symbol_names().len();
@@ -282,9 +351,11 @@ pub fn render_shard(
                 .channel
                 .as_deref()
                 .or(service.spec.transport.channel.as_deref());
-            let Some(channel) = channel else {
+            if service.spec.transport.mode == MarketDataTransportMode::Multicast
+                && channel.is_none()
+            {
                 continue;
-            };
+            }
             for symbol_name in &group.symbols {
                 if !deployments
                     .iter()
@@ -292,9 +363,28 @@ pub fn render_shard(
                 {
                     continue;
                 }
-                let candidate = MarketDataEgress {
-                    channel: channel.to_string(),
-                    stream_base: group.stream_base,
+                let candidate = if service.spec.transport.mode == MarketDataTransportMode::Nats {
+                    let Some(feed) = nats_feed(catalog, &service.spec.cell, symbol_name) else {
+                        continue;
+                    };
+                    MarketDataEgress {
+                        mode: MarketDataTransportMode::Nats,
+                        channel: None,
+                        nats_url: service.spec.transport.nats_url.clone(),
+                        nats_subject_prefix: Some(feed.prefix),
+                        stream_base: feed.stream_base,
+                    }
+                } else {
+                    let Some(channel) = channel else {
+                        continue;
+                    };
+                    MarketDataEgress {
+                        mode: MarketDataTransportMode::Multicast,
+                        channel: Some(channel.to_string()),
+                        nats_url: None,
+                        nats_subject_prefix: None,
+                        stream_base: group.stream_base,
+                    }
                 };
                 let replace =
                     market_data
@@ -392,14 +482,24 @@ fn config_map(ctx: &Ctx<'_>) -> Value {
                 "raftIdOffset": deployment.spec.raft_id_offset,
             });
             if let Some(egress) = ctx.market_data.get(&symbol.name) {
-                process["marketData"] = json!({
-                    "channel": egress.channel,
+                let mut market_data = json!({
                     "streamBase": egress.stream_base,
-                    "dir": format!("/dev/shm/aeron-{}", dns_label(&symbol.name)),
-                    "embedded": true,
                     "heartbeatMs": 1000,
                     "statusEvery": 10,
                 });
+                if let Some(channel) = &egress.channel {
+                    market_data["channel"] = json!(channel);
+                    market_data["dir"] =
+                        json!(format!("/dev/shm/aeron-{}", dns_label(&symbol.name)));
+                    market_data["embedded"] = json!(true);
+                }
+                if let Some(url) = &egress.nats_url {
+                    market_data["natsUrl"] = json!(url);
+                }
+                if let Some(prefix) = &egress.nats_subject_prefix {
+                    market_data["natsSubjectPrefix"] = json!(prefix);
+                }
+                process["marketData"] = market_data;
             }
             process
         })
@@ -640,6 +740,21 @@ fn network_policy(ctx: &Ctx<'_>) -> Value {
                 "ports": ports,
             }));
     }
+    // Profile N: the engine opens one TCP connection to NATS. The default
+    // cluster policy is deny-all egress, so this rule is required.
+    if ctx
+        .market_data
+        .values()
+        .any(|egress| egress.mode == MarketDataTransportMode::Nats)
+    {
+        policy["spec"]["egress"]
+            .as_array_mut()
+            .expect("egress array")
+            .push(json!({
+                "to": [{ "ipBlock": { "cidr": "0.0.0.0/0" } }],
+                "ports": [{ "protocol": "TCP", "port": 4222 }],
+            }));
+    }
     policy
 }
 
@@ -647,7 +762,13 @@ fn market_data_udp_ports(ctx: &Ctx<'_>) -> Vec<Value> {
     let ports: std::collections::BTreeSet<u16> = ctx
         .market_data
         .values()
-        .filter_map(|egress| aeron_channel_endpoint(&egress.channel).map(|(_, port)| port))
+        .filter_map(|egress| {
+            egress
+                .channel
+                .as_deref()
+                .and_then(aeron_channel_endpoint)
+                .map(|(_, port)| port)
+        })
         .collect();
     ports
         .into_iter()
@@ -668,7 +789,7 @@ fn stateful_set(ctx: &Ctx<'_>) -> Value {
     let pod_labels = ctx.labels();
 
     let mut volumes = vec![json!({ "name": "tmp", "emptyDir": {} })];
-    if !ctx.market_data.is_empty() {
+    if ctx.uses_aeron() {
         volumes.push(json!({
             "name": "aeron",
             "emptyDir": { "medium": "Memory", "sizeLimit": "256Mi" },
@@ -909,7 +1030,7 @@ fn supervisor_stateful_set(ctx: &Ctx<'_>) -> Value {
             },
         }),
     ];
-    if !ctx.market_data.is_empty() {
+    if ctx.uses_aeron() {
         volumes.push(json!({
             "name": "aeron",
             "emptyDir": { "medium": "Memory", "sizeLimit": "256Mi" },
@@ -992,7 +1113,7 @@ fn supervisor_volume_mounts(ctx: &Ctx<'_>) -> Vec<Value> {
         json!({ "name": "tmp", "mountPath": "/tmp" }),
         json!({ "name": "config", "mountPath": "/etc/match", "readOnly": true }),
     ];
-    if !ctx.market_data.is_empty() {
+    if ctx.uses_aeron() {
         mounts.push(json!({ "name": "aeron", "mountPath": "/dev/shm" }));
     }
     mounts
@@ -1065,25 +1186,44 @@ fn container(ctx: &Ctx<'_>, deployment: &SymbolDeployment, symbol: &TradingSymbo
         json!(ctx.shard.spec.quotas.per_process.max_events.to_string()),
     ];
     if let Some(egress) = ctx.market_data.get(&symbol.name) {
-        args.extend([
-            json!("--market-data-aeron-channel"),
-            json!(egress.channel.replace("{pod_ip}", "$(POD_IP)")),
-            json!("--market-data-aeron-embedded-driver"),
-            json!("--market-data-aeron-dir"),
-            json!(format!("/dev/shm/aeron-{}", dns_label(&symbol.name))),
-            json!("--market-data-aeron-stream-base"),
-            json!(egress.stream_base.to_string()),
-            json!("--market-data-aeron-heartbeat-ms"),
-            json!("1000"),
-            json!("--market-data-status-every"),
-            json!("10"),
-        ]);
+        if let Some(url) = &egress.nats_url {
+            args.extend([
+                json!("--market-data-nats-url"),
+                json!(url),
+                json!("--market-data-nats-subject-prefix"),
+                json!(egress.nats_subject_prefix.clone().unwrap_or_default()),
+                json!("--market-data-nats-stream-base"),
+                json!(egress.stream_base.to_string()),
+                json!("--market-data-aeron-heartbeat-ms"),
+                json!("1000"),
+                json!("--market-data-status-every"),
+                json!("10"),
+            ]);
+        } else if let Some(channel) = &egress.channel {
+            args.extend([
+                json!("--market-data-aeron-channel"),
+                json!(channel.replace("{pod_ip}", "$(POD_IP)")),
+                json!("--market-data-aeron-embedded-driver"),
+                json!("--market-data-aeron-dir"),
+                json!(format!("/dev/shm/aeron-{}", dns_label(&symbol.name))),
+                json!("--market-data-aeron-stream-base"),
+                json!(egress.stream_base.to_string()),
+                json!("--market-data-aeron-heartbeat-ms"),
+                json!("1000"),
+                json!("--market-data-status-every"),
+                json!("10"),
+            ]);
+        }
     }
     let mut volume_mounts = vec![
         json!({ "name": "data", "mountPath": "/data" }),
         json!({ "name": "tmp", "mountPath": "/tmp" }),
     ];
-    if ctx.market_data.contains_key(&symbol.name) {
+    if ctx
+        .market_data
+        .get(&symbol.name)
+        .is_some_and(|egress| egress.mode == MarketDataTransportMode::Multicast)
+    {
         volume_mounts.push(json!({ "name": "aeron", "mountPath": "/dev/shm" }));
     }
 
@@ -1144,7 +1284,8 @@ struct MarketDataCtx<'a> {
 struct MarketDataSymbol<'a> {
     symbol: &'a TradingSymbol,
     stream_base: u16,
-    channel: String,
+    channel: Option<String>,
+    nats_subject_prefix: Option<String>,
 }
 
 fn market_data_labels(ctx: &MarketDataCtx<'_>) -> BTreeMap<String, String> {
@@ -1229,7 +1370,8 @@ fn market_data_config(ctx: &MarketDataCtx<'_>) -> Value {
                                 "base": entry.symbol.spec.base,
                                 "quote": entry.symbol.spec.quote,
                                 "streamBase": entry.stream_base,
-                                "channel": aeron_receiver_channel(&entry.channel),
+                                "channel": entry.channel.as_deref().map(aeron_receiver_channel),
+                                "natsSubjectPrefix": entry.nats_subject_prefix,
                             })
                         })
                 })
@@ -1292,20 +1434,48 @@ fn market_data_container(ctx: &MarketDataCtx<'_>) -> Value {
             entry.symbol.spec.quote.code
         )));
     }
-    for entry in &ctx.symbols {
-        args.push(json!("--aeron-channel"));
-        args.push(json!(aeron_receiver_channel(
-            &entry.channel.replace("{pod_ip}", "$(POD_IP)")
-        )));
-    }
-    for entry in &ctx.symbols {
-        args.push(json!("--aeron-stream-base"));
-        args.push(json!(entry.stream_base.to_string()));
+    match ctx.service.spec.transport.mode {
+        MarketDataTransportMode::Multicast => {
+            for entry in &ctx.symbols {
+                args.push(json!("--aeron-channel"));
+                args.push(json!(aeron_receiver_channel(
+                    &entry
+                        .channel
+                        .as_deref()
+                        .unwrap_or_default()
+                        .replace("{pod_ip}", "$(POD_IP)")
+                )));
+            }
+            for entry in &ctx.symbols {
+                args.push(json!("--aeron-stream-base"));
+                args.push(json!(entry.stream_base.to_string()));
+            }
+            args.extend([
+                json!("--aeron-embedded-driver"),
+                json!("--aeron-dir"),
+                json!("/dev/shm/aeron"),
+            ]);
+        }
+        MarketDataTransportMode::Nats => {
+            args.push(json!("--nats-url"));
+            args.push(json!(
+                ctx.service
+                    .spec
+                    .transport
+                    .nats_url
+                    .clone()
+                    .unwrap_or_default()
+            ));
+            for entry in &ctx.symbols {
+                args.push(json!("--nats-subject-prefix"));
+                args.push(json!(entry.nats_subject_prefix.clone().unwrap_or_default()));
+                args.push(json!("--nats-stream-base"));
+                args.push(json!(entry.stream_base.to_string()));
+            }
+        }
+        MarketDataTransportMode::Bridge => {}
     }
     args.extend([
-        json!("--aeron-embedded-driver"),
-        json!("--aeron-dir"),
-        json!("/dev/shm/aeron"),
         json!("--max-connections"),
         json!(ws.max_connections.to_string()),
         json!("--max-streams"),
@@ -1582,48 +1752,71 @@ fn market_data_hpa(ctx: &MarketDataCtx<'_>) -> Value {
 fn market_data_network_policy(ctx: &MarketDataCtx<'_>) -> Value {
     let ws = &ctx.service.spec.websocket;
     let transport = &ctx.service.spec.transport;
-    let mut aeron_ports = Vec::new();
-    for group in ctx.service.spec.effective_feed_groups() {
-        let channel = group.channel.as_deref().or(transport.channel.as_deref());
-        if let Some((_, port)) = channel.and_then(aeron_channel_endpoint)
-            && !aeron_ports.contains(&port)
-        {
-            aeron_ports.push(port);
+    let mut egress = vec![json!({
+        "to": [{ "namespaceSelector": { "matchLabels": { "kubernetes.io/metadata.name": "kube-system" } } }],
+        "ports": [
+            { "protocol": "UDP", "port": 53 },
+            { "protocol": "TCP", "port": 53 },
+        ],
+    })];
+    let mut ingress = vec![json!({
+        "from": [
+            { "namespaceSelector": { "matchLabels": { "matching.io/role": "gateway" } } },
+            { "namespaceSelector": { "matchLabels": { "matching.io/role": "observability" } } },
+            { "namespaceSelector": { "matchLabels": { "matching.io/role": "control-plane" } } },
+            { "podSelector": { "matchLabels": labels_value(&market_data_selector(ctx)) } },
+        ],
+        "ports": [{ "protocol": "TCP", "port": ws.port }],
+    })];
+
+    match transport.mode {
+        MarketDataTransportMode::Multicast => {
+            let mut aeron_ports = Vec::new();
+            for group in ctx.service.spec.effective_feed_groups() {
+                let channel = group.channel.as_deref().or(transport.channel.as_deref());
+                if let Some((_, port)) = channel.and_then(aeron_channel_endpoint)
+                    && !aeron_ports.contains(&port)
+                {
+                    aeron_ports.push(port);
+                }
+            }
+            if aeron_ports.is_empty() {
+                aeron_ports.push(24001);
+            }
+            let aeron_port_rules: Vec<Value> = aeron_ports
+                .iter()
+                .map(|port| json!({ "protocol": "UDP", "port": port }))
+                .collect();
+            egress.push(json!({
+                "to": [{ "ipBlock": { "cidr": "0.0.0.0/0" } }],
+                "ports": aeron_port_rules.clone(),
+            }));
+            // Stream-2010 snapshot requests go directly to an engine pod's HTTP port.
+            egress.push(json!({
+                "to": [{ "podSelector": { "matchLabels": {
+                    "app.kubernetes.io/name": "match-engine",
+                    "matching.io/cluster-id": ctx.cell.spec.cluster_id
+                } } }],
+            }));
+            ingress.push(json!({
+                "from": [{ "podSelector": { "matchLabels": {
+                    "app.kubernetes.io/name": "match-engine",
+                    "matching.io/cluster-id": ctx.cell.spec.cluster_id
+                } } }],
+                "ports": aeron_port_rules,
+            }));
         }
+        MarketDataTransportMode::Nats => {
+            // One TCP connection to the shared NATS service. Core NATS fans
+            // out to every replica; no direct engine connection is needed.
+            egress.push(json!({
+                "to": [{ "ipBlock": { "cidr": "0.0.0.0/0" } }],
+                "ports": [{ "protocol": "TCP", "port": 4222 }],
+            }));
+        }
+        MarketDataTransportMode::Bridge => {}
     }
-    if aeron_ports.is_empty() {
-        aeron_ports.push(24001);
-    }
-    let aeron_port_rules: Vec<Value> = aeron_ports
-        .iter()
-        .map(|port| json!({ "protocol": "UDP", "port": port }))
-        .collect();
-    let mut egress = vec![
-        json!({
-            "to": [{ "namespaceSelector": { "matchLabels": { "kubernetes.io/metadata.name": "kube-system" } } }],
-            "ports": [
-                { "protocol": "UDP", "port": 53 },
-                { "protocol": "TCP", "port": 53 },
-            ],
-        }),
-        json!({
-            "to": [{ "ipBlock": { "cidr": "0.0.0.0/0" } }],
-            "ports": aeron_port_rules.clone(),
-        }),
-        // Stream-2010 snapshot requests go directly to an engine pod's HTTP port.
-        json!({
-            "to": [{ "podSelector": { "matchLabels": {
-                "app.kubernetes.io/name": "match-engine",
-                "matching.io/cluster-id": ctx.cell.spec.cluster_id
-            } } }],
-        }),
-    ];
-    if transport.mode == MarketDataTransportMode::Nats {
-        egress.push(json!({
-            "to": [{ "ipBlock": { "cidr": "0.0.0.0/0" } }],
-            "ports": [{ "protocol": "TCP", "port": 4222 }],
-        }));
-    }
+
     json!({
         "apiVersion": "networking.k8s.io/v1",
         "kind": "NetworkPolicy",
@@ -1635,21 +1828,7 @@ fn market_data_network_policy(ctx: &MarketDataCtx<'_>) -> Value {
         "spec": {
             "podSelector": { "matchLabels": labels_value(&market_data_selector(ctx)) },
             "policyTypes": ["Ingress", "Egress"],
-            "ingress": [{
-                "from": [
-                    { "namespaceSelector": { "matchLabels": { "matching.io/role": "gateway" } } },
-                    { "namespaceSelector": { "matchLabels": { "matching.io/role": "observability" } } },
-                    { "namespaceSelector": { "matchLabels": { "matching.io/role": "control-plane" } } },
-                    { "podSelector": { "matchLabels": labels_value(&market_data_selector(ctx)) } },
-                ],
-                "ports": [{ "protocol": "TCP", "port": ws.port }],
-            }, {
-                "from": [{ "podSelector": { "matchLabels": {
-                    "app.kubernetes.io/name": "match-engine",
-                    "matching.io/cluster-id": ctx.cell.spec.cluster_id
-                } } }],
-                "ports": aeron_port_rules,
-            }],
+            "ingress": ingress,
             "egress": egress,
         },
     })
@@ -1657,12 +1836,11 @@ fn market_data_network_policy(ctx: &MarketDataCtx<'_>) -> Value {
 
 /// Render one `MarketDataService` into the fan-out Deployment/Service/PDB/NetworkPolicy/ConfigMap.
 ///
-/// Profile A (direct Aeron multicast) is the only transport rendered today. NATS and the
-/// per-pod bridge stay designed fallbacks: the market-data binary has no NATS source yet, so
-/// rendering them would produce pods that cannot serve a feed.
+/// Profile A (direct Aeron multicast) and Profile N (direct NATS) are rendered. The per-pod
+/// bridge remains a documented fallback and is rejected until an implementation exists.
 ///
 /// Fails with 422 when a symbol is missing, its shard release differs from the service release,
-/// or the Aeron channel is malformed/unsafe.
+/// the NATS URL is missing, or the Aeron channel is malformed/unsafe.
 pub fn render_market_data_service(
     catalog: &Catalog,
     name: &str,
@@ -1678,59 +1856,80 @@ pub fn render_market_data_service(
             format!("cell {} is not registered", service.spec.cell),
         )
     })?;
-    if service.spec.transport.mode != MarketDataTransportMode::Multicast {
-        return Err(market_data_error(
-            "market_data_transport",
-            name,
-            "only the multicast transport profile is implemented; NATS/bridge remain fallbacks in docs/AERON_K8S_MESSAGE_BUS.md",
-        ));
-    }
-    let groups = service.spec.effective_feed_groups();
-    let mut channels = Vec::new();
-    for group in &groups {
-        let channel = group
-            .channel
-            .as_deref()
-            .or(service.spec.transport.channel.as_deref())
-            .ok_or_else(|| {
-                market_data_error(
+    match service.spec.transport.mode {
+        MarketDataTransportMode::Multicast => {
+            let groups = service.spec.effective_feed_groups();
+            let mut channels = Vec::new();
+            for group in &groups {
+                let channel = group
+                    .channel
+                    .as_deref()
+                    .or(service.spec.transport.channel.as_deref())
+                    .ok_or_else(|| {
+                        market_data_error(
+                            "market_data_channel",
+                            name,
+                            format!(
+                                "feed group {} needs its own channel or spec.transport.channel",
+                                group.name
+                            ),
+                        )
+                    })?;
+                if !channels.contains(&channel) {
+                    channels.push(channel);
+                }
+            }
+            if channels.is_empty() {
+                return Err(market_data_error(
                     "market_data_channel",
                     name,
-                    format!(
-                        "feed group {} needs its own channel or spec.transport.channel",
-                        group.name
-                    ),
-                )
-            })?;
-        if !channels.contains(&channel) {
-            channels.push(channel);
+                    "multicast transport requires spec.transport.channel or per-group channels",
+                ));
+            }
+            for channel in channels {
+                let Some((host, _)) = aeron_channel_endpoint(channel) else {
+                    return Err(market_data_error(
+                        "market_data_channel",
+                        name,
+                        format!("cannot parse endpoint from Aeron channel {channel}"),
+                    ));
+                };
+                if let Ok(address) = host.parse::<std::net::Ipv4Addr>()
+                    && is_multicast_ipv4(&host)
+                    && address.octets()[3] % 2 == 0
+                {
+                    return Err(market_data_error(
+                        "market_data_channel_even",
+                        name,
+                        format!(
+                            "Aeron requires an odd multicast data address; {host} has an even last octet"
+                        ),
+                    ));
+                }
+            }
         }
-    }
-    if channels.is_empty() {
-        return Err(market_data_error(
-            "market_data_channel",
-            name,
-            "multicast transport requires spec.transport.channel or per-group channels",
-        ));
-    }
-    for channel in channels {
-        let Some((host, _)) = aeron_channel_endpoint(channel) else {
+        MarketDataTransportMode::Nats => {
+            if service
+                .spec
+                .transport
+                .nats_url
+                .as_deref()
+                .unwrap_or("")
+                .trim()
+                .is_empty()
+            {
+                return Err(market_data_error(
+                    "market_data_nats_url",
+                    name,
+                    "NATS transport requires spec.transport.natsUrl",
+                ));
+            }
+        }
+        MarketDataTransportMode::Bridge => {
             return Err(market_data_error(
-                "market_data_channel",
+                "market_data_transport",
                 name,
-                format!("cannot parse endpoint from Aeron channel {channel}"),
-            ));
-        };
-        if let Ok(address) = host.parse::<std::net::Ipv4Addr>()
-            && is_multicast_ipv4(&host)
-            && address.octets()[3] % 2 == 0
-        {
-            return Err(market_data_error(
-                "market_data_channel_even",
-                name,
-                format!(
-                    "Aeron requires an odd multicast data address; {host} has an even last octet"
-                ),
+                "the per-pod Aeron bridge is not implemented; use multicast or NATS",
             ));
         }
     }
@@ -1778,17 +1977,38 @@ pub fn render_market_data_service(
                 ),
             ));
         }
-        let channel = service.spec.channel_for(&symbol_name).ok_or_else(|| {
-            market_data_error(
-                "market_data_channel",
-                name,
-                format!("symbol {symbol_name} has no feed-group or transport channel"),
-            )
-        })?;
+        let (channel, nats_prefix, stream_base) = match service.spec.transport.mode {
+            MarketDataTransportMode::Multicast => {
+                let channel = service.spec.channel_for(&symbol_name).ok_or_else(|| {
+                    market_data_error(
+                        "market_data_channel",
+                        name,
+                        format!("symbol {symbol_name} has no feed-group or transport channel"),
+                    )
+                })?;
+                (
+                    Some(channel),
+                    None,
+                    service.spec.stream_base_for(&symbol_name),
+                )
+            }
+            MarketDataTransportMode::Nats => {
+                let feed =
+                    nats_feed(catalog, &cell.name, &symbol_name).unwrap_or_else(|| NatsFeed {
+                        prefix: format!("md.{}.{}", cell.name, symbol_name),
+                        stream_base: service.spec.stream_base_for(&symbol_name),
+                    });
+                (None, Some(feed.prefix), feed.stream_base)
+            }
+            MarketDataTransportMode::Bridge => {
+                (None, None, service.spec.stream_base_for(&symbol_name))
+            }
+        };
         symbols.push(MarketDataSymbol {
             symbol,
-            stream_base: service.spec.stream_base_for(&symbol_name),
+            stream_base,
             channel,
+            nats_subject_prefix: nats_prefix,
         });
     }
     if symbols.is_empty() {
@@ -2751,6 +2971,207 @@ mod tests {
             .market_data_services
             .insert(name.to_string(), service.clone());
         service
+    }
+
+    fn demo_nats_market_data(catalog: &mut Catalog, name: &str) -> crate::model::MarketDataService {
+        use crate::model::{
+            MarketDataFeedGroup, MarketDataService, MarketDataServiceSpec, MarketDataTransport,
+            MarketDataWebSocket,
+        };
+        let service = MarketDataService {
+            name: name.to_string(),
+            namespace: "match-eu-1".to_string(),
+            spec: MarketDataServiceSpec {
+                cell: "eu-1".to_string(),
+                symbols: Vec::new(),
+                feed_groups: vec![MarketDataFeedGroup {
+                    name: "btc".to_string(),
+                    symbols: vec!["btcusdt".to_string()],
+                    stream_base: 2001,
+                    channel: None,
+                }],
+                image: "registry.example.com/matchengine-marketdata@sha256:abc".to_string(),
+                release: Default::default(),
+                replicas: 2,
+                transport: MarketDataTransport {
+                    mode: MarketDataTransportMode::Nats,
+                    nats_url: Some("nats://nats.match-eu-1.svc.cluster.local:4222".to_string()),
+                    ..Default::default()
+                },
+                websocket: MarketDataWebSocket {
+                    port: 24800,
+                    max_connections: 4096,
+                    ..Default::default()
+                },
+                autoscaling: Default::default(),
+                resources: None,
+                paused: false,
+            },
+            status: Default::default(),
+        };
+        catalog
+            .market_data_services
+            .insert(name.to_string(), service.clone());
+        service
+    }
+
+    #[test]
+    fn nats_market_data_service_renders_a_nats_source() {
+        let mut catalog = demo_catalog();
+        demo_nats_market_data(&mut catalog, "btc-marketdata");
+        let objects =
+            render_market_data_service(&catalog, "btc-marketdata", Some("match-eu-1")).unwrap();
+        let deployment = object(&objects, "Deployment");
+        let args: Vec<&str> = deployment["spec"]["template"]["spec"]["containers"][0]["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|arg| arg.as_str().unwrap())
+            .collect();
+        assert!(args.contains(&"--nats-url"), "{args:?}");
+        assert!(
+            args.contains(&"nats://nats.match-eu-1.svc.cluster.local:4222"),
+            "{args:?}"
+        );
+        assert!(args.contains(&"--nats-subject-prefix"), "{args:?}");
+        assert!(args.contains(&"md.eu-1.btc"), "{args:?}");
+        assert!(args.contains(&"--nats-stream-base"), "{args:?}");
+        assert!(!args.contains(&"--aeron-channel"), "{args:?}");
+        assert!(!args.contains(&"--aeron-embedded-driver"), "{args:?}");
+        let policy = object(&objects, "NetworkPolicy");
+        assert!(
+            policy["spec"]["egress"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|rule| rule["ports"].as_array().is_some_and(|ports| ports
+                    .iter()
+                    .any(|port| { port["protocol"] == "TCP" && port["port"] == 4222 }))),
+            "{policy:?}"
+        );
+        assert!(
+            !policy["spec"]["egress"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|rule| rule["ports"].as_array().is_some_and(|ports| ports
+                    .iter()
+                    .any(|port| port["protocol"] == "UDP" && port["port"] == 24001))),
+            "{policy:?}"
+        );
+    }
+
+    #[test]
+    fn nats_services_subscribe_to_the_canonical_engine_subject() {
+        use crate::model::{
+            MarketDataFeedGroup, MarketDataService, MarketDataServiceSpec, MarketDataTransport,
+            MarketDataWebSocket,
+        };
+        let mut catalog = demo_catalog();
+        demo_nats_market_data(&mut catalog, "btc-marketdata");
+        // A larger global service uses a different local group name. It must
+        // still subscribe to the shard-local service's canonical subject.
+        catalog.market_data_services.insert(
+            "global-marketdata".to_string(),
+            MarketDataService {
+                name: "global-marketdata".to_string(),
+                namespace: "match-eu-1".to_string(),
+                spec: MarketDataServiceSpec {
+                    cell: "eu-1".to_string(),
+                    symbols: Vec::new(),
+                    feed_groups: vec![MarketDataFeedGroup {
+                        name: "global-btc".to_string(),
+                        symbols: vec!["btcusdt".to_string()],
+                        stream_base: 2001,
+                        channel: None,
+                    }],
+                    image: "registry.example.com/matchengine-marketdata@sha256:abc".to_string(),
+                    release: Default::default(),
+                    replicas: 1,
+                    transport: MarketDataTransport {
+                        mode: MarketDataTransportMode::Nats,
+                        nats_url: Some("nats://nats.match-eu-1.svc.cluster.local:4222".to_string()),
+                        ..Default::default()
+                    },
+                    websocket: MarketDataWebSocket {
+                        port: 24801,
+                        ..Default::default()
+                    },
+                    autoscaling: Default::default(),
+                    resources: None,
+                    paused: false,
+                },
+                status: Default::default(),
+            },
+        );
+        let objects =
+            render_market_data_service(&catalog, "global-marketdata", Some("match-eu-1")).unwrap();
+        let args: Vec<&str> = objects
+            .iter()
+            .find(|object| object["kind"] == "Deployment")
+            .unwrap()["spec"]["template"]["spec"]["containers"][0]["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|arg| arg.as_str().unwrap())
+            .collect();
+        assert!(args.contains(&"md.eu-1.btc"), "{args:?}");
+        assert!(!args.contains(&"md.eu-1.global-btc"), "{args:?}");
+    }
+
+    #[test]
+    fn engine_container_publishes_to_nats() {
+        let mut catalog = demo_catalog();
+        demo_nats_market_data(&mut catalog, "btc-marketdata");
+        let objects = render_shard(
+            &catalog,
+            "me-btcusdt",
+            &RenderOptions {
+                namespace: Some("match-eu-1".to_string()),
+                ..RenderOptions::default()
+            },
+        )
+        .unwrap();
+        let stateful_set = object(&objects, "StatefulSet");
+        let pod = &stateful_set["spec"]["template"]["spec"];
+        let container = &pod["containers"][0];
+        let args: Vec<&str> = container["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|arg| arg.as_str().unwrap())
+            .collect();
+        assert!(args.contains(&"--market-data-nats-url"), "{args:?}");
+        assert!(
+            args.contains(&"nats://nats.match-eu-1.svc.cluster.local:4222"),
+            "{args:?}"
+        );
+        assert!(
+            args.contains(&"--market-data-nats-subject-prefix"),
+            "{args:?}"
+        );
+        assert!(args.contains(&"md.eu-1.btc"), "{args:?}");
+        assert!(args.contains(&"--market-data-nats-stream-base"), "{args:?}");
+        assert!(!args.contains(&"--market-data-aeron-channel"), "{args:?}");
+        assert!(
+            !pod["volumes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|volume| volume["name"] == "aeron"),
+            "{pod:?}"
+        );
+        let policy = object(&objects, "NetworkPolicy");
+        assert!(
+            policy["spec"]["egress"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|rule| rule["ports"].as_array().is_some_and(|ports| ports
+                    .iter()
+                    .any(|port| { port["protocol"] == "TCP" && port["port"] == 4222 }))),
+            "{policy:?}"
+        );
     }
 
     #[test]

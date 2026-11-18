@@ -1,0 +1,119 @@
+# Single-node NATS Core for the Profile N market-data fallback.
+#
+# This is demo/lab infrastructure: plaintext, no authentication and no
+# JetStream retention. The engine publishes one wire-v7 frame per subject and
+# every market-data replica subscribes to the same subject tree. Production
+# deployments need TLS, credentials, and a multi-node NATS cluster.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nats-config
+  namespace: match-eu-1
+  labels:
+    app.kubernetes.io/name: nats
+    app.kubernetes.io/part-of: matchengine
+data:
+  nats.conf: |
+    server_name: nats
+    port: 4222
+    http_port: 8222
+    max_payload: 8388608
+    write_deadline: "10s"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nats
+  namespace: match-eu-1
+  labels:
+    app.kubernetes.io/name: nats
+    app.kubernetes.io/part-of: matchengine
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: nats
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: nats
+        app.kubernetes.io/part-of: matchengine
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: nats
+          image: nats:2.11-alpine
+          imagePullPolicy: IfNotPresent
+          args: ["-c", "/etc/nats/nats.conf"]
+          ports:
+            - name: client
+              containerPort: 4222
+              protocol: TCP
+            - name: monitor
+              containerPort: 8222
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: monitor
+            periodSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: monitor
+            periodSeconds: 10
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: "1"
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: config
+              mountPath: /etc/nats
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: config
+          configMap:
+            name: nats-config
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nats
+  namespace: match-eu-1
+  labels:
+    app.kubernetes.io/name: nats
+    app.kubernetes.io/part-of: matchengine
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: nats
+  ports:
+    - name: client
+      port: 4222
+      targetPort: client
+      protocol: TCP
+    - name: monitor
+      port: 8222
+      targetPort: monitor
+      protocol: TCP
