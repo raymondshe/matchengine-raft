@@ -27,7 +27,7 @@ cd "$ROOT"
 # ---------------------------------------------------------------------------
 
 ACTION=run
-PHASES="containers,leader,roll,stopstart,supervisor,reserved,migration,adoption"
+PHASES="containers,leader,roll,stopstart,supervisor,reserved,migration,adoption,nats"
 NAMESPACE=match-eu-1
 CONTROL_NS=match-control
 OPERATOR_DEPLOY=match-operator
@@ -37,7 +37,9 @@ LOCAL_PORT=18099
 MANAGER_OVERRIDE=
 PREFIX=acc
 BASE_PORT=26200
-IMAGE=${MATCHENGINE_ACCEPTANCE_IMAGE:-matchengine-raft:k8s-reorg-v1-aeron-arm64}
+IMAGE=${MATCHENGINE_ACCEPTANCE_IMAGE:-matchengine-raft:k8s-nats-arm64-v1}
+MARKETDATA_IMAGE=${MATCHENGINE_ACCEPTANCE_MARKETDATA_IMAGE:-matchengine-marketdata:aeron-arm64-v7}
+NATS_URL=${MATCHENGINE_ACCEPTANCE_NATS_URL:-}
 TIMEOUT=900
 ROLL_TIMEOUT=900
 KEEP=0
@@ -101,6 +103,10 @@ Phases (run --phases containers,leader,roll,stopstart,supervisor,reserved,migrat
   adoption            Scale the operator down, apply rendered manifests by hand,
                       scale it up and prove pods/PVCs/StatefulSet were adopted
                       without recreation.
+  nats                Add a direct-NATS MarketDataService for the containers
+                      symbol, prove the engine publishes with sink=nats, the
+                      service is FeedReady, and a restarted service pod
+                      re-subscribes and re-requests a snapshot.
 
 Options:
   --phases LIST             Comma-separated phase list (default: all).
@@ -112,6 +118,8 @@ Options:
   --prefix PREFIX           Acceptance name prefix, [a-z0-9]+ (default acc).
   --base-port PORT          First acceptance HTTP port (default 26200).
   --image IMAGE             Engine image for new shards.
+  --marketdata-image IMAGE  Market-data image for the nats phase.
+  --nats-url URL            NATS URL (default nats://nats.<namespace>.svc.cluster.local:4222).
   --timeout SECONDS         General readiness timeout (default 900).
   --roll-timeout SECONDS    Image rollout timeout (default 900).
   --keep                    Leave acceptance resources in place for inspection.
@@ -121,7 +129,9 @@ Options:
   -h, --help                Show this help.
 
 Environment:
-  MATCHENGINE_ACCEPTANCE_IMAGE   Default for --image.
+  MATCHENGINE_ACCEPTANCE_IMAGE             Default for --image.
+  MATCHENGINE_ACCEPTANCE_MARKETDATA_IMAGE  Default for --marketdata-image.
+  MATCHENGINE_ACCEPTANCE_NATS_URL          Default for --nats-url.
 
 Examples:
   ./scripts/operator-acceptance.sh
@@ -224,6 +234,16 @@ while [ "$#" -gt 0 ]; do
         IMAGE=$2
         shift
         ;;
+    --marketdata-image)
+        require_value "$@"
+        MARKETDATA_IMAGE=$2
+        shift
+        ;;
+    --nats-url)
+        require_value "$@"
+        NATS_URL=$2
+        shift
+        ;;
     --timeout)
         require_value "$@"
         TIMEOUT=$2
@@ -288,6 +308,10 @@ SYM_ID_SUP2=$((SYMBOL_BASE + 2))
 SYM_ID_MIG=$((SYMBOL_BASE + 3))
 SYM_ID_ADOPT=$((SYMBOL_BASE + 4))
 
+NATS_SERVICE="$PREFIX-nats-marketdata"
+NATS_WS_PORT=$((BASE_PORT + 500))
+: "${NATS_URL:=nats://nats.$NAMESPACE.svc.cluster.local:4222}"
+
 PORT_C1=$((BASE_PORT + 1))
 PORT_SUP=$((BASE_PORT + 11))
 PORT_SUP2=$((BASE_PORT + 12))
@@ -300,7 +324,7 @@ if [ "$((PORT_ADOPT + 1000))" -gt 65535 ]; then
     fail "--base-port is too high: raft port for the adoption shard is $((PORT_ADOPT + 1000))"
 fi
 
-KNOWN_PHASES="containers leader roll stopstart supervisor reserved migration adoption"
+KNOWN_PHASES="containers leader roll stopstart supervisor reserved migration adoption nats"
 for phase in $(printf '%s' "$PHASES" | tr ',' ' '); do
     case " $KNOWN_PHASES " in
     *" $phase "*) ;;
@@ -978,8 +1002,18 @@ cleanup_shard() { # shard
     done
 }
 
+cleanup_market_data() {
+    local name
+    for name in $(k get marketdataservice -o json 2>/dev/null |
+        jq -r --arg prefix "$PREFIX-" '.items[].metadata.name | select(startswith($prefix))' ||
+        true); do
+        k delete marketdataservice "$name" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+    done
+}
+
 cleanup_all() {
     local shard name
+    cleanup_market_data
     for shard in "$SHARD_C1" "$SHARD_SUP" "$SHARD_RES" "$SHARD_M1" "$SHARD_M2" "$SHARD_ADOPT"; do
         cleanup_shard "$shard"
     done
@@ -1884,11 +1918,133 @@ print_kept() {
     fi
 }
 
+market_data_pod() { # service
+    k get pods -l "matching.io/market-data=$1" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true
+}
+
+wait_market_data_ready() { # service symbol [timeout]
+    local service=$1 symbol=$2 timeout=${3:-$TIMEOUT}
+    local start=$SECONDS phase ready
+    while :; do
+        phase=$(k get marketdataservice "$service" -o jsonpath='{.status.phase}' 2>/dev/null || true)
+        ready=$(k get marketdataservice "$service" -o json 2>/dev/null |
+            jq -r --arg symbol "$symbol" \
+                '[.status.symbols[]? | select(.name == $symbol) | .ready] | first // false' ||
+            true)
+        if [ "$phase" = "Ready" ] && [ "$ready" = "true" ]; then
+            ok "market-data service $service is Ready for $symbol"
+            return 0
+        fi
+        if ((SECONDS - start >= timeout)); then
+            fail "market-data service $service did not become Ready for $symbol (phase=$phase ready=$ready)"
+        fi
+        sleep 2
+    done
+}
+
+# ---------------------------------------------------------------------------
+# phase: direct NATS market data
+# ---------------------------------------------------------------------------
+
+phase_nats() {
+    step "phase: nats market data"
+    ensure_containers_ready
+
+    # Drop a stale acceptance service first so the shard rolls back to a clean
+    # state before the new service is added.
+    k delete marketdataservice "$NATS_SERVICE" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+    wait_shard_ready "$SHARD_C1"
+
+    local body response leader status sts dep args pod ip old start metrics
+    body=$(jq -cn \
+        --arg name "$NATS_SERVICE" --arg ns "$NAMESPACE" \
+        --arg image "$MARKETDATA_IMAGE" --arg url "$NATS_URL" \
+        --arg symbol "$SYM_C1" --argjson port "$NATS_WS_PORT" \
+        '{name:$name,namespace:$ns,spec:{
+            cell:"eu-1",symbols:[],image:$image,replicas:1,
+            feedGroups:[{name:"acc-nats",symbols:[$symbol],streamBase:2001}],
+            transport:{mode:"nats",natsUrl:$url},
+            websocket:{port:$port,fastOnly:true},
+            autoscaling:{minReplicas:1,maxReplicas:1,targetCpuUtilization:70},
+            paused:false}}')
+    response=$(api_post /api/v1/market-data-services "$body")
+    assert_eq "$(jq -r '.marketDataService.spec.transport.mode // empty' <<<"$response")" \
+        "nats" "market-data service uses the NATS transport"
+    assert_eq "$(jq -r '.marketDataService.spec.transport.natsUrl // empty' <<<"$response")" \
+        "$NATS_URL" "market-data service stores the NATS URL"
+
+    wait_market_data_ready "$NATS_SERVICE" "$SYM_C1"
+    wait_shard_ready "$SHARD_C1"
+
+    sts=$(k get sts "$SHARD_C1" -o json)
+    args=$(jq -r --arg name "$SYM_C1" \
+        '.spec.template.spec.containers[] | select(.name == $name) | .args | join(" ")' \
+        <<<"$sts")
+    assert_contains "$args" "--market-data-nats-url $NATS_URL" \
+        "$SHARD_C1/$SYM_C1 publishes to NATS"
+    assert_contains "$args" "--market-data-nats-subject-prefix md.eu-1.acc-nats" \
+        "$SHARD_C1/$SYM_C1 uses the canonical NATS subject prefix"
+
+    dep=$(k get deploy "$NATS_SERVICE" -o json)
+    args=$(jq -r '.spec.template.spec.containers[0].args | join(" ")' <<<"$dep")
+    assert_contains "$args" "--nats-url $NATS_URL" \
+        "$NATS_SERVICE subscribes to NATS"
+    assert_contains "$args" "--nats-subject-prefix md.eu-1.acc-nats" \
+        "$NATS_SERVICE uses the canonical NATS subject prefix"
+    assert_contains "$args" "--nats-stream-base 2001" \
+        "$NATS_SERVICE uses the engine stream base"
+
+    leader=$(wait_leader_pod "$SHARD_C1" "$SYM_C1" "$PORT_C1" 120) ||
+        fail "no leader for $SHARD_C1/$SYM_C1"
+    status=$(engine_read "$SHARD_C1" "$leader" "$SYM_C1" "$PORT_C1" marketdata_status)
+    assert_eq "$(jq -r '.sink // empty' <<<"$status")" "nats" \
+        "$SHARD_C1/$SYM_C1 reports the NATS sink"
+    assert_eq "$(jq -r '.publishing // false' <<<"$status")" "true" \
+        "$SHARD_C1/$SYM_C1 is publishing market data"
+
+    pod=$(market_data_pod "$NATS_SERVICE")
+    [ -n "$pod" ] || fail "$NATS_SERVICE has no pod"
+    ip=$(k get pod "$pod" -o jsonpath='{.status.podIP}')
+    assert_eq "$(kubectl -n "$NAMESPACE" exec "$pod" -c market-data -- \
+        curl -sS -m 5 -o /dev/null -w '%{http_code}' "http://$ip:$NATS_WS_PORT/ready")" \
+        "200" "$NATS_SERVICE /ready returns 200"
+
+    # Restart the market-data pod and prove it re-subscribes and asks the
+    # engine for a snapshot without a NATS or engine restart.
+    old=$pod
+    k delete pod "$old" --wait=false >/dev/null 2>&1 || true
+    start=$SECONDS
+    while :; do
+        pod=$(market_data_pod "$NATS_SERVICE")
+        if [ -n "$pod" ] && [ "$pod" != "$old" ] &&
+            [ "$(k get marketdataservice "$NATS_SERVICE" -o jsonpath='{.status.phase}' 2>/dev/null || true)" = "Ready" ] &&
+            [ "$(k get marketdataservice "$NATS_SERVICE" -o json 2>/dev/null |
+                jq -r --arg symbol "$SYM_C1" \
+                    '[.status.symbols[]? | select(.name == $symbol) | .ready] | first // false' ||
+                true)" = "true" ]; then
+            break
+        fi
+        if ((SECONDS - start >= TIMEOUT)); then
+            fail "$NATS_SERVICE did not recover after its pod restart"
+        fi
+        sleep 2
+    done
+    ok "$NATS_SERVICE re-subscribed after its pod restart"
+    ip=$(k get pod "$pod" -o jsonpath='{.status.podIP}')
+    metrics=$(kubectl -n "$NAMESPACE" exec "$pod" -c market-data -- \
+        curl -sS -m 5 "http://$ip:$NATS_WS_PORT/metrics")
+    assert_eq "$(jq -r --arg symbol "$SYM_C1" '.symbols[$symbol].snapshot_seen // false' <<<"$metrics")" \
+        "true" "$NATS_SERVICE received a fresh snapshot after restart"
+    assert_eq "$(jq -r --arg symbol "$SYM_C1" '.symbols[$symbol].ready // false' <<<"$metrics")" \
+        "true" "$NATS_SERVICE is ready for $SYM_C1 after restart"
+    note "NATS URL: $NATS_URL; subject prefix: md.eu-1.acc-nats"
+}
+
 run_phases() {
     check_symbol_ids
     cleanup_all
     local phase
-    for phase in containers leader roll stopstart supervisor reserved migration adoption; do
+    for phase in containers leader roll stopstart supervisor reserved migration adoption nats; do
         phase_selected "$phase" || continue
         "phase_$phase"
     done
