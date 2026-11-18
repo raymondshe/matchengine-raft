@@ -111,7 +111,8 @@ struct Opt {
 struct MarketDataSpec {
     /// Aeron channel, with an optional `{pod_ip}` placeholder the supervisor
     /// expands from the `POD_IP` environment variable.
-    channel: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    channel: Option<String>,
     stream_base: u16,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     dir: Option<String>,
@@ -121,6 +122,12 @@ struct MarketDataSpec {
     heartbeat_ms: u64,
     #[serde(default = "default_market_data_status_every")]
     status_every: u64,
+    /// Direct NATS URL (Profile N). Takes precedence over `channel`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    nats_url: Option<String>,
+    /// NATS subject prefix including the cell and feed group.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    nats_subject_prefix: Option<String>,
 }
 
 fn default_market_data_heartbeat_ms() -> u64 {
@@ -713,22 +720,32 @@ async fn spawn_child(opt: &Opt, spec: &ProcessSpec) -> io::Result<SpawnedChild> 
         .arg("--max-events")
         .arg(opt.max_events.to_string());
     if let Some(market_data) = &spec.market_data {
-        let pod_ip = std::env::var("POD_IP").unwrap_or_default();
-        let channel = market_data.channel.replace("{pod_ip}", &pod_ip);
         command
-            .arg("--market-data-aeron-channel")
-            .arg(channel)
-            .arg("--market-data-aeron-stream-base")
-            .arg(market_data.stream_base.to_string())
             .arg("--market-data-aeron-heartbeat-ms")
             .arg(market_data.heartbeat_ms.to_string())
             .arg("--market-data-status-every")
             .arg(market_data.status_every.to_string());
-        if market_data.embedded {
-            command.arg("--market-data-aeron-embedded-driver");
-        }
-        if let Some(dir) = &market_data.dir {
-            command.arg("--market-data-aeron-dir").arg(dir);
+        if let Some(url) = &market_data.nats_url {
+            command
+                .arg("--market-data-nats-url")
+                .arg(url)
+                .arg("--market-data-nats-subject-prefix")
+                .arg(market_data.nats_subject_prefix.as_deref().unwrap_or(""))
+                .arg("--market-data-nats-stream-base")
+                .arg(market_data.stream_base.to_string());
+        } else if let Some(channel) = &market_data.channel {
+            let pod_ip = std::env::var("POD_IP").unwrap_or_default();
+            command
+                .arg("--market-data-aeron-channel")
+                .arg(channel.replace("{pod_ip}", &pod_ip))
+                .arg("--market-data-aeron-stream-base")
+                .arg(market_data.stream_base.to_string());
+            if market_data.embedded {
+                command.arg("--market-data-aeron-embedded-driver");
+            }
+            if let Some(dir) = &market_data.dir {
+                command.arg("--market-data-aeron-dir").arg(dir);
+            }
         }
     }
     command.stdout(Stdio::inherit()).stderr(Stdio::inherit());
@@ -1180,6 +1197,39 @@ mod tests {
         assert!(market_data.embedded);
         assert_eq!(market_data.heartbeat_ms, 500);
         assert_eq!(market_data.status_every, 5);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn parses_nats_market_data_child_config() {
+        let dir = temp_dir();
+        let path = dir.join("processes.json");
+        std::fs::write(
+            &path,
+            r#"{"processes":[{
+                "name":"eurgbp","slot":0,"httpPort":21101,"raftPort":22101,
+                "marketData":{
+                    "natsUrl":"nats://nats.match-eu-1.svc.cluster.local:4222",
+                    "natsSubjectPrefix":"md.eu-1.eurgbp",
+                    "streamBase":2001,
+                    "heartbeatMs":500,
+                    "statusEvery":5
+                }
+            }]}"#,
+        )
+        .unwrap();
+        let processes = read_config(&path).unwrap();
+        let market_data = processes[0].market_data.as_ref().expect("marketData");
+        assert_eq!(
+            market_data.nats_url.as_deref(),
+            Some("nats://nats.match-eu-1.svc.cluster.local:4222")
+        );
+        assert_eq!(
+            market_data.nats_subject_prefix.as_deref(),
+            Some("md.eu-1.eurgbp")
+        );
+        assert!(market_data.channel.is_none());
+        assert_eq!(market_data.stream_base, 2001);
         let _ = std::fs::remove_dir_all(dir);
     }
 

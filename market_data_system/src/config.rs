@@ -31,6 +31,18 @@ pub struct AeronSpec {
     pub embedded: bool,
 }
 
+/// Direct NATS source for one symbol (Profile N).
+#[derive(Clone, Debug)]
+pub struct NatsSpec {
+    /// Server URL, e.g. `nats://nats.match-eu-1.svc.cluster.local:4222`.
+    pub url: String,
+    /// Subject prefix including the cell and feed group; the source appends
+    /// `.<stream_id>` for each subscription.
+    pub subject_prefix: String,
+    /// First engine stream id in the prefix (`base..base+6`).
+    pub stream_base: u16,
+}
+
 /// WebSocket feed class.
 ///
 /// Binance exposes one Streams protocol with raw/combined endpoints and a

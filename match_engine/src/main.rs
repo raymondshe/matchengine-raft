@@ -161,6 +161,21 @@ pub struct Opt {
     /// on this cadence when no frame was applied (0 disables).
     #[clap(long, default_value_t = 1_000)]
     pub market_data_aeron_heartbeat_ms: u64,
+
+    /// NATS server URL for the market-data feed, e.g. `nats://nats:4222`.
+    /// Requires a binary built with the `market-data-nats` feature.
+    #[clap(long, env = "MARKET_DATA_NATS_URL")]
+    pub market_data_nats_url: Option<String>,
+
+    /// NATS subject prefix including the cell and feed group, e.g.
+    /// `md.match-eu-1.fx-sup-01-eurgbp`. The stream id is appended.
+    #[clap(long, env = "MARKET_DATA_NATS_SUBJECT_PREFIX")]
+    pub market_data_nats_subject_prefix: Option<String>,
+
+    /// First stream id published to NATS (the seven feed streams are
+    /// `base..base+6`).
+    #[clap(long, default_value_t = 2001)]
+    pub market_data_nats_stream_base: u16,
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -220,7 +235,22 @@ async fn main() -> std::io::Result<()> {
     if let Some(path) = options.match_event_log {
         storage = storage.with_match_event_log(path);
     }
-    if options.market_data_log.is_some() || options.market_data_aeron_channel.is_some() {
+    if options.market_data_nats_url.is_some() && options.market_data_aeron_channel.is_some() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "--market-data-nats-url and --market-data-aeron-channel are mutually exclusive",
+        ));
+    }
+    if options.market_data_nats_url.is_some() && options.market_data_nats_subject_prefix.is_none() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "--market-data-nats-url requires --market-data-nats-subject-prefix",
+        ));
+    }
+    if options.market_data_log.is_some()
+        || options.market_data_aeron_channel.is_some()
+        || options.market_data_nats_url.is_some()
+    {
         let mut config = match options.market_data_log {
             Some(path) => MarketDataConfig::jsonl(path),
             None => MarketDataConfig::default(),
@@ -232,6 +262,11 @@ async fn main() -> std::io::Result<()> {
         config.aeron_stream_base = options.market_data_aeron_stream_base;
         config.aeron_dir = options.market_data_aeron_dir;
         config.aeron_embedded_driver = options.market_data_aeron_embedded_driver;
+        config.nats_url = options.market_data_nats_url;
+        if let Some(prefix) = options.market_data_nats_subject_prefix {
+            config.nats_subject_prefix = prefix;
+        }
+        config.nats_stream_base = options.market_data_nats_stream_base;
         config.snapshot_every_ms = options.market_data_aeron_snapshot_every_ms;
         config.heartbeat_ms = options.market_data_aeron_heartbeat_ms;
         if !options.market_data_bar_intervals_ms.is_empty() {

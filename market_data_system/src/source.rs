@@ -30,22 +30,47 @@ pub type Item = io::Result<MarketMessage>;
 /// Non-blocking handle used by WebSocket sessions and the feed to ask the
 /// engine for a fresh depth snapshot on stream 2010.
 ///
-/// This type is transport-neutral; only the Aeron source currently creates one.
-/// A full channel is reported to the caller and never blocks the session.
+/// This type is transport-neutral: the Aeron source hands the receiver to its
+/// blocking publisher thread, and the NATS source keeps the async receiver in
+/// its Tokio task. A full queue is reported to the caller and never blocks the
+/// session.
 #[derive(Clone, Debug)]
 pub struct SnapshotRequester {
-    tx: std::sync::mpsc::SyncSender<SnapshotRequest>,
+    queue: SnapshotQueue,
     symbol_id: u32,
     next_id: Arc<AtomicU64>,
 }
 
+#[derive(Clone, Debug)]
+enum SnapshotQueue {
+    Blocking(std::sync::mpsc::SyncSender<SnapshotRequest>),
+    Async(tokio::sync::mpsc::UnboundedSender<SnapshotRequest>),
+}
+
 impl SnapshotRequester {
-    /// Creates a requester and the blocking receiver handed to the transport.
+    /// Creates a requester and the blocking receiver handed to the Aeron
+    /// publisher thread.
     pub fn channel(symbol_id: u32) -> (Self, std::sync::mpsc::Receiver<SnapshotRequest>) {
         let (tx, rx) = std::sync::mpsc::sync_channel(64);
         (
             Self {
-                tx,
+                queue: SnapshotQueue::Blocking(tx),
+                symbol_id,
+                next_id: Arc::new(AtomicU64::new(1)),
+            },
+            rx,
+        )
+    }
+
+    /// Creates a requester and the async receiver handed to a Tokio transport
+    /// such as the NATS source.
+    pub fn tokio_channel(
+        symbol_id: u32,
+    ) -> (Self, tokio::sync::mpsc::UnboundedReceiver<SnapshotRequest>) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        (
+            Self {
+                queue: SnapshotQueue::Async(tx),
                 symbol_id,
                 next_id: Arc::new(AtomicU64::new(1)),
             },
@@ -61,7 +86,10 @@ impl SnapshotRequester {
             depth_levels,
             self.next_id.fetch_add(1, Ordering::Relaxed),
         );
-        self.tx.try_send(request).is_ok()
+        match &self.queue {
+            SnapshotQueue::Blocking(tx) => tx.try_send(request).is_ok(),
+            SnapshotQueue::Async(tx) => tx.send(request).is_ok(),
+        }
     }
 }
 

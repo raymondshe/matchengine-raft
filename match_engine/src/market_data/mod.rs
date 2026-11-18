@@ -58,6 +58,8 @@ use crate::order_book::VolumeUnit;
 
 #[cfg(feature = "market-data-aeron")]
 pub mod aeron;
+#[cfg(feature = "market-data-nats")]
+pub mod nats;
 pub mod request;
 pub mod wire;
 
@@ -135,6 +137,15 @@ pub struct MarketDataConfig {
     /// Start an embedded media driver instead of connecting to an external one.
     /// Intended for demos and tests.
     pub aeron_embedded_driver: bool,
+    /// NATS server URL for Profile N (`nats://host:4222`). When set, the NATS
+    /// sink replaces Aeron/JSONL and publishes raw wire frames to
+    /// `<nats_subject_prefix>.<stream_id>`.
+    pub nats_url: Option<String>,
+    /// Subject prefix including the cell and feed group, e.g.
+    /// `md.match-eu-1.fx-sup-01-eurgbp`. The stream id is appended by the sink.
+    pub nats_subject_prefix: String,
+    /// First stream id published to NATS; mirrors [`Self::aeron_stream_base`].
+    pub nats_stream_base: u16,
     /// Re-broadcast a fresh reset depth snapshot on this cadence while
     /// publishing (0 disables). Late-joining consumers need a snapshot.
     pub snapshot_every_ms: u64,
@@ -157,6 +168,9 @@ impl Default for MarketDataConfig {
             aeron_stream_base: 2001,
             aeron_dir: None,
             aeron_embedded_driver: false,
+            nats_url: None,
+            nats_subject_prefix: String::new(),
+            nats_stream_base: 2001,
             snapshot_every_ms: 30_000,
             heartbeat_ms: 1_000,
         }
@@ -925,6 +939,18 @@ async fn build_sink(
     config: &MarketDataConfig,
     node_id: u64,
 ) -> io::Result<Box<dyn MarketDataSink>> {
+    if config.nats_url.is_some() {
+        #[cfg(feature = "market-data-nats")]
+        {
+            return Ok(Box::new(nats::NatsSink::start(config).await?));
+        }
+        #[cfg(not(feature = "market-data-nats"))]
+        {
+            return Err(io::Error::other(
+                "a NATS market-data URL is configured, but this binary was built without the `market-data-nats` feature",
+            ));
+        }
+    }
     if config.aeron_channel.is_some() {
         #[cfg(feature = "market-data-aeron")]
         {

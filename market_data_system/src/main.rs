@@ -9,11 +9,13 @@ use clap::Parser;
 use matchengine_marketdata::AeronSpec;
 use matchengine_marketdata::BoxedSource;
 use matchengine_marketdata::Config;
+use matchengine_marketdata::NatsSpec;
 use matchengine_marketdata::SnapshotRequester;
 use matchengine_marketdata::SymbolSpec;
 use matchengine_marketdata::archive_path;
 use matchengine_marketdata::archive_source;
 use matchengine_marketdata::jsonl_source;
+use matchengine_marketdata::nats_source;
 use matchengine_marketdata::start_with_snapshot_requesters;
 
 #[derive(Parser, Debug)]
@@ -38,6 +40,19 @@ struct Opt {
     /// Replay `<dir>/<symbol>.jsonl` instead of a live source.
     #[clap(long, env = "MARKET_DATA_REPLAY_DIR")]
     replay_dir: Option<PathBuf>,
+
+    /// NATS server URL for the direct Profile N source (one URL serves every symbol).
+    #[clap(long, env = "NATS_URL")]
+    nats_url: Option<String>,
+
+    /// NATS subject prefix per symbol, including cell and feed group
+    /// (repeat once per `--symbol`).
+    #[clap(long, env = "NATS_SUBJECT_PREFIX")]
+    nats_subject_prefix: Vec<String>,
+
+    /// First NATS stream id per symbol; repeat once per `--symbol` (default 2001).
+    #[clap(long, value_name = "ID", default_value = "2001")]
+    nats_stream_base: Vec<u16>,
 
     /// Aeron channel per symbol (one value is reused for every symbol).
     #[clap(long, env = "AERON_CHANNEL")]
@@ -193,11 +208,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     config.snapshot_levels = opt.snapshot_levels.max(1);
 
     if opt.replay_dir.is_some()
-        && (!opt.market_data_log.is_empty() || !opt.aeron_channel.is_empty())
+        && (!opt.market_data_log.is_empty()
+            || !opt.aeron_channel.is_empty()
+            || opt.nats_url.is_some())
     {
         return Err(
-            "--replay-dir cannot be combined with --market-data-log or --aeron-channel".into(),
+            "--replay-dir cannot be combined with --market-data-log, --aeron-channel or --nats-url"
+                .into(),
         );
+    }
+    if opt.nats_url.is_some() && !opt.aeron_channel.is_empty() {
+        return Err("--nats-url cannot be combined with --aeron-channel".into());
+    }
+    if opt.nats_url.is_some() && opt.nats_subject_prefix.is_empty() {
+        return Err("--nats-url requires --nats-subject-prefix".into());
+    }
+    if !opt.nats_subject_prefix.is_empty() && opt.nats_subject_prefix.len() != symbols.len() {
+        return Err("--nats-subject-prefix must be repeated once per --symbol".into());
     }
     if opt.replay_dir.is_some() && opt.archive_dir.is_some() {
         return Err("--archive-dir cannot be combined with --replay-dir".into());
@@ -228,6 +255,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .map(|path| jsonl_source(path.clone())),
             )
             .collect()
+    } else if let Some(url) = &opt.nats_url {
+        let url = url.clone();
+        let mut sources = Vec::with_capacity(symbols.len());
+        for (index, spec) in symbols.iter().enumerate() {
+            let subject_prefix = opt
+                .nats_subject_prefix
+                .get(index)
+                .ok_or("--nats-subject-prefix is empty")?
+                .clone();
+            let stream_base = opt
+                .nats_stream_base
+                .get(index)
+                .or_else(|| opt.nats_stream_base.first())
+                .copied()
+                .unwrap_or(2001);
+            let nats = NatsSpec {
+                url: url.clone(),
+                subject_prefix,
+                stream_base,
+            };
+            let source = nats_source(&nats, spec.symbol_id);
+            snapshot_requesters.insert(spec.symbol.clone(), source.requester);
+            sources.push((spec.clone(), source.frames));
+        }
+        sources
     } else if !opt.aeron_channel.is_empty() {
         let mut sources = Vec::with_capacity(symbols.len());
         for (index, spec) in symbols.iter().enumerate() {
@@ -264,7 +316,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         sources
     } else {
-        return Err("--market-data-log, --aeron-channel or --replay-dir is required".into());
+        return Err(
+            "--market-data-log, --aeron-channel, --nats-url or --replay-dir is required".into(),
+        );
     };
 
     if let Some(dir) = &opt.archive_dir {

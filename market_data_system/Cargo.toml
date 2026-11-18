@@ -8,6 +8,7 @@ publish = false
 [dependencies]
 actix-web = "4.18.1"
 actix-ws = "0.3"
+async-nats = { version = "0.53.0", default-features = false }
 bytes = "1"
 clap = { version = "4.6.7", features = ["derive", "env"] }
 ctrlc = { version = "3.5", optional = true }
