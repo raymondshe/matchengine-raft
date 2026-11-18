@@ -377,6 +377,24 @@ impl Store {
             .await
     }
 
+    /// Order-system images available for an update. The current image is the system's configured
+    /// image; running user-shard pods are annotated in the same inventory.
+    pub async fn available_order_system_images(
+        &self,
+        name: &str,
+    ) -> Result<ImageInventory, ApiError> {
+        let catalog = self.snapshot();
+        let system = catalog.order_systems.get(name).ok_or_else(|| {
+            ApiError::not_found(
+                "order_system_not_found",
+                format!("unknown order system {name}"),
+            )
+        })?;
+        let current = Some(system.spec.image.clone());
+        self.available_images_for(&catalog, current, Some(name))
+            .await
+    }
+
     async fn available_images_for(
         &self,
         catalog: &Catalog,

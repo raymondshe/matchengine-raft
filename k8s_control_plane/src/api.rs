@@ -149,25 +149,37 @@ struct ImagesQuery {
     shard: Option<String>,
     #[serde(default)]
     market_data_service: Option<String>,
+    #[serde(default)]
+    order_system: Option<String>,
 }
 
-/// Images the engine or market-data upgrade picker can offer.
+/// Images the engine, market-data or order-system upgrade picker can offer.
 ///
-/// The CRD backend also lists node-cached images and running engine/market-data pods (read-only).
-/// Other backends return the references recorded in the catalog.
+/// The CRD backend also lists node-cached images and running engine/market-data/order-system pods
+/// (read-only). Other backends return the references recorded in the catalog.
 async fn images(
     State(store): State<Arc<Store>>,
     Query(query): Query<ImagesQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    if query.shard.is_some() && query.market_data_service.is_some() {
+    let selectors = [
+        query.shard.is_some(),
+        query.market_data_service.is_some(),
+        query.order_system.is_some(),
+    ];
+    if selectors.iter().filter(|selected| **selected).count() > 1 {
         return Err(ApiError::bad_request(
             "images_query",
-            "pass either shard or marketDataService, not both",
+            "pass only one of shard, marketDataService or orderSystem",
         ));
     }
-    let inventory = match query.market_data_service.as_deref() {
-        Some(name) => store.available_market_data_images(name).await?,
-        None => store.available_images(query.shard.as_deref()).await?,
+    let inventory = match (
+        query.shard.as_deref(),
+        query.market_data_service.as_deref(),
+        query.order_system.as_deref(),
+    ) {
+        (_, Some(name), _) => store.available_market_data_images(name).await?,
+        (_, _, Some(name)) => store.available_order_system_images(name).await?,
+        (shard, None, None) => store.available_images(shard).await?,
     };
     Ok(Json(json!(inventory)))
 }
@@ -1828,6 +1840,26 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{body}");
     }
 
+    async fn create_order_system(app: axum::Router) {
+        let (status, body) = post_json_to(
+            app,
+            "/api/v1/order-systems",
+            json!({
+                "name": "orders",
+                "spec": {
+                    "cell": "eu-1",
+                    "image": "registry.example.com/matchengine-order-system:arm64-v5",
+                    "replicas": 1,
+                    "targets": [{"symbol": "gbpusd", "label": "GBP/USD"}],
+                    "shards": [{"name": "users-0", "userIdMin": 0, "userIdMax": 249}],
+                    "ingress": "orders.match-eu-1.example"
+                }
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
     #[tokio::test]
     async fn market_data_upgrade_updates_the_image_and_keeps_the_release() {
         let app = app();
@@ -1980,6 +2012,38 @@ mod tests {
             detail["orderSystem"]["spec"]["image"],
             "matchengine-order-system:arm64-v2"
         );
+    }
+
+    #[tokio::test]
+    async fn order_system_image_inventory_uses_the_system_image() {
+        let app = app();
+        create_order_system(app.clone()).await;
+
+        let (status, body) = get_json_from(app.clone(), "/api/v1/images?orderSystem=orders").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["current"],
+            "registry.example.com/matchengine-order-system:arm64-v5"
+        );
+        assert_eq!(
+            body["repository"],
+            "registry.example.com/matchengine-order-system"
+        );
+        assert!(body["items"].as_array().unwrap().iter().any(|image| {
+            image["current"] == true
+                && image["reference"] == "registry.example.com/matchengine-order-system:arm64-v5"
+        }));
+        assert!(
+            body["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|image| image["repository"] == "registry.example.com/matchengine-order-system")
+        );
+
+        let (status, body) = get_json_from(app, "/api/v1/images?orderSystem=nope").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"], "order_system_not_found");
     }
 
     #[tokio::test]

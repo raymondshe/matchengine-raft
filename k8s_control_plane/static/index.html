@@ -647,6 +647,33 @@
   </div>
 </div>
 
+<div id="orderSystemUpgradeModal" class="modal" aria-hidden="true">
+  <div class="modal-card">
+    <div class="modal-head">
+      <h2>Update order-system image</h2>
+      <button class="close" type="button" data-close="orderSystemUpgradeModal" aria-label="Close">×</button>
+    </div>
+    <form id="orderSystemUpgradeForm">
+      <p class="muted">Order-system shards are stateless, so the operator rolls every user-shard
+        Deployment with <span class="mono">maxUnavailable: 0</span> and one surge pod. The
+        dropdown lists images cached on a node, currently running, or recorded in the catalog for
+        this order system's repository.</p>
+      <div class="form-grid" style="grid-template-columns: repeat(2, minmax(0, 1fr))">
+        <label class="field">Service<input id="osUpgradeService" readonly></label>
+        <label class="field">Current image<input id="osUpgradeCurrent" readonly></label>
+        <label class="field">Target image<select id="osUpgradeImageSelect"></select></label>
+        <label class="field">Custom image<input id="osUpgradeImage" autocomplete="off" spellcheck="false" placeholder="registry/...@sha256:..."></label>
+      </div>
+      <p class="muted mono" id="osUpgradeHint" style="overflow-wrap:anywhere"></p>
+      <div class="form-actions">
+        <span class="muted" id="osUpgradeStatus"></span>
+        <button type="button" data-close="orderSystemUpgradeModal">Cancel</button>
+        <button type="submit" class="primary" id="osUpgradeSubmit">Update image</button>
+      </div>
+    </form>
+  </div>
+</div>
+
 <script>
 const $ = (id) => document.getElementById(id);
 const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (c) => ({
@@ -950,7 +977,7 @@ async function openMarketDataUpgrade(name) {
       if (image.nodes) labels.push(`${image.nodes} node${image.nodes === 1 ? "" : "s"}`);
       return `<option value="${esc(image.reference)}">${esc(labels.join(" · "))}</option>`;
     }).join("") + `<option value="__custom">custom image…</option>`;
-    selectMarketDataImage(spec.image || "");
+    selectMarketDataImage(items.find((image) => image.current)?.reference || spec.image || "");
     $("mdUpgradeHint").textContent = inventory.warning
       ? `cluster inventory warning: ${inventory.warning}`
       : `repository: ${inventory.repository || "—"}`;
@@ -1095,24 +1122,96 @@ function renderOrderSystems() {
   });
 }
 
+let orderSystemUpgradeName = null;
+
+function orderSystemByName(name) {
+  return orderSystemItems.find((item) => item.name === name) || null;
+}
+
+function selectOrderSystemImage(reference) {
+  const select = $("osUpgradeImageSelect");
+  const custom = $("osUpgradeImage");
+  const known = [...select.options].some((option) => option.value === reference);
+  select.value = known ? reference : "__custom";
+  custom.value = known ? "" : (reference || "");
+  custom.disabled = select.value !== "__custom";
+}
+
 async function upgradeOrderSystem(name) {
-  const system = orderSystemItems.find((item) => item.name === name);
+  const system = orderSystemByName(name);
   if (!system) return;
-  const image = window.prompt(`Target image for ${name}`, system.spec?.image || "");
-  if (!image || image === system.spec?.image) return;
+  orderSystemUpgradeName = name;
+  const spec = system.spec || {};
+  $("osUpgradeService").value = name;
+  $("osUpgradeCurrent").value = spec.image || "";
+  $("osUpgradeImage").value = "";
+  $("osUpgradeHint").textContent = "";
+  $("osUpgradeStatus").textContent = "";
+  $("osUpgradeSubmit").disabled = false;
+  const select = $("osUpgradeImageSelect");
+  select.innerHTML = `<option value="">loading images…</option>`;
+  openModal("orderSystemUpgradeModal");
+  try {
+    const inventory = await api(`/api/v1/images?orderSystem=${encodeURIComponent(name)}`);
+    const items = inventory.items || [];
+    select.innerHTML = items.map((image) => {
+      const labels = [image.tag || image.reference];
+      if (image.current) labels.push("current");
+      if (image.runningHere) labels.push("running here");
+      if (image.nodes) labels.push(`${image.nodes} node${image.nodes === 1 ? "" : "s"}`);
+      return `<option value="${esc(image.reference)}">${esc(labels.join(" · "))}</option>`;
+    }).join("") + `<option value="__custom">custom image…</option>`;
+    selectOrderSystemImage(items.find((image) => image.current)?.reference || spec.image || "");
+    $("osUpgradeHint").textContent = inventory.warning
+      ? `cluster inventory warning: ${inventory.warning}`
+      : `repository: ${inventory.repository || "—"}`;
+  } catch (error) {
+    select.innerHTML = `<option value="__custom">custom image…</option>`;
+    select.value = "__custom";
+    $("osUpgradeImage").disabled = false;
+    $("osUpgradeImage").value = spec.image || "";
+    $("osUpgradeHint").textContent = `cannot load image inventory: ${error.message}`;
+  }
+}
+
+function syncOrderSystemImageSelect() {
+  const custom = $("osUpgradeImageSelect").value === "__custom";
+  $("osUpgradeImage").disabled = !custom;
+  if (custom) $("osUpgradeImage").focus();
+}
+
+function orderSystemUpgradeTarget() {
+  const selected = $("osUpgradeImageSelect").value;
+  return selected === "__custom" ? $("osUpgradeImage").value.trim() : selected;
+}
+
+async function submitOrderSystemUpgrade(event) {
+  event.preventDefault();
+  const name = orderSystemUpgradeName;
+  if (!name) return;
+  const image = orderSystemUpgradeTarget();
+  if (!image) {
+    $("osUpgradeStatus").textContent = "choose or enter a target image";
+    return;
+  }
+  $("osUpgradeSubmit").disabled = true;
+  $("osUpgradeStatus").textContent = "updating desired state…";
   try {
     const result = await api(`/api/v1/order-systems/${encodeURIComponent(name)}/upgrade`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ image: image.trim() }),
+      body: JSON.stringify({ image }),
     });
     const upgrade = result.upgrade || {};
+    closeModal("orderSystemUpgradeModal");
     toast(upgrade.changed
       ? `rolling ${name}: ${upgrade.shards?.length || 0} user shard(s)`
       : `${name} already uses this image`);
     await loadOrderSystems();
+    loadAudit();
   } catch (error) {
-    toast(error.message, true);
+    $("osUpgradeStatus").textContent = error.message;
+    $("osUpgradeSubmit").disabled = false;
   }
 }
 
@@ -1960,6 +2059,8 @@ function bind() {
   });
   $("mdUpgradeImageSelect").addEventListener("change", syncMarketDataImageSelect);
   $("marketDataUpgradeForm").addEventListener("submit", submitMarketDataUpgrade);
+  $("osUpgradeImageSelect").addEventListener("change", syncOrderSystemImageSelect);
+  $("orderSystemUpgradeForm").addEventListener("submit", submitOrderSystemUpgrade);
   $("upgradeBtn").addEventListener("click", upgradeShard);
   $("targetImageSelect").addEventListener("change", () => {
     const value = $("targetImageSelect").value;

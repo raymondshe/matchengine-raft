@@ -178,6 +178,11 @@ pub fn catalog_repositories(catalog: &Catalog) -> BTreeSet<String> {
             repositories.insert(image.repository);
         }
     }
+    for system in catalog.order_systems.values() {
+        if let Some(image) = parse_image(&system.spec.image) {
+            repositories.insert(image.repository);
+        }
+    }
     repositories
 }
 
@@ -200,6 +205,9 @@ pub fn merge_catalog(catalog: &Catalog, images: &mut BTreeMap<String, ImageChoic
     }
     for service in catalog.market_data_services.values() {
         insert_reference(images, &service.spec.image);
+    }
+    for system in catalog.order_systems.values() {
+        insert_reference(images, &system.spec.image);
     }
 }
 
@@ -287,6 +295,13 @@ pub async fn cluster_images(
             ApiError::internal(format!("list market-data pods for images: {error}"))
         })?;
     pods.items.extend(market_data_pods.items);
+    let order_system_pods = Api::<Pod>::all(client.clone())
+        .list(&ListParams::default().labels("matching.io/order-system"))
+        .await
+        .map_err(|error| {
+            ApiError::internal(format!("list order-system pods for images: {error}"))
+        })?;
+    pods.items.extend(order_system_pods.items);
 
     let mut images = BTreeMap::<String, ImageChoice>::new();
     for node in &nodes.items {
@@ -373,6 +388,12 @@ pub async fn cluster_images(
                     .labels
                     .as_ref()
                     .and_then(|labels| labels.get("matching.io/market-data"))
+            })
+            .or_else(|| {
+                pod.metadata
+                    .labels
+                    .as_ref()
+                    .and_then(|labels| labels.get("matching.io/order-system"))
             })
             .cloned()
             .or_else(|| pod.metadata.namespace.clone());

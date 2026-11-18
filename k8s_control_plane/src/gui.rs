@@ -179,6 +179,10 @@ mod tests {
         assert!(INDEX.contains("the manager does not proxy"));
         assert!(INDEX.contains("data-order-upgrade="));
         assert!(INDEX.contains("function upgradeOrderSystem"));
+        assert!(INDEX.contains("id=\"orderSystemUpgradeModal\""));
+        assert!(INDEX.contains("id=\"osUpgradeImageSelect\""));
+        assert!(INDEX.contains("/api/v1/images?orderSystem="));
+        assert!(!INDEX.contains("window.prompt"));
         assert!(INDEX.contains("/upgrade`"));
         assert!(INDEX.contains("hpa ${esc(minReplicas)}"));
     }
