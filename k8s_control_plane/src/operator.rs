@@ -2660,6 +2660,23 @@ async fn rollout_shards(
         if pods.items.is_empty() {
             continue;
         }
+        // A symbol that has just been added to an existing shard has no ready
+        // replica and no leader anywhere yet. Its first pod can never pass the
+        // Ready gate: the Raft group needs every replica before it can elect.
+        // Let the roll proceed while those new containers are running so the
+        // group can form; keep the gate for every existing symbol.
+        let unformed: BTreeSet<&str> = active
+            .iter()
+            .filter(|deployment| {
+                observations
+                    .get(&deployment.name)
+                    .is_some_and(|observation| {
+                        observation.leader_pod.is_none()
+                            && observation.pods.iter().all(|row| !row.ready)
+                    })
+            })
+            .map(|deployment| deployment.spec.symbol_ref.as_str())
+            .collect();
         // Serialize the roll at the pod level. A terminating pod still counts as healthy in
         // the observation until it disappears, so deleting a second outdated pod in the same
         // window can take a second voter down before the replacement is ready. Wait for the
@@ -2675,7 +2692,7 @@ async fn rollout_shards(
             );
             continue;
         }
-        if pods.items.iter().any(|pod| {
+        let waiting_for_ready = pods.items.iter().any(|pod| {
             pod.metadata.deletion_timestamp.is_none()
                 && pod
                     .metadata
@@ -2684,7 +2701,9 @@ async fn rollout_shards(
                     .and_then(|labels| labels.get("controller-revision-hash"))
                     .is_some_and(|revision| revision == &update_revision)
                 && !pod_ready(pod)
-        }) {
+                && !new_containers_are_starting(pod, &unformed)
+        });
+        if waiting_for_ready {
             info!(
                 shard = %shard.name,
                 "waiting for the rollout replacement to become ready"
@@ -2946,6 +2965,48 @@ fn pod_has_container(pod: &Pod, name: &str) -> bool {
     })
 }
 
+/// True when a not-ready pod's only unready containers belong to an unformed
+/// (newly added) symbol and are still running.
+///
+/// A newly added Raft group cannot elect until every replica carries the new
+/// container, so waiting for this pod to become Ready before releasing the next
+/// outdated pod deadlocks the add. The rollout may continue while the new
+/// container is running; a crash loop still blocks it.
+fn new_containers_are_starting(pod: &Pod, unformed: &BTreeSet<&str>) -> bool {
+    let Some(spec) = pod.spec.as_ref() else {
+        return false;
+    };
+    let Some(statuses) = pod
+        .status
+        .as_ref()
+        .and_then(|status| status.container_statuses.as_ref())
+    else {
+        return false;
+    };
+    let mut saw_unformed = false;
+    for container in &spec.containers {
+        let Some(status) = statuses.iter().find(|status| status.name == container.name) else {
+            return false;
+        };
+        if status.ready {
+            continue;
+        }
+        if !unformed.contains(container.name.as_str()) {
+            return false;
+        }
+        let running = status
+            .state
+            .as_ref()
+            .and_then(|state| state.running.as_ref())
+            .is_some();
+        if !running {
+            return false;
+        }
+        saw_unformed = true;
+    }
+    saw_unformed
+}
+
 /// Returns true when removing `pod` leaves a healthy quorum for every active process it hosts.
 ///
 /// In containers mode, processes whose container is absent from the pod (for example a symbol
@@ -2972,6 +3033,13 @@ fn processes_tolerate_removal(
             return false;
         };
         let healthy = observation.pods.iter().filter(|row| row.ready).count();
+        // A process with no ready replica and no leader has not formed a group
+        // yet (typically a symbol just added to an existing shard). There is no
+        // quorum to protect; blocking here would prevent the remaining pods from
+        // ever starting the new container.
+        if healthy == 0 && observation.leader_pod.is_none() {
+            continue;
+        }
         let candidate_healthy = observation
             .pods
             .iter()
@@ -4479,6 +4547,64 @@ mod tests {
         }
     }
 
+    fn rollout_pod_status(name: &str, containers: &[(&str, bool, bool)]) -> Pod {
+        use k8s_openapi::api::core::v1::{
+            Container, ContainerState, ContainerStateRunning, ContainerStatus, PodSpec, PodStatus,
+        };
+        Pod {
+            metadata: k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
+                name: Some(name.to_string()),
+                ..Default::default()
+            },
+            spec: Some(PodSpec {
+                containers: containers
+                    .iter()
+                    .map(|(name, _, _)| Container {
+                        name: name.to_string(),
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            }),
+            status: Some(PodStatus {
+                container_statuses: Some(
+                    containers
+                        .iter()
+                        .map(|(name, ready, running)| ContainerStatus {
+                            name: name.to_string(),
+                            ready: *ready,
+                            state: Some(ContainerState {
+                                running: running.then(ContainerStateRunning::default),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        })
+                        .collect(),
+                ),
+                ..Default::default()
+            }),
+        }
+    }
+
+    #[test]
+    fn new_symbol_containers_do_not_block_the_rollout() {
+        let unformed = BTreeSet::from(["eurusd"]);
+        let starting = rollout_pod_status(
+            "fx-eu-01-3",
+            &[("eurusd", false, true), ("gbpusd", true, true)],
+        );
+        assert!(new_containers_are_starting(&starting, &unformed));
+
+        let waiting = rollout_pod_status(
+            "fx-eu-01-3",
+            &[("eurusd", false, false), ("gbpusd", true, true)],
+        );
+        assert!(!new_containers_are_starting(&waiting, &unformed));
+
+        let formed_not_ready = rollout_pod_status("fx-eu-01-3", &[("gbpusd", false, true)]);
+        assert!(!new_containers_are_starting(&formed_not_ready, &unformed));
+    }
+
     fn rollout_observations(deployment: &SymbolDeployment, ready: [bool; 4]) -> Observations {
         Observations::from([(
             deployment.name.clone(),
@@ -4537,6 +4663,11 @@ mod tests {
             &observations,
             &unrelated
         ));
+
+        // A newly added symbol has no ready replica and no leader yet. It has
+        // no quorum to protect, so its presence must not hold the roll.
+        let unformed = rollout_observations(&deployment, [false, false, false, false]);
+        assert!(processes_tolerate_removal(&shard, &active, &unformed, &pod));
     }
 
     #[test]
