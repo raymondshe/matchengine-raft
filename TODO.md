@@ -108,10 +108,11 @@ run as production evidence for them.
     unaffected.
 11. **Market-data feed hardening.** Source startup requests a snapshot immediately and retries
     until one is seen; the supervisor restarts a child when its `marketData` configuration changes;
-    and Profile N direct NATS is live on OrbStack, which removes the single-node Aeron
-    image-registration failure. Remaining work: add a NATS phase to `scripts/operator-acceptance.sh`,
-    prove reconnect/replay with a NATS restart, add TLS/auth and JetStream retention, and keep the
-    Aeron 5-30 s watchdog for clusters that still use multicast.
+    Profile N direct NATS is live on OrbStack; and `scripts/operator-acceptance.sh` now has a `nats`
+    phase that proves sink=`nats`, feed readiness, and service-pod re-subscribe/snapshot recovery.
+    A live NATS restart also preserved all symbol readiness and re-established all 36 client
+    connections. Remaining work: add TLS/auth and JetStream retention, run a multi-node NATS
+    cluster, and keep the Aeron 5-30 s watchdog for clusters that still use multicast.
 12. **Multi-host evidence.** Rerun the read/write A/B on a second host and a Linux multi-host
     four-voter cluster, force a stale lease so the `ReadIndex` fallback is observed, validate
     Aeron multicast across hosts, and dispatch the bare-metal pinned-core `e2e` workflow.
@@ -314,6 +315,15 @@ Completed work is summarised here; detailed evidence, measurements and implement
 in git history and the linked docs. For the full history, check out `TODO.md` from an earlier commit
 (`git log -- TODO.md`).
 
+- **2026-11-18** — New-symbol rollout fix and NATS acceptance: adding a symbol to an existing
+  containers-mode shard no longer deadlocks the operator. A new Raft group has no leader or ready
+  replica until every pod carries its container, so the rollout now treats a zero-ready/no-leader
+  deployment as unformed, continues while its new containers are running, and skips its quorum
+  gate until it has something to protect. A crash-looping new container still blocks the roll.
+  `eurusd-g1` was re-enabled and rolled onto all four `fx-eu-01` pods; `eurusd` and `gbpusd` are
+  both Ready and the shard rollout is complete. The acceptance harness gained a `nats` phase
+  (containers+nats passed in 248s) and the acceptance engine image default moved to
+  `matchengine-raft:k8s-nats-arm64-v1`.
 - **2026-11-18** — Profile N direct NATS market-data transport: the engine has a `NatsSink`
   (`market-data-nats` feature, `--market-data-nats-url`/`--market-data-nats-subject-prefix`/
   `--market-data-nats-stream-base`), `market_data_system` has a `NatsSource` (`--nats-url`,

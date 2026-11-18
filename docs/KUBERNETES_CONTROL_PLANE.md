@@ -838,9 +838,12 @@ data:
   request sets `allowRestart: true`. Use supervisor mode for repeated zero-impact placement; an
   empty/new containers shard is zero-impact for its first placement only.
 - **Containers mode:** adding a symbol creates a `SymbolDeployment` and updates the StatefulSet pod
-  template with a new container. The operator rolls one pod at a time (each symbol loses one voter;
-  quorum stays 3/4), then initialises the new process on all four pods and applies its config.
-  Removing is the reverse after the gateway drains the symbol; the last active engine in a shard
+  template with a new container. The operator rolls one pod at a time (each existing symbol loses
+  one voter; quorum stays 3/4). The new symbol has no leader or ready replica until every pod
+  carries its container, so it is exempt from the Ready and removal-quorum gates during that add
+  roll; a crash-looping new container still stops the roll. Once all four replicas are healthy the
+  operator initialises the new process and applies its config. Removing is the reverse after the
+  gateway drains the symbol; the last active engine in a shard
   can be stopped without restarting another engine, then its StatefulSet/pods are pruned and the
   PVC is retained.
 - **Supervisor mode:** the supervisor reads the bound `SymbolDeployment` objects (or a rendered
@@ -1624,9 +1627,11 @@ Adding a symbol does not require a new shard; it adds one engine process to the 
 
 - **Containers mode:** the manager creates a `SymbolDeployment` with the next free slot/ports; the
   operator adds a container to the StatefulSet pod template. It rolls one pod at a time (every
-  existing process loses one voter, but quorum stays 3/4), then initialises the new process on all
-  four pods (`/init` on its port), applies the symbol config and waits for ready. Preflight the
-  pod's new total CPU/memory request; otherwise the rolling pods can stay Pending.
+  existing process loses one voter, but quorum stays 3/4), exempting the new symbol from the
+  Ready/quorum gate until all four pods carry it; then it initialises the new process on all four
+  pods (`/init` on its port), applies the symbol config and waits for ready. A crash-looping new
+  container still stops the roll. Preflight the pod's new total CPU/memory request; otherwise the
+  rolling pods can stay Pending.
 - **Supervisor mode:** the supervisor starts the new engine process on all four pods without a
   pod-template change; the operator then initialises/configures it. No existing symbol restarts.
 - If the pod is already at `maxProcessesPerPod`, place the symbol in another shard or promote a hot

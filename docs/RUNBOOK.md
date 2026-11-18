@@ -620,9 +620,12 @@ curl -s -X POST http://127.0.0.1:8099/api/v1/symbols \
 ```
 
 Adding to a non-empty **containers** shard returns `409 restart_required`; only pass
-`"allowRestart": true` when a one-voter-at-a-time pod roll is acceptable. The manager allocates the
+`"allowRestart": true` when a one-pod-at-a-time roll is acceptable. The manager allocates the
 lowest free slot and `httpBasePort + slot`; rename or migrate the symbol if you need different
-placement.
+placement. A newly added symbol has no leader or ready replica until every pod carries its
+container, so the operator exempts it from the Ready/quorum gate during that add roll and
+bootstraps the group once all replicas are healthy. A crash-looping new container still stops the
+roll; check its logs and the shard's `Progressing` condition before retrying.
 
 ### Stop and start an engine
 
@@ -810,6 +813,8 @@ touches the demo fleet. Everything it creates is removed on exit unless `--keep`
 # One or more phases.
 ./scripts/operator-acceptance.sh run --phases containers,leader,roll
 ./scripts/operator-acceptance.sh run --phases supervisor --keep
+# Direct NATS market data (about 4 minutes; requires deploy/nats.yaml).
+./scripts/operator-acceptance.sh run --phases containers,nats
 
 # Read-only template checks against existing shards (containers, supervisor,
 # reserved) plus the order-system Deployments/HPAs.
@@ -831,6 +836,7 @@ Phases and evidence:
 | `reserved` | A shard with no process renders only ConfigMap/PDB/NetworkPolicy, reports `Reserved`, and drops with `mode: reserved` and no PVCs. |
 | `migration` | A shadow deployment uses `raftIdOffset = source offset + replicas`; the route transitions `Shadow → Cutover → Active`, the source drains, the target serves the same sequence/book and accepts a new write; patching `state: Rollback` restores the source voters, both orders and the post-cutover write, and disables the target. |
 | `adoption` | With the operator scaled to zero, the rendered manifests are applied by hand; after scaling the operator up it bootstraps the group without recreating the StatefulSet, PVCs or pods (UIDs compared) and the engine is usable. |
+| `nats` | Creates an acceptance-only `MarketDataService` with `transport.mode: nats`, proves the shard rolls onto `--market-data-nats-*`, the canonical `md.<cell>.<feed-group>` subject and sink=`nats`, the service is FeedReady and `/ready` 200, then restarts the market-data pod and proves it re-subscribes and requests a fresh snapshot. |
 
 `render` also asserts the order-system render: one Deployment/Service/PDB/Ingress and one HPA per
 user shard, a one-replica HPA floor with a 70% CPU target, `maxUnavailable: 0` with one surge pod,
@@ -839,11 +845,16 @@ their one-replica floor as well.
 
 The harness starts a manager port-forward on `18099` when the manager is not already reachable; use
 `--manager URL`, `--namespace`, `--control-namespace`, `--operator`, `--prefix`, `--base-port`,
-`--timeout` and `--roll-timeout` to point it elsewhere. `--phases` accepts
-`containers,leader,roll,stopstart,supervisor,reserved,migration,adoption`. The default symbol IDs
-are 91-95 and the default ports start at 26201, so a run does not collide with the demo fleet.
+`--image`, `--marketdata-image`, `--nats-url`, `--timeout` and `--roll-timeout` to point it
+elsewhere. `--phases` accepts
+`containers,leader,roll,stopstart,supervisor,reserved,migration,adoption,nats`. The default symbol
+IDs are 91-95 and the default ports start at 26201, so a run does not collide with the demo fleet;
+the `nats` service uses `<base-port>+500` for its WebSocket port. The default engine image is
+`matchengine-raft:k8s-nats-arm64-v1` and the default market-data image is
+`matchengine-marketdata:aeron-arm64-v7`.
 
-`cleanup` removes every `acc-*` shard, deployment, route, symbol, workload and retained PVC. The
+`cleanup` removes every `acc-*` shard, deployment, route, symbol, `MarketDataService`, workload
+and retained PVC. The
 local operator runs with `--retention-seconds 0`, so an orphaned PVC is marked `manual` instead of
 being deleted automatically; the harness deletes the labelled acceptance PVCs explicitly.
 
@@ -852,16 +863,19 @@ volume update), and each image roll waits for the terminating pod's grace period
 takes about 15 minutes. The harness has no metrics-server dependency; HPA CPU scaling and CSI
 volume snapshots remain separate validation items.
 
-Latest run on the OrbStack demo (2026-11-17, `operator-v78`): all eight phases passed in 889s,
-including 0→1→2→3 pod replacement progress with 0/33/66/100 manager percentages in both roll
-directions and unchanged StatefulSet/PVC/pod UIDs during adoption.
+Latest runs on the OrbStack demo: the original eight phases passed in 889s on `operator-v78`
+(2026-11-17), including 0→1→2→3 pod replacement progress with 0/33/66/100 manager percentages in
+both roll directions and unchanged StatefulSet/PVC/pod UIDs during adoption. The new
+`containers,nats` pair passed in 248s on `operator-v82` (2026-11-18), including a market-data pod
+restart and re-subscribe.
 
 ### Market-data service
 
 `MarketDataService` is a separate desired-state CRD for the standalone WebSocket fan-out tier. The
 operator renders Deployment/Service/PDB/NetworkPolicy/ConfigMap, an Ingress when
 `websocket.ingress` is set, and an HPA with a minimum of one replica. Profile A (direct Aeron
-multicast) is the only rendered transport. A shard-local service sets `websocket.fastOnly: true`
+multicast) and Profile N (direct NATS) are rendered. A shard-local service sets
+`websocket.fastOnly: true`
 and serves only `/ws/<symbol>@<stream>`; a global service declares one `feedGroup` per shard with
 its own `channel` and keeps the terminal `/ws` and `/stream?streams=...` routes.
 
