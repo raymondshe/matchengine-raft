@@ -263,6 +263,9 @@ NATS only:
   NetworkPolicy. The canonical prefix is `md.<cell>.<feed-group>` from the smallest service that
   covers the symbol, so the fast and global services share one subject even when their local group
   names differ. `transport.subjectPrefix` overrides the `md` root.
+- Symbol lifecycle: stopping a `SymbolDeployment` removes it from every service that declares it
+  (engine args, market-data args/ConfigMap and status); starting it re-adds the symbol and rolls
+  the service. A service whose symbols are all stopped scales to zero and drops its HPA.
 - Lab infrastructure: `k8s_control_plane/deploy/nats.yaml` runs a single plaintext NATS server in
   `match-eu-1`. Production still needs a multi-node NATS cluster, TLS, credentials and (optionally)
   JetStream retention.

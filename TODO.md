@@ -111,7 +111,9 @@ run as production evidence for them.
     Profile N direct NATS is live on OrbStack; and `scripts/operator-acceptance.sh` now has a `nats`
     phase that proves sink=`nats`, feed readiness, and service-pod re-subscribe/snapshot recovery.
     A live NATS restart also preserved all symbol readiness and re-established all 36 client
-    connections. Remaining work: add TLS/auth and JetStream retention, run a multi-node NATS
+    connections. A stopped `SymbolDeployment` now leaves every `MarketDataService` that declares
+    it, and starting it re-adds the symbol; a service with no active symbols scales to zero and
+    drops its HPA. Remaining work: add TLS/auth and JetStream retention, run a multi-node NATS
     cluster, and keep the Aeron 5-30 s watchdog for clusters that still use multicast.
 12. **Multi-host evidence.** Rerun the read/write A/B on a second host and a Linux multi-host
     four-voter cluster, force a stale lease so the `ReadIndex` fallback is observed, validate

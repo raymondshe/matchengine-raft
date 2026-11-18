@@ -1995,7 +1995,12 @@ per-service image picker. Profile N direct NATS is also rendered:
 `--market-data-nats-*` args and the market-data `--nats-*` source args, opens TCP 4222 in the
 NetworkPolicy and skips Aeron ports. The canonical subject is `md.<cell>.<feed-group>`, chosen
 from the smallest service that covers a symbol, so a fast service and the global terminal service
-subscribe to the same feed. `k8s_control_plane/deploy/nats.yaml` is the single-node lab server.
+subscribe to the same feed. A symbol's lifecycle follows its `SymbolDeployment`: stopping it
+(`spec.desiredState: Disabled`) removes it from every service that declares it — rendered args,
+ConfigMap and per-symbol status — while the other symbols stay Ready; starting it re-adds the
+symbol and rolls the Deployment. A service whose declared symbols are all stopped scales to zero
+and omits its HPA, so it does not flap while the shard is down.
+`k8s_control_plane/deploy/nats.yaml` is the single-node lab server.
 HPA/canary policy, ServiceMonitor, NATS TLS/auth and JetStream retention remain follow-ups; the
 transport choice, multicast constraints and scale-out profiles are designed in
 [`AERON_K8S_MESSAGE_BUS.md`](./AERON_K8S_MESSAGE_BUS.md).

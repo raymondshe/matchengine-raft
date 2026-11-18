@@ -879,6 +879,12 @@ multicast) and Profile N (direct NATS) are rendered. A shard-local service sets
 and serves only `/ws/<symbol>@<stream>`; a global service declares one `feedGroup` per shard with
 its own `channel` and keeps the terminal `/ws` and `/stream?streams=...` routes.
 
+A `MarketDataService` follows each symbol's lifecycle. Stopping a symbol through the manager
+(`POST /api/v1/symbols/{name}/shutdown`) removes it from every service that declares it, including
+the rendered args, ConfigMap and per-symbol status; the rest of the feed stays Ready and a service
+whose symbols are all stopped scales to zero. `POST /api/v1/symbols/{name}/start` re-adds the
+symbol and rolls the service back up.
+
 ```sh
 curl -s -X POST http://127.0.0.1:8099/api/v1/market-data-services \
   -H 'content-type: application/json' -d '{
