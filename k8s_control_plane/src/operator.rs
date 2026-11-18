@@ -1067,7 +1067,9 @@ async fn observe_market_data(
         let now = now_ms();
         let mut not_ready = Vec::new();
         let mut symbols = Vec::new();
-        for name in service.spec.symbol_names() {
+        // A stopped symbol has left the feed; probing it would keep the service
+        // Degraded forever because it never receives frames.
+        for name in catalog.market_data_symbols(service) {
             let ready_symbol = ready
                 .as_ref()
                 .and_then(|value| value.get("symbols"))
@@ -3438,6 +3440,17 @@ fn market_data_status(
 ) -> crate::model::MarketDataServiceStatus {
     use crate::model::MarketDataServiceStatus;
 
+    let active = catalog.market_data_symbols(service);
+    if active.is_empty() {
+        return MarketDataServiceStatus {
+            phase: Phase::Disabled,
+            conditions: vec![Condition::false_("FeedReady", "NoActiveSymbols")],
+            replicas: 0,
+            ready_replicas: 0,
+            symbols: Vec::new(),
+            message: "no active symbols; deployment scaled to zero".to_string(),
+        };
+    }
     let observation = observation.cloned().unwrap_or_default();
     // HPA owns the live replica count; `spec.replicas` is only the upper bound
     // when `autoscaling.maxReplicas` is unset. Use the Deployment's observed
@@ -3448,7 +3461,7 @@ fn market_data_status(
         service.spec.min_replicas()
     });
     let image_pinned = service.spec.image.contains("@sha256:");
-    let release_compatible = service.spec.symbol_names().iter().all(|name| {
+    let release_compatible = active.iter().all(|name| {
         catalog
             .deployments
             .values()
@@ -4755,6 +4768,34 @@ mod tests {
             }],
             ..MarketDataObservation::default()
         }
+    }
+
+    #[test]
+    fn market_data_status_is_disabled_without_active_symbols() {
+        let mut catalog = demo_catalog();
+        for deployment in catalog.deployments.values_mut() {
+            deployment.spec.desired_state = DeploymentState::Disabled;
+        }
+        let service = market_data_service();
+        let status = market_data_status(
+            &service,
+            &catalog,
+            Some(&market_data_observation(0, false)),
+            false,
+        );
+        assert_eq!(status.phase, Phase::Disabled);
+        assert_eq!(status.replicas, 0);
+        assert!(status.symbols.is_empty());
+        assert!(
+            status
+                .conditions
+                .iter()
+                .any(|condition| condition.kind == "FeedReady"
+                    && condition.status == "False"
+                    && condition.reason.as_deref() == Some("NoActiveSymbols")),
+            "{:?}",
+            status.conditions
+        );
     }
 
     #[test]

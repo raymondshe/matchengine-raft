@@ -238,7 +238,13 @@ fn nats_feed(catalog: &Catalog, cell: &str, symbol: &str) -> Option<NatsFeed> {
             .trim()
             .trim_end_matches('.');
         let base = if base.is_empty() { "md" } else { base };
-        let rank = service.spec.symbol_names().len();
+        // Only services that actively serve the symbol take part in the
+        // canonical-subject ranking; a stopped symbol leaves the feed entirely.
+        let active = catalog.market_data_symbols(service);
+        if !active.iter().any(|name| name == symbol) {
+            continue;
+        }
+        let rank = active.len();
         for group in service.spec.effective_feed_groups() {
             if !group.symbols.iter().any(|name| name == symbol) {
                 continue;
@@ -345,7 +351,7 @@ pub fn render_shard(
         if service.spec.paused || service.spec.transport.mode == MarketDataTransportMode::Bridge {
             continue;
         }
-        let rank = service.spec.symbol_names().len();
+        let rank = catalog.market_data_symbols(service).len();
         for group in service.spec.effective_feed_groups() {
             let channel = group
                 .channel
@@ -1279,6 +1285,8 @@ struct MarketDataCtx<'a> {
     namespace: String,
     /// Resolved symbols with the channel and stream base each one uses.
     symbols: Vec<MarketDataSymbol<'a>>,
+    /// False when every declared symbol is stopped; the Deployment then scales to zero.
+    has_active_symbols: bool,
 }
 
 struct MarketDataSymbol<'a> {
@@ -1619,8 +1627,9 @@ fn market_data_deployment(ctx: &MarketDataCtx<'_>, config: &Value) -> Value {
             },
         },
     });
-    // The HPA owns the replica count; only pin it when the service is paused.
-    if ctx.service.spec.paused {
+    // The HPA owns the replica count; pin it when the service is paused or when
+    // every symbol it serves has been stopped.
+    if ctx.service.spec.paused || !ctx.has_active_symbols {
         deployment["spec"]["replicas"] = json!(0);
     }
     deployment
@@ -1934,8 +1943,21 @@ pub fn render_market_data_service(
         }
     }
 
+    let declared = service.spec.symbol_names();
+    if declared.is_empty() {
+        return Err(market_data_error(
+            "market_data_symbols",
+            name,
+            "declare at least one symbol or feed group",
+        ));
+    }
+    // A disabled engine deployment (stopped symbol) leaves the feed. Resolve every
+    // declared symbol so a stale name is still rejected, but only render the
+    // active ones into the container and the ConfigMap.
+    let active: std::collections::BTreeSet<String> =
+        catalog.market_data_symbols(service).into_iter().collect();
     let mut symbols = Vec::new();
-    for symbol_name in service.spec.symbol_names() {
+    for symbol_name in declared {
         let symbol = catalog.symbols.get(&symbol_name).ok_or_else(|| {
             market_data_error(
                 "symbol_missing",
@@ -1977,6 +1999,9 @@ pub fn render_market_data_service(
                 ),
             ));
         }
+        if !active.contains(&symbol_name) {
+            continue;
+        }
         let (channel, nats_prefix, stream_base) = match service.spec.transport.mode {
             MarketDataTransportMode::Multicast => {
                 let channel = service.spec.channel_for(&symbol_name).ok_or_else(|| {
@@ -2011,14 +2036,6 @@ pub fn render_market_data_service(
             nats_subject_prefix: nats_prefix,
         });
     }
-    if symbols.is_empty() {
-        return Err(market_data_error(
-            "market_data_symbols",
-            name,
-            "declare at least one symbol or feed group",
-        ));
-    }
-
     let namespace = namespace
         .map(str::to_string)
         .filter(|namespace| !namespace.is_empty())
@@ -2029,11 +2046,13 @@ pub fn render_market_data_service(
                 service.namespace.clone()
             }
         });
+    let has_active_symbols = !symbols.is_empty();
     let ctx = MarketDataCtx {
         service,
         cell,
         namespace,
         symbols,
+        has_active_symbols,
     };
     let config = market_data_config(&ctx);
     let mut objects = vec![
@@ -2046,7 +2065,9 @@ pub fn render_market_data_service(
     if !service.spec.websocket.ingress.trim().is_empty() {
         objects.push(market_data_ingress(&ctx));
     }
-    if !service.spec.paused {
+    // An HPA would scale a zero-symbol service back up, so omit it until a
+    // symbol is started again.
+    if !service.spec.paused && ctx.has_active_symbols {
         objects.push(market_data_hpa(&ctx));
     }
     Ok(objects)
@@ -3013,6 +3034,102 @@ mod tests {
             .market_data_services
             .insert(name.to_string(), service.clone());
         service
+    }
+
+    fn demo_nats_groups_service(
+        catalog: &mut Catalog,
+        name: &str,
+        groups: &[(&str, &str)],
+    ) -> crate::model::MarketDataService {
+        use crate::model::MarketDataFeedGroup;
+        let mut service = demo_nats_market_data(catalog, name);
+        service.spec.feed_groups = groups
+            .iter()
+            .map(|(group, symbol)| MarketDataFeedGroup {
+                name: (*group).to_string(),
+                symbols: vec![(*symbol).to_string()],
+                stream_base: 2001,
+                channel: None,
+            })
+            .collect();
+        catalog
+            .market_data_services
+            .insert(name.to_string(), service.clone());
+        service
+    }
+
+    fn deployment_args(objects: &[Value]) -> Vec<String> {
+        object(objects, "Deployment")["spec"]["template"]["spec"]["containers"][0]["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|arg| arg.as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn stopped_symbol_leaves_the_market_data_feed() {
+        let mut catalog = demo_catalog();
+        demo_nats_groups_service(
+            &mut catalog,
+            "fx-marketdata",
+            &[("fx-a", "gbpusd"), ("eurusd", "eurusd")],
+        );
+        catalog
+            .deployments
+            .get_mut("eurusd-g1")
+            .unwrap()
+            .spec
+            .desired_state = DeploymentState::Disabled;
+
+        let objects = render_market_data_service(&catalog, "fx-marketdata", None).unwrap();
+        let args = deployment_args(&objects);
+        assert!(args.iter().any(|arg| arg == "gbpusd:2:GBP:USD"), "{args:?}");
+        assert!(
+            !args.iter().any(|arg| arg.starts_with("eurusd:")),
+            "{args:?}"
+        );
+        assert!(args.iter().any(|arg| arg == "md.eu-1.fx-a"), "{args:?}");
+        assert!(!args.iter().any(|arg| arg == "md.eu-1.eurusd"), "{args:?}");
+
+        let config = object(&objects, "ConfigMap");
+        let config: Value =
+            serde_json::from_str(config["data"]["marketdata.json"].as_str().unwrap()).unwrap();
+        let eurusd = config["feedGroups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|group| group["name"] == "eurusd")
+            .unwrap();
+        assert!(
+            eurusd["symbols"].as_array().unwrap().is_empty(),
+            "{eurusd:?}"
+        );
+    }
+
+    #[test]
+    fn all_stopped_symbols_scale_market_data_to_zero() {
+        let mut catalog = demo_catalog();
+        demo_nats_groups_service(
+            &mut catalog,
+            "fx-marketdata",
+            &[("fx-a", "gbpusd"), ("eurusd", "eurusd")],
+        );
+        for deployment in catalog.deployments.values_mut() {
+            deployment.spec.desired_state = DeploymentState::Disabled;
+        }
+
+        let objects = render_market_data_service(&catalog, "fx-marketdata", None).unwrap();
+        let deployment = object(&objects, "Deployment");
+        assert_eq!(deployment["spec"]["replicas"], 0);
+        let args = deployment_args(&objects);
+        assert!(!args.iter().any(|arg| arg == "--symbol"), "{args:?}");
+        assert!(
+            !objects
+                .iter()
+                .any(|object| object["kind"] == "HorizontalPodAutoscaler"),
+            "an HPA would scale a zero-symbol service back up"
+        );
     }
 
     #[test]

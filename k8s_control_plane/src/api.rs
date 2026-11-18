@@ -1081,9 +1081,8 @@ async fn market_data_services(State(store): State<Arc<Store>>) -> Json<Value> {
 
 /// Engine shards that currently publish the symbols served by this fan-out tier.
 fn market_data_sources(catalog: &Catalog, service: &MarketDataService) -> Vec<Value> {
-    service
-        .spec
-        .symbol_names()
+    catalog
+        .market_data_symbols(service)
         .into_iter()
         .map(|symbol| {
             let deployment = catalog

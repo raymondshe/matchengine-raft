@@ -17,7 +17,8 @@ use crate::bundle::ShardBundle;
 use crate::error::ApiError;
 use crate::images::{ImageChoice, ImageInventory};
 use crate::model::{
-    Cell, MarketDataService, OrderSystem, SymbolDeployment, SymbolRoute, SymbolShard, TradingSymbol,
+    Cell, DeploymentState, MarketDataService, OrderSystem, SymbolDeployment, SymbolRoute,
+    SymbolShard, TradingSymbol,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -93,6 +94,26 @@ impl Catalog {
 
     pub fn shard_processes(&self, shard: &str) -> usize {
         self.shard_deployments(shard).len()
+    }
+
+    /// Symbols a market-data service should serve right now.
+    ///
+    /// Stopping a symbol sets its engine deployment to `Disabled`; the symbol then
+    /// leaves every feed and rejoins when it is started again. A symbol with a
+    /// shadow/draining/migrating deployment counts as active so a cutover never
+    /// drops the feed before the replacement is serving.
+    pub fn market_data_symbols(&self, service: &MarketDataService) -> Vec<String> {
+        service
+            .spec
+            .symbol_names()
+            .into_iter()
+            .filter(|symbol| {
+                self.deployments.values().any(|deployment| {
+                    deployment.spec.symbol_ref == *symbol
+                        && deployment.spec.desired_state != DeploymentState::Disabled
+                })
+            })
+            .collect()
     }
 
     pub fn audit(&mut self, actor: &str, action: &str, target: &str, detail: impl Into<String>) {
@@ -465,6 +486,52 @@ pub fn demo_catalog() -> Catalog {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn market_data_symbols_follow_deployment_state() {
+        use crate::model::{MarketDataService, MarketDataServiceSpec};
+
+        let mut catalog = demo_catalog();
+        let service = MarketDataService {
+            name: "fx-marketdata".to_string(),
+            namespace: "match-eu-1".to_string(),
+            spec: MarketDataServiceSpec {
+                cell: "eu-1".to_string(),
+                symbols: vec![
+                    "eurusd".to_string(),
+                    "gbpusd".to_string(),
+                    "btcusdt".to_string(),
+                ],
+                feed_groups: Vec::new(),
+                image: "matchengine-marketdata:test".to_string(),
+                release: Default::default(),
+                replicas: 1,
+                transport: Default::default(),
+                websocket: Default::default(),
+                autoscaling: Default::default(),
+                resources: None,
+                paused: false,
+            },
+            status: Default::default(),
+        };
+        assert_eq!(
+            catalog.market_data_symbols(&service),
+            ["eurusd", "gbpusd", "btcusdt"]
+        );
+
+        catalog
+            .deployments
+            .get_mut("eurusd-g1")
+            .unwrap()
+            .spec
+            .desired_state = DeploymentState::Disabled;
+        assert_eq!(catalog.market_data_symbols(&service), ["gbpusd", "btcusdt"]);
+
+        for deployment in catalog.deployments.values_mut() {
+            deployment.spec.desired_state = DeploymentState::Disabled;
+        }
+        assert!(catalog.market_data_symbols(&service).is_empty());
+    }
 
     #[test]
     fn demo_catalog_has_packed_reserved_and_dedicated_shards() {
