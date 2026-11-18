@@ -1787,6 +1787,7 @@ GET    /api/v1/operations/{id}
 POST   /api/v1/operations/{id}/cancel
 GET    /api/v1/templates
 POST   /api/v1/templates
+GET    /api/v1/images?shard={name}|marketDataService={name}|orderSystem={name}
 GET    /api/v1/market-data-services
 POST   /api/v1/market-data-services
 POST   /api/v1/market-data-services/{name}/upgrade
@@ -2051,7 +2052,10 @@ Order-system upgrades are stateless: `POST /api/v1/order-systems/{name}/upgrade`
 no Raft quorum, leader transfer or wire-version gate. The manager **order systems** view lists
 shards, targets, HPA bounds, per-shard readiness and a **WebUI** link per shard
 (`http://<shard>.<spec.ingress>/demo/`, `https` when `spec.tlsSecret` is set), plus an **upgrade**
-button. Order entry stays in the order system: the control plane does not render an order ticket
+button. Its upgrade dialog lists every image cached on a node, currently running in an
+order-system pod, or recorded in the catalog for the system's repository; a free-text field remains
+for a new digest-pinned reference. The picker is backed by
+`GET /api/v1/images?orderSystem={name}`. Order entry stays in the order system: the control plane does not render an order ticket
 and does not proxy `/orders` or book state. A user-ID routing gateway in front of the per-shard
 Services (exact modulo or range routing) remains a P2 follow-up; today clients open the shard WebUI
 or select the shard URL directly. In the OrbStack demo, the rendered Ingresses are served by the

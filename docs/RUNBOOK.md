@@ -190,12 +190,14 @@ details are in [`k8s_control_plane/README.md`](../k8s_control_plane/README.md).
 | Drop a shard | `POST /api/v1/shards/{shard}/drop` or **drop shard** | catalog-only; requires every engine stopped; asks `retainStorage`; the operator prunes workloads/PVCs |
 | Audit | `GET /api/v1/audit` | `shutdown-symbol`, `start-symbol` and `drop-shard` are recorded |
 
-The GUI is served at `/` (and `/console`). From a workstation:
+The GUI is served at `/` (and `/console`). In the OrbStack demo it is published through the
+ingress front door:
 
 ```sh
-kubectl -n match-control port-forward deploy/match-manager 8099:8099
-open http://127.0.0.1:8099/
+open http://console.match-eu-1.example/
 ```
+
+When the ingress is not installed, port-forward the manager and use `http://localhost:8099/`.
 
 ### Safety model and data locations
 
@@ -367,12 +369,9 @@ allows HTTP from namespaces labelled `matching.io/role=control-plane`; keep that
 the GUI from another namespace. It also allows same-cell engine pods to reach each other on all
 ports for cross-shard migration.
 
-Port-forward the manager for a workstation browser:
-
-```sh
-kubectl -n match-control port-forward deploy/match-manager 8099:8099
-# http://127.0.0.1:8099/
-```
+Open the manager at `http://console.match-eu-1.example/`; the front door is described under
+[Reach the demo ingress hosts](#reach-the-demo-ingress-hosts). When the ingress is unavailable,
+port-forward `deploy/match-manager` and use `http://localhost:8099/` instead.
 
 When the manager runs on the workstation instead of in the cluster, point the console proxy at
 loopback with `cargo run --manifest-path k8s_control_plane/Cargo.toml -- serve
@@ -404,7 +403,7 @@ cargo build --manifest-path k8s_control_plane/Cargo.toml \
 
    Capture the data baseline for every symbol (`orderbook_sequence` and `orderbook_orders` on the
    leader or through the manager console proxy). Save the manager's current catalog too:
-   `curl -s http://127.0.0.1:8099/api/v1/catalog > /tmp/match-adopt/catalog.json`.
+   `curl -s http://console.match-eu-1.example/api/v1/catalog > /tmp/match-adopt/catalog.json`.
 
 2. **Rebuild and validate the catalog.** Reuse the old manager catalog if it matches the live
    placement; otherwise reconstruct it from the StatefulSets, ConfigMaps and symbol configs. Set
@@ -472,7 +471,7 @@ Render one shard through the manager (the API returns a `v1/List` that `kubectl 
 accepts):
 
 ```sh
-curl -s 'http://127.0.0.1:8099/api/v1/shards/fx-eu-01/manifests?profile=local' \
+curl -s 'http://console.match-eu-1.example/api/v1/shards/fx-eu-01/manifests?profile=local' \
   | kubectl apply -f -
 ```
 
@@ -517,8 +516,8 @@ synthesized route status honest; it does not read the real cluster or change eng
 ### Verify
 
 ```sh
-curl -s http://127.0.0.1:8099/api/v1/health
-curl -s http://127.0.0.1:8099/api/v1/shards | python3 -m json.tool | head
+curl -s http://console.match-eu-1.example/api/v1/health
+curl -s http://console.match-eu-1.example/api/v1/shards | python3 -m json.tool | head
 kubectl -n match-eu-1 get pods -o wide
 kubectl -n match-eu-1 get pvc
 kubectl -n match-eu-1 get statefulsets
@@ -527,7 +526,7 @@ kubectl -n match-eu-1 get statefulsets
 kubectl -n match-eu-1 exec fx-sup-01-0 -- curl -s http://127.0.0.1:9090/processes
 
 # Engine console through the manager proxy (symbol is the large header)
-open 'http://127.0.0.1:8099/api/v1/shards/fx-sup-01/processes/eurgbp/pods/0/console/'
+open 'http://console.match-eu-1.example/api/v1/shards/fx-sup-01/processes/eurgbp/pods/0/console/'
 ```
 
 The console's cluster tab must report four reachable peers. A stopped engine has no console link in
@@ -590,8 +589,8 @@ and `stop` removes it. If port 80 is already taken, pass another port:
 The front door publishes only plaintext HTTP. For the local demo, leave a market-data service's
 `spec.websocket.tlsSecret` empty; otherwise ingress-nginx redirects HTTP to HTTPS and the front
 door does not publish 443. The manager's **web ui** link uses `spec.websocket.ingress` (for example
-`http://fast-ws-fx-eu-01.match-eu-1.example/`), falling back to `127.0.0.1:<port>` only when no
-ingress is configured.
+`http://fast-ws-fx-eu-01.match-eu-1.example/`), falling back to the market-data Service address
+only when no ingress is configured.
 
 This is demo plumbing, not a production gateway: it serves plaintext HTTP with no authentication,
 TLS termination, rate limits or NetworkPolicy for the public hosts. Use the platform ingress or
@@ -602,7 +601,7 @@ gateway for production, and see the P1 public-edge items in `TODO.md`.
 Add a symbol to a **supervisor** shard with the GUI or:
 
 ```sh
-curl -s -X POST http://127.0.0.1:8099/api/v1/symbols \
+curl -s -X POST http://console.match-eu-1.example/api/v1/symbols \
   -H 'content-type: application/json' -d '{
   "shard": "fx-sup-01",
   "symbol": {
@@ -631,11 +630,11 @@ roll; check its logs and the shard's `Progressing` condition before retrying.
 
 ```sh
 # Graceful stop: keep the record, slot and PVC.
-curl -s -X POST http://127.0.0.1:8099/api/v1/symbols/chfusd/shutdown \
+curl -s -X POST http://console.match-eu-1.example/api/v1/symbols/chfusd/shutdown \
   -H 'content-type: application/json' -d '{}'
 
 # Re-enable from the retained data; no /init or ConfigureSymbol.
-curl -s -X POST http://127.0.0.1:8099/api/v1/symbols/chfusd/start \
+curl -s -X POST http://console.match-eu-1.example/api/v1/symbols/chfusd/start \
   -H 'content-type: application/json' -d '{}'
 ```
 
@@ -645,7 +644,7 @@ ConfigMap so the supervisor stops/starts that child without touching the other P
 
 ```sh
 SHARD=fx-sup-01
-curl -s "http://127.0.0.1:8099/api/v1/shards/$SHARD/manifests?profile=local" > "/tmp/$SHARD-manifests.json"
+curl -s "http://console.match-eu-1.example/api/v1/shards/$SHARD/manifests?profile=local" > "/tmp/$SHARD-manifests.json"
 python3 - "$SHARD" <<'PY'
 import json, sys
 shard = sys.argv[1]
@@ -734,7 +733,7 @@ falls back to catalog references with a `warning` when the manager cannot list n
 manager only reads nodes and engine-labeled pods (`deploy/rbac.yaml`); it never mutates workloads.
 
 ```sh
-curl -s -X POST http://127.0.0.1:8099/api/v1/shards/fx-eu-01/upgrade \
+curl -s -X POST http://console.match-eu-1.example/api/v1/shards/fx-eu-01/upgrade \
   -H 'content-type: application/json' \
   -d '{"image":"matchengine-raft@sha256:<digest>",
        "release":{"wireVersion":7,"snapshotVersion":11,"mixedVersionSafe":false}}'
@@ -886,7 +885,7 @@ whose symbols are all stopped scales to zero. `POST /api/v1/symbols/{name}/start
 symbol and rolls the service back up.
 
 ```sh
-curl -s -X POST http://127.0.0.1:8099/api/v1/market-data-services \
+curl -s -X POST http://console.match-eu-1.example/api/v1/market-data-services \
   -H 'content-type: application/json' -d '{
     "name": "me-btcusdt-marketdata",
     "spec": {
@@ -905,15 +904,15 @@ curl -s -X POST http://127.0.0.1:8099/api/v1/market-data-services \
 kubectl -n match-eu-1 get deploy,svc,pdb,networkpolicy | grep marketdata
 kubectl -n match-eu-1 get marketdataservice me-btcusdt-marketdata \
   -o jsonpath='{.status.phase} {.status.readyReplicas}/{.status.replicas}{"\n"}'
-curl -s http://127.0.0.1:8099/api/v1/market-data-services/me-btcusdt-marketdata/manifests
+curl -s http://console.match-eu-1.example/api/v1/market-data-services/me-btcusdt-marketdata/manifests
 
 # Stateless image update: writes desired state, then the operator rolls the Deployment.
-curl -s -X POST http://127.0.0.1:8099/api/v1/market-data-services/me-btcusdt-marketdata/upgrade \
+curl -s -X POST http://console.match-eu-1.example/api/v1/market-data-services/me-btcusdt-marketdata/upgrade \
   -H 'content-type: application/json' -d '{
     "image": "registry.example.com/matchengine-marketdata@sha256:...",
     "release": {"wireVersion": 7, "snapshotVersion": 11, "mixedVersionSafe": false}
   }'
-curl -s 'http://127.0.0.1:8099/api/v1/images?marketDataService=me-btcusdt-marketdata'
+curl -s 'http://console.match-eu-1.example/api/v1/images?marketDataService=me-btcusdt-marketdata'
 ```
 
 The upgrade endpoint rejects a paused service and any release whose wire version differs from a
@@ -990,7 +989,7 @@ ConfigMap plus one Deployment/Service/PDB/HPA (and optional Ingress) per user sh
 addresses derived from the symbol deployment's pod-0 headless DNS.
 
 ```sh
-curl -s -X POST http://127.0.0.1:8099/api/v1/order-systems   -H 'content-type: application/json' -d '{
+curl -s -X POST http://console.match-eu-1.example/api/v1/order-systems   -H 'content-type: application/json' -d '{
     "name": "orders",
     "spec": {
       "cell": "eu-1",
@@ -1020,10 +1019,16 @@ the HPA reports `<unknown>` but still enforces the floor.
 Roll a new stateless image without touching Raft:
 
 ```sh
-curl -s -X POST http://127.0.0.1:8099/api/v1/order-systems/orders/upgrade \
+curl -s 'http://console.match-eu-1.example/api/v1/images?orderSystem=orders'
+curl -s -X POST http://console.match-eu-1.example/api/v1/order-systems/orders/upgrade \
   -H 'content-type: application/json' -d '{"image":"matchengine-order-system:arm64-v3"}'
 kubectl -n match-eu-1 rollout status deploy/orders-users-0
 ```
+
+The GUI's **upgrade** action opens a picker backed by
+`GET /api/v1/images?orderSystem={name}`: it lists node-cached images, images running in an
+order-system pod, and catalog references for the order-system repository, with a custom
+digest-pinned field for a new reference.
 
 Each shard rolls independently with `maxUnavailable: 0` and `maxSurge: 1`; there is no quorum or
 leader-transfer gate. The BFF enforces the shard's user range (`409 user_shard`), sets `owner_id`
@@ -1033,8 +1038,9 @@ targets, HPA bounds, readiness and a **WebUI** link per shard
 (`http://<shard>.<spec.ingress>/demo/`, `https` with `tlsSecret`), and has an **upgrade** action.
 Order entry happens in the order-system WebUI; the manager neither renders an order ticket nor
 proxies orders. For the shard Hosts to load in the local demo, install the ingress controller and
-front door described in [Reach the demo ingress hosts](#reach-the-demo-ingress-hosts); without
-them, port-forward a shard and open `http://127.0.0.1:<port>/demo/` instead.
+front door described in [Reach the demo ingress hosts](#reach-the-demo-ingress-hosts); for example
+open `http://users-0.orders.match-eu-1.example/demo/`. If the ingress is not installed,
+port-forward that shard's Service and open `/demo/`.
 
 ### Retention window
 
@@ -1082,20 +1088,20 @@ Save these before changing the catalog; after the drop the manager can no longer
 ```sh
 SHARD=fx-eu-03
 
-curl -s http://127.0.0.1:8099/api/v1/catalog > /tmp/catalog-before-drop.json
-curl -s "http://127.0.0.1:8099/api/v1/shards/$SHARD" > "/tmp/$SHARD-detail.json"
-curl -s "http://127.0.0.1:8099/api/v1/shards/$SHARD/manifests?profile=local" \
+curl -s http://console.match-eu-1.example/api/v1/catalog > /tmp/catalog-before-drop.json
+curl -s "http://console.match-eu-1.example/api/v1/shards/$SHARD" > "/tmp/$SHARD-detail.json"
+curl -s "http://console.match-eu-1.example/api/v1/shards/$SHARD/manifests?profile=local" \
   > "/tmp/$SHARD-manifests.json"
 ```
 
 #### 2. Stop every symbol and apply the ConfigMap
 
 ```sh
-curl -s "http://127.0.0.1:8099/api/v1/shards/$SHARD" \
+curl -s "http://console.match-eu-1.example/api/v1/shards/$SHARD" \
   | python3 -c 'import json,sys; print("\n".join(d["spec"]["symbolRef"] for d in json.load(sys.stdin)["deployments"]))' \
   | while read -r symbol; do
       echo "stopping $symbol"
-      curl -s -X POST "http://127.0.0.1:8099/api/v1/symbols/$symbol/shutdown" \
+      curl -s -X POST "http://console.match-eu-1.example/api/v1/symbols/$symbol/shutdown" \
         -H 'content-type: application/json' -d '{}'
     done
 ```
@@ -1104,7 +1110,7 @@ Apply the updated ConfigMap as in [Stop and start an engine](#stop-and-start-an-
 verify the shard is idle:
 
 ```sh
-curl -s "http://127.0.0.1:8099/api/v1/shards/$SHARD" | python3 -c '
+curl -s "http://console.match-eu-1.example/api/v1/shards/$SHARD" | python3 -c '
 import json, sys
 d = json.load(sys.stdin)
 print("active", d["activeProcesses"], "disabled", d["disabledProcesses"])
@@ -1118,12 +1124,12 @@ The GUI dialog and the API both ask; **keep storage is the default and recommend
 
 ```sh
 # Safe default: prune workloads but retain the PVCs so the shard can be brought up again.
-curl -s -X POST "http://127.0.0.1:8099/api/v1/shards/$SHARD/drop" \
+curl -s -X POST "http://console.match-eu-1.example/api/v1/shards/$SHARD/drop" \
   -H 'content-type: application/json' \
   -d '{"retainStorage": true}' | tee "/tmp/$SHARD-drop.json"
 
 # Destructive: delete the PVCs too. There is no in-cluster recovery after this.
-curl -s -X POST "http://127.0.0.1:8099/api/v1/shards/$SHARD/drop" \
+curl -s -X POST "http://console.match-eu-1.example/api/v1/shards/$SHARD/drop" \
   -H 'content-type: application/json' \
   -d '{"retainStorage": false}'
 ```
@@ -1173,8 +1179,8 @@ SHARD=fx-eu-03
 
 # Catalog is gone.
 curl -s -o /dev/null -w 'catalog HTTP %{http_code}\n' \
-  "http://127.0.0.1:8099/api/v1/shards/$SHARD"   # 404
-curl -s http://127.0.0.1:8099/api/v1/shards | python3 -m json.tool | head
+  "http://console.match-eu-1.example/api/v1/shards/$SHARD"   # 404
+curl -s http://console.match-eu-1.example/api/v1/shards | python3 -m json.tool | head
 
 # Workload objects are pruned.
 kubectl -n match-eu-1 get statefulsets,deployments,pods,services,configmaps,pdb,networkpolicy \
@@ -1214,7 +1220,7 @@ shape** so the new pods bind the existing PVCs:
 
    ```sh
    # A bundle restores the shard plus its symbols, deployments and routes with exact slots/ports.
-   curl -s -X POST http://127.0.0.1:8099/api/v1/bundles \
+   curl -s -X POST http://console.match-eu-1.example/api/v1/bundles \
      -H 'content-type: application/json' --data-binary @fx-eu-03.json
    ```
 
@@ -1222,7 +1228,7 @@ shape** so the new pods bind the existing PVCs:
    names:
 
    ```sh
-   curl -s "http://127.0.0.1:8099/api/v1/shards/$SHARD/manifests?profile=local" \
+   curl -s "http://console.match-eu-1.example/api/v1/shards/$SHARD/manifests?profile=local" \
      | kubectl apply -f -
    ```
 
@@ -1341,7 +1347,7 @@ spec:
 ```sh
 kubectl apply -f manager-state-pvc.yaml
 # Save the current catalog first; this patch rolls the manager.
-curl -s http://127.0.0.1:8099/api/v1/catalog > /tmp/manager-catalog.json
+curl -s http://console.match-eu-1.example/api/v1/catalog > /tmp/manager-catalog.json
 kubectl -n match-control patch deploy match-manager --type=json \
   -p='[{"op":"replace","path":"/spec/template/spec/volumes/0","value":{"name":"data","persistentVolumeClaim":{"claimName":"match-manager-state"}}}]'
 kubectl -n match-control rollout status deploy/match-manager --timeout=120s

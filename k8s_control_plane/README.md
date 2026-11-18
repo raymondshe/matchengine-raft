@@ -18,14 +18,15 @@ etcd directly.
 
 ![Kubernetes control plane manager GUI](../docs/kubernetes-control-plane.png)
 
-The reference manager GUI has two top-level views: **matching engine** (shard catalog, packing
-mode, validation, preview plan, image upgrade, manifests, audit and engine-console links) and
-**market data**. The market-data view has **terminal** (multi-symbol services with
-`websocket.fastOnly=false`) and **fast** (single-symbol shard services with
+The reference manager GUI has three top-level views: **matching engine** (shard catalog, packing
+mode, validation, preview plan, image upgrade, manifests, audit and engine-console links),
+**market data**, and **order systems**. The market-data view has **terminal** (multi-symbol
+services with `websocket.fastOnly=false`) and **fast** (single-symbol shard services with
 `websocket.fastOnly=true`) second-level tabs. Both market-data tabs are independent of the
-selected shard.
-The selected `fx-sup-01` shard is supervisor-mode and hosts two symbols added without restarting
-the existing engine processes.
+selected shard. The order-systems view lists each user-ID range, engine targets, per-shard
+readiness, **Demo order desk** links and an **upgrade** action; its image picker lists every
+node-cached, running, or catalog-recorded order-system image. The screenshot shows the live
+`fx-eu-01` shard with `eurusd` and `gbpusd` Ready.
 
 ```
 k8s_control_plane/
@@ -54,7 +55,8 @@ From the repository root:
 ```bash
 cd k8s_control_plane
 
-# Manager GUI + API on http://127.0.0.1:8099/
+# Manager GUI + API. The OrbStack demo publishes http://console.match-eu-1.example/;
+# a local `cargo run -- serve` uses the default port 8099.
 cargo run -- serve
 
 # Same, with a persisted JSON catalog (seeded on first start)
@@ -151,7 +153,9 @@ image (and optional release) to the CR; the operator rolls the Deployment with `
 and one surge pod. The manager checks the target wire version against every source shard before
 committing, so an incompatible image is rejected without touching the running service. The
 **market data** GUI view exposes an **upgrade** button per service in its terminal and fast
-sub-tabs, backed by `GET /api/v1/images?marketDataService={name}`.
+sub-tabs, backed by `GET /api/v1/images?marketDataService={name}`. The **order systems** view uses
+the same picker pattern for its stateless user shards, backed by
+`GET /api/v1/images?orderSystem={name}`.
 
 Install the generated CRDs and least-privilege RBAC first:
 
@@ -314,7 +318,7 @@ bootstrap, rollout, retention, migration, status and label actions.
 | `GET` | `/` | embedded GUI |
 | `GET` | `/api/v1/health` | catalog counts and validation summary |
 | `GET` | `/api/v1/catalog` | full catalog plus validation report |
-| `GET` | `/api/v1/images?shard={name}` or `?marketDataService={name}` | selectable images from `Node.status.images` and running engine/market-data pods, merged with catalog references; marks the configured (`current`) and running (`runningHere`) image |
+| `GET` | `/api/v1/images?shard={name}`, `?marketDataService={name}` or `?orderSystem={name}` | selectable images from `Node.status.images` and running engine/market-data/order-system pods, merged with catalog references; marks the configured (`current`) and running (`runningHere`) image |
 | `GET/POST` | `/api/v1/market-data-services` | list or upsert a `MarketDataService` desired-state object (feed groups, transport profile, image/release, replicas and WebSocket settings) |
 | `GET` | `/api/v1/market-data-services/{name}` | service detail with the WebSocket endpoint and scoped validation |
 | `GET` | `/api/v1/market-data-services/{name}/manifests` | read-only rendered Deployment/Service/PDB/NetworkPolicy/ConfigMap/Ingress/HPA list |
@@ -323,7 +327,7 @@ bootstrap, rollout, retention, migration, status and label actions.
 | `GET` | `/api/v1/order-systems/{name}` | order-system detail with resolved shard services, user ranges and scoped validation |
 | `GET` | `/api/v1/order-systems/{name}/manifests` | rendered ConfigMap, and one Deployment/Service/PDB/Ingress/HPA per user shard |
 | — | `http://<shard>.<spec.ingress>/demo/` | the order system's own WebUI; the manager **order systems** table links each shard here and does not proxy order entry |
-| `POST` | `/api/v1/order-systems/{name}/upgrade` | write a new `spec.image`; the operator rolls the stateless user shards with `maxUnavailable: 0` one surge pod at a time |
+| `POST` | `/api/v1/order-systems/{name}/upgrade` | write a new `spec.image`; the GUI picker is backed by `GET /api/v1/images?orderSystem={name}`, and the operator rolls the stateless user shards with `maxUnavailable: 0` one surge pod at a time |
 | `GET` | `/api/v1/shards` | shard list with per-pod CPU/memory requests, `slots`, `freeSlots`, phase and paused state |
 | `POST` | `/api/v1/shards` | reserve an empty shard from a `SymbolShard` body |
 | `POST` | `/api/v1/shards/{name}/upgrade` | write `spec.image` and `spec.release` to a shard; rejects incompatible releases and per-deployment image overrides; the operator performs the one-pod-at-a-time roll |
@@ -352,7 +356,7 @@ are available over HTTP.
 Reserve an empty shard:
 
 ```bash
-curl -s -X POST http://127.0.0.1:8099/api/v1/shards \
+curl -s -X POST http://console.match-eu-1.example/api/v1/shards \
   -H 'content-type: application/json' -d '{
   "name": "fx-eu-03",
   "namespace": "match-eu-1",
@@ -376,7 +380,7 @@ curl -s -X POST http://127.0.0.1:8099/api/v1/shards \
 Place a new symbol on the reserved shard (slot 0, HTTP `21041`):
 
 ```bash
-curl -s -X POST http://127.0.0.1:8099/api/v1/symbols \
+curl -s -X POST http://console.match-eu-1.example/api/v1/symbols \
   -H 'content-type: application/json' -d '{
   "shard": "fx-eu-02",
   "symbol": {
@@ -405,7 +409,7 @@ reservation.
 Prepare a migration from `fx-eu-01` to the reserved shard:
 
 ```bash
-curl -s -X POST http://127.0.0.1:8099/api/v1/symbols/eurusd/migrate \
+curl -s -X POST http://console.match-eu-1.example/api/v1/symbols/eurusd/migrate \
   -H 'content-type: application/json' -d '{"targetShard":"fx-eu-02"}'
 ```
 
@@ -436,7 +440,7 @@ are treated like any other non-empty containers shard.
 
 ```bash
 # Reserve a supervisor shard (the GUI's + shard form does this by default).
-curl -s -X POST http://127.0.0.1:8099/api/v1/shards \
+curl -s -X POST http://console.match-eu-1.example/api/v1/shards \
   -H 'content-type: application/json' -d '{
   "name": "fx-sup-01", "namespace": "match-eu-1",
   "spec": {
@@ -453,16 +457,16 @@ curl -s -X POST http://127.0.0.1:8099/api/v1/shards \
 }'
 
 # Both placements are zero-impact; the supervisor starts a child without a pod restart.
-curl -s -X POST http://127.0.0.1:8099/api/v1/symbols \
+curl -s -X POST http://console.match-eu-1.example/api/v1/symbols \
   -H 'content-type: application/json' -d '{ "shard": "fx-sup-01", "symbol": { ... } }'
-curl -s -X POST http://127.0.0.1:8099/api/v1/symbols \
+curl -s -X POST http://console.match-eu-1.example/api/v1/symbols \
   -H 'content-type: application/json' -d '{ "shard": "fx-sup-01", "symbol": { ... } }'
 ```
 
 To deliberately add a container to a **non-empty containers** shard, opt in explicitly:
 
 ```bash
-curl -s -X POST http://127.0.0.1:8099/api/v1/symbols \
+curl -s -X POST http://console.match-eu-1.example/api/v1/symbols \
   -H 'content-type: application/json' -d '{
     "shard": "fx-eu-01", "allowRestart": true,
     "symbol": { ... }
@@ -478,7 +482,7 @@ non-empty containers-mode targets and labels them `restart required`.
 The shard detail table has a **stop** button per active process. It calls:
 
 ```bash
-curl -s -X POST http://127.0.0.1:8099/api/v1/symbols/nzdusd/shutdown \
+curl -s -X POST http://console.match-eu-1.example/api/v1/symbols/nzdusd/shutdown \
   -H 'content-type: application/json' -d '{}'
 ```
 
@@ -503,7 +507,7 @@ route, slot/ports and PVC stay; the response returns the operator steps:
 remain visible as `stopped` with a **start** button. Starting is the symmetric operation:
 
 ```bash
-curl -s -X POST http://127.0.0.1:8099/api/v1/symbols/nzdusd/start \
+curl -s -X POST http://console.match-eu-1.example/api/v1/symbols/nzdusd/start \
   -H 'content-type: application/json' -d '{}'
 ```
 
@@ -532,7 +536,7 @@ falls back to catalog references and shows the warning. The inventory refreshes 
 and the selected target survives the 2-second live catalog refresh. Use a digest-pinned image:
 
 ```bash
-curl -s -X POST http://127.0.0.1:8099/api/v1/shards/fx-eu-01/upgrade \
+curl -s -X POST http://console.match-eu-1.example/api/v1/shards/fx-eu-01/upgrade \
   -H 'content-type: application/json' \
   -d '{"image":"matchengine-raft@sha256:<digest>",
        "release":{"wireVersion":7,"snapshotVersion":11,"mixedVersionSafe":false}}'
@@ -575,11 +579,11 @@ The drop dialog asks the storage question before anything is removed:
 
 ```bash
 # Keep the PVCs: the shard can be brought up again.
-curl -s -X POST http://127.0.0.1:8099/api/v1/shards/fx-eu-03/drop \
+curl -s -X POST http://console.match-eu-1.example/api/v1/shards/fx-eu-03/drop \
   -H 'content-type: application/json' -d '{"retainStorage": true}'
 
 # Delete the PVCs: destructive.
-curl -s -X POST http://127.0.0.1:8099/api/v1/shards/fx-eu-03/drop \
+curl -s -X POST http://console.match-eu-1.example/api/v1/shards/fx-eu-03/drop \
   -H 'content-type: application/json' -d '{"retainStorage": false}'
 ```
 
