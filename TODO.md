@@ -1,6 +1,6 @@
 # TODO
 
-Last reviewed: 2026-11-17. Working roadmap only; completed detail lives in the History section and
+Last reviewed: 2026-11-18. Working roadmap only; completed detail lives in the History section and
 git history — check out an earlier `TODO.md` from git for the full record
 (`git log -- TODO.md`, then `git show <commit>:TODO.md`). Measurements remain in
 [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md). See `AGENTS.md` for commands and the current branch
@@ -10,7 +10,7 @@ state.
 18-scale `Fixed` values. It supports the full order-type set (GTC/IOC/FOK/GTD/Day, market,
 post-only, iceberg, stop, market-to-limit, trailing and peg) plus STP, maker/taker fees with
 asset-aware policies, a replicated event log (`/events`, gRPC streaming), local-lease reads,
-bounded write admission and the market-data feed with Aeron egress. One process/cluster trades one
+bounded write admission and the market-data feed with Aeron multicast or direct NATS egress. One process/cluster trades one
 symbol; multi-symbol isolation is deployment-level. The reference fleet also runs four fast-only
 shard market-data services and one global terminal service that consumes every shard feed and
 serves one multi-symbol WebSocket.
@@ -74,10 +74,12 @@ write response.
    Helm/Kustomize, digest-pinned image publication and CRD/etcd backup integration. The demo still
    depends on a local image, an `emptyDir` and a port-forward, which blocks a clean install.
 6. **Market-data production readiness.** Couple symbol create/migrate/stop to both the fast and
-   global symbol sets and the `SymbolRoute`, wait for the new feed before publishing, drain old
-   WebSocket sessions and define the one-subscriber-per-group-per-node rule (or add
-   dual-publish/relay). Validate Profile A on a multi-node multicast-capable CNI/VPC; that half is
-   blocked on this single-node host, but the lifecycle and topology code is not.
+   global symbol sets and the `SymbolRoute`, wait for the new feed before publishing and drain old
+   WebSocket sessions. Profile N (direct NATS) is now the single-node fallback and removes the
+   Aeron image-registration constraint; harden it for production with a multi-node NATS cluster,
+   TLS/credentials, strict NetworkPolicy and optional JetStream retention. Validate Profile A on a
+   multi-node multicast-capable CNI/VPC; that half is blocked on this single-node host, but the
+   lifecycle and topology code is not.
 
 **Blocked on this host.** CSI volume snapshots (no snapshot CRDs or driver), multi-host
 lease/`ReadIndex` and Aeron multicast evidence (one OrbStack node), and the bare-metal pinned-core
@@ -102,13 +104,12 @@ run as production evidence for them.
     and slow consumers through the Kubernetes deployment; measure per-instance encode/fan-out
     CPU, queue depth, gap/resync behavior and p99, and prove the engine's matching path is
     unaffected.
-11. **Market-data feed hardening.** Source startup now requests a snapshot immediately and retries
-    until one is seen, each symbol owns an embedded media driver, and the source restarts its own
-    driver/client after an idle period; the supervisor also restarts a child when its `marketData`
-    configuration changes. The single-node OrbStack lab still flips Aeron images when the fast and
-    global services subscribe to the same feed, so the remaining work is a relay/dual-publish or a
-    strict one-subscriber-per-group-per-node rule. Keep the 5-30 s watchdog as the fallback and
-    avoid restart loops when an engine feed is genuinely down.
+11. **Market-data feed hardening.** Source startup requests a snapshot immediately and retries
+    until one is seen; the supervisor restarts a child when its `marketData` configuration changes;
+    and Profile N direct NATS is live on OrbStack, which removes the single-node Aeron
+    image-registration failure. Remaining work: add a NATS phase to `scripts/operator-acceptance.sh`,
+    prove reconnect/replay with a NATS restart, add TLS/auth and JetStream retention, and keep the
+    Aeron 5-30 s watchdog for clusters that still use multicast.
 12. **Multi-host evidence.** Rerun the read/write A/B on a second host and a Linux multi-host
     four-voter cluster, force a stale lease so the `ReadIndex` fallback is observed, validate
     Aeron multicast across hosts, and dispatch the bare-metal pinned-core `e2e` workflow.
@@ -311,6 +312,15 @@ Completed work is summarised here; detailed evidence, measurements and implement
 in git history and the linked docs. For the full history, check out `TODO.md` from an earlier commit
 (`git log -- TODO.md`).
 
+- **2026-11-18** — Profile N direct NATS market-data transport: the engine has a `NatsSink`
+  (`market-data-nats` feature, `--market-data-nats-url`/`--market-data-nats-subject-prefix`/
+  `--market-data-nats-stream-base`), `market_data_system` has a `NatsSource` (`--nats-url`,
+  repeatable `--nats-subject-prefix`/`--nats-stream-base`), and the control plane renders
+  `transport.mode: nats` with a canonical `md.<cell>.<feed-group>` subject shared by every service
+  that covers a symbol. Snapshot requests use `<prefix>.snapshot.request`; Core NATS plus reset
+  snapshots is the lab contract. `k8s_control_plane/deploy/nats.yaml` runs a single-node NATS Core
+  server. The local engine/service NATS round-trip and the OrbStack deployment are validated; TLS,
+  auth, multi-node NATS and JetStream retention remain production follow-ups.
 - **2026-11-17** — Market-data feed hardening and supervisor child restart: the source requests a
   snapshot at startup and retries until `snapshot_seen`; each symbol owns an embedded media driver
   and restarts its driver/client after an idle period; the supervisor now restarts a child when

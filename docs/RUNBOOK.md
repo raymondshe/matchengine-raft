@@ -907,7 +907,51 @@ multicast forwarding. For a containers-mode shard, the renderer adds those flags
 a `MarketDataService` references the symbol; build the engine image with
 `--build-arg CARGO_FEATURES=market-data-aeron` and mount a writable `/dev/shm` (the renderer adds a
 memory emptyDir). Supervisor children receive the same flags through `processes.json`. The renderer keeps `interface={pod_ip}` on the engine publication and strips it from the market-data subscriber args so several pods on one node can subscribe to the same group. A `Failed` service means the renderer rejected the desired state (unknown
-symbol/deployment, wire-version mismatch or a non-multicast transport) — see the operator log.
+symbol/deployment, wire-version mismatch or the unimplemented per-pod bridge) — see the operator log.
+
+#### Profile N: direct NATS on OrbStack
+
+When pod multicast is unavailable or the single-node lab flips Aeron subscriber images, switch a
+`MarketDataService` to direct NATS instead of Aeron. The server is shared infrastructure, not part
+of the service:
+
+```sh
+kubectl apply -f k8s_control_plane/deploy/nats.yaml
+kubectl -n match-eu-1 rollout status deploy/nats
+```
+
+Build the engine with the NATS feature (keep `market-data-aeron` only if other services still use
+multicast) and the market-data image as usual:
+
+```sh
+docker build --platform linux/arm64 -f match_engine/docker/k8s.Dockerfile \
+  --build-arg CARGO_FEATURES="market-data-nats market-data-aeron" \
+  -t matchengine-raft:k8s-nats-arm64-v1 match_engine
+docker build --platform linux/arm64 -f market_data_system/docker/k8s.Dockerfile \
+  -t matchengine-marketdata:aeron-arm64-v7 .
+```
+
+Switch the CR (the renderer ignores per-group `channel` values in NATS mode):
+
+```sh
+kubectl -n match-eu-1 patch marketdataservice global-marketdata --type merge -p '{
+  "spec": {
+    "image": "matchengine-marketdata:aeron-arm64-v7",
+    "transport": {
+      "mode": "nats",
+      "natsUrl": "nats://nats.match-eu-1.svc.cluster.local:4222"
+    }
+  }
+}'
+```
+
+The engine publishes `md.<cell>.<feed-group>.<stream_id>`; the renderer derives the canonical
+`feed-group` from the smallest service that covers the symbol, so a fast service and the global
+service subscribe to the same subject even when their local group names differ.
+`transport.subjectPrefix` overrides the default `md` root. Snapshot requests use
+`<prefix>.snapshot.request`; reset snapshots still cover a late or reconnected subscriber, so Core
+NATS at-most-once is sufficient. The lab server is plaintext and unauthenticated: add TLS,
+credentials, a multi-node NATS cluster and (optionally) JetStream retention before production.
 
 Do not point the market-data tier at the engine's WAL/snapshot PVCs or put feed payloads in CRDs.
 

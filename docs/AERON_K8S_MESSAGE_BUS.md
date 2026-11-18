@@ -1,12 +1,15 @@
 # Market-data message bus on Kubernetes: Profile A Aeron multicast default and fallbacks
 
-Status: **Profile A implemented end-to-end in the single-node lab; fallbacks are design-level.**
-The `MarketDataService` CRD, manager API/GUI, deterministic renderer and operator Deployment/
-Service/PDB/NetworkPolicy/ConfigMap rollout exist and are live in the OrbStack cluster. The engine
-Aeron sink, market-data Aeron source and single-node pod multicast path are implemented and tested;
-the engine -> service feed is Ready with `interface={pod_ip}`. Cross-node multicast is not yet
-validated. There is no direct-NATS sink/source or bridge implementation.
-Date: 2026-11-16.
+Status: **Profile A and Profile N are implemented end-to-end in the single-node lab; the bridge
+remains design-level.** The `MarketDataService` CRD, manager API/GUI, deterministic renderer and
+operator Deployment/Service/PDB/NetworkPolicy/ConfigMap rollout exist and are live in the OrbStack
+cluster. The engine Aeron sink, market-data Aeron source and single-node pod multicast path are
+implemented and tested; the engine -> service feed is Ready with `interface={pod_ip}`. Cross-node
+multicast is not yet validated. Profile N (direct NATS) is implemented end-to-end: the engine
+`NatsSink` publishes raw wire-v7 frames and the market-data `NatsSource` subscribes to the same
+subject tree. Core NATS plus reset snapshots is the live OrbStack fallback; JetStream retention and
+TLS/auth remain production follow-ups.
+Date: 2026-11-18.
 
 This document designs the transport between the replicated match-engine clusters and the standalone
 market-data cluster on Kubernetes. It answers four questions:
@@ -243,6 +246,27 @@ before promising the same p99 as Core. The feed's delivery contract is already l
 snapshot/reset, so Core NATS plus reset is valid; JetStream is a recovery convenience, not a
 correctness requirement.
 
+**Implementation status (2026-11-18).** Profile N is live on the single-node OrbStack lab as Core
+NATS only:
+
+- Engine: `match_engine/src/market_data/nats.rs` (`market-data-nats` feature) publishes each
+  encoded frame to `<prefix>.<stream_id>` through a bounded queue. It is leader-gated and retries
+  the NATS connection in the background. Flags: `--market-data-nats-url`,
+  `--market-data-nats-subject-prefix`, `--market-data-nats-stream-base`.
+- Market data: `market_data_system/src/nats_source.rs` subscribes to `<prefix>.*`, filters the
+  stream-id suffix, decodes the unchanged wire-v7 payload and feeds the existing assembler/WS hub.
+  Flags: `--nats-url`, `--nats-subject-prefix` (repeat per symbol), `--nats-stream-base`.
+- Snapshot requests use `<prefix>.snapshot.request` with the existing 24-byte `MSRQ` frame, so a
+  new service asks for a fresh depth snapshot without an Aeron stream 2010.
+- Control plane: `MarketDataService.spec.transport.mode: nats` plus `transport.natsUrl` renders the
+  engine egress and market-data source args, skips Aeron ports, and opens NATS TCP 4222 in the
+  NetworkPolicy. The canonical prefix is `md.<cell>.<feed-group>` from the smallest service that
+  covers the symbol, so the fast and global services share one subject even when their local group
+  names differ. `transport.subjectPrefix` overrides the `md` root.
+- Lab infrastructure: `k8s_control_plane/deploy/nats.yaml` runs a single plaintext NATS server in
+  `match-eu-1`. Production still needs a multi-node NATS cluster, TLS, credentials and (optionally)
+  JetStream retention.
+
 ### 5.2 Profile A — direct Aeron multicast (default implementation)
 
 ```
@@ -354,26 +378,31 @@ Any transformation would make the edge and the bus diverge and break dedupe/repl
 
 ### 6.1 EKS NATS mapping
 
-For the confirmed EKS profile (engine `NatsSink` → NATS):
+For the NATS profile (engine `NatsSink` → NATS):
 
 - **Subjects:** `md.<cell>.<feed_group>.<stream_id>` (for example
   `md.eu-1.fx-a.2001`). The raw wire-v7 payload stays unchanged; `symbol_id`, `stream_id`,
-  `market_seq` and `sub_seq` remain in the payload.
-- **Streams:** one `MD_<CELL>` stream (or one per feed group if retention differs), with
+  `market_seq` and `sub_seq` remain in the payload. The renderer strips `interface={pod_ip}` from
+  receiver args and uses the same canonical prefix for every service that covers the symbol.
+- **Streams (optional):** one `MD_<CELL>` stream (or one per feed group if retention differs), with
   `storage=file`, `replicas=3`, `discard=old`, a short `max_age` (start with 10 minutes) and a
   byte cap. This is a restart/incident buffer, not the authoritative history; the engine's Raft log
-  and match-event window remain authoritative.
+  and match-event window remain authoritative. The current OrbStack deployment uses Core NATS
+  without JetStream.
 - **Consumers:** each market-data replica needs the **full** feed, so do not use a shared queue
-  group for the data path. A live `NatsSource` can use a Core subscription with `New`/reset
-  behavior. For restart continuity use a stable replica identity (StatefulSet ordinal) and one
-  durable JetStream consumer per replica/feed group; otherwise rebuild from the next reset
-  snapshot. Document which guarantee the `MarketDataService` profile promises.
-- **Publishers:** one NATS connection per bridge, asynchronous publish with a bounded in-flight
-  window. A slow/unavailable NATS connection is a bridge backpressure event, never an engine
-  blocking event; the engine tap degrades to `GAP` and the next reset repairs the service state.
+  group for the data path. `NatsSource` uses a Core subscription with reset behavior; a fresh
+  process requests a snapshot at startup and retries until it sees one. For restart continuity use
+  a stable replica identity (StatefulSet ordinal) and one durable JetStream consumer per
+  replica/feed group; otherwise rebuild from the next reset snapshot.
+- **Publishers:** one NATS connection per leader, asynchronous publish with a bounded in-flight
+  window. A slow/unavailable NATS connection never blocks the engine; the tap reports the publish
+  failure as a `GAP` and the next reset repairs the service state.
 - **Placement:** NATS 3 nodes across 3 AZs with EBS gp3; market-data replicas spread across AZs;
   engine shards keep their four voters spread as usual. Use anti-affinity/PDB and a
-  topology-aware service where available to keep bridge/consumer traffic in-zone.
+  topology-aware service where available to keep publisher/consumer traffic in-zone.
+- **Security:** the lab server is plaintext and unauthenticated. Production must add TLS
+  (`tls://` URLs/credentials), per-cell accounts, and a NetworkPolicy that restricts 4222 to the
+  engine and market-data identities only.
 
 
 ## 7. Scale-out model

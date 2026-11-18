@@ -1985,9 +1985,14 @@ one **market data** GUI view with **terminal** and **fast** sub-tabs. Market-dat
 `POST /api/v1/market-data-services/{name}/upgrade` writes a new image and optional release, checks
 the target wire version against every source shard, and lets the operator roll the Deployment with
 `maxUnavailable: 0` and one surge pod; `GET /api/v1/images?marketDataService={name}` backs the
-per-service image picker. HPA/canary policy, ServiceMonitor
-and the NATS/bridge sources remain follow-ups; the transport choice, multicast constraints and
-scale-out profiles are designed in
+per-service image picker. Profile N direct NATS is also rendered:
+`spec.transport.mode: nats` plus `spec.transport.natsUrl` adds the engine
+`--market-data-nats-*` args and the market-data `--nats-*` source args, opens TCP 4222 in the
+NetworkPolicy and skips Aeron ports. The canonical subject is `md.<cell>.<feed-group>`, chosen
+from the smallest service that covers a symbol, so a fast service and the global terminal service
+subscribe to the same feed. `k8s_control_plane/deploy/nats.yaml` is the single-node lab server.
+HPA/canary policy, ServiceMonitor, NATS TLS/auth and JetStream retention remain follow-ups; the
+transport choice, multicast constraints and scale-out profiles are designed in
 [`AERON_K8S_MESSAGE_BUS.md`](./AERON_K8S_MESSAGE_BUS.md).
 
 At fleet scale:

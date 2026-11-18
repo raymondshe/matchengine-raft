@@ -151,6 +151,42 @@ The JSONL log is node-local and debug-only (it duplicates lines when the engine
 replays entries after a restart); the assembler dedupes by
 `(stream, market_seq, sub_seq)` and a body-flagged reset rewinds state.
 
+## 🛰️ Run with NATS (Profile N)
+
+Direct NATS avoids Aeron media drivers and multicast entirely. The engine
+publishes raw wire-v7 frames to `md.<cell>.<feed-group>.<stream-id>`; this
+service subscribes to `<prefix>.*` and feeds the same assembler and WebSocket
+hub. Core NATS is at-most-once, so reset snapshots and the startup snapshot
+request are what make a late or reconnected subscriber whole.
+
+```shell
+# terminal 1: NATS Core
+docker run --rm -p 4222:4222 nats:2.11-alpine
+
+# terminal 2: engine (build with --features market-data-nats)
+cargo run --release --features market-data-nats -- \
+  --id 1 --http-addr 127.0.0.1:21001 \
+  --market-data-nats-url nats://127.0.0.1:4222 \
+  --market-data-nats-subject-prefix md.local.eurusd
+
+# terminal 3: service
+cargo run --release --manifest-path market_data_system/Cargo.toml -- \
+  --addr 127.0.0.1:24700 --symbol eurusd:0:EUR:USD \
+  --nats-url nats://127.0.0.1:4222 \
+  --nats-subject-prefix md.local.eurusd
+```
+
+`--nats-subject-prefix` is repeatable and aligns with `--symbol`.
+`--nats-stream-base` defaults to `2001` and selects the stream ids in the last
+subject token. A fresh source requests a snapshot on
+`<prefix>.snapshot.request`; the engine answers through the same
+`MarketDataSnapshot` path used by Aeron stream 2010.
+
+For Kubernetes, use `k8s_control_plane/deploy/nats.yaml` and set the
+`MarketDataService` `spec.transport` to `mode: nats` with `natsUrl`. The
+renderer derives one canonical subject prefix per symbol so a fast shard
+service and the global terminal service receive the same feed.
+
 ## 📼 Archive and replay
 
 `--archive-dir <dir>` records every message the service consumes to
@@ -439,6 +475,9 @@ even when entries in between did not touch the book.
 | `--market-data-log` | unset | JSONL feed (fallback transport); repeat per symbol |
 | `--archive-dir` | unset | record consumed messages to `<dir>/<symbol>.jsonl` |
 | `--replay-dir` | unset | replay `<dir>/<symbol>.jsonl`; excludes live sources |
+| `--nats-url` | unset | NATS server URL for the direct Profile N source |
+| `--nats-subject-prefix` | unset | NATS prefix per symbol; repeat once per `--symbol` |
+| `--nats-stream-base` | `2001` | first NATS stream id per symbol; repeat once per `--symbol` |
 | `--aeron-channel` | unset | Aeron feed (requires `--features aeron`); repeat per symbol |
 | `--aeron-stream-base` | `2001` | first stream id per symbol; repeat once per `--symbol` |
 | `--aeron-dir` | `AERON_DIR` | media-driver directory; repeat per symbol |
