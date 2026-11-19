@@ -1,6 +1,6 @@
 # TODO
 
-Last reviewed: 2026-11-18. Working roadmap only; completed detail lives in the History section and
+Last reviewed: 2026-11-19. Working roadmap only; completed detail lives in the History section and
 git history — check out an earlier `TODO.md` from git for the full record
 (`git log -- TODO.md`, then `git show <commit>:TODO.md`). Measurements remain in
 [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md). See `AGENTS.md` for commands and the current branch
@@ -10,8 +10,9 @@ state.
 18-scale `Fixed` values. It supports the full order-type set (GTC/IOC/FOK/GTD/Day, market,
 post-only, iceberg, stop, market-to-limit, trailing and peg) plus STP, maker/taker fees with
 asset-aware policies, a replicated event log (`/events`, gRPC streaming), local-lease reads,
-bounded write admission and the market-data feed with Aeron multicast or direct NATS egress. One process/cluster trades one
-symbol; multi-symbol isolation is deployment-level. The reference fleet also runs four fast-only
+bounded write admission and the market-data feed with Aeron multicast or direct NATS egress. One
+process/cluster trades one symbol; multi-symbol isolation is deployment-level. The reference fleet
+also runs four fast-only
 shard market-data services and one global terminal service that consumes every shard feed and
 serves one multi-symbol WebSocket.
 
@@ -25,121 +26,141 @@ sub-tabs, and images roll through `POST /api/v1/market-data-services/{name}/upgr
 source-shard wire-version check. The `OrderSystem` CRD renders four user-ID shards, each with its
 own Deployment/Service/PDB/Ingress/HPA (min 1) and `maxUnavailable:0` image rolls; the manager links
 each shard to its own order desk instead of proxying order entry. The `match-eu-1` reference fleet
-runs digest-pinned images. The live acceptance harness (`scripts/operator-acceptance.sh`) covers
-containers, supervisor, reserved, migration, adoption, digest-pinned roll/rollback and stop/start
-flows; the full eight-phase OrbStack run passes in about 15 minutes. There are no known P0 defects.
+records image digests in its CRDs, but the demo has no registry: images live only in the node's
+local image store, so a `DiskPressure` image GC can leave a roll with nothing to pull. The live
+acceptance harness (`scripts/operator-acceptance.sh`) covers nine phases: containers, leader, roll,
+stop/start, supervisor, reserved, migration, adoption and NATS. The eight-phase run before the NATS
+phase was added passed in 889s; containers+NATS passed in 248s on `operator-v82`. The scheduled
+backup path creates, drills, signs and uploads a bundle daily and publishes the verified result; an
+hourly job re-verifies it and fails when the newest bundle or drill is stale, and the shard page
+shows the same record in a **backup** tab. There are no known P0 defects.
 
 Priority key: **P0** = known correctness/security defect, do next; **P1** = production safety and
 operability; **P2** = evidence, scale and important non-blocking work; **P3** = later/optional.
 
 ## Top priorities
 
-Last prioritised 2026-11-17, after the operator acceptance harness passed all eight phases and
-found two rollout defects that are now fixed. Ordering weighs data loss, security exposure and
+Last prioritised 2026-11-19, after the scheduled backup path and the console backup view landed
+and were exercised live (bundle, drill, signature, publish, freshness and stale states against the
+`fx-eu-01` CRDs). Backup construction is complete, so its remaining work — a real object-storage
+cycle and the CSI volume drill — moved to the explicit production gates and the actionable queue
+now leads with security, packaging and metrics. Ordering weighs data loss, security exposure and
 production blockers first, then work that is actionable in the current single-node lab;
 environment-blocked validation is called out explicitly rather than mixed into the actionable
 queue.
 
 The local-lease semantic risk stays covered by the delivery contract: client retries are
-at-least-once and use `client_order_id` for replicated dedupe, while downstream event readers
+at-least-once. `client_order_id` makes `Place` retries idempotent; `Cancel`/`Amend` have no request
+key yet, so clients and the planned gateway must not blind-retry them. Downstream event readers
 resume from `(log_index, ordinal)` and dedupe on `event_id`. A local-lease cache hit may overtake
 an unfinished write, so read-after-write is not a guarantee; clients that need it must await the
 write response.
 
 **P1 - production safety and operability, in execution order**
 
-1. **Backup and restore validation.** Data loss is the highest-consequence risk. The CLI and
-   checksummed CRD/etcd bundle path are implemented and tested. Finish the actionable part now:
-   run `backup` from a CronJob with `match-backup`, upload bundles to object storage, enforce
-   retention, alert when the newest bundle or restore drill is stale, and record a signed
-   CRD-bundle drill. The CSI `VolumeSnapshot`/`VolumeGroupSnapshot` drill stays blocked until a
-   snapshot-capable cluster is available; keep it an explicit production gate, not a silent gap.
-2. **Observability and HPA metrics.** Install a metrics-server or Prometheus adapter so the four
-   order-system and five market-data HPAs can report CPU and actually scale, then add the
-   Prometheus text bridge for the engine's JSON `/metrics`, operator reconcile/rollout metrics,
-   alerts, dashboards and log shipping. This is the largest actionable unblock in the current lab:
-   every HPA currently shows `<unknown>` and only the min-1 floor applies, and the same metrics
-   are needed before any load or soak test.
-3. **Control-plane and public-edge security.** One workstream for manager OIDC/RBAC,
+1. **Control-plane and public-edge security.** One workstream for manager OIDC/RBAC,
    console-proxy authorization, destructive-action approvals, idempotency keys,
    namespace-qualified paths and dry-run diffs, plus TLS, client authentication, rate limits,
-   origin checks and NetworkPolicy/Pod Security for the order-system and market-data edges. The
-   manager and both demo edges are still plaintext and unauthenticated.
+   origin checks and NetworkPolicy/Pod Security for the order-system, market-data and NATS edges.
+   It leads the queue because the manager, both demo edges and the NATS broker endpoint are all
+   plaintext and unauthenticated: exposure is the largest remaining production gate and no amount
+   of scaling or backup evidence mitigates it.
+2. **Manager packaging and image supply.** Check in Deployment/Service/RBAC/NetworkPolicy/Pod
+   Security, Helm/Kustomize, digest-pinned image publication and CRD/etcd backup integration. The
+   demo still depends on local-only images, an `emptyDir` and a port-forward, which blocks a clean
+   install; a `DiskPressure` image GC evicted them during the 2026-11-18 rollout, so publish to a
+   local registry or add an explicit `docker save`/`load` step before the next fleet roll. It
+   follows security because it has already broken a rollout.
+3. **Observability and HPA metrics.** Install a metrics-server or Prometheus adapter so the four
+   order-system and five market-data HPAs can report CPU and actually scale, then add the
+   Prometheus text bridge for the engine's JSON `/metrics` (or a native `/metrics/prometheus`),
+   operator reconcile/rollout metrics, alerts, dashboards and log shipping. This is the largest
+   scale and evidence unblock: every HPA currently shows `<unknown>` and only the min-1 floor
+   applies, and load/soak work depends on it. It follows packaging because the current min-1 floor
+   still serves traffic and no known defect depends on autoscaling.
 4. **Gateway routing and user-ID shard routing.** Route from `SymbolRoute.status` with
    shadow/cutover/drain, retries and a canary path, then run a tested client cutover. Add one host
    that maps user IDs to their order-system shard range so clients stop choosing shard URLs
-   manually. Migrations and the four order shards already exist; this is the missing production
-   data path.
-5. **Manager deployment packaging.** Check in Deployment/Service/RBAC/NetworkPolicy/Pod Security,
-   Helm/Kustomize, digest-pinned image publication and CRD/etcd backup integration. The demo still
-   depends on local-only image tags, an `emptyDir` and a port-forward, which blocks a clean install;
-   a `DiskPressure` image GC removed those tags during the 2026-11-18 rollout, so publish to a local
-   registry or add an explicit `docker save`/`load` step before the next fleet roll.
-6. **Market-data production readiness.** Couple symbol create/migrate/stop to both the fast and
+   manually. Do not blind-retry `Cancel`/`Amend` until the engine retry contract lands (P2);
+   `Place` retries use `client_order_id`. Migrations and the four order shards already exist;
+   this is the missing production data path, after the edges it fronts are secured.
+5. **Market-data production readiness.** Couple symbol create and migrate to both the fast and
    global symbol sets and the `SymbolRoute`, wait for the new feed before publishing and drain old
-   WebSocket sessions. Profile N (direct NATS) is now the single-node fallback and removes the
-   Aeron image-registration constraint; harden it for production with a multi-node NATS cluster,
-   TLS/credentials, strict NetworkPolicy and optional JetStream retention. Validate Profile A on a
-   multi-node multicast-capable CNI/VPC; that half is blocked on this single-node host, but the
-   lifecycle and topology code is not.
+   WebSocket sessions; the stop path already removes a symbol from every service. Profile N
+   (direct NATS) is the single-node fallback and removes the Aeron image-registration constraint;
+   harden it with a multi-node NATS cluster, TLS/credentials (security item 1), strict
+   NetworkPolicy and optional JetStream retention. Define the one-subscriber-per-group-per-node
+   rule for Profile A and validate Profile A on a multi-node multicast-capable CNI/VPC; that half
+   is blocked on this host, but the lifecycle and topology code is not.
 
-**Blocked on this host.** CSI volume snapshots (no snapshot CRDs or driver), multi-host
-lease/`ReadIndex` and Aeron multicast evidence (one OrbStack node), and the bare-metal pinned-core
-`bench-linux` dispatch. The lists below keep those halves visible; do not treat a green single-node
-run as production evidence for them.
+**Explicit production gates not exercised in this lab.** Backup close-out: one live
+object-storage bucket cycle to confirm rclone upload, retention and alerting (the local-PVC path
+and the signed CRD drill are validated), and the CSI volume-snapshot drill, which needs
+snapshot CRDs and a driver this host does not have. Also multi-host lease/`ReadIndex` and Aeron
+multicast evidence (one OrbStack node), a multi-node NATS cluster, Linux supervisor cgroup
+delegation (OrbStack), and the bare-metal pinned-core `bench-linux` dispatch. The lists below
+keep those halves visible; do not treat a green single-node run as production evidence for them.
 
 **P2 - evidence and scale, in execution order**
 
-7. **Acceptance-harness automation and rollout invariants.** The manual harness found two real
-   rollout defects. Run `scripts/operator-acceptance.sh` in a disposable CI cluster or nightly,
-   and extract the rollout candidate decision into a pure function with unit tests for: at most
-   one terminating pod, the replacement must be Ready before the next deletion, and no roll may be
-   skipped when `currentRevision == updateRevision` while pods still run the old template.
-8. **Stop-the-world incompatible upgrade execution.** The release gate correctly blocks mixed
+6. **Rollout invariants and acceptance-harness automation.** The manual harness found two real
+   rollout defects, now fixed. First extract the rollout candidate decision into a pure function
+   with unit tests for: at most one terminating pod, the replacement must be Ready before the next
+   deletion, and no roll may be skipped when `currentRevision == updateRevision` while pods still
+   run the old template. Then run the nine-phase `scripts/operator-acceptance.sh` in a disposable
+   CI cluster or nightly. The unit tests are the cheap regression guard; land them before the CI
+   plumbing.
+7. **Stop-the-world incompatible upgrade execution.** The release gate correctly blocks mixed
    rolls, and the runbook has a manual stop/upgrade/restart path. Automate the coordinated cutover
    (backup gate, disable routes, stop all symbols, apply image/release, restart, verify, re-enable)
-   and record a drill.
-9. **Market-data manager controls.** Add create/edit/scale and a read-only preview plan for
-   `MarketDataService`; image/release update and the per-service picker are implemented. Add a
-   rollback action that restores the previous image.
+   and record a drill. The backup gate now uses the real published bundle timestamp.
+8. **Safe retries for `Cancel`/`Amend` and typed leader redirect.** Today `client_order_id`
+   dedupes only `Place`, and a follower `/write` returns `500` with no leader hint. Add a request
+   key for cancel/amend and a typed `503` with the leader address so the gateway can refresh and
+   retry deterministically. Until then, document and enforce the no-blind-retry rule; this is
+   needed before the gateway can safely retry those requests.
+9. **Market-data manager controls.** Add GUI create/edit/scale and a read-only preview plan for
+   `MarketDataService`; the upsert API, image/release update and the per-service picker are
+   implemented. Add a rollback action that restores the previous image.
 10. **Market-data fan-out and slow-consumer evidence.** Soak many symbols, streams, connections
     and slow consumers through the Kubernetes deployment; measure per-instance encode/fan-out
     CPU, queue depth, gap/resync behavior and p99, and prove the engine's matching path is
     unaffected.
-11. **Market-data feed hardening.** Source startup requests a snapshot immediately and retries
-    until one is seen; the supervisor restarts a child when its `marketData` configuration changes;
-    Profile N direct NATS is live on OrbStack; and `scripts/operator-acceptance.sh` now has a `nats`
-    phase that proves sink=`nats`, feed readiness, and service-pod re-subscribe/snapshot recovery.
-    A live NATS restart also preserved all symbol readiness and re-established all 36 client
-    connections. A stopped `SymbolDeployment` now leaves every `MarketDataService` that declares
-    it, and starting it re-adds the symbol; a service with no active symbols scales to zero and
-    drops its HPA. Remaining work: add TLS/auth and JetStream retention, run a multi-node NATS
-    cluster, and keep the Aeron 5-30 s watchdog for clusters that still use multicast.
-12. **Multi-host evidence.** Rerun the read/write A/B on a second host and a Linux multi-host
-    four-voter cluster, force a stale lease so the `ReadIndex` fallback is observed, validate
-    Aeron multicast across hosts, and dispatch the bare-metal pinned-core `e2e` workflow.
-13. **Linux supervisor isolation.** Validate opt-in cgroup v2 delegation and rotating logs on a
-    node that delegates a writable subtree; OrbStack cannot, so the supervisor reports
-    `isolationError` and fails open.
-14. **CRD scale and soak.** Thousands of symbols/CRs across shards and cells, status churn,
+11. **Profile A feed hardening.** Startup snapshot/retry, supervisor restarts on configuration
+    changes, Profile N direct NATS and the acceptance `nats` phase are live. For clusters still on
+    multicast, characterize the Aeron image-registration race and single-node multi-subscriber
+    behavior, make source startup readiness-gated (or add a per-source generation), and keep the
+    5-30 s re-subscribe watchdog without restart loops.
+12. **CRD scale and soak.** Thousands of symbols/CRs across shards and cells, status churn,
     API-server/etcd size, informer memory and operator workqueue latency.
-15. **Docs synchronization.** Keep `AGENTS.md`, READMEs, `docs/PERFORMANCE.md`, `docs/API.md`,
+13. **Docs synchronization.** Keep `AGENTS.md`, READMEs, `docs/PERFORMANCE.md`, `docs/API.md`,
     `docs/ETCD_STORAGE.md` and the runbooks moving with storage, wire, read-policy and
-    control-plane changes.
+    control-plane changes. Fix the known drift first: `k8s_control_plane/README.md` still says
+    Profile A is the only rendered transport, and the control-plane design doc still lists NATS as
+    a fallback, while Profile N is rendered and live on OrbStack.
+14. **Multi-host evidence (blocked on this host).** Rerun the read/write A/B on a second host and a
+    Linux multi-host four-voter cluster, force a stale lease so the `ReadIndex` fallback is
+    observed, validate Aeron multicast across hosts, and dispatch the bare-metal pinned-core `e2e`
+    workflow.
+15. **Linux supervisor isolation (blocked on this host).** Validate opt-in cgroup v2 delegation
+    and rotating logs on a node that delegates a writable subtree; OrbStack cannot, so the
+    supervisor reports `isolationError` and fails open.
 
 **P3 - later, in impact order**
 
-1. **GUI follow-ups:** migration/promote forms, approvals, filters/pagination, diff/rollback and
-   SSE/WebSocket updates.
+1. **GUI follow-ups:** the order-system image picker and upgrade modal are implemented; add
+   order-system create/edit and image-rollback actions, migration/promote forms, approvals,
+   filters/pagination, diff/rollback and SSE/WebSocket updates.
 2. **Automation surface:** CLI `create-shard`/`create-symbol`/`migrate`, an OpenAPI client and
    admission validation/defaulting beyond the CRD YAML.
 3. **Multi-cell federation:** cell registration/capacity, CR projection and cross-cell migration.
-4. **Engine optional work:** bounded-admission backpressure, snapshot-policy purge knobs,
-   `STREAM_APPEND_CHANNEL_SIZE` benchmark, leader-change callbacks, peer preconnect/larger
-   frames/snapshot compression, async-WAL productionization, Aeron Raft transport, binary order
-   entry and ITCH-style replay, binary/compressed WebSocket market-data payloads only after a
-   measured JSON fan-out bottleneck, derivative fields, reserve replenishment/collars and
-   protobuf/Avro, module renaming and AON/order-mask coverage.
+4. **Engine optional work:** wire-version negotiation for compatible rolls, bounded-admission
+   backpressure, snapshot-policy purge knobs, `STREAM_APPEND_CHANNEL_SIZE` benchmark,
+   leader-change callbacks, peer preconnect/larger frames/snapshot compression, async-WAL
+   productionization, Aeron Raft transport, binary order entry and ITCH-style replay,
+   binary/compressed WebSocket market-data payloads only after a measured JSON fan-out bottleneck,
+   derivative fields, reserve replenishment/collars and protobuf/Avro, module renaming and
+   AON/order-mask coverage.
 5. **Operator documentation:** metrics, troubleshooting, capacity planning and disaster-recovery
    runbooks.
 
@@ -147,29 +168,27 @@ run as production evidence for them.
 
 ### Control plane
 
-- [ ] **P1** Backup/restore validation: the `backup`/`backup-verify`/`restore --drill` CLI is
-  implemented in `src/backup.rs` with `VolumeGroupSnapshot`/`VolumeSnapshot`, checksummed CRD/etcd
-  bundles, selective `--apply-crds` and prefixed PVC restore. Finish the actionable part: run
-  `backup` from a CronJob with the `match-backup` ServiceAccount, upload the bundle to object
-  storage, enforce a retention window, alert when the newest bundle or restore drill is stale and
-  record a signed CRD-bundle drill. The CSI volume drill is blocked until a snapshot-capable
-  cluster is available.
-- [ ] **P1** Observability: install a metrics-server/Prometheus adapter so the four order-system and
-  five market-data HPAs report CPU and scale, then add a Prometheus text bridge for the engine's
-  JSON `/metrics`, operator reconcile/rollout metrics, alert rules, dashboards and log shipping.
-  The console peer view is already covered by the NetworkPolicy rule.
 - [ ] **P1** Production manager and control-plane security: OIDC/RBAC, console-proxy
   authorization, destructive-action approvals, idempotency keys, namespace-qualified paths,
-  pagination, dry-run diffs, NetworkPolicy tests and Pod Security Standards. Desired state stays
-  in CRDs; use Postgres/object storage only for audit, a query/read model or long-term history,
-  not as a second source of truth. The demo manager has no auth.
-- [ ] **P1** Gateway integration: leader-aware routing from `SymbolRoute.status`, shadow/cutover/
-  drain, retries and a canary path. No gateway is deployed in the demo.
+  pagination, dry-run diffs, NetworkPolicy tests and Pod Security Standards for the manager, the
+  order-system and market-data edges and the NATS endpoint. Desired state stays in CRDs; use
+  Postgres/object storage only for audit, a query/read model or long-term history, not as a second
+  source of truth. The demo manager has no auth.
 - [ ] **P1** Manager deployment packaging: checked-in Deployment/Service/RBAC/Pod Security/
   NetworkPolicy, Helm/Kustomize, image digest pinning/publishing and etcd/CRD backup integration.
   No PVC is needed for desired state; an optional volume is only for audit/export caches. The
   console, engine-console proxy and order selector now have checked-in Ingress hosts
-  (`deploy/web-ingress.yaml`); the workload and packaging manifests remain.
+  (`deploy/web-ingress.yaml`); the workload and packaging manifests remain. The demo images exist
+  only in the node's local store, so add a registry (or an explicit `docker save`/`load` step)
+  before the next fleet roll; a `DiskPressure` image GC evicted local images on 2026-11-18.
+- [ ] **P1** Observability: install a metrics-server/Prometheus adapter so the four order-system and
+  five market-data HPAs report CPU and scale, then add a Prometheus text bridge for the engine's
+  JSON `/metrics`, operator reconcile/rollout metrics, alert rules, dashboards and log shipping.
+  The console peer view is already covered by the NetworkPolicy rule.
+- [ ] **P1** Gateway integration: leader-aware routing from `SymbolRoute.status`, shadow/cutover/
+  drain, retries and a canary path. Retry `Place` with `client_order_id`; do not blind-retry
+  `Cancel`/`Amend` until the request-key/typed-redirect item lands (P2). No gateway is deployed in
+  the demo.
 - [ ] **P1** Order-system public edge: TLS, authentication, rate limits and NetworkPolicy for the
   per-shard WebUI and `/demo/api`; the demo currently exposes plaintext HTTP with no auth. Keep
   order entry in the order system and the manager's role to linking only.
@@ -177,11 +196,20 @@ run as production evidence for them.
   clients do not choose a shard URL manually, and add per-user auth/rate limits. The four shards,
   per-shard APIs/WebUI links, HPAs and rolling image updates are live; the shared host and per-user
   authorization remain.
-- [ ] **P2** Automate the acceptance harness and rollout invariants: run
-  `scripts/operator-acceptance.sh` in a disposable CI cluster or nightly, and add pure-function
-  tests for the rollout candidate rules (one terminating pod at a time, replacement Ready before
-  the next deletion, and no skip when `currentRevision == updateRevision` while pods still run the
-  old template). The manual run found the two defects fixed on 2026-11-17.
+- [ ] **P1 (explicit production gate)** Backup close-out: the `backup`/`backup-verify`/`restore
+  --drill` CLI, `deploy/backup.yaml` (daily create + drill + HMAC signature + `rclone` upload +
+  retention, hourly `backup-status` freshness check), `deploy/backup-alerts.yaml` and the shard
+  **backup** tab are implemented and tested. The full path ran live on `fx-eu-01` on 2026-11-19
+  (32-object bundle, signed drill, publish, stale and not-configured states) through the
+  `scripts/backup-local-lab.sh` PVC path. Remaining: one cycle against a real object-storage
+  bucket, confirming retention and alerting, plus the CSI volume drill once a snapshot-capable
+  cluster is available.
+- [ ] **P2** Automate the acceptance harness and rollout invariants: first add pure-function tests
+  for the rollout candidate rules (one terminating pod at a time, replacement Ready before the next
+  deletion, and no skip when `currentRevision == updateRevision` while pods still run the old
+  template), then run the nine-phase `scripts/operator-acceptance.sh` in a disposable CI cluster or
+  nightly. The manual run found the two defects fixed on 2026-11-17; the unit tests are the cheap
+  regression guard.
 - [ ] **P2** Stop-the-world incompatible upgrade execution: the release gate correctly blocks
   mixed rolls and supervisor rolling is implemented; automate the coordinated stop/upgrade/
   restart cutover (backup gate, disable routes, stop all symbols, apply image/release, restart,
@@ -189,12 +217,13 @@ run as production evidence for them.
 - [ ] **P2** Scale and soak the CRD path: thousands of symbols/CRs across shards and cells, status
   churn, API-server/etcd size and backup/restore, manager informer memory and operator workqueue
   latency. No real engine load is required.
-- [ ] **P2** Validate opt-in supervisor cgroups and rotating logs on a Linux node that delegates a
-  writable cgroup v2 subtree; OrbStack does not, so the supervisor reports `isolationError` and
-  fails open.
-- [ ] **P3** GUI: the overview is live, the upgrade tab is a single action and the preview plan tab
-  is a read-only simulator. Add order-system create/edit and image-rollback actions,
-  migration/promote forms, approvals, filters/pagination, diff/rollback and SSE/WebSocket updates.
+- [ ] **P2 (blocked on OrbStack)** Validate opt-in supervisor cgroups and rotating logs on a Linux
+  node that delegates a writable cgroup v2 subtree; OrbStack does not, so the supervisor reports
+  `isolationError` and fails open.
+- [ ] **P3** GUI: the overview is live, the upgrade tab is a single action, the preview plan tab is
+  a read-only simulator and the order-system/market-data image pickers are implemented. Add
+  order-system create/edit and image-rollback actions, migration/promote forms, approvals,
+  filters/pagination, diff/rollback and SSE/WebSocket updates.
 - [ ] **P3** CLI `create-shard`, `create-symbol` and `migrate` commands for automation; the API/GUI
   are implemented today.
 - [ ] **P3** OpenAPI client, admission validation/defaulting and schema tests beyond the CRD YAML
@@ -209,19 +238,23 @@ run as production evidence for them.
 The `MarketDataService` CRD, renderer, operator lifecycle, fast/terminal profiles, four fast-only
 shard services and the global terminal service are live; see History. Remaining work:
 
-- [ ] **P1** Validate Profile A across a multi-node multicast-capable CNI/VPC (Cilium/Isovalent
-  multicast, or Multus plus AWS Transit Gateway multicast). The default EKS VPC CNI cannot run it.
-  Record CNI/MTU, cross-node `/ready`, leader-transfer reset behavior, and benchmark direct NATS
-  (`NatsSink` -> NATS Core/JetStream -> `NatsSource`) as the fallback when multicast is unavailable
-  or misses the p99 target.
 - [ ] **P1** Market-data topology and symbol lifecycle coupling. Define a one-subscriber-per-group
   per-node placement rule (or add dual-publish/relay support): two pods joining the same group on
-  the single-node lab can transiently starve one feed. Creating, migrating or stopping a symbol
-  must update both the fast and global symbol sets and `SymbolRoute` in one guarded flow, wait for
-  the new feed to be ready before publishing traffic, and drain the old WebSocket sessions.
+  the single-node lab can transiently starve one feed. Stopping a symbol already removes it from
+  every service and scales an empty service to zero; the remaining half is the guarded create/
+  migrate flow that updates both the fast and global symbol sets and `SymbolRoute`, waits for the
+  new feed to be ready before publishing traffic, and drains the old WebSocket sessions.
 - [ ] **P1** Public market-data edge: ingress TLS/authentication, rate limits, origin checks,
   connection/stream caps, NetworkPolicy and no public Aeron exposure; document the
   gateway/Ingress/manager boundary as part of the security review.
+- [ ] **P1** NATS production hardening: the single-node `deploy/nats.yaml` lab server and the
+  `NatsSink`/`NatsSource` round-trip are validated, but production needs TLS/credentials, strict
+  NetworkPolicy, a multi-node NATS cluster (blocked on this host) and optional JetStream retention.
+- [ ] **P1 (blocked on this host)** Validate Profile A across a multi-node multicast-capable
+  CNI/VPC (Cilium/Isovalent multicast, or Multus plus AWS Transit Gateway multicast). The default
+  EKS VPC CNI cannot run it. Record CNI/MTU, cross-node `/ready` and leader-transfer reset behavior.
+  Profile N (`NatsSink` -> NATS Core/JetStream -> `NatsSource`) is the live single-node fallback;
+  benchmark it before deciding multicast is required.
 - [ ] **P2** Optional Aeron profiles only if the NATS benchmark misses the latency target: direct
   multicast where the multi-node CNI/VPC test passes, or the per-pod IPC bridge for existing Aeron
   deployments. Keep unique stream bases per engine process (`2001 + 7 * slot`), a cell-unique
@@ -229,17 +262,18 @@ shard services and the global terminal service are live; see History. Remaining 
 - [ ] **P2** Market-data profile extras: all-market aggregate streams (`!miniTicker@arr`), a
   per-connection terminal frame budget, per-profile connection/lag metrics, explicit WebSocket close
   reasons and a ServiceMonitor.
-- [ ] **P2** Manager controls for the market-data tier: create/edit/scale and a read-only preview
-  plan in the market-data view; image/release update and the per-service image picker are
+- [ ] **P2** Manager controls for the market-data tier: add GUI create/edit/scale and a read-only
+  preview plan; the upsert API, image/release update and the per-service image picker are
   implemented. Add a rollback action that restores the previous image.
 - [ ] **P2** Rollout and availability: canary policy, PDB verification, drain-aware image upgrades
   and a tested rollback path that restores subscriber capacity without touching matching. HPA CPU
   metrics for the market-data and order-system HPAs need a metrics server or Prometheus adapter;
   this is tracked as a P1 in Top priorities.
-- [ ] **P2** Aeron feed hardening: characterize the image-registration race and the single-node
-  multi-subscriber behavior; make source startup readiness-gated (or add a per-source generation)
-  so a stale feed is detected and rebuilt without log spam. Keep the 5-30 s re-subscribe watchdog as
-  the fallback and avoid restart loops when an engine feed is genuinely down.
+- [ ] **P2** Aeron feed hardening (Profile A only): characterize the image-registration race and the
+  single-node multi-subscriber behavior; make source startup readiness-gated (or add a per-source
+  generation) so a stale feed is detected and rebuilt without log spam. Keep the 5-30 s
+  re-subscribe watchdog as the fallback and avoid restart loops when an engine feed is genuinely
+  down.
 - [ ] **P2** Observability: a Prometheus text endpoint (or bridge for the JSON metrics), per-symbol
   readiness and last-frame age, feed lag, `GAP`/drop counts, queue depth, subscribers per stream,
   conflation ratio, encode CPU and WebSocket close reasons; alerts and the manager status view.
@@ -257,21 +291,27 @@ shard services and the global terminal service are live; see History. Remaining 
 
 ### Engine and transport
 
-- [ ] **P2** Validate the default `local_lease` path on a second host and a Linux multi-host
-  four-voter cluster: rerun `read_e2e --policy lease|local_lease` plus the e2e/cluster write A/B,
-  force a stale lease or cache miss so the `ReadIndex` fallback is observed, and check
-  `/read-policy/status` counters under bounded clock skew. The OrbStack four-container lab proves
-  the Linux path but is still one host.
-- [ ] **P2** Validate Aeron multicast across a real multi-host fabric: separate hosts/drivers on a
-  non-loopback NIC, independent service instances and no shared `/dev/shm`. The single-host `lo`
-  path is covered by `scripts/aeron-linux-lab.sh`.
-- [ ] **P2** Dispatch `.github/workflows/bench-linux.yml` for the bare-metal pinned short and
-  sustained `e2e` rows. The OrbStack container run covers the short pinned check in both fsync
-  modes; this is the remaining bare-metal evidence.
+- [ ] **P2** Make gateway retries safe: add a request key for `Cancel`/`Amend` (the current
+  `client_order_id` dedupes only `Place`) and a typed `503` with the leader address so a follower
+  `/write` can be retried deterministically instead of today's `500`. Until then, document and
+  enforce the no-blind-retry rule so the gateway never duplicates a cancel or amend.
+- [ ] **P2 (blocked on this host)** Validate the default `local_lease` path on a second host and a
+  Linux multi-host four-voter cluster: rerun `read_e2e --policy lease|local_lease` plus the
+  e2e/cluster write A/B, force a stale lease or cache miss so the `ReadIndex` fallback is observed,
+  and check `/read-policy/status` counters under bounded clock skew. The OrbStack four-container
+  lab proves the Linux path but is still one host.
+- [ ] **P2 (blocked on this host)** Validate Aeron multicast across a real multi-host fabric:
+  separate hosts/drivers on a non-loopback NIC, independent service instances and no shared
+  `/dev/shm`. The single-host `lo` path is covered by `scripts/aeron-linux-lab.sh`.
+- [ ] **P2 (blocked on the bare-metal runner)** Dispatch `.github/workflows/bench-linux.yml` for the
+  bare-metal pinned short and sustained `e2e` rows. The OrbStack container run covers the short
+  pinned check in both fsync modes; this is the remaining bare-metal evidence.
 - [ ] **P3** Productionize async WAL only after the second-host Linux multi-node A/B and pipelining
   work: add periodic-mode support if useful, bound the pending cache with backpressure, extend
   crash/failover coverage and test whether more append concurrency exposes a real gain. Keep the
   synchronous WAL as the default until then.
+- [ ] **P3** Add wire-version negotiation so wire-compatible releases can roll instead of using the
+  stop-the-world cutover; keep the release gate until then.
 - [ ] **P3** When exposing the snapshot policy, expose `purge_batch_size` and
   `max_in_snapshot_log_to_keep` together; a lower policy would otherwise cause frequent small
   purges.
@@ -306,7 +346,9 @@ shard services and the global terminal service are live; see History. Remaining 
 ### Docs and hygiene
 
 - [ ] **P2** Keep `AGENTS.md`, READMEs, `docs/DECIMAL.md` and this file in sync after future
-  storage/wire changes.
+  storage/wire changes. Fix the known drift first: `k8s_control_plane/README.md` still says Profile
+  A is the only rendered transport, and the control-plane design doc still lists NATS as a
+  fallback, while Profile N is rendered and live on OrbStack.
 - [ ] **P3** Decide whether to rename the remaining mixed-style modules before 1.0
   (`src/match_result/` → `match_events/`). This is import-breaking and offers no functional benefit
   today.
@@ -317,6 +359,42 @@ Completed work is summarised here; detailed evidence, measurements and implement
 in git history and the linked docs. For the full history, check out `TODO.md` from an earlier commit
 (`git log -- TODO.md`).
 
+- **2026-11-19** — Backup view in the control plane: the scheduled jobs publish the verified
+  result to the `match-backup-status` ConfigMap, the manager serves
+  `GET /api/v1/backup-status?shard={name}`, and the shard page gained a **backup** tab showing the
+  newest bundle id/age/checksum, the signed drill kind/age/signer, the configured age limits and
+  the exact stale reasons (`not configured` until a record exists). The upgrade gate's
+  `lastBackupAt` now uses the real published bundle timestamp in CRD mode. A live run against
+  OrbStack exercised the whole path: the daily Job created/verified/drilled/signed a 32-object
+  `fx-eu-01` bundle, uploaded it, pruned and published; the hourly status Job re-downloaded,
+  re-verified the signature and republished; a synthetic old timestamp produced the `stale` state
+  with human-readable reasons. `scripts/backup-local-lab.sh` wires both CronJobs to a shared PVC
+  (rclone local path) for labs without object storage, and `deploy/rbac.yaml` gained the two
+  namespaced Roles for the publish/read path.
+- **2026-11-19** — Scheduled backups and signed drills: `deploy/backup.yaml` adds a daily
+  `match-backup` CronJob that creates and verifies a bundle, runs `restore --drill`, signs the
+  result, uploads the bundle and drill through `rclone`, prunes objects older than
+  `BACKUP_RETENTION`, and fails when the newest bundle or drill is stale. An hourly
+  `match-backup-status` CronJob repeats the freshness check from object storage. `restore --drill
+  --attest-key/--attest-out` writes an HMAC-SHA256 `<bundle-id>.drill.json` + `.drill.sig`, and the
+  new `backup-status` command verifies the signature, shard/namespace, bundle checksums and age
+  limits. `deploy/backup-alerts.yaml` covers failed and stale jobs; the control-plane runtime image
+  now includes `rclone`. The CronJob script was exercised against the live `fx-eu-01` CRDs with a
+  local rclone sink: it created a 32-object CRD-only bundle, drilled and signed it, and
+  `backup-status` verified the catalog and signature. The manifest defaults to `BACKUP_MODE:
+  crd-only` because the local lab has no CSI snapshot driver; the CSI volume drill remains blocked.
+- **2026-11-18** — Order-system image inventory and demo replay:
+  `GET /api/v1/images?orderSystem={name}` scopes the picker to the system's repository and merges
+  node-cached, running and catalog images; the GUI uses an upgrade modal instead of
+  `window.prompt`, and the same current-image selection applies to the market-data picker.
+  `scripts/replay-order-system.py` translates the checked-in replay fixtures into demo tickets and
+  drives the BFF, user-ID shard routing, leader forwarding and the engine together (`--dry-run`,
+  `--keep-book`). README/RUNBOOK examples use the OrbStack ingress hosts and the screenshots were
+  refreshed.
+- **2026-11-18** — Market-data symbol lifecycle: stopping a `SymbolDeployment` removes it from
+  every `MarketDataService` that declares it (rendered args, ConfigMap and per-symbol status);
+  starting it re-adds the symbol and rolls the service, and a service with no active symbols scales
+  to zero and drops its HPA.
 - **2026-11-18** — New-symbol rollout fix and NATS acceptance: adding a symbol to an existing
   containers-mode shard no longer deadlocks the operator. A new Raft group has no leader or ready
   replica until every pod carries its container, so the rollout now treats a zero-ready/no-leader
