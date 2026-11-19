@@ -57,6 +57,32 @@ subjects:
     name: match-manager
     namespace: match-control
 ---
+# The manager reads the backup/status Jobs' published ConfigMap for the Backup tab.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: match-manager-backup-status
+  namespace: match-control
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["match-backup-status"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: match-manager-backup-status
+  namespace: match-control
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: match-manager-backup-status
+subjects:
+  - kind: ServiceAccount
+    name: match-manager
+    namespace: match-control
+---
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -184,6 +210,35 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
   name: match-backup
+subjects:
+  - kind: ServiceAccount
+    name: match-backup
+    namespace: match-control
+---
+# The backup/status Jobs publish the latest bundle/drill result for the manager Backup view.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: match-backup-status
+  namespace: match-control
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["match-backup-status"]
+    verbs: ["get", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: match-backup-status
+  namespace: match-control
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: match-backup-status
 subjects:
   - kind: ServiceAccount
     name: match-backup

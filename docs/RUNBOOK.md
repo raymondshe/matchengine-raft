@@ -1321,8 +1321,90 @@ and a controlled StatefulSet cutover; restoring a subset of voters over newer co
 unsupported. The etcd snapshot is checksum-verified and preserved in the bundle, but restoring etcd
 is the provider's control-plane procedure, not this tool. Snapshots are crash-consistent; the
 reference CLI does not quiesce writes, so drain the gateway route first when a quiesced backup is
-required. Copy the bundle to object storage after creation; the output directory is a staging path,
-not a retention system.
+required. The output directory is a staging path, not a retention system; use the scheduled path
+below to upload, prune and alert. Object storage holds the checksummed bundle and signed drill
+records, not the CSI snapshot data; keep the storage backend's snapshot replication in place for
+cross-cluster recovery until a logical exporter exists.
+
+### Scheduled backups, retention and signed drills
+
+`deploy/backup.yaml` runs two CronJobs with the `match-backup` ServiceAccount:
+
+- `match-backup` (daily) creates a bundle, verifies it, runs `restore --drill`, signs the drill,
+  uploads the bundle and drill through `rclone`, prunes objects older than `BACKUP_RETENTION`, and
+  fails if the newest bundle or drill exceeds its age limit.
+- `match-backup-status` (hourly) downloads the newest bundle and signed drill and repeats the
+  freshness check, so a suspended or broken schedule fails even when the daily Job is not running.
+
+Create the object-storage config and signing key before enabling the schedule:
+
+```sh
+kubectl -n match-control create secret generic match-backup-rclone \
+  --from-file=rclone.conf="$HOME/.config/rclone/rclone.conf"
+openssl rand -out /tmp/match-backup.key 32
+kubectl -n match-control create secret generic match-backup-signing-key \
+  --from-file=signing.key=/tmp/match-backup.key
+kubectl apply -f k8s_control_plane/deploy/rbac.yaml
+kubectl apply -f k8s_control_plane/deploy/backup.yaml
+kubectl apply -f k8s_control_plane/deploy/backup-alerts.yaml   # Prometheus Operator only
+```
+
+On the local lab, `scripts/backup-local-lab.sh` wires the same CronJobs to a shared PVC instead:
+rclone treats a plain filesystem path as a local remote, so the create/verify/drill/sign/publish/
+retention path runs end to end without object storage. It creates the two Secrets when missing and
+patches both CronJobs in place (`--uninstall` reverses it). The PVC is on the same node and cluster
+as the data, so it is a demo convenience, not a backup destination.
+
+```sh
+scripts/backup-local-lab.sh
+kubectl -n match-control create job --from=cronjob/match-backup match-backup-bootstrap
+kubectl -n match-control logs job/match-backup-bootstrap -f
+```
+
+Scope the rclone credential to the backup bucket/prefix; the Jobs only need create, read and
+delete permission under that prefix. Edit `match-backup-config` for the shard, namespace,
+`RCLONE_REMOTE` (`s3:<bucket>/<prefix>`; the scripts append `/<shard>`), retention window (default
+`720h`) and age limits. Keep `BACKUP_RETENTION` longer than both age limits so pruning cannot
+remove the object the status job is about to check. The manifest defaults to `BACKUP_MODE: crd-only`
+because the local lab has no CSI snapshot driver; set `volume` or `volume-group` and the matching
+snapshot class when one is available. Rebuild the manager image after pulling this change: the
+runtime image now includes `rclone` for the upload steps. `ETCD_SNAPSHOT_FILE` is optional; mount
+the producer's file into both Jobs before setting it.
+
+The signing key is a 32-byte HMAC-SHA256 key. Each drill writes `<bundle-id>.drill.json` and
+`<bundle-id>.drill.sig`; the signature covers the exact JSON bytes. Signed volume drills require
+recorded verification, so a bundle created with `--no-verify` is refused. `backup-status` verifies
+the signature, the shard/namespace, the bundle checksums, and both age limits:
+
+```sh
+cargo run --manifest-path k8s_control_plane/Cargo.toml --bin k8s-control-plane -- \
+  backup-status \
+  --bundle-dir /var/backups --drill-dir /var/backups/drills \
+  --key /tmp/match-backup.key
+```
+
+Rotate the key by replacing the Secret and running the backup Job immediately; drills signed with
+the old key are rejected until a new signed drill exists.
+
+The manager's shard **backup** tab reads the same record: both Jobs publish the verified status to
+the `match-backup-status` ConfigMap in `match-control`, and `GET /api/v1/backup-status?shard=<name>`
+serves it. The tab shows the newest bundle id/age/checksum, the signed drill kind/age/signer, the
+age limits and the exact stale reasons; `not configured` means no record has been published yet.
+The shard detail's backup gate also uses this record, so a stop-the-world upgrade requires a real
+verified bundle newer than 24 hours rather than the demo simulation.
+
+A stale bundle or drill exits non-zero; that is the alert signal. `deploy/backup-alerts.yaml` adds
+Prometheus rules for failed Jobs, a 26-hour-old newest bundle, a two-hour-old status check and a
+CronJob that has never succeeded. Without Prometheus Operator, alert on failed `match-backup*` Jobs
+directly. Bootstrap the first backup and drill manually so the hourly status job has data:
+
+```sh
+kubectl -n match-control create job --from=cronjob/match-backup match-backup-bootstrap
+kubectl -n match-control logs job/match-backup-bootstrap -f
+```
+
+A CRD-only drill verifies the catalog and checksums without a volume snapshot; it is the current
+requirement. The CSI volume drill remains blocked on a snapshot-capable cluster.
 
 Audit/action history is not part of CRDs. Use the external audit store for that.
 

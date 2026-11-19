@@ -10,6 +10,7 @@
 //!
 //! (From the repository root, add `--manifest-path k8s_control_plane/Cargo.toml`.)
 
+use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -99,7 +100,10 @@ enum Command {
     /// Create a volume-snapshot + CRD/etcd backup bundle for one shard.
     Backup {
         shard: String,
-        /// Bundle directory. Defaults to backups/<shard>-<unix-seconds>.
+        /// Bundle id and manifest id. Defaults to <shard>-<unix-seconds>.
+        #[arg(long)]
+        id: Option<String>,
+        /// Bundle directory. Defaults to backups/<id>.
         #[arg(long)]
         out: Option<PathBuf>,
         /// `volume-group` uses the Kubernetes VolumeGroupSnapshot API; `volume` creates one
@@ -138,6 +142,31 @@ enum Command {
         #[arg(long)]
         input: PathBuf,
     },
+    /// Check the newest uploaded bundle and signed restore drill for freshness.
+    BackupStatus {
+        /// Directory containing one or more backup bundles (searched recursively).
+        #[arg(long, default_value = "backups")]
+        bundle_dir: PathBuf,
+        /// Directory containing `<bundle-id>.drill.json` and `.drill.sig` files.
+        #[arg(long, default_value = "drills")]
+        drill_dir: PathBuf,
+        /// HMAC-SHA256 key used to verify signed drill records.
+        #[arg(long, env = "BACKUP_SIGNING_KEY_FILE")]
+        key: PathBuf,
+        #[arg(long, default_value_t = backup::DEFAULT_MAX_BACKUP_AGE_SECS)]
+        max_backup_age_secs: u64,
+        #[arg(long, default_value_t = backup::DEFAULT_MAX_DRILL_AGE_SECS)]
+        max_drill_age_secs: u64,
+        /// Print a machine-readable report.
+        #[arg(long)]
+        json: bool,
+        /// Publish the verified status into this ConfigMap for the manager.
+        #[arg(long)]
+        publish_configmap: Option<String>,
+        /// Namespace of `--publish-configmap`.
+        #[arg(long, default_value = "match-control", env = "BACKUP_STATUS_NAMESPACE")]
+        configmap_namespace: String,
+    },
     /// Verify and selectively restore a backup bundle. Without an action it only verifies.
     Restore {
         #[arg(long)]
@@ -170,6 +199,19 @@ enum Command {
         /// Keep drill PVCs for inspection.
         #[arg(long)]
         keep: bool,
+        /// HMAC-SHA256 key used to sign the drill result. Requires `--drill` and `--attest-out`.
+        #[arg(long, requires_all = ["drill", "attest_out"], env = "BACKUP_ATTEST_KEY")]
+        attest_key: Option<PathBuf>,
+        /// Directory for `<bundle-id>.drill.json` and `.drill.sig`. Requires `--drill`.
+        #[arg(long, requires_all = ["drill", "attest_key"])]
+        attest_out: Option<PathBuf>,
+        /// Label recorded in the signed drill record.
+        #[arg(
+            long,
+            default_value = "k8s-control-plane",
+            env = "BACKUP_ATTEST_SIGNER"
+        )]
+        attest_signer: String,
         #[arg(long, default_value = "busybox:1.36")]
         verify_image: String,
         #[arg(long, default_value_t = 300)]
@@ -354,6 +396,7 @@ async fn main() -> Result<()> {
         }
         Command::Backup {
             shard,
+            id,
             out,
             mode,
             namespace,
@@ -382,10 +425,21 @@ async fn main() -> Result<()> {
                 .get(&shard)
                 .cloned()
                 .ok_or_else(|| anyhow::anyhow!("unknown shard {shard}"))?;
-            let id = format!(
-                "{shard}-{}",
-                matchengine_k8s_control_plane::store::now_epoch()
-            );
+            let id = id.unwrap_or_else(|| {
+                format!(
+                    "{shard}-{}",
+                    matchengine_k8s_control_plane::store::now_epoch()
+                )
+            });
+            if id.is_empty()
+                || id == "."
+                || id == ".."
+                || !id
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.')
+            {
+                bail!("--id must be a non-empty name using only letters, digits, '.', '-' or '_'");
+            }
             let out = out.unwrap_or_else(|| PathBuf::from("backups").join(&id));
             let snapshot_options = backup::SnapshotOptions {
                 namespace: namespace.clone(),
@@ -453,6 +507,69 @@ async fn main() -> Result<()> {
             );
             Ok(())
         }
+        Command::BackupStatus {
+            bundle_dir,
+            drill_dir,
+            key,
+            max_backup_age_secs,
+            max_drill_age_secs,
+            json,
+            publish_configmap,
+            configmap_namespace,
+        } => {
+            let key = fs::read(&key)
+                .map_err(|error| anyhow::anyhow!("read signing key {}: {error}", key.display()))?;
+            let report = backup::check_backup_freshness(
+                &bundle_dir,
+                &drill_dir,
+                &key,
+                max_backup_age_secs,
+                max_drill_age_secs,
+            )?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("backup status: ok");
+                println!(
+                    "  newest bundle: {} (age {}s, {} volume(s), catalog {})",
+                    report.bundle_id,
+                    report.bundle_age_secs,
+                    report.bundle_volumes,
+                    report.catalog_sha256
+                );
+                println!(
+                    "  newest signed drill: {} (age {}s, kind {}, bundle {}, {} volume(s), signer {})",
+                    report.drill_path,
+                    report.drill_age_secs,
+                    report.drill_kind,
+                    report.drill_bundle_id,
+                    report.drill_volumes_verified,
+                    report.drill_signer
+                );
+            }
+            if let Some(configmap) = publish_configmap {
+                let client = kube::Client::try_default()
+                    .await
+                    .map_err(|error| anyhow::anyhow!("load Kubernetes client: {error}"))?;
+                let published = backup::PublishedBackupStatus::new(
+                    report.clone(),
+                    max_backup_age_secs,
+                    max_drill_age_secs,
+                );
+                backup::publish_backup_status(
+                    &client,
+                    &configmap,
+                    &configmap_namespace,
+                    &published,
+                )
+                .await?;
+                eprintln!(
+                    "published backup status: {configmap_namespace}/{configmap}#{}",
+                    report.bundle_shard
+                );
+            }
+            Ok(())
+        }
         Command::Restore {
             input,
             cell,
@@ -466,6 +583,9 @@ async fn main() -> Result<()> {
             target_namespace,
             volume_prefix,
             keep,
+            attest_key,
+            attest_out,
+            attest_signer,
             verify_image,
             timeout_secs,
             namespace,
@@ -489,19 +609,40 @@ async fn main() -> Result<()> {
                 plan.volumes
             );
             if drill {
-                let target = target_namespace.unwrap_or_else(|| bundle.manifest.namespace.clone());
-                let options = backup::VolumeRestoreOptions {
-                    target_namespace: target,
-                    prefix: format!("drill-{}-", sanitize_id(&bundle.manifest.id)),
-                    drill: true,
-                    keep,
-                    verify_image,
-                    timeout: Duration::from_secs(timeout_secs),
+                let attest = match (attest_key, attest_out) {
+                    (Some(key_path), Some(out)) => {
+                        let key = fs::read(&key_path).map_err(|error| {
+                            anyhow::anyhow!("read signing key {}: {error}", key_path.display())
+                        })?;
+                        if key.len() < backup::MIN_DRILL_KEY_BYTES {
+                            bail!(
+                                "drill signing key must be at least {} bytes",
+                                backup::MIN_DRILL_KEY_BYTES
+                            );
+                        }
+                        Some((key, out))
+                    }
+                    (None, None) => None,
+                    _ => bail!("--attest-key and --attest-out must be used together"),
                 };
-                let client = kube::Client::try_default()
-                    .await
-                    .map_err(|error| anyhow::anyhow!("load Kubernetes client: {error}"))?;
-                let volumes = backup::restore_volumes(&client, &bundle.manifest, &options).await?;
+                let volumes = if bundle.manifest.volumes.is_empty() {
+                    Vec::new()
+                } else {
+                    let target =
+                        target_namespace.unwrap_or_else(|| bundle.manifest.namespace.clone());
+                    let options = backup::VolumeRestoreOptions {
+                        target_namespace: target,
+                        prefix: format!("drill-{}-", sanitize_id(&bundle.manifest.id)),
+                        drill: true,
+                        keep,
+                        verify_image,
+                        timeout: Duration::from_secs(timeout_secs),
+                    };
+                    let client = kube::Client::try_default()
+                        .await
+                        .map_err(|error| anyhow::anyhow!("load Kubernetes client: {error}"))?;
+                    backup::restore_volumes(&client, &bundle.manifest, &options).await?
+                };
                 if volumes.is_empty() {
                     println!(
                         "restore drill passed: catalog verified; the bundle has no volume snapshots"
@@ -511,6 +652,16 @@ async fn main() -> Result<()> {
                         "restore drill passed: {} PVC(s) mounted and hashed; desired state not changed",
                         volumes.len()
                     );
+                }
+                if let Some((key, out)) = attest {
+                    let path = backup::write_drill_attestation(
+                        &bundle,
+                        &key,
+                        &attest_signer,
+                        volumes.len(),
+                        &out,
+                    )?;
+                    println!("signed drill: {}", path.display());
                 }
                 return Ok(());
             }
@@ -806,6 +957,8 @@ mod tests {
             "k8s-control-plane",
             "backup",
             "fx-eu-01",
+            "--id",
+            "fx-eu-01-nightly",
             "--mode",
             "volume",
             "--volume-snapshot-class",
@@ -816,12 +969,14 @@ mod tests {
         match cli.command {
             Command::Backup {
                 shard,
+                id,
                 mode,
                 volume_snapshot_class,
                 no_verify,
                 ..
             } => {
                 assert_eq!(shard, "fx-eu-01");
+                assert_eq!(id.as_deref(), Some("fx-eu-01-nightly"));
                 assert_eq!(mode, "volume");
                 assert_eq!(volume_snapshot_class, "csi-snap");
                 assert!(no_verify);
@@ -842,6 +997,76 @@ mod tests {
         ])
         .unwrap_err();
         assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn restore_cli_requires_drill_for_attestation() {
+        let error = Cli::try_parse_from([
+            "k8s-control-plane",
+            "restore",
+            "--input",
+            "backups/fx-eu-01",
+            "--attest-key",
+            "drill.key",
+            "--attest-out",
+            "drills",
+        ])
+        .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+
+        let cli = Cli::try_parse_from([
+            "k8s-control-plane",
+            "restore",
+            "--input",
+            "backups/fx-eu-01",
+            "--drill",
+            "--attest-key",
+            "drill.key",
+            "--attest-out",
+            "drills",
+            "--attest-signer",
+            "nightly",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Restore {
+                attest_signer,
+                attest_key,
+                attest_out,
+                ..
+            } => {
+                assert_eq!(attest_signer, "nightly");
+                assert!(attest_key.is_some());
+                assert!(attest_out.is_some());
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn backup_status_cli_parses_defaults() {
+        let cli = Cli::try_parse_from(["k8s-control-plane", "backup-status", "--key", "drill.key"])
+            .unwrap();
+        match cli.command {
+            Command::BackupStatus {
+                bundle_dir,
+                drill_dir,
+                max_backup_age_secs,
+                max_drill_age_secs,
+                json,
+                ..
+            } => {
+                assert_eq!(bundle_dir, PathBuf::from("backups"));
+                assert_eq!(drill_dir, PathBuf::from("drills"));
+                assert_eq!(max_backup_age_secs, backup::DEFAULT_MAX_BACKUP_AGE_SECS);
+                assert_eq!(max_drill_age_secs, backup::DEFAULT_MAX_DRILL_AGE_SECS);
+                assert!(!json);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
     }
 
     #[test]

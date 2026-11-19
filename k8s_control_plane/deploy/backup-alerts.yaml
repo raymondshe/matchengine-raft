@@ -1,0 +1,63 @@
+# Alerts for the scheduled backup path.
+#
+# Requires the Prometheus Operator (or an equivalent rule loader) and kube-state-metrics.
+# Without those, alert on failed Jobs from deploy/backup.yaml directly:
+#   kubectl -n match-control get jobs -l app.kubernetes.io/name=match-backup
+#
+# `match-backup-status` deliberately fails when the newest bundle or signed drill is stale, so
+# the Job-failure alert covers both the "backup stopped" and "drill stopped" cases.
+#
+# Keep the 93600/7200 thresholds below in sync with match-backup-config's
+# MAX_BACKUP_AGE_SECS/MAX_DRILL_AGE_SECS and the hourly status schedule.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: match-backup
+  namespace: match-control
+  labels:
+    app.kubernetes.io/name: match-backup
+spec:
+  groups:
+    - name: match-backup
+      rules:
+        - alert: MatchBackupJobFailed
+          expr: |
+            max by (job_name) (
+              kube_job_status_failed{namespace="match-control",job_name=~"match-backup.*"}
+            ) > 0
+          for: 10m
+          labels:
+            severity: critical
+          annotations:
+            summary: "A match-backup job failed"
+            description: "Job {{ $labels.job_name }} has failed; inspect its logs and the newest object-storage bundle/drill."
+
+        - alert: MatchBackupStale
+          expr: |
+            time() - max(kube_cronjob_status_last_successful_time{namespace="match-control",job_name="match-backup"}) > 93600
+          for: 30m
+          labels:
+            severity: critical
+          annotations:
+            summary: "No successful match-backup run in 26 hours"
+            description: "The daily shard backup has not completed; the newest bundle may exceed the retention SLO."
+
+        - alert: MatchBackupStatusStale
+          expr: |
+            time() - max(kube_cronjob_status_last_successful_time{namespace="match-control",job_name="match-backup-status"}) > 7200
+          for: 30m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Backup freshness checks have not succeeded for 2 hours"
+            description: "The hourly status job is failing or not running; inspect the Job and object-storage credentials."
+
+        - alert: MatchBackupNeverSucceeded
+          expr: |
+            absent(kube_cronjob_status_last_successful_time{namespace="match-control",job_name=~"match-backup.*"})
+          for: 1h
+          labels:
+            severity: warning
+          annotations:
+            summary: "The backup CronJobs have no recorded successful run"
+            description: "Check the CronJob schedule, the rclone Secret and the signing-key Secret."

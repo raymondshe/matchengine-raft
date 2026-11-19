@@ -244,7 +244,10 @@ Implications:
   `restore --drill` restores and hashes the snapshots; `restore --apply-crds` merges a selective
   CRD subset and `--restore-volumes` creates prefixed PVCs. Apply `deploy/rbac.yaml` for the
   `match-backup` ServiceAccount. The tool never connects to etcd directly, so an etcd snapshot must
-  be produced externally and is preserved/checksummed, not restored, by the CLI.
+  be produced externally and is preserved/checksummed, not restored, by the CLI. The scheduled
+  `deploy/backup.yaml` path uploads the same checksummed bundle and a signed drill to object
+  storage, prunes by retention and runs an hourly freshness check. It does not upload engine PVC
+  data; that remains in the CSI snapshot backend.
 - For a full engine restore, restore all four PVCs of a shard from the same snapshot set (or the
   storage-specific equivalent) and restore the CR catalog separately. A cluster without CSI
   snapshot support can use `backup --crd-only` for the desired-state layer.

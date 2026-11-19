@@ -1524,6 +1524,22 @@ Details:
   hashed through a short-lived pod and the result is recorded in `backup.json`. `backup-verify`
   checks every bundle checksum; `restore --drill` repeats the restore/hash comparison and cleans
   up. Test restores monthly and alert when the last drill is stale.
+- The reference scheduled path (`deploy/backup.yaml`) runs a daily bundle/drill/sign/upload with
+  `rclone`, prunes objects by retention and fails when the newest bundle or signed drill is stale;
+  an hourly status CronJob repeats the check independently. `restore --drill --attest-key/
+  --attest-out` writes HMAC-SHA256 `<bundle-id>.drill.json` + `.drill.sig` records, and
+  `backup-status` verifies the signature, shard/namespace, checksums and age limits.
+  `deploy/backup-alerts.yaml` provides the matching failed/stale alerts. The manifest defaults to
+  `BACKUP_MODE: crd-only` until a CSI snapshot driver is available. Object storage holds the
+  checksummed bundle and signed drill records, not the CSI snapshot data; cross-cluster recovery
+  still relies on the storage backend's snapshot replication until a logical exporter exists.
+- Both Jobs republish the verified result into the `match-backup-status` ConfigMap
+  (`data[<shard>]`), and the manager serves it at `GET /api/v1/backup-status?shard=<name>` for the
+  shard **backup** tab: newest bundle/age/checksum, signed drill kind/age/signer, limits and stale
+  reasons. The shard detail's upgrade gate uses the same record for `lastBackupAt`, so the
+  "backup newer than 24 hours" requirement reflects the last real verified bundle. Offline/demo
+  backends keep the simulated timestamp. Labs without object storage run
+  `scripts/backup-local-lab.sh`, which points `RCLONE_REMOTE` at a shared PVC.
 - Cap snapshot concurrency (one or two processes at a time) so a large cold symbol cannot stall
   the shard. The CLI snapshots a shard as one group or one claim per PVC; a per-process scheduler
   remains an operator follow-up.

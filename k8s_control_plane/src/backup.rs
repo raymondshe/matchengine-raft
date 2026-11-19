@@ -21,9 +21,13 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
-use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Pod};
+use hmac::{Hmac, Mac};
+use k8s_openapi::api::core::v1::{ConfigMap, PersistentVolumeClaim, Pod};
 use kube::Client;
-use kube::api::{Api, ApiResource, DeleteParams, DynamicObject, ListParams, LogParams, PostParams};
+use kube::api::{
+    Api, ApiResource, DeleteParams, DynamicObject, ListParams, LogParams, Patch, PatchParams,
+    PostParams,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -34,10 +38,20 @@ use crate::store::{Catalog, now_epoch};
 use crate::validate::validate_catalog;
 
 pub const BACKUP_FORMAT: &str = "matchengine-backup/v1";
+pub const DRILL_FORMAT: &str = "matchengine-backup-drill/v1";
 pub const MANIFEST_FILE: &str = "backup.json";
 pub const CATALOG_FILE: &str = "catalog.json";
 pub const CHECKSUMS_FILE: &str = "SHA256SUMS";
 pub const ETCD_FILE: &str = "etcd.snapshot.db";
+pub const DRILL_SUFFIX: &str = ".drill.json";
+pub const DRILL_SIGNATURE_SUFFIX: &str = ".drill.sig";
+pub const DEFAULT_MAX_BACKUP_AGE_SECS: u64 = 93_600;
+pub const DEFAULT_MAX_DRILL_AGE_SECS: u64 = 691_200;
+pub const DEFAULT_MAX_STATUS_AGE_SECS: u64 = 7_200;
+pub const MIN_DRILL_KEY_BYTES: usize = 32;
+pub const BACKUP_STATUS_FORMAT: &str = "matchengine-backup-status/v1";
+pub const BACKUP_STATUS_CONFIGMAP: &str = "match-backup-status";
+pub const BACKUP_STATUS_NAMESPACE: &str = "match-control";
 
 const BACKUP_LABEL: &str = "matching.io/backup";
 const SHARD_LABEL: &str = "matching.io/shard";
@@ -478,6 +492,649 @@ pub fn verify_bundle(path: &Path) -> Result<LoadedBundle> {
         .then_some(())
         .context("restored catalog is not valid")?;
     Ok(bundle)
+}
+
+/// A signed record that a bundle passed a restore drill.
+///
+/// The signature is HMAC-SHA256 over the exact `drill.json` bytes, written next to it as
+/// `<bundle-id>.drill.sig`. The signing key is mounted from a Secret and never enters the bundle.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DrillAttestation {
+    pub format: String,
+    pub bundle_id: String,
+    pub namespace: String,
+    pub shard: String,
+    pub bundle_mode: BackupMode,
+    pub bundle_created_at: u64,
+    pub verified_at: u64,
+    pub checksums_sha256: String,
+    pub catalog_sha256: String,
+    pub volumes_requested: usize,
+    pub volumes_verified: usize,
+    pub drill_kind: String,
+    pub result: String,
+    pub signer: String,
+}
+
+impl DrillAttestation {
+    pub fn is_catalog_drill(&self) -> bool {
+        self.drill_kind == "catalog"
+    }
+}
+
+/// Summary of the newest uploaded bundle and signed drill.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FreshnessReport {
+    pub ok: bool,
+    pub bundle_id: String,
+    pub bundle_shard: String,
+    pub bundle_namespace: String,
+    pub bundle_created_at: u64,
+    pub bundle_age_secs: u64,
+    pub bundle_volumes: usize,
+    pub catalog_sha256: String,
+    pub drill_path: String,
+    pub drill_bundle_id: String,
+    pub drill_kind: String,
+    pub drill_verified_at: u64,
+    pub drill_age_secs: u64,
+    pub drill_volumes_verified: usize,
+    pub drill_signer: String,
+}
+
+/// A successful status check published by the backup/status Jobs for the manager.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublishedBackupStatus {
+    pub format: String,
+    pub published_at: u64,
+    pub max_backup_age_secs: u64,
+    pub max_drill_age_secs: u64,
+    pub report: FreshnessReport,
+}
+
+impl PublishedBackupStatus {
+    pub fn new(report: FreshnessReport, max_backup_age_secs: u64, max_drill_age_secs: u64) -> Self {
+        Self {
+            format: BACKUP_STATUS_FORMAT.to_string(),
+            published_at: now_epoch(),
+            max_backup_age_secs,
+            max_drill_age_secs,
+            report,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackupBundleView {
+    pub id: String,
+    pub shard: String,
+    pub namespace: String,
+    pub created_at: u64,
+    pub age_secs: u64,
+    pub volumes: usize,
+    pub catalog_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackupDrillView {
+    pub bundle_id: String,
+    pub kind: String,
+    pub verified_at: u64,
+    pub age_secs: u64,
+    pub volumes_verified: usize,
+    pub signer: String,
+    pub path: String,
+}
+
+/// Manager-facing view with ages recomputed against the current clock.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackupStatusView {
+    pub shard: String,
+    pub configured: bool,
+    pub status: String,
+    pub ok: bool,
+    pub message: String,
+    pub published_at: Option<u64>,
+    pub checked_age_secs: Option<u64>,
+    pub max_backup_age_secs: Option<u64>,
+    pub max_drill_age_secs: Option<u64>,
+    pub reasons: Vec<String>,
+    pub bundle: Option<BackupBundleView>,
+    pub drill: Option<BackupDrillView>,
+    pub source: String,
+}
+
+/// Build the manager-facing backup view from the last published record.
+pub fn view_backup_status(
+    shard: &str,
+    record: Option<&PublishedBackupStatus>,
+    now: u64,
+) -> BackupStatusView {
+    let source = format!("{BACKUP_STATUS_NAMESPACE}/{BACKUP_STATUS_CONFIGMAP}#{shard}");
+    let Some(record) = record else {
+        return BackupStatusView {
+            shard: shard.to_string(),
+            configured: false,
+            status: "not-configured".to_string(),
+            ok: false,
+            message: "No backup status has been published. Apply deploy/backup.yaml and run the match-backup Job."
+                .to_string(),
+            published_at: None,
+            checked_age_secs: None,
+            max_backup_age_secs: None,
+            max_drill_age_secs: None,
+            reasons: Vec::new(),
+            bundle: None,
+            drill: None,
+            source,
+        };
+    };
+    let report = &record.report;
+    let bundle_age_secs = now.saturating_sub(report.bundle_created_at);
+    let drill_age_secs = now.saturating_sub(report.drill_verified_at);
+    let checked_age_secs = now.saturating_sub(record.published_at);
+    let mut reasons = Vec::new();
+    if bundle_age_secs > record.max_backup_age_secs {
+        reasons.push(format!(
+            "newest bundle is {} old; limit is {}",
+            human_age(bundle_age_secs),
+            human_age(record.max_backup_age_secs)
+        ));
+    }
+    if drill_age_secs > record.max_drill_age_secs {
+        reasons.push(format!(
+            "newest signed drill is {} old; limit is {}",
+            human_age(drill_age_secs),
+            human_age(record.max_drill_age_secs)
+        ));
+    }
+    if checked_age_secs > DEFAULT_MAX_STATUS_AGE_SECS {
+        reasons.push(format!(
+            "status has not been refreshed for {}; expected at least hourly",
+            human_age(checked_age_secs)
+        ));
+    }
+    if report.bundle_shard != shard {
+        reasons.push(format!(
+            "published bundle is for shard {}, not {shard}",
+            report.bundle_shard
+        ));
+    }
+    let ok = reasons.is_empty();
+    BackupStatusView {
+        shard: shard.to_string(),
+        configured: true,
+        status: if ok { "ok" } else { "stale" }.to_string(),
+        ok,
+        message: if ok {
+            "The newest verified bundle and signed restore drill are within their limits."
+                .to_string()
+        } else {
+            "The backup or restore drill needs attention.".to_string()
+        },
+        published_at: Some(record.published_at),
+        checked_age_secs: Some(checked_age_secs),
+        max_backup_age_secs: Some(record.max_backup_age_secs),
+        max_drill_age_secs: Some(record.max_drill_age_secs),
+        reasons,
+        bundle: Some(BackupBundleView {
+            id: report.bundle_id.clone(),
+            shard: report.bundle_shard.clone(),
+            namespace: report.bundle_namespace.clone(),
+            created_at: report.bundle_created_at,
+            age_secs: bundle_age_secs,
+            volumes: report.bundle_volumes,
+            catalog_sha256: report.catalog_sha256.clone(),
+        }),
+        drill: Some(BackupDrillView {
+            bundle_id: report.drill_bundle_id.clone(),
+            kind: report.drill_kind.clone(),
+            verified_at: report.drill_verified_at,
+            age_secs: drill_age_secs,
+            volumes_verified: report.drill_volumes_verified,
+            signer: report.drill_signer.clone(),
+            path: report.drill_path.clone(),
+        }),
+        source,
+    }
+}
+
+fn human_age(seconds: u64) -> String {
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 3_600 {
+        format!("{}m", seconds / 60)
+    } else if seconds < 86_400 {
+        format!("{}h", seconds / 3_600)
+    } else {
+        format!("{}d", seconds / 86_400)
+    }
+}
+
+pub fn hmac_sha256_hex(key: &[u8], data: &[u8]) -> String {
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts keys of any length");
+    mac.update(data);
+    mac.finalize()
+        .into_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+pub fn verify_hmac_sha256_hex(key: &[u8], data: &[u8], signature: &str) -> Result<()> {
+    let signature = signature.trim();
+    let bytes = decode_hex(signature).context("drill signature is not valid hex")?;
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts keys of any length");
+    mac.update(data);
+    mac.verify_slice(&bytes)
+        .context("drill signature does not match")
+}
+
+fn decode_hex(value: &str) -> Option<Vec<u8>> {
+    if !value.len().is_multiple_of(2) {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(value.len() / 2);
+    for pair in value.as_bytes().chunks(2) {
+        let high = (pair[0] as char).to_digit(16)?;
+        let low = (pair[1] as char).to_digit(16)?;
+        bytes.push((high * 16 + low) as u8);
+    }
+    Some(bytes)
+}
+
+fn safe_file_component(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.')
+        && value != "."
+        && value != ".."
+}
+
+fn drill_paths(out_dir: &Path, bundle_id: &str) -> Result<(PathBuf, PathBuf)> {
+    if !safe_file_component(bundle_id) {
+        bail!("backup id {bundle_id:?} is not safe for a drill file name");
+    }
+    Ok((
+        out_dir.join(format!("{bundle_id}{DRILL_SUFFIX}")),
+        out_dir.join(format!("{bundle_id}{DRILL_SIGNATURE_SUFFIX}")),
+    ))
+}
+
+/// Write a signed drill record for a verified bundle.
+///
+/// `volumes_verified` must equal the bundle's volume count for a volume drill; catalog-only
+/// bundles use zero.
+pub fn write_drill_attestation(
+    bundle: &LoadedBundle,
+    key: &[u8],
+    signer: &str,
+    volumes_verified: usize,
+    out_dir: &Path,
+) -> Result<PathBuf> {
+    if key.len() < MIN_DRILL_KEY_BYTES {
+        bail!("drill signing key must be at least {MIN_DRILL_KEY_BYTES} bytes");
+    }
+    if signer.trim().is_empty() {
+        bail!("drill signer is empty");
+    }
+    let requested = bundle.manifest.volumes.len();
+    if requested > 0 && volumes_verified != requested {
+        bail!("volume drill verified {volumes_verified} of {requested} volumes; refusing to sign");
+    }
+    if requested > 0
+        && bundle
+            .manifest
+            .volumes
+            .iter()
+            .any(|volume| volume.verified_at.is_none() && volume.file_sha256.is_empty())
+    {
+        bail!("refusing to sign a volume drill without recorded checksums or verification");
+    }
+    if requested == 0 && volumes_verified != 0 {
+        bail!("catalog-only drill cannot verify volumes");
+    }
+    let checksums_path = bundle.root.join(CHECKSUMS_FILE);
+    let checksums_sha256 = sha256_file(&checksums_path)?;
+    let attestation = DrillAttestation {
+        format: DRILL_FORMAT.to_string(),
+        bundle_id: bundle.manifest.id.clone(),
+        namespace: bundle.manifest.namespace.clone(),
+        shard: bundle.manifest.shard.clone(),
+        bundle_mode: bundle.manifest.mode,
+        bundle_created_at: bundle.manifest.created_at,
+        verified_at: now_epoch(),
+        checksums_sha256,
+        catalog_sha256: bundle.manifest.catalog.sha256.clone(),
+        volumes_requested: requested,
+        volumes_verified,
+        drill_kind: if requested == 0 {
+            "catalog".to_string()
+        } else {
+            "volume".to_string()
+        },
+        result: "passed".to_string(),
+        signer: signer.to_string(),
+    };
+    let bytes = format!("{}\n", serde_json::to_string_pretty(&attestation)?).into_bytes();
+    let signature = hmac_sha256_hex(key, &bytes);
+    fs::create_dir_all(out_dir)
+        .with_context(|| format!("create drill directory {}", out_dir.display()))?;
+    let (json_path, signature_path) = drill_paths(out_dir, &bundle.manifest.id)?;
+    fs::write(&json_path, &bytes).with_context(|| format!("write {}", json_path.display()))?;
+    fs::write(&signature_path, format!("{signature}\n"))
+        .with_context(|| format!("write {}", signature_path.display()))?;
+    Ok(json_path)
+}
+
+/// Verify a signed drill record and return it.
+pub fn verify_drill_attestation(path: &Path, key: &[u8]) -> Result<DrillAttestation> {
+    if key.len() < MIN_DRILL_KEY_BYTES {
+        bail!("drill signing key must be at least {MIN_DRILL_KEY_BYTES} bytes");
+    }
+    let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("drill file has no UTF-8 name")?;
+    let stem = file_name
+        .strip_suffix(DRILL_SUFFIX)
+        .context("drill file must end in .drill.json")?;
+    let signature_path = path.with_file_name(format!("{stem}{DRILL_SIGNATURE_SUFFIX}"));
+    let signature = fs::read_to_string(&signature_path)
+        .with_context(|| format!("read {}", signature_path.display()))?;
+    verify_hmac_sha256_hex(key, &bytes, &signature)?;
+    let attestation: DrillAttestation =
+        serde_json::from_slice(&bytes).context("parse signed drill record")?;
+    if attestation.format != DRILL_FORMAT {
+        bail!(
+            "unsupported drill format {} (expected {DRILL_FORMAT})",
+            attestation.format
+        );
+    }
+    if attestation.result != "passed" {
+        bail!("drill result is {:?}, not passed", attestation.result);
+    }
+    if !safe_file_component(&attestation.bundle_id) {
+        bail!("drill has an unsafe bundle id");
+    }
+    if attestation.checksums_sha256.len() != 64
+        || !attestation
+            .checksums_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+        || attestation.catalog_sha256.len() != 64
+        || !attestation
+            .catalog_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        bail!("drill checksums are malformed");
+    }
+    match attestation.drill_kind.as_str() {
+        "catalog" if attestation.volumes_requested == 0 && attestation.volumes_verified == 0 => {}
+        "volume"
+            if attestation.volumes_requested > 0
+                && attestation.volumes_verified == attestation.volumes_requested => {}
+        "catalog" => bail!("catalog drill references a volume bundle"),
+        "volume" => bail!("volume drill did not verify every volume"),
+        other => bail!("unknown drill kind {other:?}"),
+    }
+    Ok(attestation)
+}
+
+fn find_files(
+    root: &Path,
+    name: Option<&str>,
+    suffix: Option<&str>,
+    depth: usize,
+    out: &mut Vec<PathBuf>,
+) -> Result<()> {
+    if depth == 0 {
+        return Ok(());
+    }
+    let entries =
+        fs::read_dir(root).with_context(|| format!("read directory {}", root.display()))?;
+    for entry in entries {
+        let entry = entry?;
+        let file_name = entry.file_name();
+        let file_name = file_name.to_string_lossy();
+        if file_name.starts_with('.') {
+            continue;
+        }
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            find_files(&entry.path(), name, suffix, depth - 1, out)?;
+        } else if file_type.is_file()
+            && (name.is_some_and(|want| file_name == want)
+                || suffix.is_some_and(|want| file_name.ends_with(want)))
+        {
+            out.push(entry.path());
+        }
+    }
+    Ok(())
+}
+
+/// Find the newest bundle by its manifest timestamp and verify it.
+pub fn newest_bundle(root: &Path) -> Result<LoadedBundle> {
+    let mut files = Vec::new();
+    find_files(root, Some(MANIFEST_FILE), None, 4, &mut files)?;
+    if files.is_empty() {
+        bail!("no backup bundles under {}", root.display());
+    }
+    let mut newest: Option<(u64, PathBuf)> = None;
+    for path in files {
+        let bytes = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
+        let manifest: BackupManifest =
+            serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))?;
+        if newest
+            .as_ref()
+            .is_none_or(|(created, _)| manifest.created_at > *created)
+        {
+            newest = Some((manifest.created_at, path));
+        }
+    }
+    let (_, path) = newest.context("no readable backup manifest")?;
+    verify_bundle(&path)
+}
+
+/// Find the newest signed drill and verify its signature.
+pub fn newest_drill(root: &Path, key: &[u8]) -> Result<(PathBuf, DrillAttestation)> {
+    let mut files = Vec::new();
+    find_files(root, None, Some(DRILL_SUFFIX), 4, &mut files)?;
+    if files.is_empty() {
+        bail!("no signed drills under {}", root.display());
+    }
+    let mut newest: Option<(u64, PathBuf)> = None;
+    for path in files {
+        let bytes = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
+        let attestation: DrillAttestation =
+            serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))?;
+        if newest
+            .as_ref()
+            .is_none_or(|(verified, _)| attestation.verified_at > *verified)
+        {
+            newest = Some((attestation.verified_at, path));
+        }
+    }
+    let (_, path) = newest.context("no readable signed drill")?;
+    let attestation = verify_drill_attestation(&path, key)?;
+    Ok((path, attestation))
+}
+
+/// Check the newest bundle and newest signed drill against the configured age limits.
+pub fn check_backup_freshness(
+    bundle_dir: &Path,
+    drill_dir: &Path,
+    key: &[u8],
+    max_backup_age_secs: u64,
+    max_drill_age_secs: u64,
+) -> Result<FreshnessReport> {
+    let bundle = newest_bundle(bundle_dir)?;
+    let now = now_epoch();
+    let bundle_age_secs = now.saturating_sub(bundle.manifest.created_at);
+    if bundle_age_secs > max_backup_age_secs {
+        bail!(
+            "newest backup {} is stale: age {}s exceeds {}s",
+            bundle.manifest.id,
+            bundle_age_secs,
+            max_backup_age_secs
+        );
+    }
+    let (drill_path, drill) = newest_drill(drill_dir, key)?;
+    if drill.shard != bundle.manifest.shard {
+        bail!(
+            "newest signed drill is for shard {:?}, not {:?}",
+            drill.shard,
+            bundle.manifest.shard
+        );
+    }
+    if drill.namespace != bundle.manifest.namespace {
+        bail!(
+            "newest signed drill is for namespace {:?}, not {:?}",
+            drill.namespace,
+            bundle.manifest.namespace
+        );
+    }
+    let drill_age_secs = now.saturating_sub(drill.verified_at);
+    if drill_age_secs > max_drill_age_secs {
+        bail!(
+            "newest signed drill is stale: age {}s exceeds {}s",
+            drill_age_secs,
+            max_drill_age_secs
+        );
+    }
+    if drill.bundle_id == bundle.manifest.id {
+        let checksums = sha256_file(&bundle.root.join(CHECKSUMS_FILE))?;
+        if drill.checksums_sha256 != checksums {
+            bail!(
+                "signed drill for {} does not match the bundle checksums",
+                bundle.manifest.id
+            );
+        }
+    }
+    Ok(FreshnessReport {
+        ok: true,
+        bundle_id: bundle.manifest.id.clone(),
+        bundle_shard: bundle.manifest.shard.clone(),
+        bundle_namespace: bundle.manifest.namespace.clone(),
+        bundle_created_at: bundle.manifest.created_at,
+        bundle_age_secs,
+        bundle_volumes: bundle.manifest.volumes.len(),
+        catalog_sha256: bundle.manifest.catalog.sha256.clone(),
+        drill_path: drill_path.display().to_string(),
+        drill_bundle_id: drill.bundle_id,
+        drill_kind: drill.drill_kind,
+        drill_verified_at: drill.verified_at,
+        drill_age_secs,
+        drill_volumes_verified: drill.volumes_verified,
+        drill_signer: drill.signer,
+    })
+}
+
+/// Publish the manager-visible status into a ConfigMap.
+///
+/// The ConfigMap is shared by shards: `data[<shard>]` is the JSON status. A merge patch preserves
+/// keys written by other shards.
+pub async fn publish_backup_status(
+    client: &Client,
+    configmap: &str,
+    namespace: &str,
+    status: &PublishedBackupStatus,
+) -> Result<()> {
+    let shard = status.report.bundle_shard.clone();
+    if !safe_file_component(&shard) {
+        bail!("published backup status has an unsafe shard name");
+    }
+    let text = serde_json::to_string_pretty(status)?;
+    let mut data = BTreeMap::new();
+    data.insert(shard, text);
+    let labels = json!({
+        "app.kubernetes.io/name": "match-backup",
+        "matching.io/role": "backup-status",
+    });
+    let annotations = json!({
+        "matching.io/backup-status-format": BACKUP_STATUS_FORMAT,
+    });
+    let patch = json!({
+        "metadata": {
+            "name": configmap,
+            "namespace": namespace,
+            "labels": labels,
+            "annotations": annotations,
+        },
+        "data": data,
+    });
+    let api: Api<ConfigMap> = Api::namespaced(client.clone(), namespace);
+    if api
+        .get_opt(configmap)
+        .await
+        .with_context(|| format!("read ConfigMap {namespace}/{configmap}"))?
+        .is_some()
+    {
+        api.patch(configmap, &PatchParams::default(), &Patch::Merge(&patch))
+            .await
+            .with_context(|| format!("patch ConfigMap {namespace}/{configmap}"))?;
+        return Ok(());
+    }
+    let object: ConfigMap = serde_json::from_value(json!({
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": {
+            "name": configmap,
+            "namespace": namespace,
+            "labels": labels,
+            "annotations": annotations,
+        },
+        "data": data,
+    }))?;
+    match api.create(&PostParams::default(), &object).await {
+        Ok(_) => Ok(()),
+        Err(kube::Error::Api(error)) if error.code == 409 => {
+            api.patch(configmap, &PatchParams::default(), &Patch::Merge(&patch))
+                .await
+                .with_context(|| format!("patch ConfigMap {namespace}/{configmap}"))?;
+            Ok(())
+        }
+        Err(error) => {
+            Err(error).with_context(|| format!("create ConfigMap {namespace}/{configmap}"))
+        }
+    }
+}
+
+/// Read the status published for one shard from the manager-readable ConfigMap.
+pub async fn read_backup_status(
+    client: &Client,
+    namespace: &str,
+    shard: &str,
+) -> Result<Option<PublishedBackupStatus>> {
+    let api: Api<ConfigMap> = Api::namespaced(client.clone(), namespace);
+    let Some(configmap) = api
+        .get_opt(BACKUP_STATUS_CONFIGMAP)
+        .await
+        .with_context(|| format!("read ConfigMap {namespace}/{BACKUP_STATUS_CONFIGMAP}"))?
+    else {
+        return Ok(None);
+    };
+    let Some(text) = configmap.data.and_then(|data| data.get(shard).cloned()) else {
+        return Ok(None);
+    };
+    let status: PublishedBackupStatus =
+        serde_json::from_str(&text).context("parse published backup status")?;
+    if status.format != BACKUP_STATUS_FORMAT {
+        bail!(
+            "unsupported backup status format {} (expected {BACKUP_STATUS_FORMAT})",
+            status.format
+        );
+    }
+    Ok(Some(status))
 }
 
 fn parse_checksums(text: &str) -> Result<Vec<ChecksumEntry>> {
@@ -1669,5 +2326,210 @@ mod tests {
             files.get("log/state").map(String::as_str),
             Some("abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789")
         );
+    }
+
+    fn fixture(dir: &Path, created_at: u64) -> LoadedBundle {
+        let catalog = demo_catalog();
+        let shard = catalog.shards.values().next().unwrap().clone();
+        let mut manifest = BackupManifest::new(
+            "drill-test".to_string(),
+            "match-eu-1",
+            &shard,
+            BackupMode::VolumeGroup,
+            &catalog,
+            "vg-class",
+            "snap-class",
+        );
+        manifest.created_at = created_at;
+        write_bundle(dir, &catalog, manifest, None, false).unwrap();
+        read_bundle(dir).unwrap()
+    }
+
+    #[test]
+    fn hmac_sha256_known_vector() {
+        assert_eq!(
+            hmac_sha256_hex(b"Jefe", b"what do ya want for nothing?"),
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
+    }
+
+    const DRILL_KEY: &[u8] = b"0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn refuses_to_sign_an_unverified_volume_drill() {
+        let dir = temp_dir("backup-drill-unverified");
+        let catalog = demo_catalog();
+        let shard = catalog.shards.values().next().unwrap().clone();
+        let mut manifest = BackupManifest::new(
+            "drill-unverified".to_string(),
+            "match-eu-1",
+            &shard,
+            BackupMode::Volume,
+            &catalog,
+            "",
+            "snap-class",
+        );
+        manifest.volumes.push(VolumeBackup {
+            pvc: "data-fx-eu-01-0".to_string(),
+            snapshot: "snap-0".to_string(),
+            ready: true,
+            restore_size: "1Gi".to_string(),
+            requested_size: "1Gi".to_string(),
+            storage_class: "fast".to_string(),
+            access_modes: vec!["ReadWriteOnce".to_string()],
+            file_sha256: BTreeMap::new(),
+            verified_at: None,
+        });
+        write_bundle(&dir, &catalog, manifest, None, false).unwrap();
+        let bundle = read_bundle(&dir).unwrap();
+        let error = write_drill_attestation(&bundle, DRILL_KEY, "test", 1, &dir.join("drills"))
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("without recorded checksums or verification"),
+            "{error}"
+        );
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn published_status_view_flags_stale_and_missing_records() {
+        let missing = view_backup_status("fx-eu-01", None, 1_000);
+        assert!(!missing.configured);
+        assert_eq!(missing.status, "not-configured");
+        assert!(missing.bundle.is_none());
+
+        let report = FreshnessReport {
+            ok: true,
+            bundle_id: "fx-eu-01-1".to_string(),
+            bundle_shard: "fx-eu-01".to_string(),
+            bundle_namespace: "match-eu-1".to_string(),
+            bundle_created_at: 900,
+            bundle_age_secs: 0,
+            bundle_volumes: 0,
+            catalog_sha256: "a".repeat(64),
+            drill_path: "/drills/fx-eu-01-1.drill.json".to_string(),
+            drill_bundle_id: "fx-eu-01-1".to_string(),
+            drill_kind: "catalog".to_string(),
+            drill_verified_at: 950,
+            drill_age_secs: 0,
+            drill_volumes_verified: 0,
+            drill_signer: "cronjob".to_string(),
+        };
+        let fresh = view_backup_status(
+            "fx-eu-01",
+            Some(&PublishedBackupStatus::new(report.clone(), 3_600, 3_600)),
+            1_000,
+        );
+        assert!(fresh.ok);
+        assert_eq!(fresh.status, "ok");
+        assert_eq!(
+            fresh.bundle.as_ref().map(|b| b.id.as_str()),
+            Some("fx-eu-01-1")
+        );
+
+        // Both ages exceed the limits and the status itself is old.
+        let stale = view_backup_status(
+            "fx-eu-01",
+            Some(&PublishedBackupStatus {
+                format: BACKUP_STATUS_FORMAT.to_string(),
+                published_at: 0,
+                max_backup_age_secs: 10,
+                max_drill_age_secs: 10,
+                report: report.clone(),
+            }),
+            100_000,
+        );
+        assert!(!stale.ok);
+        assert_eq!(stale.status, "stale");
+        assert!(stale.reasons.iter().any(|r| r.contains("bundle is")));
+        assert!(stale.reasons.iter().any(|r| r.contains("drill is")));
+        assert!(
+            stale
+                .reasons
+                .iter()
+                .any(|r| r.contains("has not been refreshed"))
+        );
+
+        // A record published for a different shard is reported, not silently accepted.
+        let other = view_backup_status(
+            "fx-eu-02",
+            Some(&PublishedBackupStatus::new(report, 3_600, 3_600)),
+            1_000,
+        );
+        assert!(!other.ok);
+        assert!(other.reasons.iter().any(|r| r.contains("fx-eu-01")));
+    }
+
+    #[test]
+    fn rejects_a_short_drill_key() {
+        let dir = temp_dir("backup-drill-short-key");
+        let bundle = fixture(&dir, now_epoch());
+        let drills = dir.join("drills");
+        assert!(
+            write_drill_attestation(&bundle, b"short", "test", 0, &drills).is_err(),
+            "a short HMAC key must be rejected"
+        );
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn signed_drill_round_trips_and_detects_tampering() {
+        let dir = temp_dir("backup-drill-sign");
+        let bundle = fixture(&dir, now_epoch());
+        let drills = dir.join("drills");
+        let path = write_drill_attestation(&bundle, DRILL_KEY, "test", 0, &drills).unwrap();
+        let attestation = verify_drill_attestation(&path, DRILL_KEY).unwrap();
+        assert_eq!(attestation.bundle_id, bundle.manifest.id);
+        assert_eq!(attestation.drill_kind, "catalog");
+        assert_eq!(attestation.result, "passed");
+        assert!(verify_drill_attestation(&path, b"fedcba9876543210fedcba9876543210").is_err());
+
+        let mut bytes = fs::read(&path).unwrap();
+        bytes.push(b' ');
+        fs::write(&path, bytes).unwrap();
+        assert!(verify_drill_attestation(&path, DRILL_KEY).is_err());
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn freshness_rejects_a_stale_bundle_or_drill() {
+        let dir = temp_dir("backup-freshness");
+        let fresh = fixture(&dir.join("fresh"), now_epoch());
+        let drills = dir.join("drills");
+        write_drill_attestation(&fresh, DRILL_KEY, "test", 0, &drills).unwrap();
+        let report =
+            check_backup_freshness(&dir.join("fresh"), &drills, DRILL_KEY, 3_600, 3_600).unwrap();
+        assert!(report.ok);
+        assert_eq!(report.bundle_id, fresh.manifest.id);
+
+        let stale_dir = dir.join("stale-bundle");
+        let stale = fixture(&stale_dir, 0);
+        let stale_drills = dir.join("stale-drills");
+        write_drill_attestation(&stale, DRILL_KEY, "test", 0, &stale_drills).unwrap();
+        assert!(
+            check_backup_freshness(&stale_dir, &stale_drills, DRILL_KEY, 1, 3_600).is_err(),
+            "a zero-timestamp bundle must be stale"
+        );
+
+        // Re-sign a drill with an old timestamp so only the drill age check can fail.
+        let (json_path, signature_path) = drill_paths(&drills, &fresh.manifest.id).unwrap();
+        let mut attestation: DrillAttestation =
+            serde_json::from_slice(&fs::read(&json_path).unwrap()).unwrap();
+        attestation.verified_at = 0;
+        let bytes =
+            format!("{}\n", serde_json::to_string_pretty(&attestation).unwrap()).into_bytes();
+        fs::write(&json_path, &bytes).unwrap();
+        fs::write(
+            &signature_path,
+            format!("{}\n", hmac_sha256_hex(DRILL_KEY, &bytes)),
+        )
+        .unwrap();
+        assert!(
+            check_backup_freshness(&dir.join("fresh"), &drills, DRILL_KEY, 3_600, 1).is_err(),
+            "an old signed drill must be stale"
+        );
+        fs::remove_dir_all(dir).ok();
     }
 }

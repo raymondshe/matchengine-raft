@@ -1,7 +1,8 @@
 # Non-root manager image for the OrbStack Kubernetes test tier.
 #
 # The manager serves the API and embedded GUI on 8099. It keeps its JSON
-# catalog in /data; mount an emptyDir or PVC there.
+# catalog in /data; mount an emptyDir or PVC there. The runtime includes
+# rclone for the scheduled backup CronJobs in deploy/backup.yaml.
 
 # syntax=docker/dockerfile:1
 
@@ -31,6 +32,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
         curl \
+        rclone \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 10001 controlplane \
     && useradd --uid 10001 --gid 10001 --no-create-home \

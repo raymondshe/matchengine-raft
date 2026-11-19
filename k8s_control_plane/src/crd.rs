@@ -952,6 +952,19 @@ impl CatalogStore for CrdCatalogStore {
     ) -> Result<Vec<crate::images::ImageChoice>, ApiError> {
         crate::images::cluster_images(&self.client, repositories).await
     }
+
+    async fn backup_status(
+        &self,
+        shard: &str,
+    ) -> Result<Option<crate::backup::PublishedBackupStatus>, ApiError> {
+        crate::backup::read_backup_status(
+            &self.client,
+            crate::backup::BACKUP_STATUS_NAMESPACE,
+            shard,
+        )
+        .await
+        .map_err(|error| ApiError::internal(format!("read backup status: {error:#}")))
+    }
 }
 
 fn apply_watch_object(

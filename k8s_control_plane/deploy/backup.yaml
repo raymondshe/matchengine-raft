@@ -1,0 +1,403 @@
+# Scheduled shard backups, signed restore drills and object-storage retention.
+#
+# Apply deploy/rbac.yaml first (ServiceAccount `match-backup`). Create the two Secrets
+# referenced below before enabling the schedule:
+#
+#   kubectl -n match-control create secret generic match-backup-rclone \
+#     --from-file=rclone.conf=/path/to/rclone.conf
+#   openssl rand -out /tmp/match-backup.key 32
+#   kubectl -n match-control create secret generic match-backup-signing-key \
+#     --from-file=signing.key=/tmp/match-backup.key
+#
+# Edit match-backup-config for the shard, namespace, object-storage remote and retention
+# window. `BACKUP_MODE: crd-only` works without CSI snapshots; switch to `volume` or
+# `volume-group` plus a snapshot class when the cluster has a CSI snapshot driver.
+#
+# The daily job creates a bundle, verifies it, runs a restore drill, signs the drill record,
+# uploads the bundle and drill, prunes old objects, and fails if the newest bundle or drill is
+# stale. The hourly status job downloads the newest objects and performs the same freshness
+# check independently, so a suspended or broken backup schedule surfaces as a failed Job.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: match-backup-config
+  namespace: match-control
+  labels:
+    app.kubernetes.io/name: match-backup
+data:
+  BACKUP_SHARD: fx-eu-01
+  BACKUP_NAMESPACE: match-eu-1
+  BACKUP_MODE: crd-only
+  # s3:<bucket>/<prefix>; the scripts append /<shard> so several shards can share a bucket.
+  RCLONE_REMOTE: s3:matchengine-backups
+  BACKUP_RETENTION: 720h
+  MAX_BACKUP_AGE_SECS: "93600"
+  MAX_DRILL_AGE_SECS: "691200"
+  BACKUP_TIMEOUT_SECS: "900"
+  BACKUP_VERIFY_IMAGE: busybox:1.36
+  BACKUP_SIGNER: cronjob
+  BACKUP_VOLUME_GROUP_SNAPSHOT_CLASS: ""
+  BACKUP_VOLUME_SNAPSHOT_CLASS: ""
+  # Optional externally produced etcd snapshot. Mount the file into both Jobs before setting this.
+  ETCD_SNAPSHOT_FILE: ""
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: match-backup-scripts
+  namespace: match-control
+  labels:
+    app.kubernetes.io/name: match-backup
+data:
+  backup.sh: |
+    #!/bin/sh
+    set -eu
+
+    log() { printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
+    fail() { log "ERROR: $*" >&2; exit 1; }
+
+    : "${BACKUP_SHARD:?set BACKUP_SHARD}"
+    : "${BACKUP_NAMESPACE:?set BACKUP_NAMESPACE}"
+    : "${RCLONE_REMOTE:?set RCLONE_REMOTE, for example s3:my-bucket/matchengine}"
+    : "${WORK_DIR:=/work}"
+    : "${BACKUP_MODE:=crd-only}"
+    : "${BACKUP_RETENTION:=720h}"
+    : "${BACKUP_TIMEOUT_SECS:=900}"
+    : "${BACKUP_VERIFY_IMAGE:=busybox:1.36}"
+    : "${BACKUP_SIGNER:=cronjob}"
+    : "${MAX_BACKUP_AGE_SECS:=93600}"
+    : "${MAX_DRILL_AGE_SECS:=691200}"
+    : "${BACKUP_SIGNING_KEY:=/etc/backup/signing.key}"
+    : "${RCLONE_CONFIG:=/etc/rclone/rclone.conf}"
+    : "${K8S_CONTROL_PLANE_BIN:=/usr/local/bin/k8s-control-plane}"
+    : "${RCLONE_BIN:=rclone}"
+
+    export HOME="$WORK_DIR"
+    export TMPDIR="$WORK_DIR/tmp"
+    export RCLONE_CONFIG
+    export RCLONE_CACHE_DIR="$WORK_DIR/rclone-cache"
+
+    kc() { "$K8S_CONTROL_PLANE_BIN" "$@"; }
+    rc() { "$RCLONE_BIN" "$@"; }
+
+    BUNDLE_DIR="$WORK_DIR/bundles"
+    DRILL_DIR="$WORK_DIR/drills"
+    REMOTE_ROOT="${RCLONE_REMOTE%/}/$BACKUP_SHARD"
+    ID="${BACKUP_SHARD}-$(date -u +%s)"
+    OUT="$BUNDLE_DIR/$ID"
+
+    mkdir -p "$BUNDLE_DIR" "$DRILL_DIR" "$TMPDIR" "$RCLONE_CACHE_DIR"
+    [ -f "$BACKUP_SIGNING_KEY" ] || fail "signing key $BACKUP_SIGNING_KEY is missing"
+    [ -f "$RCLONE_CONFIG" ] || fail "rclone config $RCLONE_CONFIG is missing"
+    [ -x "$K8S_CONTROL_PLANE_BIN" ] || fail "$K8S_CONTROL_PLANE_BIN is not executable"
+    command -v "$RCLONE_BIN" >/dev/null 2>&1 || fail "rclone is not installed (RCLONE_BIN=$RCLONE_BIN)"
+
+    set -- backup "$BACKUP_SHARD" \
+      --namespace "$BACKUP_NAMESPACE" \
+      --id "$ID" \
+      --out "$OUT" \
+      --timeout-secs "$BACKUP_TIMEOUT_SECS" \
+      --verify-image "$BACKUP_VERIFY_IMAGE"
+    case "$BACKUP_MODE" in
+      crd-only) set -- "$@" --crd-only ;;
+      volume) set -- "$@" --mode volume ;;
+      volume-group) set -- "$@" --mode volume-group ;;
+      *) fail "unknown BACKUP_MODE: $BACKUP_MODE" ;;
+    esac
+    if [ -n "${BACKUP_VOLUME_GROUP_SNAPSHOT_CLASS:-}" ]; then
+      set -- "$@" --volume-group-snapshot-class "$BACKUP_VOLUME_GROUP_SNAPSHOT_CLASS"
+    fi
+    if [ -n "${BACKUP_VOLUME_SNAPSHOT_CLASS:-}" ]; then
+      set -- "$@" --volume-snapshot-class "$BACKUP_VOLUME_SNAPSHOT_CLASS"
+    fi
+    if [ -n "${ETCD_SNAPSHOT_FILE:-}" ]; then
+      [ -f "$ETCD_SNAPSHOT_FILE" ] || fail "ETCD_SNAPSHOT_FILE=$ETCD_SNAPSHOT_FILE is missing"
+      set -- "$@" --etcd-snapshot "$ETCD_SNAPSHOT_FILE"
+    fi
+
+    log "creating $BACKUP_MODE backup $ID"
+    kc "$@"
+    kc backup-verify --input "$OUT"
+
+    log "running restore drill and signing the result"
+    kc restore --input "$OUT" --drill \
+      --attest-key "$BACKUP_SIGNING_KEY" \
+      --attest-out "$DRILL_DIR" \
+      --attest-signer "$BACKUP_SIGNER" \
+      --verify-image "$BACKUP_VERIFY_IMAGE" \
+      --timeout-secs "$BACKUP_TIMEOUT_SECS"
+
+    log "uploading bundle and signed drill to $REMOTE_ROOT"
+    rc copy "$OUT" "$REMOTE_ROOT/bundles/$ID" \
+      --config "$RCLONE_CONFIG" --retries 3 --low-level-retries 10
+    rc check "$OUT" "$REMOTE_ROOT/bundles/$ID" \
+      --config "$RCLONE_CONFIG" --one-way
+    rc copyto "$DRILL_DIR/$ID.drill.json" "$REMOTE_ROOT/drills/$ID.drill.json" \
+      --config "$RCLONE_CONFIG" --retries 3 --low-level-retries 10
+    rc copyto "$DRILL_DIR/$ID.drill.sig" "$REMOTE_ROOT/drills/$ID.drill.sig" \
+      --config "$RCLONE_CONFIG" --retries 3 --low-level-retries 10
+
+    if [ "$BACKUP_RETENTION" != "0" ]; then
+      log "pruning object storage older than $BACKUP_RETENTION"
+      rc delete --min-age "$BACKUP_RETENTION" "$REMOTE_ROOT/bundles" --config "$RCLONE_CONFIG"
+      rc delete --min-age "$BACKUP_RETENTION" "$REMOTE_ROOT/drills" --config "$RCLONE_CONFIG"
+      rc rmdirs --leave-root "$REMOTE_ROOT/bundles" --config "$RCLONE_CONFIG" || true
+      rc rmdirs --leave-root "$REMOTE_ROOT/drills" --config "$RCLONE_CONFIG" || true
+    fi
+
+    log "checking bundle and drill freshness"
+    kc backup-status \
+      --bundle-dir "$BUNDLE_DIR" \
+      --drill-dir "$DRILL_DIR" \
+      --key "$BACKUP_SIGNING_KEY" \
+      --max-backup-age-secs "$MAX_BACKUP_AGE_SECS" \
+      --max-drill-age-secs "$MAX_DRILL_AGE_SECS" \
+      --publish-configmap match-backup-status \
+      --configmap-namespace match-control
+    log "backup complete"
+
+  status.sh: |
+    #!/bin/sh
+    set -eu
+
+    log() { printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
+    fail() { log "ERROR: $*" >&2; exit 1; }
+
+    : "${BACKUP_SHARD:?set BACKUP_SHARD}"
+    : "${RCLONE_REMOTE:?set RCLONE_REMOTE, for example s3:my-bucket/matchengine}"
+    : "${WORK_DIR:=/work}"
+    : "${MAX_BACKUP_AGE_SECS:=93600}"
+    : "${MAX_DRILL_AGE_SECS:=691200}"
+    : "${BACKUP_SIGNING_KEY:=/etc/backup/signing.key}"
+    : "${RCLONE_CONFIG:=/etc/rclone/rclone.conf}"
+    : "${K8S_CONTROL_PLANE_BIN:=/usr/local/bin/k8s-control-plane}"
+    : "${RCLONE_BIN:=rclone}"
+
+    export HOME="$WORK_DIR"
+    export TMPDIR="$WORK_DIR/tmp"
+    export RCLONE_CONFIG
+    export RCLONE_CACHE_DIR="$WORK_DIR/rclone-cache"
+
+    kc() { "$K8S_CONTROL_PLANE_BIN" "$@"; }
+    rc() { "$RCLONE_BIN" "$@"; }
+
+    BUNDLE_DIR="$WORK_DIR/bundles"
+    DRILL_DIR="$WORK_DIR/drills"
+    REMOTE_ROOT="${RCLONE_REMOTE%/}/$BACKUP_SHARD"
+    mkdir -p "$BUNDLE_DIR" "$DRILL_DIR" "$TMPDIR" "$RCLONE_CACHE_DIR"
+    [ -f "$BACKUP_SIGNING_KEY" ] || fail "signing key $BACKUP_SIGNING_KEY is missing"
+    [ -f "$RCLONE_CONFIG" ] || fail "rclone config $RCLONE_CONFIG is missing"
+    [ -x "$K8S_CONTROL_PLANE_BIN" ] || fail "$K8S_CONTROL_PLANE_BIN is not executable"
+    command -v "$RCLONE_BIN" >/dev/null 2>&1 || fail "rclone is not installed (RCLONE_BIN=$RCLONE_BIN)"
+
+    LATEST_BUNDLE=$(rc lsf --dirs-only "$REMOTE_ROOT/bundles" \
+      --config "$RCLONE_CONFIG" | sed 's:/$::' | sort -V | tail -n 1)
+    [ -n "$LATEST_BUNDLE" ] || fail "no bundles at $REMOTE_ROOT/bundles"
+    log "downloading bundle $LATEST_BUNDLE"
+    rc copy "$REMOTE_ROOT/bundles/$LATEST_BUNDLE" "$BUNDLE_DIR/$LATEST_BUNDLE" \
+      --config "$RCLONE_CONFIG" --retries 3 --low-level-retries 10
+
+    LATEST_DRILL=$(rc lsf "$REMOTE_ROOT/drills" \
+      --config "$RCLONE_CONFIG" | grep -E '\.drill\.json$' | sort -V | tail -n 1 || true)
+    [ -n "$LATEST_DRILL" ] || fail "no signed drills at $REMOTE_ROOT/drills"
+    LATEST_SIG="${LATEST_DRILL%.json}.sig"
+    log "downloading signed drill $LATEST_DRILL"
+    rc copyto "$REMOTE_ROOT/drills/$LATEST_DRILL" "$DRILL_DIR/$LATEST_DRILL" \
+      --config "$RCLONE_CONFIG" --retries 3 --low-level-retries 10
+    rc copyto "$REMOTE_ROOT/drills/$LATEST_SIG" "$DRILL_DIR/$LATEST_SIG" \
+      --config "$RCLONE_CONFIG" --retries 3 --low-level-retries 10
+
+    kc backup-status \
+      --bundle-dir "$BUNDLE_DIR" \
+      --drill-dir "$DRILL_DIR" \
+      --key "$BACKUP_SIGNING_KEY" \
+      --max-backup-age-secs "$MAX_BACKUP_AGE_SECS" \
+      --max-drill-age-secs "$MAX_DRILL_AGE_SECS" \
+      --publish-configmap match-backup-status \
+      --configmap-namespace match-control
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: match-backup
+  namespace: match-control
+  labels:
+    app.kubernetes.io/name: match-backup
+spec:
+  schedule: "17 2 * * *"
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 600
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 6
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 7200
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: match-backup
+        spec:
+          serviceAccountName: match-backup
+          automountServiceAccountToken: true
+          restartPolicy: Never
+          securityContext:
+            runAsUser: 10001
+            runAsGroup: 10001
+            runAsNonRoot: true
+            fsGroup: 10001
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: backup
+              image: matchengine-k8s-control-plane:local
+              imagePullPolicy: IfNotPresent
+              command: ["/bin/sh", "/scripts/backup.sh"]
+              envFrom:
+                - configMapRef:
+                    name: match-backup-config
+              env:
+                - name: RCLONE_CONFIG
+                  value: /etc/rclone/rclone.conf
+                - name: BACKUP_SIGNING_KEY
+                  value: /etc/backup/signing.key
+                - name: WORK_DIR
+                  value: /work
+                - name: HOME
+                  value: /work
+                - name: TMPDIR
+                  value: /work/tmp
+                - name: RCLONE_CACHE_DIR
+                  value: /work/rclone-cache
+              volumeMounts:
+                - name: scripts
+                  mountPath: /scripts
+                  readOnly: true
+                - name: work
+                  mountPath: /work
+                - name: rclone-config
+                  mountPath: /etc/rclone
+                  readOnly: true
+                - name: signing-key
+                  mountPath: /etc/backup
+                  readOnly: true
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 128Mi
+                limits:
+                  cpu: "1"
+                  memory: 512Mi
+          volumes:
+            - name: scripts
+              configMap:
+                name: match-backup-scripts
+                defaultMode: 0555
+            - name: work
+              emptyDir: {}
+            - name: rclone-config
+              secret:
+                secretName: match-backup-rclone
+                defaultMode: 0440
+            - name: signing-key
+              secret:
+                secretName: match-backup-signing-key
+                defaultMode: 0440
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: match-backup-status
+  namespace: match-control
+  labels:
+    app.kubernetes.io/name: match-backup
+spec:
+  schedule: "47 * * * *"
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 300
+  successfulJobsHistoryLimit: 2
+  failedJobsHistoryLimit: 6
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 900
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: match-backup-status
+        spec:
+          serviceAccountName: match-backup
+          automountServiceAccountToken: true
+          restartPolicy: Never
+          securityContext:
+            runAsUser: 10001
+            runAsGroup: 10001
+            runAsNonRoot: true
+            fsGroup: 10001
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: status
+              image: matchengine-k8s-control-plane:local
+              imagePullPolicy: IfNotPresent
+              command: ["/bin/sh", "/scripts/status.sh"]
+              envFrom:
+                - configMapRef:
+                    name: match-backup-config
+              env:
+                - name: RCLONE_CONFIG
+                  value: /etc/rclone/rclone.conf
+                - name: BACKUP_SIGNING_KEY
+                  value: /etc/backup/signing.key
+                - name: WORK_DIR
+                  value: /work
+                - name: HOME
+                  value: /work
+                - name: TMPDIR
+                  value: /work/tmp
+                - name: RCLONE_CACHE_DIR
+                  value: /work/rclone-cache
+              volumeMounts:
+                - name: scripts
+                  mountPath: /scripts
+                  readOnly: true
+                - name: work
+                  mountPath: /work
+                - name: rclone-config
+                  mountPath: /etc/rclone
+                  readOnly: true
+                - name: signing-key
+                  mountPath: /etc/backup
+                  readOnly: true
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+              resources:
+                requests:
+                  cpu: 20m
+                  memory: 64Mi
+                limits:
+                  cpu: 500m
+                  memory: 256Mi
+          volumes:
+            - name: scripts
+              configMap:
+                name: match-backup-scripts
+                defaultMode: 0555
+            - name: work
+              emptyDir: {}
+            - name: rclone-config
+              secret:
+                secretName: match-backup-rclone
+                defaultMode: 0440
+            - name: signing-key
+              secret:
+                secretName: match-backup-signing-key
+                defaultMode: 0440

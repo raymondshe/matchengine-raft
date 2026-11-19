@@ -190,6 +190,17 @@ pub trait CatalogStore: Send + Sync {
     ) -> Result<Vec<ImageChoice>, ApiError> {
         Ok(Vec::new())
     }
+
+    /// Read the manager-visible backup status published by the backup Jobs.
+    ///
+    /// The CRD backend reads the `match-backup-status` ConfigMap in `match-control`; offline
+    /// backends return `None` and the GUI shows the not-configured state.
+    async fn backup_status(
+        &self,
+        _shard: &str,
+    ) -> Result<Option<crate::backup::PublishedBackupStatus>, ApiError> {
+        Ok(None)
+    }
 }
 
 /// No-op backend used by tests and the offline demo.
@@ -332,6 +343,14 @@ impl Store {
 
     pub fn mode(&self) -> &'static str {
         self.backend.mode()
+    }
+
+    /// Read the backup status published by the backup/status Jobs.
+    pub async fn backup_status(
+        &self,
+        shard: &str,
+    ) -> Result<Option<crate::backup::PublishedBackupStatus>, ApiError> {
+        self.backend.backup_status(shard).await
     }
 
     /// Engine images available for an upgrade: catalog references plus node-cached and running
