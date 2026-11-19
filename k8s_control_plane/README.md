@@ -19,14 +19,16 @@ etcd directly.
 ![Kubernetes control plane manager GUI](../docs/kubernetes-control-plane.png)
 
 The reference manager GUI has three top-level views: **matching engine** (shard catalog, packing
-mode, validation, preview plan, image upgrade, manifests, audit and engine-console links),
-**market data**, and **order systems**. The market-data view has **terminal** (multi-symbol
+mode, validation, preview plan, backup status, image upgrade, manifests, audit and engine-console
+links), **market data**, and **order systems**. The market-data view has **terminal** (multi-symbol
 services with `websocket.fastOnly=false`) and **fast** (single-symbol shard services with
 `websocket.fastOnly=true`) second-level tabs. Both market-data tabs are independent of the
 selected shard. The order-systems view lists each user-ID range, engine targets, per-shard
 readiness, **Demo order desk** links and an **upgrade** action; its image picker lists every
-node-cached, running, or catalog-recorded order-system image. The screenshot shows the live
-`fx-eu-01` shard with `eurusd` and `gbpusd` Ready.
+node-cached, running, or catalog-recorded order-system image. The matching-engine shard tabs are
+**overview**, **upgrade**, **backup**, **preview plan**, **manifests** and **objects**; the
+**backup** tab renders the status published by the scheduled backup Jobs (see below). The
+screenshot shows the live `fx-eu-01` shard with `eurusd` and `gbpusd` Ready.
 
 ```
 k8s_control_plane/
@@ -41,10 +43,12 @@ k8s_control_plane/
 ├── src/api.rs         Axum manager API
 ├── src/gui.rs         embedded single-page GUI
 ├── src/main.rs        serve | render | validate | plan | seed | crds | crd-backup | crd-restore
-│                      backup | backup-verify | restore
+│                      backup | backup-verify | backup-status | restore
 ├── src/bin/match_operator.rs  cell operator binary
-├── deploy/            generated CRDs, least-privilege RBAC, the operator Deployment and the
-│                      local demo ingress controller (ingress-nginx.yaml)
+├── deploy/            generated CRDs, least-privilege RBAC, the operator Deployment, scheduled
+│                      backups (backup.yaml), alerts (backup-alerts.yaml), NATS and the local demo
+│                      ingress controller (ingress-nginx.yaml); scripts/backup-local-lab.sh wires
+│                      the backups to a shared PVC for object-storage-free labs
 └── examples/          demo ShardBundle JSON files
 ```
 
@@ -217,6 +221,37 @@ from the snapshots, verifies recorded checksums, and keeps live `data-*` claims 
 `deploy/rbac.yaml` for the `match-backup` ServiceAccount. The bundle includes the etcd snapshot
 checksum but does not restore etcd; use the provider's control-plane runbook for that.
 
+`deploy/backup.yaml` is the scheduled path: a daily CronJob creates, verifies, drills, signs and
+uploads a bundle through `rclone`, prunes objects older than `BACKUP_RETENTION`, and fails when the
+newest bundle or drill is stale. An hourly status CronJob repeats the freshness check from object
+storage. Both Jobs publish the verified result to the `match-backup-status` ConfigMap in
+`match-control` (`data[<shard>]`), which the manager reads. Object storage holds the bundle and
+signed drill records, not the CSI snapshot data; cross-cluster recovery still relies on
+storage-level snapshot replication. Create the `match-backup-rclone` and
+`match-backup-signing-key` Secrets, edit `match-backup-config`, then apply `deploy/backup.yaml`.
+The signing key is a 32-byte HMAC-SHA256 key; each drill writes `<bundle-id>.drill.json` and
+`.drill.sig`, and `backup-status` verifies the signature, shard, namespace, bundle checksums and
+age limits. `deploy/backup-alerts.yaml` adds Prometheus rules for failed and stale jobs. The
+manifest defaults to `BACKUP_MODE: crd-only` because the local lab has no CSI snapshot driver;
+switch to `volume`/`volume-group` when one is available. Rebuild the control-plane image after this
+change so the upload runtime includes `rclone`.
+
+On the local lab (no object storage), `scripts/backup-local-lab.sh` mounts one shared PVC into
+both CronJobs and points `RCLONE_REMOTE` at the mount path; rclone treats a plain path as a local
+remote, so the full create/verify/drill/sign/publish/retention path runs end to end. It creates
+the two Secrets when they are missing and patches the CronJobs in place; `--uninstall` reverses it.
+
+### Backup view
+
+![Backup tab](../docs/control-plane-backup.png)
+
+The shard **backup** tab (and `GET /api/v1/backup-status?shard=<name>`) reports the published
+status for that shard: the newest bundle id, age, volume count and catalog checksum; the newest
+signed drill (kind, age, signer); the configured age limits; and the reason list when anything is
+stale. `not configured` means no status record has been published yet for that shard. The same
+record replaces the simulated `lastBackupAt` in the shard detail, so the stop-the-world upgrade
+gate's "verified backup newer than 24h" check uses the real bundle timestamp in CRD mode.
+
 Older `crd-backup` / `crd-restore` commands remain available for a catalog-only export. Audit and
 engine PVC data are separate. Restore order is: CRs first, then workloads, then PVCs/engine
 recovery.
@@ -318,6 +353,7 @@ bootstrap, rollout, retention, migration, status and label actions.
 | `GET` | `/` | embedded GUI |
 | `GET` | `/api/v1/health` | catalog counts and validation summary |
 | `GET` | `/api/v1/catalog` | full catalog plus validation report |
+| `GET` | `/api/v1/backup-status?shard={name}` | newest bundle and signed drill published by the backup/status Jobs, with ages, limits and stale reasons |
 | `GET` | `/api/v1/images?shard={name}`, `?marketDataService={name}` or `?orderSystem={name}` | selectable images from `Node.status.images` and running engine/market-data/order-system pods, merged with catalog references; marks the configured (`current`) and running (`runningHere`) image |
 | `GET/POST` | `/api/v1/market-data-services` | list or upsert a `MarketDataService` desired-state object (feed groups, transport profile, image/release, replicas and WebSocket settings) |
 | `GET` | `/api/v1/market-data-services/{name}` | service detail with the WebSocket endpoint and scoped validation |
@@ -803,10 +839,11 @@ crate on Rust 1.89.
 - Status is synthesized for the demo; there is no per-process status endpoint in the engine yet
   (phase 2 in the design doc). CRD status writes are rate-limited coalescing writes, not a full
   operator status controller.
-- Engine PVC backup/restore is implemented in the `backup`/`restore` CLI, but the local demo has no
+- Engine PVC backup/restore is implemented in the `backup`/`restore` CLI, and `deploy/backup.yaml`
+  adds the scheduled upload, retention, signed drill and freshness checks. The local demo has no
   CSI `VolumeSnapshot`/`VolumeGroupSnapshot` CRDs or snapshot driver, so only the checksummed
   CRD/etcd bundle path is live-validated. Validate the volume path on a snapshot-capable cluster.
-  CRD backup/restore is implemented and live-tested.
+  CRD backup/restore and the scheduled CRD drill are implemented and tested.
 - No authentication or authorization. The real manager and operator sit behind the platform's
   SSO and RBAC; the public engine edge remains plaintext behind the gateway.
 - The demo audit log is in-memory. Production audit belongs in an append-only store, not etcd.

@@ -267,6 +267,7 @@
     <div class="tabs">
       <button class="tab active" data-tab="overview">overview</button>
       <button class="tab" data-tab="upgrade" title="Write a target image and release; the operator rolls one pod at a time">upgrade</button>
+      <button class="tab" data-tab="backup" title="Latest verified bundle and signed restore drill">backup</button>
       <button class="tab" data-tab="plan" title="Preview the operator's reconcile steps from a synthetic observation">preview plan</button>
       <button class="tab" data-tab="manifests">manifests</button>
       <button class="tab" data-tab="objects">objects</button>
@@ -320,6 +321,18 @@
             <input id="targetImage" size="52" spellcheck="false" placeholder="repository@sha256:… or repository:tag">
           </label>
         </details>
+      </div>
+    </div>
+
+    <div class="panel" id="tab-backup">
+      <div class="actions">
+        <button class="primary" id="backupRefresh" type="button">Refresh</button>
+        <span class="muted" id="backupHint">The hourly match-backup-status Job publishes this record.</span>
+      </div>
+      <div class="grid" id="backupCards" style="margin-top:12px"></div>
+      <div class="card" style="margin-top:12px">
+        <h3>Details</h3>
+        <div id="backupDetails"><span class="muted">Select the backup tab to load status.</span></div>
       </div>
     </div>
 
@@ -684,6 +697,7 @@ let catalog = null;
 let currentView = "engine";
 let selected = null;
 let detail = null;
+let backupStatus = null;
 let manifestList = null;
 let loadedPlan = null;
 let imageInventory = null;
@@ -1215,6 +1229,90 @@ async function submitOrderSystemUpgrade(event) {
   }
 }
 
+function formatAge(seconds) {
+  if (seconds === null || seconds === undefined) return "—";
+  seconds = Math.max(0, Number(seconds) || 0);
+  if (seconds < 60) return `${Math.round(seconds)}s`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
+  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h`;
+  return `${Math.floor(seconds / 86400)}d`;
+}
+
+function backupTabVisible() {
+  return Boolean(document.querySelector("#tab-backup.active"));
+}
+
+function renderBackupStatus() {
+  const status = backupStatus;
+  const hint = $("backupHint");
+  if (!status) {
+    $("backupCards").innerHTML = "";
+    $("backupDetails").innerHTML = '<span class="muted">Select the backup tab to load status.</span>';
+    hint.textContent = "The hourly match-backup-status Job publishes this record.";
+    return;
+  }
+  const tone = status.status === "ok" ? "good" : status.status === "stale" ? "warn" : "bad";
+  const label = status.status === "ok" ? "verified" : status.status === "stale" ? "stale" : status.status === "not-configured" ? "not configured" : "error";
+  const cards = [
+    `<div class="card"><h3>Status</h3><dl class="kv">
+      <dt>state</dt><dd><span class="chip ${tone}">${esc(label)}</span></dd>
+      <dt>checked</dt><dd>${esc(formatAge(status.checkedAgeSecs))} ago</dd>
+      <dt>source</dt><dd class="mono">${esc(status.source || "—")}</dd>
+    </dl><p class="muted" style="margin:10px 0 0">${esc(status.message || "")}</p></div>`,
+  ];
+  if (status.bundle) {
+    cards.push(`<div class="card"><h3>Newest bundle</h3><dl class="kv">
+      <dt>id</dt><dd class="mono">${esc(status.bundle.id)}</dd>
+      <dt>age</dt><dd>${esc(formatAge(status.bundle.ageSecs))}</dd>
+      <dt>volumes</dt><dd>${esc(status.bundle.volumes)}</dd>
+      <dt>namespace</dt><dd>${esc(status.bundle.namespace)}</dd>
+    </dl></div>`);
+  }
+  if (status.drill) {
+    cards.push(`<div class="card"><h3>Newest signed drill</h3><dl class="kv">
+      <dt>kind</dt><dd>${esc(status.drill.kind)}</dd>
+      <dt>age</dt><dd>${esc(formatAge(status.drill.ageSecs))}</dd>
+      <dt>volumes</dt><dd>${esc(status.drill.volumesVerified)}</dd>
+      <dt>signer</dt><dd>${esc(status.drill.signer)}</dd>
+    </dl></div>`);
+  }
+  cards.push(`<div class="card"><h3>Limits</h3><dl class="kv">
+    <dt>bundle</dt><dd>${status.maxBackupAgeSecs == null ? "—" : esc(formatAge(status.maxBackupAgeSecs))}</dd>
+    <dt>drill</dt><dd>${status.maxDrillAgeSecs == null ? "—" : esc(formatAge(status.maxDrillAgeSecs))}</dd>
+    <dt>published</dt><dd>${status.publishedAt == null ? "—" : esc(new Date(status.publishedAt * 1000).toLocaleString())}</dd>
+  </dl></div>`);
+  $("backupCards").innerHTML = cards.join("");
+  const reasons = status.reasons || [];
+  const bundle = status.bundle;
+  const drill = status.drill;
+  $("backupDetails").innerHTML = `
+    ${reasons.length ? `<div class="issue warning" style="margin-bottom:12px"><b>Needs attention</b><ul style="margin:8px 0 0 18px">${reasons.map((reason) => `<li>${esc(reason)}</li>`).join("")}</ul></div>` : ""}
+    <dl class="kv">
+      <dt>bundle id</dt><dd class="mono">${esc(bundle?.id || "—")}</dd>
+      <dt>catalog sha256</dt><dd class="mono">${esc(bundle?.catalogSha256 || "—")}</dd>
+      <dt>drill bundle</dt><dd class="mono">${esc(drill?.bundleId || "—")}</dd>
+      <dt>drill path</dt><dd class="mono">${esc(drill?.path || "—")}</dd>
+      <dt>checked</dt><dd>${esc(formatAge(status.checkedAgeSecs))} ago</dd>
+    </dl>
+    <p class="muted" style="margin:12px 0 0">Configured by <span class="mono">deploy/backup.yaml</span>;
+      the CronJobs publish after verifying the bundle and signed drill.</p>`;
+  hint.textContent = `source ${status.source || "—"} · checked ${formatAge(status.checkedAgeSecs)} ago`;
+}
+
+async function loadBackupStatus() {
+  if (!selected) return;
+  $("backupHint").textContent = "loading backup status…";
+  try {
+    backupStatus = await api(`/api/v1/backup-status?shard=${encodeURIComponent(selected)}`);
+  } catch (error) {
+    backupStatus = {
+      shard: selected, configured: false, status: "error", ok: false,
+      message: error.message, source: "—", reasons: [],
+    };
+  }
+  renderBackupStatus();
+}
+
 function renderShards() {
   const shards = Object.values(catalog.shards || {});
   $("shardList").innerHTML = shards.map((shard) => {
@@ -1635,9 +1733,11 @@ async function loadDetail() {
 
 async function loadShard() {
   if (!selected) return;
+  backupStatus = null;
   try {
     await loadDetail();
     if (planVisible()) await loadPlan();
+    if (backupTabVisible()) await loadBackupStatus();
   } catch (error) {
     toast(error.message, true);
   }
@@ -2048,10 +2148,12 @@ function bind() {
       document.querySelectorAll(".tab").forEach((t) => t.classList.toggle("active", t === tab));
       document.querySelectorAll(".panel").forEach((p) => p.classList.toggle("active", p.id === "tab-" + tab.dataset.tab));
       if (tab.dataset.tab === "manifests" && !manifestList) loadManifests();
+      if (tab.dataset.tab === "backup") loadBackupStatus();
       if (tab.dataset.tab === "plan") loadPlan();
     });
   });
   $("planBtn").addEventListener("click", loadPlan);
+  $("backupRefresh").addEventListener("click", loadBackupStatus);
   $("marketDataRefresh").addEventListener("click", loadMarketData);
   $("orderSystemRefresh").addEventListener("click", loadOrderSystems);
   document.querySelectorAll(".md-tab").forEach((tab) => {
@@ -2155,6 +2257,7 @@ async function refreshLive() {
     if (currentView === "engine" && selected) {
       await loadDetail();
       if (liveTicks % 3 === 0 && planVisible()) await loadPlan();
+      if (liveTicks % 3 === 0 && backupTabVisible()) await loadBackupStatus();
     }
     if (currentView === "marketdata" && liveTicks % 3 === 0) await loadMarketData();
     if (currentView === "ordersystem" && liveTicks % 3 === 0) await loadOrderSystems();

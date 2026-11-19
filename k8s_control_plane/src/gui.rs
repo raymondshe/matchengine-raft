@@ -112,6 +112,20 @@ mod tests {
     }
 
     #[test]
+    fn backup_tab_shows_published_status_and_signed_drill() {
+        assert!(INDEX.contains("data-tab=\"backup\""));
+        assert!(INDEX.contains("id=\"tab-backup\""));
+        assert!(INDEX.contains("id=\"backupCards\""));
+        assert!(INDEX.contains("id=\"backupRefresh\""));
+        assert!(INDEX.contains("/api/v1/backup-status?shard="));
+        assert!(INDEX.contains("function renderBackupStatus"));
+        assert!(INDEX.contains("not-configured"));
+        assert!(INDEX.contains("Newest signed drill"));
+        assert!(INDEX.contains("deploy/backup.yaml"));
+        assert!(INDEX.contains("backupTabVisible"));
+    }
+
+    #[test]
     fn market_data_is_top_level_with_terminal_and_fast_subtabs() {
         assert!(INDEX.contains("data-view=\"engine\""));
         assert!(INDEX.contains("data-view=\"marketdata\""));

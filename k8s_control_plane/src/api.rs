@@ -22,6 +22,7 @@ use hyper_util::rt::TokioExecutor;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use crate::backup;
 use crate::bundle::ShardBundle;
 use crate::error::ApiError;
 use crate::model::dns_label;
@@ -34,7 +35,7 @@ use crate::reconcile::{Action, PlanStep, ReconcilePlan, Scenario, ShardObservati
 use crate::render::{
     Profile, RenderOptions, as_list, render_market_data_service, render_order_system, render_shard,
 };
-use crate::store::{AuditEntry, Catalog, Store};
+use crate::store::{AuditEntry, Catalog, Store, now_epoch};
 use crate::validate::{Report, per_pod_totals, validate_bundle, validate_catalog, validate_symbol};
 
 /// Options for the engine-console reverse proxy.
@@ -58,6 +59,7 @@ pub fn router_with_options(store: Arc<Store>, console: ConsoleOptions) -> Router
         .route("/console/", get(crate::gui::index))
         .route("/api/v1/health", get(health))
         .route("/api/v1/catalog", get(catalog))
+        .route("/api/v1/backup-status", get(backup_status))
         .route("/api/v1/images", get(images))
         .route("/api/v1/cells", get(cells))
         .route("/api/v1/shards", get(shards).post(create_shard))
@@ -140,6 +142,35 @@ async fn health(State(store): State<Arc<Store>>) -> Json<Value> {
         "errors": report.errors.len(),
         "warnings": report.warnings.len(),
     }))
+}
+
+#[derive(Debug, Deserialize)]
+struct BackupStatusQuery {
+    #[serde(default)]
+    shard: Option<String>,
+}
+
+/// Latest backup and signed restore drill published by the backup/status Jobs.
+async fn backup_status(
+    State(store): State<Arc<Store>>,
+    Query(query): Query<BackupStatusQuery>,
+) -> Result<Json<backup::BackupStatusView>, ApiError> {
+    let shard = query
+        .shard
+        .ok_or_else(|| ApiError::bad_request("backup_status_query", "pass ?shard=<shard-name>"))?;
+    let catalog = store.snapshot();
+    if !catalog.shards.contains_key(&shard) {
+        return Err(ApiError::not_found(
+            "shard_not_found",
+            format!("unknown shard {shard}"),
+        ));
+    }
+    let record = store.backup_status(&shard).await?;
+    Ok(Json(backup::view_backup_status(
+        &shard,
+        record.as_ref(),
+        now_epoch(),
+    )))
 }
 
 #[derive(Debug, Deserialize)]
@@ -748,6 +779,21 @@ fn console_upstream_path(path: &str) -> Result<String, ApiError> {
     }
 }
 
+/// Use the real published backup timestamp when the CRD backend can read it.
+///
+/// Offline/demo backends keep the simulated observation so the GUI remains usable without a
+/// cluster or a backup ConfigMap.
+async fn apply_live_backup_status(store: &Store, shard: &str, observation: &mut ShardObservation) {
+    if store.mode() != "crd" {
+        return;
+    }
+    match store.backup_status(shard).await {
+        Ok(Some(status)) => observation.last_backup_at = Some(status.report.bundle_created_at),
+        Ok(None) => observation.last_backup_at = None,
+        Err(_) => {}
+    }
+}
+
 async fn shard_detail(
     State(store): State<Arc<Store>>,
     Path(name): Path<String>,
@@ -762,7 +808,10 @@ async fn shard_detail(
         Some(value) => Scenario::parse(value)?,
         None => Scenario::Ready,
     };
-    let observation = crate::reconcile::simulate(&catalog, &name, scenario);
+    let mut observation = crate::reconcile::simulate(&catalog, &name, scenario);
+    if let Ok(observed) = observation.as_mut() {
+        apply_live_backup_status(&store, &name, observed).await;
+    }
     let validation = validate_catalog(&catalog);
     let all_deployments: Vec<&SymbolDeployment> = catalog.shard_deployments(&name);
     let deployments: Vec<&SymbolDeployment> = all_deployments
@@ -918,7 +967,8 @@ async fn shard_plan(
         Some(value) => Scenario::parse(value)?,
         None => Scenario::Ready,
     };
-    let observation = crate::reconcile::simulate(&catalog, &name, scenario)?;
+    let mut observation = crate::reconcile::simulate(&catalog, &name, scenario)?;
+    apply_live_backup_status(&store, &name, &mut observation).await;
     let plan = crate::reconcile::plan_shard(
         &catalog,
         &name,
@@ -950,7 +1000,8 @@ async fn post_plan(
     Json(request): Json<PlanRequest>,
 ) -> Result<Json<Value>, ApiError> {
     let catalog = store.snapshot();
-    let observation = match request.observation {
+    let explicit = request.observation.is_some();
+    let mut observation = match request.observation {
         Some(mut observation) => {
             if !observation.shard.is_empty() && observation.shard != name {
                 return Err(ApiError::bad_request(
@@ -979,6 +1030,9 @@ async fn post_plan(
             crate::reconcile::simulate(&catalog, &name, scenario)?
         }
     };
+    if !explicit {
+        apply_live_backup_status(&store, &name, &mut observation).await;
+    }
     let plan = crate::reconcile::plan_shard(
         &catalog,
         &name,
@@ -1708,6 +1762,30 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["counts"]["symbols"], 3);
         assert_eq!(body["validation"]["errors"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn backup_status_reports_not_configured_for_a_known_shard() {
+        let (status, body) = get_json("/api/v1/backup-status").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"], "backup_status_query");
+
+        let (status, body) = get_json("/api/v1/backup-status?shard=missing").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"], "shard_not_found");
+
+        let (status, body) = get_json("/api/v1/backup-status?shard=fx-eu-01").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["shard"], "fx-eu-01");
+        assert_eq!(body["configured"], false);
+        assert_eq!(body["status"], "not-configured");
+        assert_eq!(body["ok"], false);
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap()
+                .contains("deploy/backup.yaml")
+        );
     }
 
     #[tokio::test]
