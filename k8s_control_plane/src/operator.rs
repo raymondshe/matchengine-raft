@@ -3370,8 +3370,21 @@ fn shard_status(
         Condition::false_("Progressing", "ReleaseBlocked")
     } else if capacity_block.is_some() {
         Condition::false_("Progressing", "CapacityBlocked")
-    } else if phase == Phase::Ready && rollout.is_none_or(|rollout| rollout.complete) {
-        Condition::false_("Progressing", "Settled")
+    } else if matches!(phase, Phase::Ready | Phase::Reserved)
+        && rollout.is_none_or(|rollout| rollout.complete)
+    {
+        // A reserved shard (no active processes: freshly reserved, or every symbol stopped with
+        // the stop rollout finished) has nothing to roll. Without this branch it would report
+        // `Progressing=True` forever, and the console would show `stopping…` and permanently
+        // disable start.
+        Condition::false_(
+            "Progressing",
+            if phase == Phase::Reserved {
+                "Reserved"
+            } else {
+                "Settled"
+            },
+        )
     } else {
         Condition::true_("Progressing")
     };
@@ -3982,6 +3995,60 @@ mod tests {
             "no per-pod rows in the synthetic observation"
         );
         assert_eq!(status.nodes.len(), 4);
+    }
+
+    #[test]
+    fn reserved_shard_settles_instead_of_reporting_a_perpetual_rollout() {
+        // Every symbol stopped: the shard is reserved and there is nothing left to roll.
+        let mut catalog = demo_catalog();
+        for deployment in catalog.deployments.values_mut() {
+            if deployment.spec.shard_ref == "fx-eu-01" {
+                deployment.spec.desired_state = DeploymentState::Disabled;
+            }
+        }
+        let shard = catalog.shards["fx-eu-01"].clone();
+        let observations = Observations::default();
+        let status = shard_status(&shard, &catalog, &observations, 1, None, None, None);
+        assert_eq!(status.phase, Phase::Reserved);
+        let progressing = status
+            .conditions
+            .iter()
+            .find(|condition| condition.kind == "Progressing")
+            .expect("Progressing condition");
+        assert_eq!(progressing.status, "False");
+        assert_eq!(progressing.reason.as_deref(), Some("Reserved"));
+
+        // A stop rollout that is still replacing pods keeps `Progressing=True` until it is done.
+        let rolling = shard_rollout_status(4, 2, 2);
+        let status = shard_status(
+            &shard,
+            &catalog,
+            &observations,
+            1,
+            Some(&rolling),
+            None,
+            None,
+        );
+        assert_eq!(status.phase, Phase::Reserved);
+        let progressing = status
+            .conditions
+            .iter()
+            .find(|condition| condition.kind == "Progressing")
+            .expect("Progressing condition");
+        assert_eq!(progressing.status, "True");
+
+        // A freshly reserved, never-used shard has the same settled status.
+        let reserved = catalog.shards["fx-eu-02"].clone();
+        let status = shard_status(&reserved, &catalog, &observations, 1, None, None, None);
+        assert_eq!(status.phase, Phase::Reserved);
+        assert!(
+            status
+                .conditions
+                .iter()
+                .any(|condition| condition.kind == "Progressing"
+                    && condition.status == "False"
+                    && condition.reason.as_deref() == Some("Reserved"))
+        );
     }
 
     #[test]
