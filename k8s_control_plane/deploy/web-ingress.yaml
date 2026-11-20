@@ -77,29 +77,8 @@ spec:
                 port:
                   name: http
 ---
-# The order system is sharded by user ID; each shard keeps its own
-# users-<n>.orders.match-eu-1.example WebUI. The base host lands on the
-# control-plane order-systems view so users can pick their shard instead of
-# choosing a pod or service IP.
-apiVersion: networking.k8s.io/v1
-kind: Ingress
-metadata:
-  name: orders-index
-  namespace: match-control
-  labels:
-    app.kubernetes.io/name: match-manager
-    app.kubernetes.io/part-of: matchengine
-  annotations:
-    nginx.ingress.kubernetes.io/temporal-redirect: "http://console.match-eu-1.example/?view=ordersystem"
-spec:
-  rules:
-    - host: orders.match-eu-1.example
-      http:
-        paths:
-          - path: /
-            pathType: Exact
-            backend:
-              service:
-                name: match-manager
-                port:
-                  name: http
+# The order-system base host (orders.<base>) is owned by the OrderSystem
+# renderer: it now backs the single stateless order desk, and the per-shard
+# users-<n>.<base> hosts are alias Ingresses pointing at the same Service.
+# Do not define an Ingress for orders.<base> here — that would shadow the
+# rendered Ingress and send order entry to the manager again.

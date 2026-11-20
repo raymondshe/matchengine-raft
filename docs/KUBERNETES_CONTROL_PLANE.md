@@ -2065,18 +2065,21 @@ metrics-server or a Prometheus adapter; without one the HPA still enforces the o
 
 Order-system upgrades are stateless: `POST /api/v1/order-systems/{name}/upgrade` writes
 `spec.image`, validates the scoped catalog and lets the operator roll one shard at a time. There is
-no Raft quorum, leader transfer or wire-version gate. The manager **order systems** view lists
-shards, targets, HPA bounds, per-shard readiness and a **WebUI** link per shard
-(`http://<shard>.<spec.ingress>/demo/`, `https` when `spec.tlsSecret` is set), plus an **upgrade**
-button. Its upgrade dialog lists every image cached on a node, currently running in an
-order-system pod, or recorded in the catalog for the system's repository; a free-text field remains
-for a new digest-pinned reference. The picker is backed by
-`GET /api/v1/images?orderSystem={name}`. Order entry stays in the order system: the control plane does not render an order ticket
-and does not proxy `/orders` or book state. A user-ID routing gateway in front of the per-shard
-Services (exact modulo or range routing) remains a P2 follow-up; today clients open the shard WebUI
-or select the shard URL directly. In the OrbStack demo, the rendered Ingresses are served by the
-bundled ingress-nginx controller plus a Docker front door on port 80
-(`k8s_control_plane/deploy/ingress-nginx.yaml`, `scripts/ingress-frontdoor.sh`); that path is
+no Raft quorum, leader transfer or wire-version gate. The order system is **stateless**: every
+instance serves every user, one Deployment/Service/PDB/HPA is rendered per `OrderSystem`, and the
+base host `http://<spec.ingress>/demo/` is the single order desk (`https` when `spec.tlsSecret` is
+set); the former `<shard>.<ingress>` hosts remain as migration aliases pointing at the same
+Service. `OrderSystem.spec.shards` is now capacity metadata only — no user-ID range is enforced in
+the BFF. The manager **order systems** view lists the ranges, targets, HPA bounds, readiness and one
+**WebUI** link to the base host, plus an **upgrade** button. Its upgrade dialog lists every image
+cached on a node, currently running in an order-system pod, or recorded in the catalog for the
+system's repository; a free-text field remains for a new digest-pinned reference. The picker is
+backed by `GET /api/v1/images?orderSystem={name}`. Order entry stays in the order system: the
+control plane does not render an order ticket and does not proxy `/orders` or book state, and no
+user-ID routing gateway is needed. A public trading gateway for engine `SymbolRoute` leader routing
+is deferred per [docs/GATEWAY_ROUTING.md](./GATEWAY_ROUTING.md) §9. In the OrbStack demo, the
+rendered Ingresses are served by the bundled ingress-nginx controller plus a Docker front door on
+port 80 (`k8s_control_plane/deploy/ingress-nginx.yaml`, `scripts/ingress-frontdoor.sh`); that path is
 plaintext demo plumbing, and TLS/authentication/rate limits remain production-edge work.
 
 ## 10. Security and multi-tenancy

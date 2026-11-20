@@ -3579,41 +3579,39 @@ async fn observe_order_systems(
         let mut ready = 0u16;
         let mut pending = false;
         let mut errors = Vec::new();
-        for shard in &system.spec.shards {
-            let name = dns_label(&format!("{}-{}", system.name, shard.name));
-            let api = Api::<Deployment>::namespaced(client.clone(), namespace);
-            let observation = match api.get(&name).await {
-                Ok(deployment) => {
-                    let shard_status = deployment.status.unwrap_or_default();
-                    let replicas = shard_status.replicas.unwrap_or(0).max(0) as u16;
-                    let ready_replicas = shard_status.ready_replicas.unwrap_or(0).max(0) as u16;
-                    desired = desired.saturating_add(replicas);
-                    ready = ready.saturating_add(ready_replicas);
-                    OrderSystemShardStatus {
-                        name: shard.name.clone(),
-                        replicas,
-                        ready_replicas,
-                    }
+        // One stateless Deployment serves every user; shard ranges are capacity
+        // metadata only, so there is exactly one observation per system.
+        let name = dns_label(&system.name);
+        let api = Api::<Deployment>::namespaced(client.clone(), namespace);
+        let observation = match api.get(&name).await {
+            Ok(deployment) => {
+                let shard_status = deployment.status.unwrap_or_default();
+                desired = shard_status.replicas.unwrap_or(0).max(0) as u16;
+                ready = shard_status.ready_replicas.unwrap_or(0).max(0) as u16;
+                OrderSystemShardStatus {
+                    name: system.name.clone(),
+                    replicas: desired,
+                    ready_replicas: ready,
                 }
-                Err(kube::Error::Api(error)) if error.code == 404 => {
-                    pending = true;
-                    OrderSystemShardStatus {
-                        name: shard.name.clone(),
-                        replicas: 0,
-                        ready_replicas: 0,
-                    }
+            }
+            Err(kube::Error::Api(error)) if error.code == 404 => {
+                pending = true;
+                OrderSystemShardStatus {
+                    name: system.name.clone(),
+                    replicas: 0,
+                    ready_replicas: 0,
                 }
-                Err(error) => {
-                    errors.push(format!("{name}: {error}"));
-                    OrderSystemShardStatus {
-                        name: shard.name.clone(),
-                        replicas: 0,
-                        ready_replicas: 0,
-                    }
+            }
+            Err(error) => {
+                errors.push(format!("{name}: {error}"));
+                OrderSystemShardStatus {
+                    name: system.name.clone(),
+                    replicas: 0,
+                    ready_replicas: 0,
                 }
-            };
-            status.shards.push(observation);
-        }
+            }
+        };
+        status.shards.push(observation);
         status.replicas = desired;
         status.ready_replicas = ready;
         status.phase = if system.spec.paused {

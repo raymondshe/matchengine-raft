@@ -23,8 +23,8 @@ mode, validation, preview plan, backup status, image upgrade, manifests, audit a
 links), **market data**, and **order systems**. The market-data view has **terminal** (multi-symbol
 services with `websocket.fastOnly=false`) and **fast** (single-symbol shard services with
 `websocket.fastOnly=true`) second-level tabs. Both market-data tabs are independent of the
-selected shard. The order-systems view lists each user-ID range, engine targets, per-shard
-readiness, **Demo order desk** links and an **upgrade** action; its image picker lists every
+selected shard. The order-systems view lists the capacity ranges, engine targets, readiness and one
+**Demo order desk** link to the base host, plus an **upgrade** action; its image picker lists every
 node-cached, running, or catalog-recorded order-system image. The matching-engine shard tabs are
 **overview**, **upgrade**, **backup**, **preview plan**, **manifests** and **objects**; the
 **backup** tab renders the status published by the scheduled backup Jobs (see below). The
@@ -158,7 +158,7 @@ and one surge pod. The manager checks the target wire version against every sour
 committing, so an incompatible image is rejected without touching the running service. The
 **market data** GUI view exposes an **upgrade** button per service in its terminal and fast
 sub-tabs, backed by `GET /api/v1/images?marketDataService={name}`. The **order systems** view uses
-the same picker pattern for its stateless user shards, backed by
+the same picker pattern for its single stateless order desk, backed by
 `GET /api/v1/images?orderSystem={name}`.
 
 Install the generated CRDs and least-privilege RBAC first:
@@ -359,11 +359,11 @@ bootstrap, rollout, retention, migration, status and label actions.
 | `GET` | `/api/v1/market-data-services/{name}` | service detail with the WebSocket endpoint and scoped validation |
 | `GET` | `/api/v1/market-data-services/{name}/manifests` | read-only rendered Deployment/Service/PDB/NetworkPolicy/ConfigMap/Ingress/HPA list |
 | `POST` | `/api/v1/market-data-services/{name}/upgrade` | write `spec.image` and optional `spec.release` to a market-data service; validates the source-shard wire version and lets the operator roll the stateless Deployment |
-| `GET/POST` | `/api/v1/order-systems` | list or upsert an `OrderSystem`; each `spec.shards` entry is one user-ID range and `spec.targets` lists the engine symbols every shard may trade |
-| `GET` | `/api/v1/order-systems/{name}` | order-system detail with resolved shard services, user ranges and scoped validation |
-| `GET` | `/api/v1/order-systems/{name}/manifests` | rendered ConfigMap, and one Deployment/Service/PDB/Ingress/HPA per user shard |
+| `GET/POST` | `/api/v1/order-systems` | list or upsert an `OrderSystem`; `spec.shards` ranges are capacity metadata and `spec.targets` lists every engine symbol the stateless desk may trade |
+| `GET` | `/api/v1/order-systems/{name}` | order-system detail with the single service/URL, capacity ranges and scoped validation |
+| `GET` | `/api/v1/order-systems/{name}/manifests` | rendered ConfigMap, one Deployment/Service/PDB/HPA, and a base-host Ingress plus per-shard alias Ingresses |
 | — | `http://<shard>.<spec.ingress>/demo/` | the order system's own WebUI; the manager **order systems** table links each shard here and does not proxy order entry |
-| `POST` | `/api/v1/order-systems/{name}/upgrade` | write a new `spec.image`; the GUI picker is backed by `GET /api/v1/images?orderSystem={name}`, and the operator rolls the stateless user shards with `maxUnavailable: 0` one surge pod at a time |
+| `POST` | `/api/v1/order-systems/{name}/upgrade` | write a new `spec.image`; the GUI picker is backed by `GET /api/v1/images?orderSystem={name}`, and the operator rolls one stateless Deployment with `maxUnavailable: 0` and one surge pod |
 | `GET` | `/api/v1/shards` | shard list with per-pod CPU/memory requests, `slots`, `freeSlots`, phase and paused state |
 | `POST` | `/api/v1/shards` | reserve an empty shard from a `SymbolShard` body |
 | `POST` | `/api/v1/shards/{name}/upgrade` | write `spec.image` and `spec.release` to a shard; rejects incompatible releases and per-deployment image overrides; the operator performs the one-pod-at-a-time roll |
@@ -708,10 +708,10 @@ the catalog's HTTP ports. The direct pod URL remains in the shard detail payload
 
 ## 🌐 Local ingress for demo hosts
 
-The renderer emits class-less `Ingress` objects for order-system shards and market-data services;
-`deploy/web-ingress.yaml` adds the control-plane console (`console.match-eu-1.example`), the
-engine-console origin (`engine.match-eu-1.example`) and the order-system selector
-(`orders.match-eu-1.example`). On OrbStack nothing serves them by default: there is no cloud
+The renderer emits class-less `Ingress` objects for the order-system base host and its per-shard
+aliases, plus market-data services; `deploy/web-ingress.yaml` adds the control-plane console
+(`console.match-eu-1.example`) and the engine-console origin (`engine.match-eu-1.example`). On
+OrbStack nothing serves them by default: there is no cloud
 LoadBalancer, NodePorts are not reachable from macOS, and binding port 80 needs root. Install the
 bundled controller and publish it through the Docker front door:
 
@@ -724,8 +724,8 @@ kubectl apply -f deploy/web-ingress.yaml
 
 Then open `http://console.match-eu-1.example/` for the control plane,
 `http://engine.match-eu-1.example/` for the engine-console index, or
-`http://orders.match-eu-1.example/` for the order-shard selector. The order shards keep their
-`users-<n>.orders.match-eu-1.example/demo/` hosts.
+`http://orders.match-eu-1.example/demo/` for the single stateless order desk. The former
+`users-<n>.orders.match-eu-1.example/demo/` hosts remain as migration aliases to the same Service.
 
 `deploy/ingress-nginx.yaml` is a single-controller ingress-nginx install that watches Ingresses
 without a class, so the existing objects need no annotation. `scripts/ingress-frontdoor.sh` labels
@@ -806,9 +806,10 @@ restart backoff, max-child backpressure, orphan cleanup) and `tests/cluster/test
 
 `scripts/operator-acceptance.sh` is the repeatable live acceptance matrix for the whole control
 plane. `render` re-checks the containers, supervisor and reserved templates against existing
-shards without mutating anything, and asserts the order-system render (one Deployment/HPA per user
-shard, a one-replica HPA floor with a 70% CPU target, `maxUnavailable: 0` with one surge pod, and no
-Deployment `spec.replicas`); `run` creates private `acc-*` shards and exercises containers
+shards without mutating anything, and asserts the order-system render (one stateless Deployment and
+HPA, base-host plus per-shard alias Ingresses, a one-replica HPA floor with a 70% CPU target,
+`maxUnavailable: 0` with one surge pod, and no Deployment `spec.replicas`); `run` creates private
+`acc-*` shards and exercises containers
 readiness/write, explicit leadership transfer, digest-pinned image roll and rollback (one-at-a-time
 pod replacements, quorum-safe readiness and manager 0/33/66/100 percentages), stop/start PVC and
 book continuity, supervisor zero-impact add/stop/start with child PID continuity, reserved

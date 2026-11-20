@@ -44,14 +44,6 @@ struct Opt {
     /// Raft node id of the engine at --perp-engine.
     #[arg(long, default_value_t = 1)]
     perp_engine_id: u64,
-
-    /// First user ID handled by this order-system shard (inclusive).
-    #[arg(long, default_value_t = 0)]
-    user_id_min: u64,
-
-    /// Last user ID handled by this order-system shard (inclusive).
-    #[arg(long, default_value_t = u64::MAX)]
-    user_id_max: u64,
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -67,9 +59,6 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    if opt.user_id_min > opt.user_id_max {
-        anyhow::bail!("--user-id-min must be <= --user-id-max");
-    }
     let targets = if let Some(path) = &opt.targets {
         let raw = fs::read_to_string(path)
             .map_err(|error| anyhow::anyhow!("read --targets {}: {error}", path.display()))?;
@@ -109,7 +98,7 @@ async fn main() -> anyhow::Result<()> {
             anyhow::bail!("target {} needs a non-empty engine address", target.id);
         }
     }
-    let app = state::DemoApp::new(targets).with_user_range(opt.user_id_min, opt.user_id_max);
+    let app = state::DemoApp::new(targets);
     let target_summary = app
         .backends()
         .targets
@@ -146,8 +135,8 @@ async fn main() -> anyhow::Result<()> {
     .bind(&opt.addr)?;
 
     println!(
-        "demo order desk: http://{}/demo/ (users {}..={}; targets {}; legacy spot engine {})",
-        opt.addr, opt.user_id_min, opt.user_id_max, target_summary, opt.engine
+        "demo order desk: http://{}/demo/ (all users; targets {}; legacy spot engine {})",
+        opt.addr, target_summary, opt.engine
     );
     server.run().await?;
     Ok(())

@@ -1069,11 +1069,13 @@ async function loadOrderSystems() {
   }
 }
 
-function orderSystemWebuiUrl(spec, shardName) {
+function orderSystemWebuiUrl(spec) {
   const ingress = String(spec?.ingress || "").trim().replace(/\.+$/, "");
-  if (!ingress || !shardName) return "";
+  if (!ingress) return "";
   const scheme = String(spec?.tlsSecret || "").trim() ? "https" : "http";
-  return `${scheme}://${shardName}.${ingress}/demo/`;
+  // One stateless order desk on the base host; per-shard hosts remain as
+  // migration aliases but are not the canonical client URL.
+  return `${scheme}://${ingress}/demo/`;
 }
 
 function renderOrderSystems() {
@@ -1102,12 +1104,10 @@ function renderOrderSystems() {
     const phaseClass = phase === "Ready" ? "ok" : phase === "Failed" || phase === "Degraded" ? "err" : "warn";
     const serviceRows = (status.shards || []).map((shard) =>
       `${esc(shard.name)} ${esc(shard.readyReplicas ?? 0)}/${esc(shard.replicas ?? 0)}`).join("<br>");
-    const webuiRows = (spec.shards || []).map((shard) => {
-      const url = orderSystemWebuiUrl(spec, shard.name);
-      return url
-        ? `<span class="muted">${esc(shard.name)}</span> <a class="mono" href="${esc(url)}" target="_blank" rel="noreferrer" title="${esc(url)}">Demo order desk</a>`
-        : `<span class="muted">${esc(shard.name)} —</span>`;
-    }).join("<br>");
+    const webuiUrl = orderSystemWebuiUrl(spec);
+    const webuiRows = webuiUrl
+      ? `<a class="mono" href="${esc(webuiUrl)}" target="_blank" rel="noreferrer" title="${esc(webuiUrl)}">Demo order desk</a>`
+      : `<span class="muted">no ingress —</span>`;
     const minReplicas = spec.autoscaling?.minReplicas ?? 1;
     const maxReplicas = spec.autoscaling?.maxReplicas || spec.replicas || minReplicas;
     const hpa = spec.paused

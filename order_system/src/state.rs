@@ -574,11 +574,10 @@ impl EngineBackend {
 }
 
 /// The demo server's engine targets. Each target is one symbol on one engine
-/// cluster; every user shard can select every target.
+/// cluster. Every instance serves every user: the process is stateless with
+/// respect to users, so Kubernetes can load-balance across identical replicas.
 pub struct DemoApp {
     targets: Vec<EngineBackend>,
-    user_id_min: u64,
-    user_id_max: u64,
 }
 
 impl DemoApp {
@@ -589,29 +588,7 @@ impl DemoApp {
         );
         Self {
             targets: targets.into_iter().map(EngineBackend::new).collect(),
-            user_id_min: 0,
-            user_id_max: u64::MAX,
         }
-    }
-
-    /// Restrict this order-system instance to one user-ID range.
-    pub fn with_user_range(mut self, user_id_min: u64, user_id_max: u64) -> Self {
-        self.user_id_min = user_id_min;
-        self.user_id_max = user_id_max;
-        self
-    }
-
-    fn require_user(&self, user_id: u64) -> Result<(), ApiError> {
-        if !(self.user_id_min..=self.user_id_max).contains(&user_id) {
-            return Err(ApiError::conflict(
-                "user_shard",
-                format!(
-                    "user {user_id} belongs to another order-system shard (this shard covers {}..={})",
-                    self.user_id_min, self.user_id_max
-                ),
-            ));
-        }
-        Ok(())
     }
 
     pub fn backends(&self) -> BackendsState {
@@ -626,8 +603,6 @@ impl DemoApp {
                 .find(|target| target.product == Product::Perpetual)
                 .cloned(),
             targets,
-            user_id_min: self.user_id_min,
-            user_id_max: self.user_id_max,
         }
     }
 
@@ -687,22 +662,18 @@ impl DemoApp {
     }
 
     pub async fn place(&self, ticket: PlaceTicket) -> Result<OrderResult, ApiError> {
-        self.require_user(ticket.user_id)?;
         self.backend(&ticket.target)?.place(ticket).await
     }
 
     pub async fn preview_freeze(&self, ticket: PlaceTicket) -> Result<FreezePreview, ApiError> {
-        self.require_user(ticket.user_id)?;
         self.backend(&ticket.target)?.preview_freeze(ticket).await
     }
 
     pub async fn cancel(&self, request: CancelTicket) -> Result<OrderResult, ApiError> {
-        self.require_user(request.user_id)?;
         self.backend(&request.target)?.cancel(request).await
     }
 
     pub async fn amend(&self, request: AmendTicket) -> Result<OrderResult, ApiError> {
-        self.require_user(request.user_id)?;
         self.backend(&request.target)?.amend(request).await
     }
 
@@ -960,8 +931,6 @@ pub struct BackendsState {
     pub spot: Option<BackendInfo>,
     pub perpetual: Option<BackendInfo>,
     pub targets: Vec<BackendInfo>,
-    pub user_id_min: u64,
-    pub user_id_max: u64,
 }
 
 #[derive(Serialize)]
@@ -1338,14 +1307,7 @@ mod tests {
     }
 
     #[test]
-    fn user_ranges_are_enforced_and_orders_carry_the_owner() {
-        let app = DemoApp::new(vec![target("spot", Product::Spot, 1, "127.0.0.1:24401")])
-            .with_user_range(100, 199);
-        assert!(app.require_user(100).is_ok());
-        assert!(app.require_user(199).is_ok());
-        assert!(app.require_user(99).is_err());
-        assert!(app.require_user(200).is_err());
-
+    fn every_user_is_served_and_orders_carry_the_owner() {
         let ticket: PlaceTicket = serde_json::from_str(
             r#"{"side":"Buy","user_id":150,"type":"Limit","volume":"1","price":"100"}"#,
         )

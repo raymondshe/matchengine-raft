@@ -349,8 +349,11 @@ Deployed `matchengine-k8s-control-plane:operator-v89` (renderer) and
   while driving ~10 writes/s through all four shards. **1,480/1,480 writes succeeded** across
   the whole roll, including while pods were terminating and being replaced. The roll completed
   4/4 updated, 4/4 Ready; the shard image was restored to the original tag afterwards.
-- Observed side issue (not part of this change): engine pods under sustained order load can
-  linger in `Terminating` past the 60 s grace period until force-deleted; the rolling upgrade
-  still served every order. Worth a separate graceful-shutdown investigation.
+- Observed side issue, fixed separately the same day: engine pods under sustained order load
+  could linger in `Terminating` past the 60 s grace period until force-deleted, because tonic's
+  graceful gRPC shutdown waited for long-lived peer `AppendStream` connections to close. The
+  node now caps that drain at 5 s and aborts the server task on expiry; a second live roll with
+  the fixed image terminated each pod in ~6 s and completed in ~1 minute, with orders continuing
+  to succeed throughout.
 
 Still outstanding: the optional F typed `503` + leader hint for non-Rust clients/gateways.

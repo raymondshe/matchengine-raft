@@ -1,6 +1,6 @@
 # TODO
 
-Last reviewed: 2026-11-19. Working roadmap only; completed detail lives in the History section and
+Last reviewed: 2026-11-20. Working roadmap only; completed detail lives in the History section and
 git history — check out an earlier `TODO.md` from git for the full record
 (`git log -- TODO.md`, then `git show <commit>:TODO.md`). Measurements remain in
 [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md). See `AGENTS.md` for commands and the current branch
@@ -40,12 +40,18 @@ operability; **P2** = evidence, scale and important non-blocking work; **P3** = 
 
 ## Top priorities
 
-Last prioritised 2026-11-19, after the scheduled backup path and the console backup view landed
-and were exercised live (bundle, drill, signature, publish, freshness and stale states against the
-`fx-eu-01` CRDs). Backup construction is complete, so its remaining work — a real object-storage
-cycle and the CSI volume drill — moved to the explicit production gates and the actionable queue
-now leads with security, packaging and metrics. Ordering weighs data loss, security exposure and
-production blockers first, then work that is actionable in the current single-node lab;
+Last prioritised 2026-11-20, after Raft-native leader discovery/failover landed in the reusable
+`MatchEngineClient` and was validated live on OrbStack (hard leader kill and a full rolling
+upgrade: order entry kept succeeding throughout). That closes the **Rust-client** half of leader
+failover — the typed `503` leader hint for gateways/non-Rust clients and a request key for
+`Cancel`/`Amend` remain (P2). The same live roll exposed a graceful-shutdown defect: pods lingered
+in `Terminating` past the 60 s grace period because tonic drained long-lived peer `AppendStream`s
+forever. It was fixed the same day by capping the gRPC drain at 5 s — a four-voter roll under load
+now terminates each pod in ~6 s and completes in ~1 minute — so it is no longer in the queue.
+
+Backup construction is complete, so its remaining work — a real object-storage cycle and the CSI
+volume drill — stays in the explicit production gates. Ordering weighs data loss, security exposure
+and production blockers first, then work actionable in the current single-node lab;
 environment-blocked validation is called out explicitly rather than mixed into the actionable
 queue.
 
@@ -78,12 +84,14 @@ write response.
    scale and evidence unblock: every HPA currently shows `<unknown>` and only the min-1 floor
    applies, and load/soak work depends on it. It follows packaging because the current min-1 floor
    still serves traffic and no known defect depends on autoscaling.
-4. **Gateway routing and user-ID shard routing.** Route from `SymbolRoute.status` with
-   shadow/cutover/drain, retries and a canary path, then run a tested client cutover. Add one host
-   that maps user IDs to their order-system shard range so clients stop choosing shard URLs
-   manually. Do not blind-retry `Cancel`/`Amend` until the engine retry contract lands (P2);
-   `Place` retries use `client_order_id`. Migrations and the four order shards already exist;
-   this is the missing production data path, after the edges it fronts are secured.
+4. **Gateway routing — deferred; user-ID shard routing — resolved by making the order system
+   stateless.** Decision (2026-11-20, [docs/GATEWAY_ROUTING.md](./docs/GATEWAY_ROUTING.md) §9):
+   collapse the four order-system shards into one stateless Deployment so the base host
+   `orders.<ingress>` is a plain load-balanced order desk and no user-ID routing is needed. Engine
+   leader routing stays client-side via `MatchEngineClient::with_members`, already live; no public
+   gateway is built until TLS/auth and packaging land, a second client appears, or cutover must be
+   automated. The full `SymbolRoute` gateway design (shadow/cutover/drain, canary, retries,
+   no-blind-retry `Cancel`/`Amend`) is documented for those triggers.
 5. **Market-data production readiness.** Couple symbol create and migrate to both the fast and
    global symbol sets and the `SymbolRoute`, wait for the new feed before publishing and drain old
    WebSocket sessions; the stop path already removes a symbol from every service. Profile N
@@ -114,11 +122,13 @@ keep those halves visible; do not treat a green single-node run as production ev
    rolls, and the runbook has a manual stop/upgrade/restart path. Automate the coordinated cutover
    (backup gate, disable routes, stop all symbols, apply image/release, restart, verify, re-enable)
    and record a drill. The backup gate now uses the real published bundle timestamp.
-8. **Safe retries for `Cancel`/`Amend` and typed leader redirect.** Today `client_order_id`
-   dedupes only `Place`, and a follower `/write` returns `500` with no leader hint. Add a request
-   key for cancel/amend and a typed `503` with the leader address so the gateway can refresh and
-   retry deterministically. Until then, document and enforce the no-blind-retry rule; this is
-   needed before the gateway can safely retry those requests.
+8. **Safe retries for `Cancel`/`Amend` and typed leader redirect.** The 2026-11-20 failover work
+   closed the Rust-client half: `MatchEngineClient::with_members` re-discovers the leader from
+   `/metrics` on transport failure, so the order system needs no typed redirect. Remaining: a
+   request key for cancel/amend (`client_order_id` still dedupes only `Place`) and a typed `503`
+   with the leader address so a gateway or non-Rust client can refresh and retry deterministically;
+   a follower `/write` still returns `500` with no leader hint. Until then, document and enforce
+   the no-blind-retry rule before the gateway can safely retry those requests.
 9. **Market-data manager controls.** Add GUI create/edit/scale and a read-only preview plan for
    `MarketDataService`; the upsert API, image/release update and the per-service picker are
    implemented. Add a rollback action that restores the previous image.
@@ -185,17 +195,19 @@ keep those halves visible; do not treat a green single-node run as production ev
   five market-data HPAs report CPU and scale, then add a Prometheus text bridge for the engine's
   JSON `/metrics`, operator reconcile/rollout metrics, alert rules, dashboards and log shipping.
   The console peer view is already covered by the NetworkPolicy rule.
-- [ ] **P1** Gateway integration: leader-aware routing from `SymbolRoute.status`, shadow/cutover/
-  drain, retries and a canary path. Retry `Place` with `client_order_id`; do not blind-retry
-  `Cancel`/`Amend` until the request-key/typed-redirect item lands (P2). No gateway is deployed in
-  the demo.
+- [ ] **P1 (deferred)** Gateway integration: leader-aware routing from `SymbolRoute.status`,
+  shadow/cutover/drain, retries and a canary path. Deferred by the 2026-11-20 decision in
+  `docs/GATEWAY_ROUTING.md` — no public gateway is built until TLS/auth and packaging land, a
+  second client that cannot use the Rust client appears, or cutover needs automating. Retry `Place`
+  with `client_order_id`; do not blind-retry `Cancel`/`Amend` until the request-key/typed-redirect
+  item lands (P2).
 - [ ] **P1** Order-system public edge: TLS, authentication, rate limits and NetworkPolicy for the
   per-shard WebUI and `/demo/api`; the demo currently exposes plaintext HTTP with no auth. Keep
   order entry in the order system and the manager's role to linking only.
-- [ ] **P1** Order-system user-routing edge: map user IDs to their shard range behind one host so
-  clients do not choose a shard URL manually, and add per-user auth/rate limits. The four shards,
-  per-shard APIs/WebUI links, HPAs and rolling image updates are live; the shared host and per-user
-  authorization remain.
+- [x] **P1** Order-system user-routing edge — resolved: the BFF no longer enforces user ranges and
+  one stateless Deployment/Service serves every user on the base `orders.<ingress>` host; the
+  per-shard hosts remain as migration aliases. Remaining work is per-user auth/rate limits, which
+  belongs to the P1 security item and the deferred gateway.
 - [ ] **P1 (explicit production gate)** Backup close-out: the `backup`/`backup-verify`/`restore
   --drill` CLI, `deploy/backup.yaml` (daily create + drill + HMAC signature + `rclone` upload +
   retention, hourly `backup-status` freshness check), `deploy/backup-alerts.yaml` and the shard
@@ -293,8 +305,10 @@ shard services and the global terminal service are live; see History. Remaining 
 
 - [ ] **P2** Make gateway retries safe: add a request key for `Cancel`/`Amend` (the current
   `client_order_id` dedupes only `Place`) and a typed `503` with the leader address so a follower
-  `/write` can be retried deterministically instead of today's `500`. Until then, document and
-  enforce the no-blind-retry rule so the gateway never duplicates a cancel or amend.
+  `/write` can be retried deterministically instead of today's `500`. The Rust
+  `MatchEngineClient::with_members` path already re-discovers the leader from `/metrics` on
+  transport failure, so this is for gateways/non-Rust clients. Until then, document and enforce the
+  no-blind-retry rule so the gateway never duplicates a cancel or amend.
 - [ ] **P2 (blocked on this host)** Validate the default `local_lease` path on a second host and a
   Linux multi-host four-voter cluster: rerun `read_e2e --policy lease|local_lease` plus the
   e2e/cluster write A/B, force a stale lease or cache miss so the `ReadIndex` fallback is observed,
@@ -359,6 +373,29 @@ Completed work is summarised here; detailed evidence, measurements and implement
 in git history and the linked docs. For the full history, check out `TODO.md` from an earlier commit
 (`git log -- TODO.md`).
 
+- **2026-11-20** — Stateless order system (solution G): removed user-range enforcement from the
+  BFF (`--user-id-min/--user-id-max` and `DemoApp::require_user` are gone) and collapsed the four
+  order-system shards into one Deployment/Service/PDB/HPA. The renderer emits a base-host Ingress
+  (`orders.<ingress>`) plus per-shard alias Ingresses, all targeting that Service; the operator
+  reports one observation, the manager API/GUI link to the base host, and the stale static
+  `orders-index` redirect was removed from `web-ingress.yaml`. Clients now use one order-desk URL
+  with plain Ingress load balancing; the public gateway is deferred (decision matrix and full A/F
+  design in `docs/GATEWAY_ROUTING.md`).
+- **2026-11-20** — Bounded gRPC drain on shutdown: the live roll exposed engine pods stuck in
+  `Terminating` past the 60 s grace period. Instrumentation traced it to `grpc_task.await` —
+  tonic's graceful shutdown waits for every HTTP/2 connection to close, and peer `AppendStream`
+  replication connections stay open on a live cluster. `MatchEngineNode::stop_background` now caps
+  the drain at 5 s and aborts the server task on expiry (safe: the node is leaving the cluster and
+  peers retry against the remaining voters). A four-voter roll-under-load regression test failed
+  before the fix and passes after; live on OrbStack each pod now terminates in ~6 s and the whole
+  roll completes in ~1 minute with every order served.
+- **2026-11-20** — Raft-native leader discovery and failover: `MatchEngineClient::with_members`
+  re-discovers the current leader from `GET /metrics` on transport failure (the cached leader is a
+  hint, not a pin); `TargetSpec.engineMembers` and the control-plane renderer wire the full member
+  set into order-system `targets.json`. Validated live on OrbStack: a hard leader kill recovered
+  after the election with no client restart, and 1,480/1,480 orders succeeded through a full
+  one-pod-at-a-time rolling upgrade. The same live roll exposed the graceful-shutdown defect now
+  tracked as P1 #2. Design, alternatives and results are in `docs/LEADER_ENDPOINT_ROUTING.md`.
 - **2026-11-19** — Backup view in the control plane: the scheduled jobs publish the verified
   result to the `match-backup-status` ConfigMap, the manager serves
   `GET /api/v1/backup-status?shard={name}`, and the shard page gained a **backup** tab showing the

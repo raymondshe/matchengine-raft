@@ -1808,9 +1808,11 @@ assert_order_systems() {
         shards=$(jq -r --arg name "$name" '.items[] | select(.name == $name) | .spec.shards | length' <<<"$list")
         manifest=$(api_get "/api/v1/order-systems/$name/manifests")
         assert_eq "$(jq -r '[.items[] | select(.kind == "Deployment")] | length' <<<"$manifest")" \
-            "$shards" "$name renders one Deployment per user shard"
+            "1" "$name renders one stateless Deployment for all users"
         assert_eq "$(jq -r '[.items[] | select(.kind == "HorizontalPodAutoscaler")] | length' <<<"$manifest")" \
-            "$shards" "$name renders one HPA per user shard"
+            "1" "$name renders one HPA for all users"
+        assert_eq "$(jq -r --arg name "$name" '[.items[] | select(.kind == "Ingress")] | length' <<<"$manifest")" \
+            "$((shards + 1))" "$name renders the base host plus one alias Ingress per shard"
         jq -e '[.items[] | select(.kind == "HorizontalPodAutoscaler")]
             | length > 0
               and all(.[]; .spec.minReplicas == 1

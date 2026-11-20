@@ -2115,6 +2115,21 @@ fn order_system_labels(ctx: &OrderSystemCtx<'_>, shard: Option<&str>) -> BTreeMa
     labels
 }
 
+/// Metadata labels include the pruner's managed-by marker; the selector labels
+/// deliberately do not, because `spec.selector` is immutable and adding a
+/// label to an existing Deployment would be rejected by the API server.
+fn order_system_meta_labels(
+    ctx: &OrderSystemCtx<'_>,
+    shard: Option<&str>,
+) -> BTreeMap<String, String> {
+    let mut labels = order_system_labels(ctx, shard);
+    labels.insert(
+        "app.kubernetes.io/managed-by".to_string(),
+        MANAGED_BY.to_string(),
+    );
+    labels
+}
+
 fn order_system_config(ctx: &OrderSystemCtx<'_>) -> Value {
     let targets: Vec<Value> = ctx
         .targets
@@ -2160,24 +2175,17 @@ fn order_system_resources(ctx: &OrderSystemCtx<'_>) -> Resources {
         .unwrap_or_else(|| Resources::new("100m", "128Mi", "1000m", "512Mi"))
 }
 
-fn order_system_deployment(
-    ctx: &OrderSystemCtx<'_>,
-    shard: &crate::model::OrderSystemShard,
-    config: &Value,
-) -> Value {
+fn order_system_deployment(ctx: &OrderSystemCtx<'_>, config: &Value) -> Value {
     let spec = &ctx.system.spec;
-    let name = dns_label(&format!("{}-{}", ctx.system.name, shard.name));
-    let labels = order_system_labels(ctx, Some(&shard.name));
+    let name = dns_label(&ctx.system.name);
+    let labels = order_system_labels(ctx, None);
+    let meta_labels = order_system_meta_labels(ctx, None);
     let resources = order_system_resources(ctx);
     let args = vec![
         json!("--addr"),
         json!(format!("0.0.0.0:{}", spec.port)),
         json!("--targets"),
         json!("/etc/order-system/targets.json"),
-        json!("--user-id-min"),
-        json!(shard.user_id_min.to_string()),
-        json!("--user-id-max"),
-        json!(shard.user_id_max.to_string()),
     ];
     let mut deployment = json!({
         "apiVersion": "apps/v1",
@@ -2185,7 +2193,7 @@ fn order_system_deployment(
         "metadata": {
             "name": name,
             "namespace": ctx.namespace,
-            "labels": labels_value(&labels),
+            "labels": labels_value(&meta_labels),
         },
         "spec": {
             "strategy": { "type": "RollingUpdate", "rollingUpdate": { "maxUnavailable": 0, "maxSurge": 1 } },
@@ -2258,16 +2266,17 @@ fn order_system_deployment(
     deployment
 }
 
-fn order_system_service(ctx: &OrderSystemCtx<'_>, shard: &crate::model::OrderSystemShard) -> Value {
-    let name = dns_label(&format!("{}-{}", ctx.system.name, shard.name));
-    let labels = order_system_labels(ctx, Some(&shard.name));
+fn order_system_service(ctx: &OrderSystemCtx<'_>) -> Value {
+    let name = dns_label(&ctx.system.name);
+    let labels = order_system_labels(ctx, None);
+    let meta_labels = order_system_meta_labels(ctx, None);
     json!({
         "apiVersion": "v1",
         "kind": "Service",
         "metadata": {
             "name": name,
             "namespace": ctx.namespace,
-            "labels": labels_value(&labels),
+            "labels": labels_value(&meta_labels),
         },
         "spec": {
             "type": "ClusterIP",
@@ -2283,16 +2292,17 @@ fn order_system_service(ctx: &OrderSystemCtx<'_>, shard: &crate::model::OrderSys
     })
 }
 
-fn order_system_pdb(ctx: &OrderSystemCtx<'_>, shard: &crate::model::OrderSystemShard) -> Value {
-    let name = dns_label(&format!("{}-{}", ctx.system.name, shard.name));
-    let labels = order_system_labels(ctx, Some(&shard.name));
+fn order_system_pdb(ctx: &OrderSystemCtx<'_>) -> Value {
+    let name = dns_label(&ctx.system.name);
+    let labels = order_system_labels(ctx, None);
+    let meta_labels = order_system_meta_labels(ctx, None);
     json!({
         "apiVersion": "policy/v1",
         "kind": "PodDisruptionBudget",
         "metadata": {
             "name": name,
             "namespace": ctx.namespace,
-            "labels": labels_value(&labels),
+            "labels": labels_value(&meta_labels),
         },
         "spec": {
             "minAvailable": ctx.system.spec.min_replicas().saturating_sub(1),
@@ -2301,17 +2311,17 @@ fn order_system_pdb(ctx: &OrderSystemCtx<'_>, shard: &crate::model::OrderSystemS
     })
 }
 
-fn order_system_hpa(ctx: &OrderSystemCtx<'_>, shard: &crate::model::OrderSystemShard) -> Value {
+fn order_system_hpa(ctx: &OrderSystemCtx<'_>) -> Value {
     let spec = &ctx.system.spec;
-    let name = dns_label(&format!("{}-{}", ctx.system.name, shard.name));
-    let labels = order_system_labels(ctx, Some(&shard.name));
+    let name = dns_label(&ctx.system.name);
+    let meta_labels = order_system_meta_labels(ctx, None);
     json!({
         "apiVersion": "autoscaling/v2",
         "kind": "HorizontalPodAutoscaler",
         "metadata": {
             "name": name,
             "namespace": ctx.namespace,
-            "labels": labels_value(&labels),
+            "labels": labels_value(&meta_labels),
         },
         "spec": {
             "scaleTargetRef": {
@@ -2345,44 +2355,64 @@ fn order_system_hpa(ctx: &OrderSystemCtx<'_>, shard: &crate::model::OrderSystemS
     })
 }
 
-fn order_system_ingress(
-    ctx: &OrderSystemCtx<'_>,
-    shard: &crate::model::OrderSystemShard,
-) -> Option<Value> {
+/// One Ingress on the base host and one alias Ingress per declared shard.
+/// All of them target the single stateless order-system Service, so the
+/// Ingress controller simply load-balances across identical pods and no
+/// user-ID routing is needed. Per-shard aliases keep existing client URLs
+/// working during migration; they can be retired once clients use the base host.
+fn order_system_ingresses(ctx: &OrderSystemCtx<'_>) -> Vec<Value> {
     let base = ctx.system.spec.ingress.trim().trim_end_matches('.');
     if base.is_empty() {
-        return None;
+        return Vec::new();
     }
-    let name = dns_label(&format!("{}-{}", ctx.system.name, shard.name));
-    let labels = order_system_labels(ctx, Some(&shard.name));
-    let host = format!("{}.{}", shard.name, base);
-    let mut spec = json!({
-        "rules": [{
-            "host": host,
-            "http": { "paths": [{
-                "path": "/",
-                "pathType": "Prefix",
-                "backend": { "service": { "name": name, "port": { "name": "http" } } },
-            }] },
-        }],
-    });
-    if !ctx.system.spec.tls_secret.trim().is_empty() {
-        spec["tls"] = json!([{ "hosts": [host], "secretName": ctx.system.spec.tls_secret }]);
+    let service = dns_label(&ctx.system.name);
+    let meta_labels = order_system_meta_labels(ctx, None);
+    let primary = dns_label(&ctx.system.name);
+    let mut hosts = vec![(primary, base.to_string())];
+    for shard in &ctx.system.spec.shards {
+        let host = format!("{}.{}", shard.name, base);
+        let alias_name = dns_label(&format!("{}-alias", host));
+        if !hosts.iter().any(|(_, existing)| existing == &host)
+            && !hosts.iter().any(|(existing, _)| existing == &alias_name)
+        {
+            hosts.push((alias_name, host));
+        }
     }
-    Some(json!({
-        "apiVersion": "networking.k8s.io/v1",
-        "kind": "Ingress",
-        "metadata": {
-            "name": name,
-            "namespace": ctx.namespace,
-            "labels": labels_value(&labels),
-        },
-        "spec": spec,
-    }))
+    hosts
+        .into_iter()
+        .map(|(name, host)| {
+            let mut spec = json!({
+                "rules": [{
+                    "host": host,
+                    "http": { "paths": [{
+                        "path": "/",
+                        "pathType": "Prefix",
+                        "backend": { "service": { "name": service, "port": { "name": "http" } } },
+                    }] },
+                }],
+            });
+            if !ctx.system.spec.tls_secret.trim().is_empty() {
+                spec["tls"] =
+                    json!([{ "hosts": [host], "secretName": ctx.system.spec.tls_secret }]);
+            }
+            json!({
+                "apiVersion": "networking.k8s.io/v1",
+                "kind": "Ingress",
+                "metadata": {
+                    "name": name,
+                    "namespace": ctx.namespace,
+                    "labels": labels_value(&meta_labels),
+                },
+                "spec": spec,
+            })
+        })
+        .collect()
 }
 
-/// Render one `OrderSystem` into one ConfigMap and a Deployment/Service/PDB/Ingress
-/// set per user-ID shard. Every shard receives the same target list.
+/// Render one `OrderSystem` into one ConfigMap and one stateless
+/// Deployment/Service/PDB/HPA set, plus a base-host Ingress and alias Ingresses
+/// for the declared user-ID shards. Every instance serves every user and
+/// receives the same target list.
 pub fn render_order_system(
     catalog: &Catalog,
     name: &str,
@@ -2518,17 +2548,13 @@ pub fn render_order_system(
     };
     let config = order_system_config(&ctx);
     let mut objects = vec![order_system_config_map(&ctx, &config)];
-    for shard in &system.spec.shards {
-        objects.push(order_system_deployment(&ctx, shard, &config));
-        objects.push(order_system_service(&ctx, shard));
-        objects.push(order_system_pdb(&ctx, shard));
-        if !system.spec.paused {
-            objects.push(order_system_hpa(&ctx, shard));
-        }
-        if let Some(ingress) = order_system_ingress(&ctx, shard) {
-            objects.push(ingress);
-        }
+    objects.push(order_system_deployment(&ctx, &config));
+    objects.push(order_system_service(&ctx));
+    objects.push(order_system_pdb(&ctx));
+    if !system.spec.paused {
+        objects.push(order_system_hpa(&ctx));
     }
+    objects.extend(order_system_ingresses(&ctx));
     Ok(objects)
 }
 
@@ -3371,7 +3397,7 @@ mod tests {
             .iter()
             .filter(|object| object["kind"] == "HorizontalPodAutoscaler")
             .collect();
-        assert_eq!(2, hpas.len());
+        assert_eq!(1, hpas.len());
         assert_eq!(1, hpas[0]["spec"]["minReplicas"]);
         assert_eq!(2, hpas[0]["spec"]["maxReplicas"]);
         assert_eq!(
@@ -3382,7 +3408,19 @@ mod tests {
             .iter()
             .filter(|object| object["kind"] == "Deployment")
             .collect();
-        assert_eq!(2, deployments.len());
+        assert_eq!(1, deployments.len());
+        assert_eq!("orders", deployments[0]["metadata"]["name"]);
+        assert_eq!(
+            MANAGED_BY,
+            deployments[0]["metadata"]["labels"]["app.kubernetes.io/managed-by"]
+        );
+        // The selector must stay stable: managed-by is metadata-only because
+        // spec.selector is immutable on an existing Deployment.
+        assert!(
+            deployments[0]["spec"]["selector"]["matchLabels"]
+                .get("app.kubernetes.io/managed-by")
+                .is_none()
+        );
         // The HPA owns the replica count while the system is running.
         assert!(deployments[0]["spec"].get("replicas").is_none());
         assert_eq!(
@@ -3393,15 +3431,33 @@ mod tests {
             1,
             deployments[0]["spec"]["strategy"]["rollingUpdate"]["maxSurge"]
         );
-        assert_eq!(
-            1,
-            deployments[0]["spec"]["template"]["spec"]["containers"][0]["args"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .filter(|arg| *arg == "--user-id-min")
-                .count()
-        );
+        // One stateless deployment: no user-range flags; every user is served.
+        let args = deployments[0]["spec"]["template"]["spec"]["containers"][0]["args"]
+            .as_array()
+            .unwrap();
+        assert!(args.iter().all(|arg| arg.as_str() != Some("--user-id-min")));
+        assert!(args.iter().all(|arg| arg.as_str() != Some("--user-id-max")));
+
+        // One base-host Ingress plus one alias per declared shard, all pointing
+        // at the single Service.
+        let ingresses: Vec<&Value> = objects
+            .iter()
+            .filter(|object| object["kind"] == "Ingress")
+            .collect();
+        assert_eq!(3, ingresses.len());
+        let hosts: Vec<&str> = ingresses
+            .iter()
+            .map(|ingress| ingress["spec"]["rules"][0]["host"].as_str().unwrap())
+            .collect();
+        assert!(hosts.contains(&"orders.match-eu-1.example"));
+        assert!(hosts.contains(&"users-0.orders.match-eu-1.example"));
+        assert!(hosts.contains(&"users-1.orders.match-eu-1.example"));
+        for ingress in &ingresses {
+            assert_eq!(
+                "orders",
+                ingress["spec"]["rules"][0]["http"]["paths"][0]["backend"]["service"]["name"]
+            );
+        }
 
         // The target dials pod 0, whose node ID is the deployment's Raft ID
         // offset (the pod ordinal is added by `--id $(POD_ORDINAL)`).

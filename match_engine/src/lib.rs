@@ -297,7 +297,23 @@ impl MatchEngineNode {
         if let Some(tx) = self.grpc_shutdown.take() {
             let _ = tx.send(());
         }
-        let _ = self.grpc_task.await;
+        // tonic's graceful shutdown waits for every HTTP/2 connection to close.
+        // Peer replication streams (`AppendStream`) are long-lived and stay open
+        // while the cluster is up, so draining them can never finish on a live
+        // cluster. Give well-behaved peers a short window, then abort the server
+        // task: dropping in-flight Raft RPCs is safe because this node is leaving
+        // the cluster and peers will retry against the remaining voters.
+        if tokio::time::timeout(GRPC_DRAIN_TIMEOUT, &mut self.grpc_task)
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                timeout = ?GRPC_DRAIN_TIMEOUT,
+                "gRPC drain timed out on active peer streams; aborting server task"
+            );
+            self.grpc_task.abort();
+            let _ = self.grpc_task.await;
+        }
 
         // Stop the feed before Raft: the watcher must not push snapshots for a
         // shutting-down node, and the publisher task joins here.
@@ -332,6 +348,14 @@ pub async fn start_match_engine_node(
 ) -> std::io::Result<()> {
     start_match_engine_node_with_config(node_id, http_addr, default_raft_config()).await
 }
+
+/// Upper bound for draining the gRPC Raft server on shutdown.
+///
+/// tonic waits for every HTTP/2 connection to close before its graceful
+/// shutdown future resolves, and peer `AppendStream` replication connections
+/// stay open as long as the cluster is up. Without a cap the node hangs in
+/// `stop_background()` until Kubernetes SIGKILLs it at the grace-period limit.
+const GRPC_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Snapshot after this many applied log entries even if the timer has not fired.
 pub const DEFAULT_SNAPSHOT_LOG_THRESHOLD: u64 = 100_000;

@@ -1412,27 +1412,35 @@ async fn order_system_detail(
     let mut scope = BTreeSet::new();
     scope.insert(name.clone());
     let base = system.spec.ingress.trim().trim_end_matches('.');
+    let service = dns_label(&system.name);
+    let url = if base.is_empty() {
+        format!(
+            "http://{service}.{}.svc.cluster.local:{}",
+            system.namespace, system.spec.port
+        )
+    } else {
+        format!("http://{base}")
+    };
+    // Shard ranges are capacity metadata; every instance serves every user,
+    // so all shard rows link to the same stateless order desk.
     let shards: Vec<Value> = system
         .spec
         .shards
         .iter()
         .map(|shard| {
-            let service = dns_label(&format!("{}-{}", system.name, shard.name));
             json!({
                 "name": shard.name,
                 "userIdMin": shard.user_id_min,
                 "userIdMax": shard.user_id_max,
                 "service": service,
-                "url": if base.is_empty() {
-                    format!("http://{service}.{}.svc.cluster.local:{}", system.namespace, system.spec.port)
-                } else {
-                    format!("https://{}.{base}", shard.name)
-                },
+                "url": url,
             })
         })
         .collect();
     Ok(Json(json!({
         "orderSystem": system,
+        "service": service,
+        "url": url,
         "shards": shards,
         "validation": report.scoped(&scope),
     })))
@@ -2060,17 +2068,18 @@ mod tests {
             .map(|object| object["kind"].as_str().unwrap())
             .collect();
         assert_eq!(
-            2,
+            1,
             kinds.iter().filter(|kind| **kind == "Deployment").count()
         );
         assert_eq!(
-            2,
+            1,
             kinds
                 .iter()
                 .filter(|kind| **kind == "HorizontalPodAutoscaler")
                 .count()
         );
-        assert_eq!(2, kinds.iter().filter(|kind| **kind == "Ingress").count());
+        // Base host + one alias per declared shard, all on the single Service.
+        assert_eq!(3, kinds.iter().filter(|kind| **kind == "Ingress").count());
 
         let (status, body) = post_json_to(
             app.clone(),

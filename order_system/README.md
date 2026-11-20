@@ -58,14 +58,15 @@ cargo run --manifest-path order_system/Cargo.toml -- \
 ```
 
 - `--addr`: demo WebUI/BFF address.
-- `--targets <file>`: JSON file with one target per engine/symbol. This is the multi-symbol mode:
-  every user shard can select every target.
+- `--targets <file>`: JSON file with one target per engine/symbol. Every instance serves every
+  user and can select every target; Kubernetes load-balances across identical replicas.
 - `--engine`: HTTP API address of the legacy Spot engine target.
 - `--engine-id`: that node's Raft id.
 - `--perp-engine`: optional HTTP API address of a **second** engine for the legacy Perpetual target.
 - `--perp-engine-id`: the perpetual node's Raft id (default 1).
-- `--user-id-min` / `--user-id-max`: inclusive user-ID range enforced by this instance. Requests
-  for any other user fail with HTTP `409 user_shard`.
+- User-ID ranges are no longer enforced in the process. Deployments are stateless and any replica
+  serves any user; per-user state would live in a sharded store (design-level, see
+  `docs/GATEWAY_ROUTING.md`).
 
 `--targets` format:
 

@@ -556,7 +556,7 @@ kubectl apply -f k8s_control_plane/deploy/web-ingress.yaml
 
 # The console, shard links and market-data hosts now resolve through OrbStack DNS + the front door
 curl -s -o /dev/null -w '%{http_code}\n' http://console.match-eu-1.example/
-curl -s -o /dev/null -w '%{http_code}\n' http://users-0.orders.match-eu-1.example/demo/
+curl -s -o /dev/null -w '%{http_code}\n' http://orders.match-eu-1.example/demo/
 curl -s -o /dev/null -w '%{http_code}\n' http://ws-fx-eu-02.match-eu-1.example/
 ```
 
@@ -566,13 +566,13 @@ The static web hosts are:
 |---|---|
 | `console.match-eu-1.example` | Control-plane GUI, manager API and the per-pod engine-console proxy. |
 | `engine.match-eu-1.example` | Stable engine-console origin. The root redirects to `console.match-eu-1.example/?view=engine`; open a console at `http://engine.match-eu-1.example/api/v1/shards/<shard>/processes/<symbol>/pods/<pod>/console/`. |
-| `orders.match-eu-1.example` | Order-system selector. It redirects to `console.match-eu-1.example/?view=ordersystem`; each user shard keeps its own `users-<n>.orders.match-eu-1.example/demo/` WebUI. |
-| `users-<n>.orders.match-eu-1.example` | One order-system user shard (order entry stays here). |
+| `orders.match-eu-1.example` | The single stateless order desk (`/demo/`), load-balanced across all order-system replicas. |
+| `users-<n>.orders.match-eu-1.example` | Migration aliases for the former per-shard WebUIs; they point at the same order desk. |
 | `fast-ws-*.match-eu-1.example`, `ws-fx-eu-02.match-eu-1.example` | Market-data fast/terminal WebSocket hosts. |
 
-The manager and order hosts are still plaintext and unauthenticated in the demo. The `orders` base
-host is a selector, not a user-ID-routing gateway; routing a user to the correct shard from one host
-remains the P1 gateway item.
+The manager and order hosts are still plaintext and unauthenticated in the demo. The `orders` host
+needs no user-ID routing: every order-system instance serves every user. A public engine gateway
+for `SymbolRoute` leader routing is deferred per `docs/GATEWAY_ROUTING.md` §9.
 
 After the rollout, every Ingress shows the controller ClusterIP in `ADDRESS`:
 
@@ -1022,7 +1022,7 @@ Roll a new stateless image without touching Raft:
 curl -s 'http://console.match-eu-1.example/api/v1/images?orderSystem=orders'
 curl -s -X POST http://console.match-eu-1.example/api/v1/order-systems/orders/upgrade \
   -H 'content-type: application/json' -d '{"image":"matchengine-order-system:arm64-v3"}'
-kubectl -n match-eu-1 rollout status deploy/orders-users-0
+kubectl -n match-eu-1 rollout status deploy/orders
 ```
 
 The GUI's **upgrade** action opens a picker backed by
@@ -1030,17 +1030,17 @@ The GUI's **upgrade** action opens a picker backed by
 order-system pod, and catalog references for the order-system repository, with a custom
 digest-pinned field for a new reference.
 
-Each shard rolls independently with `maxUnavailable: 0` and `maxSurge: 1`; there is no quorum or
-leader-transfer gate. The BFF enforces the shard's user range (`409 user_shard`), sets `owner_id`
-on new orders, and rejects cancels/amends by a different user. Clients can still reach one shard
-directly; a user-ID-routing edge is a follow-up. The manager **order systems** tab lists shards,
-targets, HPA bounds, readiness and a **WebUI** link per shard
-(`http://<shard>.<spec.ingress>/demo/`, `https` with `tlsSecret`), and has an **upgrade** action.
-Order entry happens in the order-system WebUI; the manager neither renders an order ticket nor
-proxies orders. For the shard Hosts to load in the local demo, install the ingress controller and
-front door described in [Reach the demo ingress hosts](#reach-the-demo-ingress-hosts); for example
-open `http://users-0.orders.match-eu-1.example/demo/`. If the ingress is not installed,
-port-forward that shard's Service and open `/demo/`.
+One stateless Deployment rolls with `maxUnavailable: 0` and `maxSurge: 1`; there is no quorum or
+leader-transfer gate. Every instance serves every user — the BFF no longer enforces user ranges —
+and sets `owner_id` on new orders. The base host `http://<spec.ingress>/demo/` is the one order desk
+(the former `users-<n>.<ingress>` hosts remain as aliases). The manager **order systems** tab lists
+the capacity ranges, targets, HPA bounds, readiness and one **WebUI** link to the base host
+(`https` with `tlsSecret`), and has an **upgrade** action. Order entry happens in the order-system
+WebUI; the manager neither renders an order ticket nor proxies orders, and no user-ID routing
+gateway is needed. For the hosts to load in the local demo, install the ingress controller and front
+door described in [Reach the demo ingress hosts](#reach-the-demo-ingress-hosts); for example open
+`http://orders.match-eu-1.example/demo/`. If the ingress is not installed, port-forward the
+`orders` Service and open `/demo/`.
 
 ### Retention window
 
