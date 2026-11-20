@@ -83,6 +83,7 @@ async fn main() -> anyhow::Result<()> {
             engine: opt.engine.clone(),
             engine_id: opt.engine_id,
             product: Product::Spot,
+            engine_members: Vec::new(),
         }];
         if let Some(engine) = opt.perp_engine.clone() {
             targets.push(TargetSpec {
@@ -91,6 +92,7 @@ async fn main() -> anyhow::Result<()> {
                 engine,
                 engine_id: opt.perp_engine_id,
                 product: Product::Perpetual,
+                engine_members: Vec::new(),
             });
         }
         targets

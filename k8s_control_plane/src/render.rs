@@ -2082,6 +2082,8 @@ struct OrderSystemTargetResolved {
     engine: String,
     engine_id: u64,
     product: OrderSystemProduct,
+    /// All Raft members (node id + HTTP addr) for leader discovery/failover.
+    engine_members: Vec<(u64, String)>,
 }
 
 struct OrderSystemCtx<'a> {
@@ -2124,6 +2126,11 @@ fn order_system_config(ctx: &OrderSystemCtx<'_>) -> Value {
                 "engine": target.engine,
                 "engineId": target.engine_id,
                 "product": target.product,
+                "engineMembers": target
+                    .engine_members
+                    .iter()
+                    .map(|(node_id, addr)| json!({ "nodeId": node_id, "addr": addr }))
+                    .collect::<Vec<_>>(),
             })
         })
         .collect();
@@ -2457,6 +2464,21 @@ pub fn render_order_system(
             "http://{}-0.{}-headless.{}.svc.cluster.local:{}",
             shard.name, shard.name, ns, deployment.spec.placement.http_port
         );
+        // Enumerate every Raft member so the order-system client can discover
+        // the current leader from `GET /metrics` if its target pod is down.
+        // Pod ordinal maps to raft id `raft_id_offset + ordinal` (the engine is
+        // started with `--id $(POD_ORDINAL) --id-offset <raft_id_offset>`).
+        let engine_members = (0..shard.spec.replicas)
+            .map(|ordinal| {
+                (
+                    deployment.spec.raft_id_offset + ordinal as u64,
+                    format!(
+                        "{}-{}.{}-headless.{}.svc.cluster.local:{}",
+                        shard.name, ordinal, shard.name, ns, deployment.spec.placement.http_port
+                    ),
+                )
+            })
+            .collect();
         targets.push(OrderSystemTargetResolved {
             id: symbol.name.clone(),
             label: if target.label.trim().is_empty() {
@@ -2467,6 +2489,7 @@ pub fn render_order_system(
             engine,
             engine_id: deployment.spec.raft_id_offset,
             product: target.product,
+            engine_members,
         });
     }
     if targets.is_empty() {
@@ -3401,6 +3424,22 @@ mod tests {
                     .as_str()
                     .is_some_and(|engine| engine.contains("-0.")),
                 "target dials pod 0: {target}"
+            );
+            let members = target["engineMembers"]
+                .as_array()
+                .expect("engineMembers array");
+            assert_eq!(4, members.len());
+            assert_eq!(0, members[0]["nodeId"]);
+            assert!(
+                members[0]["addr"]
+                    .as_str()
+                    .is_some_and(|addr| addr.contains("-0."))
+            );
+            assert_eq!(3, members[3]["nodeId"]);
+            assert!(
+                members[3]["addr"]
+                    .as_str()
+                    .is_some_and(|addr| addr.contains("-3."))
             );
         }
 

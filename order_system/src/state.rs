@@ -45,6 +45,14 @@ pub const SCHEMA_VERSION: u8 = 2;
 const PERPETUAL_POLICY_HINT: &str =
     "linear perpetual requires fee_asset_policy=quote; configure the symbol before trading";
 
+/// One Raft member used by the order system for leader discovery/failover.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EngineMemberSpec {
+    pub node_id: u64,
+    pub addr: String,
+}
+
 /// One configured order-system target. A target points at one engine
 /// cluster/process that serves exactly one trading symbol.
 #[derive(Debug, Clone, Deserialize)]
@@ -63,10 +71,26 @@ pub struct TargetSpec {
     /// Spot cash or the demo-only perpetual margin overlay.
     #[serde(default)]
     pub product: Product,
+    /// All Raft members of the engine cluster. When present the client uses
+    /// Raft-native leader discovery: on a transport failure it queries
+    /// `GET /metrics` on these members and re-dials the current leader, so a
+    /// rolling pod reboot does not strand order entry on a dead pod.
+    #[serde(default)]
+    pub engine_members: Vec<EngineMemberSpec>,
 }
 
 fn default_engine_id() -> u64 {
     1
+}
+
+/// `MatchEngineClient` adds the scheme itself; accept either form in target
+/// config and normalize to `host:port`.
+fn normalize_engine_addr(addr: &str) -> String {
+    let addr = addr.trim().trim_end_matches('/');
+    addr.strip_prefix("http://")
+        .or_else(|| addr.strip_prefix("https://"))
+        .unwrap_or(addr)
+        .to_string()
 }
 
 /// JSON file accepted by `--targets`: one entry per engine/symbol target.
@@ -93,23 +117,24 @@ pub struct EngineBackend {
 
 impl EngineBackend {
     fn new(target: TargetSpec) -> Self {
-        // `MatchEngineClient` adds the scheme itself; accept either form in
-        // target config and normalize to `host:port`.
-        let engine = target
-            .engine
-            .trim()
-            .trim_end_matches('/')
-            .strip_prefix("http://")
-            .or_else(|| {
-                target
-                    .engine
-                    .trim()
-                    .trim_end_matches('/')
-                    .strip_prefix("https://")
-            })
-            .unwrap_or_else(|| target.engine.trim().trim_end_matches('/'))
-            .to_string();
-        let client = MatchEngineClient::new(target.engine_id, engine.clone());
+        let engine = normalize_engine_addr(&target.engine);
+        // When the renderer supplies the full Raft member set, enable
+        // leader discovery so a dead target pod fails over to the current
+        // leader instead of blocking order entry. Otherwise keep the original
+        // single-target behaviour for hand-written target files.
+        let client = if target.engine_members.is_empty() {
+            MatchEngineClient::new(target.engine_id, engine.clone())
+        } else {
+            let mut members: Vec<(u64, String)> = target
+                .engine_members
+                .into_iter()
+                .map(|member| (member.node_id, normalize_engine_addr(&member.addr)))
+                .collect();
+            if !members.iter().any(|(id, _)| *id == target.engine_id) {
+                members.insert(0, (target.engine_id, engine.clone()));
+            }
+            MatchEngineClient::with_members(members, Default::default())
+        };
         let label = if target.label.trim().is_empty() {
             target.id.clone()
         } else {
@@ -1161,7 +1186,31 @@ mod tests {
             engine: engine.to_string(),
             engine_id,
             product,
+            engine_members: Vec::new(),
         }
+    }
+
+    #[test]
+    fn target_engine_members_enable_raft_failover_client() {
+        let mut target = target("gbpusd", Product::Spot, 0, "http://engine-0:21001");
+        target.engine_members = vec![
+            EngineMemberSpec {
+                node_id: 0,
+                addr: "http://engine-0:21001".to_string(),
+            },
+            EngineMemberSpec {
+                node_id: 1,
+                addr: "engine-1:21001".to_string(),
+            },
+        ];
+        let backend = EngineBackend::new(target);
+        assert_eq!(2, backend.client.members.len());
+        assert_eq!("engine-0:21001", backend.client.members[0].1);
+        assert_eq!("engine-1:21001", backend.client.members[1].1);
+        assert_eq!(
+            (0, "engine-0:21001".to_string()),
+            *backend.client.leader.lock().unwrap()
+        );
     }
 
     fn order(side: OrderSide, price: i128, volume: i128, sequence: u64) -> Order {

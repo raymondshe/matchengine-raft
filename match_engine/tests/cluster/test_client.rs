@@ -201,6 +201,85 @@ fn client_retries_a_dropped_connection() {
 }
 
 #[test]
+fn client_discovers_new_leader_after_target_dies() {
+    C::run(async {
+        let temp = TempDir::new("client-discovery-failover");
+        let storage = StorageConfig::new(temp.path()).with_instance_prefix("client-discovery");
+        let bases = [21950u16, 21951, 21952];
+        let addr = |id: u64| TestAddr::new(bases[(id - 1) as usize]).to_string();
+
+        let mut nodes: Vec<Option<MatchEngineNode>> = Vec::new();
+        for (i, id) in (1..=3u64).enumerate() {
+            nodes.push(Some(
+                start_node(id, TestAddr::new(bases[i]), &storage).await,
+            ));
+        }
+        let observers: Vec<MatchEngineClient<C>> = (1..=3u64)
+            .map(|id| MatchEngineClient::<C>::new(id, addr(id)))
+            .collect();
+
+        observers[0].init().await.unwrap().unwrap();
+        let leader =
+            wait_for_leader(&observers, None, Instant::now() + Duration::from_secs(15)).await;
+        assert_eq!(1, leader);
+        observers[0]
+            .add_learner((2, addr(2)))
+            .await
+            .unwrap()
+            .unwrap();
+        observers[0]
+            .add_learner((3, addr(3)))
+            .await
+            .unwrap()
+            .unwrap();
+        observers[0]
+            .change_membership(&BTreeSet::from([1, 2, 3]))
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Kill the leader; a survivor takes over.
+        nodes[(leader - 1) as usize]
+            .take()
+            .unwrap()
+            .shutdown()
+            .await
+            .unwrap();
+        let new_leader = wait_for_leader(
+            &observers,
+            Some(leader),
+            Instant::now() + Duration::from_secs(20),
+        )
+        .await;
+        assert_ne!(leader, new_leader);
+
+        // Seed the client with the DEAD leader as its first member/hint. The
+        // first write must fail over through Raft-native discovery on /metrics.
+        let members: Vec<(u64, String)> = (1..=3u64).map(|id| (id, addr(id))).collect();
+        let client = MatchEngineClient::<C>::with_members(
+            members,
+            ClientConfig {
+                max_retries: 4,
+                initial_backoff: Duration::from_millis(50),
+                max_backoff: Duration::from_millis(200),
+                ..ClientConfig::default()
+            },
+        );
+        let response = client.write(&place()).await.unwrap().unwrap();
+        assert_eq!(Some(0), response.data.sequence);
+        assert_eq!(
+            (new_leader, addr(new_leader)),
+            *client.leader.lock().unwrap(),
+            "the client must cache the newly discovered leader"
+        );
+
+        for node in nodes.into_iter().flatten() {
+            node.shutdown().await.unwrap();
+        }
+    });
+}
+
+#[test]
 fn client_forwards_after_leader_failover() {
     C::run(async {
         let temp = TempDir::new("client-failover");

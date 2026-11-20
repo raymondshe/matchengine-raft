@@ -17,6 +17,7 @@ use openraft::errors::LinearizableReadError;
 use openraft::errors::NetworkError;
 use openraft::errors::RPCError;
 use openraft::errors::Unreachable;
+use openraft::membership::RaftMembership;
 use openraft::raft::ClientWriteResponse;
 use reqwest::Client;
 use serde::Serialize;
@@ -91,6 +92,18 @@ impl<C: RaftTypeConfig> ClientError<C> {
             Self::Api { status, .. } => *status == 429 || (500..600).contains(status),
             Self::NoLeader | Self::Decode(_) | Self::Rpc(RPCError::RemoteError(_)) => false,
         }
+    }
+
+    /// Whether the target node itself could not be reached (as opposed to the
+    /// cluster rejecting the request). Only these errors trigger leader
+    /// re-discovery: an edge `429`/`5xx` means the node is alive, so rotating
+    /// leaders would be wasteful and could ping-pong between members.
+    pub fn is_transport_error(&self) -> bool {
+        matches!(
+            self,
+            Self::Timeout
+                | Self::Rpc(RPCError::Timeout(_) | RPCError::Unreachable(_) | RPCError::Network(_))
+        )
     }
 
     /// The HTTP status for an edge rejection.
@@ -172,10 +185,21 @@ pub struct MatchEngineClient<C>
 where
     C: RaftTypeConfig,
 {
-    /// The leader node to send request to.
+    /// The last known leader node (id + HTTP addr).
     ///
-    /// All traffic should be sent to the leader in a cluster.
+    /// This is a **hint, not a pin**: after a transport error the client
+    /// re-discovers the leader from `members` and replaces this value. Requests
+    /// are sent here on the fast path.
     pub leader: Arc<Mutex<(C::NodeId, String)>>,
+
+    /// Bootstrap members (id + HTTP addr) used for leader discovery.
+    ///
+    /// Any member can answer `GET /metrics`, which reports the current Raft
+    /// leader and the membership address map. The client queries these on a
+    /// transport failure and on startup recovery; no Kubernetes leader label or
+    /// Service endpoint switch is required. With a single member this reduces
+    /// to a plain single-target client.
+    pub members: Arc<Vec<(C::NodeId, String)>>,
 
     pub inner: Client,
 
@@ -187,23 +211,45 @@ impl<C> MatchEngineClient<C>
 where
     C: RaftTypeConfig<Node = BasicNode>,
 {
-    /// Create a client with the default transport policy.
+    /// Create a client with the default transport policy that talks to one node.
+    ///
+    /// For multi-node failover use [`MatchEngineClient::with_members`].
     pub fn new(leader_id: C::NodeId, leader_addr: String) -> Self {
         Self::with_config(leader_id, leader_addr, ClientConfig::default())
     }
 
-    /// Create a client with an explicit timeout/retry policy.
+    /// Create a single-target client with an explicit timeout/retry policy.
     pub fn with_config(leader_id: C::NodeId, leader_addr: String, config: ClientConfig) -> Self {
+        Self::with_members(vec![(leader_id, leader_addr)], config)
+    }
+
+    /// Create a client that discovers the leader from a set of Raft members.
+    ///
+    /// The first member is used as the initial leader hint; the rest are
+    /// discovery sources. On a transport error the client calls `GET /metrics`
+    /// on the members (skipping the address that just failed) to resolve the
+    /// current leader's HTTP address, then retries there. This keeps leader
+    /// tracking inside Raft — no Kubernetes label/Service changes are needed —
+    /// and works identically for dedicated and packed shards.
+    pub fn with_members(members: Vec<(C::NodeId, String)>, config: ClientConfig) -> Self {
+        assert!(!members.is_empty(), "at least one member is required");
         let inner = Client::builder()
             .no_proxy()
             .timeout(config.timeout)
             .build()
             .expect("HTTP client configuration is valid");
+        let initial = members[0].clone();
         Self {
-            leader: Arc::new(Mutex::new((leader_id, leader_addr))),
+            leader: Arc::new(Mutex::new(initial)),
+            members: Arc::new(members),
             inner,
             config,
         }
+    }
+
+    /// Address of the current leader hint.
+    fn leader_addr(&self) -> String {
+        self.leader.lock().unwrap().1.clone()
     }
 
     fn backoff(&self, attempt: usize) -> Duration {
@@ -363,13 +409,14 @@ where
 
     // --- Internal methods
 
-    /// Send one request without retrying.
+    /// Send one request to an explicit address without retrying.
     ///
     /// It sends out a POST request if `req` is Some. Otherwise a GET request.
     /// The remote endpoint must respond a reply in form of `Result<Resp, Err>`.
     /// A non-2xx response is returned as [`ClientError::Api`] with the edge body.
-    async fn send<Req, Resp, Err>(
+    async fn send_to<Req, Resp, Err>(
         &self,
+        addr: &str,
         uri: &str,
         req: Option<&Req>,
     ) -> Result<Result<Resp, Err>, ClientError<C>>
@@ -380,11 +427,7 @@ where
     {
         tracing::debug!("client-http: start, send to {}; request: {:?}", uri, req);
 
-        let (_leader_id, url) = {
-            let t = self.leader.lock().unwrap();
-            let target_addr = &t.1;
-            (t.0.clone(), format!("http://{}/{}", target_addr, uri))
-        };
+        let url = format!("http://{}/{}", addr.trim_end_matches('/'), uri);
 
         let resp = if let Some(r) = req {
             tracing::debug!(
@@ -434,15 +477,11 @@ where
 
     /// Send one GET request whose response is raw JSON rather than the usual
     /// `Result<Resp, Err>` envelope (`/health`, `/ready`, `/pretrade/status`).
-    async fn send_raw<Resp>(&self, uri: &str) -> Result<Resp, ClientError<C>>
+    async fn send_raw_to<Resp>(&self, addr: &str, uri: &str) -> Result<Resp, ClientError<C>>
     where
         Resp: DeserializeOwned,
     {
-        let (_leader_id, url) = {
-            let t = self.leader.lock().unwrap();
-            let target_addr = &t.1;
-            (t.0.clone(), format!("http://{}/{}", target_addr, uri))
-        };
+        let url = format!("http://{}/{}", addr.trim_end_matches('/'), uri);
 
         let resp = self.inner.get(url).send().await.map_err(|e| {
             if e.is_timeout() {
@@ -468,33 +507,117 @@ where
             .map_err(|e| ClientError::Decode(e.to_string()))
     }
 
-    /// Raw-GET variant with transient retries.
+    /// Resolve the current leader from `GET /metrics` on one member.
+    ///
+    /// Returns `Ok(None)` when the member reports no known leader (election in
+    /// progress) or the leader id is not in the membership. Such a result is
+    /// not an error — the caller should try another member.
+    async fn discover_from(
+        &self,
+        addr: &str,
+    ) -> Result<Option<(C::NodeId, String)>, ClientError<C>> {
+        let res = self
+            .send_to::<_, RaftMetrics<C>, Infallible>(addr, "metrics", None::<&()>)
+            .await?;
+        let metrics = res.unwrap(); // Err = Infallible
+        let Some(leader_id) = metrics.current_leader else {
+            return Ok(None);
+        };
+        let membership = metrics.membership_config.membership();
+        let Some(node) = membership.get_node(&leader_id) else {
+            return Ok(None);
+        };
+        Ok(Some((leader_id, node.node.addr.clone())))
+    }
+
+    /// Re-discover the leader from the configured members.
+    ///
+    /// The cached leader is queried first (skipping `failed_addr`, which just
+    /// produced a transport error), followed by the bootstrap members. The
+    /// first member that reports a leader wins and updates the cached hint.
+    /// Discovery calls are read-only, so they are safe to repeat on any member.
+    async fn discover_leader(&self, failed_addr: Option<&str>) -> Result<(), ClientError<C>> {
+        let mut candidates: Vec<String> = Vec::new();
+        let hint = self.leader_addr();
+        if !hint.is_empty() && Some(hint.as_str()) != failed_addr && !candidates.contains(&hint) {
+            candidates.push(hint);
+        }
+        for (_, addr) in self.members.iter() {
+            if Some(addr.as_str()) != failed_addr && !candidates.contains(addr) {
+                candidates.push(addr.clone());
+            }
+        }
+
+        let mut last_error = ClientError::NoLeader;
+        for addr in candidates {
+            match self.discover_from(&addr).await {
+                Ok(Some((id, leader_addr))) => {
+                    {
+                        let mut t = self.leader.lock().unwrap();
+                        *t = (id.clone(), leader_addr.clone());
+                    }
+                    tracing::info!(source = %addr, leader_id = ?id, leader = %leader_addr, "re-discovered Raft leader");
+                    return Ok(());
+                }
+                Ok(None) => {
+                    tracing::debug!(addr = %addr, "no leader known during discovery");
+                    last_error = ClientError::NoLeader;
+                }
+                Err(error) => {
+                    tracing::debug!(addr = %addr, %error, "discovery failed on member");
+                    last_error = error;
+                }
+            }
+        }
+        Err(last_error)
+    }
+
+    /// Recover from a transport error: best-effort leader re-discovery, then
+    /// backoff. Discovery is skipped only when every known address is the one
+    /// that just failed (a plain single-target client has no alternative). A
+    /// client pinned by `ForwardToLeader` to a moved pod still falls back to
+    /// its bootstrap member.
+    async fn recover_after_error(&self, attempt: usize, failed_addr: &str, error: &ClientError<C>) {
+        let has_alternative = self.leader_addr() != failed_addr
+            || self.members.iter().any(|(_, addr)| addr != failed_addr);
+        if error.is_transport_error()
+            && has_alternative
+            && let Err(error) = self.discover_leader(Some(failed_addr)).await
+        {
+            tracing::warn!(%error, "leader re-discovery failed; retrying hinted target");
+        }
+        let delay = self.backoff(attempt);
+        tokio::time::sleep(delay).await;
+    }
+
+    /// Raw-GET variant with transient retries and leader failover.
     async fn send_raw_with_retry<Resp>(&self, uri: &str) -> Result<Resp, ClientError<C>>
     where
         Resp: DeserializeOwned,
     {
         let mut attempt = 0usize;
         loop {
-            match self.send_raw(uri).await {
+            let addr = self.leader_addr();
+            match self.send_raw_to(&addr, uri).await {
                 Ok(value) => return Ok(value),
                 Err(error) if error.is_retryable() && attempt < self.config.max_retries => {
                     attempt += 1;
-                    let delay = self.backoff(attempt);
                     tracing::warn!(
                         uri,
                         attempt,
-                        timeout = ?delay,
+                        timeout = ?self.backoff(attempt),
                         error = %error,
                         "retrying transient client error"
                     );
-                    tokio::time::sleep(delay).await;
+                    self.recover_after_error(attempt, &addr, &error).await;
                 }
                 Err(error) => return Err(error),
             }
         }
     }
 
-    /// Send one request, retrying transient transport/5xx errors with backoff.
+    /// Send one request, retrying transient transport/5xx errors with backoff
+    /// and leader failover.
     async fn send_with_retry<Req, Resp, Err>(
         &self,
         uri: &str,
@@ -507,19 +630,19 @@ where
     {
         let mut attempt = 0usize;
         loop {
-            match self.send(uri, req).await {
+            let addr = self.leader_addr();
+            match self.send_to(&addr, uri, req).await {
                 Ok(res) => return Ok(res),
                 Err(error) if error.is_retryable() && attempt < self.config.max_retries => {
                     attempt += 1;
-                    let delay = self.backoff(attempt);
                     tracing::warn!(
                         uri,
                         attempt,
-                        timeout = ?delay,
+                        timeout = ?self.backoff(attempt),
                         error = %error,
                         "retrying transient client error"
                     );
-                    tokio::time::sleep(delay).await;
+                    self.recover_after_error(attempt, &addr, &error).await;
                 }
                 Err(error) => return Err(error),
             }
@@ -548,21 +671,22 @@ where
         let mut transient_attempts = 0usize;
         let mut forward_attempts = 0usize;
         loop {
-            let res: Result<Resp, Err> = match self.send(uri, req).await {
+            let addr = self.leader_addr();
+            let res: Result<Resp, Err> = match self.send_to(&addr, uri, req).await {
                 Ok(res) => res,
                 Err(error)
                     if error.is_retryable() && transient_attempts < self.config.max_retries =>
                 {
                     transient_attempts += 1;
-                    let delay = self.backoff(transient_attempts);
                     tracing::warn!(
                         uri,
                         attempt = transient_attempts,
-                        timeout = ?delay,
+                        timeout = ?self.backoff(transient_attempts),
                         error = %error,
                         "retrying transient client error"
                     );
-                    tokio::time::sleep(delay).await;
+                    self.recover_after_error(transient_attempts, &addr, &error)
+                        .await;
                     continue;
                 }
                 Err(error) => return Err(error),
