@@ -52,38 +52,41 @@ impl FuzzOrder {
             FuzzTif::Gtd(expiry) => TimeInForce::Gtd(u64::from(expiry)),
             FuzzTif::Day => TimeInForce::Day,
         };
-        Order {
-            live: if self.live {
-                OrderType::Market
-            } else {
-                OrderType::Limit
-            },
-            side: if self.side {
+        // Build from `Order::new` rather than a struct literal: it fills the
+        // schema-v11 fields (owner_id, market_to_limit, trail_*, peg*) with
+        // defaults, so adding future optional fields cannot break this target.
+        let mut order = Order::new(
+            if self.side {
                 OrderSide::Buy
             } else {
                 OrderSide::Sell
             },
-            symbol_id: 0,
-            price: Fixed::from(i32::from(self.price)),
-            volume: Fixed::from(i32::from(self.volume)),
-            volume_unit: if self.volume_unit {
-                VolumeUnit::Quote
-            } else {
-                VolumeUnit::Base
-            },
-            requested_volume: Fixed::from(i32::from(self.requested_volume)),
-            requested_volume_unit: VolumeUnit::Base,
-            maker_fee_rate: fee_rate(self.maker_fee_bps),
-            taker_fee_rate: fee_rate(self.taker_fee_bps),
-            id: u64::from(self.id),
-            sequence: 0,
-            tif,
-            post_only: self.post_only,
-            stop_price: Fixed::from(u32::from(self.stop_price)),
-            display_volume: Fixed::from(u32::from(self.display_volume)),
-            hidden_volume: Fixed::from(u32::from(self.hidden_volume)),
-            timestamp: u64::from(self.timestamp),
-        }
+            i32::from(self.price),
+            i32::from(self.volume),
+            0,
+        );
+        order.live = if self.live {
+            OrderType::Market
+        } else {
+            OrderType::Limit
+        };
+        order.volume_unit = if self.volume_unit {
+            VolumeUnit::Quote
+        } else {
+            VolumeUnit::Base
+        };
+        order.requested_volume = Fixed::from(i32::from(self.requested_volume));
+        order.requested_volume_unit = VolumeUnit::Base;
+        order.maker_fee_rate = fee_rate(self.maker_fee_bps);
+        order.taker_fee_rate = fee_rate(self.taker_fee_bps);
+        order.id = u64::from(self.id);
+        order.tif = tif;
+        order.post_only = self.post_only;
+        order.stop_price = Fixed::from(u32::from(self.stop_price));
+        order.display_volume = Fixed::from(u32::from(self.display_volume));
+        order.hidden_volume = Fixed::from(u32::from(self.hidden_volume));
+        order.timestamp = u64::from(self.timestamp);
+        order
     }
 }
 
