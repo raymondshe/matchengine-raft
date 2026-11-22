@@ -1,6 +1,6 @@
 # Third-party matching-engine investigations
 
-Five external matching-engine projects were reviewed for design ideas, benchmark methodology and
+Six external matching-engine projects were reviewed for design ideas, benchmark methodology and
 failure modes. This document consolidates the separate reports into one reference.
 
 | Project | Revision | License | Primary value to us |
@@ -10,16 +10,21 @@ failure modes. This document consolidates the separate reports into one referenc
 | [llc-993/matching-core](https://github.com/llc-993/matching-core) | `2cb21c0` (2026-01-03) | No license file exposed | Feature breadth, WAL/snapshot attempt, integration/benchmark caution |
 | [flash1-dev/matching-engine-benchmark](https://github.com/flash1-dev/matching-engine-benchmark) | `424e4e5` (2026-10-16) | MIT (vendored parts have their own licenses) | 249-engine differential benchmark, consensus oracle, conformance battery, worst-case methodology |
 | [ronitgupta138/Apex-Matching-Engine](https://github.com/ronitgupta138/Apex-Matching-Engine) | `a31909c` (2026-11-13) | MIT | Readable Java/Spring teaching engine; a case study in documentation-vs-code and benchmark scope |
+| [zzxscodes/pitlane](https://github.com/zzxscodes/pitlane) | `ece9c8a` (2026-11-21, v1.0.0) | MIT | Shared-memory fail-closed desk, ordered pre-trade gate, mode-isolated RBAC and a disciplined CI/latency setup |
 
 Review date: 2026-11-01, re-reviewed 2026-11-04, benchmark review added 2026-11-10, Apex review
-added 2026-11-16. The review used the public READMEs, `PLAN.md`, the benchmark's reports and the key
-source files listed in the references; the 2026-11-04 pass added AsthaMishra's
-`matching-core/optimization_notes.md`, and the 2026-11-10 pass added Part IV. Tests for the other
-four projects were not executed here. For Apex, the engine/model classes were compiled directly and
-a local harness reran its benchmark shape plus a same-price cancellation probe on 2026-11-16 (Apple
-M4, OpenJDK 25); its Spring test suite was not run. No code was copied; all five projects are
-reference material only. The performance-specific verdicts (what transfers to matchengine-raft and
-what does not) live in [`docs/PERFORMANCE.md`](./PERFORMANCE.md) ("External optimization notes").
+added 2026-11-16, pitlane review added 2026-11-21. The review used the public READMEs, `PLAN.md`, the
+benchmark's reports and the key source files listed in the references; the 2026-11-04 pass added
+AsthaMishra's `matching-core/optimization_notes.md`, the 2026-11-10 pass added Part IV, and the
+2026-11-21 pass read pitlane's README, CI workflow, build file and three headers (`FanRing`,
+`ReplicaLog`, `PreTradeGuard`). Tests for the other five projects were not
+executed here. For Apex, the engine/model classes were compiled directly and a local harness reran
+its benchmark shape plus a same-price cancellation probe on 2026-11-16 (Apple M4, OpenJDK 25); its
+Spring test suite was not run. No code was copied; all six projects are reference material only.
+Pitlane is MIT licensed, but its single commit and one-star history give it no independent track
+record — every claim below is treated as self-reported unless the source was checked. The
+performance-specific verdicts (what transfers to matchengine-raft and what does not) live in
+[`docs/PERFORMANCE.md`](./PERFORMANCE.md) ("External optimization notes").
 
 ## Part I - AsthaMishra/matching-engine
 
@@ -853,22 +858,201 @@ No code should be adopted from this repository. Treat it as a readable Spring te
 and a cautionary example of benchmark/documentation drift, not as a low-latency or production
 engine.
 
-## Part VI - Comparison with matchengine-raft
+## Part VI - zzxscodes/pitlane
 
-| Dimension | AsthaMishra | Wire v9 | llc-993/matching-core | Apex | matchengine-raft |
-|---|---|---|---|---|---|
-| Topology | Single node | Single node, benchmark kernels | Single-node library + Disruptor pipeline | Single-node Spring Boot service | Raft-replicated cluster |
-| Durability | None | No WAL on matching path | WAL/snapshot attempt without fsync/atomicity | None (JPA/H2 dependencies unused) | Segmented WAL + atomic snapshots + recovery |
-| Symbol model | Multi-symbol sharded; single-book OUCH path | One flat book, 65k slots | Symbol-sharded routers; Direct book per symbol | Multi-symbol map, one fair lock per book | One symbol per process/cluster |
-| Book | Flat array + bitmap + `Vec` level | Flat array + linked-list levels | BTreeMap/Slab/AHashMap (Direct); BTreeMap/SmallVec (Advanced); SOA prototype unused | `TreeMap` + `ArrayDeque` + fair lock | `BTreeMap` price/sequence |
-| Price/quantity | Cents, `u32` | `u32` price index, `u32` shares | `i64` price/size | `BigDecimal` price, `long` quantity | 18-decimal `Fixed` `i128` |
-| Order types | Limit/Market/IOC/FOK | Single-fill primitive | Advertised many; exchange Direct only GTC/IOC/FokBudget | Limit/Market only | GTC/IOC/FOK/GTD/Day/market/post-only/iceberg/stop/market-to-limit/trailing/peg + STP |
-| User/STP | Cancel-resting STP | None in matcher | No STP; Advanced cancel ignores uid | User id on orders/trades; no STP or balances | `owner_id` + STP modes; fees/assets modeled |
-| Events | In-process stream; global trade id | One `MarketEvent` per fill | Trade/Reject/Reduce only | REST response + STOMP trade/depth; process-local ids | Replicated event window; deterministic ids |
-| Protocol | OUCH/ITCH + REST | No integrated order entry | Library only | HTTP JSON + STOMP/WebSocket | HTTP JSON + gRPC Raft |
-| Tests | Unit/proptest/fuzz (stale target) | Unit per kernel; no v9 integration | Tests present; no pipeline/consensus integration observed | 4 unit + 2 integration; benchmark not asserted | Unit/property/conformance/integration/restart/snapshot/fees |
-| Benchmarks | Criterion/ITCH/tail | Pinned-core microbenchmarks | AdvancedOrderBook TPS; estimated memory; flawed Criterion cases | 100k shallow sequential limits; docs claim 1.24M QPS | e2e/batch/feed/storage/P0 benchmarks |
-| FlashOne survey (Part IV) | 5.60 M/s, with fix; bounded-domain flat array | Not listed in the roster | 7.14 M/s, as shipped; new/cancel/modify ABI only | Not listed in the roster | 7.20 M/s, fastest B-tree; "with fix" at the old pin, fixed at `HEAD` |
+### 1. What it is
+
+A C++17 header-only trading kernel plus `pitlane-trading`, a CTP/paper console. The repository is
+MIT licensed, has **one commit** (`ece9c8a`, 2026-11-21, "pitlane 1.0.0", ~101.8k added lines), one
+star and no forks. That single-commit history matters: there is no independent review or bug-fix
+trail, so claims are treated as self-reported unless source was checked.
+
+The kernel is a fixed-layout **shared-memory desk**: market data, strategy, risk and clearing run as
+separate processes that meet at one `PITLANE1` memory-mapped region rather than calling each other.
+Prices are integers, timestamps microseconds. The library opens no exchange or broker socket; the
+optional UDP layer carries pitlane-to-pitlane frames only. The only runnable program is the trading
+console. The hot path is explicitly lock-free, allocation-free and I/O-free; startup may allocate or
+mmap. The desk is versioned (`kDeskVersion` 8, magic `PITLANE1`) and processes sharing it must all
+restart together — `desk_view` refuses an older layout rather than migrating it.
+
+The scope is much broader than a matching engine: order lifecycle (OMS/EMS/SOR/PMS/RMS), position
+and cash ledgers, clearing, factor research, backtests, block tapes, a C ABI, a Python bridge and a
+ten-tab web console with RBAC. Paper matching covers 256 instruments and 1024 working orders; the
+docs use Chinese futures/CTP semantics (seven offset codes, close-today/close-yesterday, margin
+trading, corporate actions). There is no external consensus service: the optional replication is a
+fixed-capacity in-process log (see §3).
+
+### 2. What the shared desk actually guarantees
+
+`include/pitlane/desk/ring.hpp` was read directly. `FanRing<T, Cap>` is a single-producer ring where
+each of up to 64 readers owns a bit:
+
+- `claim()` returns `nullptr` when the ring is full; `publish_batch()` writes n slots and advances
+  the tail once, failing and leaving the ring unchanged if any slot is still busy.
+- A slot carries `need` (required reader bits), `ack` and `seq`. `blocked(pos)` refuses reuse while
+  a required reader has not acked; with `need == 0`, the first reader to ack claims the slot.
+- `view()`/`poll()` double-check `state` and `seq` after reading, so a concurrently reused slot is
+  detected rather than returning torn data.
+- `ack()` uses CAS for `need == 0` and `fetch_or` for named readers; `ack_span()` stops at the first
+  position the reader cannot ack.
+- Each `Slot` is cache-line aligned; the tail is a separate aligned atomic. No grow, no overwrite of
+  an unacked slot, no blocking.
+
+This is the project's strongest transferable idea, and it is the same contract our market-data
+`try_send` + `GAP` path already implements on a Tokio `mpsc`: **fail closed, bound the queue, and
+account for the drop** instead of silently growing or overwriting. The named-reader ack bitmask is a
+different mechanism from our `(log_index, ordinal)` event cursors, but the discipline matches: a
+consumer's position is explicit and a slot is not recycled underneath a lagging reader.
+
+### 3. Replication is a log primitive, not consensus
+
+`include/pitlane/net/replicate.hpp` was read directly. `ReplicaLog<T, Cap = 4096>` is a ring buffer
+with 1-based indexes, `terms_`, `index_`, `value_`, `count_`, `commit_`, `applied_`, `match_[3]`,
+`quorum_` and a two-state `ReplicaRole {Follower, Leader}`:
+
+- `become_leader(term, quorum)` is called by the host; there is **no election algorithm** in this
+  class. `leader_append` writes at the current term and advances `match_[0]`.
+- `follower_append` checks `term >= term_`, `prev_index <= count_`, a matching `prev_term`, and
+  truncates a divergent suffix before appending. It advances `commit_` from the leader's commit.
+- `commit_quorum()` sorts the three match indexes and takes `m[q-1]` (q clamped to 1..3). `apply()`
+  copies committed-but-unapplied entries into a caller buffer.
+- The backing arrays are fixed at `Cap`; `leader_append` simply returns `false` when full. There is
+  no disk persistence, no snapshot, no membership change, no PreVote and no leader transfer here.
+
+That is a useful contrast to our OpenRaft choice. A quorum match-index rule plus term checks is a
+building block; durability, elections, membership and recovery live outside this class (or not at
+all). It reinforces the same lesson as Parts II–III: a "replicated log" label is not evidence of a
+consensus implementation, and a fixed ring that fails a write at capacity is not a WAL.
+
+### 4. Pre-trade gate: ordered, deterministic and fail-closed
+
+`include/pitlane/order/precheck.hpp` was read directly. `PreTradeGuard::check()` runs a fixed first-failure-wins
+pipeline and returns a typed `PreCode`:
+
+```
+input -> halt -> open/close blacklist -> notional cap by class ->
+account flow (1s, 10s) -> market flow (1s) -> cancel ratio ->
+cancelled-amount ratio -> self-trade -> Ok
+```
+
+Concrete details worth borrowing:
+
+- **Zero means "rule off"**, so the same pipeline serves strict and permissive deployments.
+- Every code is named by `pre_code_name()`, so a rejection reason is deterministic for a given
+  state. No allocation and no locks; caller-owned fixed arrays only.
+- A 128-slot active-order table provides self-trade cover. `on_submit` returns `false` when the
+  table is full and the caller **must drop the order** because cover would be incomplete — fail
+  closed rather than silently accept an unchecked order.
+- Cancel-ratio and cancelled-**amount**-ratio gates use a warm-up minimum and a configurable window,
+  which is a more complete version of the simple in-flight cap we use at `--max-inflight-writes`.
+
+This is directly relevant to the P1 security/gateway workstream and to the now-stateless order desk:
+rate limits, blacklists and self-trade screening are edge/policy concerns that do not require
+moving user state into the engine. It is **not** a replacement for our `owner_id` + STP modes —
+pitlane's self-trade check is a pre-trade screen against a local active table, while ours is
+replicated matching semantics.
+
+### 5. Console, RBAC and mode isolation
+
+The console defines five roles — `viewer`, `trader`, `risk`, `ops`, `admin` — with permission bits
+checked on every `/api/*` route except `health` and `login`. Accounts are PBKDF2-HMAC-SHA256
+verifiers (10,000 rounds, per-user salt); login issues a 64-hex token with an 8-hour TTL in an
+HttpOnly cookie and as a bearer token. A session picks **test** or **live** at login, every object
+is filtered by mode, and a cross-mode request is refused with `409`. Gateway start/stop, control
+actions (pause, halt, risk-block, reload, cancel_all, stop) and clearing operations are audited;
+alarms escalate on stale/jump/link/gateway/risk events and can cancel all orders for a product.
+
+Two things transfer cleanly to our TODO: **mode isolation at the session layer** and **one typed
+permission bit per route**. Our manager has no auth today; the pitlane pattern is a useful concrete
+shape for the P1 workstream, though its single `poll` thread, 8 KB request ceiling and plaintext
+loopback binding are lab-scale, not a production gateway.
+
+### 6. Measurement and engineering discipline
+
+- `ctest` runs the core, shared-library, C-ABI and trading tests plus `perf`/`perf_shared`. The
+  tick-to-trade test spans three processes on one desk: quote stamp to gateway stamp, report path
+  excluded; cycles use a scale sampled before the measured section. It reports five batches of
+  2,000 samples, p50/p99/p999, plus a separate "set aside" count for outliers several times above
+  the body. Sample README result: p50 395 ns, p99 1,658 ns, p999 1,929 ns.
+- The strict build enforces a 2 µs bound on p99 **and** p999 and expects a tuned host; CI configures
+  `-DPITLANE_RELAX_LATENCY=ON`. This is the same "loose in CI, strict on a quiet host" split our
+  `bench-regression` job and `bench-linux` manual workflow already use.
+- The build uses `-O3 -fno-exceptions -fno-rtti -march=native`, LTO, `-Werror`, optional PGO
+  (train on the paths you care about; `USE` treats untrained code as cold), explicit huge pages with
+  ordinary-page fallback, `mlockall`, NUMA binding and a deliberate AVX-512 opt-out
+  (`-mprefer-vector-width=256 -mno-avx512f`) because AVX-512 can drop core frequency.
+- CI regenerates `doc/site` with `python3 doc/gen_site.py` and fails on a diff; `CONTRIBUTING.md`
+  requires `README.md`/`README_CN.md` and `doc/API.md`/`doc/API_CN.md` to be updated in the same
+  change. That is a concrete guard against the docs drift our own P2 docs-sync item keeps flagging.
+
+### 7. Paper matching and failure taxonomy
+
+Paper matching is intentionally narrow: day orders reaching their own limit fill the whole
+remainder even beyond displayed quantity; passive-only expires as soon as it would trade through;
+immediate takes only visible quantity; all-or-nothing expires entirely when visible quantity is
+short; fills use the passive price; empty levels disappear at once; a self-trade stops the order.
+Call auctions pick the max-matched-price with ties resolved by a reference. Two details echo bugs
+already catalogued in Parts II–III: **prints on the same aggressive side must not fill resting
+orders**, and **later level changes must not subtract the same print twice** — the same
+double-decrement class as Part II's `wire-exchange` LOB and Part III's expired-maker volume bug.
+Our `BTreeMap` book plus property/conformance model already guards both; keep those invariants.
+
+The block tape is also relevant to storage: append-only 64 KiB blocks, a 64-byte header, and
+64-byte commit records that publish immutable versions. Readers can query an older version, project
+columns and binary-search inside a block. It uses `pread` rather than `mmap` so a truncated tail
+cannot raise `SIGBUS`. Our WAL already uses `pread`, CRC and torn-tail truncation; the extra idea is
+publishing an **immutable version pointer** rather than mutating a "current" record in place.
+
+### 8. Findings and risks
+
+- **No consensus durability.** The desk is shared memory and `ReplicaLog` is a capped in-memory
+  ring with host-driven leadership. A crash loses everything unless the host persists it; our WAL,
+  snapshots and Raft recovery remain a non-comparable strength.
+- **One commit, one star, self-reported numbers.** No independent reproduction of the 395 ns / 2 µs
+  figures was performed here. The three headers checked did match the README's described contracts.
+- **Fixed capacities everywhere.** Orders 32,768; reports 32,768; quotes 8,192; cash 512;
+  positions 4,096; paper matching 256 instruments / 1,024 working orders; signals 128
+  subscriptions / 256 queue. This is a deliberate fail-closed design, not a general engine; our
+  18-decimal `Fixed` and sparse `BTreeMap` are the right trade for an unbounded price domain.
+- **The console is lab-scale.** Plaintext HTTP, loopback default, one `poll` thread, one request per
+  connection. Do not treat its RBAC as a production gateway.
+- **C++ intrinsics are not portable evidence.** SSE2/SSE4.2/AVX2 with scalar fallbacks, no
+  AVX-512. Our `level_book`/`sorted_book` prototypes must still win on our own workloads.
+
+### 9. Lessons for matchengine-raft
+
+- Keep the **fail-closed bounded queue + drop accounting** discipline; our `try_send`/`GAP` path and
+  the replicated event window already follow it. Named-reader acks are a different mechanism but
+  reinforce explicit consumer cursors.
+- Treat a quorum match-index log as a primitive, not as a reason to weaken Raft. Do not trade our
+  election, membership, fsync and snapshot guarantees for a simpler replication shape.
+- Add **typed permission bits and test/live mode isolation** to the P1 security workstream; make a
+  cross-mode request fail with `409` rather than silently reading the other mode's data.
+- Consider an **ordered pre-trade rule pipeline** with typed first-failure codes, zero-off limits,
+  cancel-ratio gates and fail-closed cover at the edge/gateway — kept policy-side so the stateless
+  order desk stays stateless. This is recorded in `TODO.md`.
+- A **generated-docs diff check** would close the known README/API drift permanently; recorded in
+  the P2 docs-sync item in `TODO.md`.
+- Report latency like pitlane does where it matters: several batches, p50/p99/p999 plus outliers
+  set aside, and strict bounds only on a quiet host. Our `PERFORMANCE.md` warm/cold and CI-vs-manual
+  split already has the shape.
+
+## Part VII - Comparison with matchengine-raft
+
+| Dimension | AsthaMishra | Wire v9 | llc-993/matching-core | Apex | pitlane | matchengine-raft |
+|---|---|---|---|---|---|---|
+| Topology | Single node | Single node, benchmark kernels | Single-node library + Disruptor pipeline | Single-node Spring Boot service | Shared-memory multi-process desk; optional capped UDP replication | Raft-replicated cluster |
+| Durability | None | No WAL on matching path | WAL/snapshot attempt without fsync/atomicity | None (JPA/H2 dependencies unused) | Shared region + optional host WAL/tape; `ReplicaLog` is in-memory | Segmented WAL + atomic snapshots + recovery |
+| Symbol model | Multi-symbol sharded; single-book OUCH path | One flat book, 65k slots | Symbol-sharded routers; Direct book per symbol | Multi-symbol map, one fair lock per book | 256 paper instruments; 1024-name directory | One symbol per process/cluster |
+| Book | Flat array + bitmap + `Vec` level | Flat array + linked-list levels | BTreeMap/Slab/AHashMap (Direct); BTreeMap/SmallVec (Advanced); SOA prototype unused | `TreeMap` + `ArrayDeque` + fair lock | Fixed tables on the shared desk; paper venue | `BTreeMap` price/sequence |
+| Price/quantity | Cents, `u32` | `u32` price index, `u32` shares | `i64` price/size | `BigDecimal` price, `long` quantity | Integer price, microsecond timestamps | 18-decimal `Fixed` `i128` |
+| Order types | Limit/Market/IOC/FOK | Single-fill primitive | Advertised many; exchange Direct only GTC/IOC/FokBudget | Limit/Market only | Day/passive/immediate/AON + call auction; CTP offsets/styles | GTC/IOC/FOK/GTD/Day/market/post-only/iceberg/stop/market-to-limit/trailing/peg + STP |
+| User/STP | Cancel-resting STP | None in matcher | No STP; Advanced cancel ignores uid | User id on orders/trades; no STP or balances | Pre-trade self-trade screen + paper self-trade stop; RBAC roles | `owner_id` + STP modes; fees/assets modeled |
+| Events | In-process stream; global trade id | One `MarketEvent` per fill | Trade/Reject/Reduce only | REST response + STOMP trade/depth; process-local ids | Fail-closed `FanRing` reports/alarms/audit with reader acks | Replicated event window; deterministic ids |
+| Protocol | OUCH/ITCH + REST | No integrated order entry | Library only | HTTP JSON + STOMP/WebSocket | Shared desk + C ABI + Python bridge + web console | HTTP JSON + gRPC Raft |
+| Tests | Unit/proptest/fuzz (stale target) | Unit per kernel; no v9 integration | Tests present; no pipeline/consensus integration observed | 4 unit + 2 integration; benchmark not asserted | ctest across areas + perf + C ABI; 5-batch tick-to-trade assertion | Unit/property/conformance/integration/restart/snapshot/fees |
+| Benchmarks | Criterion/ITCH/tail | Pinned-core microbenchmarks | AdvancedOrderBook TPS; estimated memory; flawed Criterion cases | 100k shallow sequential limits; docs claim 1.24M QPS | 3-process tick-to-trade p50/p99/p999; strict CI-relaxed split | e2e/batch/feed/storage/P0 benchmarks |
+| FlashOne survey (Part IV) | 5.60 M/s, with fix; bounded-domain flat array | Not listed in the roster | 7.14 M/s, as shipped; new/cancel/modify ABI only | Not listed in the roster | Not listed in the roster | 7.20 M/s, fastest B-tree; "with fix" at the old pin, fixed at `HEAD` |
 
 Our engine is stronger on semantics, durability, exactness and recovery. Astha is stronger on
 single-node hot-path layout, binary gateway work and measurement scope. Wire is stronger on
@@ -878,7 +1062,10 @@ types are not wired into the exchange, its WAL/snapshot is not crash-safe, and i
 measure a separate `AdvancedOrderBook`, not the product pipeline. Apex is the clearest teaching
 implementation of the five and the easiest to read, but it is a Spring demo with no durability,
 risk, STP or production edge, and its docs claim concurrency and benchmark behaviour the code does
-not implement.
+not implement. Pitlane is the strongest of the six on process-to-process transport discipline and
+pre-trade policy structure, but its "replication" is a capped in-memory log without elections or
+durability, and its console is a lab-scale plaintext service; it is a source of patterns, not of a
+durability or consensus story.
 
 On the FlashOne benchmark's matching-only ABI, our `BTreeMap` core is the fastest B-tree entry and
 within about 8% of the fastest Rust engine. That is a useful external validation of the price ladder
@@ -887,7 +1074,7 @@ and the basic FIFO loop; it is not a validation of the replicated product path. 
 `Amend` would be wrong. Its "conforming" verdict is scoped to limit new/cancel/modify and IOC; it
 does not exercise FOK, stops, icebergs, fees, persistence or consensus.
 
-## Part VII - Consolidated takeaways
+## Part VIII - Consolidated takeaways
 
 ### Adopt
 
@@ -917,6 +1104,12 @@ does not exercise FOK, stops, icebergs, fees, persistence or consensus.
    conditional on a book-only A/B.
 10. **A reusable MPMC reference.** If we ever need a custom bounded queue, the Vyukov pattern is a
     useful reference; Tokio `mpsc` remains the default.
+11. **Fail-closed bounded queues with explicit drop accounting (pitlane-derived).** Done: the
+    market-data tap uses `try_send` + `GAP` and the event window is bounded with `(log_index,
+    ordinal)` cursors; never grow or silently overwrite a lagging consumer's slot.
+12. **Strict-vs-relaxed latency bounds by host (pitlane-derived).** Done: `bench-regression` keeps
+    loose CI bounds while `bench-linux` is the manual pinned-core strict pass. Keep the split and
+    report outliers separately rather than hiding them in p99.
 
 ### Adapt / evaluate later
 
@@ -948,6 +1141,22 @@ does not exercise FOK, stops, icebergs, fees, persistence or consensus.
   report an estimated 200 bytes/order as measured memory.
 - **Do not ship an unintegrated optimized book.** If a book cannot serialize its state or is not
   reachable from the exchange, it is a prototype, not a production path.
+
+### pitlane-specific takeaways
+
+- **Do not mistake a quorum log for consensus.** `ReplicaLog` has match indexes and commit/advance
+  but no election, persistence or membership; our Raft/WAL/snapshot story stays non-negotiable.
+- **Keep bounded queues fail-closed.** A full `FanRing` refuses the write and never overwrites an
+  unacked slot; our `try_send`/`GAP` and event cursors already do the equivalent.
+- **Put policy before the book, not in it.** The ordered `PreTradeGuard` pipeline with typed
+  first-failure codes, zero-off limits and fail-closed cover is a good shape for the gateway/edge.
+  Keep it out of the matching core and out of the stateless order desk's durable state.
+- **Isolate test and live at the session layer**, return `409` on cross-mode requests, and give
+  every API route one named permission bit; all three are recorded in the P1 security item.
+- **Guard docs drift mechanically.** A generated-site diff check plus paired EN/CN updates stopped
+  that class of drift upstream; our known README/API drift needs the same discipline.
+- **Measure latency with batches and set-aside outliers.** Strict bounds belong on a quiet host,
+  loose bounds in CI; do not let a single outlier silently inflate a headline percentile.
 
 ### Apex-specific takeaways
 
@@ -988,6 +1197,10 @@ does not exercise FOK, stops, icebergs, fees, persistence or consensus.
   llc-993 have no license file; Wire's fuzz/README claims need verification.
 - Feature matrices that are only demonstrated through a separate book type, or benchmark numbers
   from a different code path than the exchange pipeline.
+- Calling a fixed-capacity quorum match-index log "consensus" (pitlane's `ReplicaLog`): no election,
+  no persistence, no membership; our Raft/WAL guarantees are not negotiable for a simpler shape.
+- Trusting a single-commit, one-star repository's latency claims without reproduction, even when
+  the three headers checked do match the prose.
 
 ### Prioritized plan
 
@@ -1005,9 +1218,16 @@ does not exercise FOK, stops, icebergs, fees, persistence or consensus.
 4. Re-pin the FlashOne benchmark and record the book-only result, pin and scope in
    `PERFORMANCE.md`; publish the adapter only if it can be maintained.
 
+**P2 - policy and docs (pitlane-derived, tracked in `TODO.md`)**
+
+5. Add typed permission bits and test/live mode isolation with `409` cross-mode refusal to the P1
+   security workstream; evaluate an ordered first-failure pre-trade gate at the edge/gateway, kept
+   out of the stateless order desk and the matching core.
+6. Add a generated-docs diff check to close the known README/API drift permanently.
+
 **P3 - optional platform work**
 
-5. Real-data replay, custom MPMC/SIMD/io_uring, binary order entry and feature-gated histograms,
+7. Real-data replay, custom MPMC/SIMD/io_uring, binary order entry and feature-gated histograms,
    only after a measured bottleneck and a deployment decision.
 
 **Non-negotiable foundations:** Raft consensus, WAL/snapshot durability, deterministic event ids,
@@ -1095,3 +1315,16 @@ exact 18-decimal values, fees/assets and the existing property/conformance/integ
 - <https://github.com/flash1-dev/matching-engine-benchmark/blob/main/workload/scenarios.json>
 - <https://arxiv.org/abs/2606.01183>
 - This project's finding: <https://github.com/raymondshe/matchengine-raft/issues/1>
+
+### zzxscodes/pitlane
+
+- <https://github.com/zzxscodes/pitlane>
+- <https://github.com/zzxscodes/pitlane/blob/ece9c8acc52ad4cb9ad54e1877b11ec548418190/README.md>
+- <https://github.com/zzxscodes/pitlane/blob/ece9c8acc52ad4cb9ad54e1877b11ec548418190/CHANGELOG.md>
+- <https://github.com/zzxscodes/pitlane/blob/ece9c8acc52ad4cb9ad54e1877b11ec548418190/CONTRIBUTING.md>
+- <https://github.com/zzxscodes/pitlane/blob/ece9c8acc52ad4cb9ad54e1877b11ec548418190/.github/workflows/ci.yml>
+- <https://github.com/zzxscodes/pitlane/blob/ece9c8acc52ad4cb9ad54e1877b11ec548418190/CMakeLists.txt>
+- <https://github.com/zzxscodes/pitlane/blob/ece9c8acc52ad4cb9ad54e1877b11ec548418190/include/pitlane/desk/ring.hpp>
+- <https://github.com/zzxscodes/pitlane/blob/ece9c8acc52ad4cb9ad54e1877b11ec548418190/include/pitlane/net/replicate.hpp>
+- <https://github.com/zzxscodes/pitlane/blob/ece9c8acc52ad4cb9ad54e1877b11ec548418190/include/pitlane/order/precheck.hpp>
+- <https://github.com/zzxscodes/pitlane/blob/ece9c8acc52ad4cb9ad54e1877b11ec548418190/doc/web-api.md>

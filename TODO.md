@@ -1,6 +1,6 @@
 # TODO
 
-Last reviewed: 2026-11-20. Working roadmap only; completed detail lives in the History section and
+Last reviewed: 2026-11-22. Working roadmap only; completed detail lives in the History section and
 git history — check out an earlier `TODO.md` from git for the full record
 (`git log -- TODO.md`, then `git show <commit>:TODO.md`). Measurements remain in
 [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md). See `AGENTS.md` for commands and the current branch
@@ -23,9 +23,11 @@ over-capacity renders, retains PVCs and performs cross-shard cutover/rollback. T
 live refresh, release/capacity banners, a cluster image picker and a read-only preview plan. The
 market-data tier lives under one **market data** top-level view with **terminal** and **fast**
 sub-tabs, and images roll through `POST /api/v1/market-data-services/{name}/upgrade` with a
-source-shard wire-version check. The `OrderSystem` CRD renders four user-ID shards, each with its
-own Deployment/Service/PDB/Ingress/HPA (min 1) and `maxUnavailable:0` image rolls; the manager links
-each shard to its own order desk instead of proxying order entry. The `match-eu-1` reference fleet
+source-shard wire-version check. The `OrderSystem` CRD renders **one stateless** Deployment/Service/
+PDB/HPA (min 1) with a base-host Ingress (`orders.<ingress>`) plus per-shard alias Ingresses; every
+instance serves every user, and `maxUnavailable:0` image rolls replace the old four-shard layout.
+Engine leader discovery is client-side (`MatchEngineClient::with_members`), validated by a hard
+leader kill and a rolling upgrade on OrbStack. The `match-eu-1` reference fleet
 records image digests in its CRDs, but the demo has no registry: images live only in the node's
 local image store, so a `DiskPressure` image GC can leave a roll with nothing to pull. The live
 acceptance harness (`scripts/operator-acceptance.sh`) covers nine phases: containers, leader, roll,
@@ -40,24 +42,24 @@ operability; **P2** = evidence, scale and important non-blocking work; **P3** = 
 
 ## Top priorities
 
-Last prioritised 2026-11-20, after Raft-native leader discovery/failover landed in the reusable
-`MatchEngineClient` and was validated live on OrbStack (hard leader kill and a full rolling
-upgrade: order entry kept succeeding throughout). That closes the **Rust-client** half of leader
-failover — the typed `503` leader hint for gateways/non-Rust clients and a request key for
-`Cancel`/`Amend` remain (P2). The same live roll exposed a graceful-shutdown defect: pods lingered
-in `Terminating` past the 60 s grace period because tonic drained long-lived peer `AppendStream`s
-forever. It was fixed the same day by capping the gRPC drain at 5 s — a four-voter roll under load
-now terminates each pod in ~6 s and completes in ~1 minute — so it is no longer in the queue.
+Last prioritised 2026-11-21. Since the last pass three items were closed: Raft-native leader
+discovery/failover in `MatchEngineClient` (validated by a hard leader kill and a rolling upgrade),
+the bounded gRPC drain (pods now terminate in ~6 s instead of hanging until SIGKILL), and the
+stateless order desk (solution G — one Deployment, no user-ID routing). The public gateway is
+therefore **out of the execution queue**: leader routing is client-side and user-ID routing was
+removed rather than built. Its full design stays in `docs/GATEWAY_ROUTING.md` behind the stated
+triggers. The same pass added the pitlane review; its concrete findings are folded into the P1
+security item (mode isolation, per-route permission bits) and a new P2 pre-trade policy pipeline.
 
 Backup construction is complete, so its remaining work — a real object-storage cycle and the CSI
-volume drill — stays in the explicit production gates. Ordering weighs data loss, security exposure
-and production blockers first, then work actionable in the current single-node lab;
+volume drill — stays in the explicit production gates. Ordering still weighs security exposure,
+image supply and production blockers first, then cheap regression guards, then evidence/scale;
 environment-blocked validation is called out explicitly rather than mixed into the actionable
-queue.
+queue. Nothing is P0: the engine, client and control plane are green on tests and the live lab.
 
 The local-lease semantic risk stays covered by the delivery contract: client retries are
 at-least-once. `client_order_id` makes `Place` retries idempotent; `Cancel`/`Amend` have no request
-key yet, so clients and the planned gateway must not blind-retry them. Downstream event readers
+key yet, so clients and any future gateway must not blind-retry them. Downstream event readers
 resume from `(log_index, ordinal)` and dedupe on `event_id`. A local-lease cache hit may overtake
 an unfinished write, so read-after-write is not a guarantee; clients that need it must await the
 write response.
@@ -70,36 +72,31 @@ write response.
    origin checks and NetworkPolicy/Pod Security for the order-system, market-data and NATS edges.
    It leads the queue because the manager, both demo edges and the NATS broker endpoint are all
    plaintext and unauthenticated: exposure is the largest remaining production gate and no amount
-   of scaling or backup evidence mitigates it.
+   of scaling or backup evidence mitigates it. The pitlane review suggests the concrete shape:
+   one named permission bit per route (viewer/trader/risk/ops/admin) and test/live mode isolation
+   at the session layer with a `409` cross-mode refusal.
 2. **Manager packaging and image supply.** Check in Deployment/Service/RBAC/NetworkPolicy/Pod
    Security, Helm/Kustomize, digest-pinned image publication and CRD/etcd backup integration. The
    demo still depends on local-only images, an `emptyDir` and a port-forward, which blocks a clean
    install; a `DiskPressure` image GC evicted them during the 2026-11-18 rollout, so publish to a
    local registry or add an explicit `docker save`/`load` step before the next fleet roll. It
    follows security because it has already broken a rollout.
-3. **Observability and HPA metrics.** Install a metrics-server or Prometheus adapter so the four
+3. **Observability and HPA metrics.** Install a metrics-server or Prometheus adapter so the one
    order-system and five market-data HPAs can report CPU and actually scale, then add the
    Prometheus text bridge for the engine's JSON `/metrics` (or a native `/metrics/prometheus`),
    operator reconcile/rollout metrics, alerts, dashboards and log shipping. This is the largest
    scale and evidence unblock: every HPA currently shows `<unknown>` and only the min-1 floor
    applies, and load/soak work depends on it. It follows packaging because the current min-1 floor
    still serves traffic and no known defect depends on autoscaling.
-4. **Gateway routing — deferred; user-ID shard routing — resolved by making the order system
-   stateless.** Decision (2026-11-20, [docs/GATEWAY_ROUTING.md](./docs/GATEWAY_ROUTING.md) §9):
-   collapse the four order-system shards into one stateless Deployment so the base host
-   `orders.<ingress>` is a plain load-balanced order desk and no user-ID routing is needed. Engine
-   leader routing stays client-side via `MatchEngineClient::with_members`, already live; no public
-   gateway is built until TLS/auth and packaging land, a second client appears, or cutover must be
-   automated. The full `SymbolRoute` gateway design (shadow/cutover/drain, canary, retries,
-   no-blind-retry `Cancel`/`Amend`) is documented for those triggers.
-5. **Market-data production readiness.** Couple symbol create and migrate to both the fast and
-   global symbol sets and the `SymbolRoute`, wait for the new feed before publishing and drain old
-   WebSocket sessions; the stop path already removes a symbol from every service. Profile N
-   (direct NATS) is the single-node fallback and removes the Aeron image-registration constraint;
-   harden it with a multi-node NATS cluster, TLS/credentials (security item 1), strict
-   NetworkPolicy and optional JetStream retention. Define the one-subscriber-per-group-per-node
-   rule for Profile A and validate Profile A on a multi-node multicast-capable CNI/VPC; that half
-   is blocked on this host, but the lifecycle and topology code is not.
+4. **Market-data production readiness (lifecycle/topology done, infrastructure gated).** Symbol
+   create now attaches the symbol to every non-paused service in the cell (per-symbol NATS group,
+   or shard-scoped multicast group on the shard's channel); migration waits for per-symbol feed
+   readiness before finishing the route cutover, and service pods drain WebSocket sessions through
+   `preStop`. The stop/start path was already coupled. NATS egress is scoped to the NATS pods, and
+   market-data Deployments spread across nodes/zones. Subscribers bind the wildcard address, so
+   several pods may consume one group on one node — no one-per-node limit is needed. Remaining:
+   multi-node NATS cluster + credentials/NKey + optional JetStream retention (needs source work and
+   infrastructure), and Profile A multi-node multicast validation (blocked on this host).
 
 **Explicit production gates not exercised in this lab.** Backup close-out: one live
 object-storage bucket cycle to confirm rclone upload, retention and alerting (the local-PVC path
@@ -109,15 +106,22 @@ multicast evidence (one OrbStack node), a multi-node NATS cluster, Linux supervi
 delegation (OrbStack), and the bare-metal pinned-core `bench-linux` dispatch. The lists below
 keep those halves visible; do not treat a green single-node run as production evidence for them.
 
-**P2 - evidence and scale, in execution order**
+**P2 - policy, evidence and scale, in execution order**
 
-6. **Rollout invariants and acceptance-harness automation.** The manual harness found two real
+5. **Rollout invariants and acceptance-harness automation.** The manual harness found two real
    rollout defects, now fixed. First extract the rollout candidate decision into a pure function
    with unit tests for: at most one terminating pod, the replacement must be Ready before the next
    deletion, and no roll may be skipped when `currentRevision == updateRevision` while pods still
    run the old template. Then run the nine-phase `scripts/operator-acceptance.sh` in a disposable
    CI cluster or nightly. The unit tests are the cheap regression guard; land them before the CI
    plumbing.
+6. **Pre-trade edge policy pipeline (pitlane-derived).** The stateless order desk removed user
+   ranges but has no per-user flow limits, blacklist or cancel-ratio gate — the policy half of P1
+   item 1. Implement a fixed, ordered first-failure-wins gate with typed codes: halt,
+   open/close blacklist, notional cap by class, per-account and per-market flow windows,
+   cancel-ratio and cancelled-amount-ratio, then self-trade screening; zero means "rule off" and a
+   full cover table fails closed. Keep it at the edge/gateway, not in the matching core or the
+   order desk's durable state; it does not replace our replicated `owner_id`/STP semantics.
 7. **Stop-the-world incompatible upgrade execution.** The release gate correctly blocks mixed
    rolls, and the runbook has a manual stop/upgrade/restart path. Automate the coordinated cutover
    (backup gate, disable routes, stop all symbols, apply image/release, restart, verify, re-enable)
@@ -129,25 +133,27 @@ keep those halves visible; do not treat a green single-node run as production ev
    with the leader address so a gateway or non-Rust client can refresh and retry deterministically;
    a follower `/write` still returns `500` with no leader hint. Until then, document and enforce
    the no-blind-retry rule before the gateway can safely retry those requests.
-9. **Market-data manager controls.** Add GUI create/edit/scale and a read-only preview plan for
-   `MarketDataService`; the upsert API, image/release update and the per-service picker are
-   implemented. Add a rollback action that restores the previous image.
-10. **Market-data fan-out and slow-consumer evidence.** Soak many symbols, streams, connections
+9. **Docs synchronization.** Keep `AGENTS.md`, READMEs, `docs/PERFORMANCE.md`, `docs/API.md`,
+    `docs/ETCD_STORAGE.md` and the runbooks moving with storage, wire, read-policy and
+    control-plane changes. Fix the known drift first: `k8s_control_plane/README.md` still says
+    Profile A is the only rendered transport, and the control-plane design doc still lists NATS as
+    a fallback, while Profile N is rendered and live on OrbStack. The pitlane review gives the
+    mechanical guard: regenerate derived docs and fail CI on a diff, plus paired EN/CN updates in
+    the same change.
+10. **Market-data manager controls.** Add GUI create/edit/scale and a read-only preview plan for
+    `MarketDataService`; the upsert API, image/release update and the per-service picker are
+    implemented. Add a rollback action that restores the previous image.
+11. **Market-data fan-out and slow-consumer evidence.** Soak many symbols, streams, connections
     and slow consumers through the Kubernetes deployment; measure per-instance encode/fan-out
     CPU, queue depth, gap/resync behavior and p99, and prove the engine's matching path is
     unaffected.
-11. **Profile A feed hardening.** Startup snapshot/retry, supervisor restarts on configuration
+12. **Profile A feed hardening.** Startup snapshot/retry, supervisor restarts on configuration
     changes, Profile N direct NATS and the acceptance `nats` phase are live. For clusters still on
     multicast, characterize the Aeron image-registration race and single-node multi-subscriber
     behavior, make source startup readiness-gated (or add a per-source generation), and keep the
     5-30 s re-subscribe watchdog without restart loops.
-12. **CRD scale and soak.** Thousands of symbols/CRs across shards and cells, status churn,
+13. **CRD scale and soak.** Thousands of symbols/CRs across shards and cells, status churn,
     API-server/etcd size, informer memory and operator workqueue latency.
-13. **Docs synchronization.** Keep `AGENTS.md`, READMEs, `docs/PERFORMANCE.md`, `docs/API.md`,
-    `docs/ETCD_STORAGE.md` and the runbooks moving with storage, wire, read-policy and
-    control-plane changes. Fix the known drift first: `k8s_control_plane/README.md` still says
-    Profile A is the only rendered transport, and the control-plane design doc still lists NATS as
-    a fallback, while Profile N is rendered and live on OrbStack.
 14. **Multi-host evidence (blocked on this host).** Rerun the read/write A/B on a second host and a
     Linux multi-host four-voter cluster, force a stale lease so the `ReadIndex` fallback is
     observed, validate Aeron multicast across hosts, and dispatch the bare-metal pinned-core `e2e`
@@ -183,7 +189,11 @@ keep those halves visible; do not treat a green single-node run as production ev
   pagination, dry-run diffs, NetworkPolicy tests and Pod Security Standards for the manager, the
   order-system and market-data edges and the NATS endpoint. Desired state stays in CRDs; use
   Postgres/object storage only for audit, a query/read model or long-term history, not as a second
-  source of truth. The demo manager has no auth.
+  source of truth. The demo manager has no auth. The 2026-11-21 pitlane review suggests two
+  concrete shapes for this workstream: one named permission bit checked per API route (viewer/
+  trader/risk/ops/admin style) and **test/live mode isolation at the session layer** with a `409`
+  cross-mode refusal, so a mode-filtered client cannot silently read the other mode's data. Audit
+  every control action and alarm on stale/jump/link/risk events.
 - [ ] **P1** Manager deployment packaging: checked-in Deployment/Service/RBAC/Pod Security/
   NetworkPolicy, Helm/Kustomize, image digest pinning/publishing and etcd/CRD backup integration.
   No PVC is needed for desired state; an optional volume is only for audit/export caches. The
@@ -191,7 +201,7 @@ keep those halves visible; do not treat a green single-node run as production ev
   (`deploy/web-ingress.yaml`); the workload and packaging manifests remain. The demo images exist
   only in the node's local store, so add a registry (or an explicit `docker save`/`load` step)
   before the next fleet roll; a `DiskPressure` image GC evicted local images on 2026-11-18.
-- [ ] **P1** Observability: install a metrics-server/Prometheus adapter so the four order-system and
+- [ ] **P1** Observability: install a metrics-server/Prometheus adapter so the one order-system and
   five market-data HPAs report CPU and scale, then add a Prometheus text bridge for the engine's
   JSON `/metrics`, operator reconcile/rollout metrics, alert rules, dashboards and log shipping.
   The console peer view is already covered by the NetworkPolicy rule.
@@ -202,8 +212,9 @@ keep those halves visible; do not treat a green single-node run as production ev
   with `client_order_id`; do not blind-retry `Cancel`/`Amend` until the request-key/typed-redirect
   item lands (P2).
 - [ ] **P1** Order-system public edge: TLS, authentication, rate limits and NetworkPolicy for the
-  per-shard WebUI and `/demo/api`; the demo currently exposes plaintext HTTP with no auth. Keep
-  order entry in the order system and the manager's role to linking only.
+  base-host order desk (`orders.<ingress>/demo/`) and `/demo/api`; the per-shard hosts are migration
+  aliases. The demo currently exposes plaintext HTTP with no auth. Keep order entry in the order
+  system and the manager's role to linking only.
 - [x] **P1** Order-system user-routing edge — resolved: the BFF no longer enforces user ranges and
   one stateless Deployment/Service serves every user on the base `orders.<ingress>` host; the
   per-shard hosts remain as migration aliases. Remaining work is per-user auth/rate limits, which
@@ -216,6 +227,14 @@ keep those halves visible; do not treat a green single-node run as production ev
   `scripts/backup-local-lab.sh` PVC path. Remaining: one cycle against a real object-storage
   bucket, confirming retention and alerting, plus the CSI volume drill once a snapshot-capable
   cluster is available.
+- [ ] **P2 (Top priorities #6)** Ordered pre-trade rule pipeline at the edge/gateway (pitlane
+  review): a fixed first-failure-wins gate with typed rejection codes — halt, open/close blacklist,
+  notional cap by class, per-account and per-market order flow windows, cancel-ratio and
+  cancelled-amount-ratio gates, then self-trade screening — with zero meaning "rule off" and
+  fail-closed behaviour when its fixed cover table is full. Keep it policy-side: do not put user
+  state into the stateless order desk or the matching core, and do not replace our replicated
+  `owner_id`/STP semantics. This is the natural home for the per-user limits left open by
+  solution G.
 - [ ] **P2** Automate the acceptance harness and rollout invariants: first add pure-function tests
   for the rollout candidate rules (one terminating pod at a time, replacement Ready before the next
   deletion, and no skip when `currentRevision == updateRevision` while pods still run the old
@@ -250,18 +269,20 @@ keep those halves visible; do not treat a green single-node run as production ev
 The `MarketDataService` CRD, renderer, operator lifecycle, fast/terminal profiles, four fast-only
 shard services and the global terminal service are live; see History. Remaining work:
 
-- [ ] **P1** Market-data topology and symbol lifecycle coupling. Define a one-subscriber-per-group
-  per-node placement rule (or add dual-publish/relay support): two pods joining the same group on
-  the single-node lab can transiently starve one feed. Stopping a symbol already removes it from
-  every service and scales an empty service to zero; the remaining half is the guarded create/
-  migrate flow that updates both the fast and global symbol sets and `SymbolRoute`, waits for the
-  new feed to be ready before publishing traffic, and drains the old WebSocket sessions.
+- [x] **P1** Market-data topology and symbol lifecycle coupling — done. Creating a symbol attaches
+  it to every non-paused service in the cell; stopping/starting is derived from deployment state;
+  migration waits for per-symbol feed readiness before finishing the route cutover. Subscriber
+  channels bind the wildcard address, so multiple pods may consume one group on one node and no
+  one-per-node placement rule is required. Deployments add hostname/zone topology spread for
+  availability. WebSocket sessions drain via the existing `preStop` hook on service rolls.
 - [ ] **P1** Public market-data edge: ingress TLS/authentication, rate limits, origin checks,
   connection/stream caps, NetworkPolicy and no public Aeron exposure; document the
   gateway/Ingress/manager boundary as part of the security review.
-- [ ] **P1** NATS production hardening: the single-node `deploy/nats.yaml` lab server and the
-  `NatsSink`/`NatsSource` round-trip are validated, but production needs TLS/credentials, strict
-  NetworkPolicy, a multi-node NATS cluster (blocked on this host) and optional JetStream retention.
+- [ ] **P1** NATS production hardening (partly done): the single-node `deploy/nats.yaml` lab server
+  and the `NatsSink`/`NatsSource` round-trip are validated. TCP 4222 egress is now scoped to the
+  NATS pods instead of `0.0.0.0/0`, and a `tls://` URL enables TLS with platform roots. Still needed:
+  credentials/NKey support in both source and sink, a multi-node NATS cluster (blocked on this
+  host), and optional JetStream retention (needs source support plus a stream provisioner).
 - [ ] **P1 (blocked on this host)** Validate Profile A across a multi-node multicast-capable
   CNI/VPC (Cilium/Isovalent multicast, or Multus plus AWS Transit Gateway multicast). The default
   EKS VPC CNI cannot run it. Record CNI/MTU, cross-node `/ready` and leader-transfer reset behavior.
@@ -362,7 +383,10 @@ shard services and the global terminal service are live; see History. Remaining 
 - [ ] **P2** Keep `AGENTS.md`, READMEs, `docs/DECIMAL.md` and this file in sync after future
   storage/wire changes. Fix the known drift first: `k8s_control_plane/README.md` still says Profile
   A is the only rendered transport, and the control-plane design doc still lists NATS as a
-  fallback, while Profile N is rendered and live on OrbStack.
+  fallback, while Profile N is rendered and live on OrbStack. The pitlane review shows a mechanical
+  guard: regenerate derived docs and fail CI on a diff, and require paired EN/CN doc updates in the
+  same change. Add the equivalent check once the generated-doc surface exists; until then, keep the
+  drift list explicit here.
 - [ ] **P3** Decide whether to rename the remaining mixed-style modules before 1.0
   (`src/match_result/` → `match_events/`). This is import-breaking and offers no functional benefit
   today.
@@ -373,6 +397,22 @@ Completed work is summarised here; detailed evidence, measurements and implement
 in git history and the linked docs. For the full history, check out `TODO.md` from an earlier commit
 (`git log -- TODO.md`).
 
+- **2026-11-22** — Market-data lifecycle/topology work: `place_symbol` now attaches a new symbol
+  to every non-paused `MarketDataService` in its cell (per-symbol NATS group or shard-scoped
+  multicast group), with unit tests for both transports. Migration plans carry a
+  `wait-for-market-data-feed` step and the operator blocks cutover completion until every
+  declaring service reports the symbol ready. NATS 4222 egress is scoped to the NATS pods in both
+  engine and service NetworkPolicies, and market-data Deployments spread across hostname/zone.
+  The wildcard subscriber bind means no one-per-group-per-node restriction is needed. Remaining
+  production gates: multi-node NATS + credentials/NKey + JetStream, and multi-node Aeron validation.
+- **2026-11-21** — Added [zzxscodes/pitlane](https://github.com/zzxscodes/pitlane) (`ece9c8a`,
+  MIT, single commit) to `docs/THIRD_PARTY_INVESTIGATION.md` as Part VI. Verified against source:
+  the `FanRing` fail-closed single-producer/64-reader ring, `ReplicaLog` (a capped in-memory quorum
+  match-index log with host-driven leadership — not consensus), and `PreTradeGuard` (ordered
+  first-failure-wins rule pipeline with typed codes and fail-closed cover). Three findings entered
+  the actionable queue: test/live mode isolation and one-permission-bit-per-route in the P1 security
+  workstream, an edge/gateway pre-trade rule pipeline as P2, and a generated-docs diff guard in the
+  P2 docs-sync item. No code was copied; no latency claims were reproduced.
 - **2026-11-20** — Stateless order system (solution G): removed user-range enforcement from the
   BFF (`--user-id-min/--user-id-max` and `DemoApp::require_user` are gone) and collapsed the four
   order-system shards into one Deployment/Service/PDB/HPA. The renderer emits a base-host Ingress
