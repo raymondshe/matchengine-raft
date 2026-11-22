@@ -632,7 +632,14 @@ async fn reconcile_once(client: &Client, options: &OperatorOptions) -> Result<Re
         stats.membership_changes = actions.membership_changes;
         stats.config_writes = actions.config_writes;
         stats.action_failures = actions.failures;
-        stats.migration_actions = execute_migrations(client, &view, &observations, options).await?;
+        stats.migration_actions = execute_migrations(
+            client,
+            &view,
+            &observations,
+            &market_data_observations,
+            options,
+        )
+        .await?;
         let rollout = rollout_shards(client, &view.catalog, &observations).await?;
         stats.rollouts = rollout.actions;
         stats.status_writes = write_statuses(
@@ -1609,10 +1616,11 @@ async fn execute_migrations(
     client: &Client,
     view: &CrdView,
     observations: &Observations,
+    market_data: &BTreeMap<String, MarketDataObservation>,
     options: &OperatorOptions,
 ) -> Result<usize> {
     let http = reqwest::Client::new();
-    let mut actions = finish_cutovers(client, view, observations).await?;
+    let mut actions = finish_cutovers(client, view, observations, market_data).await?;
     actions += rollback_migrations(client, view, observations, options).await?;
 
     for deployment in view.catalog.deployments.values() {
@@ -1815,10 +1823,45 @@ async fn execute_migrations(
     Ok(actions)
 }
 
+/// Whether every market-data service that declares `symbol` has observed a
+/// ready feed for it. Services that do not declare the symbol (or are paused)
+/// are not a cutover gate: there is no feed to wait for there.
+fn market_data_feed_ready(
+    view: &CrdView,
+    market_data: &BTreeMap<String, MarketDataObservation>,
+    symbol: &str,
+) -> bool {
+    for service in view.catalog.market_data_services.values() {
+        if service.spec.paused
+            || !service
+                .spec
+                .symbol_names()
+                .iter()
+                .any(|name| name == symbol)
+        {
+            continue;
+        }
+        let Some(observation) = market_data.get(&service.name) else {
+            return false;
+        };
+        if !observation.feed_ready
+            || !observation
+                .symbols
+                .iter()
+                .any(|status| status.name == symbol && status.ready)
+        {
+            return false;
+        }
+    }
+    // No declaring service means there is no feed to wait for.
+    true
+}
+
 async fn finish_cutovers(
     client: &Client,
     view: &CrdView,
     observations: &Observations,
+    market_data: &BTreeMap<String, MarketDataObservation>,
 ) -> Result<usize> {
     let mut actions = 0;
     for route in view.catalog.routes.values() {
@@ -1842,6 +1885,13 @@ async fn finish_cutovers(
         };
         if target_obs.leader_pod.is_none() {
             info!(target = %target.name, "waiting for the cutover target leader");
+            continue;
+        }
+        if !market_data_feed_ready(view, market_data, &route.spec.symbol_ref) {
+            info!(
+                symbol = %route.spec.symbol_ref,
+                "waiting for market-data feed readiness before finishing cutover"
+            );
             continue;
         }
         if target.spec.desired_state != DeploymentState::Active {
@@ -4833,6 +4883,41 @@ mod tests {
             }],
             ..MarketDataObservation::default()
         }
+    }
+
+    #[test]
+    fn cutover_waits_for_the_market_data_feed() {
+        let mut catalog = demo_catalog();
+        let service = market_data_service();
+        catalog
+            .market_data_services
+            .insert(service.name.clone(), service);
+        let view = CrdView {
+            catalog,
+            objects: BTreeMap::new(),
+        };
+
+        // No service observes a ready feed yet: cutover must wait.
+        let mut observations = BTreeMap::new();
+        observations.insert(
+            "btc-marketdata".to_string(),
+            market_data_observation(2, false),
+        );
+        assert!(!market_data_feed_ready(&view, &observations, "btcusdt"));
+
+        // The declaring service reports the symbol ready: cutover may finish.
+        observations.insert(
+            "btc-marketdata".to_string(),
+            market_data_observation(2, true),
+        );
+        assert!(market_data_feed_ready(&view, &observations, "btcusdt"));
+
+        // A symbol nobody declares has no feed to wait for.
+        assert!(market_data_feed_ready(
+            &view,
+            &observations,
+            "unknown-symbol"
+        ));
     }
 
     #[test]

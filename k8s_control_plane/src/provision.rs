@@ -10,11 +10,93 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::ApiError;
 use crate::model::{
-    DeploymentState, PackingMode, Phase, Placement, Release, RouteSpec, RouteState, ShardStatus,
-    SymbolDeployment, SymbolRoute, SymbolShard, TradingSymbol, dns_label,
+    DeploymentState, MarketDataFeedGroup, MarketDataService, MarketDataTransportMode, PackingMode,
+    Phase, Placement, Release, RouteSpec, RouteState, ShardStatus, SymbolDeployment, SymbolRoute,
+    SymbolShard, TradingSymbol, dns_label,
 };
 use crate::store::Catalog;
 use crate::validate::validate_catalog;
+
+/// Add a newly placed symbol to one market-data service.
+///
+/// The service's declared symbol set is the source of truth for which feeds it
+/// renders. A symbol created through the manager must therefore be attached to
+/// every fast/global service in its cell, otherwise the engine publishes a feed
+/// nobody consumes. The shape follows the transport:
+///
+/// - NATS uses one group per symbol because the subject has no symbol token;
+///   the group name is the symbol, which is unique by construction.
+/// - Multicast/bridge uses one group per `(shard, symbol)` on the shard's
+///   channel, with a stream base that does not overlap an existing group on
+///   that channel. Services with no explicit groups use the simple `symbols`
+///   list.
+fn attach_market_data_symbol(
+    service: &mut MarketDataService,
+    symbol: &str,
+    shard: &str,
+    channel_hint: Option<String>,
+) {
+    if service
+        .spec
+        .symbol_names()
+        .iter()
+        .any(|name| name == symbol)
+    {
+        return;
+    }
+    if service.spec.transport.mode == MarketDataTransportMode::Nats {
+        // NATS subjects have no symbol token, so every group carries exactly
+        // one symbol. A service that declared plain `symbols` has one implicit
+        // group; expand it before adding the new symbol, otherwise
+        // `effective_feed_groups()` would ignore the `symbols` list and drop
+        // the existing symbols from the rendered feed.
+        if service.spec.feed_groups.is_empty() {
+            let existing = std::mem::take(&mut service.spec.symbols);
+            for name in existing {
+                service.spec.feed_groups.push(MarketDataFeedGroup {
+                    name: name.clone(),
+                    symbols: vec![name],
+                    stream_base: 2001,
+                    channel: None,
+                });
+            }
+        }
+        service.spec.feed_groups.push(MarketDataFeedGroup {
+            name: symbol.to_string(),
+            symbols: vec![symbol.to_string()],
+            stream_base: 2001,
+            channel: None,
+        });
+        return;
+    }
+    if service.spec.feed_groups.is_empty() {
+        service.spec.symbols.push(symbol.to_string());
+        return;
+    }
+    let channel = channel_hint
+        .or_else(|| service.spec.transport.channel.clone())
+        .or_else(|| {
+            service
+                .spec
+                .feed_groups
+                .first()
+                .and_then(|group| group.channel.clone())
+        });
+    let base = service
+        .spec
+        .feed_groups
+        .iter()
+        .filter(|group| group.channel == channel)
+        .map(|group| group.stream_base)
+        .max()
+        .map_or(2001, |base| base.saturating_add(10).max(2001));
+    service.spec.feed_groups.push(MarketDataFeedGroup {
+        name: dns_label(&format!("{shard}-{symbol}")),
+        symbols: vec![symbol.to_string()],
+        stream_base: base,
+        channel,
+    });
+}
 
 /// Create a symbol and bind it to a shard.
 #[derive(Debug, Clone, Deserialize)]
@@ -583,6 +665,27 @@ pub fn place_symbol(
     if let Some(target) = candidate.shards.get_mut(&shard.name) {
         target.status.phase = Phase::Pending;
     }
+
+    // Couple the new symbol to the cell's market-data tier. Without this the
+    // engine would publish a feed that no fast/global service subscribes to,
+    // and clients would never see the symbol. Paused services are left alone:
+    // they are deliberately not serving traffic.
+    let shard_prefix = format!("{}-", shard.name);
+    let channel_hint = candidate
+        .market_data_services
+        .values()
+        .filter(|service| service.spec.cell == shard.spec.cell && !service.spec.paused)
+        .flat_map(|service| service.spec.feed_groups.iter())
+        .find(|group| group.name.starts_with(&shard_prefix))
+        .and_then(|group| group.channel.clone());
+    let mut attached = Vec::new();
+    for service in candidate.market_data_services.values_mut() {
+        if service.spec.cell == shard.spec.cell && !service.spec.paused {
+            attach_market_data_symbol(service, &symbol.name, &shard.name, channel_hint.clone());
+            attached.push(service.name.clone());
+        }
+    }
+
     let report = validate_catalog(&candidate);
     if !report.is_ok() {
         return Err(ApiError::unprocessable(report));
@@ -594,11 +697,16 @@ pub fn place_symbol(
         "create-symbol",
         &symbol.name,
         format!(
-            "placed on shard {} slot {} (http {} / raft {})",
+            "placed on shard {} slot {} (http {} / raft {}); market-data services: {}",
             shard.name,
             slot,
             http_port,
-            http_port + crate::model::RAFT_PORT_OFFSET
+            http_port + crate::model::RAFT_PORT_OFFSET,
+            if attached.is_empty() {
+                "none in cell".to_string()
+            } else {
+                attached.join(", ")
+            }
         ),
     );
     Ok(PlacementResult {
@@ -773,6 +881,12 @@ pub fn migrate_symbol(
                 ),
             },
             MigrationStep {
+                action: "wait-for-market-data-feed".to_string(),
+                detail: format!(
+                    "operator keeps route {symbol_name} on the source until every MarketDataService covering the symbol reports per-symbol ready on the new feed; service pods drain existing WebSocket sessions through their preStop hook while the deployment rolls"
+                ),
+            },
+            MigrationStep {
                 action: "cutover-route".to_string(),
                 detail: format!(
                     "operator patches SymbolRoute {} activeDeploymentRef={}, previousDeploymentRef={}, state=Active, then disables the source deployment; source PVCs stay for rollback",
@@ -791,6 +905,7 @@ pub fn migrate_symbol(
             "the target deployment is desiredState=Shadow with a non-overlapping raftIdOffset and consumes a target shard slot"
                 .to_string(),
             "slots are not reused while the source data is retained".to_string(),
+            "the cutover waits for market-data feed readiness; the WebSocket tier drains sessions on rollout instead of dropping them".to_string(),
         ],
     })
 }
@@ -1555,7 +1670,10 @@ fn allocate_slot(catalog: &Catalog, shard: &SymbolShard) -> Result<u16, ApiError
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{AssetClass, AssetId, FeeAssetPolicy, StpMode, TradingSymbolSpec};
+    use crate::model::{
+        AssetClass, AssetId, FeeAssetPolicy, MarketDataService, MarketDataServiceSpec,
+        MarketDataTransport, MarketDataTransportMode, StpMode, TradingSymbolSpec,
+    };
     use crate::store::demo_catalog;
 
     fn symbol(name: &str, id: u32) -> TradingSymbol {
@@ -1615,6 +1733,161 @@ mod tests {
                 .audit
                 .iter()
                 .any(|entry| entry.action == "create-shard" && entry.target == "fx-eu-03")
+        );
+    }
+
+    #[test]
+    fn place_symbol_attaches_it_to_cell_market_data_services() {
+        let mut catalog = demo_catalog();
+        let nats = MarketDataService {
+            name: "fx-marketdata".to_string(),
+            namespace: "match-eu-1".to_string(),
+            spec: MarketDataServiceSpec {
+                cell: "eu-1".to_string(),
+                symbols: Vec::new(),
+                feed_groups: vec![MarketDataFeedGroup {
+                    name: "eurusd".to_string(),
+                    symbols: vec!["eurusd".to_string()],
+                    stream_base: 2001,
+                    channel: None,
+                }],
+                image: "matchengine-marketdata:test".to_string(),
+                release: Default::default(),
+                replicas: 1,
+                transport: MarketDataTransport {
+                    mode: MarketDataTransportMode::Nats,
+                    nats_url: Some("nats://nats.match-eu-1.svc.cluster.local:4222".to_string()),
+                    ..MarketDataTransport::default()
+                },
+                websocket: crate::model::MarketDataWebSocket {
+                    port: 8081,
+                    ..Default::default()
+                },
+                autoscaling: Default::default(),
+                resources: None,
+                paused: false,
+            },
+            status: Default::default(),
+        };
+        let multicast = MarketDataService {
+            name: "global-marketdata".to_string(),
+            namespace: "match-eu-1".to_string(),
+            spec: MarketDataServiceSpec {
+                cell: "eu-1".to_string(),
+                symbols: Vec::new(),
+                feed_groups: vec![MarketDataFeedGroup {
+                    name: "fx-eu-01-eurusd".to_string(),
+                    symbols: vec!["eurusd".to_string()],
+                    stream_base: 2001,
+                    channel: Some("aeron:udp?endpoint=239.1.2.63:24021|ttl=1".to_string()),
+                }],
+                image: "matchengine-marketdata:test".to_string(),
+                release: Default::default(),
+                replicas: 1,
+                transport: MarketDataTransport::default(),
+                websocket: crate::model::MarketDataWebSocket {
+                    port: 8082,
+                    ..Default::default()
+                },
+                autoscaling: Default::default(),
+                resources: None,
+                paused: false,
+            },
+            status: Default::default(),
+        };
+        let paused = MarketDataService {
+            name: "paused-marketdata".to_string(),
+            namespace: "match-eu-1".to_string(),
+            spec: MarketDataServiceSpec {
+                cell: "eu-1".to_string(),
+                paused: true,
+                websocket: crate::model::MarketDataWebSocket {
+                    port: 8090,
+                    ..Default::default()
+                },
+                ..multicast.spec.clone()
+            },
+            status: Default::default(),
+        };
+        let simple = MarketDataService {
+            name: "simple-marketdata".to_string(),
+            namespace: "match-eu-1".to_string(),
+            spec: MarketDataServiceSpec {
+                symbols: vec!["gbpusd".to_string()],
+                feed_groups: Vec::new(),
+                websocket: crate::model::MarketDataWebSocket {
+                    port: 8091,
+                    ..Default::default()
+                },
+                ..nats.spec.clone()
+            },
+            status: Default::default(),
+        };
+        catalog.market_data_services.insert(nats.name.clone(), nats);
+        catalog
+            .market_data_services
+            .insert(multicast.name.clone(), multicast);
+        catalog
+            .market_data_services
+            .insert(paused.name.clone(), paused);
+        catalog
+            .market_data_services
+            .insert(simple.name.clone(), simple);
+
+        place_symbol(&mut catalog, request("nzdchf", 90, Some("fx-eu-02"), None)).unwrap();
+
+        // NATS: one group per symbol, group name is the symbol.
+        let nats = &catalog.market_data_services["fx-marketdata"];
+        let group = nats
+            .spec
+            .feed_groups
+            .iter()
+            .find(|group| group.name == "nzdchf")
+            .expect("NATS service gained a group for the new symbol");
+        assert_eq!(group.symbols, vec!["nzdchf".to_string()]);
+        assert!(group.stream_base >= 2001);
+
+        // A simple `symbols` service is expanded into one NATS group per
+        // symbol, so its existing symbols survive the new attachment.
+        let simple = &catalog.market_data_services["simple-marketdata"];
+        assert!(simple.spec.symbols.is_empty());
+        let names = simple.spec.symbol_names();
+        assert!(names.contains(&"gbpusd".to_string()), "{names:?}");
+        assert!(names.contains(&"nzdchf".to_string()), "{names:?}");
+        let groups = simple.spec.effective_feed_groups();
+        assert_eq!(groups.len(), 2, "{groups:?}");
+        for group in &groups {
+            assert_eq!(group.symbols.len(), 1, "{group:?}");
+        }
+        let grouped: Vec<&str> = groups
+            .iter()
+            .flat_map(|group| group.symbols.iter().map(String::as_str))
+            .collect();
+        assert!(grouped.contains(&"gbpusd"));
+        assert!(grouped.contains(&"nzdchf"));
+
+        // Multicast: one group per (shard, symbol) on the shard's channel.
+        let global = &catalog.market_data_services["global-marketdata"];
+        let group = global
+            .spec
+            .feed_groups
+            .iter()
+            .find(|group| group.name == "fx-eu-02-nzdchf")
+            .expect("global service gained a shard-scoped group");
+        assert_eq!(group.symbols, vec!["nzdchf".to_string()]);
+        assert_eq!(
+            group.channel.as_deref(),
+            Some("aeron:udp?endpoint=239.1.2.63:24021|ttl=1")
+        );
+
+        // A paused service is deliberately left alone.
+        let paused = &catalog.market_data_services["paused-marketdata"];
+        assert!(
+            !paused
+                .spec
+                .symbol_names()
+                .iter()
+                .any(|name| name == "nzdchf")
         );
     }
 

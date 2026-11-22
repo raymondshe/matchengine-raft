@@ -646,6 +646,19 @@ fn pod_disruption_budget(ctx: &Ctx<'_>) -> Value {
     })
 }
 
+/// Pod labels used by `deploy/nats.yaml`. Both the engine and the
+/// market-data tier use this selector so Profile N egress stays inside the
+/// cell instead of opening 4222 to `0.0.0.0/0`.
+fn nats_selector() -> serde_json::Map<String, Value> {
+    let mut labels = serde_json::Map::new();
+    labels.insert("app.kubernetes.io/name".to_string(), json!("nats"));
+    labels.insert(
+        "app.kubernetes.io/part-of".to_string(),
+        json!("matchengine"),
+    );
+    labels
+}
+
 fn network_policy(ctx: &Ctx<'_>) -> Value {
     let (http_first, http_last) = ctx.http_range();
     let (raft_first, raft_last) = ctx.raft_range();
@@ -746,8 +759,10 @@ fn network_policy(ctx: &Ctx<'_>) -> Value {
                 "ports": ports,
             }));
     }
-    // Profile N: the engine opens one TCP connection to NATS. The default
-    // cluster policy is deny-all egress, so this rule is required.
+    // Profile N: the engine opens one TCP connection to NATS. Scope the rule
+    // to the cell's NATS pods rather than the whole internet: a 0.0.0.0/0
+    // egress rule for 4222 would let a compromised engine process reach any
+    // NATS-shaped endpoint on the network.
     if ctx
         .market_data
         .values()
@@ -757,7 +772,7 @@ fn network_policy(ctx: &Ctx<'_>) -> Value {
             .as_array_mut()
             .expect("egress array")
             .push(json!({
-                "to": [{ "ipBlock": { "cidr": "0.0.0.0/0" } }],
+                "to": [{ "podSelector": { "matchLabels": nats_selector() } }],
                 "ports": [{ "protocol": "TCP", "port": 4222 }],
             }));
     }
@@ -1611,6 +1626,24 @@ fn market_data_deployment(ctx: &MarketDataCtx<'_>, config: &Value) -> Value {
                             }],
                         },
                     },
+                    // Spread replicas across nodes and zones. With the
+                    // wildcard receiver bind, several replicas may share one
+                    // node safely; spreading is for availability, not a
+                    // one-subscriber-per-group-per-node restriction.
+                    "topologySpreadConstraints": [
+                        {
+                            "maxSkew": 1,
+                            "topologyKey": "kubernetes.io/hostname",
+                            "whenUnsatisfiable": "ScheduleAnyway",
+                            "labelSelector": { "matchLabels": labels_value(&selector) },
+                        },
+                        {
+                            "maxSkew": 1,
+                            "topologyKey": "topology.kubernetes.io/zone",
+                            "whenUnsatisfiable": "ScheduleAnyway",
+                            "labelSelector": { "matchLabels": labels_value(&selector) },
+                        },
+                    ],
                     "containers": [market_data_container(ctx)],
                     "volumes": [
                         {
@@ -1816,10 +1849,11 @@ fn market_data_network_policy(ctx: &MarketDataCtx<'_>) -> Value {
             }));
         }
         MarketDataTransportMode::Nats => {
-            // One TCP connection to the shared NATS service. Core NATS fans
-            // out to every replica; no direct engine connection is needed.
+            // One TCP connection to the shared NATS service. Scope egress to
+            // the cell's NATS pods; Core NATS fans out to every replica, so no
+            // direct engine connection is needed.
             egress.push(json!({
-                "to": [{ "ipBlock": { "cidr": "0.0.0.0/0" } }],
+                "to": [{ "podSelector": { "matchLabels": nats_selector() } }],
                 "ports": [{ "protocol": "TCP", "port": 4222 }],
             }));
         }
@@ -3205,15 +3239,25 @@ mod tests {
         assert!(!args.contains(&"--aeron-channel"), "{args:?}");
         assert!(!args.contains(&"--aeron-embedded-driver"), "{args:?}");
         let policy = object(&objects, "NetworkPolicy");
+        let nats_rule = policy["spec"]["egress"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|rule| {
+                rule["ports"].as_array().is_some_and(|ports| {
+                    ports
+                        .iter()
+                        .any(|port| port["protocol"] == "TCP" && port["port"] == 4222)
+                })
+            })
+            .expect("NATS egress rule");
+        assert_eq!(
+            nats_rule["to"][0]["podSelector"]["matchLabels"]["app.kubernetes.io/name"],
+            "nats"
+        );
         assert!(
-            policy["spec"]["egress"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|rule| rule["ports"].as_array().is_some_and(|ports| ports
-                    .iter()
-                    .any(|port| { port["protocol"] == "TCP" && port["port"] == 4222 }))),
-            "{policy:?}"
+            nats_rule["to"][0]["ipBlock"].is_null(),
+            "NATS egress must not be open to 0.0.0.0/0: {nats_rule:?}"
         );
         assert!(
             !policy["spec"]["egress"]
@@ -3686,6 +3730,18 @@ mod tests {
         assert_eq!(deployment["metadata"]["name"], "btc-marketdata");
         // The HPA owns the replica count while the service is running.
         assert!(deployment["spec"].get("replicas").is_none());
+        // Replicas spread across nodes and zones for availability. This is
+        // not a one-subscriber-per-group-per-node restriction: subscriber
+        // channels bind the wildcard address, so co-located pods both receive.
+        let spread = deployment["spec"]["template"]["spec"]["topologySpreadConstraints"]
+            .as_array()
+            .expect("topology spread constraints");
+        let keys: Vec<&str> = spread
+            .iter()
+            .map(|constraint| constraint["topologyKey"].as_str().unwrap())
+            .collect();
+        assert!(keys.contains(&"kubernetes.io/hostname"));
+        assert!(keys.contains(&"topology.kubernetes.io/zone"));
         assert_eq!(
             deployment["spec"]["strategy"]["rollingUpdate"]["maxUnavailable"],
             0

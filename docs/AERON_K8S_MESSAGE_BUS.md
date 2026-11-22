@@ -263,12 +263,15 @@ NATS only:
   NetworkPolicy. The canonical prefix is `md.<cell>.<feed-group>` from the smallest service that
   covers the symbol, so the fast and global services share one subject even when their local group
   names differ. `transport.subjectPrefix` overrides the `md` root.
-- Symbol lifecycle: stopping a `SymbolDeployment` removes it from every service that declares it
-  (engine args, market-data args/ConfigMap and status); starting it re-adds the symbol and rolls
-  the service. A service whose symbols are all stopped scales to zero and drops its HPA.
+- Symbol lifecycle: creating a `SymbolDeployment` attaches the symbol to every non-paused service
+  in its cell; stopping it removes it from every service that declares it (engine args, market-data
+  args/ConfigMap and status); starting it re-adds the symbol and rolls the service. A service whose
+  symbols are all stopped scales to zero and drops its HPA. Migration waits for per-symbol feed
+  readiness on all declaring services before finishing the route cutover.
 - Lab infrastructure: `k8s_control_plane/deploy/nats.yaml` runs a single plaintext NATS server in
-  `match-eu-1`. Production still needs a multi-node NATS cluster, TLS, credentials and (optionally)
-  JetStream retention.
+  `match-eu-1`. A `tls://` URL already enables TLS; a multi-node NATS cluster, credentials/NKey and
+  (optionally) JetStream retention remain production gates. TCP 4222 egress is scoped to the NATS
+  pods, not `0.0.0.0/0`.
 
 ### 5.2 Profile A — direct Aeron multicast (default implementation)
 

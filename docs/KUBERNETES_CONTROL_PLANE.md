@@ -2012,13 +2012,22 @@ per-service image picker. Profile N direct NATS is also rendered:
 `--market-data-nats-*` args and the market-data `--nats-*` source args, opens TCP 4222 in the
 NetworkPolicy and skips Aeron ports. The canonical subject is `md.<cell>.<feed-group>`, chosen
 from the smallest service that covers a symbol, so a fast service and the global terminal service
-subscribe to the same feed. A symbol's lifecycle follows its `SymbolDeployment`: stopping it
-(`spec.desiredState: Disabled`) removes it from every service that declares it — rendered args,
-ConfigMap and per-symbol status — while the other symbols stay Ready; starting it re-adds the
-symbol and rolls the Deployment. A service whose declared symbols are all stopped scales to zero
-and omits its HPA, so it does not flap while the shard is down.
-`k8s_control_plane/deploy/nats.yaml` is the single-node lab server.
-HPA/canary policy, ServiceMonitor, NATS TLS/auth and JetStream retention remain follow-ups; the
+subscribe to the same feed. A symbol's lifecycle follows its `SymbolDeployment`: creating it attaches it to every non-paused
+`MarketDataService` in the cell (a per-symbol NATS group, or a shard-scoped multicast group on the
+shard's channel); stopping it (`spec.desiredState: Disabled`) hides it from every service that
+declares it — rendered args, ConfigMap and per-symbol status — while the other symbols stay Ready;
+starting it re-adds the symbol and rolls the Deployment. A service whose declared symbols are all
+stopped scales to zero and omits its HPA, so it does not flap while the shard is down. During a
+migration the operator keeps the source route until every declaring service reports the symbol
+`ready` on the new feed; WebSocket sessions drain through the service's `preStop` hook while its
+Deployment rolls. Market-data Deployments spread replicas across nodes and zones with
+`ScheduleAnyway` constraints; subscribers bind the wildcard address, so multiple pods may consume
+one group on the same node — there is deliberately no one-subscriber-per-group-per-node limit.
+`k8s_control_plane/deploy/nats.yaml` is the single-node lab server. Engine and service egress to
+TCP 4222 is scoped to the NATS pods by `podSelector` instead of `0.0.0.0/0`. A `tls://` URL in
+`transport.natsUrl` already gives TLS with the platform roots; NATS credentials/NKey and JetStream
+retention need source support and remain follow-ups, as does the multi-node cluster.
+HPA/canary policy and ServiceMonitor remain follow-ups; the
 transport choice, multicast constraints and scale-out profiles are designed in
 [`AERON_K8S_MESSAGE_BUS.md`](./AERON_K8S_MESSAGE_BUS.md).
 
