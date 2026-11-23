@@ -6,12 +6,15 @@ deterministic trade stream into dense, durable, queryable klines and serves them
 process and Binance-compatible API — with the guarantees Binance does not provide (a mutation
 sequence, gap repair, explicit revisions, and one store behind both history and replay).
 
-P0 implements the TDengine schema, the trade-derived `1s`/`1m` writer, exact-decimal text I/O,
+P0 implements the TDengine schema, the trade-derived `1s`/`1m`/`5m` writer, exact-decimal text I/O,
 `GET /klines` (including read-time `INTERVAL` rollups for `3m`…`3d`), and WS subscribe replay
-seeded from TDengine. Deliberately deferred: the trade spool and Lease failover, `bar_gaps` /
-`bar_revisions` / `bar_imports`, `GET /bars`, the archive/REST importers, time-zone and `1w`/`1M`
-windows, and the three-dnode deployment. The sections below describe the complete target; §17
-marks which phase each piece belongs to.
+seeded from TDengine. Targets that are whole multiples of 5 minutes roll up from `bars_5m` when it
+has data (`30m` → `5m` → `1m`), and fall back to `bars_1m` on older deployments.
+
+Deliberately deferred: the trade spool and Lease failover, `bar_gaps` / `bar_revisions` /
+`bar_imports`, `GET /bars`, the archive/REST importers, time-zone and `1w`/`1M` windows, and the
+three-dnode deployment. The sections below describe the complete target; §17 marks which phase each
+piece belongs to.
 
 The store is **TDengine**. Bars are written as exact `DECIMAL(38,18)` rows and read back as exact
 decimal text; no value in the bar path passes through a binary float or a 96-bit client decimal
@@ -36,7 +39,7 @@ reuse), [`AGENTS.md`](../AGENTS.md).
 ```text
  writer (1 active, Lease-guarded)                    TDengine (3 dnodes, REPLICA 3)
  ┌─────────────────────────────────────────┐        ┌─────────────────────────────────────┐
- │ feed tap ─► builder ─► 1s/1m bar rows ──┼─upsert►│ bars_1s   bars_1m   bar_state       │
+ │ feed tap ─► builder ─► 1s/1m/5m rows ───┼─upsert►│ bars_1s bars_1m bars_5m bar_state │
  │      │          │                       │        │ bar_gaps  bar_revisions  bar_imports│
  │      │          └─► WS hub (live)       │        └─────────────────────────────────────┘
  │      └─► trade spool (local, 7 d)       │                        ▲
@@ -241,9 +244,9 @@ the open row (the live writer's next cadence overwrites it). See §13 for the fu
 | **Feed tap** | Decode `MarketMessage` frames from NATS, Aeron or a JSONL replay; filter to `Trade` bodies and the symbol's `Status` heartbeat; retain `market_seq` | Reconnects with backoff; freshness drives `/ready` |
 | **Trade spool** | Append every consumed `TradeRecord` plus the envelope's `market_seq` (`ts_ms` is on the trade) to a rolling per-symbol file, fsync on a 1 s cadence | The restart and revision source; see §4.5 |
 | **Hole checker** | Compare the spool's `last_trade` with the engine's `/events` cursor to detect a gap the spool cannot fill | Runs at startup and every 60 s; ids only |
-| **Bar builder** | Per `(symbol, interval)`: fold trades into the open `1s` window and the open `1m` rollup, maintain cumulative fields, emit on cadence | Rebuilt from `bar_state` + spool on start |
+| **Bar builder** | Per `(symbol, interval)`: fold trades into the open `1s`, `1m` and `5m` windows, maintain cumulative fields, emit on cadence | Rebuilt from `bar_state` + spool on start |
 | **Cadence ticker** | Re-publishes the open bar every `min(interval, 2 s)` and evaluates the close watermark | Stateless |
-| **Sealer** | Freezes a completed window, asserts invariants, re-derives `1m` from its `1s` children, writes `sealed=true` | Idempotent; re-seals produce identical rows |
+| **Sealer** | Freezes a completed window, asserts invariants, re-derives `1m` from `1s` and `5m` from `1m`, writes `sealed=true` | Idempotent; re-seals produce identical rows |
 | **TDengine writer** | Batch upserts per `(symbol, interval)` subtable; retries idempotently; records errors | Reconnects with backoff; a failed batch is retried |
 | **Schema manager** | Creates databases/stables idempotently, verifies `schema_version`, checks `KEEP`/`REPLICA` | Refuses to start on a version mismatch |
 | **State tables** | `bar_state` (watermark, cursor, revision), `bar_gaps` (known holes), `bar_revisions` (audit), `bar_imports` (file ledger) | Upserts; append-only for gaps/revisions/imports |
@@ -323,7 +326,7 @@ market_data_system/src/
 ├── source/{mod,nats,aeron,jsonl}.rs   # existing feed decoders, reused as-is
 ├── feed.rs, session.rs, server.rs, protocol.rs   # existing; query routes + kline payload reused
 ├── bars/
-│   ├── mod.rs                    # window aggregation for 1s and the 1m rollup
+│   ├── mod.rs                    # window aggregation for 1s, 1m and 5m
 │   ├── ring.rs                   # open bars + live WS push buffer
 │   └── seal.rs                   # watermark, invariants, sealed upsert
 ├── store/
@@ -366,7 +369,7 @@ market_data_system/src/
 | `--max-seal-lag-secs` | 120 | new | `/ready` seal-lag bound |
 | `--bootstrap-buffer-bytes` | 64 MiB | new | trades buffered while a subscriber's snapshot query runs |
 | `--feed-timeout-secs` | 30 | existing | feed freshness bound for `/ready` |
-| `--derive-on-read` | off | new | aggregate `1s` instead of `bars_1m`; repair/backfill check only |
+| `--derive-on-read` | off | new | aggregate from `bars_1m` instead of `bars_5m`; repair/backfill check only |
 | `--rest-budget-weight-per-min` | 750 | new | tail backfill ceiling |
 | `--import-dir`, `--import-symbol`, `--import-interval` | — | new | offline archive seed |
 
@@ -380,7 +383,7 @@ The only writer-local path left is `--spool-dir`.
 
 | Earlier component | Now |
 |---|---|
-| Day segment files (`bars/<symbol>/<interval>/<day>.seg`) | `bars_1s` / `bars_1m` rows, keyed by `(symbol, ts)` |
+| Day segment files (`bars/<symbol>/<interval>/<day>.seg`) | `bars_1s` / `bars_1m` / `bars_5m` rows, keyed by `(symbol, ts)` |
 | Segment `.sha256` + CRC | TDengine block checksums + three replicas |
 | SQLite `catalog.sqlite` | `bar_state`, `bar_gaps`, `bar_imports` |
 | Shared manifest object | `bar_state` row, read with `LAST_ROW` |
@@ -620,21 +623,24 @@ database row, not a segment, is the unit of durability.
 The public interval set is exactly the Binance spot set: `1s`, `1m`, `3m`, `5m`, `15m`, `30m`,
 `1h`, `2h`, `4h`, `6h`, `8h`, `12h`, `1d`, `3d`, `1w`, `1M`.
 
-**Stored** intervals are exactly two: `1s` (the canonical series, formed from trades) and `1m` (a
-materialized rollup of the traded `1s` children). Everything coarser is computed at read time from
-`bars_1m` with TDengine `INTERVAL`, so a revision to a `1s` window never cascades through fourteen
-tables:
+**Stored** intervals are exactly three: `1s` (the canonical series, formed from trades), `1m` (a
+materialized rollup of the traded `1s` children) and `5m` (a rollup of `1m` children). Everything
+coarser is computed at read time with TDengine `INTERVAL`. A target that is a whole number of
+5-minute windows reads `bars_5m` when that table has data and falls back to `bars_1m` on older
+deployments; `3m` always reads `bars_1m`:
 
 | Request | Source | TDengine window |
 |---|---|---|
 | `1s` | `bars_1s` | none (raw rows) |
 | `1m` | `bars_1m` | none (raw rows) |
-| `3m` … `12h` | `bars_1m` | `INTERVAL(width)` |
-| `1d`, `3d` (UTC) | `bars_1m` | `INTERVAL(1d)` / `INTERVAL(3d)` |
-| `1d`, `3d` (`timeZone=±HH:MM`) | `bars_1m` | `INTERVAL(width, (24h - tz) mod 24h)` |
-| `1w` (UTC) | `bars_1m` | `INTERVAL(1w, 4d)` — Monday 00:00 |
-| `1w` (`timeZone=±HH:MM`) | `bars_1m` | `INTERVAL(1w, (96h - tz) mod 168h)` |
-| `1M` (UTC) | `bars_1m` | `INTERVAL(1n)` — natural month |
+| `5m` | `bars_5m` | none (raw rows) |
+| `3m` | `bars_1m` | `INTERVAL(3m)` |
+| `15m`, `30m`, `1h` … `12h` | `bars_5m` (fallback `bars_1m`) | `INTERVAL(width)` |
+| `1d`, `3d` (UTC) | `bars_5m` (fallback `bars_1m`) | `INTERVAL(1d)` / `INTERVAL(3d)` |
+| `1d`, `3d` (`timeZone=±HH:MM`) | `bars_5m` (fallback `bars_1m`) | `INTERVAL(width, (24h - tz) mod 24h)` |
+| `1w` (UTC) | `bars_5m` (fallback `bars_1m`) | `INTERVAL(1w, 4d)` — Monday 00:00 |
+| `1w` (`timeZone=±HH:MM`) | `bars_5m` (fallback `bars_1m`) | `INTERVAL(1w, (96h - tz) mod 168h)` |
+| `1M` (UTC) | `bars_5m` (fallback `bars_1m`) | `INTERVAL(1n)` — natural month |
 | `1M` (`timeZone=±HH:MM`) | `bars_1m` | edge-fold from `1m` at local midnight |
 
 The offset forms are verified against the pinned version: `INTERVAL(1d, 16h)` starts a day at
@@ -644,11 +650,12 @@ literal is a syntax error, so the offset is always expressed as a positive hour 
 with a positive time zone the boundary falls on the previous month's last day and is therefore
 edge-grouped rather than expressed as a TDengine offset.
 
-**Why only `1s` and `1m` are stored.** Materializing every interval multiplies the write path and
-makes a revision cascade through fourteen tables, while the measured cost of the read-time rollup is
-already single-digit to low-tens of milliseconds for the windows the 1000-bar cap allows (§12).
-`1m` is materialized because it is the source of every coarser query and because a day of `1m`
-(6.5 ms) is measurably cheaper than rolling a day of `1s` up on every request (11 ms). `1h` and
+**Why only `1s`, `1m` and `5m` are stored.** Materializing every interval multiplies the write path
+and makes a revision cascade through thirteen tables, while the measured cost of the read-time
+rollup is already single-digit to low-tens of milliseconds for the windows the 1000-bar cap allows
+(§12). `1m` is materialized because a day of `1m` (6.5 ms) is measurably cheaper than rolling a day
+of `1s` up on every request (11 ms). `5m` is the additional 6-row source for `30m` and larger
+multiples; `1m`→`5m`→`30m` is asserted field-by-field against a direct `1m`→`30m` rollup. `1h` and
 `1d` are not materialized: a year of `1d` from `1m` measured 28 ms.
 
 **Offset-anchored requests** are `1d`, `3d`, `1w` and `1M` under a non-zero `timeZone`. They are
@@ -865,7 +872,9 @@ windows**; every coarser interval is a rollup of `1m` at read time:
 |---|---|---|
 | `1s` | trades | §6.2, the only place a bar is formed from fills |
 | `1m` | traded `1s` children | `open` = first child's `open`, `close` = last child's `close`, `high` = max, `low` = min, volumes/trades sum, `first_trade` = first, `last_trade` = last, `last_ts` = last child's `last_ts`, `seq` = last child's `seq` |
-| `3m` … `1M` | `1m` rows | the same rule, executed by TDengine `INTERVAL` / `FIRST` / `LAST` / `MAX` / `MIN` / `SUM` |
+| `5m` | traded `1m` children | the same rule; materialized so coarser multiples have a 6-row instead of 30-row source |
+| `3m`, `15m` | `1m` rows | `INTERVAL` rollup (not a whole number of 5-minute windows for `3m`) |
+| `30m` … `1M` | `5m` rows when present, else `1m` | the same rule, executed by TDengine `INTERVAL` / `FIRST` / `LAST` / `MAX` / `MIN` / `SUM` |
 | any interval | — | a window with no traded child is **not** stored; densification at serve time supplies the flat carry-forward (§7.4) |
 
 **The sparse rule is not cosmetic — it is measured.** Aggregating the 2025-01-02 BTCUSDT archive:
@@ -875,6 +884,8 @@ windows**; every coarser interval is a rollup of `1m` at read time:
 | `1s` → `1m`, **traded-only** children | **1,440 / 1,440** | none |
 | `1s` → `1m`, dense children (flat seconds included) | 1,411 / 1,440 | 29 `open` values off by one tick: the flat first second carries the **previous** close, not the first trade of the minute |
 | `1m` → `1h`, traded-only (and dense) | 24 / 24 | that day had no empty leading minute, so both agree; the `1s` case is the discriminator |
+| `1m` → `5m` → `30m` vs `1m` → `30m` | exact, field by field | unit test in `market_data_system/src/history/query.rs`; sparse minutes never become flat children |
+| live `5m` → `30m` via `/klines` | 17/17 traded windows exact | `scripts/check-30m-rollup.py` against the OrbStack terminal; OHLC, both volumes and trade count |
 
 The same equality was reproduced through TDengine: a query-time `INTERVAL(1m)` rollup of the stored
 `1s` day returned 1,440 windows and matched the materialized `bars_1m` rows field for field, while
@@ -883,13 +894,15 @@ implementation of the same rule, not a second interpretation.
 
 Consequences:
 
-- **Storage**: `bars_1m` is a materialized rollup — a read accelerator, not an independent source of
-  truth. A revision to a `1s` window re-derives the containing `1m` row (§6.4); coarser intervals
-  are recomputed on the next query.
-- **Writes**: the writer maintains `1s` and `1m` only. There are no per-interval checkpoints and no
-  per-interval fan-out.
-- **Queries** never aggregate raw `1s` for far history: `1m` is the fast path for every coarser
-  interval, and `--derive-on-read` (optional) exists only for a repair or a backfill check.
+- **Storage**: `bars_1m` and `bars_5m` are materialized rollups — read accelerators, not independent
+  sources of truth. A revision to a `1s` window re-derives the containing `1m` and `5m` rows (§6.4);
+  coarser intervals are recomputed on the next query.
+- **Writes**: the writer maintains `1s`, `1m` and `5m`. There are no per-interval checkpoints and no
+  fan-out beyond those three series.
+- **Queries** never aggregate raw `1s` for far history: `5m` is the fast path for targets that are
+  whole multiples of 5 minutes (including `30m`), `1m` for the rest, with an automatic fallback to
+  `1m` when `bars_5m` is empty; `--derive-on-read` (optional) exists only for a repair or a backfill
+  check.
 - **Equality with the reference is testable**: the golden test in §16 asserts the 1,440/1,440
   result, and a dense-vs-sparse differential test would fail if the densification rule ever leaked
   into a rollup.
@@ -931,6 +944,22 @@ CREATE STABLE IF NOT EXISTS market_bars.bars_1s (
 ) TAGS (symbol VARCHAR(32));
 
 CREATE STABLE IF NOT EXISTS market_bars.bars_1m (
+  ts TIMESTAMP,
+  open DECIMAL(38,18), high DECIMAL(38,18), low DECIMAL(38,18), close DECIMAL(38,18),
+  volume DECIMAL(38,18), quote_volume DECIMAL(38,18),
+  taker_base DECIMAL(38,18), taker_quote DECIMAL(38,18),
+  trades BIGINT UNSIGNED,
+  last_ts TIMESTAMP,
+  first_log BIGINT, first_ord INT,
+  last_log BIGINT, last_ord INT,
+  rev INT,
+  source TINYINT,
+  sealed BOOL,
+  seq BIGINT
+) TAGS (symbol VARCHAR(32));
+
+-- Identical columns; 5m is the intermediate source for 30m and larger rollups.
+CREATE STABLE IF NOT EXISTS market_bars.bars_5m (
   ts TIMESTAMP,
   open DECIMAL(38,18), high DECIMAL(38,18), low DECIMAL(38,18), close DECIMAL(38,18),
   volume DECIMAL(38,18), quote_volume DECIMAL(38,18),
@@ -1108,7 +1137,7 @@ builder ──(symbol, interval, Bar)──► bounded queue ──► writer ta
 
 ```text
 GET /klines?symbol&interval&startTime&endTime&limit
-  ├─ 1s / 1m      : SELECT ts, CAST(col AS VARCHAR) ... WHERE symbol=… AND ts>=… AND ts<…
+  ├─ 1s / 1m / 5m : SELECT ts, CAST(col AS VARCHAR) ... WHERE symbol=… AND ts>=… AND ts<…
   ├─ 3m … 1M      : SELECT _wstart, CAST(FIRST(open) AS VARCHAR), CAST(MAX(high) AS VARCHAR),
   │                   CAST(MIN(low) AS VARCHAR), CAST(LAST(close) AS VARCHAR),
   │                   CAST(SUM(volume) AS VARCHAR), … FROM bars_1m
@@ -1166,7 +1195,7 @@ The `CAST` columns are the exactness boundary (§7.2); no other read path decode
 
 ### 7.6 Compression, retention and backup
 
-Measured on the benchmark schema (7 symbols, `1s` for one day, `1m` for one year):
+Measured on the benchmark schema (7 symbols, `1s` for one day, `1m` for one year; `5m` derived from `1m`):
 
 | Series | Rows | Compressed size | Bytes/row | Ratio |
 |---|---|---|---|---|
@@ -1180,7 +1209,7 @@ stored with zstd and no delta encoding in 3.3.6, which is why a `1s` row is 40 B
 operational, and 40 B per traded second is ~1.26 GB per symbol-year at a full 86,400 traded
 seconds, or ~0.76 GB at the measured 60% density.
 
-`KEEP` is the retention boundary. `bars_1s` and `bars_1m` share the database `KEEP`; a deployment
+`KEEP` is the retention boundary. `bars_1s`, `bars_1m` and `bars_5m` share the database `KEEP`; a deployment
 that wants a shorter `1s` retention and a longer `1m` retention uses two databases or accepts the
 same window. The default 10 years covers the archive and the live path; a longer import raises
 `KEEP` first. There is no compaction job, no segment merge and no cache eviction.
@@ -1343,7 +1372,7 @@ enumerate (S3 ListBucketResult, prefix=data/spot/{daily,monthly}/klines/<SYMBOL>
      first/last trade ids stay None (the archive publishes none of them)
    → clamp to [first_trade, now) — listing-month files start at the listing second
    → validate invariants and monotonicity
-   → batch upsert into bars_1s (and derive bars_1m) or bars_1m
+   → batch upsert into bars_1s (derive bars_1m and bars_5m), bars_1m or bars_5m
    → record the file in bar_imports (sha256, rows, status)
 ```
 
@@ -1413,7 +1442,7 @@ append-only. Comparison is over OHLCV, volume and trade count only: an imported 
 `last_trade_ts_us` or trade ids (§5.7), and their absence is not a disagreement — a revision may
 fill them in from the live/spool side but never invent them from the source.
 
-A revision is one `1s` upsert plus one `1m` upsert; coarser intervals follow on read. That is the
+A revision re-derives the containing `1s`, `1m` and `5m` rows; coarser intervals follow on read. That is the
 main operational win over the segment design, where a base revision had to rewrite every stored
 interval that contained the window.
 
@@ -1422,7 +1451,7 @@ interval that contained the window.
 Every window close re-checks the §5.2 invariants over the window being sealed, plus:
 
 - every stored bar's `last_trade` is greater than the previous stored bar's `last_trade`;
-- the re-derived `1m` row equals the rollup of its `1s` children for the window (cheap, in memory);
+- the re-derived `1m` row equals the rollup of its `1s` children, and `5m` of `1m` (cheap, in memory);
 - for a deterministic 1% of windows still inside spool retention, the re-derived bar from trades
   equals the stored bar (hash-selected, so coverage is uniform rather than clustered at recent
   data).
@@ -1436,7 +1465,7 @@ blocks the `1m` row from being marked sealed, even if the `1s` rows are individu
 ### 12.1 Measured on this host
 
 Environment: TDengine **3.3.6.13**, arm64 container, one dnode, one vgroup, `REPLICA 1`,
-`PRECISION 'us'`, `CACHEMODEL 'last_row'`, schema mirroring §7.1 (`bars_1s`, `bars_1m`), seven
+`PRECISION 'us'`, `CACHEMODEL 'last_row'`, schema mirroring §7.1 (`bars_1s`, `bars_1m`, `bars_5m`), seven
 symbols (`gbpusd`, `eurusd`, `audusd`, `usdjpy`, `eurgbp`, `nzdusd`, `btcusdt`), synthetic integer
 random-walk data for 2025-01-02 through 2026-01-01, REST over `taosAdapter:6041`, client round-trip
 timing (the server `timing` field read 0 in this version). The data is synthetic, so absolute
@@ -1661,9 +1690,10 @@ with its spool PVC, and points both at the DSN. TDengine itself is installed onc
 6. **TDengine is the system of record.** No custom segment format, no SQLite catalog, no manifest,
    no open-day checkpoint, no reader cache. The measured read latency, exact decimals and
    three-replica HA make the database the simpler and safer store.
-7. **Two materialized series (`1s`, `1m`); every coarser interval is a read-time rollup.** This is
-   measured, not assumed: `1s` → `1m` traded-only is 1,440/1,440 against the reference, and a
-   revision to a base window re-derives one minute instead of cascading through fourteen intervals.
+7. **Three materialized series (`1s`, `1m`, `5m`); every coarser interval is a read-time rollup.**
+   Multiples of 5 minutes read `bars_5m` when available and fall back to `bars_1m`; `30m` therefore
+   rolls up as `1m` → `5m` → `30m`. This is measured, not assumed: `1s` → `1m` traded-only is
+   1,440/1,440 against the reference and the 5m/30m chain is asserted field-by-field in unit tests.
 8. **Exact decimals end to end.** `DECIMAL(38,18)` on the server, canonical text on write,
    `CAST … AS VARCHAR` on read, a strict 18-scale parser at the edge. `f64` and `rust_decimal` are
    not allowed to decode a bar value; the measured 38-digit loss through `rust_decimal` is the

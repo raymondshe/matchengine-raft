@@ -17,6 +17,7 @@ import json
 import os
 import random
 import time
+from decimal import Decimal
 from urllib.parse import urlparse
 
 _URL = urlparse(os.environ.get("TDENGINE_URL", "http://127.0.0.1:16042"))
@@ -30,6 +31,16 @@ SYMBOLS = os.environ.get(
     "SEED_SYMBOLS", "gbpusd,audusd,usdjpy,eurgbp,nzdusd,btcusdt,eurchf"
 ).split(",")
 SCALE = 10**18
+# Lab quotes, so each symbol's history has its own visually distinct price scale.
+BASE_PRICES = {
+    "gbpusd": "1.1",
+    "audusd": "0.65",
+    "usdjpy": "150",
+    "eurgbp": "0.85",
+    "nzdusd": "0.6",
+    "btcusdt": "49990",
+    "eurchf": "0.95",
+}
 
 COLS = (
     "ts TIMESTAMP, open DECIMAL(38,18), high DECIMAL(38,18), low DECIMAL(38,18), "
@@ -75,16 +86,18 @@ def row(ts_us, o, h, l, c, vol, last_us, log_id, interval_us):
 def main():
     sql("DROP DATABASE IF EXISTS market_bars")
     sql(f"CREATE DATABASE market_bars PRECISION 'us' KEEP 3650 DURATION 10d VGROUPS 1 REPLICA 1 CACHEMODEL 'last_row'")
-    for interval in ("1s", "1m"):
+    for interval in ("1s", "1m", "5m"):
         sql(f"CREATE STABLE bars_{interval} ({COLS}) TAGS (symbol VARCHAR(32))", DB)
     for symbol in SYMBOLS:
-        for interval in ("1s", "1m"):
+        for interval in ("1s", "1m", "5m"):
             sql(f"CREATE TABLE bars_{interval}_{symbol} USING bars_{interval} TAGS ('{symbol}')", DB)
 
     now_s = int(time.time())
     for symbol in SYMBOLS:
         rng = random.Random(sum(ord(ch) for ch in symbol))
-        px = 1_100_000_000_000_000_000 + rng.randrange(0, 10**15)
+        base_units = int(Decimal(BASE_PRICES.get(symbol, "1.1")) * SCALE)
+        px = base_units + rng.randrange(0, max(1, base_units // 1_000))
+        minute_values = []
         for interval, step_s, count in (("1s", 1, 500), ("1m", 60, 500)):
             end_s = (now_s // step_s) * step_s
             rows = []
@@ -98,11 +111,34 @@ def main():
                     hi = max(hi, px)
                     lo = min(lo, px)
                 vol = rng.randrange(50, 600) * 10**15
+                last_us = ts_s * 1_000_000 + (step_s - 1) * 1_000_000
                 rows.append(row(ts_s * 1_000_000, o, hi, lo, px, vol,
-                                ts_s * 1_000_000 + (step_s - 1) * 1_000_000,
-                                i + 1, step_s * 1_000_000))
+                                last_us, i + 1, step_s * 1_000_000))
+                if interval == "1m":
+                    minute_values.append((ts_s * 1_000_000, o, hi, lo, px, vol, last_us, i + 1))
             for i in range(0, len(rows), 200):
                 sql(f"INSERT INTO bars_{interval}_{symbol} VALUES " + " ".join(rows[i:i+200]), DB)
+
+        # Derive 5m rows from traded 1m children with the same rule the writer
+        # and the Rust rollup unit test use: first open, max high, min low,
+        # last close, summed volume. Sparse minutes never become flat rows.
+        five_width_us = 300 * 1_000_000
+        fives = {}
+        for ts_us, o, hi, lo, c, vol, last_us, log_id in minute_values:
+            window = ts_us // five_width_us * five_width_us
+            bar = fives.setdefault(window, [o, hi, lo, c, 0, last_us, log_id])
+            bar[1] = max(bar[1], hi)
+            bar[2] = min(bar[2], lo)
+            bar[3] = c
+            bar[4] += vol
+            bar[5] = max(bar[5], last_us)
+            bar[6] = log_id
+        rows = [
+            row(ts_us, b[0], b[1], b[2], b[3], b[4], b[5], b[6], five_width_us)
+            for ts_us, b in sorted(fives.items())
+        ]
+        for i in range(0, len(rows), 200):
+            sql(f"INSERT INTO bars_5m_{symbol} VALUES " + " ".join(rows[i:i+200]), DB)
         print("seeded", symbol, flush=True)
     print("done")
 

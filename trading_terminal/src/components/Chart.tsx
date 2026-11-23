@@ -173,7 +173,7 @@ function IntervalToggle() {
   const { interval, setInterval_ } = useMarketFeed();
   return (
     <div className="interval-toggle" role="tablist" aria-label="Kline interval">
-      {(["1s", "1m"] as const).map((option) => (
+      {(["1s", "1m", "5m", "30m"] as const).map((option) => (
         <button
           key={option}
           type="button"

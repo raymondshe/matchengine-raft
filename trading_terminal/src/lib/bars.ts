@@ -13,7 +13,12 @@
 // `floor(ts / interval) * interval` — so they merge cleanly.
 
 /** Intervals the terminal chart offers, matching the advertised kline streams. */
-export const BAR_INTERVALS_MS = { "1s": 1_000, "1m": 60_000 } as const;
+export const BAR_INTERVALS_MS = {
+  "1s": 1_000,
+  "1m": 60_000,
+  "5m": 300_000,
+  "30m": 1_800_000,
+} as const;
 
 export type BarInterval = keyof typeof BAR_INTERVALS_MS;
 

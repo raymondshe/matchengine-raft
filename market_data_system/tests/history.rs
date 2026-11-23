@@ -76,6 +76,9 @@ async fn wait_for_bars(addr: &str, path: &str, minimum: usize) -> Vec<Value> {
     for _ in 0..200 {
         if let Some(Value::Array(bars)) = get_json(addr, path).await
             && bars.len() >= minimum
+            && bars
+                .iter()
+                .any(|bar| bar[8].as_u64().is_some_and(|trades| trades > 0))
         {
             return bars;
         }
@@ -120,13 +123,14 @@ async fn stores_and_serves_exact_klines_from_tdengine() {
     let service = start(config.clone(), vec![(spec, source)]).await.unwrap();
     let addr = service.addr.clone();
 
-    // Use a recent minute so the write is inside TDengine's KEEP window.
+    // Use a recent 30-minute boundary: it is also a 5m and 1m boundary, so
+    // one trade set exercises the whole 1s → 1m → 5m → 30m chain.
     let base_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
-        / 60_000
-        * 60_000;
+        / 1_800_000
+        * 1_800_000;
     source_tx
         .send(Ok(trade(
             1,
@@ -171,6 +175,28 @@ async fn stores_and_serves_exact_klines_from_tdengine() {
     assert_eq!(minutes[0][4], "0.999999999999999999");
     assert_eq!(minutes[0][5], "0.900000000000000011");
     assert_eq!(minutes[0][8], 3);
+
+    // 5-minute rows are materialized by the writer; 30m is rolled up from
+    // them when bars_5m has data (and from bars_1m on older deployments).
+    let five_path = format!("/klines?symbol=eurusd&interval=5m&startTime={base_ms}&limit=1");
+    let fives = wait_for_bars(&addr, &five_path, 1).await;
+    assert_eq!(fives[0][0], base_ms);
+    assert_eq!(fives[0][1], "1.000000000000000001");
+    assert_eq!(fives[0][4], "0.999999999999999999");
+    assert_eq!(fives[0][5], "0.900000000000000011");
+    assert_eq!(fives[0][8], 3);
+
+    let thirty_path = format!("/klines?symbol=eurusd&interval=30m&startTime={base_ms}&limit=1");
+    let thirties = wait_for_bars(&addr, &thirty_path, 1).await;
+    assert_eq!(thirties[0][0], base_ms);
+    assert_eq!(thirties[0][1], "1.000000000000000001");
+    assert_eq!(thirties[0][2], "1.200000000000000003");
+    assert_eq!(thirties[0][3], "0.999999999999999999");
+    assert_eq!(thirties[0][4], "0.999999999999999999");
+    assert_eq!(thirties[0][5], "0.900000000000000011");
+    assert_eq!(thirties[0][8], 3);
+    // The current 30m window cannot be final even when its 5m children are.
+    assert_eq!(thirties[0][11], "0");
 
     service.shutdown().await;
     store.drop_database().await.expect("drop test database");

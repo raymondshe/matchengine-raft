@@ -1,16 +1,19 @@
-//! Builds the two materialized bar series from the trade tape.
+//! Builds the materialized bar series from the trade tape.
 //!
 //! It reads no clock: a trade's window is derived from the taker's engine
 //! intake stamp, so a replay or a restarted writer produces the same rows.
-//! Both intervals fold the same fills; the `1m` row is therefore identical to
-//! a rollup of the traded `1s` children (asserted by the query tests).
+//! Each interval folds the same fills; the `1m` row is therefore identical to
+//! a rollup of the traded `1s` children, and `5m` to a rollup of `1m` children.
 
 use super::BarRow;
+use super::FIVE_MIN_MS;
 use super::HistoryTrade;
 use super::MIN_MS;
 use super::MIN_US;
 use super::SEC_MS;
 use super::SEC_US;
+
+const FIVE_MIN_US: u64 = 5 * MIN_US;
 
 pub struct Builder {
     symbol: String,
@@ -19,9 +22,11 @@ pub struct Builder {
     seal_lag_us: u64,
     open_1s: BarRow,
     open_1m: BarRow,
+    open_5m: BarRow,
     last_ts_us: u64,
     sealed_1s_emitted: bool,
     sealed_1m_emitted: bool,
+    sealed_5m_emitted: bool,
 }
 
 impl Builder {
@@ -32,9 +37,11 @@ impl Builder {
             seal_lag_us: seal_lag_ms.saturating_mul(1_000),
             open_1s: BarRow::new(0),
             open_1m: BarRow::new(0),
+            open_5m: BarRow::new(0),
             last_ts_us: 0,
             sealed_1s_emitted: false,
             sealed_1m_emitted: false,
+            sealed_5m_emitted: false,
         }
     }
 
@@ -52,8 +59,9 @@ impl Builder {
         self.last_ts_us = self.last_ts_us.max(ts_us);
         let window_1s = ts_us / SEC_US * SEC_US;
         let window_1m = ts_us / MIN_US * MIN_US;
+        let window_5m = ts_us / FIVE_MIN_US * FIVE_MIN_US;
 
-        let mut rows = Vec::with_capacity(4);
+        let mut rows = Vec::with_capacity(6);
         if self.open_1s.trades == 0 {
             // First trade in this symbol: start at the taker's window, not at
             // the zero-initialized placeholder.
@@ -72,17 +80,29 @@ impl Builder {
             rows.push((MIN_MS, sealed));
             self.open_1m = BarRow::new(window_1m);
         }
+        if self.open_5m.trades == 0 {
+            self.open_5m = BarRow::new(window_5m);
+        } else if self.open_5m.ts_us != window_5m {
+            let mut sealed = self.open_5m.clone();
+            sealed.sealed = true;
+            rows.push((FIVE_MIN_MS, sealed));
+            self.open_5m = BarRow::new(window_5m);
+        }
 
         self.open_1s.apply_trade(&trade);
         self.open_1m.apply_trade(&trade);
+        self.open_5m.apply_trade(&trade);
         self.sealed_1s_emitted = false;
         self.sealed_1m_emitted = false;
+        self.sealed_5m_emitted = false;
         // A late trade into a sealed window reopens it; P1 adds the audit row
         // and revision counter for this case.
         self.open_1s.sealed = false;
         self.open_1m.sealed = false;
+        self.open_5m.sealed = false;
         rows.push((SEC_MS, self.open_1s.clone()));
         rows.push((MIN_MS, self.open_1m.clone()));
+        rows.push((FIVE_MIN_MS, self.open_5m.clone()));
         rows
     }
 
@@ -91,7 +111,7 @@ impl Builder {
         if self.last_ts_us == 0 || self.last_ts_us.saturating_add(self.seal_lag_us) > now_us {
             return Vec::new();
         }
-        let mut rows = Vec::with_capacity(2);
+        let mut rows = Vec::with_capacity(3);
         if self.open_1s.trades > 0 && !self.sealed_1s_emitted {
             let mut sealed = self.open_1s.clone();
             sealed.sealed = true;
@@ -103,6 +123,12 @@ impl Builder {
             sealed.sealed = true;
             rows.push((MIN_MS, sealed));
             self.sealed_1m_emitted = true;
+        }
+        if self.open_5m.trades > 0 && !self.sealed_5m_emitted {
+            let mut sealed = self.open_5m.clone();
+            sealed.sealed = true;
+            rows.push((FIVE_MIN_MS, sealed));
+            self.sealed_5m_emitted = true;
         }
         rows
     }
@@ -163,7 +189,7 @@ mod tests {
         let t = 1_735_689_600_000;
         builder.on_trade(trade(t, "1.1", "2", 1));
         let now = (t + 3_000) * 1_000;
-        assert_eq!(builder.seal_due(now).len(), 2);
+        assert_eq!(builder.seal_due(now).len(), 3);
         assert!(builder.seal_due(now).is_empty());
     }
 

@@ -19,6 +19,7 @@ use matchengine_raft::order_book::Fixed;
 /// Interval labels are in milliseconds, matching the Binance wire contract.
 pub const SEC_MS: u64 = 1_000;
 pub const MIN_MS: u64 = 60 * SEC_MS;
+pub const FIVE_MIN_MS: u64 = 5 * MIN_MS;
 /// Window math and TDengine timestamps are in microseconds.
 pub const SEC_US: u64 = 1_000_000;
 pub const MIN_US: u64 = 60 * SEC_US;
@@ -125,8 +126,22 @@ pub enum HistoryEvent {
     Trade(HistoryTrade),
 }
 
-/// The two intervals materialized in phase P0. Every coarser interval is a
-/// read-time `INTERVAL` rollup of `bars_1m`.
+/// Intervals materialized by the writer. `5m` is the optional intermediate
+/// series that lets `30m` (and larger multiples) roll up from 5-minute rows
+/// instead of scanning every minute.
 pub fn is_materialized(interval_ms: u64) -> bool {
-    interval_ms == SEC_MS || interval_ms == MIN_MS
+    interval_ms == SEC_MS || interval_ms == MIN_MS || interval_ms == FIVE_MIN_MS
+}
+
+/// Preferred source interval for a read-time rollup.
+///
+/// A target that is a whole number of 5-minute windows uses `bars_5m` when
+/// that table has data; otherwise it falls back to `bars_1m`. This keeps old
+/// deployments (1s/1m only) working while new ones get the cheaper rollup.
+pub fn rollup_source_interval(interval_ms: u64) -> u64 {
+    if interval_ms >= FIVE_MIN_MS && interval_ms.is_multiple_of(FIVE_MIN_MS) {
+        FIVE_MIN_MS
+    } else {
+        MIN_MS
+    }
 }

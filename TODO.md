@@ -74,10 +74,12 @@ The Binance-style trading terminal (`trading_terminal/`) is built and deployed a
 third client: it derives candles from the trade tape, the market-data service replays retained bars
 on subscribe, and order entry goes through the order-system BFF. That removes the "empty chart"
 urgency from engine bar emission. The historical-bar tier's **P0 is now implemented** in `market_data_system/`: TDengine schema,
-trade-derived `1s`/`1m` writer, exact-decimal text I/O, `GET /klines` with read-time rollups and a
-TDengine-seeded WS replay. The remaining phases (trade spool, Lease failover, revisions/gaps,
-`/bars`, importers, time-zone anchors and the three-dnode deployment) are still design, with an HA
-contract for one writer and stateless queriers
+trade-derived `1s`/`1m`/`5m` writer, exact-decimal text I/O, `GET /klines` with read-time rollups
+(`30m` from `5m`) and a TDengine-seeded WS replay. Lab evidence now includes a continuous order
+replay feeding the tape, a 5m↔30m comparison script and a watermark-based finality fix for the open
+30m bar. The remaining phases (trade spool, Lease failover, revisions/gaps, `/bars`, importers,
+time-zone anchors and the three-dnode deployment) are still design, with an HA contract for one
+writer and stateless queriers
 ([`docs/HISTORICAL_BARS.md`](./docs/HISTORICAL_BARS.md) §§1, 4.2.1). They rank below P1:
 the new stateful component's DSN, Secret and NetworkPolicy must follow the P1 security/packaging
 pattern rather than adding another plaintext edge.
@@ -88,16 +90,17 @@ production gates and is not counted as queue progress.
 
 | Rank | Item | P | Impact | Effort | Gate / reason for this rank |
 |---|---|---|---|---|---|
-| 1 | Control-plane and public-edge security (#1) | P1 | High | High | None — manager, both demo edges, NATS and the future TDengine 6041 endpoint are plaintext; exposure compounds with every new service |
+| 1 | Control-plane and public-edge security (#1) | P1 | High | High | None — manager, both demo edges, NATS and the lab TDengine REST ingress are plaintext; exposure compounds with every new service |
 | 2 | Packaging and image supply (#2) | P1 | High | Medium | None — already broke a real rollout via `DiskPressure` image GC; must include the TDengine deployment/Secret before history ships |
 | 3 | Observability and HPA metrics (#3) | P1 | High | Medium | None — HPAs are pinned at min 1, so all scale/soak evidence waits on this |
 | 4 | Rollout invariants + acceptance automation (#4) | P2 | Medium | Low | None — cheap regression guard for P1 rollout changes; two real defects were found manually |
-| 5 | Historical bar store, remaining phases (#16) | P2 | High | High | P0 shipped; spool/failover, revisions/gaps, importers and HA deployment need #1/#2 and a three-dnode TDengine cluster |
+| 5 | Historical bar store, remaining phases (#16) | P2 | High | High | P0 shipped with 5m/30m rollups and lab evidence; spool/failover, revisions/gaps, importers and HA deployment need #1/#2 and a three-dnode TDengine cluster |
 | 6 | Terminal deployment hardening (#17) | P2 | Medium | Low | Deployed with a hardcoded ClusterIP; also needs the CRD integration follow-up and #2 for image supply |
 | 7 | Docs synchronization (#8) | P2 | Medium | Low | Cheap guard; keep this file, `AGENTS.md` and the design docs aligned with the TDengine decision |
 | 8 | Pre-trade policy pipeline (#5) | P2 | Medium | Medium | Security-adjacent but not blocking; belongs at the edge/gateway |
 | 9 | Engine bar emission (#11) | P2 | Low | Low | Feed correctness, but the terminal no longer depends on it; needs a four-voter engine image roll |
 | 10 | Fan-out and slow-consumer soak (#10) | P2 | Medium | High | Needs the HPAs from #3 before its results mean anything |
+| 11 | Continuous order-replay evidence (#18) | P2 | Low | Low | Harness exists; useful now as a cheap tape/kline soaker while HPA metrics (#3) are unavailable |
 
 The `P0`–`P5` phases inside the historical-bar design are implementation phases, not this file's
 P0 defect priority; item #16 is P2 here. Environment-blocked items (multi-host, CSI, bare-metal,
@@ -114,9 +117,10 @@ as queue progress.
    plaintext and unauthenticated: exposure is the largest remaining production gate and no amount
    of scaling or backup evidence mitigates it. The pitlane review suggests the concrete shape:
    one named permission bit per route (viewer/trader/risk/ops/admin) and test/live mode isolation
-   at the session layer with a `409` cross-mode refusal. Include the future TDengine 6041 endpoint
-   in this workstream: Secret-backed credentials, a NetworkPolicy admitting only market-data pods,
-   and no public exposure — the historical-bar design must not add a fourth plaintext edge.
+   at the session layer with a `409` cross-mode refusal. Include TDengine in this workstream: the
+   lab currently maps `taosAdapter` REST through a plaintext Ingress with default credentials, so
+   production needs Secret-backed credentials, a NetworkPolicy admitting only market-data pods,
+   TLS and no public exposure — the historical-bar design must not ship a fourth plaintext edge.
 2. **Manager packaging and image supply.** Check in Deployment/Service/RBAC/NetworkPolicy/Pod
    Security, Helm/Kustomize, digest-pinned image publication and CRD/etcd backup integration. The
    demo still depends on local-only images, an `emptyDir` and a port-forward, which blocks a clean
@@ -209,20 +213,24 @@ keep those halves visible; do not treat a green single-node run as production ev
     supervisor reports `isolationError` and fails open.
 16. **Historical bar store (P0 implemented, P1+ designed).** [`docs/HISTORICAL_BARS.md`](./docs/HISTORICAL_BARS.md)
     extends `market_data_system` rather than adding a service. **TDengine is the system of record**:
-    sparse traded `1s` rows (`DECIMAL(38,18)`, `PRECISION 'us'`) plus a materialized `1m` rollup;
-    `3m`…`1M` are read-time `INTERVAL` rollups of `1m` (measured `1s`→`1m` exact 1,440/1,440 vs the
-    Binance archive, 755 qps on eight concurrent readers, 166k-259k rows/s bulk ingest). No segment
-    format, catalog, manifest, checkpoint or reader cache; one Lease-guarded writer with a local
-    trade spool, stateless readers querying TDengine (HA/failover contract in §4.2.1 of the design).
+    sparse traded `1s` rows (`DECIMAL(38,18)`, `PRECISION 'us'`) plus materialized `1m`/`5m` rollups;
+    `3m` and `15m`…`1M` are read-time `INTERVAL` rollups, with `30m` generated from `5m` children when
+    present and from `1m` otherwise (field-by-field 1m→5m→30m unit test). Measured `1s`→`1m` exact
+    1,440/1,440 vs the Binance archive, 755 qps on eight concurrent readers, 166k-259k rows/s bulk
+    ingest. The open-bar `x` flag now comes only from the event-time watermark, and
+    `scripts/check-30m-rollup.py` compares live 30m bars with their traded 5m children (18/18 clean
+    windows after the replay soak). No segment format, catalog, manifest, checkpoint or reader
+    cache; one Lease-guarded writer with a local trade spool, stateless readers querying TDengine
+    (HA/failover contract in §4.2.1 of the design).
     Exact decimals: canonical 18-dp text on write, `CAST … AS VARCHAR` on read — the `taos`
     connector's `rust_decimal` is 96-bit and loses digits. Binance-compatible `GET /klines` + native
     `GET /bars` + WS `seq`/`rev` repair on the existing routes, and a `data.binance.vision` importer.
     **Ranked #5, top of P2 feature work — not an engine P0:** the terminal already avoids empty charts
     by deriving bars from the tape and replaying retained windows; this item buys durable history,
     HA queriers and exact klines. **P0 is implemented** in `market_data_system/` (`--history`,
-    `src/history/`, `tests/history.rs` gated on `TDENGINE_URL`): the schema, trade-derived `1s`/`1m`
-    writer, canonical 18-decimal text I/O, `GET /klines` (including `INTERVAL` rollups) and a
-    TDengine-seeded WS replay; it runs on one dnode with no HA yet. Remaining: P1 = trade spool,
+    `src/history/`, `tests/history.rs` gated on `TDENGINE_URL`): the schema, trade-derived
+    `1s`/`1m`/`5m` writer, canonical 18-decimal text I/O, `GET /klines` (including `5m`-first rollups
+    for `30m`) and a TDengine-seeded WS replay; it runs on one dnode with no HA yet. Remaining: P1 = trade spool,
     Lease failover, revisions, `bar_gaps`/`bar_state`, restart/catch-up and `/bars`; P2 = importer,
     REST tail, reconciler; P3+ = three-dnode `REPLICA 3` cluster, HPA readers, backup and
     offset-anchored intervals. Production phases depend on P1 #1/#2 (Secret-backed DSN,
@@ -230,12 +238,18 @@ keep those halves visible; do not treat a green single-node run as production ev
     `docs/THIRD_PARTY_INVESTIGATION.md` Part VII §6.6, and `VGROUPS`/`REPLICA` sizing measured on a
     real three-dnode cluster.
 17. **Trading terminal deployment hardening.** The React/TS terminal is built and deployed as
-    `matchengine-trading-terminal:arm64-v2`; it is a pure frontend third client (market data over the
+    `matchengine-trading-terminal:arm64-v4`; it is a pure frontend third client (market data over the
     global service WS, order entry through the order-system BFF `/demo/api`) and nginx is deployment
     plumbing only. Remaining: replace the hardcoded `DNS_UPSTREAM: 192.168.194.138` in
     `k8s_control_plane/deploy/terminal.yaml` with a runtime-resolved ClusterIP or Service DNS entry,
     add the `TradingTerminal` CRD/renderer integration, and route its image through the P1 #2 image
     supply. Do not add engine `/write` calls or embed the frontend in a crate.
+18. **Continuous order-replay evidence.** `scripts/replay-continuous.sh` loops
+    `scripts/replay-order-system.py` against one BFF target (default `gbpusd`) with a configurable
+    pause; each pass cancels leftover orders first, so it exercises the tape and kline path without
+    growing the book unbounded. Use it as a cheap soak while HPA metrics (#3) are unavailable, then
+    replace it with a controlled load test once autoscaling reports CPU. Keep it out of CI — it writes
+    to the live lab engine.
 
 **P3 - later, in impact order**
 
@@ -380,12 +394,15 @@ shard services and the global terminal service are live; see History. Remaining 
   tracked in the Top priorities item: trade spool/Lease failover, revisions/gaps, importer/REST
   tail, three-dnode `REPLICA 3` cluster and HPA readers are gated on P1 security/packaging and a real
   TDengine cluster. The OrbStack lab is wired (`deploy/tdengine.yaml`, `MarketDataService.history`,
-  `history-arm64-v2` + terminal `arm64-v3`) and the chart now seeds 500 bars from TDengine;
+  `history-arm64-v4` + terminal `arm64-v4`) and the chart now seeds 500 bars from TDengine;
   close the six live-API verification items before freezing the schema.
 - [ ] **P2 (Top priorities #17)** Trading terminal hardening: the pure-React client is deployed but
   `k8s_control_plane/deploy/terminal.yaml` hardcodes `DNS_UPSTREAM: 192.168.194.138`; resolve it at
   runtime, add the `TradingTerminal` CRD/renderer integration, and route the image through the P1
   image supply. Keep order entry on the order-system BFF and never call engine `/write` directly.
+- [ ] **P2 (Top priorities #18)** Continuous order-replay evidence: keep `scripts/replay-continuous.sh`
+  as a lab-only tape/kline soaker (default target `gbpusd`, 5 s pause, cleanup each pass) until HPA
+  metrics (#3) land; then replace it with a controlled load test. Never run it in CI.
 - [ ] **P2** Rollout and availability: canary policy, PDB verification, drain-aware image upgrades
   and a tested rollback path that restores subscriber capacity without touching matching. HPA CPU
   metrics for the market-data and order-system HPAs need a metrics server or Prometheus adapter;

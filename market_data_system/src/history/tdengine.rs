@@ -100,7 +100,7 @@ impl HistoryStore {
         }
         // The same client is used with /rest/sql/<db>, so the database must
         // already exist even when auto_create is disabled.
-        for interval in ["1s", "1m"] {
+        for interval in ["1s", "1m", "5m"] {
             self.sql(&format!(
                 "CREATE STABLE IF NOT EXISTS bars_{interval} (\
                  ts TIMESTAMP, open DECIMAL(38,18), high DECIMAL(38,18), \
@@ -127,7 +127,7 @@ impl HistoryStore {
 
         for symbol in symbols {
             let name = valid_identifier(&symbol.symbol)?;
-            for interval in ["1s", "1m"] {
+            for interval in ["1s", "1m", "5m"] {
                 self.sql(&format!(
                     "CREATE TABLE IF NOT EXISTS bars_{interval}_{name} \
                      USING bars_{interval} TAGS ('{name}')"
@@ -173,6 +173,7 @@ impl HistoryStore {
         let table = match interval_ms {
             super::SEC_MS => format!("bars_1s_{name}"),
             super::MIN_MS => format!("bars_1m_{name}"),
+            super::FIVE_MIN_MS => format!("bars_5m_{name}"),
             other => {
                 return Err(io::Error::other(format!(
                     "cannot upsert interval {other}ms; only 1s/1m are materialized"
@@ -204,16 +205,31 @@ impl HistoryStore {
         self.query_bars(&statement).await
     }
 
-    /// Rolls `bars_1m` into a coarser interval at read time. `1s` and `1m`
-    /// never use this path.
+    /// Whether a materialized source table has any rows at all. Used to fall
+    /// back from `bars_5m` to `bars_1m` on deployments that predate 5m rows.
+    pub async fn has_bars(&self, interval_ms: u64, symbol: &str) -> bool {
+        let Ok(table) = self.bar_table(interval_ms, symbol) else {
+            return false;
+        };
+        matches!(
+            self.sql(&format!("SELECT 1 FROM {table} LIMIT 1")).await,
+            Ok(rows) if !rows.is_empty()
+        )
+    }
+
+    /// Rolls a materialized source series into a coarser interval at read time.
+    ///
+    /// `source_ms` is chosen by the caller: `bars_5m` when it has data and the
+    /// target is a whole number of 5-minute windows, otherwise `bars_1m`.
     pub async fn rollup(
         &self,
         interval_ms: u64,
+        source_ms: u64,
         symbol: &str,
         from_us: u64,
         to_us: u64,
     ) -> io::Result<Vec<BarRow>> {
-        let table = self.bar_table(super::MIN_MS, symbol)?;
+        let table = self.bar_table(source_ms, symbol)?;
         let window = tdengine_interval(interval_ms).ok_or_else(|| {
             io::Error::other(format!("unsupported historical interval {interval_ms}ms"))
         })?;
@@ -267,6 +283,7 @@ impl HistoryStore {
         match interval_ms {
             super::SEC_MS => Ok(format!("bars_1s_{name}")),
             super::MIN_MS => Ok(format!("bars_1m_{name}")),
+            super::FIVE_MIN_MS => Ok(format!("bars_5m_{name}")),
             _ => Err(io::Error::other(format!(
                 "no table for interval {interval_ms}ms"
             ))),

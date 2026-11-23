@@ -30,7 +30,10 @@ use crate::feed::Registry;
 use crate::feed::SharedState;
 use crate::feed::Stats;
 use crate::feed::SymbolRuntime;
+use crate::history::FIVE_MIN_MS;
 use crate::history::HistoryRuntime;
+use crate::history::MIN_MS;
+use crate::history::SEC_MS;
 use crate::history::query;
 use crate::history::query::KlineWindow;
 use crate::history::runtime;
@@ -398,7 +401,19 @@ async fn klines(state: Data<AppState>, params: web::Query<KlinesQuery>) -> HttpR
         }));
     }
     let limit = params.limit.unwrap_or(500).clamp(1, 1_000);
-    let source_interval = if interval_ms == 1_000 { 1_000 } else { 60_000 };
+    // Prefer 5m rows for targets that are whole multiples of 5 minutes, but
+    // keep old 1s/1m-only deployments working when bars_5m is still empty.
+    let preferred_source = if interval_ms <= SEC_MS {
+        SEC_MS
+    } else {
+        query::rollup_source_interval(interval_ms)
+    };
+    let source_interval =
+        if preferred_source == FIVE_MIN_MS && !store.has_bars(FIVE_MIN_MS, &spec.symbol).await {
+            MIN_MS
+        } else {
+            preferred_source
+        };
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -439,11 +454,12 @@ async fn klines(state: Data<AppState>, params: web::Query<KlinesQuery>) -> HttpR
     let rows = {
         let from_us = start_ms.saturating_mul(1_000);
         let to_us = end_ms.saturating_add(interval_ms).saturating_mul(1_000);
-        let result = if interval_ms == 1_000 || interval_ms == 60_000 {
+        let result = if interval_ms == SEC_MS || interval_ms == MIN_MS || interval_ms == FIVE_MIN_MS
+        {
             store.bars(interval_ms, &spec.symbol, from_us, to_us).await
         } else {
             store
-                .rollup(interval_ms, &spec.symbol, from_us, to_us)
+                .rollup(interval_ms, source_interval, &spec.symbol, from_us, to_us)
                 .await
         };
         match result {

@@ -474,17 +474,23 @@ even when entries in between did not touch the book.
 `--history` enables the TDengine-backed tier described in
 [`docs/HISTORICAL_BARS.md`](../docs/HISTORICAL_BARS.md). The writer is one process
 that consumes the same typed trade tap as the live feed and stores sparse traded
-`1s` rows plus a `1m` rollup in `bars_1s`/`bars_1m` (`DECIMAL(38,18)`,
-`PRECISION 'us'`). Every value is written as canonical 18-decimal text and read
-back with `CAST(... AS VARCHAR)`; no `f64` or 96-bit client decimal is involved.
+`1s` rows plus `1m` and `5m` rollups in `bars_1s`/`bars_1m`/`bars_5m`
+(`DECIMAL(38,18)`, `PRECISION 'us'`). Every value is written as canonical
+18-decimal text and read back with `CAST(... AS VARCHAR)`; no `f64` or 96-bit
+client decimal is involved. `30m` and other 5-minute multiples roll up from
+`bars_5m` when present and fall back to `bars_1m`; the `1m` → `5m` → `30m`
+chain has a field-by-field unit test against a direct `1m` → `30m` rollup. Finality (`x`) always comes from the
+event-time watermark, never from a sealed child, so the open 30m window stays open. Run
+`./scripts/check-30m-rollup.py` (with `TERMINAL_URL`/`SYMBOL` overrides) to compare the live 30m
+klines against the rollup of their traded 5m children.
 With history on, the service derives klines from trades instead of the engine's
 partial `Bar` frames, seeds the WebSocket subscribe replay from the stored rows
 and publishes the same unchanged `kline` payloads.
 
 `GET /klines?symbol=eurusd&interval=1s&startTime=...&limit=500` returns
 Binance-shaped dense arrays straight from TDengine; empty windows carry the
-previous close forward. `1s`/`1m` are read from their tables, `3m`…`3d` are
-read-time `INTERVAL` rollups of `1m`. `1w`/`1M` and non-UTC `timeZone` are
+previous close forward. `1s`/`1m`/`5m` are read from their tables, `3m` is a
+read-time rollup of `1m`, and `15m`/`30m`/`1h`…`3d` prefer `5m` children with a `1m` fallback. `1w`/`1M` and non-UTC `timeZone` are
 phase P5 and return `400` rather than a wrong window. Responses carry
 `X-Bar-Schema: 1` and `X-Bar-Sealed-Through`.
 
@@ -505,9 +511,9 @@ ClusterIP cannot reach, so the manifest moves the adapter to 6042 and adds a
 tiny Node sidecar that owns IPv4 `0.0.0.0:6041` and forwards to
 `127.0.0.1:6042`; the Service and the market-data NetworkPolicy stay on 6041.
 The global market-data service is built from `docker/k8s-history.Dockerfile`
-(`matchengine-marketdata:history-arm64-v2`) and receives `--history` plus the
+(`matchengine-marketdata:history-arm64-v4`) and receives `--history` plus the
 DSN from `MarketDataService.spec.history`; the terminal image
-(`matchengine-trading-terminal:arm64-v3`) seeds its chart through the same-origin
+(`matchengine-trading-terminal:arm64-v4`) seeds its chart through the same-origin
 `/md/klines` proxy. That is a lab profile, not the three-dnode `REPLICA 3`
 production topology in §4.7.2 of the design.
 

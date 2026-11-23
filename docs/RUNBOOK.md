@@ -33,11 +33,11 @@ docker build -f k8s_control_plane/Dockerfile \
 # Market-data service with the TDengine history tier.
 docker build --platform linux/arm64 \
   -f market_data_system/docker/k8s-history.Dockerfile \
-  -t matchengine-marketdata:history-arm64-v2 .
+  -t matchengine-marketdata:history-arm64-v4 .
 
 # Pure frontend terminal (own Vite build, no Rust).
 docker build --platform linux/arm64 -f trading_terminal/Dockerfile \
-  -t matchengine-trading-terminal:arm64-v3 trading_terminal
+  -t matchengine-trading-terminal:arm64-v4 trading_terminal
 ```
 
 ### 2. Namespaces, CRDs and desired state
@@ -139,7 +139,7 @@ metadata:
   namespace: match-eu-1
 spec:
   cell: eu-1
-  image: matchengine-marketdata:history-arm64-v2
+  image: matchengine-marketdata:history-arm64-v4
   replicas: 1
   feedGroups:
     - {name: lab-gbpusd, symbols: [gbpusd], streamBase: 2001}
@@ -211,7 +211,9 @@ If the ingress/front door is not installed, the equivalent local tunnel is
 `kubectl -n match-eu-1 port-forward svc/tdengine 16042:6041` plus
 `TDENGINE_URL=http://127.0.0.1:16042`.
 
-Reload the terminal: the header shows `HISTORY 500` and candles appear without any new trade, as in
+The seeder gives each symbol its own lab price scale (GBPUSD ~1.10, AUDUSD ~0.65, USDJPY ~150,
+BTCUSDT ~50000) so switching pairs visibly changes the chart. Reload the terminal: the header shows
+`HISTORY 500` and candles appear without any new trade, as in
 [the screenshot](./trading-terminal-history.png). For the interactive architecture view, open
 [the exported Archify diagram](./historical-bars-tdengine.html).
 

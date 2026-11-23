@@ -31,11 +31,11 @@ docker build -f k8s_control_plane/Dockerfile \
 # 带 TDengine 历史层的行情服务。
 docker build --platform linux/arm64 \
   -f market_data_system/docker/k8s-history.Dockerfile \
-  -t matchengine-marketdata:history-arm64-v2 .
+  -t matchengine-marketdata:history-arm64-v4 .
 
 # 纯前端终端（独立 Vite 构建，无 Rust）。
 docker build --platform linux/arm64 -f trading_terminal/Dockerfile \
-  -t matchengine-trading-terminal:arm64-v3 trading_terminal
+  -t matchengine-trading-terminal:arm64-v4 trading_terminal
 ```
 
 ### 2. Namespace、CRD 与期望状态
@@ -137,7 +137,7 @@ metadata:
   namespace: match-eu-1
 spec:
   cell: eu-1
-  image: matchengine-marketdata:history-arm64-v2
+  image: matchengine-marketdata:history-arm64-v4
   replicas: 1
   feedGroups:
     - {name: lab-gbpusd, symbols: [gbpusd], streamBase: 2001}
@@ -210,8 +210,9 @@ TDENGINE_URL=http://tdengine.match-eu-1.example ./scripts/seed-history-lab.py
 `kubectl -n match-eu-1 port-forward svc/tdengine 16042:6041`，再设置
 `TDENGINE_URL=http://127.0.0.1:16042`。
 
-刷新终端：即使没有新成交，标题也会显示 `HISTORY 500` 并出现蜡烛图，效果见
-[截图](./trading-terminal-history.png)。交互式架构可打开
+种子脚本为每个 symbol 使用不同的实验价格量级（GBPUSD ~1.10、AUDUSD ~0.65、USDJPY ~150、
+BTCUSDT ~50000），因此切换交易对时图表会明显不同。刷新终端：即使没有新成交，标题也会显示
+`HISTORY 500` 并出现蜡烛图，效果见[截图](./trading-terminal-history.png)。交互式架构可打开
 [导出的 Archify 图](./historical-bars-tdengine.html)。
 
 ### 11. 清理

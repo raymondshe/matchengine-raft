@@ -34,7 +34,7 @@
 - 🧭 **Raft 原生** — OpenRaft 0.10 + gRPC，支持 Pre-Vote、领导权转移、学习者追赶和分块快照安装。
 - 🔢 **18 位定点数** — 撮合路径不使用 `f64`；价格、数量和费用在 API、事件、快照和 feed 中全程精确。
 - 📡 **实时行情** — 确定性 feed 通过 Aeron 发布（每个流一个独占 publication），再由 Binance 风格 WebSocket 服务分发，支持 100/1000 ms 深度合并和水平扩展。
-- 📈 **精确小数的历史 K 线** — TDengine 存储稀疏 `1s` 成交 K 线和物化 `1m` 汇总，更粗周期在读取时用 `INTERVAL` 汇总；单 writer、无状态查询端，通过 Binance 兼容的 `/klines` 供交易终端冷启动使用。
+- 📈 **精确小数的历史 K 线** — TDengine 存储稀疏 `1s` 成交 K 线和物化的 `1m`/`5m` 汇总，更粗周期在读取时用 `INTERVAL` 汇总（`30m` 优先由 `5m` 生成，缺失时回退 `1m`）；单 writer、无状态查询端，通过 Binance 兼容的 `/klines` 供交易终端冷启动使用。
 - 🖥️ **交易终端** — 纯 React/TS 的 Binance 风格现货终端，复用现有行情 WebSocket 和下单 BFF，不含 Rust，也不会直接调用引擎 `/write`。
 - 🧰 **可运维** — 内置控制台、`/health` + `/ready`、指标、重放工具和独立下单演示。
 - ☸️ **Kubernetes 集群管理** — 参考管理器和 supervisor 可管理数千个单 symbol 引擎，支持零影响 symbol 生命周期、重启保护和带存储决策的 shard 删除。

@@ -233,12 +233,13 @@ CI (`.github/workflows/ci.yml`) runs `cargo fmt --all -- --check` (and the `matc
   the JSONL fallback).
 - `docs/HISTORICAL_BARS.md` designs the **historical bar generation and query system** as an
   extension of the existing `market_data_system` (same process, no new crate): a bar builder derives
-  sparse traded `1s` bars from the deterministic trade stream, materializes `1m` as a rollup of the
-  traded `1s` children, and derives every coarser interval at read time with TDengine
-  `INTERVAL`/`FIRST`/`LAST` (measured `1s`→`1m` is exact at 1,440/1,440 against the Binance archive;
-  dense children break 29 opens). **TDengine is the system of record** — no custom segments, catalog
-  or reader cache: `bars_1s`/`bars_1m` super tables tagged by `symbol`, `DECIMAL(38,18)` prices and
-  volumes, `PRECISION 'us'`, `CACHEMODEL 'last_row'`, `KEEP 3650`, `REPLICA 3` in production, plus
+  sparse traded `1s` bars from the deterministic trade stream, materializes `1m` and `5m` rollups,
+  and derives every coarser interval at read time with TDengine `INTERVAL`/`FIRST`/`LAST`; `30m`
+  prefers `5m` children and falls back to `1m` (measured `1s`→`1m` is exact at 1,440/1,440 against
+  the Binance archive; dense children break 29 opens). **TDengine is the system of record** — no
+  custom segments, catalog or reader cache: `bars_1s`/`bars_1m`/`bars_5m` super tables tagged by
+  `symbol`, with `DECIMAL(38,18)` prices and volumes, `PRECISION 'us'`, `CACHEMODEL 'last_row'`,
+  `KEEP 3650`, `REPLICA 3` in production, plus
   `bar_state`/`bar_gaps`/`bar_revisions`/`bar_imports`. Exact decimals end to end: canonical
   18-decimal text on write, `CAST(col AS VARCHAR)` on read (the `taos` connector's `rust_decimal`
   path silently loses 18 digits on a 38-digit value), never `f64`. One Lease-guarded writer with a
@@ -249,7 +250,7 @@ CI (`.github/workflows/ci.yml`) runs `cargo fmt --all -- --check` (and the `matc
   spool, Lease failover, revisions/gaps, `/bars`, importers and time-zone anchors remain design.
   The OrbStack lab wires it up with `k8s_control_plane/deploy/tdengine.yaml` (single dnode plus an
   IPv4 bridge for `taosadapter`), `MarketDataService.spec.history`, market-data image
-  `history-arm64-v2` and terminal image `arm64-v3`, so the terminal chart seeds from TDengine.
+  `history-arm64-v4` and terminal image `arm64-v4`, so the terminal chart seeds from TDengine.
   Measured ingest/query/precision numbers are §12. The reference-API measurements it builds on are
   in `docs/THIRD_PARTY_INVESTIGATION.md` Part VII.
 - `docs/FEE_DEDUCTION.md` documents the implemented base/quote volume semantics,

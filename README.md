@@ -36,7 +36,7 @@ configurable durability and a live market-data path — without treating the eng
 - 🧭 **Raft-native** — OpenRaft 0.10 over gRPC with Pre-Vote, leadership transfer, learner catch-up and chunked snapshot install.
 - 🔢 **Exact 18-decimal fixed point** — no `f64` in the matching path; prices, quantities and fees survive the API, events, snapshots and feeds.
 - 📡 **Live data, not batch** — the deterministic feed is published over Aeron (one exclusive publication per stream) and served as Binance-style WebSocket streams with 100/1000 ms depth conflation and horizontal scale-out.
-- 📈 **Historical bars with exact decimals** — a TDengine-backed sparse `1s` series plus a materialized `1m` rollup, read-time `INTERVAL` rollups for coarser windows, one writer and stateless queriers, exposed as Binance-compatible `/klines` and seeded into the trading terminal.
+- 📈 **Historical bars with exact decimals** — a TDengine-backed sparse `1s` series plus materialized `1m`/`5m` rollups, read-time `INTERVAL` rollups for coarser windows (`30m` from `5m` when present, with a `1m` fallback), one writer and stateless queriers, exposed as Binance-compatible `/klines` and seeded into the trading terminal.
 - 🖥️ **Trading terminal** — a pure React/TS spot terminal that consumes the existing market-data WebSocket and order-system BFF; no Rust and no direct engine writes.
 - 🧰 **Operable** — embedded console, `/health` + `/ready`, metrics, replay tools and a standalone order-desk demo.
 - ☸️ **Kubernetes fleet control** — a reference manager + supervisor for thousands of single-symbol engines, with zero-impact symbol lifecycle, restart guards and storage-aware shard drops.
