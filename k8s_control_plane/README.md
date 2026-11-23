@@ -12,7 +12,7 @@ one command renders the exact manifest set, one command prints what the operator
 and the embedded GUI shows the catalog, validation report and reconcile plan. It never connects to
 etcd directly.
 
-[![Kubernetes control plane, supervisor and engine console](../docs/kubernetes-console-architecture.png)](../docs/kubernetes-console-architecture.html)
+[![Kubernetes control plane, engine shards, order systems, market data and historical bars](../docs/kubernetes-console-architecture.png)](../docs/kubernetes-console-architecture.html)
 
 [Open the interactive diagram](../docs/kubernetes-console-architecture.html).
 

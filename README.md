@@ -319,7 +319,7 @@ containers one pod at a time behind a quorum gate, applies PVC retention windows
 cross-shard cutover/rollback with a distinct Raft ID range. The architecture scales to thousands
 of single-symbol engines and their four-voter process instances across shards and cells.
 
-[![Kubernetes control plane, supervisor and engine console](./docs/kubernetes-console-architecture.png)](./docs/kubernetes-console-architecture.html)
+[![Kubernetes control plane, engine shards, order systems, market data and historical bars](./docs/kubernetes-console-architecture.png)](./docs/kubernetes-console-architecture.html)
 
 [Open the interactive diagram](./docs/kubernetes-console-architecture.html) ·
 [Design and CRDs](./docs/KUBERNETES_CONTROL_PLANE.md) ·

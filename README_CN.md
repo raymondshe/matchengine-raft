@@ -229,7 +229,7 @@ WAL/snapshot；空闲 shard 可删除，并显式选择保留 PVC 或不可逆�
 写入 shard/deployment/route 状态、bootstrap/config 每个 Raft 组、在 quorum 门禁下逐 Pod 滚动、执行 PVC
 保留窗口，并用不重叠的 Raft ID 范围完成跨 shard cutover/rollback。
 
-[![Kubernetes 控制平面、supervisor 和引擎控制台](./docs/kubernetes-console-architecture.png)](./docs/kubernetes-console-architecture.html)
+[![Kubernetes 控制平面、引擎分片、订单系统、行情与历史 K 线](./docs/kubernetes-console-architecture.png)](./docs/kubernetes-console-architecture.html)
 
 [交互式图](./docs/kubernetes-console-architecture.html) ·
 [设计与 CRD](./docs/KUBERNETES_CONTROL_PLANE.md) ·
