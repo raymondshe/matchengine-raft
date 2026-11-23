@@ -1855,6 +1855,7 @@ dependencies = [
  "ctrlc",
  "futures-util",
  "matchengine-raft",
+ "reqwest",
  "rusteron-client",
  "rusteron-media-driver",
  "serde",

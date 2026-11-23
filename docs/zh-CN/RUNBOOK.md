@@ -3,6 +3,214 @@
 > 下方的引擎命令在 `match_engine/` 下执行，或在仓库根目录使用
 > `--manifest-path match_engine/Cargo.toml`。编排脚本在仓库根目录运行；独立项目使用各自的 manifest。
 
+## OrbStack：从零搭建完整系统
+
+本 recipe 在一个全新的 OrbStack Kubernetes 集群上拉起全部五个项目：四投票引擎 shard、CRD
+管理器/operator、NATS + 行情分发、TDengine 历史 K 线，以及 React 交易终端。它会重建
+`match-eu-1` / `match-control` 参考环境，因此只应在可重置的实验集群上执行。下面的详细章节
+解释每个子系统；本节是通向可用终端的最短路径。
+
+**前置条件。** 已启用 Kubernetes 的 OrbStack、指向 OrbStack 的 Docker CLI 和 `kubectl`、Rust
+1.89+（下面的 CRD/管理器 CLI 命令）、`curl` 和 `python3`（仅可选的 K 线种子数据）。不需要镜像
+仓库：OrbStack 与节点共享本机 Docker 镜像库，manifest 使用 `imagePullPolicy: IfNotPresent`。
+预留数 GB 磁盘空间——触发 `DiskPressure` 后 kubelet 会清理仅存在于本机的镜像 tag，Pod 随即进入
+`ImagePullBackOff`。
+
+### 1. 构建本地镜像
+
+```sh
+# 引擎 + supervisor，同时打开两种行情出口 feature。
+docker build --platform linux/arm64 -f match_engine/docker/k8s.Dockerfile \
+  --build-arg CARGO_FEATURES="market-data-nats market-data-aeron" \
+  -t matchengine-raft:k8s-nats-arm64-v2 match_engine
+
+# 管理 API 和 operator 共用一个镜像；已检入的 manifest 使用此 tag。
+docker build -f k8s_control_plane/Dockerfile \
+  -t matchengine-k8s-control-plane:local k8s_control_plane
+
+# 带 TDengine 历史层的行情服务。
+docker build --platform linux/arm64 \
+  -f market_data_system/docker/k8s-history.Dockerfile \
+  -t matchengine-marketdata:history-arm64-v2 .
+
+# 纯前端终端（独立 Vite 构建，无 Rust）。
+docker build --platform linux/arm64 -f trading_terminal/Dockerfile \
+  -t matchengine-trading-terminal:arm64-v3 trading_terminal
+```
+
+### 2. Namespace、CRD 与期望状态
+
+```sh
+kubectl create namespace match-eu-1 --dry-run=client -o yaml | kubectl apply -f -
+kubectl create namespace match-control --dry-run=client -o yaml | kubectl apply -f -
+kubectl label namespace match-control matching.io/role=control-plane --overwrite
+
+cargo run --manifest-path k8s_control_plane/Cargo.toml --bin k8s-control-plane -- crds \
+  | kubectl apply -f -
+kubectl apply -f k8s_control_plane/deploy/rbac.yaml
+
+# 把内置 demo catalog 写入 CRD。若已恢复自己的 catalog 则跳过。
+cargo run --manifest-path k8s_control_plane/Cargo.toml --bin k8s-control-plane -- seed \
+  > /tmp/match-catalog.json
+cargo run --manifest-path k8s_control_plane/Cargo.toml --bin k8s-control-plane -- \
+  crd-restore --input /tmp/match-catalog.json --namespace match-eu-1
+```
+
+### 3. 管理器与 operator
+
+```sh
+kubectl -n match-control create deployment match-manager \
+  --image=matchengine-k8s-control-plane:local \
+  -- /usr/local/bin/k8s-control-plane serve --addr 0.0.0.0:8099
+kubectl -n match-control set env deploy/match-manager RUST_LOG=info
+kubectl -n match-control expose deployment match-manager --port=8099 --target-port=8099
+kubectl -n match-control patch deploy match-manager --type=merge \
+  -p '{"spec":{"template":{"spec":{"serviceAccountName":"match-manager","automountServiceAccountToken":true}}}}'
+kubectl -n match-control set args deploy/match-manager -- \
+  serve --addr 0.0.0.0:8099 --crd --crd-namespace match-eu-1 --no-seed
+
+kubectl apply -f k8s_control_plane/deploy/operator.yaml
+kubectl -n match-control rollout status deploy/match-manager deploy/match-operator --timeout=180s
+kubectl -n match-control get lease match-engine-operator -o jsonpath='{.spec.holderIdentity}{"\n"}'
+```
+
+`GET /api/v1/health` 应返回 `"store":"crd"`。只有持有 Lease 的 operator 执行 reconcile；
+可用 `kubectl -n match-control logs deploy/match-operator -f` 观察 shard 出现。
+
+### 4. 渲染 shard 并引导 Raft
+
+operator 负责 apply 渲染出的工作负载，但每个四投票成员组仍需通过 `/init` 精确引导一次。
+按照[创建目录并 apply shard](#创建目录并-apply-shard)执行 `manifests`、逐进程 `/init` 和
+`ConfigureSymbol`。渲染 `GET /api/v1/shards` 列出的每个 shard，确认每个 shard 有四个 Ready Pod
+后再继续。
+
+### 5. Ingress 与本地 front door
+
+OrbStack 没有云负载均衡器，Ingress 需要一个 class-less nginx controller 和 Mac 端口 80 上的
+Docker front door：
+
+```sh
+kubectl apply -f k8s_control_plane/deploy/ingress-nginx.yaml
+kubectl -n ingress-nginx rollout status deploy/ingress-nginx-controller --timeout=180s
+kubectl apply -f k8s_control_plane/deploy/web-ingress.yaml
+./scripts/ingress-frontdoor.sh start
+curl -s -o /dev/null -w '%{http_code}\n' http://console.match-eu-1.example/
+```
+
+主机名和限制详见英文 runbook 的 “Reach the demo ingress hosts”。
+
+### 6. 消息总线与历史存储
+
+```sh
+kubectl apply -f k8s_control_plane/deploy/nats.yaml
+kubectl -n match-eu-1 rollout status deploy/nats
+
+kubectl apply -f k8s_control_plane/deploy/tdengine.yaml
+kubectl -n match-eu-1 rollout status deploy/tdengine
+```
+
+TDengine manifest 是单 dnode 实验配置：`emptyDir` 存储、`taosadapter` 监听 6042，一个 Node
+sidecar 持有 IPv4 `0.0.0.0:6041`（Service/NetworkPolicy 端口）。它不是三节点 `REPLICA 3`
+生产拓扑，后者见 [HISTORICAL_BARS.md](./HISTORICAL_BARS.md)。
+
+### 7. 带历史能力的全局行情服务
+
+创建面向终端的服务：每个 symbol 一个 feed group，并带上 `history` 配置。按第 2 步实际写入的
+catalog 调整 symbol 列表。
+
+```sh
+kubectl -n match-eu-1 apply -f - <<'YAML'
+apiVersion: matching.io/v1
+kind: MarketDataService
+metadata:
+  name: global-marketdata
+  namespace: match-eu-1
+spec:
+  cell: eu-1
+  image: matchengine-marketdata:history-arm64-v2
+  replicas: 1
+  feedGroups:
+    - {name: lab-gbpusd, symbols: [gbpusd], streamBase: 2001}
+    - {name: lab-audusd, symbols: [audusd], streamBase: 2001}
+    - {name: lab-usdjpy, symbols: [usdjpy], streamBase: 2011}
+    - {name: lab-eurgbp, symbols: [eurgbp], streamBase: 2001}
+    - {name: lab-nzdusd, symbols: [nzdusd], streamBase: 2011}
+    - {name: lab-btcusdt, symbols: [btcusdt], streamBase: 2001}
+  transport:
+    mode: nats
+    natsUrl: nats://nats.match-eu-1.svc.cluster.local:4222
+  websocket:
+    port: 24804
+    ingress: ws-fx-eu-02.match-eu-1.example
+    maxConnections: 4096
+    maxStreamsPerConnection: 1024
+  history:
+    url: http://tdengine.match-eu-1.svc.cluster.local:6041
+    database: market_bars
+    sealLagMs: 1500
+  release:
+    wireVersion: 7
+    snapshotVersion: 11
+    mixedVersionSafe: false
+YAML
+kubectl -n match-eu-1 rollout status deploy/global-marketdata --timeout=240s
+kubectl -n match-eu-1 get marketdataservice global-marketdata \
+  -o jsonpath='{.status.phase} {.status.readyReplicas}/{.status.replicas}{"\n"}'
+```
+
+operator 会加入 `6041` egress 规则和 `--history` 参数；可用
+`kubectl -n match-eu-1 get deploy global-marketdata -o jsonpath='{.spec.template.spec.containers[0].args}'`
+验证。
+
+### 8. 交易终端
+
+```sh
+kubectl apply -f k8s_control_plane/deploy/terminal.yaml
+# manifest 中的 DNS_UPSTREAM 是特定实验环境的值；改成当前集群的 kube-dns IP。
+KUBEDNS=$(kubectl -n kube-system get svc kube-dns -o jsonpath='{.spec.clusterIP}')
+kubectl -n match-eu-1 set env deployment/match-terminal DNS_UPSTREAM="$KUBEDNS"
+kubectl -n match-eu-1 rollout status deploy/match-terminal --timeout=180s
+```
+
+nginx 在请求时解析两个上游，因此终端可以先于 BFF 启动。
+
+### 9. 端到端验证
+
+```sh
+curl -s http://console.match-eu-1.example/api/v1/health
+curl -s -o /dev/null -w '%{http_code}\n' http://orders.match-eu-1.example/demo/
+curl -s -o /dev/null -w '%{http_code}\n' http://terminal.match-eu-1.example/
+curl -s -D - 'http://terminal.match-eu-1.example/md/klines?symbol=gbpusd&interval=1s&limit=5' \
+  | head -20
+kubectl -n match-eu-1 get pods -o wide
+```
+
+打开 <http://terminal.match-eu-1.example/>。在 writer 看到成交（或按下一步写入种子数据）之前，
+图表标题显示 `HISTORY 0`；之后实时成交会用同一批行绘制 K 线。
+
+### 10. 可选：为空图表写入演示 K 线
+
+端口转发存储后运行种子脚本。**该操作会删除并重建 `market_bars`。**
+
+```sh
+kubectl -n match-eu-1 port-forward svc/tdengine 16042:6041 >/tmp/tdengine-pf.log 2>&1 &
+TDENGINE_URL=http://127.0.0.1:16042 ./scripts/seed-history-lab.py
+```
+
+刷新终端：即使没有新成交，标题也会显示 `HISTORY 500` 并出现蜡烛图，效果见
+[截图](./trading-terminal-history.png)。交互式架构可打开
+[导出的 Archify 图](./historical-bars-tdengine.html)。
+
+### 11. 清理
+
+```sh
+./scripts/ingress-frontdoor.sh stop
+kubectl delete namespace match-eu-1 match-control ingress-nginx --ignore-not-found
+```
+
+删除 `match-eu-1` 会删除引擎 PVC 和 TDengine `emptyDir`，此操作不可恢复；如果实验环境中有需要
+保留的数据，请先备份。
+
 ## 启动集群
 
 ### 使用测试脚本快速启动

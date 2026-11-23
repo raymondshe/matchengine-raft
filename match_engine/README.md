@@ -2,7 +2,7 @@
 
 The Rust engine crate of the [Matchengine Raft](../README.md) project. It owns the replicated order
 book, WAL/snapshots, gRPC Raft transport, event log and market-data feed. See the
-[root README](../README.md) for the four-project overview, demos, Kubernetes control plane,
+[root README](../README.md) for the five-project overview, demos, Kubernetes control plane,
 security boundary and benchmark headline table.
 
 ## 🚀 Build and run

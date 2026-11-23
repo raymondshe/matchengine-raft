@@ -1518,6 +1518,17 @@ fn market_data_container(ctx: &MarketDataCtx<'_>) -> Value {
     if ws.extensions {
         args.push(json!("--extensions"));
     }
+    if let Some(history) = &ctx.service.spec.history {
+        args.extend([
+            json!("--history"),
+            json!("--tdengine-url"),
+            json!(history.url),
+            json!("--tdengine-database"),
+            json!(history.database),
+            json!("--history-seal-lag-ms"),
+            json!(history.seal_lag_ms.to_string()),
+        ]);
+    }
     let resources = market_data_resources(ctx);
     json!({
         "name": "market-data",
@@ -1858,6 +1869,14 @@ fn market_data_network_policy(ctx: &MarketDataCtx<'_>) -> Value {
             }));
         }
         MarketDataTransportMode::Bridge => {}
+    }
+    if ctx.service.spec.history.is_some() {
+        // taosAdapter is internal only: admit the market-data pods to 6041
+        // and nothing else. The DSN is a ClusterIP, never a public endpoint.
+        egress.push(json!({
+            "to": [{ "podSelector": { "matchLabels": { "app": "tdengine" } } }],
+            "ports": [{ "protocol": "TCP", "port": 6041 }],
+        }));
     }
 
     json!({
@@ -3043,6 +3062,7 @@ mod tests {
             name: name.to_string(),
             namespace: "match-eu-1".to_string(),
             spec: MarketDataServiceSpec {
+                history: None,
                 cell: "eu-1".to_string(),
                 symbols: Vec::new(),
                 feed_groups: vec![MarketDataFeedGroup {
@@ -3086,6 +3106,7 @@ mod tests {
             name: name.to_string(),
             namespace: "match-eu-1".to_string(),
             spec: MarketDataServiceSpec {
+                history: None,
                 cell: "eu-1".to_string(),
                 symbols: Vec::new(),
                 feed_groups: vec![MarketDataFeedGroup {
@@ -3272,6 +3293,52 @@ mod tests {
     }
 
     #[test]
+    fn history_service_renders_tdengine_args() {
+        use crate::model::MarketDataHistory;
+        let mut catalog = demo_catalog();
+        demo_nats_market_data(&mut catalog, "btc-marketdata");
+        catalog
+            .market_data_services
+            .get_mut("btc-marketdata")
+            .unwrap()
+            .spec
+            .history = Some(MarketDataHistory {
+            url: "http://tdengine.match-eu-1.svc.cluster.local:6041".to_string(),
+            database: "market_bars".to_string(),
+            seal_lag_ms: 1_500,
+        });
+        let objects =
+            render_market_data_service(&catalog, "btc-marketdata", Some("match-eu-1")).unwrap();
+        let deployment = object(&objects, "Deployment");
+        let args: Vec<&str> = deployment["spec"]["template"]["spec"]["containers"][0]["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|arg| arg.as_str().unwrap())
+            .collect();
+        assert!(args.contains(&"--history"), "{args:?}");
+        assert!(
+            args.contains(&"http://tdengine.match-eu-1.svc.cluster.local:6041"),
+            "{args:?}"
+        );
+        assert!(args.contains(&"market_bars"), "{args:?}");
+        assert!(args.contains(&"1500"), "{args:?}");
+        let policy = object(&objects, "NetworkPolicy");
+        let allowed = policy["spec"]["egress"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|rule| {
+                rule["ports"].as_array().is_some_and(|ports| {
+                    ports
+                        .iter()
+                        .any(|port| port["port"] == 6041 && port["protocol"] == "TCP")
+                })
+            });
+        assert!(allowed, "history needs an egress rule to taosAdapter:6041");
+    }
+
+    #[test]
     fn nats_services_subscribe_to_the_canonical_engine_subject() {
         use crate::model::{
             MarketDataFeedGroup, MarketDataService, MarketDataServiceSpec, MarketDataTransport,
@@ -3287,6 +3354,7 @@ mod tests {
                 name: "global-marketdata".to_string(),
                 namespace: "match-eu-1".to_string(),
                 spec: MarketDataServiceSpec {
+                    history: None,
                     cell: "eu-1".to_string(),
                     symbols: Vec::new(),
                     feed_groups: vec![MarketDataFeedGroup {
@@ -3570,6 +3638,7 @@ mod tests {
             name: "global-marketdata".to_string(),
             namespace: "match-eu-1".to_string(),
             spec: MarketDataServiceSpec {
+                history: None,
                 cell: "eu-1".to_string(),
                 symbols: Vec::new(),
                 feed_groups: vec![
@@ -3906,6 +3975,7 @@ mod tests {
             name: "fx-eu-01-marketdata".to_string(),
             namespace: "match-eu-1".to_string(),
             spec: MarketDataServiceSpec {
+                history: None,
                 cell: "eu-1".to_string(),
                 symbols: Vec::new(),
                 feed_groups: vec![

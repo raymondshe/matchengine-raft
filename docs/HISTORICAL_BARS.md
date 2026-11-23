@@ -1,10 +1,17 @@
 # Historical bar generation and query system
 
-Status: **design, not implemented.** This document specifies the historical path added to the
-existing `market_data_system`: it turns the engine's deterministic trade stream into dense,
-durable, queryable klines and serves them through the same process and Binance-compatible API —
-with the guarantees Binance does not provide (a mutation sequence, gap repair, explicit revisions,
-and one store behind both history and replay).
+Status: **phase P0 implemented in `market_data_system/`; P1–P5 remain design.** This document
+specifies the historical path added to the existing `market_data_system`: it turns the engine's
+deterministic trade stream into dense, durable, queryable klines and serves them through the same
+process and Binance-compatible API — with the guarantees Binance does not provide (a mutation
+sequence, gap repair, explicit revisions, and one store behind both history and replay).
+
+P0 implements the TDengine schema, the trade-derived `1s`/`1m` writer, exact-decimal text I/O,
+`GET /klines` (including read-time `INTERVAL` rollups for `3m`…`3d`), and WS subscribe replay
+seeded from TDengine. Deliberately deferred: the trade spool and Lease failover, `bar_gaps` /
+`bar_revisions` / `bar_imports`, `GET /bars`, the archive/REST importers, time-zone and `1w`/`1M`
+windows, and the three-dnode deployment. The sections below describe the complete target; §17
+marks which phase each piece belongs to.
 
 The store is **TDengine**. Bars are written as exact `DECIMAL(38,18)` rows and read back as exact
 decimal text; no value in the bar path passes through a binary float or a 96-bit client decimal

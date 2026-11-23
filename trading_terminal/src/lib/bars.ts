@@ -84,6 +84,25 @@ export class BarStore {
     this.trim(book);
   }
 
+  /**
+   * Seeds the store with bars read from `GET /klines`.
+   *
+   * Values arrive as canonical decimal strings on the wire and are narrowed to
+   * chart numbers here; the store and API keep all 18 digits. A closed history
+   * bar is final and is never reopened by a later partial frame.
+   */
+  applyHistoryBars(interval: string, bars: Bar[]): void {
+    if (!isInterval(interval) || !bars.length) return;
+    const book = this.book(interval);
+    for (const bar of bars) {
+      if (!Number.isFinite(bar.time) || bar.time <= 0) continue;
+      const existing = book.get(bar.time);
+      if (existing?.closed && !bar.closed) continue;
+      book.set(bar.time, { ...bar });
+    }
+    this.trim(book);
+  }
+
   /** Ascending-time copy for the chart. */
   series(interval: BarInterval): Bar[] {
     const book = this.windows.get(interval);

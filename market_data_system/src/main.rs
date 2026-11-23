@@ -132,6 +132,36 @@ struct Opt {
     /// Depth levels in a subscribe-time snapshot.
     #[clap(long, default_value_t = 200)]
     snapshot_levels: usize,
+
+    /// Enable the TDengine-backed historical bar tier (1s/1m rows and /klines).
+    #[clap(long)]
+    history: bool,
+    /// taosAdapter endpoint for the historical store.
+    #[clap(long, env = "TDENGINE_URL", default_value = "http://127.0.0.1:6041")]
+    tdengine_url: String,
+    #[clap(long, env = "TDENGINE_USER", default_value = "root")]
+    tdengine_user: String,
+    #[clap(long, env = "TDENGINE_PASSWORD", default_value = "taosdata")]
+    tdengine_password: String,
+    #[clap(long, env = "TDENGINE_DATABASE", default_value = "market_bars")]
+    tdengine_database: String,
+    /// Create the database and stables on startup.
+    #[clap(long, default_value_t = true, action = clap::ArgAction::Set)]
+    tdengine_auto_create: bool,
+    #[clap(long, default_value_t = 1)]
+    tdengine_vgroups: u32,
+    #[clap(long, default_value_t = 1)]
+    tdengine_replica: u32,
+    #[clap(long, default_value_t = 3650)]
+    tdengine_keep_days: u32,
+    #[clap(long, default_value_t = 2000)]
+    tdengine_batch_rows: usize,
+    /// Event-time lag before a closed window is sealed.
+    #[clap(long, default_value_t = 2000)]
+    history_seal_lag_ms: u64,
+    /// Bars per interval in a WS subscribe-time replay.
+    #[clap(long, default_value_t = 500)]
+    history_snapshot_bars: usize,
 }
 
 fn parse_symbol(raw: &str) -> Result<SymbolSpec, String> {
@@ -206,6 +236,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     config.heartbeat_timeout = Duration::from_secs(opt.heartbeat_timeout_secs.max(1));
     config.snapshot_levels = opt.snapshot_levels.max(1);
+    config.history.enabled = opt.history;
+    config.history.url = opt.tdengine_url;
+    config.history.user = opt.tdengine_user;
+    config.history.password = opt.tdengine_password;
+    config.history.database = opt.tdengine_database;
+    config.history.auto_create = opt.tdengine_auto_create;
+    config.history.vgroups = opt.tdengine_vgroups.max(1);
+    config.history.replica = opt.tdengine_replica.max(1);
+    config.history.keep_days = opt.tdengine_keep_days.max(1);
+    config.history.batch_rows = opt.tdengine_batch_rows.max(1);
+    config.history.seal_lag_ms = opt.history_seal_lag_ms;
+    config.history.snapshot_bars = opt.history_snapshot_bars.max(1);
 
     if opt.replay_dir.is_some()
         && (!opt.market_data_log.is_empty()

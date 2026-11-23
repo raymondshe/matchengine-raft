@@ -244,9 +244,14 @@ CI (`.github/workflows/ci.yml`) runs `cargo fmt --all -- --check` (and the `matc
   path silently loses 18 digits on a 38-digit value), never `f64`. One Lease-guarded writer with a
   local trade spool (TDengine cannot key multiple fills at one microsecond); readers are stateless
   and query TDengine directly. Serves a Binance-compatible `GET /klines` plus a native `GET /bars`
-  and a WS snapshot/live cursor with `seq` (engine `market_seq`) and `rev` gap repair. It is
-  **design only** — no code exists yet; measured ingest/query/precision numbers are §12. The
-  reference-API measurements it builds on are in `docs/THIRD_PARTY_INVESTIGATION.md` Part VII.
+  and a WS snapshot/live cursor with `seq` (engine `market_seq`) and `rev` gap repair. **Phase P0 is
+  implemented** in `market_data_system/` (`--history`, `src/history/`, `GET /klines`); the trade
+  spool, Lease failover, revisions/gaps, `/bars`, importers and time-zone anchors remain design.
+  The OrbStack lab wires it up with `k8s_control_plane/deploy/tdengine.yaml` (single dnode plus an
+  IPv4 bridge for `taosadapter`), `MarketDataService.spec.history`, market-data image
+  `history-arm64-v2` and terminal image `arm64-v3`, so the terminal chart seeds from TDengine.
+  Measured ingest/query/precision numbers are §12. The reference-API measurements it builds on are
+  in `docs/THIRD_PARTY_INVESTIGATION.md` Part VII.
 - `docs/FEE_DEDUCTION.md` documents the implemented base/quote volume semantics,
   fiat/stablecoin/equity/ETF asset metadata, tick/lot rules and fee-asset policies. Fee tokens and
   mixed-unit iceberg/FOK are settled as out of scope; derivatives remain a documented extension.

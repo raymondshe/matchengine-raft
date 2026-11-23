@@ -4,6 +4,214 @@
 > `--manifest-path match_engine/Cargo.toml` from the repository root. Run the orchestration scripts
 > from the repository root; standalone projects have their own manifests.
 
+## OrbStack: full system from scratch
+
+This recipe brings up all five projects on a fresh OrbStack Kubernetes cluster: four-voter engine
+shards, the CRD manager/operator, NATS + market-data fan-out, the TDengine historical bar tier and
+the React trading terminal. It recreates the `match-eu-1` / `match-control` reference tier, so run it
+only on a lab cluster you are willing to reset. The detailed sections below explain each subsystem;
+this is the shortest path that ends with a working terminal.
+
+**Prerequisites.** OrbStack with Kubernetes enabled, Docker CLI on the OrbStack context, `kubectl`
+on that context, Rust 1.89+ (the CRD/manager CLI commands below), `curl` and `python3` (only for the
+optional bar seeding). No registry is needed: OrbStack shares the local Docker image store with its
+node, and the manifests use `imagePullPolicy: IfNotPresent`. Keep several GB of disk headroom —
+`DiskPressure` image GC removes local-only tags and pods then fall into `ImagePullBackOff`.
+
+### 1. Build the local images
+
+```sh
+# Engine + supervisor, with both market-data egress features.
+docker build --platform linux/arm64 -f match_engine/docker/k8s.Dockerfile \
+  --build-arg CARGO_FEATURES="market-data-nats market-data-aeron" \
+  -t matchengine-raft:k8s-nats-arm64-v2 match_engine
+
+# Manager API and operator share one image; the checked-in manifests use this tag.
+docker build -f k8s_control_plane/Dockerfile \
+  -t matchengine-k8s-control-plane:local k8s_control_plane
+
+# Market-data service with the TDengine history tier.
+docker build --platform linux/arm64 \
+  -f market_data_system/docker/k8s-history.Dockerfile \
+  -t matchengine-marketdata:history-arm64-v2 .
+
+# Pure frontend terminal (own Vite build, no Rust).
+docker build --platform linux/arm64 -f trading_terminal/Dockerfile \
+  -t matchengine-trading-terminal:arm64-v3 trading_terminal
+```
+
+### 2. Namespaces, CRDs and desired state
+
+```sh
+kubectl create namespace match-eu-1 --dry-run=client -o yaml | kubectl apply -f -
+kubectl create namespace match-control --dry-run=client -o yaml | kubectl apply -f -
+kubectl label namespace match-control matching.io/role=control-plane --overwrite
+
+cargo run --manifest-path k8s_control_plane/Cargo.toml --bin k8s-control-plane -- crds \
+  | kubectl apply -f -
+kubectl apply -f k8s_control_plane/deploy/rbac.yaml
+
+# Write the built-in demo catalog into CRDs. Skip if you already restored your own catalog.
+cargo run --manifest-path k8s_control_plane/Cargo.toml --bin k8s-control-plane -- seed \
+  > /tmp/match-catalog.json
+cargo run --manifest-path k8s_control_plane/Cargo.toml --bin k8s-control-plane -- \
+  crd-restore --input /tmp/match-catalog.json --namespace match-eu-1
+```
+
+### 3. Manager and operator
+
+```sh
+kubectl -n match-control create deployment match-manager \
+  --image=matchengine-k8s-control-plane:local \
+  -- /usr/local/bin/k8s-control-plane serve --addr 0.0.0.0:8099
+kubectl -n match-control set env deploy/match-manager RUST_LOG=info
+kubectl -n match-control expose deployment match-manager --port=8099 --target-port=8099
+kubectl -n match-control patch deploy match-manager --type=merge \
+  -p '{"spec":{"template":{"spec":{"serviceAccountName":"match-manager","automountServiceAccountToken":true}}}}'
+kubectl -n match-control set args deploy/match-manager -- \
+  serve --addr 0.0.0.0:8099 --crd --crd-namespace match-eu-1 --no-seed
+
+kubectl apply -f k8s_control_plane/deploy/operator.yaml
+kubectl -n match-control rollout status deploy/match-manager deploy/match-operator --timeout=180s
+kubectl -n match-control get lease match-engine-operator -o jsonpath='{.spec.holderIdentity}{"\n"}'
+```
+
+Check `GET /api/v1/health` reports `"store":"crd"`. Only the Lease holder reconciles; watch
+`kubectl -n match-control logs deploy/match-operator -f` while the shards appear.
+
+### 4. Render shards and bootstrap Raft
+
+The operator applies the rendered workloads but each four-voter group is bootstrapped exactly once
+through `/init`. Follow [Create the catalog and apply shards](#create-the-catalog-and-apply-shards)
+for the `manifests` call, the per-process `/init` request and `ConfigureSymbol`. Render every shard
+listed by `GET /api/v1/shards`, then confirm four Ready pods per shard before continuing.
+
+### 5. Ingress and the local front door
+
+OrbStack has no cloud load balancer, so Ingresses need one class-less nginx controller and a Docker
+front door on the Mac's port 80:
+
+```sh
+kubectl apply -f k8s_control_plane/deploy/ingress-nginx.yaml
+kubectl -n ingress-nginx rollout status deploy/ingress-nginx-controller --timeout=180s
+kubectl apply -f k8s_control_plane/deploy/web-ingress.yaml
+./scripts/ingress-frontdoor.sh start
+curl -s -o /dev/null -w '%{http_code}\n' http://console.match-eu-1.example/
+```
+
+See [Reach the demo ingress hosts](#reach-the-demo-ingress-hosts) for host names and caveats.
+
+### 6. Message bus and historical store
+
+```sh
+kubectl apply -f k8s_control_plane/deploy/nats.yaml
+kubectl -n match-eu-1 rollout status deploy/nats
+
+kubectl apply -f k8s_control_plane/deploy/tdengine.yaml
+kubectl -n match-eu-1 rollout status deploy/tdengine
+```
+
+The TDengine manifest is the single-dnode lab profile: `emptyDir` storage, `taosadapter` on 6042 and
+a Node sidecar owning IPv4 `0.0.0.0:6041` (the Service/NetworkPolicy port). It is not the
+three-dnode `REPLICA 3` production topology in [HISTORICAL_BARS.md](./HISTORICAL_BARS.md).
+
+### 7. Global market-data service with history
+
+Create the terminal-facing service with one feed group per symbol and the `history` block. Adjust the
+symbol list to the catalog you seeded in step 2.
+
+```sh
+kubectl -n match-eu-1 apply -f - <<'YAML'
+apiVersion: matching.io/v1
+kind: MarketDataService
+metadata:
+  name: global-marketdata
+  namespace: match-eu-1
+spec:
+  cell: eu-1
+  image: matchengine-marketdata:history-arm64-v2
+  replicas: 1
+  feedGroups:
+    - {name: lab-gbpusd, symbols: [gbpusd], streamBase: 2001}
+    - {name: lab-audusd, symbols: [audusd], streamBase: 2001}
+    - {name: lab-usdjpy, symbols: [usdjpy], streamBase: 2011}
+    - {name: lab-eurgbp, symbols: [eurgbp], streamBase: 2001}
+    - {name: lab-nzdusd, symbols: [nzdusd], streamBase: 2011}
+    - {name: lab-btcusdt, symbols: [btcusdt], streamBase: 2001}
+  transport:
+    mode: nats
+    natsUrl: nats://nats.match-eu-1.svc.cluster.local:4222
+  websocket:
+    port: 24804
+    ingress: ws-fx-eu-02.match-eu-1.example
+    maxConnections: 4096
+    maxStreamsPerConnection: 1024
+  history:
+    url: http://tdengine.match-eu-1.svc.cluster.local:6041
+    database: market_bars
+    sealLagMs: 1500
+  release:
+    wireVersion: 7
+    snapshotVersion: 11
+    mixedVersionSafe: false
+YAML
+kubectl -n match-eu-1 rollout status deploy/global-marketdata --timeout=240s
+kubectl -n match-eu-1 get marketdataservice global-marketdata \
+  -o jsonpath='{.status.phase} {.status.readyReplicas}/{.status.replicas}{"\n"}'
+```
+
+The operator adds the `6041` egress rule and the `--history` args; verify with
+`kubectl -n match-eu-1 get deploy global-marketdata -o jsonpath='{.spec.template.spec.containers[0].args}'`.
+
+### 8. Trading terminal
+
+```sh
+kubectl apply -f k8s_control_plane/deploy/terminal.yaml
+# The checked-in DNS_UPSTREAM is lab-specific; use this cluster's kube-dns IP.
+KUBEDNS=$(kubectl -n kube-system get svc kube-dns -o jsonpath='{.spec.clusterIP}')
+kubectl -n match-eu-1 set env deployment/match-terminal DNS_UPSTREAM="$KUBEDNS"
+kubectl -n match-eu-1 rollout status deploy/match-terminal --timeout=180s
+```
+
+nginx resolves the two upstreams at request time, so the terminal can start before the BFF.
+
+### 9. Verify end to end
+
+```sh
+curl -s http://console.match-eu-1.example/api/v1/health
+curl -s -o /dev/null -w '%{http_code}\n' http://orders.match-eu-1.example/demo/
+curl -s -o /dev/null -w '%{http_code}\n' http://terminal.match-eu-1.example/
+curl -s -D - 'http://terminal.match-eu-1.example/md/klines?symbol=gbpusd&interval=1s&limit=5' \
+  | head -20
+kubectl -n match-eu-1 get pods -o wide
+```
+
+Open <http://terminal.match-eu-1.example/>. The chart header reads `HISTORY 0` until the writer has
+seen trades (or you seed demo bars below); live fills then paint candles from the same rows.
+
+### 10. Optional: seed demo bars for a cold chart
+
+Port-forward the store and run the lab seeder. **This drops and recreates `market_bars`.**
+
+```sh
+kubectl -n match-eu-1 port-forward svc/tdengine 16042:6041 >/tmp/tdengine-pf.log 2>&1 &
+TDENGINE_URL=http://127.0.0.1:16042 ./scripts/seed-history-lab.py
+```
+
+Reload the terminal: the header shows `HISTORY 500` and candles appear without any new trade, as in
+[the screenshot](./trading-terminal-history.png). For the interactive architecture view, open
+[the exported Archify diagram](./historical-bars-tdengine.html).
+
+### 11. Tear down
+
+```sh
+./scripts/ingress-frontdoor.sh stop
+kubectl delete namespace match-eu-1 match-control ingress-nginx --ignore-not-found
+```
+
+Deleting `match-eu-1` removes the engine PVCs and the TDengine `emptyDir`; there is no recovery from
+this step. Back up first if the lab holds state you care about.
+
 ## Start a cluster
 
 ### Quick Start with Test Script

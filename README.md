@@ -36,25 +36,29 @@ configurable durability and a live market-data path — without treating the eng
 - 🧭 **Raft-native** — OpenRaft 0.10 over gRPC with Pre-Vote, leadership transfer, learner catch-up and chunked snapshot install.
 - 🔢 **Exact 18-decimal fixed point** — no `f64` in the matching path; prices, quantities and fees survive the API, events, snapshots and feeds.
 - 📡 **Live data, not batch** — the deterministic feed is published over Aeron (one exclusive publication per stream) and served as Binance-style WebSocket streams with 100/1000 ms depth conflation and horizontal scale-out.
+- 📈 **Historical bars with exact decimals** — a TDengine-backed sparse `1s` series plus a materialized `1m` rollup, read-time `INTERVAL` rollups for coarser windows, one writer and stateless queriers, exposed as Binance-compatible `/klines` and seeded into the trading terminal.
+- 🖥️ **Trading terminal** — a pure React/TS spot terminal that consumes the existing market-data WebSocket and order-system BFF; no Rust and no direct engine writes.
 - 🧰 **Operable** — embedded console, `/health` + `/ready`, metrics, replay tools and a standalone order-desk demo.
 - ☸️ **Kubernetes fleet control** — a reference manager + supervisor for thousands of single-symbol engines, with zero-impact symbol lifecycle, restart guards and storage-aware shard drops.
 
-## 🧩 Four projects, one stack
+## 🧩 Five projects, one stack
 
 | Project | What it is | Start here |
 |---|---|---|
 | 🦀 **match_engine** | Raft-replicated, deterministic matching engine: order book, WAL/snapshots, gRPC Raft, event log, market-data feed and operational console | [`match_engine/README.md`](./match_engine/README.md) |
 | ☸️ **k8s_control_plane** | CRD-backed manager, Lease-elected operator, renderer and GUI for single-symbol engine fleets | [`k8s_control_plane/README.md`](./k8s_control_plane/README.md) |
-| 📡 **market_data_system** | Standalone Aeron/JSONL consumer serving Binance-style WebSocket market data | [`market_data_system/README.md`](./market_data_system/README.md) |
+| 📡 **market_data_system** | Standalone Aeron/NATS/JSONL consumer serving Binance-style WebSocket market data and TDengine-backed historical bars | [`market_data_system/README.md`](./market_data_system/README.md) |
 | 🧾 **order_system** | Standalone order-entry WebUI and demo freeze/settlement estimates | [`order_system/README.md`](./order_system/README.md) |
+| 🖥️ **trading_terminal** | Pure React/TS Binance-style spot terminal: book, tape, chart and order ticket behind nginx | [`trading_terminal/README.md`](./trading_terminal/README.md) |
 
 ```text
 .
 ├── match_engine/          # engine crate, benches, examples, tests, fuzz, console assets and Dockerfiles
 ├── k8s_control_plane/     # manager API/GUI, operator and CRDs
-├── market_data_system/    # WebSocket market-data service
-├── order_system/          # demo order desk
-├── docs/                  # cross-project design, API, runbook and performance notes
+├── market_data_system/    # WebSocket market-data service + historical bar writer/query
+├── order_system/          # demo order desk and BFF
+├── trading_terminal/      # React/TS terminal + nginx proxy (no Rust, own build)
+├── docs/                  # cross-project design, API, runbook, diagrams and performance notes
 ├── scripts/               # cluster, lab and demo orchestration
 └── .github/workflows/     # CI, fuzz and benchmark workflows
 ```
@@ -245,6 +249,52 @@ AWS Transit Gateway multicast); the default VPC CNI cannot carry it. Direct NATS
 Aeron bridge are fallbacks. See
 [`docs/AERON_K8S_MESSAGE_BUS.md`](./docs/AERON_K8S_MESSAGE_BUS.md).
 
+## 🗄️ Historical bars with TDengine
+
+`market_data_system --history` adds a durable bar tier inside the existing service — no new crate
+and no new public edge. A single writer folds the deterministic trade tap into sparse traded `1s`
+rows plus a materialized `1m` rollup and upserts them into TDengine as canonical 18-decimal text;
+`3m`…`3d` are read-time `INTERVAL` rollups of `1m`. Reads cast DECIMAL columns to `VARCHAR` and
+parse with a strict scale-18 parser, so no `f64` or 96-bit client decimal can round a value. The
+writer row carries the engine `market_seq` and its own trade cursor, which lets a replacement
+resume from the newest row without a hot standby; readers are stateless and query TDengine
+directly. `GET /klines` is Binance-shaped and dense, and the same rows seed the WebSocket
+subscribe replay.
+
+Phase P0 (schema, trade-derived writer, `/klines`, WS replay) is implemented and wired in the
+OrbStack lab. The trade spool, Lease failover, revisions/gaps, `/bars`, importers, time-zone anchors
+and the three-dnode production topology remain in the design.
+
+[![Historical bars: TDengine as the system of record](./docs/historical-bars-tdengine.png)](./docs/historical-bars-tdengine.html)
+
+[Open the interactive Archify diagram](./docs/historical-bars-tdengine.html) ·
+[Full design and measurements](./docs/HISTORICAL_BARS.md) ·
+[Service configuration](./market_data_system/README.md)
+
+The HTML above is the exported Archify artifact (route/lens views and image/SVG/WebM export); the
+PNG is a still capture of that export for inline viewing.
+
+## 🖥️ Trading terminal
+
+[`trading_terminal/`](./trading_terminal/) is a Binance-style spot trading UI and a **pure
+frontend**: React + TypeScript with its own Vite build, no Rust dependency and no crate embedding.
+nginx is deployment plumbing only; it serves the SPA and reverse-proxies `/md/*` to the global
+market-data service and `/demo/api/*` to the order-system BFF on one origin, so the BFF's
+same-origin guard passes without CORS changes. Order entry goes through the BFF with
+`X-Demo-Action: submit`; the browser never calls engine `/write`.
+
+The book ladder keeps the spread vertically centred with asks bottom-aligned above it and bids
+top-aligned below it. The chart seeds up to 500 candles from the TDengine-backed `/md/klines`
+endpoint on every symbol/interval change, then overlays live trade and `kline` frames without
+reopening closed bars; the header reports the seeded count (`HISTORY 500` below).
+
+![Trading terminal with TDengine-backed historical candles](./docs/trading-terminal-history.png)
+
+The screenshot is the live OrbStack lab at <http://terminal.match-eu-1.example/> (seeded demo bars,
+not exchange history). See [`trading_terminal/README.md`](./trading_terminal/README.md) and
+[`k8s_control_plane/deploy/terminal.yaml`](./k8s_control_plane/deploy/terminal.yaml) for the
+deployment.
+
 ## ☸️ Kubernetes control plane
 
 The engine trades one symbol per process, so a multi-symbol deployment is a fleet of independent
@@ -369,6 +419,8 @@ for the trade-offs.
 - [Testing](./docs/TESTING.md) — cluster suite, replay matrix and failure tests.
 - [Performance](./docs/PERFORMANCE.md) — measured baselines and methodology.
 - [Market-data on Kubernetes](./docs/AERON_K8S_MESSAGE_BUS.md) — market-data message bus, multicast constraints and scale-out profiles.
+- [Trading terminal](./trading_terminal/README.md) — the React/TS client, deployment proxy and TDengine-seeded chart.
+- [Historical bars](./docs/HISTORICAL_BARS.md) — TDengine schema, exact-decimal contract, HA contract and measurements; the [interactive Archify export](./docs/historical-bars-tdengine.html) is checked in beside its PNG preview.
 - [Runbook](./docs/RUNBOOK.md) — cluster, upgrade, migration and recovery procedures.
 - [Third-party investigations](./docs/THIRD_PARTY_INVESTIGATION.md) — external engine reviews.
 - [TODO](./TODO.md) — current priorities and roadmap.

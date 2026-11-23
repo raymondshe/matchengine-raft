@@ -4,6 +4,14 @@ A Binance-style spot trading terminal for the matchengine fleet: order book,
 trade tape, candlestick chart and an order ticket, deployed to the OrbStack
 cluster as a static React SPA behind nginx.
 
+![Trading terminal with 500 historical 1m bars seeded from TDengine](../docs/trading-terminal-history.png)
+
+The screenshot is the live OrbStack lab at
+`http://terminal.match-eu-1.example/`: the chart header shows `HISTORY 500`,
+the `1m` toggle is active, and the candles/volumes were loaded from the
+TDengine-backed `GET /md/klines` endpoint before any new trade arrived.
+It is seeded lab data, not exchange history.
+
 ## Architecture — frontend/backend separation
 
 This is a **pure frontend project**: React + TypeScript with its own
@@ -64,6 +72,13 @@ exact volume/trade count and the closed flag. The chart calls `setData` with the
 whole merged series on each 10 fps flush, so switching symbol or interval cannot
 desynchronise it, and a single fill paints a candle immediately. The service
 replays its retained bars on subscribe, which gives a cold page load its history.
+
+With `--history` on the market-data service, the chart also fetches
+`/md/klines?symbol=…&interval=…&limit=500` on every symbol/interval change and
+seeds `BarStore` from the TDengine-backed rows. A closed history bar is final;
+live trade/kline frames only update the open window. The chart header reports
+the number of seeded bars (`HISTORY 500` in the screenshot), so a cold load is
+visibly backed by the store rather than by an empty tape.
 
 ## Development
 

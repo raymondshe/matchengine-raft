@@ -43,7 +43,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: terminal
-          image: matchengine-trading-terminal:arm64-v2
+          image: matchengine-trading-terminal:arm64-v3
           imagePullPolicy: IfNotPresent
           ports:
             - name: http

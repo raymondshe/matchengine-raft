@@ -4843,6 +4843,7 @@ mod tests {
             name: "btc-marketdata".to_string(),
             namespace: "match-eu-1".to_string(),
             spec: MarketDataServiceSpec {
+                history: None,
                 cell: "eu-1".to_string(),
                 symbols: Vec::new(),
                 feed_groups: vec![MarketDataFeedGroup {

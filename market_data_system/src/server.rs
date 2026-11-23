@@ -30,6 +30,12 @@ use crate::feed::Registry;
 use crate::feed::SharedState;
 use crate::feed::Stats;
 use crate::feed::SymbolRuntime;
+use crate::history::HistoryRuntime;
+use crate::history::query;
+use crate::history::query::KlineWindow;
+use crate::history::runtime;
+use crate::history::tdengine::HistoryStore;
+use crate::protocol;
 use crate::session;
 use crate::session::ConnectionGuard;
 use crate::session::FrameBudget;
@@ -58,6 +64,8 @@ pub struct AppState {
     pub registry: Arc<Mutex<Registry>>,
     pub stats: Arc<Stats>,
     pub stop: watch::Sender<bool>,
+    /// Present only with `--history`; serves `GET /klines` from TDengine.
+    pub history: Option<Arc<HistoryStore>>,
 }
 
 /// A running service. Call [`RunningService::shutdown`] to stop cleanly.
@@ -68,6 +76,7 @@ pub struct RunningService {
     stop: watch::Sender<bool>,
     feeds: Vec<JoinHandle<()>>,
     server_task: JoinHandle<()>,
+    history: Option<HistoryRuntime>,
 }
 
 impl RunningService {
@@ -76,6 +85,9 @@ impl RunningService {
         self.server.stop(true).await;
         for feed in self.feeds {
             let _ = feed.await;
+        }
+        if let Some(history) = self.history {
+            history.shutdown().await;
         }
         let _ = self.server_task.await;
     }
@@ -115,11 +127,40 @@ pub async fn start_with_snapshot_requesters(
     let (stop_tx, stop_rx) = watch::channel(false);
     let registry = Arc::new(Mutex::new(Registry::default()));
     let stats = Arc::new(Stats::default());
+
+    // Shared state is created before the writer so the writer can seed the
+    // subscribe-time kline cache from TDengine rows.
+    let mut shared_by_symbol = HashMap::new();
+    for (spec, _) in &sources {
+        shared_by_symbol.insert(
+            spec.symbol.clone(),
+            Arc::new(Mutex::new(SharedState::default())),
+        );
+    }
+    let history = if config.history.enabled {
+        Some(
+            runtime::start(
+                config.history.clone(),
+                &config.symbols,
+                shared_by_symbol.clone(),
+                registry.clone(),
+                stats.clone(),
+                stop_rx.clone(),
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    let history_tx = history.as_ref().map(|runtime| runtime.tx.clone());
+
     let mut symbols = HashMap::new();
     let mut feeds = Vec::with_capacity(sources.len());
-
     for (spec, source) in sources {
-        let shared = Arc::new(Mutex::new(SharedState::default()));
+        let shared = shared_by_symbol
+            .get(&spec.symbol)
+            .cloned()
+            .unwrap_or_else(|| Arc::new(Mutex::new(SharedState::default())));
         let snapshot_requester = snapshot_requesters.remove(&spec.symbol);
         let feed = Feed::new(
             spec.clone(),
@@ -132,7 +173,8 @@ pub async fn start_with_snapshot_requesters(
             registry.clone(),
             stats.clone(),
             snapshot_requester.clone(),
-        );
+        )
+        .with_history(history_tx.clone());
         feeds.push(tokio::spawn(feed.run(source, stop_rx.clone())));
         symbols.insert(
             spec.symbol.to_lowercase(),
@@ -150,6 +192,7 @@ pub async fn start_with_snapshot_requesters(
         registry,
         stats,
         stop: stop_tx.clone(),
+        history: history.as_ref().map(|runtime| runtime.store.clone()),
     };
     let bind = state.config.addr.clone();
     let listener = std::net::TcpListener::bind(bind.as_str())?;
@@ -165,6 +208,7 @@ pub async fn start_with_snapshot_requesters(
             .service(health)
             .service(ready)
             .service(metrics)
+            .service(klines)
             .service(ws_bare)
             .service(ws_single)
             .service(ws_combined)
@@ -185,6 +229,7 @@ pub async fn start_with_snapshot_requesters(
         stop: stop_tx,
         feeds,
         server_task,
+        history,
     })
 }
 
@@ -306,6 +351,136 @@ async fn metrics(state: Data<AppState>) -> HttpResponse {
     }
     body["symbols"] = Value::Object(symbols);
     HttpResponse::Ok().json(body)
+}
+
+#[derive(Debug, Deserialize)]
+struct KlinesQuery {
+    symbol: String,
+    interval: String,
+    #[serde(rename = "startTime")]
+    start_time: Option<u64>,
+    #[serde(rename = "endTime")]
+    end_time: Option<u64>,
+    limit: Option<usize>,
+    #[serde(rename = "timeZone")]
+    time_zone: Option<String>,
+}
+
+/// Binance-compatible `GET /klines`, served from TDengine rather than from a
+/// process-local ring. A reader that joins mid-day therefore sees the morning.
+#[get("/klines")]
+async fn klines(state: Data<AppState>, params: web::Query<KlinesQuery>) -> HttpResponse {
+    let Some(store) = state.history.as_ref() else {
+        return HttpResponse::NotFound().json(json!({"error": "historical store disabled"}));
+    };
+    let Some(spec) = state.config.symbol(&params.symbol) else {
+        return HttpResponse::BadRequest().json(json!({"error": -1121, "msg": "invalid symbol"}));
+    };
+    let Some(interval_ms) = protocol::parse_kline_interval(&params.interval) else {
+        return HttpResponse::BadRequest().json(json!({"error": -1120, "msg": "invalid interval"}));
+    };
+    // Week/month anchors are phase P5; answering them from a fixed-width grid
+    // would silently produce wrong windows.
+    if interval_ms >= 604_800_000 {
+        return HttpResponse::BadRequest().json(json!({
+            "error": -1120,
+            "msg": "1w/1M are not implemented by the historical store yet"
+        }));
+    }
+    if params
+        .time_zone
+        .as_deref()
+        .is_some_and(|tz| tz != "0" && tz != "UTC" && tz != "00:00")
+    {
+        return HttpResponse::BadRequest().json(json!({
+            "error": -1124,
+            "msg": "timeZone anchoring is not implemented by the historical store yet"
+        }));
+    }
+    let limit = params.limit.unwrap_or(500).clamp(1, 1_000);
+    let source_interval = if interval_ms == 1_000 { 1_000 } else { 60_000 };
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let sealed_through_ms = now_ms.saturating_sub(state.config.history.seal_lag_ms);
+    let align = |value: u64| value / interval_ms * interval_ms;
+
+    let (start_ms, end_ms) = match (params.start_time, params.end_time) {
+        (Some(start), Some(end)) => (align(start), end.max(align(start))),
+        (Some(start), None) => (
+            align(start),
+            align(start).saturating_add(interval_ms * (limit as u64 - 1)),
+        ),
+        (None, Some(end)) => {
+            let end = align(end);
+            (end.saturating_sub(interval_ms * (limit as u64 - 1)), end)
+        }
+        (None, None) => match store.last_ts(source_interval, &spec.symbol).await {
+            Ok(Some(last_us)) => {
+                let end = align(last_us / 1_000);
+                (end.saturating_sub(interval_ms * (limit as u64 - 1)), end)
+            }
+            Ok(None) => (0, 0),
+            Err(error) => {
+                tracing::error!(%error, "historical last-timestamp query failed");
+                return HttpResponse::ServiceUnavailable()
+                    .json(json!({"error": "store unavailable"}));
+            }
+        },
+    };
+
+    if start_ms == 0 && end_ms == 0 {
+        return HttpResponse::Ok()
+            .insert_header(("X-Bar-Schema", "1"))
+            .insert_header(("X-Bar-Sealed-Through", sealed_through_ms.to_string()))
+            .json(Vec::<Value>::new());
+    }
+    let rows = {
+        let from_us = start_ms.saturating_mul(1_000);
+        let to_us = end_ms.saturating_add(interval_ms).saturating_mul(1_000);
+        let result = if interval_ms == 1_000 || interval_ms == 60_000 {
+            store.bars(interval_ms, &spec.symbol, from_us, to_us).await
+        } else {
+            store
+                .rollup(interval_ms, &spec.symbol, from_us, to_us)
+                .await
+        };
+        match result {
+            Ok(rows) => rows,
+            Err(error) => {
+                tracing::error!(%error, interval_ms, "historical kline query failed");
+                return HttpResponse::ServiceUnavailable()
+                    .json(json!({"error": "store unavailable"}));
+            }
+        }
+    };
+    let initial_close = match store
+        .previous_close(
+            source_interval,
+            &spec.symbol,
+            start_ms.saturating_mul(1_000),
+        )
+        .await
+    {
+        Ok(close) => close,
+        Err(error) => {
+            tracing::warn!(%error, "historical previous-close lookup failed");
+            None
+        }
+    };
+    let window = KlineWindow {
+        start_ms,
+        end_ms,
+        limit,
+        sealed_through_ms,
+        initial_close,
+    };
+    let bars = query::klines(rows, interval_ms, &window);
+    HttpResponse::Ok()
+        .insert_header(("X-Bar-Schema", "1"))
+        .insert_header(("X-Bar-Sealed-Through", sealed_through_ms.to_string()))
+        .json(bars)
 }
 
 #[get("/ws")]

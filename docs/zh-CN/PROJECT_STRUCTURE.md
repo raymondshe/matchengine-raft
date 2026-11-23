@@ -1,6 +1,6 @@
 # 项目结构
 
-仓库由四个同级的 Rust 项目组成。每个项目都有自己的 `Cargo.toml`、锁文件和 README；跨项目的文档、脚本和 Dockerfile 保留在仓库根目录。
+仓库由五个同级项目组成：其中四个是 Rust crate，各自带 `Cargo.toml`、锁文件和 README；`trading_terminal/` 是独立的 React/TS 前端，使用自己的 Vite 构建，不依赖 Rust。跨项目的文档、脚本和 Dockerfile 保留在仓库根目录。
 
 ```text
 .
@@ -21,9 +21,12 @@
 │   ├── static/
 │   ├── deploy/                   # CRD、RBAC 和 operator manifest
 │   └── examples/                 # 示例 shard 目录
-├── market_data_system/           # Aeron/JSONL 消费端与 WebSocket 行情服务
+├── market_data_system/           # Aeron/NATS/JSONL 消费端、WebSocket 行情与 TDengine 历史 K 线
 │   ├── Cargo.toml
-│   ├── src/
+│   ├── src/history/              # TDengine REST 客户端、K 线 builder、查询和写入任务
+│   ├── src/config.rs             # --history 与 --tdengine-* 参数
+│   ├── tests/history.rs          # 由 TDENGINE_URL 控制的端到端测试
+│   ├── docker/k8s-history.Dockerfile
 │   ├── tests/
 │   ├── benches/
 │   └── web/
@@ -31,6 +34,10 @@
 │   ├── Cargo.toml
 │   ├── src/
 │   └── web/
+├── trading_terminal/             # React/TS 现货交易终端（无 Rust，独立 Vite 构建）
+│   ├── src/
+│   ├── nginx/                    # 同源 /md 与 /demo/api 代理
+│   └── Dockerfile
 ├── docs/                         # 跨项目设计、API、runbook 和性能文档
 ├── scripts/                      # 集群、实验环境和 demo 编排
 ├── .github/workflows/            # CI、fuzz 和 benchmark workflow

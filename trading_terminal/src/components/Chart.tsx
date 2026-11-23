@@ -24,7 +24,7 @@ export function Chart() {
   const chartRef = useRef<IChartApi | null>(null);
   const candlesRef = useRef<ISeriesApi<"Candlestick"> | null>(null);
   const volumeRef = useRef<ISeriesApi<"Histogram"> | null>(null);
-  const { interval, subscribeBars } = useMarketFeed();
+  const { interval, subscribeBars, historyCount, historyError } = useMarketFeed();
   const [hasBars, setHasBars] = useState(false);
 
   // ---- create the chart once ----
@@ -144,16 +144,23 @@ export function Chart() {
   return (
     <div className="panel chart-panel">
       <div className="panel-head">
-        <h2>Chart</h2>
+        <h2>
+          Chart
+          {historyCount > 0 ? (
+            <span className="small muted"> · history {historyCount}</span>
+          ) : historyError ? (
+            <span className="small muted"> · {historyError}</span>
+          ) : null}
+        </h2>
         <IntervalToggle />
       </div>
       <div className="chart-wrap">
         <div ref={containerRef} className="chart-container" />
         {hasBars ? null : (
           <div className="chart-empty">
-            <span className="muted">Waiting for the first trade…</span>
+            <span className="muted">Waiting for candles…</span>
             <span className="small muted">
-              Candles are built from the trade tape; a fill paints the first one.
+              History loads from TDengine; live fills update the open bar.
             </span>
           </div>
         )}

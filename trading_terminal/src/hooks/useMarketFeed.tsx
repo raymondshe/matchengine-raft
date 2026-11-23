@@ -59,6 +59,9 @@ interface MarketFeedState {
   statusFrame: StatusFrame | null;
   subscribeBars: (interval: BarInterval, handler: (bars: Bar[]) => void) => () => void;
   ready: MdReady | null;
+  /** Bars seeded from TDengine by `GET /md/klines` for the active pair/interval. */
+  historyCount: number;
+  historyError: string | null;
 }
 
 const MarketFeedContext = createContext<MarketFeedState | null>(null);
@@ -76,6 +79,8 @@ export function MarketFeedProvider({ children }: { children: ReactNode }) {
   const [connDetail, setConnDetail] = useState<string>("");
   const [frameCount, setFrameCount] = useState(0);
   const [ready, setReady] = useState<MdReady | null>(null);
+  const [historyCount, setHistoryCount] = useState(0);
+  const [historyError, setHistoryError] = useState<string | null>(null);
 
   const bookRef = useRef(new DepthBook());
   const bboRef = useRef<Bbo>({ bid: null, bidSize: null, ask: null, askSize: null });
@@ -270,7 +275,59 @@ export function MarketFeedProvider({ children }: { children: ReactNode }) {
     setFrameCount(0);
     setTrades([]);
     setStatusFrame(null);
+    setHistoryCount(0);
+    setHistoryError(null);
   }, [symbol]);
+
+  // ---- seed the chart from TDengine before/around live frames ----
+  // The market-data service reads the shared historical store behind the same
+  // origin proxy, so a cold page load paints real candles without waiting for
+  // the next trade. Live frames and the trade tape then overwrite the open bar.
+  useEffect(() => {
+    if (!symbol) return;
+    const controller = new AbortController();
+    (async () => {
+      try {
+        const response = await fetch(
+          `/md/klines?symbol=${encodeURIComponent(symbol)}&interval=${encodeURIComponent(interval_)}&limit=500`,
+          { signal: controller.signal },
+        );
+        if (!response.ok) {
+          if (!controller.signal.aborted) setHistoryError(`history ${response.status}`);
+          return;
+        }
+        const rows = (await response.json()) as unknown;
+        if (controller.signal.aborted || !Array.isArray(rows)) return;
+        const bars: Bar[] = [];
+        for (const row of rows) {
+          if (!Array.isArray(row) || row.length < 12) continue;
+          const openMs = Number(row[0]);
+          const values = [row[1], row[2], row[3], row[4], row[5]].map(Number);
+          if (!Number.isFinite(openMs) || openMs <= 0 || !values.every(Number.isFinite)) continue;
+          bars.push({
+            time: Math.floor(openMs / 1_000),
+            open: values[0],
+            high: values[1],
+            low: values[2],
+            close: values[3],
+            volume: values[4],
+            closed: String(row[11]) === "1",
+          });
+        }
+        barsRef.current.applyHistoryBars(interval_, bars);
+        setHistoryCount(bars.length);
+        setHistoryError(null);
+        for (const entry of barHandlers.current) {
+          entry.handler(barsRef.current.series(entry.interval));
+        }
+      } catch (error) {
+        if (!controller.signal.aborted) {
+          setHistoryError(error instanceof Error ? error.message : "history unavailable");
+        }
+      }
+    })();
+    return () => controller.abort();
+  }, [symbol, interval_]);
 
   // ---- (re)subscribe when symbol, interval or the stream catalogue changes ----
   useEffect(() => {
@@ -328,10 +385,13 @@ export function MarketFeedProvider({ children }: { children: ReactNode }) {
       statusFrame,
       subscribeBars,
       ready,
+      historyCount,
+      historyError,
     }),
     [
       info, symbol, setSymbol, interval_, setInterval_, status, connDetail,
       frameCount, bbo, book, bookNote, trades, statusFrame, subscribeBars, ready,
+      historyCount, historyError,
     ],
   );
 

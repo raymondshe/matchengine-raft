@@ -1743,6 +1743,7 @@ mod tests {
             name: "fx-marketdata".to_string(),
             namespace: "match-eu-1".to_string(),
             spec: MarketDataServiceSpec {
+                history: None,
                 cell: "eu-1".to_string(),
                 symbols: Vec::new(),
                 feed_groups: vec![MarketDataFeedGroup {
@@ -1773,6 +1774,7 @@ mod tests {
             name: "global-marketdata".to_string(),
             namespace: "match-eu-1".to_string(),
             spec: MarketDataServiceSpec {
+                history: None,
                 cell: "eu-1".to_string(),
                 symbols: Vec::new(),
                 feed_groups: vec![MarketDataFeedGroup {
@@ -1799,6 +1801,7 @@ mod tests {
             name: "paused-marketdata".to_string(),
             namespace: "match-eu-1".to_string(),
             spec: MarketDataServiceSpec {
+                history: None,
                 cell: "eu-1".to_string(),
                 paused: true,
                 websocket: crate::model::MarketDataWebSocket {
@@ -1813,6 +1816,7 @@ mod tests {
             name: "simple-marketdata".to_string(),
             namespace: "match-eu-1".to_string(),
             spec: MarketDataServiceSpec {
+                history: None,
                 symbols: vec!["gbpusd".to_string()],
                 feed_groups: Vec::new(),
                 websocket: crate::model::MarketDataWebSocket {

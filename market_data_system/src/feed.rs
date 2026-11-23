@@ -17,6 +17,7 @@ use bytes::Bytes;
 use futures_util::StreamExt;
 use serde_json::json;
 use tokio::sync::broadcast;
+use tokio::sync::mpsc;
 use tokio::sync::watch;
 use tokio::time::Duration;
 use tokio::time::MissedTickBehavior;
@@ -30,6 +31,8 @@ use matchengine_raft::order_book::Fixed;
 use matchengine_raft::order_book::OrderSide;
 
 use crate::config::SymbolSpec;
+use crate::history::HistoryEvent;
+use crate::history::HistoryTrade;
 use crate::protocol;
 use crate::protocol::Speed;
 use crate::source::BoxedSource;
@@ -338,6 +341,8 @@ pub struct Feed {
     stats: Arc<Stats>,
     /// Last seen `(market_seq, sub_seq)` per stream id, for replay dedupe.
     seen: HashMap<u16, (u64, u16)>,
+    /// Typed tap into the historical writer, enabled by `--history`.
+    history_tx: Option<mpsc::Sender<HistoryEvent>>,
     fast: DepthWindow,
     slow: DepthWindow,
 }
@@ -368,9 +373,16 @@ impl Feed {
             registry,
             stats,
             seen: HashMap::new(),
+            history_tx: None,
             fast: DepthWindow::default(),
             slow: DepthWindow::default(),
         }
+    }
+
+    /// Attaches the optional historical writer tap.
+    pub fn with_history(mut self, tx: Option<mpsc::Sender<HistoryEvent>>) -> Self {
+        self.history_tx = tx;
+        self
     }
 
     /// Asks the engine for a fresh snapshot when the optional transport
@@ -473,6 +485,24 @@ impl Feed {
                 for fill in fills {
                     let payload = protocol::trade_payload(&self.symbol, fill);
                     self.publish("trade", payload);
+                    if let Some(tx) = &self.history_tx {
+                        let event = HistoryEvent::Trade(HistoryTrade {
+                            symbol: self.symbol.symbol.clone(),
+                            symbol_id: u64::from(self.symbol.symbol_id),
+                            ts_ms: fill.ts_ms,
+                            price: fill.price,
+                            volume: fill.volume,
+                            quote_volume: fill.quote_volume,
+                            taker_buy: fill.taker_side == OrderSide::Buy,
+                            log_index: fill.log_index,
+                            ordinal: fill.ordinal,
+                            market_seq: message.market_seq,
+                        });
+                        // Never back-pressure the match/feed path: the tap is
+                        // best-effort and a gap is surfaced by the DB-backed
+                        // query rather than by blocking the tape.
+                        let _ = tx.try_send(event);
+                    }
                 }
                 if self.extensions {
                     let payload = protocol::sweep_payload(&self.symbol, &message);
@@ -488,6 +518,11 @@ impl Feed {
                 }
             }
             MessageBody::Bar(bar) => {
+                // With history enabled the kline path is derived from trades by
+                // the writer task; engine bars stay as a diagnostic frame only.
+                if self.history_tx.is_some() {
+                    return;
+                }
                 let closed = message.flags & flags::BAR_CLOSE != 0;
                 let quote = {
                     let mut state = self.shared.lock().expect("state lock");

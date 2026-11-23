@@ -1,7 +1,8 @@
 # Project Structure
 
-The repository is a set of four sibling Rust projects. Each has its own `Cargo.toml`, lockfile and
-README; repository-wide docs, scripts and Dockerfiles stay at the root.
+The repository is a set of five sibling projects. Four are Rust crates, each with its own
+`Cargo.toml`, lockfile and README; `trading_terminal/` is a standalone React/TS frontend with its
+own Vite build and no Rust dependency. Repository-wide docs, scripts and Dockerfiles stay at the root.
 
 ```text
 .
@@ -22,9 +23,12 @@ README; repository-wide docs, scripts and Dockerfiles stay at the root.
 │   ├── static/
 │   ├── deploy/                   # CRDs, RBAC and operator manifests
 │   └── examples/                 # example shard catalogs
-├── market_data_system/           # Aeron/JSONL consumer and WebSocket market-data service
+├── market_data_system/           # Aeron/NATS/JSONL consumer, WebSocket service and TDengine bars
 │   ├── Cargo.toml
-│   ├── src/
+│   ├── src/history/              # TDengine REST client, bar builder, query and writer task
+│   ├── src/config.rs             # --history and --tdengine-* flags
+│   ├── tests/history.rs          # end-to-end test gated on TDENGINE_URL
+│   ├── docker/k8s-history.Dockerfile
 │   ├── tests/
 │   ├── benches/
 │   └── web/
@@ -32,6 +36,10 @@ README; repository-wide docs, scripts and Dockerfiles stay at the root.
 │   ├── Cargo.toml
 │   ├── src/
 │   └── web/
+├── trading_terminal/             # React/TS spot terminal (no Rust, own Vite build)
+│   ├── src/
+│   ├── nginx/                    # same-origin /md and /demo/api proxies
+│   └── Dockerfile
 ├── docs/                         # cross-project design, API, runbook and performance notes
 ├── scripts/                      # cluster, lab and demo orchestration
 ├── .github/workflows/            # CI, fuzz and benchmark workflows

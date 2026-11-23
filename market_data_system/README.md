@@ -469,6 +469,53 @@ engine emits depth deltas only for entries that change visible depth, the
 service widens a window's `U` to `previous u + 1`, so the range is contiguous
 even when entries in between did not touch the book.
 
+## 📊 Historical bars (TDengine, phase P0)
+
+`--history` enables the TDengine-backed tier described in
+[`docs/HISTORICAL_BARS.md`](../docs/HISTORICAL_BARS.md). The writer is one process
+that consumes the same typed trade tap as the live feed and stores sparse traded
+`1s` rows plus a `1m` rollup in `bars_1s`/`bars_1m` (`DECIMAL(38,18)`,
+`PRECISION 'us'`). Every value is written as canonical 18-decimal text and read
+back with `CAST(... AS VARCHAR)`; no `f64` or 96-bit client decimal is involved.
+With history on, the service derives klines from trades instead of the engine's
+partial `Bar` frames, seeds the WebSocket subscribe replay from the stored rows
+and publishes the same unchanged `kline` payloads.
+
+`GET /klines?symbol=eurusd&interval=1s&startTime=...&limit=500` returns
+Binance-shaped dense arrays straight from TDengine; empty windows carry the
+previous close forward. `1s`/`1m` are read from their tables, `3m`…`3d` are
+read-time `INTERVAL` rollups of `1m`. `1w`/`1M` and non-UTC `timeZone` are
+phase P5 and return `400` rather than a wrong window. Responses carry
+`X-Bar-Schema: 1` and `X-Bar-Sealed-Through`.
+
+```bash
+cargo run -- --addr 127.0.0.1:24700 \
+  --symbol eurusd:0:EUR:USD --market-data-log /tmp/eurusd.jsonl \
+  --history --tdengine-url http://127.0.0.1:6041 --tdengine-database market_bars
+```
+
+`TDENGINE_URL` must point at `taosAdapter` (6041), not the native 6030 port.
+`tests/history.rs` runs end to end when `TDENGINE_URL` is set and otherwise
+skips; it creates and drops its own database.
+
+The OrbStack lab runs a single dnode from
+`k8s_control_plane/deploy/tdengine.yaml` (localhost FQDN, disposable `emptyDir`).
+`taosadapter` 3.3.6 binds an IPv6-only `:::6041` listener that this IPv4
+ClusterIP cannot reach, so the manifest moves the adapter to 6042 and adds a
+tiny Node sidecar that owns IPv4 `0.0.0.0:6041` and forwards to
+`127.0.0.1:6042`; the Service and the market-data NetworkPolicy stay on 6041.
+The global market-data service is built from `docker/k8s-history.Dockerfile`
+(`matchengine-marketdata:history-arm64-v2`) and receives `--history` plus the
+DSN from `MarketDataService.spec.history`; the terminal image
+(`matchengine-trading-terminal:arm64-v3`) seeds its chart through the same-origin
+`/md/klines` proxy. That is a lab profile, not the three-dnode `REPLICA 3`
+production topology in §4.7.2 of the design.
+
+The terminal view backed by this store (500 seeded `1m` bars, `HISTORY 500` in
+the chart header):
+
+![Trading terminal chart seeded from TDengine](../docs/trading-terminal-history.png)
+
 ## ⚙️ Configuration
 
 | Flag | Default | Meaning |
@@ -498,6 +545,16 @@ even when entries in between did not touch the book.
 | `--snapshot-levels` | `200` | subscribe-time depth levels |
 | `--extensions` | off | expose the engine extension streams (`@sweep`, `@status`, `@lifecycle`); off keeps the public catalogue Binance-only |
 | `--no-lifecycle` | off | hide the extension `@lifecycle` stream even with `--extensions` |
+| `--history` | off | enable the TDengine bar writer and `GET /klines` |
+| `--tdengine-url` | `http://127.0.0.1:6041` | `taosAdapter` endpoint (`TDENGINE_URL`) |
+| `--tdengine-user` / `--tdengine-password` | `root` / `taosdata` | credentials (`TDENGINE_USER` / `TDENGINE_PASSWORD`) |
+| `--tdengine-database` | `market_bars` | database (`TDENGINE_DATABASE`) |
+| `--tdengine-auto-create` | `true` | create database/stables on start; `false` verifies an operator-managed schema |
+| `--tdengine-vgroups` / `--tdengine-replica` | `1` / `1` | database layout; use `3` replicas in production |
+| `--tdengine-keep-days` | `3650` | `KEEP` for the bar database |
+| `--tdengine-batch-rows` | `2000` | rows per subtable upsert statement |
+| `--history-seal-lag-ms` | `2000` | event-time lag before a closed window is sealed |
+| `--history-snapshot-bars` | `500` | WS subscribe-time bar replay depth |
 
 Engine-side Aeron flags (feature `market-data-aeron`):
 

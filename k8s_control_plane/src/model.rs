@@ -988,6 +988,29 @@ pub struct MarketDataServiceSpec {
     pub resources: Option<Resources>,
     #[serde(default)]
     pub paused: bool,
+    /// Optional TDengine historical bar tier, rendered into the service args.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history: Option<MarketDataHistory>,
+}
+
+/// Historical bar writer/query configuration shared by market-data replicas.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MarketDataHistory {
+    /// `taosAdapter` endpoint, e.g. `http://tdengine.match-eu-1.svc.cluster.local:6041`.
+    pub url: String,
+    #[serde(default = "default_history_database")]
+    pub database: String,
+    #[serde(default = "default_history_seal_lag_ms")]
+    pub seal_lag_ms: u64,
+}
+
+fn default_history_database() -> String {
+    "market_bars".to_string()
+}
+
+fn default_history_seal_lag_ms() -> u64 {
+    2_000
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -8,6 +8,52 @@ use serde::Serialize;
 pub const DEFAULT_BAR_INTERVALS_MS: &[u64] = &[1_000, 60_000];
 /// Default depth levels returned by a subscribe-time snapshot.
 pub const DEFAULT_SNAPSHOT_LEVELS: usize = 200;
+/// Default number of historical bars in a WebSocket subscribe-time replay.
+pub const DEFAULT_HISTORY_SNAPSHOT_BARS: usize = 500;
+
+/// Configuration for the optional TDengine-backed historical bar tier.
+///
+/// Disabled by default: the existing in-memory feed and replay behaviour is
+/// unchanged unless `--history` is set. All bar values are stored as exact
+/// `DECIMAL(38,18)` text and read back through `CAST(... AS VARCHAR)`.
+#[derive(Clone, Debug)]
+pub struct HistoryConfig {
+    pub enabled: bool,
+    /// `taosAdapter` endpoint, e.g. `http://127.0.0.1:6041`.
+    pub url: String,
+    pub user: String,
+    pub password: String,
+    pub database: String,
+    /// Create the database/stables on startup; disable for operator-managed schemas.
+    pub auto_create: bool,
+    pub vgroups: u32,
+    pub replica: u32,
+    pub keep_days: u32,
+    pub batch_rows: usize,
+    /// Event-time lag after which a closed window is sealed.
+    pub seal_lag_ms: u64,
+    /// Bars per interval in a WS subscribe-time replay.
+    pub snapshot_bars: usize,
+}
+
+impl Default for HistoryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            url: "http://127.0.0.1:6041".to_string(),
+            user: "root".to_string(),
+            password: "taosdata".to_string(),
+            database: "market_bars".to_string(),
+            auto_create: true,
+            vgroups: 1,
+            replica: 1,
+            keep_days: 3650,
+            batch_rows: 2_000,
+            seal_lag_ms: 2_000,
+            snapshot_bars: DEFAULT_HISTORY_SNAPSHOT_BARS,
+        }
+    }
+}
 
 /// One instrument served by this instance.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -123,6 +169,8 @@ pub struct Config {
     pub snapshot_levels: usize,
     /// Broadcast channel capacity per stream key.
     pub broadcast_capacity: usize,
+    /// Optional TDengine historical bar tier.
+    pub history: HistoryConfig,
 }
 
 impl Config {
@@ -150,6 +198,7 @@ impl Config {
             heartbeat_timeout: Duration::from_secs(30),
             snapshot_levels: DEFAULT_SNAPSHOT_LEVELS,
             broadcast_capacity: 1_024,
+            history: HistoryConfig::default(),
         }
     }
 

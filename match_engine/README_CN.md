@@ -1,7 +1,7 @@
 # ⚡ match_engine
 
 [Matchengine Raft](../README_CN.md) 项目的 Rust 引擎 crate，负责复制订单簿、WAL/快照、gRPC Raft
-传输、事件日志和行情 feed。四项目总览、演示、Kubernetes 控制平面、安全边界和性能总表见
+传输、事件日志和行情 feed。五项目总览、演示、Kubernetes 控制平面、安全边界和性能总表见
 [根 README](../README_CN.md)。
 
 ## 🚀 构建与运行

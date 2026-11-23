@@ -34,25 +34,29 @@
 - 🧭 **Raft 原生** — OpenRaft 0.10 + gRPC，支持 Pre-Vote、领导权转移、学习者追赶和分块快照安装。
 - 🔢 **18 位定点数** — 撮合路径不使用 `f64`；价格、数量和费用在 API、事件、快照和 feed 中全程精确。
 - 📡 **实时行情** — 确定性 feed 通过 Aeron 发布（每个流一个独占 publication），再由 Binance 风格 WebSocket 服务分发，支持 100/1000 ms 深度合并和水平扩展。
+- 📈 **精确小数的历史 K 线** — TDengine 存储稀疏 `1s` 成交 K 线和物化 `1m` 汇总，更粗周期在读取时用 `INTERVAL` 汇总；单 writer、无状态查询端，通过 Binance 兼容的 `/klines` 供交易终端冷启动使用。
+- 🖥️ **交易终端** — 纯 React/TS 的 Binance 风格现货终端，复用现有行情 WebSocket 和下单 BFF，不含 Rust，也不会直接调用引擎 `/write`。
 - 🧰 **可运维** — 内置控制台、`/health` + `/ready`、指标、重放工具和独立下单演示。
 - ☸️ **Kubernetes 集群管理** — 参考管理器和 supervisor 可管理数千个单 symbol 引擎，支持零影响 symbol 生命周期、重启保护和带存储决策的 shard 删除。
 
-## 🧩 四个项目，一套系统
+## 🧩 五个项目，一套系统
 
 | 项目 | 说明 | 入口 |
 |---|---|---|
 | 🦀 **match_engine** | Raft 复制、确定性撮合：订单簿、WAL/快照、gRPC Raft、事件日志、行情 feed 和运维控制台 | [`match_engine/README_CN.md`](./match_engine/README_CN.md) |
 | ☸️ **k8s_control_plane** | 面向单 symbol 引擎集群的 CRD 管理器、Lease 选举 operator、渲染器和 GUI | [`k8s_control_plane/README.md`](./k8s_control_plane/README.md) |
-| 📡 **market_data_system** | 独立的 Aeron/JSONL 消费端，提供 Binance 风格 WebSocket 行情 | [`market_data_system/README.md`](./market_data_system/README.md) |
+| 📡 **market_data_system** | 独立的 Aeron/NATS/JSONL 消费端，提供 Binance 风格 WebSocket 行情和 TDengine 历史 K 线 | [`market_data_system/README.md`](./market_data_system/README.md) |
 | 🧾 **order_system** | 独立下单 WebUI，以及演示用冻结/结算估算 | [`order_system/README.md`](./order_system/README.md) |
+| 🖥️ **trading_terminal** | 纯 React/TS 的 Binance 风格现货终端：订单簿、成交、K 线和下单票据，经 nginx 部署 | [`trading_terminal/README.md`](./trading_terminal/README.md) |
 
 ```text
 .
 ├── match_engine/          # 引擎 crate、bench、示例、测试、fuzz、控制台资源和 Dockerfile
 ├── k8s_control_plane/     # 管理 API/GUI、operator 和 CRD
-├── market_data_system/    # WebSocket 行情服务
+├── market_data_system/    # WebSocket 行情服务 + 历史 K 线写入/查询
 ├── order_system/          # 演示下单系统
-├── docs/                  # 跨项目设计、API、runbook 和性能文档
+├── trading_terminal/      # React/TS 交易终端 + nginx 代理（无 Rust，独立构建）
+├── docs/                  # 跨项目设计、API、runbook、架构图和性能文档
 ├── scripts/               # 集群、实验环境和 demo 编排
 └── .github/workflows/     # CI、fuzz 和 benchmark workflow
 ```
@@ -169,6 +173,45 @@ Kubernetes/AWS EKS 生产路径默认采用 **Profile A（引擎直接 Aeron 组
 直接 NATS 和每引擎 Pod 的 Aeron bridge 是回退方案，见
 [`docs/AERON_K8S_MESSAGE_BUS.md`](./docs/AERON_K8S_MESSAGE_BUS.md)。
 
+## 🗄️ 基于 TDengine 的历史 K 线
+
+`market_data_system --history` 在现有服务内增加持久化 K 线层——不新建 crate，也不新增对外端口。
+单个 writer 把确定性的成交 tap 折叠成稀疏的 `1s` 成交 K 线和物化的 `1m` 汇总，以规范的 18 位小数
+文本 upsert 到 TDengine；`3m`…`3d` 在读取时由 `1m` 通过 `INTERVAL` 汇总。读取时把 DECIMAL 列
+`CAST` 为 `VARCHAR`，再用严格的 scale-18 解析器处理，因此 `f64` 或 96 位客户端小数都不可能悄悄
+舍入数值。writer 行携带引擎 `market_seq` 和自身成交游标，替换实例可从最新行恢复，无需热备；查询端
+完全无状态，直接读 TDengine。`GET /klines` 为 Binance 兼容的稠密数组，同一批行也用于 WebSocket
+订阅回放。
+
+**阶段 P0**（schema、成交驱动 writer、`/klines`、WS 回放）已实现并在 OrbStack 实验环境接通。
+成交 spool、Lease 故障切换、修订/缺口表、`/bars`、导入器、时区锚定和三节点生产拓扑仍属于设计范围。
+
+[![历史 K 线：TDengine 作为系统记录层](./docs/historical-bars-tdengine.png)](./docs/historical-bars-tdengine.html)
+
+[打开交互式 Archify 图](./docs/historical-bars-tdengine.html) ·
+[完整设计与实测数据](./docs/HISTORICAL_BARS.md) ·
+[服务配置](./market_data_system/README.md)
+
+上图是已检入的 Archify HTML 导出文件的静态截图；HTML 支持 route/lens 视图以及图片/SVG/WebM 导出。
+
+## 🖥️ 交易终端
+
+[`trading_terminal/`](./trading_terminal/) 是 Binance 风格现货交易界面，也是**纯前端项目**：React +
+TypeScript 独立 Vite 构建，不依赖 Rust crate，也不嵌入任何 Rust 二进制。nginx 仅作部署管道：静态托管
+SPA，并把同源 `/md/*` 代理到全局行情服务、`/demo/api/*` 代理到下单 BFF，因此 BFF 的同源
+`Origin` 校验无需 CORS 改动即可通过。下单走 BFF 的 `X-Demo-Action: submit`，浏览器从不直接调用
+引擎 `/write`。
+
+订单簿以价差为中心上下锚定：卖盘底部对齐贴价差上方，买盘顶部对齐贴价差下方。图表在每次 symbol/interval
+切换时从 TDengine 支持的 `/md/klines` 拉取最多 500 根 K 线来初始化，再叠加实时成交与 `kline` 帧，
+且不会重新打开已闭合的历史 K 线；标题栏显示种子数量（`HISTORY 500`）。
+
+![由 TDengine 历史 K 线初始化的交易终端](./docs/trading-terminal-history.png)
+
+截图来自 OrbStack 实验环境 <http://terminal.match-eu-1.example/>（演示种子数据，非交易所历史）。
+部署说明见 [`trading_terminal/README.md`](./trading_terminal/README.md) 和
+[`k8s_control_plane/deploy/terminal.yaml`](./k8s_control_plane/deploy/terminal.yaml)。
+
 ## ☸️ Kubernetes 控制平面
 
 引擎一个进程只交易一个 symbol，因此多 symbol 部署是多个独立 Raft 集群。
@@ -181,7 +224,7 @@ containers 模式需要显式允许重启。
 
 同一个控制平面支持单个 symbol 的优雅停启，保留 slot、端口和 PVC，并在不重新 `/init` 的情况下恢复
 WAL/snapshot；空闲 shard 可删除，并显式选择保留 PVC 或不可逆删除。期望状态可以使用 JSON demo store
-或 CRD 后端；后者通过 Kubernetes API server 写入六个 `matching.io` CRD（含 `MarketDataService`）（底层 etcd），并从 informer
+或 CRD 后端；后者通过 Kubernetes API server 写入七个 `matching.io` CRD（含 `MarketDataService`）（底层 etcd），并从 informer
 重建缓存。Lease 选举的 operator 监听 CRD、apply/prune 渲染出的工作负载、给 dedicated leader Pod 打标签、
 写入 shard/deployment/route 状态、bootstrap/config 每个 Raft 组、在 quorum 门禁下逐 Pod 滚动、执行 PVC
 保留窗口，并用不重叠的 Raft ID 范围完成跨 shard cutover/rollback。
@@ -246,6 +289,8 @@ payload/purge、async WAL 或 thin LTO，它们都没有超过默认配置。详
 - [测试](./docs/zh-CN/TESTING.md) — 集群测试、回放矩阵和故障测试。
 - [性能](./docs/PERFORMANCE.md) — 实测基线和测量方法。
 - [Kubernetes 行情消息总线](./docs/AERON_K8S_MESSAGE_BUS.md) — 行情消息总线、multicast 限制和扩展方案。
+- [交易终端](./trading_terminal/README.md) — React/TS 客户端、部署代理和由 TDengine 种子的图表。
+- [历史 K 线](./docs/HISTORICAL_BARS.md) — TDengine schema、精确小数契约、HA 契约和实测数据；[可交互 Archify 导出](./docs/historical-bars-tdengine.html)与 PNG 预览已一并检入。
 - [Runbook](./docs/zh-CN/RUNBOOK.md) — 集群、升级、迁移和恢复流程。
 - [第三方调研](./docs/THIRD_PARTY_INVESTIGATION.md) — 外部引擎 review。
 - [TODO](./TODO.md) — 当前优先级和路线图。

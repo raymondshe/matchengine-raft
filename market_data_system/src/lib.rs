@@ -11,6 +11,7 @@ pub mod aeron_source;
 pub mod archive;
 pub mod config;
 pub mod feed;
+pub mod history;
 pub mod nats_source;
 pub mod protocol;
 pub mod server;
