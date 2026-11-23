@@ -107,11 +107,21 @@ kubectl -n match-eu-1 rollout status deploy/nats
 
 kubectl apply -f k8s_control_plane/deploy/tdengine.yaml
 kubectl -n match-eu-1 rollout status deploy/tdengine
+
+# 工作站通过 OrbStack ingress/front door 访问 REST API，无需 port-forward
+kubectl apply -f k8s_control_plane/deploy/tdengine-ingress.yaml
+curl -s -u root:taosdata -X POST http://tdengine.match-eu-1.example/rest/sql \
+  -d 'SELECT SERVER_VERSION()'
 ```
 
 TDengine manifest 是单 dnode 实验配置：`emptyDir` 存储、`taosadapter` 监听 6042，一个 Node
 sidecar 持有 IPv4 `0.0.0.0:6041`（Service/NetworkPolicy 端口）。它不是三节点 `REPLICA 3`
 生产拓扑，后者见 [HISTORICAL_BARS.md](./HISTORICAL_BARS.md)。
+
+`tdengine-ingress.yaml` 只把 HTTP REST（6041）以 `tdengine.match-eu-1.example` 暴露出去，复用第 5 步
+安装的 class-less ingress-nginx 和 80 端口 front door，工作站工具不再需要 `kubectl port-forward`。
+注意这是**明文 HTTP + 默认凭据**，仅限实验环境。原生 6030 协议是 TCP，Ingress 无法承载；集群内
+客户端仍使用 ClusterIP。
 
 ### 7. 带历史能力的全局行情服务
 
@@ -190,12 +200,15 @@ kubectl -n match-eu-1 get pods -o wide
 
 ### 10. 可选：为空图表写入演示 K 线
 
-端口转发存储后运行种子脚本。**该操作会删除并重建 `market_bars`。**
+通过第 6 步的 ingress 运行种子脚本。**该操作会删除并重建 `market_bars`。**
 
 ```sh
-kubectl -n match-eu-1 port-forward svc/tdengine 16042:6041 >/tmp/tdengine-pf.log 2>&1 &
-TDENGINE_URL=http://127.0.0.1:16042 ./scripts/seed-history-lab.py
+TDENGINE_URL=http://tdengine.match-eu-1.example ./scripts/seed-history-lab.py
 ```
+
+如果没有安装 ingress/front door，等价的本地隧道是
+`kubectl -n match-eu-1 port-forward svc/tdengine 16042:6041`，再设置
+`TDENGINE_URL=http://127.0.0.1:16042`。
 
 刷新终端：即使没有新成交，标题也会显示 `HISTORY 500` 并出现蜡烛图，效果见
 [截图](./trading-terminal-history.png)。交互式架构可打开

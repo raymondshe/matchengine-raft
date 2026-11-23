@@ -109,11 +109,21 @@ kubectl -n match-eu-1 rollout status deploy/nats
 
 kubectl apply -f k8s_control_plane/deploy/tdengine.yaml
 kubectl -n match-eu-1 rollout status deploy/tdengine
+
+# Workstation access to the REST API through the same OrbStack ingress/front door
+kubectl apply -f k8s_control_plane/deploy/tdengine-ingress.yaml
+curl -s -u root:taosdata -X POST http://tdengine.match-eu-1.example/rest/sql \
+  -d 'SELECT SERVER_VERSION()'
 ```
 
 The TDengine manifest is the single-dnode lab profile: `emptyDir` storage, `taosadapter` on 6042 and
 a Node sidecar owning IPv4 `0.0.0.0:6041` (the Service/NetworkPolicy port). It is not the
 three-dnode `REPLICA 3` production topology in [HISTORICAL_BARS.md](./HISTORICAL_BARS.md).
+
+`tdengine-ingress.yaml` exposes only HTTP REST (6041) as `tdengine.match-eu-1.example` using the
+class-less ingress-nginx controller and the port-80 front door from step 5 — no `kubectl port-forward`
+is needed for workstation tooling. It is **plaintext with the default credentials**: lab only. The
+native 6030 protocol is TCP and is not carried by Ingress; in-cluster clients use the ClusterIP.
 
 ### 7. Global market-data service with history
 
@@ -191,12 +201,15 @@ seen trades (or you seed demo bars below); live fills then paint candles from th
 
 ### 10. Optional: seed demo bars for a cold chart
 
-Port-forward the store and run the lab seeder. **This drops and recreates `market_bars`.**
+Run the lab seeder through the ingress from step 6. **This drops and recreates `market_bars`.**
 
 ```sh
-kubectl -n match-eu-1 port-forward svc/tdengine 16042:6041 >/tmp/tdengine-pf.log 2>&1 &
-TDENGINE_URL=http://127.0.0.1:16042 ./scripts/seed-history-lab.py
+TDENGINE_URL=http://tdengine.match-eu-1.example ./scripts/seed-history-lab.py
 ```
+
+If the ingress/front door is not installed, the equivalent local tunnel is
+`kubectl -n match-eu-1 port-forward svc/tdengine 16042:6041` plus
+`TDENGINE_URL=http://127.0.0.1:16042`.
 
 Reload the terminal: the header shows `HISTORY 500` and candles appear without any new trade, as in
 [the screenshot](./trading-terminal-history.png). For the interactive architecture view, open

@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """Seed the lab TDengine with dense demo bars so the terminal has history.
 
-Lab only. DROPS and recreates the configured database. Point TDENGINE_URL at a
-port-forward of the in-cluster taosAdapter, for example:
+Lab only. DROPS and recreates the configured database. Point TDENGINE_URL at
+the in-cluster taosAdapter through the OrbStack ingress (preferred):
+
+  TDENGINE_URL=http://tdengine.match-eu-1.example ./scripts/seed-history-lab.py
+
+or at a local port-forward if the ingress/front door is not installed:
 
   kubectl -n match-eu-1 port-forward svc/tdengine 16042:6041 &
   TDENGINE_URL=http://127.0.0.1:16042 ./scripts/seed-history-lab.py

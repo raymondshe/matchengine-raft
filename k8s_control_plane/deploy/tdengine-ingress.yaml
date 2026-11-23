@@ -1,0 +1,30 @@
+# Lab-only HTTP ingress for taosAdapter REST.
+#
+# This replaces `kubectl port-forward svc/tdengine 16042:6041` for workstation
+# tooling (seed script, curl, debugging). The OrbStack front door already maps
+# *.match-eu-1.example to 127.0.0.1:80 and the class-less ingress-nginx
+# controller routes by Host, so no port-forward is needed.
+#
+# WARNING: plaintext HTTP with the default root/taosdata credentials. This is
+# a demo convenience, not a production database endpoint. The native 6030
+# protocol is TCP and cannot be carried by Ingress; use the ClusterIP inside
+# the cluster or a TCP tunnel/LoadBalancer for that.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: tdengine-rest
+  namespace: match-eu-1
+  labels:
+    matching.io/role: market-data-history
+spec:
+  rules:
+    - host: tdengine.match-eu-1.example
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: tdengine
+                port:
+                  name: rest
