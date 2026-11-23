@@ -1,0 +1,198 @@
+# Trading terminal (React SPA behind nginx), deployed as plain manifests the
+# same way as deploy/nats.yaml and deploy/ingress-nginx.yaml. A TradingTerminal
+# CRD rendered by the operator is a deliberate follow-up; until then this file
+# is applied with kubectl and torn down by deleting it.
+#
+# Frontend-backend separation: the terminal is a third client of the existing
+# services. It proxies only to the global market-data service (public feed)
+# and the order-system BFF (order entry); the engine is never exposed to it.
+#
+#   kubectl apply -f k8s_control_plane/deploy/terminal.yaml
+#   host: http://terminal.match-eu-1.example/   (via the demo front door)
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: match-terminal
+  namespace: match-eu-1
+  labels:
+    app.kubernetes.io/name: match-terminal
+    app.kubernetes.io/part-of: matchengine
+    matching.io/cell: eu-1
+spec:
+  replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: match-terminal
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: match-terminal
+        app.kubernetes.io/part-of: matchengine
+        matching.io/cell: eu-1
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: terminal
+          image: matchengine-trading-terminal:arm64-v2
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: MD_UPSTREAM
+              value: http://global-marketdata.match-eu-1.svc.cluster.local:24804
+            - name: DESK_UPSTREAM
+              value: http://orders.match-eu-1.svc.cluster.local:24300
+            # Cluster DNS ClusterIP for nginx's runtime resolver (variable
+            # proxy_pass does not read /etc/resolv.conf).
+            - name: DNS_UPSTREAM
+              value: 192.168.194.138
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: match-terminal
+  namespace: match-eu-1
+  labels:
+    app.kubernetes.io/name: match-terminal
+    app.kubernetes.io/part-of: matchengine
+spec:
+  selector:
+    app.kubernetes.io/name: match-terminal
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: match-terminal
+  namespace: match-eu-1
+  labels:
+    app.kubernetes.io/name: match-terminal
+    app.kubernetes.io/part-of: matchengine
+spec:
+  rules:
+    - host: terminal.match-eu-1.example
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: match-terminal
+                port:
+                  number: 80
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: match-terminal
+  namespace: match-eu-1
+  labels:
+    app.kubernetes.io/name: match-terminal
+    app.kubernetes.io/part-of: matchengine
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: match-terminal
+  policyTypes: ["Ingress", "Egress"]
+  ingress:
+    # The demo ingress controller (namespace labelled matching.io/role=gateway
+    # by scripts/ingress-frontdoor.sh) is the only allowed ingress path.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              matching.io/role: gateway
+      ports:
+        - protocol: TCP
+          port: 8080
+  egress:
+    # DNS.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Global market-data service (public feed).
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: match-marketdata
+              matching.io/market-data: global-marketdata
+      ports:
+        - protocol: TCP
+          port: 24804
+    # Order-system BFF (order entry).
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: match-order-system
+      ports:
+        - protocol: TCP
+          port: 24300
+---
+# The operator-rendered global-marketdata NetworkPolicy admits only the
+# gateway/observability/control-plane namespaces and its own pods. NetworkPolicies
+# are additive, so this supplementary policy unions one more ingress source: the
+# terminal's nginx proxying market data for the SPA's same-origin /md/* routes.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: match-terminal-marketdata-ingress
+  namespace: match-eu-1
+  labels:
+    app.kubernetes.io/name: match-terminal
+    app.kubernetes.io/part-of: matchengine
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: match-marketdata
+      matching.io/market-data: global-marketdata
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: match-terminal
+      ports:
+        - protocol: TCP
+          port: 24804

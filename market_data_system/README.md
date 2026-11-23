@@ -22,7 +22,9 @@ below. It shows the shared hub in action: one WebSocket connection, per-symbol
 readiness and the raw frames. Switching the dropdown unsubscribes the old
 symbol's topics and subscribes the new ones without reconnecting. The chart
 follows one `kline_<interval>` stream at a time (toggle a kline stream to switch
-intervals); the vendor copy of TradingView Lightweight Charts v5.3.0 lives in
+intervals); a kline subscription first replays the bars the service retained for
+that interval (oldest first, at most 1000 per interval), so a page that loads
+into a quiet market still draws the session's candles instead of a blank chart. the vendor copy of TradingView Lightweight Charts v5.3.0 lives in
 `web/lightweight-charts.js` (Apache-2.0, with `lightweight-charts.LICENSE` and
 `lightweight-charts.NOTICE`) and keeps its upstream banner, so the page needs
 no CDN. The tape deliberately does not show fees: the public WebSocket follows

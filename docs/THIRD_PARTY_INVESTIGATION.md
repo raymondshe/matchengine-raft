@@ -1,7 +1,8 @@
 # Third-party matching-engine investigations
 
 Six external matching-engine projects were reviewed for design ideas, benchmark methodology and
-failure modes. This document consolidates the separate reports into one reference.
+failure modes, plus the Binance Spot market-data API as the contract reference for a planned
+historical kline system. This document consolidates the separate reports into one reference.
 
 | Project | Revision | License | Primary value to us |
 |---|---|---|---|
@@ -11,16 +12,21 @@ failure modes. This document consolidates the separate reports into one referenc
 | [flash1-dev/matching-engine-benchmark](https://github.com/flash1-dev/matching-engine-benchmark) | `424e4e5` (2026-10-16) | MIT (vendored parts have their own licenses) | 249-engine differential benchmark, consensus oracle, conformance battery, worst-case methodology |
 | [ronitgupta138/Apex-Matching-Engine](https://github.com/ronitgupta138/Apex-Matching-Engine) | `a31909c` (2026-11-13) | MIT | Readable Java/Spring teaching engine; a case study in documentation-vs-code and benchmark scope |
 | [zzxscodes/pitlane](https://github.com/zzxscodes/pitlane) | `ece9c8a` (2026-11-21, v1.0.0) | MIT | Shared-memory fail-closed desk, ordered pre-trade gate, mode-isolated RBAC and a disciplined CI/latency setup |
+| [Binance Spot API](https://github.com/binance/binance-spot-api-docs) | `a049a2b`/`adfd443` (2026-11-11) | Documentation (API terms apply) | Kline publication cadence and finality, dense-bar semantics, archive layout, backfill economics |
 
 Review date: 2026-11-01, re-reviewed 2026-11-04, benchmark review added 2026-11-10, Apex review
-added 2026-11-16, pitlane review added 2026-11-21. The review used the public READMEs, `PLAN.md`, the
+added 2026-11-16, pitlane review added 2026-11-21, Binance API review added 2026-11-22. The review used the public READMEs, `PLAN.md`, the
 benchmark's reports and the key source files listed in the references; the 2026-11-04 pass added
 AsthaMishra's `matching-core/optimization_notes.md`, the 2026-11-10 pass added Part IV, and the
 2026-11-21 pass read pitlane's README, CI workflow, build file and three headers (`FanRing`,
 `ReplicaLog`, `PreTradeGuard`). Tests for the other five projects were not
 executed here. For Apex, the engine/model classes were compiled directly and a local harness reran
 its benchmark shape plus a same-price cancellation probe on 2026-11-16 (Apple M4, OpenJDK 25); its
-Spring test suite was not run. No code was copied; all six projects are reference material only.
+Spring test suite was not run. The 2026-11-22 Binance pass read the published
+`binance-spot-api-docs` specifications and downloaded and decompressed archive samples from
+`data.binance.vision`; the live REST and WebSocket hosts were unreachable from this network, so
+the runtime cadence claims there are doc-derived and flagged as such. No code was copied; all seven
+references are documentation or reference material only.
 Pitlane is MIT licensed, but its single commit and one-star history give it no independent track
 record — every claim below is treated as self-reported unless the source was checked. The
 performance-specific verdicts (what transfers to matchengine-raft and what does not) live in
@@ -1037,7 +1043,263 @@ publishing an **immutable version pointer** rather than mutating a "current" rec
   set aside, and strict bounds only on a quiet host. Our `PERFORMANCE.md` warm/cold and CI-vs-manual
   split already has the shape.
 
-## Part VII - Comparison with matchengine-raft
+## Part VII - Binance Spot market-data API: kline updates and historical retrieval
+
+This part is an API-contract review rather than an engine review, and it exists to scope a
+historical data system for this project. Binance is the reference for two separate things: how an
+open kline is published while it is still changing, and how the same kline is later retrieved as
+final data. The two paths share no sequence number, and that single fact drives most of the design
+below.
+
+**Evidence.** Specification text was read from `binance/binance-spot-api-docs` at
+`web-socket-streams.md` `a049a2b37d` (2026-11-11), `rest-api.md` `adfd443f85` (2026-11-11) and
+`web-socket-api.md` `907657c4d0` (2026-11-11); archive facts from `binance/binance-public-data`
+`d571690eb6` (2026-10-16). Statements marked *(doc)* are quoted from those files. Statements marked
+*(measured)* were reproduced on 2026-11-22 by downloading and decompressing files from
+`data.binance.vision`. The live endpoints `api.binance.com` and `stream.binance.com` were **not
+reachable from the review network**, so frame cadence, `x` timing and `startTime` inclusivity were
+not re-measured; they are doc-derived and are carried as verification items in section 6.6.
+
+### 1. Live kline updates (WebSocket Streams)
+
+| Property | Value |
+|---|---|
+| Stream name | `<symbol>@kline_<interval>` (lowercase symbol) |
+| Combined form | `/stream?streams=<s1>/<s2>/...`, frames wrapped `{"stream":...,"data":...}` |
+| Intervals *(doc)* | `1s`, `1m`, `3m`, `5m`, `15m`, `30m`, `1h`, `2h`, `4h`, `6h`, `8h`, `12h`, `1d`, `3d`, `1w`, `1M` |
+| Update speed *(doc)* | **1000 ms for `1s`, 2000 ms for every other interval** |
+| Time zone *(doc)* | UTC by default; `<symbol>@kline_<interval>@+08:00` anchors windows in an offset |
+| Time unit *(doc)* | milliseconds by default; `?timeUnit=MICROSECOND` switches all timestamps |
+| Connection lifetime *(doc)* | 24 h, then a forced disconnect; a `serverShutdown` event precedes planned shutdowns |
+| Liveness *(doc)* | server pings every 20 s; pong within 60 s or the connection drops |
+| Limits *(doc)* | 1024 streams per connection, 5 inbound messages/s, 300 connections per 5 min per IP |
+| All-market stream | **none for klines** — only `!miniTicker@arr` and rolling-window statistics |
+
+Payload *(doc, field meanings confirmed against the archive's column order)*:
+
+```javascript
+{
+  "e": "kline", "E": 1672515782136, "s": "BNBBTC",
+  "k": {
+    "t": 1672515780000,  // window open time
+    "T": 1672515839999,  // window close time, = t + interval - 1
+    "s": "BNBBTC", "i": "1m",
+    "f": 100, "L": 200,  // first / last trade id in the window
+    "o": "0.0010", "c": "0.0020", "h": "0.0025", "l": "0.0015",
+    "v": "1000", "n": 100,          // base volume, trade count
+    "x": false,                     // is this kline closed?
+    "q": "1.0000",                  // quote volume
+    "V": "500", "Q": "0.500",       // taker-buy base / quote volume
+    "B": "123456"                   // documented as "Ignore"
+  }
+}
+```
+
+The three properties that matter for a consumer:
+
+1. **Each frame is a cumulative snapshot of one window, not a delta.** `o`/`h`/`l`/`c`/`v`/`q` are
+   totals for the window so far; a client overwrites the bar rather than applying an increment.
+2. **The same open window is re-sent on a timer.** The doc says the stream "push updates to the
+   current klines/candlestick every second" with an update speed of 1-2 s, i.e. the cadence is time
+   driven, not trade driven. A quiet market still produces frames whose values do not change.
+3. **`x` is the only finality signal.** The last frame of a window carries `"x": true`; every
+   earlier frame of that window carries `false`. Nothing orders frames beyond `t`, and unlike the
+   depth streams there is no `U`/`u` range and no `lastUpdateId`.
+
+That last point is the operational trap. Binance gives a kline consumer **no way to detect a dropped
+frame** from the stream alone: two frames whose `t` differ by one interval look perfectly normal if
+the one in between never arrived. A missed `"x": true` frame is invisible until the chart's last
+candle silently stops updating. Consumers therefore reconcile against REST on `t`, or track `f`/`L`
+(the first/last trade id) and detect a discontinuity in the trade sequence instead of the bar
+sequence.
+
+### 2. On-demand history (REST and WebSocket API)
+
+| Endpoint | Weight *(doc)* | `limit` *(doc)* | Parameters *(doc)* | Data source |
+|---|---|---|---|---|
+| `GET /api/v3/klines` | 2 | default 500, max 1000 | `symbol`, `interval`, `startTime`, `endTime`, `timeZone` | Database |
+| `GET /api/v3/uiKlines` | 2 | default 500, max 1000 | same; "modified kline data, optimized for presentation" | Database |
+| WS API `klines` / `uiKlines` | 2 | default 500, max 1000 | same, as a request/response frame on the socket | Database |
+| `GET /api/v3/aggTrades` | 4 | default 500, max 1000 | `symbol`, `fromId`, `startTime`, `endTime` | Database |
+| `GET /api/v3/historicalTrades` | 25 | default 500, max 1000 | `symbol`, `fromId` | Database |
+
+The kline response is a twelve-element array per bar, with prices and volumes as strings:
+`[openTime, open, high, low, close, volume, closeTime, quoteVolume, trades, takerBuyBase,
+takerBuyQuote, ignore]`. The REST doc states "Klines are uniquely identified by their open time";
+the WebSocket API page says "open & close time". In practice `closeTime = openTime + interval - 1`
+exactly *(measured in every sample file)*, so the open time is the key and the close time is derived.
+
+Other properties worth recording:
+
+- **`timeZone` shifts interval anchoring only.** Any offset in `[-12:00, +14:00]` is accepted;
+  `startTime`/`endTime` remain UTC. This is how a `1d` candle can open at a local midnight.
+- **Pagination is by `limit`, not by cursor.** 1000 bars per call maximum, so one year of `1s` is
+  31,536 calls and one year of `1m` is 526. The next page's `startTime` should be the last returned
+  `openTime + interval` so the boundary bar is not fetched twice.
+- **Rate limits are per IP, not per API key** *(doc)*. The published `exchangeInfo` example shows
+  `REQUEST_WEIGHT` 6000 per minute; every response carries
+  `X-MBX-USED-WEIGHT-(intervalNum)(intervalLetter)`. Exceeding it returns `429` with `Retry-After`;
+  repeatedly ignoring `429` escalates to `418` and an IP ban that scales from 2 minutes to 3 days.
+- **`Data Source: Database`** and, from the API notes, "The API system is asynchronous, so some
+  delay in the response is normal and expected." A kline read is therefore not a linearizable view
+  of the matching engine; it is a database view that can trail the live stream by an unspecified
+  amount. That is exactly the window in which a backfill can disagree with a live bar.
+- **`aggTrades` and `historicalTrades` are the trade-level complement.** `aggTrades` aggregates
+  fills by taker order and price and accepts `fromId`, `startTime` or `endTime`; `historicalTrades`
+  is the older, id-addressed form at weight 25. Together with the kline `f`/`L` fields they allow a
+  bar to be rebuilt from trades and checked against the served bar.
+
+### 3. Bulk archive (`data.binance.vision`)
+
+The archive is the practical way to seed history; the REST ladder is only for the tail.
+
+| Property | Value |
+|---|---|
+| Layout | `data/spot/{daily,monthly}/klines/<SYMBOL>/<interval>/<SYMBOL>-<interval>-<YYYY-MM[-DD]>.zip` |
+| Monthly interval name *(doc)* | `1mo`, not `1M`, to survive case-insensitive file systems |
+| Publication *(doc)* | daily data "the next day"; monthly data "on the first monday of the month" |
+| Contents | one CSV per zip, same twelve columns as REST, **no header row in any sample** |
+| Integrity *(doc, measured)* | sibling `<file>.zip.CHECKSUM`, `sha256sum` format; verified `OK` on a 1s daily file |
+| Timestamps *(doc, measured)* | **microseconds from 2025-01-01**, milliseconds before that |
+| Revisions *(doc)* | archive files can be replaced after publication; a changelog lists past corrections |
+| Enumeration *(measured)* | `https://s3.ap-northeast-1.amazonaws.com/data.binance.vision?prefix=<path>` returns a `ListBucketResult` XML with `<Key>` entries and `<IsTruncated>` |
+
+Measured samples (BTCUSDT), 2026-11-22:
+
+| File | Rows | CSV bytes | Zip bytes | Notes |
+|---|---|---|---|---|
+| `1s` daily, `2025-01-02` | 86,400 | 12,697,051 | 2,667,429 | microsecond timestamps |
+| `1s` daily, `2024-12-31` | 86,400 | — | 2,637,831 | millisecond timestamps |
+| `1s` daily, `2020-01-01` | 86,400 | 11,619,794 | 2,091,917 | zip mtime 2022-10-18, i.e. backfilled |
+| `1s` daily, `2017-08-17` | 71,972 | — | 480,298 | starts at the listing second (04:00:28 UTC) |
+| `1m` monthly, `2024-01` | 44,640 | 6,699,071 | 2,169,570 | 31 days × 1440 |
+| `1m` monthly, `2017-08` | 21,360 | — | 595,271 | starts at listing, not month start |
+
+Four findings from those samples change how a loader must be written:
+
+1. **Bars are dense.** A full day has exactly 86,400 `1s` rows and a full month exactly
+   `days × 1440` `1m` rows, including intervals with no trades. On the sampled `1s` day, 4,259 rows
+   (4.9%) had `volume = 0`, `trades = 0` and `open = high = low = close` equal to the **previous**
+   row's close. Empty intervals are carried forward, not omitted. The 2020 file's zip entry is
+   dated 2022-10-18, i.e. the dense `1s` series was generated after the fact rather than streamed
+   as it happened.
+2. **The twelfth column is not always `0`.** The `2017-08` `1m` monthly file ends its rows with
+   values such as `7960.54017996`, while modern files end with `0`. The column is documented
+   "Ignore"; a loader must discard it rather than assume a constant.
+3. **The unit changed mid-history.** Rows before 2025 are milliseconds
+   (`1735603200000`), rows from 2025-01-01 are microseconds (`1735776000000000`). A single file can
+   be read correctly only after deciding the unit from the digit count, not from the file date.
+4. **`1s` history is complete, not recent.** The archive serves `1s` daily files from
+   `2017-08-17` (spot's first day for BTCUSDT) onward, so the whole spot history is available at
+   one-second granularity regardless of when the live `1s` interval was documented.
+
+### 4. Bar semantics, condensed
+
+1. **Identity is the open time.** `(symbol, interval, openTime)` is the key; `closeTime` is
+   `openTime + interval - 1`; no other identifier exists.
+2. **A bar is a cumulative value, not an event.** There is no depth-style delta chain, no
+   sequence number and no gap marker.
+3. **Finality is `x`** (stream) or simply "the window is in the past" (REST/archive). A closed bar
+   is stable in practice, subject to the documented archive revisions.
+4. **Every bar is derivable from trades**, and the payload carries the linkage: `f`/`L` bound the
+   trade ids, `n` counts them, `v`/`q` are total volume, `V`/`Q` split out taker buys.
+5. **Empty intervals are still bars.** The public contract is a dense series; a chart consumer that
+   receives sparse bars will draw gaps where the reference implementation draws flat candles.
+
+### 5. Where matchengine-raft differs today
+
+| Aspect | Binance Spot | matchengine-raft today | Consequence for a historical system |
+|---|---|---|---|
+| Open-bar emission | timer, 1 s (`1s`) / 2 s (others) *(doc)* | only when a fill lands, gated to ≤1 Hz, first fill of a window suppressed | a quiet market publishes no bars at all (logged as TODO P2 #11) |
+| Empty intervals | dense flat bar, `v = 0` | absent | charts must synthesise flat candles or show gaps |
+| Open-bar refresh for a late joiner | next timer tick | replay on subscribe only | a subscriber can hold a stale open bar until the next fill |
+| Identity | `(symbol, interval, openTime)` | `(symbol, interval, window_start_ms)` | same shape, both in milliseconds |
+| Order-flow fields | `n`, `v`, `q`, `V`, `Q`, `f`, `L` | `trade_count`, `volume` | no taker-buy split, no trade-id linkage |
+| Finality | `x` boolean | `BAR_CLOSE` flag | equivalent |
+| Ordering aid | none | `bar_seq` per `(symbol, interval)` | ours is stronger; keep it as an extension, do not rename it into the public shape |
+| Long-term history | REST + archive + 1000-bar replay | 1000-bar in-memory replay per service | no durable store, no backfill, no rollup |
+| Time unit | ms, optional µs *(doc)* | ms | archive import must normalise |
+
+### 6. Design implications
+
+1. **One key, one row, one writer.** Store `(symbol_id, interval, open_time)` as the primary key
+   with `close_time` derived. Reject a write whose `close_time` disagrees, and never accept a write
+   that moves `open_time` backwards into a sealed segment. Everything else in this section follows
+   from that constraint.
+2. **Seal per day, mirror the archive's granularity.** Segments of
+   `<symbol>/<interval>/<YYYY>/<YYYY-MM-DD>` (sealed, immutable, checksummed, with a catalog row of
+   `min_t`, `max_t`, `rows`, `sha256`) make the archive import, the REST backfill and the live tap
+   converge on the same unit of work. Columnar encoding is the obvious fit: 86,400 rows/day/symbol
+   at `1s` is 12.7 MB as CSV and 2.7 MB zipped, so a year is ~4.6 GB raw per symbol before
+   compression; delta/varint columns should land far below the zip.
+3. **Three ingest paths, one merge rule.** Live tap (authoritative for the open bar), REST
+   gap-fill (authoritative for closed bars), archive import (bulk seed, idempotent by content
+   hash). Merge rule: a closed bar is final; an open bar is replaced by the newest source; a closed
+   bar that disagrees with a stored closed bar is a **revision**, recorded with both values and the
+   source, never a silent overwrite. Then assert the invariants
+   `close_time = open_time + interval - 1`, strictly increasing `open_time` within a segment, and
+   `low ≤ open, close ≤ high`.
+4. **Decide sparse-vs-dense once, at the storage boundary.** Store what the source actually gave
+   (sparse for our engine's per-fill bars, dense for an archive import) and densify at the serving
+   layer with the carry-forward rule, so "no trade in this interval" stays a fact rather than
+   becoming seven identical zero-volume rows. Serving must be dense to be Binance-compatible.
+5. **Backfill is an archive problem, not a REST problem.** One year of `1s` is 31,536,000 bars per
+   symbol: 365 archive files (~1 GB zipped) or 31,536 REST calls at weight 2 (63,072 weight, about
+   ten minutes at the published 6000/min ceiling before retries and other traffic). Use the archive
+   for anything older than a day, then reconcile the tail with REST. `1m` from 2017-08 is only
+   ~5.3 M bars, i.e. ~5,300 REST calls — but the archive is still cheaper and far less
+   rate-limit-exposed.
+6. **Verification items before the design is frozen.** Because the live hosts were unreachable
+   here, confirm on a network that can reach them: (a) that the open bar really is re-pushed on the
+   1-2 s cadence with no trades, and what `x: true` looks like for a window with zero trades;
+   (b) whether `startTime`/`endTime` are inclusive of bar open times at both edges; (c) whether the
+   REST response for a closed bar can differ from the final `x: true` frame (and how often);
+   (d) whether `timeUnit=MICROSECOND` also changes `t`/`T` inside `k.` or only `E`; (e) the
+   `1M`/`1mo` naming behaviour for the WebSocket stream versus the archive; (f) `Retry-After` and
+   the `X-MBX-USED-WEIGHT-*` header on `429`/`418` under controlled load.
+7. **Read surface to target.** A `GET /klines` with Binance's exact parameter names, defaults
+   (500) and cap (1000), returning the twelve-element array, is cheap to implement over a
+   columnar store and makes every existing Binance client work unchanged. Pair it with the
+   subscribe-time replay the market-data service already does, and keep a cursor/`since` extension
+   (`bar_seq`) for internal consumers that need gap detection.
+8. **Rollups.** Deriving `1m` from `1s` is only exact if the densification rule matches (an empty
+   `1s` interval must not fabricate a trade). Deriving from trades is exact by construction and is
+   the safer canonical form; deriving from `1s` is a cost optimisation to be adopted only after a
+   differential test over a month of data.
+9. **Failure cases to test explicitly.** Duplicate ingest, out-of-order bars, a late `x: true` after
+   a newer window, an archive revision replacing a month, a µs/ms mix-up, a request whose `limit`
+   would cross a month boundary, an empty interval at the edge of a trading halt, and a symbol whose
+   listing day is mid-month (the 2017-08 samples in section 3 start at the listing second, not at
+   the calendar boundary).
+
+### 7. Recommended shape
+
+```text
+engine apply ──► market-data tap ──► per-symbol ring + open-bar cadence ──► WS /kline
+                        │
+                        └──────────► historical writer ──► TDengine
+                                                          bars_1s (canonical)
+                                                          bars_1m (materialized rollup)
+                                                                  ▲
+data.binance.vision importer ─────────────────────────────────────┤
+REST /api/v3/klines gap-fill ─────────────────────────────────────┘
+                                                                  │
+                                                    GET /klines + WS replay
+```
+
+The live path stays on the existing asynchronous tap; the writer consumes the same frames and never
+touches the matching path. The archive importer and the REST gap-filler write through the same merge
+rule (an idempotent upsert keyed by `(symbol, open_time)`), so a month can be seeded twice, corrected,
+or replayed without a special case.
+
+The full system design — data model, TDengine schema and the exact-`DECIMAL(38,18)` contract, merge
+and revision rules, API shapes, capacity and rollout — is
+[`HISTORICAL_BARS.md`](./HISTORICAL_BARS.md).
+
+## Part VIII - Comparison with matchengine-raft
+
+Binance is deliberately absent from this table: it is a market-data API contract, not an engine
+implementation, and its kline-specific comparison against this project is in Part VII §5.
 
 | Dimension | AsthaMishra | Wire v9 | llc-993/matching-core | Apex | pitlane | matchengine-raft |
 |---|---|---|---|---|---|---|
@@ -1074,7 +1336,7 @@ and the basic FIFO loop; it is not a validation of the replicated product path. 
 `Amend` would be wrong. Its "conforming" verdict is scoped to limit new/cancel/modify and IOC; it
 does not exercise FOK, stops, icebergs, fees, persistence or consensus.
 
-## Part VIII - Consolidated takeaways
+## Part IX - Consolidated takeaways
 
 ### Adopt
 
@@ -1173,6 +1435,29 @@ does not exercise FOK, stops, icebergs, fees, persistence or consensus.
 - **Make planned work explicit.** The Apex `docs/` describe Loom, Disruptor, FlatBuffers and
   lock-free maps that are not in `main`. Mark design notes as planned and link them to issues.
 
+### Binance Spot API takeaways
+
+- **A bar is a value, not a delta.** Klines carry no sequence number and no gap marker, so a dropped
+  frame is invisible; consumers reconcile on `t` or on the trade ids (`f`/`L`). Do not invent a
+  cursor into the Binance shape — expose ours as an extension instead (Part VII §1, §4).
+- **Publish on a cadence, not only on activity.** The reference feed re-pushes the open bar every
+  1-2 s regardless of trades. Our feed emits only on fills and suppresses each window's first emit,
+  which is why a quiet market produces no candles (TODO P2 #11).
+- **Dense is the public contract.** Empty intervals are flat bars carrying the previous close, not
+  omitted bars; a sparse series draws gaps where the reference draws candles. Store what the source
+  gave, densify when serving.
+- **Two sources, one key.** Live and historical paths never share a sequence, so
+  `(symbol, interval, openTime)` is the only join. Closed bars win over open bars; a disagreeing
+  revision is recorded, never silently overwritten.
+- **Archive first, REST for the tail.** One year of `1s` per symbol is 365 files (~1 GB zipped) or
+  31,536 weight-2 requests; the archive is enumerable, checksummed and idempotent, and the REST
+  ladder is rate-limited per IP (429 → 418 bans of 2 minutes to 3 days).
+- **Normalise the file quirks at ingest.** Milliseconds before 2025 and microseconds after, no
+  header row, `1mo` instead of `1M`, and a twelfth column documented "Ignore" that is not always
+  zero. The listing-month files start at the symbol's listing second, not at the calendar boundary.
+- **Roll up from trades, verify against `1s`.** Fabricating bars from empty intervals is a
+  correctness trap; a differential test over a month is the adoption gate for any rollup.
+
 ### Avoid
 
 - Calling a one-fill primitive a matching engine, or comparing its cycles to a full exchange stack.
@@ -1229,6 +1514,14 @@ does not exercise FOK, stops, icebergs, fees, persistence or consensus.
 
 7. Real-data replay, custom MPMC/SIMD/io_uring, binary order entry and feature-gated histograms,
    only after a measured bottleneck and a deployment decision.
+
+**P2 - historical market data (Part VII)**
+
+8. Before building, close the six live-API verification items in Part VII §6.6 and decide the
+   sparse-store/dense-serve boundary. Then implement the store (TDengine `bars_1s`/`bars_1m` with
+   exact `DECIMAL(38,18)` columns and read-time `INTERVAL` rollups), the three ingest paths under
+   one merge rule, and a Binance-shaped `GET /klines` with subscribe-time replay. Seed from
+   `data.binance.vision`; use REST only for the tail.
 
 **Non-negotiable foundations:** Raft consensus, WAL/snapshot durability, deterministic event ids,
 exact 18-decimal values, fees/assets and the existing property/conformance/integration suites.
@@ -1328,3 +1621,16 @@ exact 18-decimal values, fees/assets and the existing property/conformance/integ
 - <https://github.com/zzxscodes/pitlane/blob/ece9c8acc52ad4cb9ad54e1877b11ec548418190/include/pitlane/net/replicate.hpp>
 - <https://github.com/zzxscodes/pitlane/blob/ece9c8acc52ad4cb9ad54e1877b11ec548418190/include/pitlane/order/precheck.hpp>
 - <https://github.com/zzxscodes/pitlane/blob/ece9c8acc52ad4cb9ad54e1877b11ec548418190/doc/web-api.md>
+
+### Binance Spot market-data API
+
+- <https://github.com/binance/binance-spot-api-docs>
+- <https://github.com/binance/binance-spot-api-docs/blob/a049a2b37d/web-socket-streams.md>
+- <https://github.com/binance/binance-spot-api-docs/blob/adfd443f85/rest-api.md>
+- <https://github.com/binance/binance-spot-api-docs/blob/907657c4d0/web-socket-api.md>
+- <https://github.com/binance/binance-public-data/tree/d571690eb6>
+- <https://data.binance.vision/>
+- <https://data.binance.vision/data/spot/monthly/klines/BTCUSDT/1m/BTCUSDT-1m-2024-01.zip>
+- <https://data.binance.vision/data/spot/daily/klines/BTCUSDT/1s/BTCUSDT-1s-2025-01-02.zip>
+- <https://data.binance.vision/data/spot/daily/klines/BTCUSDT/1s/BTCUSDT-1s-2020-01-01.zip>
+- <https://s3.ap-northeast-1.amazonaws.com/data.binance.vision?prefix=data/spot/monthly/klines/BTCUSDT/1m/>

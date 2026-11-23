@@ -363,20 +363,21 @@ fn subscribe(
         }
     }
 
-    // Push the cached snapshot for stateful streams.
-    let snapshot = {
+    // Push the cached snapshot(s) for stateful streams. Kline subscriptions get
+    // the recent bar history so a freshly loaded chart is not blank.
+    let snapshots = {
         let state = runtime.shared.lock().expect("state lock");
         snapshot_payload(&runtime.spec, &state, spec.kind, ctx.config.snapshot_levels)
     };
-    if let Some(payload) = snapshot
-        && out_tx
+    for payload in snapshots {
+        // Best-effort: a long history never fails the subscription, it just
+        // stops seeding once the session queue is full and live frames follow.
+        if out_tx
             .try_send(Outbound::Frame(frame_vec(ctx.combined, &spec.key, payload)))
             .is_err()
-    {
-        return Err(ProtocolError {
-            code: 2,
-            message: "connection queue full".to_string(),
-        });
+        {
+            break;
+        }
     }
 
     let out = out_tx.clone();
@@ -496,47 +497,65 @@ fn wrap(key: &str, payload: &[u8]) -> Bytes {
     Bytes::from(buffer)
 }
 
+/// Frames to push when a stream is subscribed: at most one for depth/BBO, one
+/// per retained bar for klines, none for pure event streams.
 fn snapshot_payload(
     symbol: &SymbolSpec,
     state: &SharedState,
     kind: StreamKind,
     snapshot_levels: usize,
-) -> Option<Vec<u8>> {
+) -> Vec<Vec<u8>> {
     match kind {
         StreamKind::BookTicker => state
             .bbo
             .as_ref()
-            .map(|bbo| protocol::book_ticker_payload(symbol, bbo, state.bbo_update_id)),
+            .map(|bbo| protocol::book_ticker_payload(symbol, bbo, state.bbo_update_id))
+            .into_iter()
+            .collect(),
         StreamKind::DepthDiff(_) => {
             let bids = state.depth.top(OrderSide::Buy, snapshot_levels);
             let asks = state.depth.top(OrderSide::Sell, snapshot_levels);
-            Some(protocol::depth_snapshot_payload(
+            vec![protocol::depth_snapshot_payload(
                 symbol,
                 state.last_update_id,
                 &bids,
                 &asks,
                 state.last_ts_ms,
-            ))
+            )]
         }
         StreamKind::DepthPartial { levels, .. } => {
             let bids = state.depth.top(OrderSide::Buy, levels);
             let asks = state.depth.top(OrderSide::Sell, levels);
-            Some(protocol::depth_partial_payload(
+            vec![protocol::depth_partial_payload(
                 symbol,
                 state.last_update_id,
                 &bids,
                 &asks,
-            ))
+            )]
         }
-        StreamKind::Kline { interval_ms } => state.bars.get(&interval_ms).map(|bar| {
-            let quote = state
-                .bar_quote
-                .get(&(bar.interval_ms, bar.window_start_ms))
-                .copied()
-                .unwrap_or(Fixed::ZERO);
-            protocol::kline_payload(symbol, bar, quote, state.last_ts_ms, false)
-        }),
-        StreamKind::Trade | StreamKind::Sweep | StreamKind::Status | StreamKind::Lifecycle => None,
+        StreamKind::Kline { interval_ms } => state
+            .bar_history
+            .get(&interval_ms)
+            .map(|history| {
+                history
+                    .iter()
+                    .map(|(bar, closed)| {
+                        let quote = state
+                            .bar_quote
+                            .get(&(bar.interval_ms, bar.window_start_ms))
+                            .copied()
+                            .unwrap_or(Fixed::ZERO);
+                        // A replayed kline is labelled with the bar's own last
+                        // trade time, never with the last frame the service saw
+                        // (a reset snapshot or heartbeat must not leak in).
+                        protocol::kline_payload(symbol, bar, quote, bar.last_ts_ms, *closed)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        StreamKind::Trade | StreamKind::Sweep | StreamKind::Status | StreamKind::Lifecycle => {
+            Vec::new()
+        }
     }
 }
 

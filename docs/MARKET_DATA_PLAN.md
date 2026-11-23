@@ -21,7 +21,13 @@ planned as U9–U15 below, from [`MARKET_DATA_WEBSOCKET.md`](./MARKET_DATA_WEBSO
 ## Decisions already fixed (from AERON_SOLUTION Part II)
 
 - Timestamps: the receiving leader stamps `Order.timestamp` at intake (overwriting client values)
-  and every market-data record uses it. Never a publish-time clock.
+  and every market-data record uses it. Never a publish-time clock. Three frames carry something
+  else because they have no taker: the idle STATUS heartbeat and the reset depth snapshot use the
+  leader's clock, and a `PurgeExpired` frame uses the caller-supplied `now_ms` (request-driven so
+  expiry stays deterministic). None of them carries a trade, and a replayed kline is stamped from
+  `bar.last_ts_ms`, not from the newest frame the service has seen.
+  `tests/cluster/test_market_data.rs` bounds the trade and bar timestamps inside the taker's intake
+  window.
 - Identity and dedupe: `(symbol_id, stream_id, market_seq, sub_seq)`, anchored on the replicated
   order/mutation sequence (the taker order sequence for a `Place`) with a deterministic per-entry
   `sub_seq`. `(log_index, ordinal)` stays the audit key. Implemented in U8.

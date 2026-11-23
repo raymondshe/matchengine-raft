@@ -143,6 +143,29 @@ fn delta(seq: u64, price: &str, volume: &str) -> MarketMessage {
     )
 }
 
+fn bar(seq: u64, window_start_ms: u64, close: &str, closed: bool) -> MarketMessage {
+    let price = fixed(close);
+    message(
+        matchengine_raft::market_data::STREAM_BAR,
+        if closed { flags::BAR_CLOSE } else { 0 },
+        seq,
+        0,
+        window_start_ms + 1_000,
+        MessageBody::Bar(matchengine_raft::market_data::BarRecord {
+            interval_ms: 1_000,
+            window_start_ms,
+            last_ts_ms: window_start_ms + 900,
+            open: price,
+            high: price,
+            low: price,
+            close: price,
+            volume: fixed("2"),
+            trade_count: 1,
+            bar_seq: seq,
+        }),
+    )
+}
+
 fn trade(seq: u64) -> MarketMessage {
     message(
         STREAM_TRADE,
@@ -184,6 +207,35 @@ async fn next_json(ws: &mut Ws) -> Value {
         Message::Text(text) => serde_json::from_str(text.as_str()).expect("valid JSON"),
         other => panic!("expected text frame, got {other:?}"),
     }
+}
+
+async fn get_body(addr: &str, path: &str) -> String {
+    let mut stream = TcpStream::connect(addr).await.expect("connect for GET");
+    let request = format!("GET {path} HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n");
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut response = Vec::new();
+    let _ = stream.read_to_end(&mut response).await;
+    String::from_utf8_lossy(&response).into_owned()
+}
+
+/// `/metrics` carries the per-symbol `last_ts_ms`, which advances for every
+/// applied frame, so a test can wait until the service has consumed a message
+/// instead of sleeping.
+async fn wait_last_ts(addr: &str, symbol: &str, ts_ms: u64) {
+    for _ in 0..200 {
+        let body = get_body(addr, "/metrics").await;
+        if let Some(start) = body.find("\r\n\r\n") {
+            let parsed: Value = serde_json::from_str(&body[start + 4..]).expect("metrics JSON");
+            if parsed["symbols"][symbol]["last_ts_ms"]
+                .as_u64()
+                .is_some_and(|value| value >= ts_ms)
+            {
+                return;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("symbol {symbol} did not reach ts {ts_ms}");
 }
 
 async fn wait_ready(addr: &str) {
@@ -804,6 +856,63 @@ async fn fast_only_disables_terminal_endpoints() {
         .await
         .unwrap();
     assert_eq!(10, wait_result(&mut ws, 10).await["id"]);
+
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kline_subscribe_replays_retained_bars() {
+    let config = Config::for_test("127.0.0.1:0");
+    let (tx, source) = channel_source(64);
+    tx.send(Ok(snapshot(0))).await.unwrap();
+    // Two adjacent 1s windows: the older one has rolled over into a closed
+    // bar, the newer one is still open.
+    tx.send(Ok(bar(1, 1_000, "1.085", true))).await.unwrap();
+    tx.send(Ok(bar(2, 2_000, "1.088", false))).await.unwrap();
+    let running = start_single(config, source).await;
+    wait_ready(&running.addr).await;
+    wait_last_ts(&running.addr, "eurusd", 3_000).await;
+
+    // A chart that loads after the trades must still receive both candles.
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{}/ws", running.addr))
+        .await
+        .expect("connect");
+    ws.send(Message::text(
+        r#"{"method":"SUBSCRIBE","params":["eurusd@kline_1s"],"id":9}"#,
+    ))
+    .await
+    .unwrap();
+
+    let mut bars = Vec::new();
+    for _ in 0..4 {
+        let frame = next_json(&mut ws).await;
+        if frame["e"] == "kline" {
+            bars.push(frame);
+            if bars.len() == 2 {
+                break;
+            }
+        }
+    }
+    assert_eq!(
+        2,
+        bars.len(),
+        "late subscriber did not receive the bar history: {bars:?}"
+    );
+    assert_eq!(1_000, bars[0]["k"]["t"]);
+    assert_eq!(
+        true, bars[0]["k"]["x"],
+        "the rolled-over bar should replay closed"
+    );
+    assert_eq!(2_000, bars[1]["k"]["t"]);
+    assert_eq!(false, bars[1]["k"]["x"]);
+    assert_eq!("1.088", bars[1]["k"]["c"]);
+    // A replayed frame is stamped with the bar's own last trade time, not with
+    // the newest frame the service has seen (which is 3_000 here).
+    assert_eq!(
+        1_900, bars[0]["E"],
+        "replayed klines must use the bar's last trade timestamp"
+    );
+    assert_eq!(2_900, bars[1]["E"]);
 
     running.shutdown().await;
 }

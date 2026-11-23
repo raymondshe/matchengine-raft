@@ -115,6 +115,9 @@ pub struct SharedState {
     pub bbo: Option<matchengine_raft::market_data::BboRecord>,
     pub bbo_update_id: u64,
     pub bars: HashMap<u64, matchengine_raft::market_data::BarRecord>,
+    /// Recent bars per interval, oldest first, replayed to a late subscriber so
+    /// a freshly loaded chart starts with the session's candles instead of one.
+    pub bar_history: HashMap<u64, Vec<(matchengine_raft::market_data::BarRecord, bool)>>,
     /// Quote volume per `(interval_ms, window_start_ms)`, accumulated from fills.
     pub bar_quote: HashMap<(u64, u64), Fixed>,
     pub status: Option<matchengine_raft::market_data::StatusRecord>,
@@ -130,6 +133,30 @@ pub struct SharedState {
 }
 
 impl SharedState {
+    /// Records a bar in the per-interval history a late subscriber replays.
+    ///
+    /// Bars arrive in window order from one leader; a repeated window replaces
+    /// the stored copy (the engine re-sends the open bar as it grows), and an
+    /// older window is ignored so a delayed frame cannot rewrite history.
+    pub fn record_bar(&mut self, bar: &matchengine_raft::market_data::BarRecord, closed: bool) {
+        const MAX_BARS: usize = 1_000;
+        let history = self.bar_history.entry(bar.interval_ms).or_default();
+        if let Some(last) = history.last_mut() {
+            if last.0.window_start_ms == bar.window_start_ms {
+                last.0 = bar.clone();
+                last.1 = closed;
+                return;
+            }
+            if last.0.window_start_ms > bar.window_start_ms {
+                return;
+            }
+        }
+        history.push((bar.clone(), closed));
+        if history.len() > MAX_BARS {
+            history.drain(..history.len() - MAX_BARS);
+        }
+    }
+
     pub fn ready(&self) -> bool {
         self.snapshot_seen
             && !self.depth_stale
@@ -461,12 +488,17 @@ impl Feed {
                 }
             }
             MessageBody::Bar(bar) => {
-                let quote = self.quote_volume(bar);
-                {
+                let closed = message.flags & flags::BAR_CLOSE != 0;
+                let quote = {
                     let mut state = self.shared.lock().expect("state lock");
                     state.bars.insert(bar.interval_ms, bar.clone());
-                }
-                let closed = message.flags & flags::BAR_CLOSE != 0;
+                    state.record_bar(bar, closed);
+                    state
+                        .bar_quote
+                        .get(&(bar.interval_ms, bar.window_start_ms))
+                        .copied()
+                        .unwrap_or(Fixed::ZERO)
+                };
                 let payload =
                     protocol::kline_payload(&self.symbol, bar, quote, message.ts_ms, closed);
                 let key = format!("kline_{}", protocol::kline_label(bar.interval_ms));
@@ -698,15 +730,6 @@ impl Feed {
         state
             .bar_quote
             .retain(|key, _| key.1.saturating_add(key.0 * 2) >= newest);
-    }
-
-    fn quote_volume(&self, bar: &matchengine_raft::market_data::BarRecord) -> Fixed {
-        let state = self.shared.lock().expect("state lock");
-        state
-            .bar_quote
-            .get(&(bar.interval_ms, bar.window_start_ms))
-            .copied()
-            .unwrap_or(Fixed::ZERO)
     }
 
     fn publish(&mut self, suffix: &str, payload: Vec<u8>) {

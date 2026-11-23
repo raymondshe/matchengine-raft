@@ -1042,6 +1042,16 @@ door described in [Reach the demo ingress hosts](#reach-the-demo-ingress-hosts);
 `http://orders.match-eu-1.example/demo/`. If the ingress is not installed, port-forward the
 `orders` Service and open `/demo/`.
 
+For a Binance-style full-screen experience, deploy the React trading terminal
+(`trading_terminal/`, see its README) with
+`kubectl apply -f k8s_control_plane/deploy/terminal.yaml` and open
+`http://terminal.match-eu-1.example/`: order book with cumulative depth bars,
+trade tape, candlestick chart, an order ticket (limit/market, TIF, post-only,
+iceberg, stop trigger, freeze estimate), open orders with cancel/amend and the
+fill tape. It is a pure frontend project that proxies the global market-data
+feed and the order-system BFF same-origin and never talks to an engine
+directly.
+
 ### Retention window
 
 An orphaned shard PVC is labeled by the renderer and marked with

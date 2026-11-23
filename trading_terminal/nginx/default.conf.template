@@ -1,0 +1,80 @@
+# Terminal edge: static SPA plus same-origin reverse proxies.
+#
+# Frontend-backend separation: this file is deployment plumbing only. It
+# gives the SPA one origin, then forwards
+#   /md/ws, /md/stream, /md/*  -> market-data service (public feed)
+#   /demo/api/*                -> order-system BFF (order entry)
+# `Host $host` is preserved so the BFF's X-Demo-Action/Origin guard sees the
+# terminal's own origin and accepts the request without CORS changes.
+#
+# The upstream variables resolve at request time (nginx defers DNS for
+# variable proxy_pass), so the terminal pod can start before/after either
+# backend without failing its own startup.
+
+server {
+    listen 8080;
+    server_name _;
+
+    root /usr/share/nginx/html;
+    index index.html;
+
+    gzip on;
+    gzip_types text/css application/javascript application/json image/svg+xml;
+    gzip_min_length 1024;
+
+    set $md_upstream ${MD_UPSTREAM};
+    set $desk_upstream ${DESK_UPSTREAM};
+
+    # Variable proxy_pass resolves at request time through this resolver. The
+    # k8s manifest sets DNS_UPSTREAM to the cluster DNS ClusterIP; the image
+    # default (127.0.0.11, Docker's embedded resolver) only keeps local smoke
+    # runs parseable.
+    resolver ${DNS_UPSTREAM} valid=10s ipv6=off;
+
+    # --- market data: WebSocket upgrades ---
+    location = /md/ws {
+        rewrite ^ /ws break;
+        proxy_pass $md_upstream;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+    }
+
+    location = /md/stream {
+        rewrite ^ /stream break;
+        proxy_pass $md_upstream;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+    }
+
+    # --- market data: plain HTTP (/info, /ready, assets) ---
+    location /md/ {
+        rewrite ^/md/(.*)$ /$1 break;
+        proxy_pass $md_upstream;
+        proxy_set_header Host $host;
+    }
+
+    # --- order desk BFF (same path prefix) ---
+    location /demo/api/ {
+        proxy_pass $desk_upstream;
+        proxy_set_header Host $host;
+        proxy_read_timeout 30s;
+    }
+
+    # --- static SPA ---
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+
+    location = /healthz {
+        access_log off;
+        return 200 'ok\n';
+    }
+}

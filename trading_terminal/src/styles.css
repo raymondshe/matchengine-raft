@@ -1,0 +1,555 @@
+/* Binance-style dark theme and trade-page layout:
+   left column = order book over the trade tape, center = chart over the
+   order tabs, right = buy/sell ticket. Fixed viewport; panels scroll
+   internally. The terminal ships its own stylesheet and shares nothing with
+   the Rust services' embedded CSS. */
+
+:root {
+  --bg: #0b0e11;
+  --panel: #181a20;
+  --panel-2: #1e2329;
+  --panel-3: #2b3139;
+  --border: #2b3139;
+  --text: #eaecef;
+  --muted: #848e9c;
+  --accent: #f0b90b;
+  --buy: #2ebd85;
+  --sell: #f6465d;
+  --warn: #f0b90b;
+  --mono: "SFMono-Regular", ui-monospace, "JetBrains Mono", Menlo, Consolas, monospace;
+  --sans: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+* { box-sizing: border-box; }
+
+html, body, #root { height: 100%; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 12px/1.45 var(--sans);
+  -webkit-font-smoothing: antialiased;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+
+.mono { font-family: var(--mono); }
+.muted { color: var(--muted); }
+.small { font-size: 11px; }
+.num { font-family: var(--mono); font-variant-numeric: tabular-nums; text-align: right; }
+.buy { color: var(--buy); }
+.sell { color: var(--sell); }
+
+.terminal {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  min-width: 1040px;
+}
+
+/* ---------- header ---------- */
+
+.terminal-header {
+  display: flex;
+  align-items: center;
+  gap: 22px;
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg);
+  flex: none;
+  height: 58px;
+}
+
+.brand { display: flex; align-items: center; gap: 6px; font: 700 17px/1 var(--sans); }
+.brand-mark { color: var(--accent); }
+.brand-rest { color: var(--text); }
+.brand .badge { background: var(--panel-2); }
+
+.pair-block { display: flex; flex-direction: column; gap: 1px; }
+.pair-select {
+  background: transparent;
+  color: var(--text);
+  border: none;
+  font: 700 16px/1.2 var(--sans);
+  cursor: pointer;
+  padding: 0;
+}
+.pair-select option { background: var(--panel); font-weight: 400; font-size: 13px; }
+.pair-meta { font-size: 10px; }
+
+.price-block { display: flex; flex-direction: column; gap: 1px; min-width: 140px; }
+.last-price { font: 700 20px/1.1 var(--mono); font-variant-numeric: tabular-nums; color: var(--text); }
+.last-price.buy { color: var(--buy); }
+.last-price.sell { color: var(--sell); }
+.price-caption { font-size: 10px; }
+
+.stat-block { display: flex; gap: 22px; }
+.stat { display: flex; flex-direction: column; gap: 1px; }
+.stat-label { color: var(--muted); font-size: 10px; }
+.stat-value { font: 600 12px/1.2 var(--mono); font-variant-numeric: tabular-nums; }
+.stat-value.buy { color: var(--buy); }
+.stat-value.sell { color: var(--sell); }
+
+.header-chips { margin-left: auto; display: flex; gap: 8px; align-items: center; }
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 9px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-family: var(--mono);
+  background: var(--panel);
+  color: var(--muted);
+  border: 1px solid var(--border);
+}
+.chip.good { color: var(--buy); }
+.chip.bad { color: var(--sell); }
+.chip.warn { color: var(--warn); }
+.dot { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); }
+.dot.good { background: var(--buy); }
+.dot.bad { background: var(--sell); }
+.dot.warn { background: var(--warn); }
+
+/* ---------- layout ---------- */
+
+.terminal-grid {
+  display: grid;
+  grid-template-columns: 280px minmax(0, 1fr) 300px;
+  gap: 6px;
+  padding: 6px;
+  flex: 1;
+  min-height: 0;
+}
+
+.col { display: flex; flex-direction: column; gap: 6px; min-width: 0; min-height: 0; }
+.market-column .book-panel { flex: 11; min-height: 0; }
+.market-column .trades-panel { flex: 9; min-height: 0; }
+.center-column .chart-panel { flex: 6; min-height: 0; }
+.center-column .orders-panel { flex: 4; min-height: 0; }
+.ticket-column .ticket-panel { flex: 1; min-height: 0; }
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.panel-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 12px;
+  border-bottom: 1px solid var(--border);
+  flex: none;
+}
+.panel-head h2 { margin: 0; font: 600 11px/1 var(--sans); text-transform: uppercase; letter-spacing: 0.8px; color: var(--muted); }
+
+/* ---------- chart ---------- */
+
+.chart-wrap { position: relative; flex: 1; min-height: 120px; }
+.chart-container { position: absolute; inset: 0; }
+.chart-empty {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  padding: 0 24px;
+  text-align: center;
+  pointer-events: none;
+}
+
+.interval-toggle { margin-left: auto; display: flex; gap: 4px; }
+.interval-toggle button {
+  background: transparent;
+  border: none;
+  color: var(--muted);
+  border-radius: 4px;
+  padding: 3px 9px;
+  font: 600 11px/1.4 var(--mono);
+  cursor: pointer;
+}
+.interval-toggle button.active { color: var(--accent); background: rgba(240, 185, 11, 0.1); }
+
+.badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 3px;
+  font-size: 10px;
+  font-family: var(--mono);
+  background: var(--panel-2);
+  color: var(--muted);
+}
+.badge.good { color: var(--buy); background: rgba(46, 189, 133, 0.12); }
+.badge.bad { color: var(--sell); background: rgba(246, 70, 93, 0.12); }
+.badge.warn { color: var(--warn); background: rgba(240, 185, 11, 0.12); }
+.badge.leader { color: var(--accent); background: rgba(240, 185, 11, 0.14); }
+
+/* ---------- order book ---------- */
+
+.book-head {
+  display: grid;
+  grid-template-columns: 34% 33% 33%;
+  color: var(--muted);
+  font-size: 10px;
+  padding: 6px 0 4px;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+  flex: none;
+}
+.book-head > span { padding-right: 10px; }
+.book-head > span:first-child { padding-left: 12px; }
+
+/* The ladder is two halves anchored on the spread: asks bottom-aligned above
+   it, bids top-aligned below it. Equal flex shares keep the mid row centred
+   whatever either side holds; a deep side clips its worst levels. */
+.book-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.book-side {
+  flex: 1 1 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.book-side.asks { justify-content: flex-end; }
+.book-side.bids { justify-content: flex-start; }
+
+.book-table { width: 100%; border-collapse: collapse; font-size: 11.5px; table-layout: fixed; }
+.book-table col.c-price { width: 34%; }
+.book-table col.c-size { width: 33%; }
+.book-table col.c-total { width: 33%; }
+.book-table td { padding: 2px 10px; position: relative; height: 20px; }
+.book-table td:first-child { padding-left: 12px; }
+.book-table .level { cursor: pointer; }
+.book-table .level:hover { background: var(--panel-2); }
+.book-table td.num { text-align: right; }
+/* Binance colours every number on a side: all ask cells red, all bid cells
+   green, so the two sides read differently at a glance. */
+.book-table .ask td { color: var(--sell); }
+.book-table .bid td { color: var(--buy); }
+.book-table td.cum::after {
+  content: "";
+  position: absolute;
+  right: 0;
+  top: 1px;
+  bottom: 1px;
+  width: var(--depth, 0%);
+  opacity: 0.18;
+  pointer-events: none;
+}
+.book-table .ask td.cum::after { background: var(--sell); }
+.book-table .bid td.cum::after { background: var(--buy); }
+
+.book-mid {
+  flex: none;
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 5px 10px 5px 12px;
+  color: var(--text);
+  font-family: var(--mono);
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  background: var(--panel-2);
+}
+.mid-price { font-size: 15px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.mid-price.buy { color: var(--buy); }
+.mid-price.sell { color: var(--sell); }
+.spread-meta { color: var(--muted); font-weight: 400; font-size: 10px; text-align: right; }
+
+.book-empty { padding: 10px 12px; color: var(--muted); font-size: 11px; text-align: center; }
+.book-empty.warn { color: var(--warn); }
+.book-note { padding: 4px 12px 7px; color: var(--muted); font-size: 10px; font-family: var(--mono); flex: none; }
+.book-note.warn { color: var(--warn); }
+
+/* ---------- trades tape ---------- */
+
+.tape-table, .data-table { width: 100%; border-collapse: collapse; font-size: 11.5px; }
+.tape-table th, .data-table th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--panel);
+  color: var(--muted);
+  font-weight: 500;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  text-align: left;
+  padding: 5px 10px 4px;
+  border-bottom: 1px solid var(--border);
+}
+.tape-table th.num, .data-table th.num { text-align: right; }
+.tape-table td, .data-table td { padding: 2px 10px; border-bottom: 1px solid rgba(43, 49, 57, 0.45); height: 22px; white-space: nowrap; }
+.tape-table tr:last-child td, .data-table tr:last-child td { border-bottom: none; }
+.tape-table td.num, .data-table td.num { text-align: right; }
+.empty { color: var(--muted); text-align: center; padding: 14px 10px !important; }
+
+.tape-table .price-buy { color: var(--buy); }
+.tape-table .price-sell { color: var(--sell); }
+
+/* ---------- ticket ---------- */
+
+.ticket-panel { display: flex; flex-direction: column; }
+
+.ticket-account {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 7px 12px 0;
+}
+.ticket-account label { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 10px; }
+.ticket-account input {
+  width: 60px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 4px;
+  padding: 4px 8px;
+  font: 600 12px/1.2 var(--mono);
+}
+
+.side-tabs { display: flex; padding: 8px 12px 0; gap: 8px; }
+.side-tab {
+  flex: 1;
+  border: none;
+  background: var(--panel-2);
+  color: var(--muted);
+  border-radius: 4px;
+  padding: 9px 0;
+  font: 600 13px/1 var(--sans);
+  cursor: pointer;
+}
+.side-tab.buy.active { background: rgba(46, 189, 133, 0.16); color: var(--buy); }
+.side-tab.sell.active { background: rgba(246, 70, 93, 0.16); color: var(--sell); }
+
+.ticket-form { display: flex; flex-direction: column; gap: 9px; padding: 10px 12px 12px; overflow-y: auto; min-height: 0; }
+
+.type-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.type-row select {
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 4px;
+  padding: 6px 10px;
+  font: 600 12px/1.2 var(--mono);
+  flex: 1;
+}
+.type-hint { color: var(--muted); font: 600 11px/1 var(--mono); }
+.market-note { background: var(--panel-2); border-radius: 4px; padding: 6px 9px; }
+
+.line-field {
+  display: flex;
+  align-items: center;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0 10px;
+  height: 34px;
+  gap: 8px;
+}
+.line-field:focus-within { border-color: var(--accent); }
+.line-label { color: var(--muted); font-size: 10px; white-space: nowrap; width: 52px; }
+.line-field input {
+  flex: 1;
+  background: transparent;
+  border: none;
+  color: var(--text);
+  font: 600 13px/1.2 var(--mono);
+  outline: none;
+  min-width: 0;
+  padding: 0;
+}
+.line-field input::placeholder { color: #545b66; font-weight: 400; }
+.line-unit { color: var(--muted); font: 600 11px/1 var(--mono); }
+.line-unit select {
+  background: transparent;
+  border: none;
+  color: var(--muted);
+  font: 600 11px/1 var(--mono);
+  outline: none;
+  cursor: pointer;
+}
+.line-unit select option { background: var(--panel); }
+
+.quick-buttons { display: flex; gap: 6px; }
+.quick-buttons button {
+  flex: 1;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  color: var(--muted);
+  border-radius: 4px;
+  padding: 4px 0;
+  font: 600 10px/1.2 var(--mono);
+  cursor: pointer;
+}
+.quick-buttons button:hover:not(:disabled) { color: var(--accent); border-color: var(--accent); }
+.quick-buttons button:disabled { opacity: 0.4; cursor: default; }
+
+.total-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 0 2px;
+}
+
+.advanced { border: 1px solid var(--border); border-radius: 4px; }
+.advanced summary {
+  padding: 6px 10px;
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+}
+.advanced summary::before { content: "▸ "; }
+.advanced[open] summary::before { content: "▾ "; }
+.advanced-body { display: flex; flex-direction: column; gap: 8px; padding: 2px 10px 10px; }
+.fee-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.check { display: flex; align-items: center; gap: 8px; color: var(--text); font-size: 11px; }
+.check input { accent-color: var(--accent); }
+
+.freeze-preview {
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 7px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.freeze-row { display: flex; align-items: center; justify-content: space-between; }
+.freeze-value { font-size: 13px; font-weight: 600; }
+
+.submit {
+  border: none;
+  border-radius: 4px;
+  padding: 12px 0;
+  font: 600 14px/1 var(--sans);
+  color: #fff;
+  cursor: pointer;
+}
+.submit.buy { background: var(--buy); }
+.submit.sell { background: var(--sell); }
+.submit:disabled { opacity: 0.6; cursor: default; }
+
+.result-banner {
+  margin: 0 12px 12px;
+  border-radius: 4px;
+  padding: 7px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 11px;
+}
+.result-banner.good { background: rgba(46, 189, 133, 0.12); color: var(--buy); }
+.result-banner.bad { background: rgba(246, 70, 93, 0.12); color: var(--sell); }
+
+/* ---------- orders tabs (center bottom) ---------- */
+
+.orders-panel { display: flex; flex-direction: column; }
+.orders-panel .panel-head { padding: 0; border-bottom: 1px solid var(--border); align-items: stretch; }
+.tabs { display: flex; }
+.tabs button {
+  background: transparent;
+  border: none;
+  color: var(--muted);
+  padding: 8px 16px;
+  font: 600 12px/1 var(--sans);
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+}
+.tabs button:hover { color: var(--text); }
+.tabs button.active { color: var(--accent); border-bottom-color: var(--accent); }
+.tabs .count { color: var(--muted); font-family: var(--mono); margin-left: 4px; font-size: 11px; }
+.orders-panel { overflow: auto; }
+.event-controls { margin-left: auto; display: flex; gap: 6px; align-items: center; padding-right: 10px; }
+.event-controls button, .actions button, .amend-form button {
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  color: var(--muted);
+  border-radius: 4px;
+  padding: 3px 9px;
+  font: 600 11px/1.2 var(--mono);
+  cursor: pointer;
+}
+.event-controls button:hover, .actions button:hover:not(:disabled), .amend-form button:hover { color: var(--text); border-color: var(--muted); }
+.actions button.ghost { opacity: 0.85; }
+.actions button:disabled { opacity: 0.4; cursor: default; }
+.actions { display: flex; gap: 6px; justify-content: flex-end; }
+/* Proportional tracks keep the cancel/amend buttons on screen at any panel
+   width; the order type (post-only / iceberg / stop) lives in the row tooltip. */
+.orders-panel .data-table { table-layout: fixed; }
+.orders-panel .data-table th:nth-child(1) { width: 8%; }
+.orders-panel .data-table th:nth-child(2) { width: 10%; }
+.orders-panel .data-table th:nth-child(3) { width: 18%; }
+.orders-panel .data-table th:nth-child(4) { width: 14%; }
+.orders-panel .data-table th:nth-child(5) { width: 21%; }
+.orders-panel .data-table th:nth-child(6) { width: 29%; }
+.orders-panel .data-table td { overflow: hidden; text-overflow: ellipsis; }
+.orders-panel .data-table td.actions-cell { padding-left: 4px; padding-right: 6px; }
+.orders-panel .actions { gap: 4px; }
+.orders-panel .actions button { padding: 3px 7px; }
+.data-table td.sell { color: var(--sell); }
+.data-table td.buy { color: var(--buy); }
+
+.amend-form {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  padding: 8px 12px;
+  border-top: 1px solid var(--border);
+  flex-wrap: wrap;
+}
+.amend-form input { width: 170px; }
+.amend-form button.primary { background: var(--accent); color: #10131a; border-color: var(--accent); }
+
+/* Narrow viewports: drop the secondary stats instead of truncating the
+   ticket column (the reference terminal does the same). */
+@media (max-width: 1250px) {
+  .stat-block .stat:nth-child(4) { display: none; }
+  .header-chips .chip.neutral { display: none; }
+  .stat-block { gap: 14px; }
+}
+
+/* ---------- footer / warning ---------- */
+
+.warning-banner {
+  background: rgba(240, 185, 11, 0.1);
+  color: var(--warn);
+  border-bottom: 1px solid rgba(240, 185, 11, 0.35);
+  padding: 5px 16px;
+  font-size: 11px;
+  flex: none;
+}
+
+.terminal-footer {
+  display: flex;
+  justify-content: space-between;
+  padding: 5px 16px;
+  border-top: 1px solid var(--border);
+  color: var(--muted);
+  font-size: 10px;
+  font-family: var(--mono);
+  background: var(--bg);
+  flex: none;
+}
+
+/* ---------- scrollbars ---------- */
+
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-thumb { background: var(--panel-3); border-radius: 4px; }
+::-webkit-scrollbar-track { background: transparent; }

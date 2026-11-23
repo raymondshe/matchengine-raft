@@ -7,6 +7,8 @@
 use std::path::Path;
 use std::time::Duration;
 use std::time::Instant;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
 use matchengine_raft::MatchEngineTypeConfig;
 use matchengine_raft::StorageConfig;
@@ -85,6 +87,9 @@ fn market_data_feed_publishes_trades_bbo_depth_and_bars() {
             .await
             .unwrap()
             .unwrap();
+        // Bound the leader's intake clock around the taker: every trade, bar,
+        // depth and BBO timestamp that follows must fall inside this window.
+        let before_sell_ms = now_ms();
         let sell_seq = client
             .write(&place(Order::new(OrderSide::Sell, 100.0, 4.0, 0)))
             .await
@@ -95,6 +100,7 @@ fn market_data_feed_publishes_trades_bbo_depth_and_bars() {
             .expect("sell sequence")
             .parse::<u64>()
             .expect("numeric sequence");
+        let after_sell_ms = now_ms();
         wait_for_events(&event_log, |events| {
             events
                 .iter()
@@ -196,9 +202,13 @@ fn market_data_feed_publishes_trades_bbo_depth_and_bars() {
         assert_eq!("100", first_trade["price"]);
         assert_eq!("4", first_trade["volume"]);
         assert_eq!("Sell", first_trade["taker_side"]);
+        let trade_ts = first_trade["ts_ms"]
+            .as_u64()
+            .expect("trade timestamp is numeric");
         assert!(
-            first_trade["ts_ms"].as_u64().unwrap() > 1_000,
-            "the leader stamps intake time, not the client placeholder"
+            (before_sell_ms..=after_sell_ms).contains(&trade_ts),
+            "the trade timestamp must be the taker's intake stamp \
+             ({before_sell_ms}..={after_sell_ms}), got {trade_ts}"
         );
         assert!(first_trade["log_index"].as_u64().unwrap() > 0);
 
@@ -220,6 +230,18 @@ fn market_data_feed_publishes_trades_bbo_depth_and_bars() {
         assert_eq!("100", bar["body"]["bar"]["open"]);
         assert_eq!("100", bar["body"]["bar"]["close"]);
         assert!(bar["body"]["bar"]["trade_count"].as_u64().unwrap() >= 1);
+        // The bar window and its last trade time are derived from the same
+        // taker timestamp as the fill — one time source for the whole feed.
+        assert_eq!(
+            trade_ts / 1_000 * 1_000,
+            bar["body"]["bar"]["window_start_ms"].as_u64().unwrap(),
+            "bar windows are anchored on the taker timestamp"
+        );
+        assert_eq!(
+            trade_ts,
+            bar["body"]["bar"]["last_ts_ms"].as_u64().unwrap(),
+            "a bar's last trade time is the taker timestamp"
+        );
 
         // The quantity amendment shows up as a post-batch depth total.
         let amended = events
@@ -340,4 +362,11 @@ async fn wait_for_events(
         );
         C::sleep(Duration::from_millis(50)).await;
     }
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or_default()
 }
