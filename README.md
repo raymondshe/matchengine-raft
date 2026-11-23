@@ -194,60 +194,11 @@ membership changes, failure drills and recovery.
 ./scripts/market-data-system.sh    # two engines + market-data WebSocket service
 ```
 
-## 🧾 Demo order desk
+## 🧾 Demo components
 
-[`order_system/`](./order_system/) is a standalone order-entry WebUI for a running node. It is a
-separate crate and process; the engine binary and its routes are unchanged. It calls the public HTTP
-API through the leader-aware client and reuses the console theme.
-
-```shell
-cargo run --manifest-path order_system/Cargo.toml -- \
-  --addr 127.0.0.1:24300 --engine 127.0.0.1:24301 --engine-id 1
-```
-
-Open <http://127.0.0.1:24300/demo/>. Tabs cover the order ticket, the full order book, the
-`/events` cursor tape and symbol configuration.
-
-![Demo order desk](./docs/demo-order-desk.png)
-
-See [`order_system/README.md`](./order_system/README.md) for the demo flow and
-[`docs/DEMO_ORDER_SYSTEM.md`](./docs/DEMO_ORDER_SYSTEM.md) for the design.
-
-## 📡 Market-data system over Aeron
-
-[`market_data_system/`](./market_data_system/) is the live distribution tier. The engine publishes
-its deterministic feed through the feature-gated `AeronSink` on streams 2001–2007; one exclusive
-publication per stream and a dedicated publisher thread keep a large depth snapshot from
-head-of-line-blocking trades. Aeron multicast fans the same bytes out to any number of stateless
-service instances, so the engine's publish cost is independent of WebSocket clients.
-
-The service keeps a shadow book per symbol, conflates diff depth at 100/1000 ms, pushes a snapshot
-on subscribe, serializes each stream message once and fans it out through bounded per-connection
-queues. The test page uses one WebSocket and switches symbols with live `UNSUBSCRIBE`/`SUBSCRIBE`:
-
-![Market-data WebSocket test page](./docs/market-data-system.png)
-
-**Why it is fast and live-safe**
-
-- `apply` never waits on a subscriber: the tap is a bounded `try_send`, and a full queue drops frames and emits `GAP` while consensus continues.
-- One exclusive Aeron publication per stream; a depth snapshot cannot block a trade or status stream.
-- One JSON encode per stream message, shared as `Bytes` across every subscriber.
-- An idle STATUS heartbeat keeps `@status` alive when the book is quiet; a late joiner can request an immediate reset snapshot on stream 2010 instead of waiting for the periodic broadcast.
-- 100/1000 ms depth conflation and latest-value collapse for `bookTicker` and partial depth, so bursts do not multiply socket writes.
-- Deterministic `(symbol_id, stream_id, market_seq, sub_seq)` keys make failover, restart and multi-instance fan-out content-identical.
-- Stateless instances rebuild from a periodic reset snapshot plus deltas and scale horizontally behind a load balancer.
-- The feed path is load-tested at 500k fills/s (495k fills/s, zero drops at the 8,192-frame tap queue).
-
-Run it with `./scripts/market-data-system.sh` (two engines over Aeron IPC) and open
-<http://127.0.0.1:24800/>. For the Linux external-driver and multicast validation, run
-`./scripts/aeron-linux-lab.sh`. See [`market_data_system/README.md`](./market_data_system/README.md)
-and [`docs/MARKET_DATA_WEBSOCKET.md`](./docs/MARKET_DATA_WEBSOCKET.md).
-
-For the Kubernetes/AWS EKS production path, **Profile A (direct Aeron multicast)** is the default
-implementation. It needs a multicast-capable platform (Cilium/Isovalent multicast, or Multus with
-AWS Transit Gateway multicast); the default VPC CNI cannot carry it. Direct NATS and the per-pod
-Aeron bridge are fallbacks. See
-[`docs/AERON_K8S_MESSAGE_BUS.md`](./docs/AERON_K8S_MESSAGE_BUS.md).
+The standalone [order desk](./order_system/README.md) and
+[market-data service](./market_data_system/README.md) have their own run instructions,
+screenshots and design links. Start both with the scripts above.
 
 ## 🗄️ Historical bars with TDengine
 

@@ -1,7 +1,8 @@
 # 🧾 Demo order desk
 
 A standalone order-entry WebUI for a running `matchengine-raft` node. It runs as a **separate
-process** in `order_system/`; the engine binary is not modified.
+process** in `order_system/`; the engine binary is not modified. See
+[`docs/DEMO_ORDER_SYSTEM.md`](../docs/DEMO_ORDER_SYSTEM.md) for the design.
 
 The demo has two pieces:
 
@@ -56,6 +57,9 @@ cargo run --manifest-path order_system/Cargo.toml -- \
   --engine 127.0.0.1:24301 \
   --engine-id 1
 ```
+
+Open <http://127.0.0.1:24300/demo/>: the tabs cover the order ticket, the full order book, the
+`/events` cursor tape and symbol configuration.
 
 - `--addr`: demo WebUI/BFF address.
 - `--targets <file>`: JSON file with one target per engine/symbol. Every instance serves every

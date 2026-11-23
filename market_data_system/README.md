@@ -41,6 +41,9 @@ a multicast-capable platform (Cilium/Isovalent multicast, or Multus with AWS Tra
 multicast), and the default VPC CNI cannot carry it. Direct NATS and the per-pod bridge are
 fallbacks; the transport comparison and multicast caveats are in
 [`docs/AERON_K8S_MESSAGE_BUS.md`](../docs/AERON_K8S_MESSAGE_BUS.md).
+The WebSocket protocol design is in
+[`docs/MARKET_DATA_WEBSOCKET.md`](../docs/MARKET_DATA_WEBSOCKET.md) and the feed implementation
+plan in [`docs/MARKET_DATA_PLAN.md`](../docs/MARKET_DATA_PLAN.md).
 
 ```
 engine A (EUR/USD) ── AeronSink ── streams 2001..2007 ──┐

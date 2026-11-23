@@ -134,44 +134,11 @@ Rust 1.89+（edition 2024）。构建脚本自带 `protoc`，无需系统安装�
 ./scripts/market-data-system.sh    # 两个引擎 + 行情 WebSocket 服务
 ```
 
-## 🧾 演示下单系统
+## 🧾 演示组件
 
-[`order_system/`](./order_system/) 是面向运行中节点的独立下单 WebUI，单独 crate/进程，不修改引擎二进制和路由。
-它通过 leader-aware 客户端调用公共 HTTP API，并复用控制台主题。
-
-```shell
-cargo run --manifest-path order_system/Cargo.toml -- \
-  --addr 127.0.0.1:24300 --engine 127.0.0.1:24301 --engine-id 1
-```
-
-打开 <http://127.0.0.1:24300/demo/>。页面包含下单票据、完整订单簿、`/events` 游标事件流和标的配置。
-
-![演示下单系统](./docs/demo-order-desk.png)
-
-演示流程见 [`order_system/README.md`](./order_system/README.md)，设计见
-[`docs/DEMO_ORDER_SYSTEM.md`](./docs/DEMO_ORDER_SYSTEM.md)。
-
-## 📡 基于 Aeron 的行情系统
-
-[`market_data_system/`](./market_data_system/) 是实时分发层。引擎通过 feature 门控的 `AeronSink`
-把确定性 feed 发布到 2001–2007 流；每个流一个独占 publication，独立 publisher 线程避免大深度快照
-阻塞成交。Aeron multicast 把相同字节分发给任意数量的无状态服务实例，因此引擎发布成本与 WebSocket
-客户端数量无关。
-
-服务为每个 symbol 维护影子订单簿，按 100/1000 ms 合并 diff depth，订阅时推送快照，每个流消息只序列化
-一次并通过有界连接队列分发。测试页使用单个 WebSocket，通过实时 `UNSUBSCRIBE`/`SUBSCRIBE` 切换 symbol：
-
-![行情 WebSocket 测试页](./docs/market-data-system.png)
-
-运行 `./scripts/market-data-system.sh`（两个引擎，Aeron IPC），打开 <http://127.0.0.1:24800/>。
-Linux 外部媒体驱动和 multicast 验证见 `./scripts/aeron-linux-lab.sh`。更多内容见
-[`market_data_system/README.md`](./market_data_system/README.md) 和
-[`docs/MARKET_DATA_WEBSOCKET.md`](./docs/MARKET_DATA_WEBSOCKET.md)。
-
-Kubernetes/AWS EKS 生产路径默认采用 **Profile A（引擎直接 Aeron 组播）**；需要支持组播的平台
-（Cilium/Isovalent multicast，或 Multus + AWS Transit Gateway multicast），默认 VPC CNI 无法承载。
-直接 NATS 和每引擎 Pod 的 Aeron bridge 是回退方案，见
-[`docs/AERON_K8S_MESSAGE_BUS.md`](./docs/AERON_K8S_MESSAGE_BUS.md)。
+独立下单系统见 [`order_system/README.md`](./order_system/README.md)，行情服务见
+[`market_data_system/README.md`](./market_data_system/README.md)；运行方式、截图和设计文档都在各自的
+README 中。
 
 ## 🗄️ 基于 TDengine 的历史 K 线
 
