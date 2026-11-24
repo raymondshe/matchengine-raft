@@ -23,6 +23,7 @@ pub mod crd;
 pub mod error;
 pub mod gui;
 pub mod images;
+pub mod metrics;
 pub mod model;
 pub mod operator;
 pub mod provision;

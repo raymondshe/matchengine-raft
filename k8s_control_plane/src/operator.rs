@@ -8,7 +8,8 @@
 //! through the CRD status subresource.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use futures::StreamExt;
@@ -29,6 +30,7 @@ use tracing::{debug, info, warn};
 
 use crate::api::{format_bytes, format_cpu};
 use crate::crd::{self, CrdKind, DEFAULT_NAMESPACE, ObjectKey};
+use crate::metrics::Metrics;
 use crate::model::{
     CapacityBlock, Condition, DeploymentState, DeploymentStatus, MarketDataService,
     MarketDataSymbolStatus, OrderSystemShardStatus, OrderSystemStatus, PackingMode, Phase, Release,
@@ -90,7 +92,7 @@ impl OperatorOptions {
 }
 
 /// Run the operator until cancellation or leadership loss.
-pub async fn run(client: Client, options: OperatorOptions) -> Result<()> {
+pub async fn run(client: Client, options: OperatorOptions, metrics: Arc<Metrics>) -> Result<()> {
     options.validate()?;
     info!(
         identity = %options.identity,
@@ -98,6 +100,7 @@ pub async fn run(client: Client, options: OperatorOptions) -> Result<()> {
         "cell operator starting"
     );
     let mut keeper = LeaseKeeper::acquire(client.clone(), &options).await?;
+    metrics.set_leader(true);
     info!("leader lease acquired; starting CRD watches");
 
     let (tx, mut rx) = mpsc::channel(1);
@@ -109,33 +112,50 @@ pub async fn run(client: Client, options: OperatorOptions) -> Result<()> {
         tokio::select! {
             _ = ticker.tick() => {}
             Some(()) = rx.recv() => {}
-            _ = keeper.lost() => bail!("leader lease lost; stopping reconciliation"),
+            _ = keeper.lost() => {
+                metrics.set_leader(false);
+                bail!("leader lease lost; stopping reconciliation")
+            }
         }
+        let started = Instant::now();
         match reconcile_once(&client, &options).await {
-            Ok(stats) => info!(
-                shards = stats.shards,
-                market_data_services = stats.market_data_services,
-                order_systems = stats.order_systems,
-                desired_objects = stats.desired_objects,
-                applied = stats.applied,
-                pruned = stats.pruned,
-                status_writes = stats.status_writes,
-                bootstraps = stats.bootstraps,
-                membership_changes = stats.membership_changes,
-                config_writes = stats.config_writes,
-                rollouts = stats.rollouts,
-                capacity_blocks = stats.capacity_blocks,
-                retention_marks = stats.retention_marks,
-                retention_deletes = stats.retention_deletes,
-                pvc_labels = stats.pvc_labels,
-                migration_actions = stats.migration_actions,
-                action_failures = stats.action_failures,
-                "reconcile complete"
-            ),
-            Err(error) => warn!(
-                error = %format!("{error:#}"),
-                "reconcile failed; retrying on the next watch/resync"
-            ),
+            Ok(stats) => {
+                metrics.observe_reconcile(
+                    stats.applied,
+                    stats.pruned,
+                    stats.status_writes,
+                    stats.rollouts,
+                    stats.action_failures,
+                    started.elapsed(),
+                );
+                info!(
+                    shards = stats.shards,
+                    market_data_services = stats.market_data_services,
+                    order_systems = stats.order_systems,
+                    desired_objects = stats.desired_objects,
+                    applied = stats.applied,
+                    pruned = stats.pruned,
+                    status_writes = stats.status_writes,
+                    bootstraps = stats.bootstraps,
+                    membership_changes = stats.membership_changes,
+                    config_writes = stats.config_writes,
+                    rollouts = stats.rollouts,
+                    capacity_blocks = stats.capacity_blocks,
+                    retention_marks = stats.retention_marks,
+                    retention_deletes = stats.retention_deletes,
+                    pvc_labels = stats.pvc_labels,
+                    migration_actions = stats.migration_actions,
+                    action_failures = stats.action_failures,
+                    "reconcile complete"
+                );
+            }
+            Err(error) => {
+                metrics.observe_failure();
+                warn!(
+                    error = %format!("{error:#}"),
+                    "reconcile failed; retrying on the next watch/resync"
+                );
+            }
         }
     }
 }

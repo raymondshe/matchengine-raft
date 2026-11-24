@@ -1,6 +1,6 @@
 # TODO
 
-Last reviewed: 2026-11-23. Working roadmap only; completed detail lives in the History section and
+Last reviewed: 2026-11-24. Working roadmap only; completed detail lives in the History section and
 git history — check out an earlier `TODO.md` from git for the full record
 (`git log -- TODO.md`, then `git show <commit>:TODO.md`). Measurements remain in
 [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md). See `AGENTS.md` for commands and the current branch
@@ -42,13 +42,14 @@ operability; **P2** = evidence, scale and important non-blocking work; **P3** = 
 
 ## Top priorities
 
-Last prioritised 2026-11-23. Since the last pass four items were closed: Raft-native leader
+Last prioritised 2026-11-24. Since the last pass six items were closed: Raft-native leader
 discovery/failover in `MatchEngineClient` (validated by a hard leader kill and a rolling upgrade),
 the bounded gRPC drain (pods now terminate in ~6 s instead of hanging until SIGKILL), the
 stateless order desk (solution G — one Deployment, no user-ID routing), and the market-data
 lifecycle/topology coupling (symbol create attaches it to every non-paused service in the cell,
 migration cutover waits for per-symbol feed readiness — validated live by creating `eurchf`
-through the GUI and watching the fast feed deliver real bookTicker frames). The public gateway is
+through the GUI and watching the fast feed deliver real bookTicker frames), and the lab
+observability stack plus the continuous order-replay harness (both in History). The public gateway is
 therefore **out of the execution queue**: leader routing is client-side and user-ID routing was
 removed rather than built. Its full design stays in `docs/GATEWAY_ROUTING.md` behind the stated
 triggers. The pitlane review's concrete findings are folded into the P1 security item (mode
@@ -69,7 +70,7 @@ resume from `(log_index, ordinal)` and dedupe on `event_id`. A local-lease cache
 an unfinished write, so read-after-write is not a guarantee; clients that need it must await the
 write response.
 
-**Priority assessment (2026-11-23).** Two things changed the tail of the queue since the last pass.
+**Priority assessment (2026-11-24).** Three things changed the tail of the queue since the last pass.
 The Binance-style trading terminal (`trading_terminal/`) is built and deployed as a pure frontend
 third client: it derives candles from the trade tape, the market-data service replays retained bars
 on subscribe, and order entry goes through the order-system BFF. That removes the "empty chart"
@@ -77,7 +78,9 @@ urgency from engine bar emission. The historical-bar tier's **P0 is now implemen
 trade-derived `1s`/`1m`/`5m` writer, exact-decimal text I/O, `GET /klines` with read-time rollups
 (`30m` from `5m`) and a TDengine-seeded WS replay. Lab evidence now includes a continuous order
 replay feeding the tape, a 5m↔30m comparison script and a watermark-based finality fix for the open
-30m bar. The remaining phases (trade spool, Lease failover, revisions/gaps, `/bars`, importers,
+30m bar. Observability (#3) and continuous replay (#18) are now closed in History; with the
+HPAs scaling, the fan-out/slow-consumer soak (#10) is the highest-value evidence item and rises
+to rank 4. The remaining phases (trade spool, Lease failover, revisions/gaps, `/bars`, importers,
 time-zone anchors and the three-dnode deployment) are still design, with an HA contract for one
 writer and stateless queriers
 ([`docs/HISTORICAL_BARS.md`](./docs/HISTORICAL_BARS.md) §§1, 4.2.1). They rank below P1:
@@ -90,17 +93,15 @@ production gates and is not counted as queue progress.
 
 | Rank | Item | P | Impact | Effort | Gate / reason for this rank |
 |---|---|---|---|---|---|
-| 1 | Control-plane and public-edge security (#1) | P1 | High | High | None — manager, both demo edges, NATS and the lab TDengine REST ingress are plaintext; exposure compounds with every new service |
+| 1 | Control-plane and public-edge security (#1) | P1 | High | High | None — manager, both demo edges, NATS and the lab TDengine REST and Grafana hosts are plaintext; exposure compounds with every new service |
 | 2 | Packaging and image supply (#2) | P1 | High | Medium | None — already broke a real rollout via `DiskPressure` image GC; must include the TDengine deployment/Secret before history ships |
-| 3 | Observability and HPA metrics (#3) | P1 | High | Medium | None — HPAs are pinned at min 1, so all scale/soak evidence waits on this |
-| 4 | Rollout invariants + acceptance automation (#4) | P2 | Medium | Low | None — cheap regression guard for P1 rollout changes; two real defects were found manually |
+| 3 | Rollout invariants + acceptance automation (#4) | P2 | Medium | Low | None — cheap regression guard before the P1 rollout work; two real defects were found manually |
+| 4 | Fan-out and slow-consumer soak (#10) | P2 | High | High | #3 shipped: all HPAs report CPU and scale, so this is now the largest reachable scale/evidence gap |
 | 5 | Historical bar store, remaining phases (#16) | P2 | High | High | P0 shipped with 5m/30m rollups and lab evidence; spool/failover, revisions/gaps, importers and HA deployment need #1/#2 and a three-dnode TDengine cluster |
-| 6 | Terminal deployment hardening (#17) | P2 | Medium | Low | Deployed with a hardcoded ClusterIP; also needs the CRD integration follow-up and #2 for image supply |
-| 7 | Docs synchronization (#8) | P2 | Medium | Low | Cheap guard; keep this file, `AGENTS.md` and the design docs aligned with the TDengine decision |
-| 8 | Pre-trade policy pipeline (#5) | P2 | Medium | Medium | Security-adjacent but not blocking; belongs at the edge/gateway |
+| 6 | Pre-trade policy pipeline (#5) | P2 | Medium | Medium | Security-adjacent but not blocking; belongs at the edge/gateway |
+| 7 | Terminal deployment hardening (#17) | P2 | Medium | Low | Deployed with a hardcoded ClusterIP; also needs the CRD integration follow-up and #2 for image supply |
+| 8 | Docs synchronization (#8) | P2 | Medium | Low | Cheap guard; keep this file, `AGENTS.md` and the design docs aligned with the new observability and historical-bar decisions |
 | 9 | Engine bar emission (#11) | P2 | Low | Low | Feed correctness, but the terminal no longer depends on it; needs a four-voter engine image roll |
-| 10 | Fan-out and slow-consumer soak (#10) | P2 | Medium | High | Needs the HPAs from #3 before its results mean anything |
-| 11 | Continuous order-replay evidence (#18) | P2 | Low | Low | Harness exists; useful now as a cheap tape/kline soaker while HPA metrics (#3) are unavailable |
 
 The `P0`–`P5` phases inside the historical-bar design are implementation phases, not this file's
 P0 defect priority; item #16 is P2 here. Environment-blocked items (multi-host, CSI, bare-metal,
@@ -129,14 +130,6 @@ as queue progress.
    follows security because it has already broken a rollout. Package the TDengine deployment with
    it — one dnode for the lab, three dnodes/mnodes with `REPLICA 3` for production — because the
    historical bar store is not shippable without a database to write to.
-3. **Observability and HPA metrics.** Install a metrics-server or Prometheus adapter so the one
-   order-system and five market-data HPAs can report CPU and actually scale, then add the
-   Prometheus text bridge for the engine's JSON `/metrics` (or a native `/metrics/prometheus`),
-   operator reconcile/rollout metrics, alerts, dashboards and log shipping. This is the largest
-   scale and evidence unblock: every HPA currently shows `<unknown>` and only the min-1 floor
-   applies, and load/soak work depends on it. It follows packaging because the current min-1 floor
-   still serves traffic and no known defect depends on autoscaling.
-
 **Explicit production gates not exercised in this lab.** Backup close-out: one live
 object-storage bucket cycle to confirm rclone upload, retention and alerting (the local-PVC path
 and the signed CRD drill are validated), and the CSI volume-snapshot drill, which needs
@@ -183,10 +176,10 @@ keep those halves visible; do not treat a green single-node run as production ev
 9. **Market-data manager controls.** Add GUI create/edit/scale and a read-only preview plan for
     `MarketDataService`; the upsert API, image/release update and the per-service picker are
     implemented. Add a rollback action that restores the previous image.
-10. **Market-data fan-out and slow-consumer evidence.** Soak many symbols, streams, connections
-    and slow consumers through the Kubernetes deployment; measure per-instance encode/fan-out
-    CPU, queue depth, gap/resync behavior and p99, and prove the engine's matching path is
-    unaffected.
+10. **Market-data fan-out and slow-consumer evidence (rank 4).** Soak many symbols, streams,
+    connections and slow consumers through the Kubernetes deployment; with #3 shipped, the HPAs
+    report CPU and scale, so measure per-instance encode/fan-out CPU, queue depth, gap/resync
+    behavior and p99, and prove the engine's matching path is unaffected.
 11. **Engine bar emission for sparse markets.** `MarketDataProcessor::update_bars` never publishes
     the first bar of a window: `BarAgg::new` seeds `last_live_ms = ts_ms`, so the 1 Hz partial-bar
     gate suppresses the opening emit, and a bar closes only when a later fill lands in a newer
@@ -244,12 +237,6 @@ keep those halves visible; do not treat a green single-node run as production ev
     `k8s_control_plane/deploy/terminal.yaml` with a runtime-resolved ClusterIP or Service DNS entry,
     add the `TradingTerminal` CRD/renderer integration, and route its image through the P1 #2 image
     supply. Do not add engine `/write` calls or embed the frontend in a crate.
-18. **Continuous order-replay evidence.** `scripts/replay-continuous.sh` loops
-    `scripts/replay-order-system.py` against one BFF target (default `gbpusd`) with a configurable
-    pause; each pass cancels leftover orders first, so it exercises the tape and kline path without
-    growing the book unbounded. Use it as a cheap soak while HPA metrics (#3) are unavailable, then
-    replace it with a controlled load test once autoscaling reports CPU. Keep it out of CI — it writes
-    to the live lab engine.
 
 **P3 - later, in impact order**
 
@@ -291,10 +278,6 @@ keep those halves visible; do not treat a green single-node run as production ev
   (`deploy/web-ingress.yaml`); the workload and packaging manifests remain. The demo images exist
   only in the node's local store, so add a registry (or an explicit `docker save`/`load` step)
   before the next fleet roll; a `DiskPressure` image GC evicted local images on 2026-11-18.
-- [ ] **P1** Observability: install a metrics-server/Prometheus adapter so the one order-system and
-  five market-data HPAs report CPU and scale, then add a Prometheus text bridge for the engine's
-  JSON `/metrics`, operator reconcile/rollout metrics, alert rules, dashboards and log shipping.
-  The console peer view is already covered by the NetworkPolicy rule.
 - [ ] **P1 (deferred)** Gateway integration: leader-aware routing from `SymbolRoute.status`,
   shadow/cutover/drain, retries and a canary path. Deferred by the 2026-11-20 decision in
   `docs/GATEWAY_ROUTING.md` — no public gateway is built until TLS/auth and packaging land, a
@@ -305,10 +288,6 @@ keep those halves visible; do not treat a green single-node run as production ev
   base-host order desk (`orders.<ingress>/demo/`) and `/demo/api`; the per-shard hosts are migration
   aliases. The demo currently exposes plaintext HTTP with no auth. Keep order entry in the order
   system and the manager's role to linking only.
-- [x] **P1** Order-system user-routing edge — resolved: the BFF no longer enforces user ranges and
-  one stateless Deployment/Service serves every user on the base `orders.<ingress>` host; the
-  per-shard hosts remain as migration aliases. Remaining work is per-user auth/rate limits, which
-  belongs to the P1 security item and the deferred gateway.
 - [ ] **P1 (explicit production gate)** Backup close-out: the `backup`/`backup-verify`/`restore
   --drill` CLI, `deploy/backup.yaml` (daily create + drill + HMAC signature + `rclone` upload +
   retention, hourly `backup-status` freshness check), `deploy/backup-alerts.yaml` and the shard
@@ -359,12 +338,6 @@ keep those halves visible; do not treat a green single-node run as production ev
 The `MarketDataService` CRD, renderer, operator lifecycle, fast/terminal profiles, four fast-only
 shard services and the global terminal service are live; see History. Remaining work:
 
-- [x] **P1** Market-data topology and symbol lifecycle coupling — done. Creating a symbol attaches
-  it to every non-paused service in the cell; stopping/starting is derived from deployment state;
-  migration waits for per-symbol feed readiness before finishing the route cutover. Subscriber
-  channels bind the wildcard address, so multiple pods may consume one group on one node and no
-  one-per-node placement rule is required. Deployments add hostname/zone topology spread for
-  availability. WebSocket sessions drain via the existing `preStop` hook on service rolls.
 - [ ] **P1** Public market-data edge: ingress TLS/authentication, rate limits, origin checks,
   connection/stream caps, NetworkPolicy and no public Aeron exposure; document the
   gateway/Ingress/manager boundary as part of the security review.
@@ -388,33 +361,24 @@ shard services and the global terminal service are live; see History. Remaining 
 - [ ] **P2** Manager controls for the market-data tier: add GUI create/edit/scale and a read-only
   preview plan; the upsert API, image/release update and the per-service image picker are
   implemented. Add a rollback action that restores the previous image.
-- [x] **P2 (Top priorities #16)** Historical bar store P0: TDengine schema, `1s`/`1m` builder and
-  upserts, `GET /klines`, WS snapshot/replay and exact `DECIMAL(38,18)` text I/O are implemented in
-  `market_data_system/` (`--history`, `src/history/`, `tests/history.rs`). Remaining phases are
-  tracked in the Top priorities item: trade spool/Lease failover, revisions/gaps, importer/REST
-  tail, three-dnode `REPLICA 3` cluster and HPA readers are gated on P1 security/packaging and a real
-  TDengine cluster. The OrbStack lab is wired (`deploy/tdengine.yaml`, `MarketDataService.history`,
-  `history-arm64-v4` + terminal `arm64-v4`) and the chart now seeds 500 bars from TDengine;
-  close the six live-API verification items before freezing the schema.
 - [ ] **P2 (Top priorities #17)** Trading terminal hardening: the pure-React client is deployed but
   `k8s_control_plane/deploy/terminal.yaml` hardcodes `DNS_UPSTREAM: 192.168.194.138`; resolve it at
   runtime, add the `TradingTerminal` CRD/renderer integration, and route the image through the P1
   image supply. Keep order entry on the order-system BFF and never call engine `/write` directly.
-- [ ] **P2 (Top priorities #18)** Continuous order-replay evidence: keep `scripts/replay-continuous.sh`
-  as a lab-only tape/kline soaker (default target `gbpusd`, 5 s pause, cleanup each pass) until HPA
-  metrics (#3) land; then replace it with a controlled load test. Never run it in CI.
 - [ ] **P2** Rollout and availability: canary policy, PDB verification, drain-aware image upgrades
   and a tested rollback path that restores subscriber capacity without touching matching. HPA CPU
-  metrics for the market-data and order-system HPAs need a metrics server or Prometheus adapter;
-  this is tracked as a P1 in Top priorities.
+  metrics are live (#3); the fan-out/slow-consumer soak (Top priorities #10, rank 4) can now measure
+  real scaling.
 - [ ] **P2** Aeron feed hardening (Profile A only): characterize the image-registration race and the
   single-node multi-subscriber behavior; make source startup readiness-gated (or add a per-source
   generation) so a stale feed is detected and rebuilt without log spam. Keep the 5-30 s
   re-subscribe watchdog as the fallback and avoid restart loops when an engine feed is genuinely
   down.
-- [ ] **P2** Observability: a Prometheus text endpoint (or bridge for the JSON metrics), per-symbol
-  readiness and last-frame age, feed lag, `GAP`/drop counts, queue depth, subscribers per stream,
-  conflation ratio, encode CPU and WebSocket close reasons; alerts and the manager status view.
+- [ ] **P2** Observability extras: the JSON→text bridge now exposes market-data messages, `GAP`s,
+  `resync`s, snapshot requests, slow closes, per-symbol readiness/last-frame/subscribers and
+  terminal conflation/throttling; Prometheus alerts cover gaps and not-ready symbols and the
+  Grafana dashboard shows message rate. Remaining: queue depth, encode CPU and close-reason
+  series, and surfacing alert state in the manager status view. The core stack is done (#3 in History).
 - [ ] **P2** Fan-out and slow-consumer soak: many symbols, 1,024-stream connections, mixed
   `SUBSCRIBE`/`UNSUBSCRIBE`, snapshot-request storms, slow clients and reconnect bursts. Measure
   per-instance encode/fan-out CPU, queue depth, resync time and p99, and prove the engine's
@@ -501,6 +465,25 @@ shard services and the global terminal service are live; see History. Remaining 
 Completed work is summarised here; detailed evidence, measurements and implementation notes remain
 in git history and the linked docs. For the full history, check out `TODO.md` from an earlier commit
 (`git log -- TODO.md`).
+
+- **2026-11-24** — Observability and HPA metrics (Top priorities #3 closed):
+  `k8s_control_plane/deploy/metrics-server.yaml` registers `metrics.k8s.io` so the five market-data
+  HPAs and the one order-system HPA report CPU and scale (verified by driving the order-system
+  Deployment to two replicas at a 1% target and back to the floor at 70%). A small Prometheus
+  server scrapes the JSON→text bridge for engine/market-data `/metrics`, the operator's per-pod
+  reconcile/rollout counters and seven alert rules; Grafana has a provisioned dashboard and
+  Promtail ships container logs to single-node Loki. Screenshots live in
+  `docs/grafana-observability.png`, `docs/prometheus-targets.png` and `docs/prometheus-alerts.png`;
+  install and verification are in `docs/OBSERVABILITY.md` and `scripts/check-observability.sh`.
+  Production HA, Secrets and retention remain in the production gates.
+- **2026-11-23** — Terminal history, 5m/30m rollups and replay evidence (Top priorities #18 closed):
+  the pure-React terminal seeds 500 bars from TDengine `/md/klines` and was deployed as
+  `matchengine-trading-terminal:arm64-v4`. `market_data_system` materialises `5m` bars and rolls
+  `30m` from `5m` children with a `1m` fallback, checked field-by-field in unit tests and live via
+  `scripts/check-30m-rollup.py` (18/18 traded windows). The open `30m` bar's `x` now comes only
+  from the event-time watermark. `scripts/replay-continuous.sh` drove a continuous GBPUSD tape
+  through the BFF, and the lab seeder gave each symbol its own price scale. The historical-bar P0
+  checklist item is closed here; its remaining phases stay in Top priorities #16.
 
 - **2026-11-22** — Market-data lifecycle/topology work: `place_symbol` now attaches a new symbol
   to every non-paused `MarketDataService` in its cell (per-symbol NATS group or shard-scoped

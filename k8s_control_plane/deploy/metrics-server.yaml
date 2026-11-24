@@ -1,0 +1,158 @@
+# metrics-server for the OrbStack reference lab.
+#
+# The renderer already emits autoscaling/v2 HPAs with CPU resource metrics and
+# the pod templates already declare cpu requests, but without a metrics.k8s.io
+# provider every HPA reports <unknown> and stays at its min-1 floor. This is
+# that provider: one small replica, self-signed kubelet certs accepted (the
+# lab kubelet serves a cert that does not match its InternalIP).
+#
+# Apply: kubectl apply -f k8s_control_plane/deploy/metrics-server.yaml
+# Verify: kubectl get --raw /apis/metrics.k8s.io/v1beta1/nodes | head -c 400
+#         kubectl get hpa -n match-eu-1     # CPU/<70% instead of <unknown>
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: metrics-server
+  namespace: kube-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: system:metrics-server
+rules:
+  - apiGroups: [""]
+    resources: [pods, nodes]
+    verbs: [get, list, watch]
+  # The kubelet authorises /metrics/resource with a SubjectAccessReview for
+  # these subresources; without them the scrape returns 403 on OrbStack.
+  - apiGroups: [""]
+    resources: [nodes/stats, nodes/metrics, pods/metrics]
+    verbs: [get]
+  - apiGroups: ["apps"]
+    resources: [deployments]
+    verbs: [get, list, watch]
+  # Required by the aggregated API server to authenticate request headers.
+  - apiGroups: [""]
+    resources: [configmaps]
+    resourceNames: [extension-apiserver-authentication]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: system:metrics-server
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:metrics-server
+subjects:
+  - kind: ServiceAccount
+    name: metrics-server
+    namespace: kube-system
+---
+# Aggregated API servers authenticate request headers through the built-in
+# auth-reader Role and delegate SubjectAccessReviews to the API server; the
+# kubelet uses the latter to authorise node-metrics scrapes.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: metrics-server-auth-reader
+  namespace: kube-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: extension-apiserver-authentication-reader
+subjects:
+  - kind: ServiceAccount
+    name: metrics-server
+    namespace: kube-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: system:auth-delegator-metrics-server
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:auth-delegator
+subjects:
+  - kind: ServiceAccount
+    name: metrics-server
+    namespace: kube-system
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: metrics-server
+  namespace: kube-system
+  labels:
+    k8s-app: metrics-server
+spec:
+  ports:
+    - name: https
+      port: 443
+      protocol: TCP
+      targetPort: https
+  selector:
+    k8s-app: metrics-server
+---
+apiVersion: apiregistration.k8s.io/v1
+kind: APIService
+metadata:
+  name: v1beta1.metrics.k8s.io
+spec:
+  group: metrics.k8s.io
+  version: v1beta1
+  service:
+    name: metrics-server
+    namespace: kube-system
+    port: 443
+  insecureSkipTLSVerify: true
+  groupPriorityMinimum: 100
+  versionPriority: 100
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: metrics-server
+  namespace: kube-system
+  labels:
+    k8s-app: metrics-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      k8s-app: metrics-server
+  template:
+    metadata:
+      labels:
+        k8s-app: metrics-server
+    spec:
+      serviceAccountName: metrics-server
+      containers:
+        - name: metrics-server
+          image: registry.k8s.io/metrics-server/metrics-server:v0.7.2
+          args:
+            - --cert-dir=/tmp
+            - --secure-port=10250
+            - --kubelet-insecure-tls
+            - --kubelet-preferred-address-types=InternalIP,Hostname,ExternalIP
+            - --kubelet-use-node-status-port
+            - --metric-resolution=15s
+          ports:
+            - name: https
+              containerPort: 10250
+              protocol: TCP
+          resources:
+            requests:
+              cpu: 100m
+              memory: 200Mi
+            limits:
+              memory: 400Mi
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}

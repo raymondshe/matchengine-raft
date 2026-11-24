@@ -1,0 +1,243 @@
+# Single-node Loki + Promtail DaemonSet for lab log shipping.
+# Seven-day filesystem retention, no object storage, no auth: this is a lab
+# evidence path, not a production log platform.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: loki-config
+  namespace: match-observability
+data:
+  loki.yaml: |-
+    auth_enabled: false
+    server:
+      http_listen_port: 3100
+    common:
+      instance_addr: 127.0.0.1
+      path_prefix: /loki
+      storage:
+        filesystem:
+          chunks_directory: /loki/chunks
+          rules_directory: /loki/rules
+      replication_factor: 1
+      ring:
+        kvstore:
+          store: inmemory
+    schema_config:
+      configs:
+        - from: 2024-01-01
+          store: tsdb
+          object_store: filesystem
+          schema: v13
+          index:
+            prefix: index_
+            period: 24h
+    limits_config:
+      retention_period: 168h
+    compactor:
+      working_directory: /loki/compactor
+      compaction_interval: 10m
+      retention_delete_delay: 2h
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: loki
+  namespace: match-observability
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: loki
+  template:
+    metadata:
+      labels:
+        app: loki
+    spec:
+      containers:
+        - name: loki
+          image: grafana/loki:3.4.0
+          args:
+            - -config.file=/etc/loki/loki.yaml
+          ports:
+            - name: http
+              containerPort: 3100
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              memory: 768Mi
+          volumeMounts:
+            - name: config
+              mountPath: /etc/loki/loki.yaml
+              subPath: loki.yaml
+              readOnly: true
+            - name: data
+              mountPath: /loki
+      volumes:
+        - name: config
+          configMap:
+            name: loki-config
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: loki
+  namespace: match-observability
+spec:
+  selector:
+    app: loki
+  ports:
+    - name: http
+      port: 3100
+      targetPort: http
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: promtail
+  namespace: match-observability
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: match-promtail
+rules:
+  - apiGroups: [""]
+    resources: [pods, nodes, namespaces]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: match-promtail
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: match-promtail
+subjects:
+  - kind: ServiceAccount
+    name: promtail
+    namespace: match-observability
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: promtail-config
+  namespace: match-observability
+data:
+  promtail.yaml: |-
+    server:
+      http_listen_port: 9080
+      grpc_listen_port: 0
+    positions:
+      filename: /tmp/positions.yaml
+    clients:
+      - url: http://loki.match-observability.svc.cluster.local:3100/loki/api/v1/push
+    scrape_configs:
+      - job_name: kubernetes-pods
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces:
+              names: [match-eu-1, match-control, match-observability]
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_node_name]
+            action: replace
+            target_label: __host__
+          - action: labelmap
+            regex: __meta_kubernetes_pod_label_(.+)
+          - source_labels: [__meta_kubernetes_namespace]
+            action: replace
+            target_label: namespace
+          - source_labels: [__meta_kubernetes_pod_name]
+            action: replace
+            target_label: pod
+          - source_labels: [__meta_kubernetes_pod_container_name]
+            action: replace
+            target_label: container
+          # /var/log/pods/.../0.log is a symlink into /var/lib/docker/containers
+          # on Docker-backed nodes; Promtail does not follow it, so point at the
+          # real json log via the discovered container id.
+          - source_labels: [__meta_kubernetes_pod_container_id]
+            target_label: __path__
+            regex: docker://(.+)
+            replacement: /var/lib/docker/containers/*$1/*-json.log
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: promtail
+  namespace: match-observability
+spec:
+  selector:
+    matchLabels:
+      app: promtail
+  template:
+    metadata:
+      labels:
+        app: promtail
+    spec:
+      serviceAccountName: promtail
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: promtail
+          image: grafana/promtail:3.4.0
+          env:
+            # Promtail 3.x adds spec.nodeName=<NODE_NAME> to Kubernetes pod
+            # discovery; without this it filters on the pod's own hostname and
+            # discovers zero log files.
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            # Promtail 3.4 derives its auto-added pod selector from HOSTNAME,
+            # which Kubernetes sets to the pod name; override it with the node.
+            - name: HOSTNAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          args:
+            - -config.file=/etc/promtail/promtail.yaml
+            - -client.url=http://loki.match-observability.svc.cluster.local:3100/loki/api/v1/push
+          ports:
+            - name: http
+              containerPort: 9080
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              memory: 256Mi
+          volumeMounts:
+            - name: config
+              mountPath: /etc/promtail/promtail.yaml
+              subPath: promtail.yaml
+              readOnly: true
+            - name: pods-log
+              mountPath: /var/log/pods
+              readOnly: true
+            - name: containers-log
+              mountPath: /var/lib/docker/containers
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: promtail-config
+        - name: pods-log
+          hostPath:
+            path: /var/log/pods
+            type: Directory
+        - name: containers-log
+          hostPath:
+            path: /var/lib/docker/containers
+            type: Directory

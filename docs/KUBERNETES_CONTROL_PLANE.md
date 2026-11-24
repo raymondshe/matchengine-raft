@@ -2121,7 +2121,13 @@ plaintext demo plumbing, and TLS/authentication/rate limits remain production-ed
 ### Metrics
 
 Each engine process exposes `/metrics` on its HTTP port, but it returns **JSON**
-(`MetricsResponse`), not Prometheus text. Two supported shapes:
+(`MetricsResponse`), not Prometheus text. The OrbStack lab now runs a **third, implemented shape**:
+one small HTTP bridge in `match-observability` discovers the rendered `*-metrics` Services, fetches
+their JSON and serves one aggregated text exposition to Prometheus, with `cell`/`shard`/`slot`/`pod`
+labels. It avoids an engine image rebuild and a sidecar in every pod. Prometheus also scrapes the
+operator's `/metrics` (`:9091`, reconcile/rollout counters), alerts use seven native rules, and
+Promtail ships logs to Loki. Install and verify with [`docs/OBSERVABILITY.md`](./OBSERVABILITY.md).
+The two earlier options remain the production choices:
 
 1. **Recommended engine change:** add `GET /metrics/prometheus` (text exposition format) and scrape
    it with a `PodMonitor` that has one `podMetricsEndpoint` per container port. This keeps one

@@ -360,6 +360,18 @@ voters), `0` = every append, `N > 0` = periodic. See [Storage](./docs/STORAGE.md
 contract and [production decisions](./docs/PERFORMANCE.md#production-configuration-decisions-2026-11-08)
 for the trade-offs.
 
+## 📈 Observability UI
+
+The lab's Prometheus and Grafana views show scrape health, alert state, Raft and
+market-data rates, and operator reconcile/rollout counters. Install and verify
+them with [`docs/OBSERVABILITY.md`](./docs/OBSERVABILITY.md).
+
+![Grafana lab observability dashboard](./docs/grafana-observability.png)
+
+![Prometheus target health](./docs/prometheus-targets.png)
+
+![Prometheus alert rules](./docs/prometheus-alerts.png)
+
 ## 📚 Documentation and testing
 
 - [Engine README](./match_engine/README.md) — build/run, engine configuration and internals.
@@ -370,6 +382,7 @@ for the trade-offs.
 - [Testing](./docs/TESTING.md) — cluster suite, replay matrix and failure tests.
 - [Performance](./docs/PERFORMANCE.md) — measured baselines and methodology.
 - [Market-data on Kubernetes](./docs/AERON_K8S_MESSAGE_BUS.md) — market-data message bus, multicast constraints and scale-out profiles.
+- [Lab observability](./docs/OBSERVABILITY.md) — metrics-server for HPA CPU, Prometheus bridge, operator metrics, alerts, Grafana dashboard and Loki log shipping.
 - [Trading terminal](./trading_terminal/README.md) — the React/TS client, deployment proxy and TDengine-seeded chart.
 - [Historical bars](./docs/HISTORICAL_BARS.md) — TDengine schema, exact-decimal contract, HA contract and measurements; the [interactive Archify export](./docs/historical-bars-tdengine.html) is checked in beside its PNG preview.
 - [Runbook](./docs/RUNBOOK.md) — cluster, upgrade, migration and recovery procedures.

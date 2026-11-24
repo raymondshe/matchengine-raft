@@ -129,8 +129,9 @@ The manager has two persistence backends behind the `CatalogStore` abstraction:
 
 `MarketDataService` is rendered by the operator as a Deployment, Service, PDB, NetworkPolicy,
 ConfigMap, optional Ingress and `autoscaling/v2` HPA. The HPA defaults to **minReplicas 1**, maxReplicas from
-`spec.replicas` (or `spec.autoscaling.maxReplicas`) and 70% CPU; the cluster needs a metrics server
-for the CPU metric to resolve. The Deployment uses `maxUnavailable: 0` with one surge pod and a
+`spec.replicas` (or `spec.autoscaling.maxReplicas`) and 70% CPU. Apply
+`deploy/metrics-server.yaml` for the CPU metric to resolve and the HPAs to scale; the full lab
+metrics/logging stack is in [`docs/OBSERVABILITY.md`](../docs/OBSERVABILITY.md). The Deployment uses `maxUnavailable: 0` with one surge pod and a
 `preStop` drain, and the operator writes per-symbol readiness, last-frame age, subscribers and
 `GAP` counts to status. The
 service exposes a fast single-symbol profile (`/ws/<symbol>@<stream>`, 32 streams, exact delivery)
@@ -255,6 +256,18 @@ gate's "verified backup newer than 24h" check uses the real bundle timestamp in 
 Older `crd-backup` / `crd-restore` commands remain available for a catalog-only export. Audit and
 engine PVC data are separate. Restore order is: CRs first, then workloads, then PVCs/engine
 recovery.
+
+## 📈 Lab observability UI
+
+The reference lab runs metrics-server for HPA CPU plus a small Prometheus,
+Grafana and Loki stack; see [`docs/OBSERVABILITY.md`](../docs/OBSERVABILITY.md)
+for installation and the HPA scale verification.
+
+![Grafana lab observability dashboard](../docs/grafana-observability.png)
+
+![Prometheus target health](../docs/prometheus-targets.png)
+
+![Prometheus alert rules](../docs/prometheus-alerts.png)
 
 ## ☸️ Cell operator
 

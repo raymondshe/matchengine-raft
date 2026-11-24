@@ -246,6 +246,17 @@ HTTP API 和 gRPC Raft 监听器（HTTP 端口 + 1000）按设计是**明文且�
 payload/purge、async WAL 或 thin LTO，它们都没有超过默认配置。详见
 [生产配置决策](./docs/PERFORMANCE.md#production-configuration-decisions-2026-11-08)。
 
+## 📈 可观测性界面
+
+实验环境的 Prometheus 与 Grafana 展示抓取状态、告警状态、Raft 与行情速率，以及 operator 的 reconcile/rollout 计数。
+安装与验证见 [`docs/OBSERVABILITY.md`](./docs/OBSERVABILITY.md)。
+
+![Grafana 实验可观测性面板](./docs/grafana-observability.png)
+
+![Prometheus 抓取目标状态](./docs/prometheus-targets.png)
+
+![Prometheus 告警规则](./docs/prometheus-alerts.png)
+
 ## 📚 文档与测试
 
 - [引擎 README](./match_engine/README_CN.md) — 构建/运行、引擎配置和内部结构。

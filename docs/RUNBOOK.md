@@ -1082,8 +1082,10 @@ being deleted automatically; the harness deletes the labelled acceptance PVCs ex
 
 The supervisor phase depends on kubelet ConfigMap propagation (up to about a minute per projected
 volume update), and each image roll waits for the terminating pod's grace period, so the full run
-takes about 15 minutes. The harness has no metrics-server dependency; HPA CPU scaling and CSI
-volume snapshots remain separate validation items.
+takes about 15 minutes. The harness has no metrics-server dependency; HPA CPU scaling is verified
+separately with `kubectl get hpa -n match-eu-1` after installing
+`deploy/metrics-server.yaml` (see [`docs/OBSERVABILITY.md`](./OBSERVABILITY.md)), while CSI volume
+snapshots remain a separate validation item.
 
 Latest runs on the OrbStack demo: the original eight phases passed in 889s on `operator-v78`
 (2026-11-17), including 0→1→2→3 pod replacement progress with 0/33/66/100 manager percentages in
@@ -1236,8 +1238,10 @@ kubectl -n match-eu-1 get deploy,svc,pdb,hpa,ingress -l matching.io/order-system
 
 The HPA floor is always one replica; `maxReplicas: 0` derives the ceiling from `spec.replicas`.
 The running Deployment omits `spec.replicas` so the HPA owns the count, and a paused system scales
-to zero and drops its HPA. CPU targets need a metrics-server or a Prometheus adapter; without one
-the HPA reports `<unknown>` but still enforces the floor.
+to zero and drops its HPA. CPU targets are resolved by `deploy/metrics-server.yaml`; once applied,
+the HPAs report `cpu: N%/70%` instead of `<unknown>` and scale. See
+[`docs/OBSERVABILITY.md`](./OBSERVABILITY.md) for the metrics-server, Prometheus, Grafana and Loki
+install and verification steps.
 
 Roll a new stateless image without touching Raft:
 

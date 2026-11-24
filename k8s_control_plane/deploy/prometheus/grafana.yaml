@@ -1,0 +1,121 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-datasources
+  namespace: match-observability
+data:
+  datasources.yaml: "apiVersion: 1\ndatasources:\n  - name: Prometheus\n    type: prometheus\n    access: proxy\n    url: http://prometheus.match-observability.svc.cluster.local:9090\n    isDefault: true\n  - name: Loki\n    type: loki\n    access: proxy\n    url: http://loki.match-observability.svc.cluster.local:3100"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboards
+  namespace: match-observability
+data:
+  provider.yaml: "apiVersion: 1\nproviders:\n  - name: matching\n    orgId: 1\n    folder: MatchEngine\n    type: file\n    disableDeletion: true\n    options:\n      path: /var/lib/grafana/dashboards"
+  matching-lab.json: "{\n  \"uid\": \"matching-lab\",\n  \"title\": \"MatchEngine · Lab Observability\",\n  \"tags\": [\n    \"matchengine\",\n    \"orbstack\"\n  ],\n  \"timezone\": \"utc\",\n  \"schemaVersion\": 39,\n  \"refresh\": \"10s\",\n  \"panels\": [\n    {\n      \"id\": 1,\n      \"type\": \"stat\",\n      \"title\": \"Engine leaders\",\n      \"gridPos\": {\n        \"h\": 5,\n        \"w\": 6,\n        \"x\": 0,\n        \"y\": 0\n      },\n      \"targets\": [\n        {\n          \"expr\": \"sum(matchengine_has_leader)\",\n          \"refId\": \"A\"\n        }\n      ]\n    },\n    {\n      \"id\": 2,\n      \"type\": \"stat\",\n      \"title\": \"Operator leader\",\n      \"gridPos\": {\n        \"h\": 5,\n        \"w\": 6,\n        \"x\": 6,\n        \"y\": 0\n      },\n      \"targets\": [\n        {\n          \"expr\": \"max(match_operator_leader)\",\n          \"refId\": \"A\"\n        }\n      ]\n    },\n    {\n      \"id\": 3,\n      \"type\": \"stat\",\n      \"title\": \"Bridge scrape failures\",\n      \"gridPos\": {\n        \"h\": 5,\n        \"w\": 6,\n        \"x\": 12,\n        \"y\": 0\n      },\n      \"targets\": [\n        {\n          \"expr\": \"sum(bridge_scrape_failed) or vector(0)\",\n          \"refId\": \"A\"\n        }\n      ]\n    },\n    {\n      \"id\": 4,\n      \"type\": \"stat\",\n      \"title\": \"Market-data gaps (5m)\",\n      \"gridPos\": {\n        \"h\": 5,\n        \"w\": 6,\n        \"x\": 18,\n        \"y\": 0\n      },\n      \"targets\": [\n        {\n          \"expr\": \"sum(increase(marketdata_gaps[5m]))\",\n          \"refId\": \"A\"\n        }\n      ]\n    },\n    {\n      \"id\": 5,\n      \"type\": \"timeseries\",\n      \"title\": \"Raft last log index by shard/slot\",\n      \"gridPos\": {\n        \"h\": 8,\n        \"w\": 12,\n        \"x\": 0,\n        \"y\": 5\n      },\n      \"targets\": [\n        {\n          \"expr\": \"matchengine_last_log_index\",\n          \"legendFormat\": \"{{shard}}/{{slot}}\"\
+    ,\n          \"refId\": \"A\"\n        }\n      ]\n    },\n    {\n      \"id\": 6,\n      \"type\": \"timeseries\",\n      \"title\": \"Market-data messages/s by service\",\n      \"gridPos\": {\n        \"h\": 8,\n        \"w\": 12,\n        \"x\": 12,\n        \"y\": 5\n      },\n      \"targets\": [\n        {\n          \"expr\": \"rate(marketdata_messages[1m])\",\n          \"legendFormat\": \"{{service}}\",\n          \"refId\": \"A\"\n        }\n      ]\n    },\n    {\n      \"id\": 7,\n      \"type\": \"timeseries\",\n      \"title\": \"Operator reconciles and rollouts\",\n      \"gridPos\": {\n        \"h\": 8,\n        \"w\": 12,\n        \"x\": 0,\n        \"y\": 13\n      },\n      \"targets\": [\n        {\n          \"expr\": \"rate(match_operator_reconciles_total[1m])\",\n          \"legendFormat\": \"reconciles/s\",\n          \"refId\": \"A\"\n        },\n        {\n          \"expr\": \"rate(match_operator_rollouts_total[5m])\",\n          \"legendFormat\": \"rollouts/s\",\n          \"refId\": \"B\"\n        }\n      ]\n    },\n    {\n      \"id\": 8,\n      \"type\": \"timeseries\",\n      \"title\": \"Operator reconcile duration (ms)\",\n      \"gridPos\": {\n        \"h\": 8,\n        \"w\": 12,\n        \"x\": 12,\n        \"y\": 13\n      },\n      \"targets\": [\n        {\n          \"expr\": \"match_operator_reconcile_duration_ms\",\n          \"legendFormat\": \"average\",\n          \"refId\": \"A\"\n        },\n        {\n          \"expr\": \"match_operator_reconcile_duration_ms_max\",\n          \"legendFormat\": \"max\",\n          \"refId\": \"B\"\n        }\n      ]\n    }\n  ],\n  \"version\": 1,\n  \"editable\": true,\n  \"graphTooltip\": 0,\n  \"time\": {\n    \"from\": \"now-6h\",\n    \"to\": \"now\"\n  },\n  \"timepicker\": {},\n  \"fiscalYearStartMonth\": 0,\n  \"liveNow\": false\n}"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grafana
+  namespace: match-observability
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: grafana
+  template:
+    metadata:
+      labels:
+        app: grafana
+    spec:
+      containers:
+      - name: grafana
+        image: grafana/grafana:11.6.0
+        env:
+        - name: GF_SECURITY_ADMIN_USER
+          value: admin
+        - name: GF_SECURITY_ADMIN_PASSWORD
+          value: admin
+        - name: GF_USERS_ALLOW_SIGN_UP
+          value: 'false'
+        ports:
+        - name: http
+          containerPort: 3000
+        readinessProbe:
+          httpGet:
+            path: /api/health
+            port: http
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            memory: 512Mi
+        volumeMounts:
+        - name: datasources
+          mountPath: /etc/grafana/provisioning/datasources
+          readOnly: true
+        - name: dashboards
+          mountPath: /etc/grafana/provisioning/dashboards
+          readOnly: true
+        - name: dashboard-data
+          mountPath: /var/lib/grafana/dashboards
+          readOnly: true
+        - name: data
+          mountPath: /var/lib/grafana
+        - name: plugins
+          mountPath: /var/lib/grafana/plugins
+      volumes:
+      - name: plugins
+        emptyDir: {}
+      - name: datasources
+        configMap:
+          name: grafana-datasources
+      - name: dashboards
+        configMap:
+          name: grafana-dashboards
+          items:
+          - key: provider.yaml
+            path: provider.yaml
+      - name: dashboard-data
+        configMap:
+          name: grafana-dashboards
+          items:
+          - key: matching-lab.json
+            path: matching-lab.json
+      - name: data
+        emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: grafana
+  namespace: match-observability
+spec:
+  selector:
+    app: grafana
+  ports:
+  - name: http
+    port: 3000
+    targetPort: http
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: grafana
+  namespace: match-observability
+spec:
+  rules:
+  - host: grafana.match-eu-1.example
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: grafana
+            port:
+              name: http

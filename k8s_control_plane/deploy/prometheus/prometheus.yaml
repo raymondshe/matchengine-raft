@@ -1,0 +1,231 @@
+# Small single-replica Prometheus for the OrbStack reference lab.
+#
+# It scrapes the JSON->text bridge (engine shards + market-data services) and
+# the operator's reconcile/rollout counters. The HPAs themselves stay on
+# metrics-server (deploy/metrics-server.yaml) so they report CPU immediately;
+# Prometheus is the dashboard/alerting plane, not the HPA metrics provider.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: prometheus
+  namespace: match-observability
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: match-prometheus
+rules:
+  - apiGroups: [""]
+    resources: [nodes, services, endpoints, pods]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: match-prometheus
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: match-prometheus
+subjects:
+  - kind: ServiceAccount
+    name: prometheus
+    namespace: match-observability
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: match-observability
+data:
+  prometheus.yml: |-
+    global:
+      scrape_interval: 15s
+      evaluation_interval: 15s
+      external_labels:
+        cell: eu-1
+    rule_files:
+      - /etc/prometheus/rules/*.yaml
+    scrape_configs:
+      - job_name: prometheus
+        static_configs:
+          - targets: ["127.0.0.1:9090"]
+      - job_name: json-bridge
+        static_configs:
+          - targets: ["json-bridge.match-observability.svc.cluster.local:9090"]
+      - job_name: match-operator
+        # One target per replica: a Service DNS target would load-balance
+        # scrapes across leader and standby and make counters jump between pods.
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces:
+              names: [match-control]
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+            action: keep
+            regex: true
+          - source_labels: [__meta_kubernetes_pod_ip, __meta_kubernetes_pod_annotation_prometheus_io_port]
+            separator: ":"
+            action: replace
+            target_label: __address__
+          - source_labels: [__meta_kubernetes_pod_name]
+            target_label: pod
+          - source_labels: [__meta_kubernetes_pod_node_name]
+            target_label: node
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-rules
+  namespace: match-observability
+data:
+  alerts.yaml: |-
+    groups:
+      - name: matching-lab
+        rules:
+          - alert: BridgeScrapeFailed
+            expr: bridge_scrape_failed > 0
+            for: 2m
+            labels:
+              severity: warning
+            annotations:
+              summary: "JSON->Prometheus bridge cannot read a service (/metrics)"
+              description: "Target {{ $labels.target }} has been unreadable for 2m."
+          - alert: MarketDataGap
+            expr: increase(marketdata_gaps[5m]) > 0
+            for: 1m
+            labels:
+              severity: warning
+            annotations:
+              summary: "Market data dropped frames on {{ $labels.service }}"
+          - alert: MarketDataSymbolNotReady
+            expr: '{__name__=~"marketdata_symbols_.+_ready"} == 0'
+            for: 3m
+            labels:
+              severity: warning
+            annotations:
+              summary: "{{ $labels.__name__ }} is 0 in {{ $labels.service }}"
+          - alert: OperatorLeaderless
+            expr: max(match_operator_leader) == 0
+            for: 5m
+            labels:
+              severity: critical
+            annotations:
+              summary: "No match-operator replica holds the Lease"
+          - alert: OperatorReconcileFailures
+            expr: increase(match_operator_reconcile_failures_total[10m]) > 0
+            for: 2m
+            labels:
+              severity: warning
+            annotations:
+              summary: "Operator reconcile returned an error in the last 10m"
+          - alert: OperatorSlowReconcile
+            expr: |-
+              rate(match_operator_reconcile_duration_ms_sum[5m])
+                / clamp_min(rate(match_operator_reconciles_total[5m]), 0.001) > 5000
+            for: 2m
+            labels:
+              severity: warning
+            annotations:
+              summary: "Rolling-average operator reconcile exceeded 5s"
+          - alert: EngineLeaderMissing
+            expr: matchengine_has_leader == 0
+            for: 5m
+            labels:
+              severity: warning
+            annotations:
+              summary: "Engine shard {{ $labels.shard }} slot {{ $labels.slot }} has no leader"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus
+  namespace: match-observability
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: prometheus
+  template:
+    metadata:
+      labels:
+        app: prometheus
+    spec:
+      serviceAccountName: prometheus
+      containers:
+        - name: prometheus
+          image: prom/prometheus:v3.4.0
+          args:
+            - --config.file=/etc/prometheus/prometheus.yml
+            - --storage.tsdb.path=/prometheus
+            - --storage.tsdb.retention.time=7d
+            - --web.enable-lifecycle
+            - --web.external-url=http://prometheus.match-eu-1.example
+          ports:
+            - name: http
+              containerPort: 9090
+          readinessProbe:
+            httpGet:
+              path: /-/ready
+              port: http
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              memory: 1Gi
+          volumeMounts:
+            - name: config
+              mountPath: /etc/prometheus/prometheus.yml
+              subPath: prometheus.yml
+              readOnly: true
+            - name: rules
+              mountPath: /etc/prometheus/rules
+              readOnly: true
+            - name: data
+              mountPath: /prometheus
+      volumes:
+        - name: config
+          configMap:
+            name: prometheus-config
+        - name: rules
+          configMap:
+            name: prometheus-rules
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus
+  namespace: match-observability
+  labels:
+    app: prometheus
+spec:
+  selector:
+    app: prometheus
+  ports:
+    - name: http
+      port: 9090
+      targetPort: http
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: prometheus
+  namespace: match-observability
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+spec:
+  rules:
+    - host: prometheus.match-eu-1.example
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: prometheus
+                port:
+                  name: http

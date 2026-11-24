@@ -16,6 +16,10 @@ spec:
     metadata:
       labels:
         app.kubernetes.io/name: match-operator
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9091"
+        prometheus.io/path: /metrics
     spec:
       serviceAccountName: match-operator
       automountServiceAccountToken: true
@@ -39,6 +43,9 @@ spec:
             - local
             - --resync-seconds
             - "10"
+          ports:
+            - name: metrics
+              containerPort: 9091
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -51,3 +58,19 @@ spec:
             limits:
               cpu: 500m
               memory: 256Mi
+---
+# Reconcile/rollout counters from the operator's Prometheus text endpoint.
+apiVersion: v1
+kind: Service
+metadata:
+  name: match-operator-metrics
+  namespace: match-control
+  labels:
+    app.kubernetes.io/name: match-operator
+spec:
+  selector:
+    app.kubernetes.io/name: match-operator
+  ports:
+    - name: metrics
+      port: 9091
+      targetPort: metrics

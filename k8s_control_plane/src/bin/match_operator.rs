@@ -6,10 +6,13 @@
 //!   --profile local
 //! ```
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use axum::{Router, routing::get};
 use clap::Parser;
+use matchengine_k8s_control_plane::metrics::Metrics;
 use matchengine_k8s_control_plane::operator::{OperatorOptions, run};
 use matchengine_k8s_control_plane::render::Profile;
 
@@ -67,6 +70,9 @@ struct Opt {
     /// Log desired changes and status, but do not apply/prune or write status.
     #[arg(long)]
     dry_run: bool,
+    /// Prometheus text exposition port for reconcile/rollout counters.
+    #[arg(long, default_value_t = 9091, env = "OPERATOR_METRICS_PORT")]
+    metrics_port: u16,
 }
 
 #[tokio::main]
@@ -106,5 +112,27 @@ async fn main() -> Result<()> {
     let client = kube::Client::try_default()
         .await
         .context("load Kubernetes client")?;
-    run(client, options).await
+
+    let metrics = Arc::new(Metrics::default());
+    let scrape = metrics.clone();
+    let port = opt.metrics_port;
+    tokio::spawn(async move {
+        let app = Router::new().route(
+            "/metrics",
+            get(move || {
+                let scrape = scrape.clone();
+                async move { scrape.render() }
+            }),
+        );
+        match tokio::net::TcpListener::bind(("0.0.0.0", port)).await {
+            Ok(listener) => {
+                if let Err(error) = axum::serve(listener, app).await {
+                    tracing::warn!(error = %error, "operator metrics server stopped");
+                }
+            }
+            Err(error) => tracing::warn!(error = %error, "could not bind operator metrics port"),
+        }
+    });
+
+    run(client, options, metrics).await
 }
