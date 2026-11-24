@@ -155,4 +155,12 @@ require_cronjob match-backup-status
 patch_cronjob match-backup backup
 patch_cronjob match-backup-status status
 log "patched both CronJobs: RCLONE_REMOTE=$MOUNT_PATH on $PVC_NAME"
+# The production window (02:17 UTC) falls while a laptop lab is asleep; with
+# startingDeadlineSeconds=600 the controller skips the missed run entirely, so
+# no fresh bundle is published and every hourly status check then fails as
+# "newest backup is stale". Give the lab a wake-time schedule and a full-day
+# deadline so one awake moment in 24h is enough to run the backup.
+kubectl -n "$NAMESPACE" patch cronjob match-backup --type merge -p \
+  '{"spec":{"schedule":"17 6 * * *","startingDeadlineSeconds":86400}}' >/dev/null
+log "lab backup schedule: 17 6 * * * with a 24h starting deadline"
 log "next: kubectl -n $NAMESPACE create job --from=cronjob/match-backup match-backup-bootstrap"

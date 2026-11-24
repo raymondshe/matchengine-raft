@@ -1598,6 +1598,14 @@ kubectl -n match-control create job --from=cronjob/match-backup match-backup-boo
 kubectl -n match-control logs job/match-backup-bootstrap -f
 ```
 
+The lab script also moves the daily schedule to `17 6 * * *` and extends
+`startingDeadlineSeconds` to 24h. The production `02:17 UTC` window falls while a
+laptop is asleep, and with the default 600-second deadline the controller skips the
+missed run entirely — then every hourly status Job fails with `newest backup ... is
+stale` (two pods per Job because `backoffLimit: 1` retries once). Clean up those
+finished Jobs via `kubectl -n match-control delete job <name>` or
+`scripts/cleanup-orbstack.sh --apply`; they are history, not live capacity.
+
 Scope the rclone credential to the backup bucket/prefix; the Jobs only need create, read and
 delete permission under that prefix. Edit `match-backup-config` for the shard, namespace,
 `RCLONE_REMOTE` (`s3:<bucket>/<prefix>`; the scripts append `/<shard>`), retention window (default
