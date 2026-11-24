@@ -59,11 +59,11 @@ impl Metrics {
 
     pub fn render(&self) -> String {
         let reconciles = self.reconciles.load(Ordering::Relaxed);
-        let average_ms = if reconciles == 0 {
-            0
-        } else {
-            self.duration_ms_sum.load(Ordering::Relaxed) / reconciles
-        };
+        let average_ms = self
+            .duration_ms_sum
+            .load(Ordering::Relaxed)
+            .checked_div(reconciles)
+            .unwrap_or(0);
         let mut out = String::new();
         counter(
             &mut out,

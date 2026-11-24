@@ -1259,7 +1259,7 @@ checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
 
 [[package]]
 name = "matchengine-k8s-control-plane"
-version = "0.0.0"
+version = "0.0.14"
 dependencies = [
  "anyhow",
  "async-trait",
