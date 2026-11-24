@@ -1,0 +1,146 @@
+# Manager API + GUI for the reference control plane.
+#
+# This replaces the imperative `kubectl create deployment match-manager` /
+# `expose` / `patch` sequence in the runbook. The Service port is named `http`
+# because deploy/web-ingress.yaml targets it by name.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: match-control
+  labels:
+    matching.io/role: control-plane
+    # Warn/audit during the lab rollout; the production overlay promotes these
+    # to enforce=restricted once every workload in the namespace is compliant.
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/warn-version: v1.33
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/audit-version: v1.33
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: match-manager
+  namespace: match-control
+  labels:
+    app.kubernetes.io/name: match-manager
+    app.kubernetes.io/component: manager
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: match-manager
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: match-manager
+        app.kubernetes.io/component: manager
+    spec:
+      serviceAccountName: match-manager
+      automountServiceAccountToken: true
+      securityContext:
+        runAsUser: 10001
+        runAsGroup: 10001
+        runAsNonRoot: true
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: manager
+          image: matchengine-k8s-control-plane:local
+          imagePullPolicy: IfNotPresent
+          command: ["/usr/local/bin/k8s-control-plane"]
+          args:
+            - serve
+            - --addr
+            - 0.0.0.0:8099
+            - --crd
+            - --no-seed
+            - --crd-namespace
+            - match-eu-1
+          ports:
+            - name: http
+              containerPort: 8099
+          readinessProbe:
+            httpGet:
+              path: /api/v1/health
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /api/v1/health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: data
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: match-manager
+  namespace: match-control
+  labels:
+    app.kubernetes.io/name: match-manager
+spec:
+  selector:
+    app.kubernetes.io/name: match-manager
+  ports:
+    - name: http
+      port: 8099
+      targetPort: http
+---
+# Only the gateway (ingress-nginx front door), the observability namespace and
+# in-namespace clients may reach the manager. No public exposure from a pod.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: match-manager
+  namespace: match-control
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: match-manager
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              matching.io/role: gateway
+      ports:
+        - protocol: TCP
+          port: 8099
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              matching.io/role: observability
+      ports:
+        - protocol: TCP
+          port: 8099
+    - from:
+        - podSelector: {}
+      ports:
+        - protocol: TCP
+          port: 8099

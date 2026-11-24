@@ -8,3 +8,10 @@ match_engine/fuzz/artifacts
 match_engine/fuzz/coverage
 .archify/
 .DS_Store
+# Generated packaging artifacts and real secrets — never commit these.
+dist/images/
+.install-*.yaml
+k8s_control_plane/overlays/production/images.patch.yaml
+k8s_control_plane/deploy/tdengine-credentials.yaml
+k8s_control_plane/deploy/backup-rclone.yaml
+k8s_control_plane/deploy/backup-signing-key.yaml

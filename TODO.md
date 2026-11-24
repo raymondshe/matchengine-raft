@@ -42,7 +42,7 @@ operability; **P2** = evidence, scale and important non-blocking work; **P3** = 
 
 ## Top priorities
 
-Last prioritised 2026-11-24. Since the last pass six items were closed: Raft-native leader
+Last prioritised 2026-11-24. Since the last pass seven items were closed: Raft-native leader
 discovery/failover in `MatchEngineClient` (validated by a hard leader kill and a rolling upgrade),
 the bounded gRPC drain (pods now terminate in ~6 s instead of hanging until SIGKILL), the
 stateless order desk (solution G — one Deployment, no user-ID routing), and the market-data
@@ -94,14 +94,13 @@ production gates and is not counted as queue progress.
 | Rank | Item | P | Impact | Effort | Gate / reason for this rank |
 |---|---|---|---|---|---|
 | 1 | Control-plane and public-edge security (#1) | P1 | High | High | None — manager, both demo edges, NATS and the lab TDengine REST and Grafana hosts are plaintext; exposure compounds with every new service |
-| 2 | Packaging and image supply (#2) | P1 | High | Medium | None — already broke a real rollout via `DiskPressure` image GC; must include the TDengine deployment/Secret before history ships |
-| 3 | Rollout invariants + acceptance automation (#4) | P2 | Medium | Low | None — cheap regression guard before the P1 rollout work; two real defects were found manually |
-| 4 | Fan-out and slow-consumer soak (#10) | P2 | High | High | #3 shipped: all HPAs report CPU and scale, so this is now the largest reachable scale/evidence gap |
-| 5 | Historical bar store, remaining phases (#16) | P2 | High | High | P0 shipped with 5m/30m rollups and lab evidence; spool/failover, revisions/gaps, importers and HA deployment need #1/#2 and a three-dnode TDengine cluster |
-| 6 | Pre-trade policy pipeline (#5) | P2 | Medium | Medium | Security-adjacent but not blocking; belongs at the edge/gateway |
-| 7 | Terminal deployment hardening (#17) | P2 | Medium | Low | Deployed with a hardcoded ClusterIP; also needs the CRD integration follow-up and #2 for image supply |
-| 8 | Docs synchronization (#8) | P2 | Medium | Low | Cheap guard; keep this file, `AGENTS.md` and the design docs aligned with the new observability and historical-bar decisions |
-| 9 | Engine bar emission (#11) | P2 | Low | Low | Feed correctness, but the terminal no longer depends on it; needs a four-voter engine image roll |
+| 2 | Rollout invariants + acceptance automation (#4) | P2 | Medium | Low | None — cheap regression guard before the P1 rollout work; two real defects were found manually |
+| 3 | Fan-out and slow-consumer soak (#10) | P2 | High | High | #3 shipped: all HPAs report CPU and scale, so this is now the largest reachable scale/evidence gap |
+| 4 | Historical bar store, remaining phases (#16) | P2 | High | High | P0 shipped with 5m/30m rollups; spool/failover, revisions/gaps, importers and HA deployment need #1 and a real three-dnode TDengine cluster |
+| 5 | Pre-trade policy pipeline (#5) | P2 | Medium | Medium | Security-adjacent but not blocking; belongs at the edge/gateway |
+| 6 | Terminal deployment hardening (#17) | P2 | Medium | Low | Deployed with a hardcoded ClusterIP; also needs the CRD integration follow-up |
+| 7 | Docs synchronization (#8) | P2 | Medium | Low | Cheap guard; keep this file, `AGENTS.md` and the design docs aligned with the new packaging/observability decisions |
+| 8 | Engine bar emission (#11) | P2 | Low | Low | Feed correctness, but the terminal no longer depends on it; needs a four-voter engine image roll |
 
 The `P0`–`P5` phases inside the historical-bar design are implementation phases, not this file's
 P0 defect priority; item #16 is P2 here. Environment-blocked items (multi-host, CSI, bare-metal,
@@ -122,14 +121,11 @@ as queue progress.
    lab currently maps `taosAdapter` REST through a plaintext Ingress with default credentials, so
    production needs Secret-backed credentials, a NetworkPolicy admitting only market-data pods,
    TLS and no public exposure — the historical-bar design must not ship a fourth plaintext edge.
-2. **Manager packaging and image supply.** Check in Deployment/Service/RBAC/NetworkPolicy/Pod
-   Security, Helm/Kustomize, digest-pinned image publication and CRD/etcd backup integration. The
-   demo still depends on local-only images, an `emptyDir` and a port-forward, which blocks a clean
-   install; a `DiskPressure` image GC evicted them during the 2026-11-18 rollout, so publish to a
-   local registry or add an explicit `docker save`/`load` step before the next fleet roll. It
-   follows security because it has already broken a rollout. Package the TDengine deployment with
-   it — one dnode for the lab, three dnodes/mnodes with `REPLICA 3` for production — because the
-   historical bar store is not shippable without a database to write to.
+2. **Manager packaging and image supply (shipped, see History).** `deploy/kustomization.yaml`
+   plus `overlays/{lab,production}`, a checked-in manager Deployment/Service/NetworkPolicy,
+   `scripts/publish-images.sh` (`docker save`/`load` or registry push with digest pinning) and the
+   `tdengine-ha.yaml` production profile are in place. Remaining production evidence — a real
+   registry, an object-storage backup cycle and a CSI snapshot drill — stays in the gates below.
 **Explicit production gates not exercised in this lab.** Backup close-out: one live
 object-storage bucket cycle to confirm rclone upload, retention and alerting (the local-PVC path
 and the signed CRD drill are validated), and the CSI volume-snapshot drill, which needs
@@ -466,6 +462,17 @@ Completed work is summarised here; detailed evidence, measurements and implement
 in git history and the linked docs. For the full history, check out `TODO.md` from an earlier commit
 (`git log -- TODO.md`).
 
+- **2026-11-24** — Manager packaging and image supply (#2 closed): checked in a Kustomize base
+  (`k8s_control_plane/deploy/kustomization.yaml`) with CRDs, RBAC, the scheduled backup path,
+  ingress and observability, plus `overlays/lab` (single-node TDengine, NATS, terminal, local
+  tags) and `overlays/production` (three-dnode `deploy/tdengine-ha.yaml` with per-dnode PVCs,
+  REPLICA 3, PDB and NetworkPolicy, restricted Pod Security and digest-pinned images). The manager
+  now has a checked-in Deployment/Service/NetworkPolicy with probes, Pod Security and the `http`
+  Service port the Ingress expects. `scripts/install-control-plane.sh` applies either overlay and
+  wires the templated backup Secrets; `scripts/publish-images.sh` builds all five images with
+  version `0.0.14`, writes `docker save` tarballs for the image-GC failure mode, or pushes to a
+  registry and renders the production digest patch. CI validates all three builds. Production
+  evidence (real registry, object-storage backup cycle, CSI snapshot drill) remains gated.
 - **2026-11-24** — Observability and HPA metrics (Top priorities #3 closed):
   `k8s_control_plane/deploy/metrics-server.yaml` registers `metrics.k8s.io` so the five market-data
   HPAs and the one order-system HPA report CPU and scale (verified by driving the order-system

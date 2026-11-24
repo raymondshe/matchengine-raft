@@ -1,0 +1,218 @@
+# Production TDengine profile for the historical-bar store.
+#
+# The checked-in tdengine.yaml is the disposable single-dnode lab profile
+# (emptyDir, taosAdapter on 6042 plus an IPv4 bridge sidecar, REPLICA 1).
+# This overlay replaces it with three dnodes/mnodes, per-dnode PVCs and a
+# database created with REPLICA 3 by market_data_system --tdengine-replica 3.
+#
+# Prerequisites:
+#   * a Secret tdengine-credentials in match-eu-1 with keys `user` and
+#     `password` (see tdengine-credentials.yaml.example); the same values go
+#     into MarketDataService.spec.history credentials.
+#   * a StorageClass with three dynamically provisioned volumes.
+#   * TLS/ingress policy for the REST endpoint; the lab Ingress is plaintext
+#     and must not be reused in production.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tdengine-ha-config
+  namespace: match-eu-1
+  labels:
+    matching.io/role: market-data-history
+data:
+  taos.cfg.tpl: |-
+    # Rendered per pod by the init container; __FQDN__ and __FIRST_EP__ are
+    # substituted from the pod's stable DNS name.
+    fqdn __FQDN__
+    firstEp __FIRST_EP__
+    serverPort 6030
+    supportVnodes 4096
+    debugFlag 131
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tdengine-ha-headless
+  namespace: match-eu-1
+  labels:
+    matching.io/role: market-data-history
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: tdengine-ha
+  ports:
+    - name: native
+      port: 6030
+      targetPort: native
+    - name: rest
+      port: 6041
+      targetPort: rest
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tdengine
+  namespace: match-eu-1
+  labels:
+    matching.io/role: market-data-history
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: tdengine-ha
+  ports:
+    - name: rest
+      port: 6041
+      targetPort: rest
+    - name: native
+      port: 6030
+      targetPort: native
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: tdengine-ha
+  namespace: match-eu-1
+  labels:
+    app.kubernetes.io/name: tdengine-ha
+    matching.io/role: market-data-history
+spec:
+  serviceName: tdengine-ha-headless
+  replicas: 3
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: tdengine-ha
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: tdengine-ha
+        matching.io/role: market-data-history
+    spec:
+      securityContext:
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        - name: render-config
+          image: busybox:1.36
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              FQDN="$(hostname).tdengine-ha-headless.match-eu-1.svc.cluster.local"
+              FIRST_EP="tdengine-ha-0.tdengine-ha-headless.match-eu-1.svc.cluster.local:6030"
+              sed -e "s|__FQDN__|$FQDN|" -e "s|__FIRST_EP__|$FIRST_EP|" \
+                /etc/taos-tpl/taos.cfg.tpl > /etc/taos/taos.cfg
+          volumeMounts:
+            - name: template
+              mountPath: /etc/taos-tpl
+              readOnly: true
+            - name: config
+              mountPath: /etc/taos
+      containers:
+        - name: tdengine
+          image: tdengine/tdengine:3.3.6.13
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: TAOS_FQDN
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: TZ
+              value: UTC
+          ports:
+            - name: rest
+              containerPort: 6041
+            - name: native
+              containerPort: 6030
+          readinessProbe:
+            tcpSocket:
+              port: rest
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: "1"
+              memory: 2Gi
+            limits:
+              cpu: "2"
+              memory: 4Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: config
+              mountPath: /etc/taos
+            - name: data
+              mountPath: /var/lib/taos
+            - name: logs
+              mountPath: /var/log/taos
+      volumes:
+        - name: template
+          configMap:
+            name: tdengine-ha-config
+        - name: config
+          emptyDir: {}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 100Gi
+    - metadata:
+        name: logs
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 20Gi
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: tdengine-ha
+  namespace: match-eu-1
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: tdengine-ha
+---
+# Only market-data pods and in-namespace operators may reach the cluster;
+# the REST endpoint is never publicly exposed in this profile.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: tdengine-ha
+  namespace: match-eu-1
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: tdengine-ha
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              matching.io/role: market-data
+      ports:
+        - protocol: TCP
+          port: 6041
+        - protocol: TCP
+          port: 6030
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: tdengine-ha
+      ports:
+        - protocol: TCP
+          port: 6030
+        - protocol: TCP
+          port: 6041

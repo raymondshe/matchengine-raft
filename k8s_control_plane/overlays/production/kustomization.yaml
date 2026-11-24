@@ -1,0 +1,15 @@
+# Production overlay: three-dnode TDengine with REPLICA 3 and digest-pinned
+# images. Run scripts/publish-images.sh --registry <registry> --pin first: it
+# writes the generated images.patch.yaml (gitignored) from the pushed digests.
+# Without that file this overlay deliberately fails to build rather than
+# silently deploying a mutable local tag.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../deploy
+  - ../../deploy/ha
+  - ../../deploy/alerts
+  - ../../deploy/terminal
+patches:
+  - path: images.patch.yaml
+  - path: enforce-policy.yaml

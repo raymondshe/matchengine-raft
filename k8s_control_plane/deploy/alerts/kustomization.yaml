@@ -1,0 +1,6 @@
+# PrometheusRule alerts require the Prometheus Operator CRDs. Not installed
+# by the lab overlay; Prometheus in the lab uses native rule files instead.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../backup-alerts.yaml

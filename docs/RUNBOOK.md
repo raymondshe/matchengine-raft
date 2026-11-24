@@ -17,6 +17,10 @@ on that context, Rust 1.89+ (the CRD/manager CLI commands below), `curl` and `py
 optional bar seeding). No registry is needed: OrbStack shares the local Docker image store with its
 node, and the manifests use `imagePullPolicy: IfNotPresent`. Keep several GB of disk headroom —
 `DiskPressure` image GC removes local-only tags and pods then fall into `ImagePullBackOff`.
+`./scripts/publish-images.sh --save` writes versioned `docker save` tarballs in `dist/images/`;
+after an image GC, `./scripts/publish-images.sh --load` restores them. For an image supply that
+survives a node rebuild, push to a registry with `--registry <host> --push --pin` — `--pin` renders
+`k8s_control_plane/overlays/production/images.patch.yaml` from the real repo digests.
 
 ### 1. Build the local images
 
@@ -59,6 +63,20 @@ cargo run --manifest-path k8s_control_plane/Cargo.toml --bin k8s-control-plane -
 ```
 
 ### 3. Manager and operator
+
+The packaged install applies CRDs, RBAC, the manager Deployment/Service/NetworkPolicy, the
+operator, the Ingresses and the scheduled backup path as one Kustomize build. The lab overlay
+adds single-node NATS, the single-dnode TDengine and the terminal; the production overlay swaps
+in three-dnode TDengine and digest-pinned images:
+
+```sh
+kubectl kustomize --load-restrictor=LoadRestrictionsNone k8s_control_plane/overlays/lab > /tmp/lab.yaml   # inspect
+./scripts/install-control-plane.sh --lab                 # apply + wire backup Secrets when env files are given
+kubectl -n match-control rollout status deploy/match-manager deploy/match-operator --timeout=180s
+kubectl -n match-control get lease match-engine-operator -o jsonpath='{.spec.holderIdentity}{"\n"}'
+```
+
+The imperative sequence below is the equivalent fallback when Kustomize is unavailable:
 
 ```sh
 kubectl -n match-control create deployment match-manager \
@@ -119,6 +137,12 @@ curl -s -u root:taosdata -X POST http://tdengine.match-eu-1.example/rest/sql \
 The TDengine manifest is the single-dnode lab profile: `emptyDir` storage, `taosadapter` on 6042 and
 a Node sidecar owning IPv4 `0.0.0.0:6041` (the Service/NetworkPolicy port). It is not the
 three-dnode `REPLICA 3` production topology in [HISTORICAL_BARS.md](./HISTORICAL_BARS.md).
+`k8s_control_plane/deploy/tdengine-ha.yaml` is that production profile: a three-replica StatefulSet
+with stable FQDNs and `firstEp`, per-dnode `data`/`logs` PVCs, a PodDisruptionBudget, a
+market-data-only NetworkPolicy and resource requests. Copy
+`tdengine-credentials.yaml.example` to a real Secret, apply it with the production overlay, and
+configure `MarketDataService.spec.history` with `--tdengine-replica 3` so the bar database itself
+is created with `REPLICA 3`.
 
 `tdengine-ingress.yaml` exposes only HTTP REST (6041) as `tdengine.match-eu-1.example` using the
 class-less ingress-nginx controller and the port-80 front door from step 5 — no `kubectl port-forward`

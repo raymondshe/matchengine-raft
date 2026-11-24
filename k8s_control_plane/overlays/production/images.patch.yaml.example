@@ -1,0 +1,66 @@
+# Template for the generated images.patch.yaml. scripts/publish-images.sh
+# --pin replaces REGISTRY and the sha256 placeholders with real repo digests
+# from the registry after a push; never commit the generated file.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: match-manager
+  namespace: match-control
+spec:
+  template:
+    spec:
+      containers:
+        - name: manager
+          image: REGISTRY/matchengine-k8s-control-plane@sha256:REPLACE_ME
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: match-operator
+  namespace: match-control
+spec:
+  template:
+    spec:
+      containers:
+        - name: operator
+          image: REGISTRY/matchengine-k8s-control-plane@sha256:REPLACE_ME
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: match-backup
+  namespace: match-control
+spec:
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+            - name: backup
+              image: REGISTRY/matchengine-k8s-control-plane@sha256:REPLACE_ME
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: match-backup-status
+  namespace: match-control
+spec:
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+            - name: status
+              image: REGISTRY/matchengine-k8s-control-plane@sha256:REPLACE_ME
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: match-terminal
+  namespace: match-eu-1
+spec:
+  template:
+    spec:
+      containers:
+        - name: terminal
+          image: REGISTRY/matchengine-trading-terminal@sha256:REPLACE_ME

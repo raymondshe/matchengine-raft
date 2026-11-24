@@ -1,0 +1,15 @@
+# Kustomize base for the reference control plane. Deployable overlays live in
+# k8s_control_plane/overlays/{lab,production}.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - crds.yaml
+  - rbac.yaml
+  - manager.yaml
+  - operator.yaml
+  - web-ingress.yaml
+  - backup.yaml
+  - prometheus/bridge.yaml
+  - prometheus/prometheus.yaml
+  - prometheus/grafana.yaml
+  - prometheus/loki.yaml

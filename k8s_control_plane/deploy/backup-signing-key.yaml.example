@@ -1,0 +1,10 @@
+# HMAC signing key for restore-drill attestations. Generate a fresh key per
+# environment with `openssl rand -out signing.key 32` and keep it outside git.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: match-backup-signing-key
+  namespace: match-control
+type: Opaque
+stringData:
+  signing.key: REPLACE_WITH_32_BYTE_RANDOM_KEY

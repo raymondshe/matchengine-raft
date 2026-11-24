@@ -1,0 +1,10 @@
+# Promote the control-plane namespace from warn/audit to enforcing restricted
+# Pod Security. Every workload in the base and this overlay runs non-root with
+# a dropped capability set and seccomp RuntimeDefault.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: match-control
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: v1.33

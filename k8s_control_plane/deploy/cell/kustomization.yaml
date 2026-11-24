@@ -1,0 +1,10 @@
+# Cell-level components for the single-node lab overlay.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../ingress-nginx.yaml
+  - ../metrics-server.yaml
+  - ../nats.yaml
+  - ../tdengine.yaml
+  - ../tdengine-ingress.yaml
+  - ../terminal.yaml

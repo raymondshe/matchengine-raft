@@ -117,6 +117,28 @@ The demo catalog contains three shards:
 Every shard has four voters. The Raft port is always the HTTP port + 1000. Each process is the
 existing single-symbol engine binary; packing does not merge Raft groups.
 
+## 📦 Packaged install and image supply
+
+`k8s_control_plane/deploy/kustomization.yaml` is the control-plane base (CRDs, RBAC, manager
+Deployment/Service/NetworkPolicy, operator, Ingresses and the scheduled backup path). The two
+overlays add the cell components:
+
+```sh
+./scripts/install-control-plane.sh --lab --dry-run      # inspect the merged manifests
+./scripts/install-control-plane.sh --lab                # apply the lab overlay
+./scripts/publish-images.sh --save                       # versioned docker save tarballs
+./scripts/publish-images.sh --load                       # restore them after an image GC
+./scripts/publish-images.sh --registry <host> --push --pin   # digest-pinned production patch
+./scripts/install-control-plane.sh --production         # needs the patch and real Secrets
+```
+
+Because the overlay directories are siblings of `deploy/`, the build uses
+`kubectl kustomize --load-restrictor=LoadRestrictionsNone`; CI validates both overlays. The
+production overlay uses `deploy/tdengine-ha.yaml` (three dnodes/mnodes, per-dnode PVCs, `REPLICA 3`,
+PodDisruptionBudget, NetworkPolicy) and enforces restricted Pod Security; the lab keeps the
+single-dnode `emptyDir` profile. Backup Secrets are templated as `*.yaml.example` and wired by
+`scripts/install-control-plane.sh`; `scripts/backup-local-lab.sh` remains the lab shortcut.
+
 ## 🧩 CRD-backed desired state
 
 The manager has two persistence backends behind the `CatalogStore` abstraction:

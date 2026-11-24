@@ -1,0 +1,17 @@
+# OrbStack lab overlay: single-dnode TDengine, local-only images, NATS Core,
+# class-less ingress-nginx and the port-80 front door set up by
+# scripts/ingress-frontdoor.sh.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../deploy
+  - ../../deploy/cell
+images:
+  # operator-v97 is the current locally built control-plane image (includes
+  # the --metrics-port endpoint); keep it instead of the older :local tag.
+  - name: matchengine-k8s-control-plane
+    newName: matchengine-k8s-control-plane
+    newTag: operator-v97
+  - name: matchengine-trading-terminal
+    newName: matchengine-trading-terminal
+    newTag: arm64-v4

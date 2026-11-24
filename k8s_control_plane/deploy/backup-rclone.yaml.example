@@ -1,0 +1,17 @@
+# rclone configuration for the scheduled backup CronJobs. Copy to
+# backup-rclone.yaml with a real credential, or create the Secret from a file:
+#   kubectl -n match-control create secret generic match-backup-rclone \
+#     --from-file=rclone.conf="$HOME/.config/rclone/rclone.conf"
+apiVersion: v1
+kind: Secret
+metadata:
+  name: match-backup-rclone
+  namespace: match-control
+type: Opaque
+stringData:
+  rclone.conf: |-
+    [backups]
+    type = s3
+    provider = AWS
+    env_auth = true
+    region = REPLACE_WITH_REGION

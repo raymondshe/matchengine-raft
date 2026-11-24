@@ -52,6 +52,22 @@ jobs:
       - name: Test
         run: cargo test --locked
 
+  manifests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build control-plane manifests
+        run: |
+          kubectl kustomize --load-restrictor=LoadRestrictionsNone k8s_control_plane/deploy > /dev/null
+          kubectl kustomize --load-restrictor=LoadRestrictionsNone k8s_control_plane/overlays/lab > /dev/null
+      - name: Build production overlay with template digests
+        run: |
+          sed -e 's|REGISTRY|registry.example.com|g' \
+              -e "s|REPLACE_ME|$(printf '0%.0s' $(seq 1 64))|g" \
+              k8s_control_plane/overlays/production/images.patch.yaml.example \
+              > k8s_control_plane/overlays/production/images.patch.yaml
+          kubectl kustomize --load-restrictor=LoadRestrictionsNone k8s_control_plane/overlays/production > /dev/null
+
   async-wal:
     runs-on: ubuntu-latest
     steps:
