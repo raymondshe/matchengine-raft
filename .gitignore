@@ -7,3 +7,4 @@ match_engine/fuzz/corpus
 match_engine/fuzz/artifacts
 match_engine/fuzz/coverage
 .archify/
+.DS_Store

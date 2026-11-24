@@ -66,7 +66,10 @@ shows seven rules). Grafana: <http://grafana.match-eu-1.example/> (`admin`/`admi
 provisioned **MatchEngine · Lab Observability** dashboard and both datasources.
 Loki is queried through Grafana or the API; container logs from
 `match-eu-1`, `match-control` and `match-observability` arrive with `namespace`,
-`pod`, `container` and rendered `matching.io/*` labels.
+`pod`, `container` and rendered `matching.io/*` labels. Promtail's own `/targets`
+and `/service-discovery` pages are at <http://promtail.match-eu-1.example/>.
+All four UIs are served by the checked-in Ingress and the port-80 front door — no
+`kubectl port-forward` is needed.
 
 A real scale test: set the `OrderSystem` CR's `spec.autoscaling.targetCpuUtilization`
 to `1` (patch the CR, not the HPA — the operator re-renders the HPA every 10 s),

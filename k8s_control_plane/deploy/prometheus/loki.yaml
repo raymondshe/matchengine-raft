@@ -241,3 +241,38 @@ spec:
           hostPath:
             path: /var/lib/docker/containers
             type: Directory
+---
+# Promtail's own /targets and /service-discovery pages replaced the two
+# temporary kubectl port-forwards used while bringing log shipping up.
+apiVersion: v1
+kind: Service
+metadata:
+  name: promtail
+  namespace: match-observability
+  labels:
+    app: promtail
+spec:
+  selector:
+    app: promtail
+  ports:
+    - name: http
+      port: 9080
+      targetPort: http
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: promtail
+  namespace: match-observability
+spec:
+  rules:
+    - host: promtail.match-eu-1.example
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: promtail
+                port:
+                  name: http

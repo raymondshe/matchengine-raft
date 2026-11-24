@@ -376,6 +376,13 @@ ensure_manager() {
         ok "manager reachable at $MANAGER"
         return
     fi
+    # Prefer the checked-in Ingress; port-forward is only a fallback for a
+    # cluster where the ingress stack is not installed.
+    MANAGER="http://console.match-eu-1.example"
+    if manager_healthy; then
+        ok "manager reachable at $MANAGER"
+        return
+    fi
     MANAGER="http://127.0.0.1:$LOCAL_PORT"
     if manager_healthy; then
         ok "manager reachable at $MANAGER"
@@ -2055,7 +2062,8 @@ run_phases() {
 main() {
     case "$ACTION" in
     cleanup)
-        MANAGER=${MANAGER_OVERRIDE:-http://127.0.0.1:$LOCAL_PORT}
+        MANAGER=${MANAGER_OVERRIDE:-http://console.match-eu-1.example}
+        manager_healthy || MANAGER="http://127.0.0.1:$LOCAL_PORT"
         cleanup_all
         CLEANED=1
         return
