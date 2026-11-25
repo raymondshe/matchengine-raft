@@ -28,6 +28,7 @@ use openraft::raft::StreamAppendResult;
 use openraft::raft::TransferLeaderRequest;
 use openraft::raft::VoteRequest;
 use tokio::io::AsyncWriteExt;
+use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::Request;
@@ -89,6 +90,11 @@ fn next_snapshot_len(received: u64, chunk_len: usize) -> Result<u64, Status> {
 }
 
 static NEXT_STAGING_FILE: AtomicU64 = AtomicU64::new(0);
+
+/// At most four snapshot streams may stage at once, bounding disk usage to
+/// 4 × MAX_SNAPSHOT_BYTES even if many peers (or an attacker with gRPC access)
+/// open streams concurrently.
+static SNAPSHOT_STREAM_PERMITS: Semaphore = Semaphore::const_new(4);
 
 /// Streams received snapshot chunks into a staging file.
 ///
@@ -265,6 +271,10 @@ impl RaftService for RaftGrpcService {
         let started = Instant::now();
         let mut stream = request.into_inner();
 
+        let _permit = SNAPSHOT_STREAM_PERMITS
+            .acquire()
+            .await
+            .map_err(|_| Status::unavailable("snapshot install overloaded"))?;
         let mut staging = SnapshotStaging::create(&self.snapshot_staging_dir).await?;
         let mut vote: Option<VoteOf<MatchEngineTypeConfig>> = None;
         let mut meta: Option<SnapshotMetaOf<MatchEngineTypeConfig>> = None;

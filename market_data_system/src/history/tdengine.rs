@@ -12,6 +12,7 @@ use serde_json::Value;
 
 use crate::config::HistoryConfig;
 use crate::config::SymbolSpec;
+use crate::config::history_table_name;
 
 use super::BarRow;
 use super::decimal;
@@ -46,7 +47,9 @@ impl HistoryStore {
             base: config.url.trim_end_matches('/').to_string(),
             user: config.user.clone(),
             password: config.password.clone(),
-            database: config.database.clone(),
+            // The database name is also the /rest/sql/<db> path segment, so
+            // sanitize it once here and use the same identifier everywhere.
+            database: history_table_name(&config.database),
         })
     }
 
@@ -89,7 +92,8 @@ impl HistoryStore {
         config: &HistoryConfig,
         symbols: &[SymbolSpec],
     ) -> io::Result<()> {
-        let db = valid_identifier(&self.database)?;
+        let db_name = history_table_name(&self.database);
+        let db = valid_identifier(&db_name)?;
         if config.auto_create {
             self.sql(&format!(
                 "CREATE DATABASE IF NOT EXISTS {db} PRECISION 'us' KEEP {} DURATION 10d \
@@ -126,7 +130,8 @@ impl HistoryStore {
             .await?;
 
         for symbol in symbols {
-            let name = valid_identifier(&symbol.symbol)?;
+            let table_symbol = history_table_name(&symbol.symbol);
+            let name = valid_identifier(&table_symbol)?;
             for interval in ["1s", "1m", "5m"] {
                 self.sql(&format!(
                     "CREATE TABLE IF NOT EXISTS bars_{interval}_{name} \
@@ -140,7 +145,8 @@ impl HistoryStore {
 
     /// Drops the store, used by integration tests to isolate databases.
     pub async fn drop_database(&self) -> io::Result<()> {
-        let db = valid_identifier(&self.database)?;
+        let db_name = history_table_name(&self.database);
+        let db = valid_identifier(&db_name)?;
         // A DROP against /rest/sql without a database is handled by a fresh
         // client with the same credentials.
         let url = format!("{}/rest/sql", self.base);
@@ -169,17 +175,7 @@ impl HistoryStore {
         if rows.is_empty() {
             return Ok(());
         }
-        let name = valid_identifier(symbol)?;
-        let table = match interval_ms {
-            super::SEC_MS => format!("bars_1s_{name}"),
-            super::MIN_MS => format!("bars_1m_{name}"),
-            super::FIVE_MIN_MS => format!("bars_5m_{name}"),
-            other => {
-                return Err(io::Error::other(format!(
-                    "cannot upsert interval {other}ms; only 1s/1m are materialized"
-                )));
-            }
-        };
+        let table = table_name(interval_ms, symbol)?;
         let mut statement = format!("INSERT INTO {table} VALUES ");
         for (index, row) in rows.iter().enumerate() {
             if index > 0 {
@@ -279,15 +275,7 @@ impl HistoryStore {
     }
 
     fn bar_table(&self, interval_ms: u64, symbol: &str) -> io::Result<String> {
-        let name = valid_identifier(symbol)?;
-        match interval_ms {
-            super::SEC_MS => Ok(format!("bars_1s_{name}")),
-            super::MIN_MS => Ok(format!("bars_1m_{name}")),
-            super::FIVE_MIN_MS => Ok(format!("bars_5m_{name}")),
-            _ => Err(io::Error::other(format!(
-                "no table for interval {interval_ms}ms"
-            ))),
-        }
+        table_name(interval_ms, symbol)
     }
 
     async fn query_bars(&self, statement: &str) -> io::Result<Vec<BarRow>> {
@@ -482,6 +470,23 @@ pub fn tdengine_interval(interval_ms: u64) -> Option<&'static str> {
     }
 }
 
+/// Every table/tag identifier is derived through this one path so a symbol
+/// accepted by the CLI (`btc-usdt`) always maps to the same TDengine name
+/// (`bars_1s_btc_usdt`) in schema creation, upserts and queries.
+fn table_name(interval_ms: u64, symbol: &str) -> io::Result<String> {
+    let table_symbol = history_table_name(symbol);
+    let name = valid_identifier(&table_symbol)?;
+    let suffix = match interval_ms {
+        super::SEC_MS => "1s",
+        super::MIN_MS => "1m",
+        super::FIVE_MIN_MS => "5m",
+        other => {
+            return Err(io::Error::other(format!("no table for interval {other}ms")));
+        }
+    };
+    Ok(format!("bars_{suffix}_{name}"))
+}
+
 fn valid_identifier(name: &str) -> io::Result<&str> {
     let valid = !name.is_empty()
         && name.len() <= 32
@@ -508,6 +513,32 @@ mod tests {
             Some(1_735_776_000_123_456)
         );
         assert_eq!(parse_timestamp_us("not-a-date"), None);
+    }
+
+    #[test]
+    fn hyphenated_symbols_use_one_sanitized_identifier_everywhere() {
+        let symbol = "btc-usdt";
+        let sanitized = history_table_name(symbol);
+        assert_eq!("btc_usdt", sanitized);
+        assert_eq!("btc_usdt", valid_identifier(&sanitized).unwrap());
+        for (interval, expected) in [
+            (super::super::SEC_MS, "bars_1s_btc_usdt"),
+            (super::super::MIN_MS, "bars_1m_btc_usdt"),
+            (super::super::FIVE_MIN_MS, "bars_5m_btc_usdt"),
+        ] {
+            assert_eq!(expected, table_name(interval, symbol).unwrap());
+            assert_eq!(expected, table_name(interval, "btc_usdt").unwrap());
+        }
+        // The database identifier follows the same rule, including the REST
+        // URL path segment used by `sql()` and `drop_database()`.
+        let config = HistoryConfig {
+            database: "market-bars".to_string(),
+            ..HistoryConfig::default()
+        };
+        let store = HistoryStore::new(&config).unwrap();
+        assert_eq!("market_bars", store.database);
+        let sanitized_db = history_table_name(&store.database);
+        assert_eq!("market_bars", valid_identifier(&sanitized_db).unwrap());
     }
 
     #[test]

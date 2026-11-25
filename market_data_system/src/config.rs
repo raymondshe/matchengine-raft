@@ -1,5 +1,6 @@
 //! Service configuration shared by the feed, hub and WebSocket sessions.
 
+use std::collections::HashSet;
 use std::time::Duration;
 
 use serde::Serialize;
@@ -10,6 +11,40 @@ pub const DEFAULT_BAR_INTERVALS_MS: &[u64] = &[1_000, 60_000];
 pub const DEFAULT_SNAPSHOT_LEVELS: usize = 200;
 /// Default number of historical bars in a WebSocket subscribe-time replay.
 pub const DEFAULT_HISTORY_SNAPSHOT_BARS: usize = 500;
+/// Hard cap on retained/replayed bars per interval. `--history-snapshot-bars`
+/// can lower this, never raise it.
+pub const MAX_HISTORY_SNAPSHOT_BARS: usize = 1_000;
+/// TDengine table identifiers are limited to 32 lowercase ASCII bytes.
+pub const MAX_TDENGINE_IDENTIFIER_LEN: usize = 32;
+
+/// Sanitizes a stream symbol for use as a TDengine table/tag identifier.
+///
+/// `parse_symbol` accepts '-' because it is safe in file names and WebSocket
+/// stream keys; TDengine identifiers are not. Replace it with '_' at the
+/// storage boundary only, so the public symbol stays unchanged.
+pub fn history_table_name(symbol: &str) -> String {
+    symbol.replace('-', "_")
+}
+
+/// Early-startup check for a symbol that will be used with `--history`.
+///
+/// Mirrors `HistoryStore::valid_identifier` after sanitization so a bad name
+/// fails with a clear CLI error instead of inside `ensure_schema`.
+pub fn validate_history_symbol(symbol: &str) -> Result<(), String> {
+    let table = history_table_name(symbol);
+    if table.is_empty()
+        || table.len() > MAX_TDENGINE_IDENTIFIER_LEN
+        || !table
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+    {
+        return Err(format!(
+            "historical store requires a lowercase symbol of at most \
+             {MAX_TDENGINE_IDENTIFIER_LEN} ASCII letters, digits, '-' or '_' (got {symbol:?})"
+        ));
+    }
+    Ok(())
+}
 
 /// Configuration for the optional TDengine-backed historical bar tier.
 ///
@@ -241,5 +276,20 @@ impl Config {
         self.symbols
             .iter()
             .find(|spec| spec.symbol.eq_ignore_ascii_case(name))
+    }
+
+    /// Rejects zero kline intervals (which would divide by zero in the feed)
+    /// and removes duplicates while preserving the caller's order.
+    pub fn normalize_bar_intervals(&mut self) -> Result<(), String> {
+        if self.bar_intervals_ms.is_empty() {
+            return Err("--bar-intervals-ms requires at least one interval".to_string());
+        }
+        if self.bar_intervals_ms.contains(&0) {
+            return Err("--bar-intervals-ms values must be greater than zero".to_string());
+        }
+        let mut seen = HashSet::new();
+        self.bar_intervals_ms
+            .retain(|interval| seen.insert(*interval));
+        Ok(())
     }
 }

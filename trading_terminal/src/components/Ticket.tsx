@@ -46,6 +46,10 @@ function buildPlaceBody(
   if (!volume) return { error: "Volume is required" };
   const price = form.price.trim();
   if (form.type === "Limit" && !price) return { error: "Price is required for a limit order" };
+  const leverage = Math.floor(form.leverage);
+  if (!Number.isFinite(leverage) || leverage < 1 || leverage > 100) {
+    return { error: "Leverage must be between 1 and 100" };
+  }
   const body: PlaceBody = {
     side: form.side,
     user_id: userId,
@@ -55,6 +59,7 @@ function buildPlaceBody(
     volume_unit: form.volumeUnit,
     maker_fee_rate: form.makerFeeRate.trim() || "0",
     taker_fee_rate: form.takerFeeRate.trim() || "0",
+    leverage,
   };
   if (form.tif) body.tif = form.tif;
   if (form.type === "Limit") {
@@ -195,6 +200,24 @@ export function Ticket({ desk, userId, onUserId, pendingPrice, onConsumePrice }:
           </select>
           <span className="type-hint">{isPerp ? `${form.leverage}x` : "Spot"}</span>
         </div>
+
+        {isPerp ? (
+          <label className="line-field">
+            <span className="line-label">Leverage</span>
+            <input
+              type="number"
+              min={1}
+              max={100}
+              step={1}
+              value={form.leverage}
+              onChange={(event) => {
+                const next = Number(event.target.value);
+                update("leverage", Number.isFinite(next) ? Math.min(100, Math.max(1, Math.floor(next))) : 1);
+              }}
+            />
+            <span className="line-unit">x</span>
+          </label>
+        ) : null}
 
         {market ? (
           <div className="market-note muted small">

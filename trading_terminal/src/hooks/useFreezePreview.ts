@@ -36,6 +36,9 @@ export function useFreezePreview(body: PlaceBody | null, enabled: boolean): Free
 
   useEffect(() => {
     if (!body || !enabled) {
+      // Invalidate any in-flight response so it cannot repopulate a disabled
+      // preview when it finally resolves.
+      seq.current += 1;
       setPreview(EMPTY);
       return;
     }

@@ -63,7 +63,9 @@ fn backup_manifest_has_the_expected_cronjobs_and_scripts() {
     assert!(backup.contains("--publish-configmap match-backup-status"));
     assert!(backup.contains("--configmap-namespace match-control"));
     assert!(status.contains("backup-status"));
-    assert!(status.contains("LATEST_DRILL"));
+    // The drill must be paired with the newest bundle, not selected independently.
+    assert!(status.contains("LATEST_BUNDLE.drill.json"));
+    assert!(status.contains("no signed drill"));
     assert!(backup.contains("K8S_CONTROL_PLANE_BIN"));
     assert!(status.contains("RCLONE_BIN"));
 

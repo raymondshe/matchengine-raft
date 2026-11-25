@@ -11,6 +11,9 @@ pub mod events;
 pub mod metrics;
 pub mod server;
 
+pub use events::decode_event_page;
+pub use events::encode_event_page;
+
 pub mod pb {
     tonic::include_proto!("matchengine.raft.v1");
 }

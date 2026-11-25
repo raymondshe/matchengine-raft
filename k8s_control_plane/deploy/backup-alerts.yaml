@@ -4,11 +4,12 @@
 # Without those, alert on failed Jobs from deploy/backup.yaml directly:
 #   kubectl -n match-control get jobs -l app.kubernetes.io/name=match-backup
 #
-# `match-backup-status` deliberately fails when the newest bundle or signed drill is stale, so
-# the Job-failure alert covers both the "backup stopped" and "drill stopped" cases.
+# `match-backup-status` deliberately fails when the newest bundle or its paired signed drill is
+# stale, so the Job-failure alert covers both the "backup stopped" and "drill stopped" cases.
 #
-# Keep the 93600/7200 thresholds below in sync with match-backup-config's
-# MAX_BACKUP_AGE_SECS/MAX_DRILL_AGE_SECS and the hourly status schedule.
+# 93600 below mirrors match-backup-config's MAX_BACKUP_AGE_SECS (26h). 7200 is the status
+# CronJob freshness window (hourly schedule plus tolerance), not MAX_DRILL_AGE_SECS (691200,
+# 8 days); keep the drill-age and status-freshness thresholds distinct.
 apiVersion: monitoring.coreos.com/v1
 kind: PrometheusRule
 metadata:

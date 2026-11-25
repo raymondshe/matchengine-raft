@@ -683,7 +683,8 @@ fn read_config(path: &Path) -> io::Result<Vec<ProcessSpec>> {
                 format!("duplicate HTTP port {}", spec.http_port),
             ));
         }
-        if spec.http_port < 1024 || spec.raft_port != spec.http_port + 1000 {
+        // Use u32 arithmetic: `http_port + 1000` overflows u16 for ports >= 64536.
+        if spec.http_port < 1024 || u32::from(spec.raft_port) != u32::from(spec.http_port) + 1000 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(

@@ -27,8 +27,14 @@ DB = os.environ.get("TDENGINE_DATABASE", "market_bars")
 AUTH = "Basic " + base64.b64encode(
     f"{os.environ.get('TDENGINE_USER', 'root')}:{os.environ.get('TDENGINE_PASSWORD', 'taosdata')}".encode()
 ).decode()
+
+def table_name(symbol):
+    """TDengine identifiers cannot contain '-'; the service uses the same mapping."""
+    return symbol.replace("-", "_")
+
+
 SYMBOLS = os.environ.get(
-    "SEED_SYMBOLS", "gbpusd,audusd,usdjpy,eurgbp,nzdusd,btcusdt,eurchf"
+    "SEED_SYMBOLS", "gbpusd,audusd,usdjpy,eurgbp,nzdusd,btcusdt,eurusd,eurchf"
 ).split(",")
 SCALE = 10**18
 # Lab quotes, so each symbol's history has its own visually distinct price scale.
@@ -39,6 +45,7 @@ BASE_PRICES = {
     "eurgbp": "0.85",
     "nzdusd": "0.6",
     "btcusdt": "49990",
+    "eurusd": "1.08",
     "eurchf": "0.95",
 }
 
@@ -84,16 +91,18 @@ def row(ts_us, o, h, l, c, vol, last_us, log_id, interval_us):
 
 
 def main():
-    sql("DROP DATABASE IF EXISTS market_bars")
-    sql(f"CREATE DATABASE market_bars PRECISION 'us' KEEP 3650 DURATION 10d VGROUPS 1 REPLICA 1 CACHEMODEL 'last_row'")
+    sql(f"DROP DATABASE IF EXISTS {DB}")
+    sql(f"CREATE DATABASE {DB} PRECISION 'us' KEEP 3650 DURATION 10d VGROUPS 1 REPLICA 1 CACHEMODEL 'last_row'")
     for interval in ("1s", "1m", "5m"):
         sql(f"CREATE STABLE bars_{interval} ({COLS}) TAGS (symbol VARCHAR(32))", DB)
     for symbol in SYMBOLS:
+        name = table_name(symbol)
         for interval in ("1s", "1m", "5m"):
-            sql(f"CREATE TABLE bars_{interval}_{symbol} USING bars_{interval} TAGS ('{symbol}')", DB)
+            sql(f"CREATE TABLE bars_{interval}_{name} USING bars_{interval} TAGS ('{name}')", DB)
 
     now_s = int(time.time())
     for symbol in SYMBOLS:
+        name = table_name(symbol)
         rng = random.Random(sum(ord(ch) for ch in symbol))
         base_units = int(Decimal(BASE_PRICES.get(symbol, "1.1")) * SCALE)
         px = base_units + rng.randrange(0, max(1, base_units // 1_000))
@@ -117,7 +126,7 @@ def main():
                 if interval == "1m":
                     minute_values.append((ts_s * 1_000_000, o, hi, lo, px, vol, last_us, i + 1))
             for i in range(0, len(rows), 200):
-                sql(f"INSERT INTO bars_{interval}_{symbol} VALUES " + " ".join(rows[i:i+200]), DB)
+                sql(f"INSERT INTO bars_{interval}_{name} VALUES " + " ".join(rows[i:i+200]), DB)
 
         # Derive 5m rows from traded 1m children with the same rule the writer
         # and the Rust rollup unit test use: first open, max high, min low,
@@ -138,7 +147,7 @@ def main():
             for ts_us, b in sorted(fives.items())
         ]
         for i in range(0, len(rows), 200):
-            sql(f"INSERT INTO bars_5m_{symbol} VALUES " + " ".join(rows[i:i+200]), DB)
+            sql(f"INSERT INTO bars_5m_{name} VALUES " + " ".join(rows[i:i+200]), DB)
         print("seeded", symbol, flush=True)
     print("done")
 

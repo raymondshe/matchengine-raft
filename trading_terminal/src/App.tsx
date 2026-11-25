@@ -22,18 +22,15 @@ export function App() {
   const consumePrice = useCallback(() => setPendingPrice(null), []);
 
   const config = desk.state?.symbol.config ?? null;
-  // The reference terminal paints the big mid-row number with the last
-  // traded price, coloured by the taker side; fall back to the desk's book
-  // value (uncoloured) before the first tape print.
+  // The mid row is driven by the market-data trade tape only; the order-system
+  // REST poll is for the desk (own orders/events), not for book display.
   const lastTrade = feed.trades[0]
     ? { price: feed.trades[0].price, side: feed.trades[0].side }
-    : desk.state?.book.last_trade_price
-      ? { price: desk.state.book.last_trade_price, side: null }
-      : null;
+    : null;
 
   return (
     <div className="terminal">
-      <Header deskState={desk.state} />
+      <Header />
       {desk.warning ? <div className="warning-banner">{desk.warning}</div> : null}
       <main className="terminal-grid">
         <section className="col market-column">

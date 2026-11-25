@@ -3,10 +3,9 @@
 use libfuzzer_sys::fuzz_target;
 use matchengine_raft::MatchEngineTypeConfig;
 use matchengine_raft::store::StateMachineData;
-use matchengine_raft::store::state_machine::read_snapshot_bytes;
+use matchengine_raft::store::state_machine::{SNAPSHOT_VERSION, read_snapshot_bytes};
 
 const SNAPSHOT_MAGIC: &[u8; 7] = b"MRFSNAP";
-const SNAPSHOT_VERSION: u32 = 9;
 
 /// Builds a valid snapshot header and CRC around an arbitrary body. This is
 /// what lets the fuzzer reach the postcard decoder instead of stopping at the

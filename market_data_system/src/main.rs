@@ -14,6 +14,9 @@ use matchengine_marketdata::SnapshotRequester;
 use matchengine_marketdata::SymbolSpec;
 use matchengine_marketdata::archive_path;
 use matchengine_marketdata::archive_source;
+use matchengine_marketdata::config::MAX_HISTORY_SNAPSHOT_BARS;
+use matchengine_marketdata::config::history_table_name;
+use matchengine_marketdata::config::validate_history_symbol;
 use matchengine_marketdata::jsonl_source;
 use matchengine_marketdata::nats_source;
 use matchengine_marketdata::start_with_snapshot_requesters;
@@ -214,10 +217,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         symbols.push(spec);
     }
 
+    // Validate the historical-store identifiers at startup. The store sanitizes
+    // '-' into '_' at the storage boundary, but names that cannot be sanitized
+    // (too long, or colliding after sanitization) must fail here with a clear
+    // message rather than deep inside `ensure_schema`.
+    if opt.history {
+        validate_history_symbol(&opt.tdengine_database)
+            .map_err(|error| format!("--tdengine-database: {error}"))?;
+        let mut tables = HashSet::new();
+        for spec in &symbols {
+            validate_history_symbol(&spec.symbol)
+                .map_err(|error| format!("--symbol {}: {error}", spec.symbol))?;
+            if !tables.insert(history_table_name(&spec.symbol)) {
+                return Err(format!(
+                    "--symbol {} collides with another symbol after sanitizing '-' to '_'",
+                    spec.symbol
+                )
+                .into());
+            }
+        }
+    }
+
     let mut config = Config::new(opt.addr, symbols.clone());
     if !opt.bar_intervals_ms.is_empty() {
         config.bar_intervals_ms = opt.bar_intervals_ms;
     }
+    config.normalize_bar_intervals()?;
     config.max_connections = opt.max_connections;
     config.max_streams = opt.max_streams.max(1);
     config.fast_max_streams = opt.fast_max_streams.max(1);
@@ -247,7 +272,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     config.history.keep_days = opt.tdengine_keep_days.max(1);
     config.history.batch_rows = opt.tdengine_batch_rows.max(1);
     config.history.seal_lag_ms = opt.history_seal_lag_ms;
-    config.history.snapshot_bars = opt.history_snapshot_bars.max(1);
+    config.history.snapshot_bars = opt
+        .history_snapshot_bars
+        .clamp(1, MAX_HISTORY_SNAPSHOT_BARS);
 
     if opt.replay_dir.is_some()
         && (!opt.market_data_log.is_empty()
@@ -437,7 +464,8 @@ async fn aeron_source_for(
 
 #[cfg(test)]
 mod tests {
-    use super::parse_symbol;
+    use super::*;
+    use matchengine_marketdata::config::MAX_TDENGINE_IDENTIFIER_LEN;
 
     #[test]
     fn symbol_names_are_safe_for_archive_paths() {
@@ -446,5 +474,25 @@ mod tests {
         assert!(parse_symbol("btc-usdt:1:BTC:USDT").is_ok());
         assert!(parse_symbol("../escape:0:EUR:USD").is_err());
         assert!(parse_symbol("a/b:0:EUR:USD").is_err());
+    }
+
+    #[test]
+    fn history_identifiers_sanitize_hyphens_and_reject_invalid_names() {
+        assert_eq!("btc_usdt", history_table_name("btc-usdt"));
+        assert!(validate_history_symbol("btc-usdt").is_ok());
+        assert!(validate_history_symbol(&"x".repeat(MAX_TDENGINE_IDENTIFIER_LEN)).is_ok());
+        assert!(validate_history_symbol(&"x".repeat(MAX_TDENGINE_IDENTIFIER_LEN + 1)).is_err());
+        assert!(validate_history_symbol("BTC").is_err());
+    }
+
+    #[test]
+    fn bar_intervals_must_be_positive_and_are_deduplicated() {
+        let mut config = Config::for_test("127.0.0.1:0");
+        config.bar_intervals_ms = vec![1000, 60_000, 1000, 5000];
+        config.normalize_bar_intervals().unwrap();
+        assert_eq!(vec![1000, 60_000, 5000], config.bar_intervals_ms);
+
+        config.bar_intervals_ms = vec![1000, 0];
+        assert!(config.normalize_bar_intervals().is_err());
     }
 }

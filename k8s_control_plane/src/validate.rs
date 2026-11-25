@@ -959,8 +959,9 @@ fn validate_shard(
                 ),
             );
         }
-        let expected = base + placement.slot;
-        if placement.http_port != expected {
+        // Widen to u32 so a high httpBasePort with a larger slot cannot wrap u16.
+        let expected = u32::from(base) + u32::from(placement.slot);
+        if u32::from(placement.http_port) != expected {
             report.error(
                 "port_convention",
                 dobj,

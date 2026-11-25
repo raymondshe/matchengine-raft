@@ -270,6 +270,12 @@ async fn main() -> std::io::Result<()> {
         config.snapshot_every_ms = options.market_data_aeron_snapshot_every_ms;
         config.heartbeat_ms = options.market_data_aeron_heartbeat_ms;
         if !options.market_data_bar_intervals_ms.is_empty() {
+            if options.market_data_bar_intervals_ms.contains(&0) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "--market-data-bar-intervals-ms values must be greater than zero",
+                ));
+            }
             config.bar_intervals_ms = options.market_data_bar_intervals_ms;
         }
         storage = storage.with_market_data(config);

@@ -1,6 +1,9 @@
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::Arc;
 use std::sync::Mutex;
+use std::time::Duration;
+use std::time::Instant;
 
 use actix_web::http::StatusCode;
 use openraft::errors::ClientWriteError;
@@ -9,6 +12,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+use tokio::sync::Mutex as AsyncMutex;
 
 use matchengine_raft::MatchEngineTypeConfig;
 use matchengine_raft::client::ClientError;
@@ -44,6 +48,13 @@ pub const DEFAULT_EVENTS_LIMIT: usize = 500;
 pub const SCHEMA_VERSION: u8 = 2;
 const PERPETUAL_POLICY_HINT: &str =
     "linear perpetual requires fee_asset_policy=quote; configure the symbol before trading";
+/// A 1 Hz desk poll must not clone the whole engine book on every request.
+/// 250 ms is short enough that an external fill is visible on the next poll,
+/// while concurrent/consecutive pollers share one full-book read.
+const BOOK_CACHE_TTL: Duration = Duration::from_millis(250);
+/// Full desk-state snapshot TTL. Client polls at ~1 Hz should all read the
+/// same cached snapshot; a successful write invalidates it immediately.
+const STATE_CACHE_TTL: Duration = Duration::from_millis(1_000);
 
 /// One Raft member used by the order system for leader discovery/failover.
 #[derive(Debug, Clone, Deserialize)]
@@ -99,6 +110,20 @@ pub struct TargetsFile {
     pub targets: Vec<TargetSpec>,
 }
 
+/// Cached full-book snapshot shared by the desk pollers.
+struct CachedBook {
+    fetched_at: Instant,
+    orders: Arc<Vec<Order>>,
+    stops: Arc<Vec<Order>>,
+}
+
+/// Full (all-user) snapshot for one engine target. Held centrally in the BFF,
+/// refreshed at most once per second, and filtered per user at response time.
+struct CachedState {
+    fetched_at: Instant,
+    state: EngineState,
+}
+
 /// One demo backend: a connection to a running engine node and the product
 /// whose own orderbook that engine serves. Different targets/symbols are
 /// separate processes/clusters, so an order sequence is only unique within a
@@ -113,6 +138,11 @@ pub struct EngineBackend {
     /// Leverage chosen when the demo submitted a perpetual order, keyed by
     /// that backend's sequence. The engine has no leverage field.
     leverages: Mutex<HashMap<u64, u32>>,
+    /// Shared, short-lived snapshot of the full resting book. Both `/state`
+    /// and `/book` read through this so a poller storm costs one engine read.
+    book_cache: AsyncMutex<Option<CachedBook>>,
+    /// Full all-user snapshot per depth, shared by every client of this engine.
+    state_cache: AsyncMutex<HashMap<usize, CachedState>>,
 }
 
 impl EngineBackend {
@@ -148,6 +178,8 @@ impl EngineBackend {
             http_addr: target.engine,
             client,
             leverages: Mutex::new(HashMap::new()),
+            book_cache: AsyncMutex::new(None),
+            state_cache: AsyncMutex::new(HashMap::new()),
         }
     }
 
@@ -187,6 +219,34 @@ impl EngineBackend {
             .insert(sequence, leverage);
     }
 
+    /// Returns the full resting book, refreshing it at most once per TTL.
+    /// The async lock is held across the engine read so concurrent pollers
+    /// queue behind one fetch instead of each cloning the whole book.
+    async fn read_book_cached(&self) -> Result<(Arc<Vec<Order>>, Arc<Vec<Order>>), ApiError> {
+        let mut cache = self.book_cache.lock().await;
+        if let Some(cached) = cache.as_ref()
+            && cached.fetched_at.elapsed() < BOOK_CACHE_TTL
+        {
+            return Ok((cached.orders.clone(), cached.stops.clone()));
+        }
+        let orders = Arc::new(self.read_json::<Vec<Order>>("orderbook_orders").await?);
+        let stops = Arc::new(self.read_json::<Vec<Order>>("orderbook_stops").await?);
+        *cache = Some(CachedBook {
+            fetched_at: Instant::now(),
+            orders: orders.clone(),
+            stops: stops.clone(),
+        });
+        Ok((orders, stops))
+    }
+
+    /// Called after every accepted write so the desk never shows a stale own
+    /// order for longer than the engine's own read-after-write visibility.
+    async fn invalidate_caches(&self) {
+        // Lock order must match `state()` (state_cache first, then book_cache).
+        self.state_cache.lock().await.clear();
+        *self.book_cache.lock().await = None;
+    }
+
     /// A resting or parked order plus its demo-side product/leverage tag and
     /// freeze estimate. A perpetual order placed before a demo restart has no
     /// remembered leverage, so it stays unestimated until it is cancelled.
@@ -216,11 +276,38 @@ impl EngineBackend {
             .collect()
     }
 
-    async fn state(&self, depth: usize) -> Result<EngineState, ApiError> {
-        let depth = depth.clamp(1, 200);
+    /// Returns a cached all-user snapshot filtered to one user. All clients of
+    /// this engine share a single refresh per second; the engine never sees
+    /// per-client polling traffic.
+    async fn state(&self, depth: usize, user_id: Option<u64>) -> Result<EngineState, ApiError> {
+        let key = depth.clamp(1, 200);
+        let state = {
+            // Held across the fetch so concurrent pollers queue behind one refresh.
+            let mut cache = self.state_cache.lock().await;
+            if let Some(cached) = cache.get(&key)
+                && cached.fetched_at.elapsed() < STATE_CACHE_TTL
+            {
+                cached.state.clone()
+            } else {
+                let state = self.fetch_state(key).await?;
+                cache.insert(
+                    key,
+                    CachedState {
+                        fetched_at: Instant::now(),
+                        state: state.clone(),
+                    },
+                );
+                state
+            }
+        };
+        // Filtering and freeze computation happen outside the cache lock so
+        // pollers do not serialize on CPU work.
+        Ok(state.for_user(user_id))
+    }
+
+    async fn fetch_state(&self, depth: usize) -> Result<EngineState, ApiError> {
         let symbol: SymbolConfig = self.read_json("symbol_config").await?;
-        let orders: Vec<Order> = self.read_json("orderbook_orders").await?;
-        let stops: Vec<Order> = self.read_json("orderbook_stops").await?;
+        let (orders, stops) = self.read_book_cached().await?;
         let sequence: u64 = self
             .read_text("orderbook_sequence")
             .await?
@@ -243,18 +330,15 @@ impl EngineBackend {
             .and_then(|id| metrics.membership_config.membership().get_node(&id))
             .map(|node| node.addr.clone());
 
-        let mut all_orders = self.desk_orders(&orders, &symbol);
-        let all_stops = self.desk_orders(&stops, &symbol);
+        let mut all_orders = self.desk_orders(orders.as_slice(), &symbol);
+        let all_stops = self.desk_orders(stops.as_slice(), &symbol);
         let freeze = freeze_state(&all_orders, &all_stops);
 
+        // Keep the full all-user list in the cache. Per-user filtering and the
+        // 200-row display cap are applied by `for_user` at response time.
         all_orders.sort_by_key(|entry| entry.order.sequence);
         let orders_total = all_orders.len();
-        let orders_truncated = orders_total > MAX_STATE_ORDERS;
-        all_orders.truncate(MAX_STATE_ORDERS);
-
         let stops_total = all_stops.len();
-        let stops_truncated = stops_total > MAX_STATE_ORDERS;
-        let stops: Vec<DeskOrder> = all_stops.into_iter().take(MAX_STATE_ORDERS).collect();
 
         Ok(EngineState {
             node: NodeState {
@@ -279,19 +363,19 @@ impl EngineBackend {
                 spread,
                 last_trade_price,
                 depth: DepthState {
-                    bids: depth_from_orders(&orders, OrderSide::Buy, depth),
-                    asks: depth_from_orders(&orders, OrderSide::Sell, depth),
+                    bids: depth_from_orders(orders.as_slice(), OrderSide::Buy, depth),
+                    asks: depth_from_orders(orders.as_slice(), OrderSide::Sell, depth),
                 },
             },
             orders: OrdersState {
                 total: orders_total,
-                truncated: orders_truncated,
+                truncated: false,
                 items: all_orders,
             },
             stops: OrdersState {
                 total: stops_total,
-                truncated: stops_truncated,
-                items: stops,
+                truncated: false,
+                items: all_stops,
             },
             freeze,
             events: EventsState {
@@ -309,8 +393,7 @@ impl EngineBackend {
     }
 
     pub async fn book(&self, limit: usize) -> Result<FullBookResponse, ApiError> {
-        let orders: Vec<Order> = self.read_json("orderbook_orders").await?;
-        let stops: Vec<Order> = self.read_json("orderbook_stops").await?;
+        let (orders, stops) = self.read_book_cached().await?;
         let sequence: u64 = self
             .read_text("orderbook_sequence")
             .await?
@@ -318,8 +401,8 @@ impl EngineBackend {
             .map_err(|error| ApiError::decode(format!("orderbook_sequence: {error}")))?;
 
         let symbol: SymbolConfig = self.read_json("symbol_config").await?;
-        let all_orders = self.desk_orders(&orders, &symbol);
-        let all_stops = self.desk_orders(&stops, &symbol);
+        let all_orders = self.desk_orders(orders.as_slice(), &symbol);
+        let all_stops = self.desk_orders(stops.as_slice(), &symbol);
         let freeze = freeze_state(&all_orders, &all_stops);
 
         let mut bids: Vec<DeskOrder> = all_orders
@@ -365,8 +448,8 @@ impl EngineBackend {
             asks,
             stops,
             depth: DepthState {
-                bids: depth_from_orders(&orders, OrderSide::Buy, usize::MAX),
-                asks: depth_from_orders(&orders, OrderSide::Sell, usize::MAX),
+                bids: depth_from_orders(orders.as_slice(), OrderSide::Buy, usize::MAX),
+                asks: depth_from_orders(orders.as_slice(), OrderSide::Sell, usize::MAX),
             },
             freeze,
             truncated: limit != usize::MAX
@@ -494,17 +577,30 @@ impl EngineBackend {
         let old_sequence = request.sequence;
         self.ensure_order_owner(old_sequence, request.user_id)
             .await?;
-        let leverage = self.take_leverage(old_sequence);
         let mut order = Order::new(request.side, request.price, Fixed::ZERO, old_sequence);
         order.symbol_id = self.symbol_id().await?;
+        // Do not touch the leverage tag until the engine has answered. A
+        // transport/timeout failure must leave the tag on the still-resting
+        // order; only a completed write can move it.
         let result = self
             .write(MatchEngineRequest::Amend {
                 order,
                 price: request.new_price,
                 volume: request.new_volume,
             })
-            .await?;
-        if let Some(leverage) = leverage {
+            .await;
+        self.finish_amend(old_sequence, result)
+    }
+
+    /// Moves the demo-side leverage tag to the sequence the engine assigned on
+    /// a successful amend. Split out so the failure path is directly testable.
+    fn finish_amend(
+        &self,
+        old_sequence: u64,
+        result: Result<OrderResult, ApiError>,
+    ) -> Result<OrderResult, ApiError> {
+        let result = result?;
+        if let Some(leverage) = self.take_leverage(old_sequence) {
             match (result.error.as_ref(), result.sequence) {
                 (None, Some(new_sequence)) => self.restore_leverage(new_sequence, leverage),
                 _ => self.restore_leverage(old_sequence, leverage),
@@ -528,11 +624,15 @@ impl EngineBackend {
     }
 
     async fn write(&self, request: MatchEngineRequest) -> Result<OrderResult, ApiError> {
-        match self.client.write(&request).await {
+        let result = match self.client.write(&request).await {
             Ok(Ok(response)) => Ok(order_result(response, &self.id, self.product)),
             Ok(Err(error)) => Err(write_error(error)),
             Err(error) => Err(client_error(error)),
-        }
+        };
+        // Any write attempt may have changed the ledger; never serve a stale
+        // cached snapshot to the desk that just submitted it.
+        self.invalidate_caches().await;
+        result
     }
 
     async fn symbol_id(&self) -> Result<u32, ApiError> {
@@ -628,9 +728,14 @@ impl DemoApp {
             })
     }
 
-    pub async fn state(&self, target: &str, depth: usize) -> Result<StateResponse, ApiError> {
+    pub async fn state(
+        &self,
+        target: &str,
+        depth: usize,
+        user_id: Option<u64>,
+    ) -> Result<StateResponse, ApiError> {
         let backend = self.backend(target)?;
-        let state = backend.state(depth).await?;
+        let state = backend.state(depth, user_id).await?;
         Ok(StateResponse {
             schema_version: SCHEMA_VERSION,
             target: backend.id.clone(),
@@ -723,6 +828,10 @@ fn freeze_state(orders: &[DeskOrder], stops: &[DeskOrder]) -> FreezeState {
     }
 }
 
+/// Mirrors `OrderBook::depth`. `/read orderbook_orders` returns the stored
+/// resting orders, whose `volume` is already the *visible* tranche: `rest()`
+/// moves any iceberg reserve into `hidden_volume`. Summing `volume` here is
+/// therefore the visible depth and must not subtract `hidden_volume` again.
 fn depth_from_orders(orders: &[Order], side: OrderSide, levels: usize) -> Vec<DepthLevel> {
     if levels == 0 {
         return Vec::new();
@@ -886,6 +995,7 @@ fn validate_fee_rate(rate: Fixed, field: &str) -> Result<Fixed, ApiError> {
 
 /// Engine-owned portion of one product's state; `DemoApp` adds the backend
 /// metadata shared by both products.
+#[derive(Clone)]
 struct EngineState {
     node: NodeState,
     symbol: SymbolState,
@@ -895,6 +1005,30 @@ struct EngineState {
     freeze: FreezeState,
     events: EventsState,
     market_data: MarketDataState,
+}
+
+impl EngineState {
+    /// Returns a copy containing only the requested user's orders and stops,
+    /// with the freeze estimate recomputed for that subset and the display cap
+    /// applied. `None` keeps the legacy all-user desk view.
+    fn for_user(mut self, user_id: Option<u64>) -> Self {
+        if let Some(owner) = user_id {
+            self.orders
+                .items
+                .retain(|entry| entry.order.owner_id == Some(owner));
+            self.stops
+                .items
+                .retain(|entry| entry.order.owner_id == Some(owner));
+            self.freeze = freeze_state(&self.orders.items, &self.stops.items);
+        }
+        self.orders.total = self.orders.items.len();
+        self.orders.truncated = self.orders.total > MAX_STATE_ORDERS;
+        self.orders.items.truncate(MAX_STATE_ORDERS);
+        self.stops.total = self.stops.items.len();
+        self.stops.truncated = self.stops.total > MAX_STATE_ORDERS;
+        self.stops.items.truncate(MAX_STATE_ORDERS);
+        self
+    }
 }
 
 #[derive(Serialize)]
@@ -933,7 +1067,7 @@ pub struct BackendsState {
     pub targets: Vec<BackendInfo>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct NodeState {
     pub id: u64,
     pub http_addr: String,
@@ -946,13 +1080,13 @@ pub struct NodeState {
     pub ready: bool,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct SymbolState {
     pub config: SymbolConfig,
     pub locked: bool,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct BookState {
     pub sequence: u64,
     pub spread: Option<Fixed>,
@@ -960,7 +1094,7 @@ pub struct BookState {
     pub depth: DepthState,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct DepthState {
     pub bids: Vec<DepthLevel>,
     pub asks: Vec<DepthLevel>,
@@ -976,7 +1110,7 @@ pub struct DeskOrder {
     pub economics: Option<OrderEconomics>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct OrdersState {
     pub total: usize,
     pub truncated: bool,
@@ -984,7 +1118,7 @@ pub struct OrdersState {
 }
 
 /// Aggregate estimated freezes for every order the demo can price.
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct FreezeState {
     pub orders: Vec<AssetFreeze>,
     pub stops: Vec<AssetFreeze>,
@@ -993,7 +1127,7 @@ pub struct FreezeState {
     pub unestimated: usize,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct EventsState {
     pub oldest_event_id: Option<EventId>,
     pub last_event_id: Option<EventId>,
@@ -1002,7 +1136,7 @@ pub struct EventsState {
     pub retention_limit: usize,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct MarketDataState {
     pub enabled: bool,
     pub status: Option<Value>,
@@ -1193,6 +1327,94 @@ mod tests {
 
     fn spot_economics(order: &Order, symbol: &SymbolConfig) -> Option<OrderEconomics> {
         estimate_order_economics(order, symbol, Product::Spot, 1)
+    }
+
+    #[test]
+    fn cached_state_filters_orders_by_owner() {
+        let symbol = SymbolConfig::default();
+        let mut alice_order = order(OrderSide::Buy, 100, 1, 1);
+        alice_order.owner_id = Some(7);
+        let mut bob_order = order(OrderSide::Buy, 99, 1, 2);
+        bob_order.owner_id = Some(8);
+        let alice_econ = spot_economics(&alice_order, &symbol);
+        let bob_econ = spot_economics(&bob_order, &symbol);
+        let entries = vec![
+            DeskOrder {
+                order: alice_order,
+                product: Product::Spot,
+                leverage: None,
+                economics: alice_econ,
+            },
+            DeskOrder {
+                order: bob_order,
+                product: Product::Spot,
+                leverage: None,
+                economics: bob_econ,
+            },
+        ];
+        let state = EngineState {
+            node: NodeState {
+                id: 1,
+                http_addr: "127.0.0.1:21001".into(),
+                is_leader: true,
+                leader_id: Some(1),
+                leader_addr: None,
+                term: 1,
+                raft_state: "Leader".into(),
+                healthy: true,
+                ready: true,
+            },
+            symbol: SymbolState {
+                config: symbol,
+                locked: true,
+            },
+            book: BookState {
+                sequence: 2,
+                spread: None,
+                last_trade_price: None,
+                depth: DepthState {
+                    bids: Vec::new(),
+                    asks: Vec::new(),
+                },
+            },
+            orders: OrdersState {
+                total: entries.len(),
+                truncated: false,
+                items: entries,
+            },
+            stops: OrdersState {
+                total: 0,
+                truncated: false,
+                items: Vec::new(),
+            },
+            freeze: FreezeState {
+                orders: Vec::new(),
+                stops: Vec::new(),
+                total: Vec::new(),
+                estimated: 0,
+                unestimated: 0,
+            },
+            events: EventsState {
+                oldest_event_id: None,
+                last_event_id: None,
+                retained_events: 0,
+                evictions_total: 0,
+                retention_limit: 262_144,
+            },
+            market_data: MarketDataState {
+                enabled: false,
+                status: None,
+            },
+        };
+
+        let alice = state.clone().for_user(Some(7));
+        assert_eq!(1, alice.orders.items.len());
+        assert_eq!(1, alice.orders.total);
+        assert_eq!(Some(7), alice.orders.items[0].order.owner_id);
+
+        let bob = state.for_user(Some(8));
+        assert_eq!(1, bob.orders.items.len());
+        assert_eq!(2, bob.orders.items[0].order.sequence);
     }
 
     #[test]
@@ -1428,6 +1650,41 @@ mod tests {
         assert_eq!(None, perpetual.take_leverage(7));
         perpetual.restore_leverage(9, moved.unwrap());
         assert_eq!(Some(25), perpetual.take_leverage(9));
+    }
+
+    #[test]
+    fn amend_failure_keeps_the_leverage_tag_on_the_resting_order() {
+        let perpetual = EngineBackend::new(target(
+            "perpetual",
+            Product::Perpetual,
+            1,
+            "127.0.0.1:24402",
+        ));
+        perpetual.remember_leverage(Some(7), 25);
+
+        // A transport/timeout failure returns from `amend` before the tag is
+        // touched; the order is still resting under the old sequence.
+        let failed = perpetual.finish_amend(7, Err(ApiError::unavailable("timeout")));
+        assert!(failed.is_err());
+        assert_eq!(Some(25), perpetual.take_leverage(7));
+
+        // A completed write moves the tag to the new sequence (or keeps the
+        // old one when the engine rejected the amend).
+        perpetual.remember_leverage(Some(8), 10);
+        let ok = OrderResult {
+            schema_version: SCHEMA_VERSION,
+            target: "perpetual".to_string(),
+            product: Product::Perpetual,
+            sequence: Some(9),
+            log_index: 3,
+            events: Vec::new(),
+            events_truncated: false,
+            error: None,
+        };
+        let returned = perpetual.finish_amend(8, Ok(ok)).unwrap();
+        assert_eq!(Some(9), returned.sequence);
+        assert_eq!(None, perpetual.take_leverage(8));
+        assert_eq!(Some(10), perpetual.take_leverage(9));
     }
 
     #[test]

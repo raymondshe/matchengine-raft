@@ -98,7 +98,7 @@ export function useDesk(symbol: string | null, userId: number): DeskSnapshot {
       if (document.hidden || loadingRef.current.state) return;
       loadingRef.current.state = true;
       try {
-        const next = await desk.getState(target);
+        const next = await desk.getState(target, 20, userId);
         if (!cancelled) applyState(next);
       } catch (error) {
         if (!cancelled) setWarning(`${symbol}: ${error instanceof Error ? error.message : String(error)}`);
@@ -112,7 +112,7 @@ export function useDesk(symbol: string | null, userId: number): DeskSnapshot {
       cancelled = true;
       clearInterval(timer);
     };
-  }, [symbol, target, applyState]);
+  }, [symbol, target, userId, applyState]);
 
   // ---- event cursor-follow ----
   const pullEvents = useCallback(
@@ -169,12 +169,22 @@ export function useDesk(symbol: string | null, userId: number): DeskSnapshot {
     [symbol, target],
   );
 
+  const resetEvents = useCallback(() => {
+    eventsRef.current.clear();
+    cursorRef.current = null;
+    setEvents([]);
+    setCursor(null);
+    void pullEvents(true);
+  }, [pullEvents]);
+
   useEffect(() => {
     if (!symbol) return;
-    void pullEvents(false);
+    // A new symbol means a new engine/shard: its event ids and cursor do not
+    // continue the previous target's log, so start from a clean slate.
+    resetEvents();
     const timer = setInterval(() => void pullEvents(false), EVENT_INTERVAL_MS);
     return () => clearInterval(timer);
-  }, [symbol, pullEvents]);
+  }, [symbol, pullEvents, resetEvents]);
 
   const afterWrite = useCallback(() => {
     void (async () => {
@@ -230,19 +240,12 @@ export function useDesk(symbol: string | null, userId: number): DeskSnapshot {
   );
 
   const togglePause = useCallback(() => {
-    setPaused((previous) => {
-      pausedRef.current = !previous;
-      return !previous;
-    });
+    // Compute outside the updater: StrictMode invokes updaters twice, which
+    // would flip the ref twice and desync it from the committed state.
+    const next = !pausedRef.current;
+    pausedRef.current = next;
+    setPaused(next);
   }, []);
-
-  const resetEvents = useCallback(() => {
-    eventsRef.current.clear();
-    cursorRef.current = null;
-    setEvents([]);
-    setCursor(null);
-    void pullEvents(true);
-  }, [pullEvents]);
 
   return {
     backends,

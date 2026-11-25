@@ -15,6 +15,7 @@ use crate::state::AmendTicket;
 use crate::state::ApiError;
 use crate::state::CancelTicket;
 use crate::state::DemoApp;
+use crate::state::MAX_STATE_ORDERS;
 use crate::state::PlaceTicket;
 
 const INDEX_HTML: &str = include_str!("../web/index.html");
@@ -78,6 +79,9 @@ pub struct StateQuery {
     #[serde(default, alias = "target")]
     pub product: Option<String>,
     pub depth: Option<usize>,
+    /// When present, the response contains only this user's orders/stops.
+    /// Omitted for the standalone demo desk, which intentionally shows all users.
+    pub user_id: Option<u64>,
 }
 
 #[get("/health")]
@@ -102,7 +106,10 @@ pub async fn backends(app: Data<DemoApp>) -> HttpResponse {
 #[get("/demo/api/state")]
 pub async fn state(app: Data<DemoApp>, query: Query<StateQuery>) -> HttpResponse {
     let target = query.product.as_deref().unwrap_or("");
-    match app.state(target, query.depth.unwrap_or(20)).await {
+    match app
+        .state(target, query.depth.unwrap_or(20), query.user_id)
+        .await
+    {
         Ok(state) => HttpResponse::Ok().json(state),
         Err(error) => api_error(error),
     }
@@ -117,7 +124,12 @@ pub struct BookQuery {
 
 #[get("/demo/api/book")]
 pub async fn book(app: Data<DemoApp>, query: Query<BookQuery>) -> HttpResponse {
-    let limit = query.limit.unwrap_or(usize::MAX);
+    // The demo serves at most MAX_STATE_ORDERS rows; an unbounded default made
+    // every book poll serialize/sort the whole cached book.
+    let limit = query
+        .limit
+        .unwrap_or(MAX_STATE_ORDERS)
+        .min(MAX_STATE_ORDERS);
     if limit == 0 {
         return api_error(ApiError::bad_request("limit must be at least 1"));
     }

@@ -644,11 +644,12 @@ async fn proxy_console(
         .map_err(|error| ApiError::internal(format!("engine console URL {url}: {error}")))?;
 
     let (parts, body) = request.into_parts();
-    let body = body
-        .collect()
+    // This route handles a raw Request, so axum's DefaultBodyLimit does not apply.
+    // Cap the buffered body explicitly before forwarding it to the engine.
+    const MAX_PROXY_BODY_BYTES: usize = 1024 * 1024;
+    let body = axum::body::to_bytes(body, MAX_PROXY_BODY_BYTES)
         .await
-        .map_err(|error| ApiError::bad_request("body", format!("read request body: {error}")))?
-        .to_bytes();
+        .map_err(|error| ApiError::bad_request("body", format!("read request body: {error}")))?;
     let mut upstream = axum::http::Request::builder().method(parts.method).uri(uri);
     for (name, value) in &parts.headers {
         if name.as_str() == "host"
@@ -1229,6 +1230,12 @@ async fn create_market_data_service(
                     .map(|cell| cell.namespace.clone())
                     .unwrap_or_default()
             };
+            if catalog.market_data_services.contains_key(&name) {
+                return Err(ApiError::bad_request(
+                    "duplicate_name",
+                    format!("market data service {name} already exists"),
+                ));
+            }
             service.namespace = namespace;
             catalog
                 .market_data_services
@@ -1273,8 +1280,15 @@ async fn market_data_service_detail(
             ),
         )
     } else {
+        // The renderer only adds Ingress `spec.tls` when a Secret is configured;
+        // a plaintext demo ingress must be advertised as ws://, not wss://.
+        let scheme = if service.spec.websocket.tls_secret.trim().is_empty() {
+            "ws"
+        } else {
+            "wss"
+        };
         (
-            "wss",
+            scheme,
             service
                 .spec
                 .websocket
@@ -1382,6 +1396,12 @@ async fn create_order_system(
                     .get(&system.spec.cell)
                     .map(|cell| cell.namespace.clone())
                     .unwrap_or_default();
+            }
+            if catalog.order_systems.contains_key(&name) {
+                return Err(ApiError::bad_request(
+                    "duplicate_name",
+                    format!("order system {name} already exists"),
+                ));
             }
             catalog.order_systems.insert(name.clone(), system.clone());
             let report = validate_catalog(catalog);

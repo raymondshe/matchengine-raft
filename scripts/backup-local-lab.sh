@@ -96,18 +96,54 @@ JSON
 )"
 }
 
+# Remove the lab wiring by merge key, not by array index. The install patch
+# appends RCLONE_REMOTE to the six-entry env list and remote-local-lab to the
+# four-entry volumeMounts/volumes lists; a hard-coded JSON-Patch index once
+# removed the `work` mount instead. Strategic patch with $patch:delete is a
+# no-op when the entries are absent and never shifts the remaining indices.
+unpatch_cronjob() {
+  local name=$1 container=$2
+  kubectl -n "$NAMESPACE" patch cronjob "$name" --type=strategic -p "$(cat <<JSON
+{
+  "spec": {
+    "jobTemplate": {
+      "spec": {
+        "template": {
+          "spec": {
+            "containers": [
+              {
+                "name": "$container",
+                "env": [
+                  { "name": "RCLONE_REMOTE", "\$patch": "delete" }
+                ],
+                "volumeMounts": [
+                  { "mountPath": "$MOUNT_PATH", "\$patch": "delete" }
+                ]
+              }
+            ],
+            "volumes": [
+              { "name": "remote-local-lab", "\$patch": "delete" }
+            ]
+          }
+        }
+      }
+    }
+  }
+}
+JSON
+)"
+}
+
 if [ "$INSTALL" = "0" ]; then
   for name in match-backup match-backup-status; do
     require_cronjob "$name"
-    kubectl -n "$NAMESPACE" patch cronjob "$name" --type=json -p "$(cat <<JSON
-[
-  { "op": "remove", "path": "/spec/jobTemplate/spec/template/spec/containers/0/volumeMounts/1" },
-  { "op": "remove", "path": "/spec/jobTemplate/spec/template/spec/volumes/5" },
-  { "op": "remove", "path": "/spec/jobTemplate/spec/template/spec/containers/0/env/7" }
-]
-JSON
-)" || log "note: $name was not carrying the lab wiring"
+    case "$name" in
+      match-backup) container=backup ;;
+      match-backup-status) container=status ;;
+    esac
+    unpatch_cronjob "$name" "$container"
   done
+  # Both patches must succeed before the PVC holding their bundles is removed.
   kubectl -n "$NAMESPACE" delete pvc "$PVC_NAME" --ignore-not-found
   log "removed the local-lab wiring; reapply k8s_control_plane/deploy/backup.yaml to be safe"
   exit 0

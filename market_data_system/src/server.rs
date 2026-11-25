@@ -422,7 +422,17 @@ async fn klines(state: Data<AppState>, params: web::Query<KlinesQuery>) -> HttpR
     let align = |value: u64| value / interval_ms * interval_ms;
 
     let (start_ms, end_ms) = match (params.start_time, params.end_time) {
-        (Some(start), Some(end)) => (align(start), end.max(align(start))),
+        (Some(start), Some(end)) => {
+            let start = align(start);
+            // Bound the scan to the requested page. Without this, a wide
+            // startTime/endTime range materializes the whole retained table
+            // before `klines` slices it down to `limit` rows.
+            let end = end.max(start);
+            (
+                start,
+                end.min(start.saturating_add(interval_ms.saturating_mul(limit as u64 - 1))),
+            )
+        }
         (Some(start), None) => (
             align(start),
             align(start).saturating_add(interval_ms * (limit as u64 - 1)),

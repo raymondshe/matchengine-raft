@@ -1,10 +1,21 @@
 # TODO
 
-Last reviewed: 2026-11-24. Working roadmap only; completed detail lives in the History section and
+Last reviewed: 2026-11-25. Working roadmap only; completed detail lives in the History section and
 git history — check out an earlier `TODO.md` from git for the full record
 (`git log -- TODO.md`, then `git show <commit>:TODO.md`). Measurements remain in
 [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md). See `AGENTS.md` for commands and the current branch
 state.
+
+**2026-11-25 review and fix pass.** `docs/CODE_REVIEW.md` was reduced to the two unresolved
+documentation/security items (lab Grafana default credentials, lab TDengine REST exposure); every
+concrete bug and performance defect from the full report was fixed, verified with all crate tests,
+Clippy/fmt, a terminal build and a Kustomize build, and rolled onto OrbStack. The roll covered new
+engine, market-data (Aeron + history), order-system, control-plane and terminal images. The order
+system now caches each target engine's full all-user snapshot for 1 Hz and filters by `owner_id`
+per client, so the terminal's book stays market-data-fed and client polls never fan out to the
+engine. `gRPC StreamEvents` pages are now postcard-encoded through an explicit positional wire
+mirror (`POST /events` stays JSON). TDengine debug flags, monitor and taosAdapter INFO logging were
+disabled in the lab. The remaining review findings are prioritised in **Review follow-ups** below.
 
 **Current baseline.** The engine runs OpenRaft 0.10.0 with a segmented WAL, snapshot v11 and exact
 18-scale `Fixed` values. It supports the full order-type set (GTC/IOC/FOK/GTD/Day, market,
@@ -42,7 +53,7 @@ operability; **P2** = evidence, scale and important non-blocking work; **P3** = 
 
 ## Top priorities
 
-Last prioritised 2026-11-24. Since the last pass seven items were closed: Raft-native leader
+Last prioritised 2026-11-25. Since the last pass seven items were closed: Raft-native leader
 discovery/failover in `MatchEngineClient` (validated by a hard leader kill and a rolling upgrade),
 the bounded gRPC drain (pods now terminate in ~6 s instead of hanging until SIGKILL), the
 stateless order desk (solution G — one Deployment, no user-ID routing), and the market-data
@@ -93,26 +104,51 @@ production gates and is not counted as queue progress.
 
 | Rank | Item | P | Impact | Effort | Gate / reason for this rank |
 |---|---|---|---|---|---|
-| 1 | Control-plane and public-edge security (#1) | P1 | High | High | None — manager, both demo edges, NATS and the lab TDengine REST and Grafana hosts are plaintext; exposure compounds with every new service |
-| 2 | Rollout invariants + acceptance automation (#4) | P2 | Medium | Low | None — cheap regression guard before the P1 rollout work; two real defects were found manually |
-| 3 | Fan-out and slow-consumer soak (#10) | P2 | High | High | #3 shipped: all HPAs report CPU and scale, so this is now the largest reachable scale/evidence gap |
-| 4 | Historical bar store, remaining phases (#16) | P2 | High | High | P0 shipped with 5m/30m rollups; spool/failover, revisions/gaps, importers and HA deployment need #1 and a real three-dnode TDengine cluster |
-| 5 | Pre-trade policy pipeline (#5) | P2 | Medium | Medium | Security-adjacent but not blocking; belongs at the edge/gateway |
-| 6 | Terminal deployment hardening (#17) | P2 | Medium | Low | Deployed with a hardcoded ClusterIP; also needs the CRD integration follow-up |
-| 7 | Docs synchronization (#8) | P2 | Medium | Low | Cheap guard; keep this file, `AGENTS.md` and the design docs aligned with the new packaging/observability decisions |
-| 8 | Engine bar emission (#11) | P2 | Low | Low | Feed correctness, but the terminal no longer depends on it; needs a four-voter engine image roll |
+| 1 | Control-plane, engine-admin and public-edge security (#1) | P1 | High | High | None — unauthenticated manager/console proxy, Raft admin endpoints, order desk, market-data, NATS and lab TDengine/Grafana; blocks production |
+| 2 | Supply-chain pinning + Pod Security/default-deny (#20) | P1 | High | Medium | Cheap hardening is still open: CI actions/base images are mutable and `match-eu-1` lacks PSA/default-deny |
+| 3 | Rollout invariants + acceptance automation (#4) | P2 | Medium | Low | None — cheap regression guard before further rollout work; two real defects were found manually |
+| 4 | Fan-out and slow-consumer soak (#10) | P2 | High | High | HPAs are live; this is the largest reachable scale/evidence gap |
+| 5 | Historical bar store, remaining phases (#16) | P2 | High | High | P0 shipped with 5m/30m rollups; spool/failover, revisions/gaps, importers and HA need #1 and a real three-dnode TDengine cluster |
+| 6 | Stop/index scale refactors (#21) | P2 | Medium | Medium | Parked-stop `Vec` scans and GTD full-book rescans are the remaining hot-path cliffs after the 2026-11-25 fixes |
+| 7 | Pre-trade policy pipeline (#5) | P2 | Medium | Medium | Security-adjacent but not blocking; belongs at the edge/gateway |
+| 8 | Terminal CRD integration (#17) | P2 | Medium | Medium | `DNS_UPSTREAM` is now runtime-resolved and the image is in the supply chain; only the CRD/renderer follow-up remains |
+| 9 | Docs synchronization (#8) | P2 | Medium | Low | Cheap guard; keep this file, `AGENTS.md` and design docs aligned with postcard pages and BFF caching |
+| 10 | Engine bar emission (#11) | P2 | Low | Low | Feed correctness, but the terminal no longer depends on it; needs a four-voter engine image roll |
 
 The `P0`–`P5` phases inside the historical-bar design are implementation phases, not this file's
 P0 defect priority; item #16 is P2 here. Environment-blocked items (multi-host, CSI, bare-metal,
 real object storage, three-dnode TDengine) stay visible in the production gates and are not counted
 as queue progress.
 
+### Review follow-ups (2026-11-25, prioritised)
+
+`docs/CODE_REVIEW.md` now contains only unresolved items. Each remaining finding is folded into an
+existing workstream or given an explicit priority here; no new P0 was found.
+
+| Finding | P | Where / note |
+|---|---|---|
+| Grafana `admin`/`admin`, lab TDengine REST plaintext with default credentials | P1 | P1 #1 security workstream — Secret-backed credentials, TLS/auth, no public exposure |
+| Unauthenticated manager API and console-proxy actions | P1 | P1 #1 — OIDC/mTLS, authorization, approvals, CSRF, narrow ServiceAccount |
+| Unauthenticated engine Raft/admin endpoints (`/init`, membership, gRPC) | P1 | P1 #1 — mTLS/shared secret, bootstrap-only membership, per-peer limits |
+| Unauthenticated order-system BFF and user ID from request body | P1 | P1 order-system public-edge item — session-bound `user_id`, TLS, rate limits |
+| Secret-backed TDengine DSN in CRDs (`MarketDataHistory.url`) | P1 | P1 #16 historical bars — move credentials to a Secret ref |
+| Pod Security/default-deny in `match-eu-1`, TDengine NetworkPolicy | P1 | P1 #20 — namespace PSA, default-deny, scoped RBAC |
+| Per-IP WebSocket connection/stream quotas and lower terminal `max_streams` | P1 | P1 public market-data edge item |
+| Overbroad RBAC (bridge ClusterRole, backup pod-create cluster-wide) | P1 | P1 #20 — namespace Roles / restricted pod creation |
+| CI actions pinned to tags, mutable Docker base images | P1 | P1 #20 — SHA/digest pinning and `permissions: contents: read` |
+| Stop/index scale refactors (parked-stop `Vec`, GTD full rescan) | P2 | New #21 below — indexed trigger/expiry structures |
+| CSRF nonce values, manager GUI CSP, internal error strings, `/events` long-poll admission, dedupe-map eviction | P2 | P2 defence-in-depth below |
+| `/klines` sequential TDengine queries, combined-frame copy, catalog clone per request, `bar_quote.retain` | P3 | Micro-optimisations; defer until a measured bottleneck |
+| Lab-only root `linux.Dockerfile`, ingress-nginx Secrets RBAC | P3 | Lab-only; keep out of production overlays |
+
 **P1 - production safety and operability, in execution order**
 
-1. **Control-plane and public-edge security.** One workstream for manager OIDC/RBAC,
+1. **Control-plane, engine-admin and public-edge security.** One workstream for manager OIDC/RBAC,
    console-proxy authorization, destructive-action approvals, idempotency keys,
    namespace-qualified paths and dry-run diffs, plus TLS, client authentication, rate limits,
    origin checks and NetworkPolicy/Pod Security for the order-system, market-data and NATS edges.
+   Include the engine's unauthenticated `/init`, `/add-learner`, `/change-membership` and gRPC
+   listener: mTLS or a shared secret, bootstrap-only membership endpoints and per-peer rate limits.
    It leads the queue because the manager, both demo edges and the NATS broker endpoint are all
    plaintext and unauthenticated: exposure is the largest remaining production gate and no amount
    of scaling or backup evidence mitigates it. The pitlane review suggests the concrete shape:
@@ -126,6 +162,11 @@ as queue progress.
    `scripts/publish-images.sh` (`docker save`/`load` or registry push with digest pinning) and the
    `tdengine-ha.yaml` production profile are in place. Remaining production evidence — a real
    registry, an object-storage backup cycle and a CSI snapshot drill — stays in the gates below.
+3. **Supply-chain and namespace hardening (#20).** Pin GitHub Actions to commit SHAs and Docker base
+   images to digests, set `permissions: contents: read` on every workflow, label `match-eu-1`
+   `restricted` with default-deny ingress/egress plus a TDengine NetworkPolicy, and narrow the
+   bridge ClusterRole and backup pod-create RBAC to the namespaces that need them. Cheap, and it
+   closes several 2026-11-25 review findings before the larger auth workstream lands.
 **Explicit production gates not exercised in this lab.** Backup close-out: one live
 object-storage bucket cycle to confirm rclone upload, retention and alerting (the local-PVC path
 and the signed CRD drill are validated), and the CSI volume-snapshot drill, which needs
@@ -226,13 +267,22 @@ keep those halves visible; do not treat a green single-node run as production ev
     NetworkPolicy, packaged TDengine), the six live-API verification items in
     `docs/THIRD_PARTY_INVESTIGATION.md` Part VII §6.6, and `VGROUPS`/`REPLICA` sizing measured on a
     real three-dnode cluster.
-17. **Trading terminal deployment hardening.** The React/TS terminal is built and deployed as
-    `matchengine-trading-terminal:arm64-v4`; it is a pure frontend third client (market data over the
+17. **Trading terminal deployment hardening.** The React/TS terminal is deployed as
+    `matchengine-trading-terminal:arm64-v5`; it is a pure frontend third client (market data over the
     global service WS, order entry through the order-system BFF `/demo/api`) and nginx is deployment
-    plumbing only. Remaining: replace the hardcoded `DNS_UPSTREAM: 192.168.194.138` in
-    `k8s_control_plane/deploy/terminal.yaml` with a runtime-resolved ClusterIP or Service DNS entry,
-    add the `TradingTerminal` CRD/renderer integration, and route its image through the P1 #2 image
-    supply. Do not add engine `/write` calls or embed the frontend in a crate.
+    plumbing only. `DNS_UPSTREAM` is now resolved from `/etc/resolv.conf` at pod start, so the
+    hardcoded ClusterIP is gone. Remaining: the `TradingTerminal` CRD/renderer integration. The image
+    is routed through the image supply via the lab overlay. Do not add engine `/write` calls or embed
+    the frontend in a crate.
+18. **Stop and GTD index refactor (#21).** Replace the linear parked-stop `Vec` scans in
+    `observe_trade`/`run_stops`/`cancel`/`amend` with a trigger-ordered index plus a sequence map,
+    and replace the GTD full-book rescan with a min-heap/`BTreeSet` keyed by expiry. The 2026-11-25
+    fixes added a trailing-stop counter and narrower rescan invalidation; this is the remaining
+    O(stops)→O(log n) and O(n)→O(k log n) work, with conformance tests for cascades and expiry.
+19. **Defence-in-depth hardening.** Cheap follow-ups from the 2026-11-25 review: nonce-valued CSRF
+    guards for console/desk actions, a CSP on the manager GUI, correlation IDs instead of internal
+    error strings on 500s, and an admission gate for concurrent `/events` long-polls. Keep these
+    separate from the P1 auth workstream.
 
 **P3 - later, in impact order**
 
@@ -274,6 +324,12 @@ keep those halves visible; do not treat a green single-node run as production ev
   (`deploy/web-ingress.yaml`); the workload and packaging manifests remain. The demo images exist
   only in the node's local store, so add a registry (or an explicit `docker save`/`load` step)
   before the next fleet roll; a `DiskPressure` image GC evicted local images on 2026-11-18.
+- [ ] **P1 (#20)** Supply-chain and namespace hardening: pin CI actions to SHAs and base images to
+  digests, add `permissions: contents: read`, label `match-eu-1` restricted with default-deny
+  ingress/egress and a TDengine NetworkPolicy, and narrow the bridge ClusterRole and backup
+  pod-create RBAC. Closes the lowest-effort 2026-11-25 security findings.
+- [ ] **P2 (#19)** Defence-in-depth: nonce-valued CSRF guards, manager GUI CSP, correlation IDs on
+  500s, and an admission gate for `/events` long-poll concurrency.
 - [ ] **P1 (deferred)** Gateway integration: leader-aware routing from `SymbolRoute.status`,
   shadow/cutover/drain, retries and a canary path. Deferred by the 2026-11-20 decision in
   `docs/GATEWAY_ROUTING.md` — no public gateway is built until TLS/auth and packaging land, a
@@ -357,10 +413,10 @@ shard services and the global terminal service are live; see History. Remaining 
 - [ ] **P2** Manager controls for the market-data tier: add GUI create/edit/scale and a read-only
   preview plan; the upsert API, image/release update and the per-service image picker are
   implemented. Add a rollback action that restores the previous image.
-- [ ] **P2 (Top priorities #17)** Trading terminal hardening: the pure-React client is deployed but
-  `k8s_control_plane/deploy/terminal.yaml` hardcodes `DNS_UPSTREAM: 192.168.194.138`; resolve it at
-  runtime, add the `TradingTerminal` CRD/renderer integration, and route the image through the P1
-  image supply. Keep order entry on the order-system BFF and never call engine `/write` directly.
+- [ ] **P2 (Top priorities #17)** Trading terminal hardening: the pure-React client is deployed as
+  `arm64-v5` and `DNS_UPSTREAM` is resolved from `/etc/resolv.conf` at pod start. Remaining: add the
+  `TradingTerminal` CRD/renderer integration. Keep order entry on the order-system BFF and never
+  call engine `/write` directly.
 - [ ] **P2** Rollout and availability: canary policy, PDB verification, drain-aware image upgrades
   and a tested rollback path that restores subscriber capacity without touching matching. HPA CPU
   metrics are live (#3); the fan-out/slow-consumer soak (Top priorities #10, rank 4) can now measure
@@ -389,6 +445,9 @@ shard services and the global terminal service are live; see History. Remaining 
 
 ### Engine and transport
 
+- [ ] **P2 (#21)** Stop and GTD index refactor: replace the parked-stop `Vec` scans with a trigger
+  index and sequence map, and the GTD earliest-expiry rescan with a min-heap/`BTreeSet`. Keep the
+  trailing-stop counter and narrow invalidation shipped on 2026-11-25 as the interim mitigation.
 - [ ] **P2** Make gateway retries safe: add a request key for `Cancel`/`Amend` (the current
   `client_order_id` dedupes only `Place`) and a typed `503` with the leader address so a follower
   `/write` can be retried deterministically instead of today's `500`. The Rust
@@ -462,6 +521,16 @@ Completed work is summarised here; detailed evidence, measurements and implement
 in git history and the linked docs. For the full history, check out `TODO.md` from an earlier commit
 (`git log -- TODO.md`).
 
+- **2026-11-25** — Review fix pass and OrbStack rollout: all concrete bugs and performance defects
+  from `docs/CODE_REVIEW.md` were fixed and the report reduced to two unresolved documentation/security
+  items. Highlights: postcard `StreamEvents` pages with an explicit wire mirror, 1 Hz full-book cache
+  in the order system with per-user filtering, binary-search event paging, bounded console-proxy body
+  and snapshot streams, zero-interval/overflow guards, terminal event/leverage/closed-bar fixes,
+  portable `DNS_UPSTREAM`, single-source bridge ConfigMap, bundle/drill pairing, and TDengine debug/
+  monitor/INFO log suppression. All six images were rebuilt and rolled on OrbStack; verification
+  passed (`VERIFY_OK`): 4 shards / 8 symbols / 5 market-data services, 43 acceptance-render checks,
+  observability checks, market feed across 8 symbols and per-user BFF filtering. Remaining review
+  findings are prioritised in **Review follow-ups** above.
 - **2026-11-24** — Manager packaging and image supply (#2 closed): checked in a Kustomize base
   (`k8s_control_plane/deploy/kustomization.yaml`) with CRDs, RBAC, the scheduled backup path,
   ingress and observability, plus `overlays/lab` (single-node TDengine, NATS, terminal, local

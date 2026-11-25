@@ -412,13 +412,16 @@ message StreamEventsRequest {
   optional uint32 wait_ms = 4;          // idle wait per page, 0..=1000
   optional uint32 max_pages = 5;        // 0 = until cancelled
 }
-message StreamEventsPage { bytes payload = 1; }  // JSON EventsResponse
+message StreamEventsPage { bytes payload = 1; }  // postcard EventsResponse
 ```
 
-- Each page is the **same JSON object** as `POST /events`, carried as bytes. JSON is deliberate:
-  `MatchEvent` omits absent optional fields with `skip_serializing_if`, which positional formats
-  such as postcard cannot deserialize reliably, and a JSON page lets non-Rust consumers share the
-  documented schema.
+- Each page is the **same schema** as `POST /events`, but encoded with `postcard` inside the
+  protobuf `bytes` field to keep the hot stream fast and compact. `MatchEvent` omits absent
+  optional fields with `skip_serializing_if`, which a positional format cannot skip, so the
+  stream uses an explicit wire mirror (`WireEventPage`) where every field is present. Rust
+  consumers should use `encode_event_page`/`decode_event_page` from
+  `matchengine_raft::network::grpc`; `POST /events` stays JSON. This changed the gRPC page format
+  from JSON, so existing gRPC stream consumers must be updated.
 - The stream is anchored with one leader-consistent read (`local_lease` by default, falling back to the core lease path and `ReadIndex`)
   when it opens, so the serving node must be the leader at that point (`FAILED_PRECONDITION` with
   the leader error otherwise). Later pages read locally applied committed events with no per-page
@@ -622,7 +625,7 @@ Still to write (operational tests):
 | 1b ✅ | Events in `MatchEngineResponse`; 512-event cap with `events_truncated` | done |
 | 2 ✅ | Bounded event window + snapshot v4–v11 + `oldest_event_id`/`last_event_id`; `/events` and `/events/status`; restart/snapshot/retention tests | done |
 | 3 ✅ | `client_order_id` submission dedupe with bounded map | done |
-| 4 ✅ | Long-poll `wait_ms` (node-local `watch` wakeup), gRPC `StreamEvents` (JSON pages, heartbeat, `max_pages`) and the reference MQ bridge sidecar (`src/bin/events_bridge.rs`) | done |
+| 4 ✅ | Long-poll `wait_ms` (node-local `watch` wakeup), gRPC `StreamEvents` (postcard pages, heartbeat, `max_pages`) and the reference MQ bridge sidecar (`src/bin/events_bridge.rs`) | done |
 
 Phases 1a–4 are implemented; phase 4 is operational convenience.
 

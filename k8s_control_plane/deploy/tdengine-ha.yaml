@@ -117,10 +117,15 @@ spec:
           image: tdengine/tdengine:3.3.6.13
           imagePullPolicy: IfNotPresent
           env:
-            - name: TAOS_FQDN
+            # taos.cfg is rendered by the init container with the full
+            # headless-service FQDN; TAOS_FQDN must match it (a bare pod name
+            # would disagree with fqdn/firstEp in taos.cfg).
+            - name: POD_NAME
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
+            - name: TAOS_FQDN
+              value: "$(POD_NAME).tdengine-ha-headless.match-eu-1.svc.cluster.local"
             - name: TZ
               value: UTC
           ports:

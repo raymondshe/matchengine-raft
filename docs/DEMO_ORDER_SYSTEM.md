@@ -113,8 +113,13 @@ The design reuses the operational console's architecture:
   `orderbook_depth[:N]`, `orderbook_sequence`, `orderbook_spread`,
   `orderbook_last_trade_price`, `marketdata_status`.
 - `POST /read orderbook_orders` returns every resting order, but `orderbook_depth[:N]` is capped at
-  200 levels. The demo process computes full depth from the full order list, so the debug view is
-  not limited to that top-N depth.
+  200 levels. The standalone desk's debug `/demo/api/book` view computes full depth from the full
+  order list.
+- `/demo/api/state` caches the complete **all-user** snapshot of each target engine for one second
+  and returns a copy to every poller. The terminal sends `user_id`; the BFF filters the cached
+  orders/stops by `owner_id` and recomputes that user's freeze, so each client sees only its own
+  orders rather than the full ledger. One order-system instance therefore reads each engine at
+  most once per second regardless of client count; a write invalidates the cache.
 - The demo runs separately: it does not read the engine's state machine directly. It calls
   `POST /read` and `POST /events` over HTTP. `symbol_locked` is not a `/read` key, so the demo
   treats `orderbook_sequence > 0` as "trading has started" and disables configuration.

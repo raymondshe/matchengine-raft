@@ -514,7 +514,15 @@ body {
   border-top: 1px solid var(--border);
   flex-wrap: wrap;
 }
-.amend-form input { width: 170px; }
+.amend-form input {
+  width: 170px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 4px;
+  padding: 4px 8px;
+  font: 600 12px/1.2 var(--mono);
+}
 .amend-form button.primary { background: var(--accent); color: #10131a; border-color: var(--accent); }
 
 /* Narrow viewports: drop the secondary stats instead of truncating the

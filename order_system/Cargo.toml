@@ -1,6 +1,6 @@
 [package]
 name = "matchengine-raft-demo"
-version = "0.0.14"
+version = "0.0.15"
 edition = "2024"
 publish = false
 

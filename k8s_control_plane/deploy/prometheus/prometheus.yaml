@@ -160,7 +160,6 @@ spec:
             - --config.file=/etc/prometheus/prometheus.yml
             - --storage.tsdb.path=/prometheus
             - --storage.tsdb.retention.time=7d
-            - --web.enable-lifecycle
             - --web.external-url=http://prometheus.match-eu-1.example
           ports:
             - name: http

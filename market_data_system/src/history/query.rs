@@ -68,8 +68,17 @@ pub fn rollup_bars(rows: &[BarRow], target_ms: u64) -> Vec<BarRow> {
         bar.taker_quote = bar.taker_quote.saturating_add(row.taker_quote);
         bar.trades += row.trades;
         bar.last_ts_us = bar.last_ts_us.max(row.last_ts_us);
-        bar.last_log = bar.last_log.or(row.last_log);
-        bar.last_ord = bar.last_ord.or(row.last_ord);
+        // Match the SQL rollup, which uses MAX(last_log)/MAX(last_ord). Rows are
+        // normally time-ordered, but `or` would also keep a stale larger key if
+        // the feed ever delivers a child out of order.
+        bar.last_log = match (bar.last_log, row.last_log) {
+            (Some(current), Some(next)) => Some(current.max(next)),
+            (current, next) => current.or(next),
+        };
+        bar.last_ord = match (bar.last_ord, row.last_ord) {
+            (Some(current), Some(next)) => Some(current.max(next)),
+            (current, next) => current.or(next),
+        };
         bar.seq = bar.seq.max(row.seq);
         bar.sealed &= row.sealed;
     }
@@ -270,5 +279,21 @@ mod tests {
         assert_eq!(rolled.len(), 1, "only the traded window exists");
         assert_eq!(rolled[0].trades, one.trades);
         assert_eq!(rolled[0].open, one.open);
+    }
+
+    #[test]
+    fn rollup_uses_max_last_log_and_last_ord_like_sql() {
+        let base = 1_735_689_600_000u64;
+        let mut first = row(base, "1.1");
+        first.last_log = Some(9);
+        first.last_ord = Some(2);
+        let mut second = row(base + MIN_MS, "1.2");
+        second.last_log = Some(10);
+        second.last_ord = Some(7);
+
+        let rolled = rollup_bars(&[first, second], FIVE_MIN_MS);
+        assert_eq!(1, rolled.len());
+        assert_eq!(Some(10), rolled[0].last_log);
+        assert_eq!(Some(7), rolled[0].last_ord);
     }
 }

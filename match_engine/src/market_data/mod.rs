@@ -1835,6 +1835,11 @@ impl MarketDataProcessor {
         let intervals = self.config.bar_intervals_ms.clone();
         for interval in &intervals {
             let interval = *interval;
+            // A zero interval has no defined window and would panic the modulo below.
+            // The binary rejects it at startup; skip it for library callers too.
+            if interval == 0 {
+                continue;
+            }
             let key = (symbol, interval);
             let window = ts_ms - (ts_ms % interval);
 

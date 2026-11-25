@@ -23,9 +23,10 @@ export interface MdSymbolReady {
   ready: boolean;
   snapshot_seen: boolean;
   depth_stale: boolean;
-  subscribers: number;
-  streams: number;
+  heartbeat_fresh: boolean;
   last_ts_ms: number;
+  epoch: number;
+  leader_id: number | null;
 }
 
 export interface MdReady {

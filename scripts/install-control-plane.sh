@@ -38,7 +38,15 @@ if [ "$MODE" = production ]; then
 fi
 
 MANIFESTS="$ROOT/.install-$MODE.yaml"
-kubectl kustomize --load-restrictor=LoadRestrictionsNone "$OVERLAY" >"$MANIFESTS"
+# Render through a private temp file: the bundle can contain Secret data and
+# must not be world-readable while kubectl writes it. Keep the stable final
+# path for tooling that reads .install-<mode>.yaml.
+tmp_manifests=$(mktemp "${TMPDIR:-/tmp}/install-control-plane.XXXXXX")
+trap 'rm -f "$tmp_manifests"' EXIT
+chmod 600 "$tmp_manifests"
+kubectl kustomize --load-restrictor=LoadRestrictionsNone "$OVERLAY" >"$tmp_manifests"
+mv -f "$tmp_manifests" "$MANIFESTS"
+chmod 600 "$MANIFESTS"
 echo "rendered $OVERLAY -> $MANIFESTS ($(grep -c '^kind:' "$MANIFESTS") resources)"
 
 if [ "$DRY_RUN" -eq 1 ]; then

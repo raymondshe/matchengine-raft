@@ -1,16 +1,11 @@
-import type { DeskState } from "../lib/types";
 import { useMarketFeed } from "../hooks/useMarketFeed";
-
-interface Props {
-  deskState: DeskState | null;
-}
 
 function trim(value: number): string {
   if (!Number.isFinite(value)) return "—";
   return value.toFixed(6).replace(/(\.\d*?)0+$/, "$1").replace(/\.$/, "");
 }
 
-export function Header({ deskState }: Props) {
+export function Header() {
   const { symbols, symbol, setSymbol, status, connDetail, bbo, ready, frameCount, statusFrame, trades } =
     useMarketFeed();
 
@@ -19,9 +14,9 @@ export function Header({ deskState }: Props) {
   const spread = bbo.bid !== null && bbo.ask !== null ? Number(bbo.ask) - Number(bbo.bid) : null;
   const mid = bbo.bid !== null && bbo.ask !== null ? (Number(bbo.ask) + Number(bbo.bid)) / 2 : null;
 
-  // Last trade price, coloured by the latest tape direction like the
-  // reference terminal (a taker buy lifts the print green).
-  const lastTrade = deskState?.book.last_trade_price ?? null;
+  // Last trade and book sequence come from the market-data feed (trade tape
+  // and STATUS frames), never from the order-system REST poll.
+  const lastTrade = trades[0]?.price ?? null;
   const lastSide = trades[0]?.side;
   const priceTone = lastSide === "SELL" ? "sell" : "buy";
 
@@ -71,7 +66,7 @@ export function Header({ deskState }: Props) {
         </div>
         <div className="stat">
           <span className="stat-label">Book seq</span>
-          <span className="stat-value">{statusFrame ? statusFrame.bookSequence : deskState?.book.sequence ?? "—"}</span>
+          <span className="stat-value">{statusFrame?.bookSequence ?? "—"}</span>
         </div>
       </div>
       <div className="header-chips">

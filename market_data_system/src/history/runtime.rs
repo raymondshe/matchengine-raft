@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::Ordering;
 
 use bytes::Bytes;
 use tokio::sync::mpsc;
@@ -77,10 +78,15 @@ pub async fn start(
         let mut pending: HashMap<(String, u64), Vec<BarRow>> = HashMap::new();
         let mut tick = tokio::time::interval(Duration::from_secs(1));
         tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let mut stopping = false;
         loop {
             tokio::select! {
-                _ = stop.changed() => {
-                    if *stop.borrow() { break; }
+                _ = stop.changed(), if !stopping => {
+                    // Do not drop queued trades on shutdown. Keep consuming the
+                    // channel until `HistoryRuntime::shutdown` drops the sender;
+                    // `recv()` then returns None after the drain and the final
+                    // flush below persists every folded row.
+                    stopping = *stop.borrow_and_update();
                 }
                 event = rx.recv() => {
                     let Some(event) = event else { break };
@@ -106,7 +112,7 @@ pub async fn start(
                             .await;
                     }
                 }
-                _ = tick.tick() => {
+                _ = tick.tick(), if !stopping => {
                     let now_us = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
@@ -165,6 +171,15 @@ async fn flush_one(
         let entry = pending.entry(key.clone()).or_default();
         if entry.len() < 10_000 {
             entry.extend(rows);
+        } else {
+            stats
+                .history_dropped_rows
+                .fetch_add(rows.len() as u64, Ordering::Relaxed);
+            tracing::error!(
+                %error, %symbol, interval_ms,
+                dropped = rows.len(),
+                "historical bar requeue limit reached; dropping rows"
+            );
         }
         return;
     }

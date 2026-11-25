@@ -15,8 +15,9 @@
 #
 # The daily job creates a bundle, verifies it, runs a restore drill, signs the drill record,
 # uploads the bundle and drill, prunes old objects, and fails if the newest bundle or drill is
-# stale. The hourly status job downloads the newest objects and performs the same freshness
-# check independently, so a suspended or broken backup schedule surfaces as a failed Job.
+# stale. The hourly status job downloads the newest bundle together with its own signed drill
+# and performs the same freshness check, so a suspended or broken backup schedule surfaces as
+# a failed Job.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -193,18 +194,22 @@ data:
     LATEST_BUNDLE=$(rc lsf --dirs-only "$REMOTE_ROOT/bundles" \
       --config "$RCLONE_CONFIG" | sed 's:/$::' | sort -V | tail -n 1)
     [ -n "$LATEST_BUNDLE" ] || fail "no bundles at $REMOTE_ROOT/bundles"
-    log "downloading bundle $LATEST_BUNDLE"
+    # Drills are named after the bundle that produced them (ID.drill.json/.sig).
+    # Pair by that ID instead of selecting the newest drill independently: a
+    # bundle whose drill upload failed must fail status, not borrow an older drill.
+    DRILL_JSON="$LATEST_BUNDLE.drill.json"
+    DRILL_SIG="$LATEST_BUNDLE.drill.sig"
+    DRILL_LIST=$(rc lsf "$REMOTE_ROOT/drills" --config "$RCLONE_CONFIG" || true)
+    printf '%s\n' "$DRILL_LIST" | grep -Fx "$DRILL_JSON" >/dev/null ||
+      fail "no signed drill $DRILL_JSON for newest bundle $LATEST_BUNDLE at $REMOTE_ROOT/drills"
+    printf '%s\n' "$DRILL_LIST" | grep -Fx "$DRILL_SIG" >/dev/null ||
+      fail "no signature $DRILL_SIG for newest bundle $LATEST_BUNDLE at $REMOTE_ROOT/drills"
+    log "downloading bundle $LATEST_BUNDLE and its signed drill"
     rc copy "$REMOTE_ROOT/bundles/$LATEST_BUNDLE" "$BUNDLE_DIR/$LATEST_BUNDLE" \
       --config "$RCLONE_CONFIG" --retries 3 --low-level-retries 10
-
-    LATEST_DRILL=$(rc lsf "$REMOTE_ROOT/drills" \
-      --config "$RCLONE_CONFIG" | grep -E '\.drill\.json$' | sort -V | tail -n 1 || true)
-    [ -n "$LATEST_DRILL" ] || fail "no signed drills at $REMOTE_ROOT/drills"
-    LATEST_SIG="${LATEST_DRILL%.json}.sig"
-    log "downloading signed drill $LATEST_DRILL"
-    rc copyto "$REMOTE_ROOT/drills/$LATEST_DRILL" "$DRILL_DIR/$LATEST_DRILL" \
+    rc copyto "$REMOTE_ROOT/drills/$DRILL_JSON" "$DRILL_DIR/$DRILL_JSON" \
       --config "$RCLONE_CONFIG" --retries 3 --low-level-retries 10
-    rc copyto "$REMOTE_ROOT/drills/$LATEST_SIG" "$DRILL_DIR/$LATEST_SIG" \
+    rc copyto "$REMOTE_ROOT/drills/$DRILL_SIG" "$DRILL_DIR/$DRILL_SIG" \
       --config "$RCLONE_CONFIG" --retries 3 --low-level-retries 10
 
     kc backup-status \

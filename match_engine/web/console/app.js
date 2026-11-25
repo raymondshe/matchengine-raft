@@ -150,10 +150,9 @@
       warnings.length === 0 ? "Cluster healthy" : "Cluster degraded",
       warnings.length === 0 ? "good" : "warn",
     );
-    const leaderLabel = cluster.leader_id === null || cluster.leader_id === undefined
-      ? "No leader"
-      : `Leader node-${cluster.leader_id}`;
-    setChip("leader-chip", leaderLabel, cluster.leader_id === null ? "warn" : "good");
+    const noLeader = cluster.leader_id === null || cluster.leader_id === undefined;
+    const leaderLabel = noLeader ? "No leader" : `Leader node-${cluster.leader_id}`;
+    setChip("leader-chip", leaderLabel, noLeader ? "warn" : "good");
     setChip("term-chip", `Term ${cluster.term}`, "");
     text("updated", `Updated ${new Date(cluster.generated_at_ms).toLocaleTimeString()}`);
 
@@ -523,7 +522,8 @@
     } else {
       status.textContent = "No events";
     }
-    $("events-older").disabled = !state.eventsAfter;
+    // The cursor is forward-only, so only "Newer" needs a next_after to advance.
+    $("events-newer").disabled = !state.eventsAfter;
   }
 
   async function refreshEvents(reset = false) {
@@ -533,6 +533,8 @@
       renderEvents({ Err: "leader only" });
       return;
     }
+    // `after: null` starts at the oldest retained event; a non-null cursor
+    // advances toward the tail. This API cannot page backwards.
     if (reset) state.eventsAfter = null;
     try {
       const response = await fetchJSON("/events", {
@@ -543,6 +545,16 @@
           limit: Number($("event-limit").value),
         }),
       });
+      const page = response && response.Ok ? response.Ok : response;
+      // A forward poll at the tail returns an empty page with next_after held
+      // at the current cursor. Keep the last page on screen instead of clearing.
+      if (!reset && page && Array.isArray(page.events) && page.events.length === 0 && state.events.length > 0) {
+        state.eventsAfter = page.next_after;
+        const status = $("events-status");
+        if (status) status.textContent = `Caught up · ${state.events.length} event(s) shown · waiting for newer events`;
+        $("events-newer").disabled = !state.eventsAfter;
+        return;
+      }
       renderEvents(response);
     } catch (error) {
       const status = $("events-status");
@@ -557,7 +569,7 @@
       const cluster = await fetchJSON("/console/api/cluster");
       renderCluster(cluster);
       await refreshActions();
-      if ($("tab-events").checked && !state.eventsPaused) await refreshEvents(true);
+      if ($("tab-events").checked && !state.eventsPaused) await refreshEvents(false);
     } catch (error) {
       setChip("cluster-chip", `Console unavailable: ${error.message}`, "bad");
       text("updated", `Stale · ${error.message}`);
@@ -633,12 +645,12 @@
     $("events-pause").textContent = state.eventsPaused ? "Resume" : "Pause";
     if (!state.eventsPaused) refreshEvents(false);
   });
-  $("events-newer").addEventListener("click", () => refreshEvents(true));
-  $("events-older").addEventListener("click", () => refreshEvents(false));
+  $("events-newer").addEventListener("click", () => refreshEvents(false));
+  $("events-older").addEventListener("click", () => refreshEvents(true));
   $("event-kind").addEventListener("change", () => renderEvents({ Ok: { events: state.events, next_after: state.eventsAfter } }));
   $("event-side").addEventListener("change", () => renderEvents({ Ok: { events: state.events, next_after: state.eventsAfter } }));
   $("tab-events").addEventListener("change", () => {
-    if ($("tab-events").checked) refreshEvents(true);
+    if ($("tab-events").checked) refreshEvents(false);
   });
 
   $("copy-json").addEventListener("click", async () => {

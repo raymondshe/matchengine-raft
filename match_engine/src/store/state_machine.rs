@@ -82,7 +82,7 @@ const SNAPSHOT_MAGIC: &[u8; 7] = b"MRFSNAP";
 /// with the `MatchErrors` bit set; version 11 adds owner identity, market-to-limit, trailing-stop
 /// state, peg state and the symbol's STP policy. Postcard is not self-describing, so an older file
 /// is rejected with an explicit error instead of being decoded into a different shape.
-const SNAPSHOT_VERSION: u32 = 11;
+pub const SNAPSHOT_VERSION: u32 = 11;
 /// `magic + version + crc32 of the body`.
 const SNAPSHOT_HEADER_LEN: usize = SNAPSHOT_MAGIC.len() + 4 + 4;
 
@@ -451,17 +451,21 @@ impl<C: RaftTypeConfig> Default for StateMachineStoreInner<C> {
 
 impl<C: RaftTypeConfig> StateMachineStoreInner<C> {
     /// Replaces the state with serialized content, rebuilding the order book indices.
-    fn install_content(&mut self, content: StateMachineData) {
+    fn install_content(&mut self, content: StateMachineData) -> io::Result<()> {
+        // A CRC-valid snapshot with an invalid symbol config is a corrupt or
+        // incompatible producer, not a reason to silently substitute defaults:
+        // doing so would diverge replicated validation state.
+        content
+            .symbol_config
+            .validate()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
         self.orderbook.asks.clear();
         self.orderbook.bids.clear();
         self.orderbook.stops.clear();
         self.orderbook.sequence = content.sequence;
         self.orderbook.last_trade_price = content.last_trade_price;
 
-        self.symbol_config = content
-            .symbol_config
-            .validate()
-            .unwrap_or_else(|_| SymbolConfig::default());
+        self.symbol_config = content.symbol_config;
         self.symbol_locked = content.symbol_locked;
 
         for order in &content.orders {
@@ -485,6 +489,7 @@ impl<C: RaftTypeConfig> StateMachineStoreInner<C> {
         self.submissions_evicted = content.submissions_evicted;
         self.trim_events();
         self.trim_submissions();
+        Ok(())
     }
 
     /// Reprices resting pegged orders after a mutating request and appends the
@@ -612,10 +617,17 @@ impl<C: RaftTypeConfig> StateMachineStoreInner<C> {
     ) -> (Vec<MatchEvent>, Option<EventId>, bool) {
         let mut events = Vec::new();
         let mut has_more = false;
-        for event in &self.events {
-            if after.is_some_and(|cursor| event.event_id <= cursor) {
-                continue;
-            }
+        // Events are appended in (log_index, ordinal) order, so find the first
+        // event strictly after the cursor in O(log n) instead of skipping the
+        // whole retained window on every tail-following page request.
+        let start = match after {
+            None => 0,
+            Some(after) => self
+                .events
+                .binary_search_by(|event| event.event_id.cmp(&after))
+                .map_or_else(|position| position, |position| position + 1),
+        };
+        for event in self.events.iter().skip(start) {
             if events.len() == limit {
                 has_more = true;
                 break;
@@ -936,7 +948,7 @@ impl<C: RaftTypeConfig> StateMachineStore<C> {
             let snapshot_last_log_id = meta.last_log_id.clone();
             let snapshot_events = content.events.len();
             let snapshot_orders = content.orders.len();
-            inner.install_content(content);
+            inner.install_content(content)?;
             inner.last_applied_log = meta.last_log_id.clone();
             inner.last_membership = meta.last_membership.clone();
             inner.current_snapshot = Some(StoredSnapshot { meta, data });
@@ -1709,7 +1721,7 @@ where
             let mut inner = self.inner.lock().await;
             inner.last_applied_log = meta.last_log_id.clone();
             inner.last_membership = meta.last_membership.clone();
-            inner.install_content(content);
+            inner.install_content(content)?;
             inner.current_snapshot = Some(StoredSnapshot {
                 meta: meta.clone(),
                 data,

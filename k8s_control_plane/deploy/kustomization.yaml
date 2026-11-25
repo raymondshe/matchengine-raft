@@ -13,3 +13,15 @@ resources:
   - prometheus/prometheus.yaml
   - prometheus/grafana.yaml
   - prometheus/loki.yaml
+
+# The bridge script has a single source of truth: the file on disk. Previously
+# it was duplicated verbatim in bridge.yaml's ConfigMap and the two copies
+# drifted. Disable the hash suffix so the Deployment's static volume reference
+# keeps working.
+configMapGenerator:
+  - name: json-bridge-script
+    namespace: match-observability
+    files:
+      - bridge.py=prometheus/json_bridge.py
+generatorOptions:
+  disableNameSuffixHash: true

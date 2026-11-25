@@ -60,8 +60,11 @@ export function getBackends(): Promise<DeskBackends> {
   return fetchJSON<DeskBackends>("/demo/api/backends");
 }
 
-export function getState(target: string, depth = 20): Promise<DeskState> {
-  return fetchJSON<DeskState>(`/demo/api/state?depth=${depth}&target=${encodeURIComponent(target)}`);
+export function getState(target: string, depth = 20, userId?: number): Promise<DeskState> {
+  const user = userId === undefined ? "" : `&user_id=${encodeURIComponent(String(userId))}`;
+  return fetchJSON<DeskState>(
+    `/demo/api/state?depth=${depth}&target=${encodeURIComponent(target)}${user}`,
+  );
 }
 
 export function getEvents(

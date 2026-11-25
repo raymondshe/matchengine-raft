@@ -437,10 +437,10 @@ pub struct BidKey {
     pub sequence: u64,
 }
 
-/// Equality for BidKey based solely on sequence number.
+/// Equality for BidKey must agree with `Ord`, which compares price then sequence.
 impl PartialEq for BidKey {
     fn eq(&self, other: &Self) -> bool {
-        self.sequence == other.sequence
+        self.price == other.price && self.sequence == other.sequence
     }
 }
 
@@ -485,10 +485,10 @@ pub struct AskKey {
     pub sequence: u64,
 }
 
-/// Equality for AskKey based solely on sequence number.
+/// Equality for AskKey must agree with `Ord`, which compares price then sequence.
 impl PartialEq for AskKey {
     fn eq(&self, other: &Self) -> bool {
-        self.sequence == other.sequence
+        self.price == other.price && self.sequence == other.sequence
     }
 }
 
@@ -584,6 +584,10 @@ pub struct OrderBook {
     /// removed and executed as immediate takers; they never rest.
     #[serde(default)]
     pub stops: Vec<Order>,
+    /// Derived count of parked trailing stops. Lets `observe_trade` skip the
+    /// whole parked-stop walk when no trailing stop exists.
+    #[serde(skip)]
+    pub trailing_stop_count: usize,
     /// Price of the most recent trade, if there has been one. This is what
     /// elects parked stops, so it is part of the replicated state.
     #[serde(default)]
@@ -1102,6 +1106,7 @@ impl OrderBook {
             asks: BTreeMap::new(),
             sequence: 0,
             stops: Vec::new(),
+            trailing_stop_count: 0,
             last_trade_price: None,
             depth_journal: Vec::new(),
             record_depth: false,
@@ -1130,6 +1135,9 @@ impl OrderBook {
     /// unambiguous "not initialised" sentinel.
     fn observe_trade(&mut self, price: Fixed) {
         self.last_trade_price = Some(price);
+        if self.trailing_stop_count == 0 {
+            return;
+        }
         for stop in &mut self.stops {
             if !stop.is_trailing_stop() {
                 continue;
@@ -1174,8 +1182,22 @@ impl OrderBook {
         self.earliest_gtd_expiry = earliest;
     }
 
+    /// Note that one GTD order left the book. Only removal of the order that
+    /// currently owns the earliest deadline can invalidate the cached minimum;
+    /// later deadlines leave it intact and avoid a full-book rescan.
+    fn note_gtd_removed(&mut self, expiry: u64) {
+        if self.earliest_gtd_expiry == Some(expiry) {
+            self.gtd_scan_dirty = true;
+        }
+    }
+
     /// Rebuilds the derived indexes after a snapshot restore.
     pub fn rebuild_derived_indexes(&mut self) {
+        self.trailing_stop_count = self
+            .stops
+            .iter()
+            .filter(|stop| stop.is_trailing_stop())
+            .count();
         self.gtd_scan_dirty = true;
         self.refresh_earliest_gtd();
     }
@@ -1378,8 +1400,8 @@ impl OrderBook {
                     OrderSide::Buy => self.bids.remove(&BidKey { price, sequence }),
                     OrderSide::Sell => self.asks.remove(&AskKey { price, sequence }),
                 };
-                if matches!(order.tif, TimeInForce::Gtd(_)) {
-                    self.gtd_scan_dirty = true;
+                if let TimeInForce::Gtd(expiry) = order.tif {
+                    self.note_gtd_removed(expiry);
                 }
                 self.record_depth_change(side, order.price, -order.volume, -1);
                 updates.push(PegUpdate::Cancelled { order, reason });
@@ -1665,6 +1687,9 @@ impl OrderBook {
                             .map_or(expiry, |current| current.min(expiry)),
                     );
                 }
+                if order.is_trailing_stop() {
+                    self.trailing_stop_count += 1;
+                }
                 self.stops.push(*order);
                 outcome.parked = true;
             }
@@ -1751,8 +1776,11 @@ impl OrderBook {
             .position(|stop| stop.side == order.side && stop.sequence == order.sequence);
         if let Some(index) = parked {
             let stop = self.stops.remove(index);
-            if matches!(stop.tif, TimeInForce::Gtd(_)) {
-                self.gtd_scan_dirty = true;
+            if stop.is_trailing_stop() {
+                self.trailing_stop_count = self.trailing_stop_count.saturating_sub(1);
+            }
+            if let TimeInForce::Gtd(expiry) = stop.tif {
+                self.note_gtd_removed(expiry);
             }
             return Some(stop);
         }
@@ -1768,8 +1796,8 @@ impl OrderBook {
             }),
         };
         if let Some(cancelled) = removed {
-            if matches!(cancelled.tif, TimeInForce::Gtd(_)) {
-                self.gtd_scan_dirty = true;
+            if let TimeInForce::Gtd(expiry) = cancelled.tif {
+                self.note_gtd_removed(expiry);
             }
             self.record_depth_change(cancelled.side, cancelled.price, -cancelled.volume, -1);
         }
@@ -2441,8 +2469,11 @@ impl OrderBook {
             };
 
             let stop = self.stops.remove(index);
-            if matches!(stop.tif, TimeInForce::Gtd(_)) {
-                self.gtd_scan_dirty = true;
+            if stop.is_trailing_stop() {
+                self.trailing_stop_count = self.trailing_stop_count.saturating_sub(1);
+            }
+            if let TimeInForce::Gtd(expiry) = stop.tif {
+                self.note_gtd_removed(expiry);
             }
             let trigger_price = last_trade_price;
             let limit = match stop.live {
@@ -2506,6 +2537,11 @@ impl OrderBook {
         });
         if !removed.is_empty() {
             self.gtd_scan_dirty = true;
+            self.trailing_stop_count = self
+                .stops
+                .iter()
+                .filter(|stop| stop.is_trailing_stop())
+                .count();
         }
 
         removed

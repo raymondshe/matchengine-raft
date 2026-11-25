@@ -317,7 +317,7 @@ fn events_long_poll_returns_new_events_or_an_empty_page_after_the_wait() {
 
 #[test]
 fn event_service_streams_pages_with_an_idle_heartbeat() {
-    use matchengine_raft::network::api::EventsResponse;
+    use matchengine_raft::network::grpc::decode_event_page;
     use matchengine_raft::network::grpc::pb::StreamEventsRequest;
     use matchengine_raft::network::grpc::pb::event_service_client::EventServiceClient;
 
@@ -345,7 +345,7 @@ fn event_service_streams_pages_with_an_idle_heartbeat() {
             .unwrap()
             .into_inner();
         let frame = stream.message().await.unwrap().expect("heartbeat page");
-        let page: EventsResponse = serde_json::from_slice(&frame.payload).unwrap_or_else(|error| {
+        let page = decode_event_page(&frame.payload).unwrap_or_else(|error| {
             panic!("decode {} payload bytes: {error}", frame.payload.len())
         });
         assert!(
@@ -390,10 +390,9 @@ fn event_service_streams_pages_with_an_idle_heartbeat() {
             .into_inner();
         let mut seen_fill = false;
         while let Some(frame) = stream.message().await.unwrap() {
-            let page: EventsResponse =
-                serde_json::from_slice(&frame.payload).unwrap_or_else(|error| {
-                    panic!("decode {} payload bytes: {error}", frame.payload.len())
-                });
+            let page = decode_event_page(&frame.payload).unwrap_or_else(|error| {
+                panic!("decode {} payload bytes: {error}", frame.payload.len())
+            });
             if page
                 .events
                 .iter()

@@ -59,11 +59,23 @@ export class BarStore {
       const book = this.book(label);
       const bar = book.get(time);
       if (bar) {
+        // A server/history bar marked closed is final; trades never rewrite it.
+        if (bar.closed) continue;
         bar.high = Math.max(bar.high, price);
         bar.low = Math.min(bar.low, price);
         bar.close = price;
         bar.volume += size;
       } else {
+        // Do not resurrect an older window as a live bar once a newer window
+        // has already been declared closed by the service or history.
+        let superseded = false;
+        for (const [closedTime, closedBar] of book) {
+          if (closedBar.closed && closedTime >= time) {
+            superseded = true;
+            break;
+          }
+        }
+        if (superseded) continue;
         book.set(time, { time, open: price, high: price, low: price, close: price, volume: size, closed: false });
         this.trim(book);
       }

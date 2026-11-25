@@ -25,6 +25,7 @@ use matchengine_raft::order_book::OrderSide;
 
 use crate::config::Config;
 use crate::config::FeedProfile;
+use crate::config::MAX_HISTORY_SNAPSHOT_BARS;
 use crate::config::SymbolSpec;
 use crate::feed::Registry;
 use crate::feed::SharedState;
@@ -39,6 +40,14 @@ use crate::protocol::StreamKind;
 pub enum Outbound {
     Frame(Bytes),
     Close(u16, String),
+}
+
+/// A stream that has passed every pre-subscription check. Keeping the runtime
+/// alongside the parsed spec makes an entire SUBSCRIBE request atomic: no
+/// subscription is mutated until every name in the request validates.
+struct ValidatedStream {
+    spec: protocol::StreamSpec,
+    runtime: Arc<SymbolRuntime>,
 }
 
 /// Per-connection context cloned from the server state.
@@ -129,13 +138,37 @@ pub async fn run(
     let mut stop = ctx.stop.clone();
 
     // Subscribe to streams requested at connect time (raw/combined URL forms).
+    // Validate the whole set first, then apply it, so a bad name cannot leave a
+    // partially established connection.
+    let mut validated: Vec<ValidatedStream> = Vec::with_capacity(ctx.initial.len());
     for name in &ctx.initial {
-        if let Err(error) = subscribe(&ctx, name, &out_tx, &mut subscriptions) {
+        match validate_stream(&ctx, name) {
+            Ok(stream) => validated.push(stream),
+            Err(error) => {
+                close = Some(CloseReason {
+                    code: CloseCode::Policy,
+                    description: Some(error.message),
+                });
+                break;
+            }
+        }
+    }
+    if close.is_none() {
+        let mut new_keys = std::collections::BTreeSet::new();
+        for stream in &validated {
+            if !subscriptions.contains_key(&stream.spec.key) {
+                new_keys.insert(stream.spec.key.clone());
+            }
+        }
+        if subscriptions.len() + new_keys.len() > ctx.profile.max_streams(&ctx.config) {
             close = Some(CloseReason {
                 code: CloseCode::Policy,
-                description: Some(error.message),
+                description: Some("subscription limit exceeded".to_string()),
             });
-            break;
+        } else {
+            for stream in &validated {
+                subscribe(&ctx, stream, &out_tx, &mut subscriptions);
+            }
         }
     }
 
@@ -233,24 +266,24 @@ fn handle_control(
     };
     match control {
         ControlMessage::Subscribe { params, id } => {
-            // Validate and deduplicate first so a mixed-symbol request is
-            // all-or-nothing and duplicate names do not consume the 1024-stream
-            // budget twice.
-            let specs: Vec<protocol::StreamSpec> = match params
+            // Validate every name (parse, fast-symbol restriction and runtime)
+            // before touching any subscription. A mixed-symbol request on a
+            // fast connection must not leave earlier streams subscribed.
+            let validated: Vec<ValidatedStream> = match params
                 .iter()
-                .map(|name| protocol::parse_stream(ctx.config.as_ref(), name))
+                .map(|name| validate_stream(ctx, name))
                 .collect()
             {
-                Ok(specs) => specs,
+                Ok(streams) => streams,
                 Err(error) => {
                     send_control(out_tx, protocol::control_error(&error, Some(&id)));
                     return;
                 }
             };
             let mut new_keys = std::collections::BTreeSet::new();
-            for spec in &specs {
-                if !subscriptions.contains_key(&spec.key) {
-                    new_keys.insert(spec.key.clone());
+            for stream in &validated {
+                if !subscriptions.contains_key(&stream.spec.key) {
+                    new_keys.insert(stream.spec.key.clone());
                 }
             }
             if subscriptions.len().saturating_add(new_keys.len())
@@ -268,11 +301,8 @@ fn handle_control(
                 );
                 return;
             }
-            for name in &params {
-                if let Err(error) = subscribe(ctx, name, out_tx, subscriptions) {
-                    send_control(out_tx, protocol::control_error(&error, Some(&id)));
-                    return;
-                }
+            for stream in &validated {
+                subscribe(ctx, stream, out_tx, subscriptions);
             }
             send_control(out_tx, protocol::control_result(&id));
         }
@@ -297,12 +327,8 @@ fn handle_control(
     }
 }
 
-fn subscribe(
-    ctx: &SessionCtx,
-    name: &str,
-    out_tx: &mpsc::Sender<Outbound>,
-    subscriptions: &mut HashMap<String, JoinHandle<()>>,
-) -> Result<(), ProtocolError> {
+/// Parses and validates one stream name without mutating any subscription.
+fn validate_stream(ctx: &SessionCtx, name: &str) -> Result<ValidatedStream, ProtocolError> {
     let spec = protocol::parse_stream(&ctx.config, name)?;
     if let Some(restrict) = &ctx.restrict_symbol
         && &spec.symbol != restrict
@@ -320,14 +346,24 @@ fn subscribe(
             code: 0,
             message: "unknown symbol".to_string(),
         })?;
+    Ok(ValidatedStream {
+        spec,
+        runtime: runtime.clone(),
+    })
+}
+
+/// Applies a pre-validated stream. The stream/connection limits are enforced
+/// by the caller before any of these mutations happen, so this cannot fail.
+fn subscribe(
+    ctx: &SessionCtx,
+    stream: &ValidatedStream,
+    out_tx: &mpsc::Sender<Outbound>,
+    subscriptions: &mut HashMap<String, JoinHandle<()>>,
+) {
+    let spec = &stream.spec;
+    let runtime = &stream.runtime;
     if subscriptions.contains_key(&spec.key) {
-        return Ok(());
-    }
-    if subscriptions.len() >= ctx.profile.max_streams(&ctx.config) {
-        return Err(ProtocolError {
-            code: 2,
-            message: "subscription limit exceeded".to_string(),
-        });
+        return;
     }
 
     // Subscribe to the broadcast before reading the cache so a delta published
@@ -367,7 +403,13 @@ fn subscribe(
     // the recent bar history so a freshly loaded chart is not blank.
     let snapshots = {
         let state = runtime.shared.lock().expect("state lock");
-        snapshot_payload(&runtime.spec, &state, spec.kind, ctx.config.snapshot_levels)
+        snapshot_payload(
+            &runtime.spec,
+            &state,
+            spec.kind,
+            ctx.config.snapshot_levels,
+            ctx.config.history.snapshot_bars,
+        )
     };
     for payload in snapshots {
         // Best-effort: a long history never fails the subscription, it just
@@ -394,8 +436,7 @@ fn subscribe(
     let task = tokio::spawn(async move {
         forward(guard, out, latest, combined, stats, conflation, budget).await;
     });
-    subscriptions.insert(spec.key, task);
-    Ok(())
+    subscriptions.insert(spec.key.clone(), task);
 }
 
 /// Owns one forward task's broadcast receiver. On exit (including `abort`) it
@@ -504,6 +545,7 @@ fn snapshot_payload(
     state: &SharedState,
     kind: StreamKind,
     snapshot_levels: usize,
+    history_snapshot_bars: usize,
 ) -> Vec<Vec<u8>> {
     match kind {
         StreamKind::BookTicker => state
@@ -537,7 +579,12 @@ fn snapshot_payload(
             .bar_history
             .get(&interval_ms)
             .map(|history| {
-                history
+                // Replay the most recent configured number of bars. The feed's
+                // ring is capped at MAX_HISTORY_SNAPSHOT_BARS; the config can
+                // only lower the replay depth.
+                let cap = history_snapshot_bars.clamp(1, MAX_HISTORY_SNAPSHOT_BARS);
+                let start = history.len().saturating_sub(cap);
+                history[start..]
                     .iter()
                     .map(|(bar, closed)| {
                         let quote = state

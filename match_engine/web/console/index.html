@@ -220,7 +220,7 @@
         <div class="panel-head">
           <div>
             <h2>Match events</h2>
-            <p>Leader-only event log. Cursor pagination uses (log_index, ordinal).</p>
+            <p>Leader-only event log. The (log_index, ordinal) cursor is forward-only: “Newer” advances toward the tail and “Oldest” restarts at the oldest retained event; older pages cannot be revisited.</p>
           </div>
           <span class="badge" id="events-badge">—</span>
         </div>
@@ -264,8 +264,8 @@
         <div class="pager">
           <span id="events-status">—</span>
           <span class="diag-actions">
-            <button class="btn ghost" id="events-newer" type="button">Newest</button>
-            <button class="btn" id="events-older" type="button">Older</button>
+            <button class="btn" id="events-newer" type="button">Newer</button>
+            <button class="btn ghost" id="events-older" type="button">Oldest</button>
           </span>
         </div>
       </section>

@@ -72,6 +72,7 @@ PORT_ADOPT=$((BASE_PORT + 51))
 MANAGER=
 PF_PID=
 OPERATOR_SCALED=0
+OPERATOR_ORIGINAL_REPLICAS=
 DID_CREATE=0
 CLEANED=0
 TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/operator-acceptance.XXXXXX")
@@ -346,16 +347,19 @@ phase_selected() {
 cleanup_on_exit() {
     local code=$?
     trap - EXIT
-    if [ -n "${PF_PID:-}" ]; then
-        kill "$PF_PID" 2>/dev/null || true
-        wait "$PF_PID" 2>/dev/null || true
-    fi
-    if [ "${OPERATOR_SCALED:-0}" = "1" ]; then
-        kubectl -n "$CONTROL_NS" scale deployment "$OPERATOR_DEPLOY" --replicas=1 >/dev/null 2>&1 || true
-    fi
+    # cleanup_shard shuts symbols down through the manager API, so CR/PVC
+    # cleanup must run while the manager port-forward is still alive.
     if [ "${KEEP:-0}" != "1" ] && [ "${DID_CREATE:-0}" = "1" ] && [ "${CLEANED:-0}" != "1" ]; then
         printf '\ncleaning up acceptance resources after exit...\n' >&2
         cleanup_all >/dev/null 2>&1 || true
+    fi
+    if [ "${OPERATOR_SCALED:-0}" = "1" ]; then
+        kubectl -n "$CONTROL_NS" scale deployment "$OPERATOR_DEPLOY" \
+            --replicas="${OPERATOR_ORIGINAL_REPLICAS:-1}" >/dev/null 2>&1 || true
+    fi
+    if [ -n "${PF_PID:-}" ]; then
+        kill "$PF_PID" 2>/dev/null || true
+        wait "$PF_PID" 2>/dev/null || true
     fi
     exit "$code"
 }
@@ -1760,6 +1764,9 @@ phase_adoption() {
     create_clean_shard "$SHARD_ADOPT"
 
     step "phase: adoption operator paused"
+    OPERATOR_ORIGINAL_REPLICAS=$(kubectl -n "$CONTROL_NS" get deployment "$OPERATOR_DEPLOY" \
+        -o jsonpath='{.spec.replicas}' 2>/dev/null || true)
+    [ -n "$OPERATOR_ORIGINAL_REPLICAS" ] || OPERATOR_ORIGINAL_REPLICAS=1
     OPERATOR_SCALED=1
     kubectl -n "$CONTROL_NS" scale deployment "$OPERATOR_DEPLOY" --replicas=0 >/dev/null
     wait_operator_replicas 0 120
@@ -1783,8 +1790,9 @@ phase_adoption() {
     assert_nonempty "$pods" "recorded the adopted pod UIDs"
 
     step "phase: adoption operator resumed"
-    kubectl -n "$CONTROL_NS" scale deployment "$OPERATOR_DEPLOY" --replicas=1 >/dev/null
-    wait_operator_replicas 1 120
+    kubectl -n "$CONTROL_NS" scale deployment "$OPERATOR_DEPLOY" \
+        --replicas="$OPERATOR_ORIGINAL_REPLICAS" >/dev/null
+    wait_operator_replicas "$OPERATOR_ORIGINAL_REPLICAS" 120
     OPERATOR_SCALED=0
     wait_shard_ready "$SHARD_ADOPT"
     wait_pods_ready "$SHARD_ADOPT" "$REPLICAS"

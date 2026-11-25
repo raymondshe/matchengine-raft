@@ -172,6 +172,8 @@ case $1 in
     clean
     ;;
   *)
-    "Nothing is done!"
+    echo "Usage: $0 <command> [node]"
+    echo "Commands: start-node, build-cluster, change-membership, metrics, place-order, get-seq, kill-node, kill, clean"
+    exit 1
     ;;
 esac

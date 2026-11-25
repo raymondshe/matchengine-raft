@@ -30,6 +30,7 @@ use matchengine_raft::market_data::flags;
 use matchengine_raft::order_book::Fixed;
 use matchengine_raft::order_book::OrderSide;
 
+use crate::config::MAX_HISTORY_SNAPSHOT_BARS;
 use crate::config::SymbolSpec;
 use crate::history::HistoryEvent;
 use crate::history::HistoryTrade;
@@ -142,7 +143,6 @@ impl SharedState {
     /// the stored copy (the engine re-sends the open bar as it grows), and an
     /// older window is ignored so a delayed frame cannot rewrite history.
     pub fn record_bar(&mut self, bar: &matchengine_raft::market_data::BarRecord, closed: bool) {
-        const MAX_BARS: usize = 1_000;
         let history = self.bar_history.entry(bar.interval_ms).or_default();
         if let Some(last) = history.last_mut() {
             if last.0.window_start_ms == bar.window_start_ms {
@@ -155,8 +155,8 @@ impl SharedState {
             }
         }
         history.push((bar.clone(), closed));
-        if history.len() > MAX_BARS {
-            history.drain(..history.len() - MAX_BARS);
+        if history.len() > MAX_HISTORY_SNAPSHOT_BARS {
+            history.drain(..history.len() - MAX_HISTORY_SNAPSHOT_BARS);
         }
     }
 
@@ -258,6 +258,10 @@ pub struct Stats {
     pub gaps: AtomicU64,
     pub snapshot_requests: AtomicU64,
     pub slow_closes: AtomicU64,
+    /// Trades dropped by the best-effort history tap when its queue is full.
+    pub history_dropped_events: AtomicU64,
+    /// Bar rows dropped when a failed upsert cannot be requeued.
+    pub history_dropped_rows: AtomicU64,
     pub last_ts_ms: AtomicU64,
 }
 
@@ -276,6 +280,8 @@ impl Stats {
             "gaps": self.gaps.load(Ordering::Relaxed),
             "snapshot_requests": self.snapshot_requests.load(Ordering::Relaxed),
             "slow_closes": self.slow_closes.load(Ordering::Relaxed),
+            "history_dropped_events": self.history_dropped_events.load(Ordering::Relaxed),
+            "history_dropped_rows": self.history_dropped_rows.load(Ordering::Relaxed),
             "last_ts_ms": self.last_ts_ms.load(Ordering::Relaxed),
         })
     }
@@ -500,8 +506,14 @@ impl Feed {
                         });
                         // Never back-pressure the match/feed path: the tap is
                         // best-effort and a gap is surfaced by the DB-backed
-                        // query rather than by blocking the tape.
-                        let _ = tx.try_send(event);
+                        // query rather than by blocking the tape. Count every
+                        // rejection so /metrics exposes the loss instead of
+                        // silently dropping trades.
+                        if tx.try_send(event).is_err() {
+                            self.stats
+                                .history_dropped_events
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                 }
                 if self.extensions {

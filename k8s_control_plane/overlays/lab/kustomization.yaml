@@ -7,11 +7,10 @@ resources:
   - ../../deploy
   - ../../deploy/cell
 images:
-  # operator-v97 is the current locally built control-plane image (includes
-  # the --metrics-port endpoint); keep it instead of the older :local tag.
+  # Current locally built images for this fix pass.
   - name: matchengine-k8s-control-plane
     newName: matchengine-k8s-control-plane
-    newTag: operator-v97
+    newTag: operator-v99
   - name: matchengine-trading-terminal
     newName: matchengine-trading-terminal
-    newTag: arm64-v4
+    newTag: arm64-v5

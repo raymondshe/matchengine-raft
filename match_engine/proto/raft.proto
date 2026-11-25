@@ -61,7 +61,9 @@ message StreamEventsRequest {
 }
 
 message StreamEventsPage {
-  // JSON-encoded `EventsResponse`, the same object as `POST /events`.
+  // postcard-encoded `EventsResponse`, the same schema as `POST /events` but
+  // compact for this internal Rust-to-Rust stream. This is a breaking change
+  // from the former JSON page payload.
   bytes payload = 1;
 }
 
