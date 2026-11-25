@@ -140,7 +140,10 @@ pub async fn start_with_snapshot_requesters(
             Arc::new(Mutex::new(SharedState::default())),
         );
     }
-    let history = if config.history.enabled {
+    // A read-only history instance queries TDengine for /klines but never
+    // starts the writer or taps trades. The per-symbol fast services own the
+    // writer so each bar series is materialized exactly once.
+    let history = if config.history.enabled && !config.history.read_only {
         Some(
             runtime::start(
                 config.history.clone(),
@@ -154,6 +157,13 @@ pub async fn start_with_snapshot_requesters(
         )
     } else {
         None
+    };
+    let history_store = if !config.history.enabled {
+        None
+    } else if let Some(runtime) = &history {
+        Some(runtime.store.clone())
+    } else {
+        Some(Arc::new(HistoryStore::new(&config.history)?))
     };
     let history_tx = history.as_ref().map(|runtime| runtime.tx.clone());
 
@@ -195,7 +205,7 @@ pub async fn start_with_snapshot_requesters(
         registry,
         stats,
         stop: stop_tx.clone(),
-        history: history.as_ref().map(|runtime| runtime.store.clone()),
+        history: history_store,
     };
     let bind = state.config.addr.clone();
     let listener = std::net::TcpListener::bind(bind.as_str())?;

@@ -26,6 +26,12 @@ kubectl apply -f k8s_control_plane/deploy/prometheus/grafana.yaml
 kubectl apply -f k8s_control_plane/deploy/prometheus/loki.yaml
 ```
 
+Promtail copies only a small allowlist of pod labels (`app`, instance, cell, cluster, role, shard,
+environment) plus `namespace`/`pod`/`container`; copying every pod label exceeds Loki's default 15
+label-name limit on engine pods. Loki's lab `limits_config` also raises `ingestion_rate_mb` to 32 and
+`ingestion_burst_size_mb` to 64 because the continuous replay and health/metrics probes generate
+bursts above the 4 MB/s default. Both are lab-only settings in `deploy/prometheus/loki.yaml`.
+
 The operator must be built from this revision so it serves its `/metrics`
 endpoint, and `k8s_control_plane/deploy/operator.yaml` adds the
 `match-operator-metrics` Service (port 9091):

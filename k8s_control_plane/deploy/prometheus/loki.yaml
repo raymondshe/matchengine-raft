@@ -34,6 +34,10 @@ data:
             period: 24h
     limits_config:
       retention_period: 168h
+      # The continuous replay harness plus health/metrics probes generate
+      # bursts well above Loki's 4 MB/s default on this single-node lab.
+      ingestion_rate_mb: 32
+      ingestion_burst_size_mb: 64
     compactor:
       working_directory: /loki/compactor
       compaction_interval: 10m
@@ -151,8 +155,11 @@ data:
           - source_labels: [__meta_kubernetes_pod_node_name]
             action: replace
             target_label: __host__
+          # Keep the label set small: Loki's default max_label_names_per_series
+          # is 15, and engine pods carry 12 Kubernetes labels. Copy only the
+          # labels used for routing/filtering; namespace/pod/container add 3.
           - action: labelmap
-            regex: __meta_kubernetes_pod_label_(.+)
+            regex: __meta_kubernetes_pod_label_(app_kubernetes_io_name|app_kubernetes_io_instance|matching_io_cell|matching_io_cluster|matching_io_role|matching_io_shard|matching_io_environment)
           - source_labels: [__meta_kubernetes_namespace]
             action: replace
             target_label: namespace

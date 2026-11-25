@@ -244,7 +244,10 @@ CI (`.github/workflows/ci.yml`) runs `cargo fmt --all -- --check` (and the `matc
   18-decimal text on write, `CAST(col AS VARCHAR)` on read (the `taos` connector's `rust_decimal`
   path silently loses 18 digits on a 38-digit value), never `f64`. One Lease-guarded writer with a
   local trade spool (TDengine cannot key multiple fills at one microsecond); readers are stateless
-  and query TDengine directly. Serves a Binance-compatible `GET /klines` plus a native `GET /bars`
+  and query TDengine directly. In the current lab Deployment the **per-symbol fast services own the
+  writer** (one series each, no duplicate) and the global terminal service is read-only
+  (`--history-read-only`); the single-Lease HA failover contract remains design. Serves a
+  Binance-compatible `GET /klines` plus a native `GET /bars`
   and a WS snapshot/live cursor with `seq` (engine `market_seq`) and `rev` gap repair. **Phase P0 is
   implemented** in `market_data_system/` (`--history`, `src/history/`, `GET /klines`); the trade
   spool, Lease failover, revisions/gaps, `/bars`, importers and time-zone anchors remain design.

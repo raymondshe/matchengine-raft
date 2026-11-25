@@ -999,6 +999,10 @@ pub struct MarketDataServiceSpec {
 pub struct MarketDataHistory {
     /// `taosAdapter` endpoint, e.g. `http://tdengine.match-eu-1.svc.cluster.local:6041`.
     pub url: String,
+    /// Serve `/klines` from TDengine without writing bars. The global terminal
+    /// service is read-only; per-symbol fast services own the writer.
+    #[serde(default)]
+    pub read_only: bool,
     #[serde(default = "default_history_database")]
     pub database: String,
     #[serde(default = "default_history_seal_lag_ms")]

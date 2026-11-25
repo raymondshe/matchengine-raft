@@ -1519,8 +1519,11 @@ fn market_data_container(ctx: &MarketDataCtx<'_>) -> Value {
         args.push(json!("--extensions"));
     }
     if let Some(history) = &ctx.service.spec.history {
+        args.push(json!("--history"));
+        if history.read_only {
+            args.push(json!("--history-read-only"));
+        }
         args.extend([
-            json!("--history"),
             json!("--tdengine-url"),
             json!(history.url),
             json!("--tdengine-database"),
@@ -3304,6 +3307,7 @@ mod tests {
             .spec
             .history = Some(MarketDataHistory {
             url: "http://tdengine.match-eu-1.svc.cluster.local:6041".to_string(),
+            read_only: false,
             database: "market_bars".to_string(),
             seal_lag_ms: 1_500,
         });
@@ -3317,6 +3321,7 @@ mod tests {
             .map(|arg| arg.as_str().unwrap())
             .collect();
         assert!(args.contains(&"--history"), "{args:?}");
+        assert!(!args.contains(&"--history-read-only"), "{args:?}");
         assert!(
             args.contains(&"http://tdengine.match-eu-1.svc.cluster.local:6041"),
             "{args:?}"
@@ -3336,6 +3341,36 @@ mod tests {
                 })
             });
         assert!(allowed, "history needs an egress rule to taosAdapter:6041");
+    }
+
+    #[test]
+    fn history_read_only_renders_the_flag() {
+        use crate::model::MarketDataHistory;
+
+        let mut catalog = demo_catalog();
+        demo_nats_market_data(&mut catalog, "btc-marketdata");
+        catalog
+            .market_data_services
+            .get_mut("btc-marketdata")
+            .unwrap()
+            .spec
+            .history = Some(MarketDataHistory {
+            url: "http://tdengine.match-eu-1.svc.cluster.local:6041".to_string(),
+            read_only: true,
+            database: "market_bars".to_string(),
+            seal_lag_ms: 1_500,
+        });
+        let objects =
+            render_market_data_service(&catalog, "btc-marketdata", Some("match-eu-1")).unwrap();
+        let deployment = object(&objects, "Deployment");
+        let args: Vec<&str> = deployment["spec"]["template"]["spec"]["containers"][0]["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|arg| arg.as_str().unwrap())
+            .collect();
+        assert!(args.contains(&"--history"), "{args:?}");
+        assert!(args.contains(&"--history-read-only"), "{args:?}");
     }
 
     #[test]

@@ -57,3 +57,7 @@ required-features = ["aeron"]
 [[bench]]
 name = "ws_fanout"
 harness = false
+
+[[bench]]
+name = "ws_soak"
+harness = false

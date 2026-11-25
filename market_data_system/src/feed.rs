@@ -258,6 +258,17 @@ pub struct Stats {
     pub gaps: AtomicU64,
     pub snapshot_requests: AtomicU64,
     pub slow_closes: AtomicU64,
+    /// Broadcast receivers that lagged and had to skip or close.
+    pub broadcast_lag: AtomicU64,
+    /// Current/peak used slots of per-connection outbound queues.
+    pub queue_depth: AtomicU64,
+    pub queue_peak: AtomicU64,
+    /// Time spent framing payloads per connection, and frames framed.
+    pub encode_ns_total: AtomicU64,
+    pub frames_encoded: AtomicU64,
+    /// Close reasons from the soak's injected slow consumers and policy gates.
+    pub close_code_1013: AtomicU64,
+    pub close_code_policy: AtomicU64,
     /// Trades dropped by the best-effort history tap when its queue is full.
     pub history_dropped_events: AtomicU64,
     /// Bar rows dropped when a failed upsert cannot be requeued.
@@ -280,6 +291,13 @@ impl Stats {
             "gaps": self.gaps.load(Ordering::Relaxed),
             "snapshot_requests": self.snapshot_requests.load(Ordering::Relaxed),
             "slow_closes": self.slow_closes.load(Ordering::Relaxed),
+            "broadcast_lag": self.broadcast_lag.load(Ordering::Relaxed),
+            "queue_depth": self.queue_depth.load(Ordering::Relaxed),
+            "queue_peak": self.queue_peak.load(Ordering::Relaxed),
+            "encode_ns_total": self.encode_ns_total.load(Ordering::Relaxed),
+            "frames_encoded": self.frames_encoded.load(Ordering::Relaxed),
+            "close_code_1013": self.close_code_1013.load(Ordering::Relaxed),
+            "close_code_policy": self.close_code_policy.load(Ordering::Relaxed),
             "history_dropped_events": self.history_dropped_events.load(Ordering::Relaxed),
             "history_dropped_rows": self.history_dropped_rows.load(Ordering::Relaxed),
             "last_ts_ms": self.last_ts_ms.load(Ordering::Relaxed),

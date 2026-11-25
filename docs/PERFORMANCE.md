@@ -1163,6 +1163,35 @@ every offered update reaches every client. The service remains bounded by the pe
 queue and closes a consumer with `1013` when it falls too far behind. These are local
 macOS/loopback numbers and exclude Aeron ingestion and JSON encoding changes under load.
 
+### Fan-out and slow-consumer soak (2026-11-25)
+
+`scripts/market-data-soak.sh` (design in
+[`docs/MARKET_DATA_SOAK_DESIGN.md`](./MARKET_DATA_SOAK_DESIGN.md)) drove the deployed
+`global-marketdata` service through `ws://terminal.match-eu-1.example/md/ws` with **32 clients ×
+16 streams** (bookTicker, trade, depth@100ms and kline_1s across 8 symbols), 15 s per phase, while
+the continuous replay kept writing orders. The instrumented service images were
+`aeron-arm64-v10` / `history-arm64-v7`.
+
+| Phase | Frames | Depth gaps | Reconnects | Driver errors |
+|---|---:|---:|---:|---:|
+| baseline (0 clients) | 0 | 0 | 0 | 0 |
+| steady | 20,169 | 0 | 0 | 0 |
+| churn (SUBSCRIBE/UNSUBSCRIBE) | 20,030 | 0 | 0 | 0 |
+| snapshot storm | 21,224 | 0 | 0 | 0 |
+| slow consumers (25%) | 20,864 | 0 | 0 | 0 |
+| reconnect burst (100%) | 36,702 | 0 | 32 | 0 |
+
+Service counters after the reconnect phase: `queue_peak` **444** (per-connection cap 1,024),
+`broadcast_lag` **0**, `close_code_1013` **0**, `frames_encoded` **82,876** with **2.62 ms** total
+framing CPU (0.032 µs/frame), `terminal_conflated` **16,528**. Eight engine node snapshots sampled
+once per second showed `market_data.dropped_frames = 0`, `gaps = 0` and `queued_peak = 0` while
+`raft.last_applied` advanced from ~747,000 to ~747,660 under the replay load; no engine pod
+restarted and both observability checks (before/after) passed. Raw JSONL samples and the generated
+report are under `dist/soak/lab-soak-pass/` (gitignored).
+
+These are single-node OrbStack results: they prove bounded per-instance fan-out and engine
+isolation, not multi-host fabric behaviour.
+
 ### Transport observability (2026-11-10)
 
 `GET /metrics` now includes `transport_metrics` (also embedded in

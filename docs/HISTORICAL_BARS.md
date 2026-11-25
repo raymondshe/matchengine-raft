@@ -11,6 +11,13 @@ P0 implements the TDengine schema, the trade-derived `1s`/`1m`/`5m` writer, exac
 seeded from TDengine. Targets that are whole multiples of 5 minutes roll up from `bars_5m` when it
 has data (`30m` → `5m` → `1m`), and fall back to `bars_1m` on older deployments.
 
+**Lab deployment ownership (2026-11-25):** the global terminal service is a **read-only querier**
+(`--history-read-only`): it serves `/klines` from TDengine but never taps trades or writes rows.
+Each per-symbol fast `MarketDataService` owns the writer for the symbols it receives, so a bar
+series is materialized by the deterministic owner of that feed rather than once per client-facing
+replica. Upserts are keyed by `(symbol, ts)`, so overlapping lifecycle-test symbols remain
+idempotent; the single-Lease writer/failover contract in §4.2 remains the production target.
+
 Deliberately deferred: the trade spool and Lease failover, `bar_gaps` / `bar_revisions` /
 `bar_imports`, `GET /bars`, the archive/REST importers, time-zone and `1w`/`1M` windows, and the
 three-dnode deployment. The sections below describe the complete target; §17 marks which phase each

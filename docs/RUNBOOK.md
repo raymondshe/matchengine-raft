@@ -163,7 +163,7 @@ metadata:
   namespace: match-eu-1
 spec:
   cell: eu-1
-  image: matchengine-marketdata:history-arm64-v4
+  image: matchengine-marketdata:history-arm64-v6
   replicas: 1
   feedGroups:
     - {name: lab-gbpusd, symbols: [gbpusd], streamBase: 2001}
@@ -184,6 +184,7 @@ spec:
     url: http://tdengine.match-eu-1.svc.cluster.local:6041
     database: market_bars
     sealLagMs: 1500
+    readOnly: true
   release:
     wireVersion: 7
     snapshotVersion: 11
@@ -194,8 +195,29 @@ kubectl -n match-eu-1 get marketdataservice global-marketdata \
   -o jsonpath='{.status.phase} {.status.readyReplicas}/{.status.replicas}{"\n"}'
 ```
 
-The operator adds the `6041` egress rule and the `--history` args; verify with
+The operator adds the `6041` egress rule and the `--history --history-read-only` args; verify with
 `kubectl -n match-eu-1 get deploy global-marketdata -o jsonpath='{.spec.template.spec.containers[0].args}'`.
+The global service is a **read-only querier**: it does not tap trades or write bars, so repeated
+clients never create duplicate writers. Each per-symbol fast service owns its own bar series; enable
+the writer there with the same `history` block and `readOnly: false` (the default). Because every
+symbol belongs to exactly one fast feed group, each `bars_*_<symbol>` subtable has one writer:
+
+```sh
+kubectl -n match-eu-1 patch marketdataservice fx-eu-01-marketdata --type merge -p '{
+  "spec": {
+    "history": {
+      "url": "http://tdengine.match-eu-1.svc.cluster.local:6041",
+      "database": "market_bars",
+      "sealLagMs": 1500,
+      "readOnly": false
+    }
+  }
+}'
+```
+
+Repeat for the other fast services. Verify the writer pod's args contain `--history` but **not**
+`--history-read-only`, and that `/metrics` on the global pod shows no growing
+`history_dropped_rows`.
 
 ### 8. Trading terminal
 

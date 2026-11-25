@@ -189,6 +189,7 @@ pub async fn run(
                 }
             }
             _ = tokio::time::sleep_until(tokio::time::Instant::from_std(last_pong + pong_timeout)) => {
+                ctx.stats.close_code_policy.fetch_add(1, Ordering::Relaxed);
                 close = Some(CloseReason { code: CloseCode::Policy, description: Some("pong timeout".into()) });
             }
             _ = tokio::time::sleep_until(rotate_at) => {
@@ -433,8 +434,19 @@ fn subscribe(
         .then(|| Duration::from_millis(ctx.config.terminal_conflation_ms))
         .filter(|interval| !interval.is_zero());
     let budget = ctx.frame_budget.clone();
+    let queue_capacity = ctx.config.queue.max(1);
     let task = tokio::spawn(async move {
-        forward(guard, out, latest, combined, stats, conflation, budget).await;
+        forward(
+            guard,
+            out,
+            latest,
+            combined,
+            stats,
+            conflation,
+            budget,
+            queue_capacity,
+        )
+        .await;
     });
     subscriptions.insert(spec.key.clone(), task);
 }
@@ -458,6 +470,7 @@ impl Drop for SubscriptionGuard {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn forward(
     mut sub: SubscriptionGuard,
     out: mpsc::Sender<Outbound>,
@@ -466,6 +479,7 @@ async fn forward(
     stats: Arc<Stats>,
     conflation: Option<Duration>,
     budget: Option<Arc<FrameBudget>>,
+    queue_capacity: usize,
 ) {
     let key = sub.key.clone();
     let mut last_sent: Option<Instant> = None;
@@ -493,17 +507,32 @@ async fn forward(
                     stats.terminal_throttled.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
-                if out
-                    .try_send(Outbound::Frame(frame_bytes(combined, &key, payload)))
-                    .is_err()
-                {
+                let framed_at = Instant::now();
+                let frame = frame_bytes(combined, &key, payload);
+                stats
+                    .encode_ns_total
+                    .fetch_add(framed_at.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                stats.frames_encoded.fetch_add(1, Ordering::Relaxed);
+                // `capacity()` is the number of free slots; derive the used
+                // depth from the configured capacity so the soak can prove the
+                // per-connection queue stays bounded.
+                let used = queue_capacity.saturating_sub(out.capacity()) as u64;
+                stats.queue_depth.store(used, Ordering::Relaxed);
+                stats.queue_peak.fetch_max(used, Ordering::Relaxed);
+                if out.try_send(Outbound::Frame(frame)).is_err() {
                     stats.slow_closes.fetch_add(1, Ordering::Relaxed);
+                    stats.close_code_1013.fetch_add(1, Ordering::Relaxed);
                     return;
                 }
             }
-            Err(broadcast::error::RecvError::Lagged(_)) if latest_value => continue,
+            Err(broadcast::error::RecvError::Lagged(_)) if latest_value => {
+                stats.broadcast_lag.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
             Err(broadcast::error::RecvError::Lagged(_)) => {
+                stats.broadcast_lag.fetch_add(1, Ordering::Relaxed);
                 stats.slow_closes.fetch_add(1, Ordering::Relaxed);
+                stats.close_code_1013.fetch_add(1, Ordering::Relaxed);
                 let _ = out.try_send(Outbound::Close(1013, "slow consumer".to_string()));
                 return;
             }

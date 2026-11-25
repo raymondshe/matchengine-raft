@@ -10,6 +10,8 @@ match_engine/fuzz/coverage
 .DS_Store
 # Generated packaging artifacts and real secrets — never commit these.
 dist/images/
+dist/soak/
+market_data_system/dist/
 .install-*.yaml
 k8s_control_plane/overlays/production/images.patch.yaml
 k8s_control_plane/deploy/tdengine-credentials.yaml

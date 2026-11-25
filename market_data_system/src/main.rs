@@ -139,6 +139,9 @@ struct Opt {
     /// Enable the TDengine-backed historical bar tier (1s/1m rows and /klines).
     #[clap(long)]
     history: bool,
+    /// Serve history reads only; do not start the TDengine bar writer.
+    #[clap(long, default_value_t = false)]
+    history_read_only: bool,
     /// taosAdapter endpoint for the historical store.
     #[clap(long, env = "TDENGINE_URL", default_value = "http://127.0.0.1:6041")]
     tdengine_url: String,
@@ -262,6 +265,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     config.heartbeat_timeout = Duration::from_secs(opt.heartbeat_timeout_secs.max(1));
     config.snapshot_levels = opt.snapshot_levels.max(1);
     config.history.enabled = opt.history;
+    config.history.read_only = opt.history_read_only;
     config.history.url = opt.tdengine_url;
     config.history.user = opt.tdengine_user;
     config.history.password = opt.tdengine_password;

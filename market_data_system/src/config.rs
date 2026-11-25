@@ -54,6 +54,10 @@ pub fn validate_history_symbol(symbol: &str) -> Result<(), String> {
 #[derive(Clone, Debug)]
 pub struct HistoryConfig {
     pub enabled: bool,
+    /// Serve `/klines` and bar replay from TDengine without writing rows.
+    /// Used by the global terminal service: the per-symbol fast services own
+    /// the deterministic writer so history is materialized exactly once.
+    pub read_only: bool,
     /// `taosAdapter` endpoint, e.g. `http://127.0.0.1:6041`.
     pub url: String,
     pub user: String,
@@ -75,6 +79,7 @@ impl Default for HistoryConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            read_only: false,
             url: "http://127.0.0.1:6041".to_string(),
             user: "root".to_string(),
             password: "taosdata".to_string(),
