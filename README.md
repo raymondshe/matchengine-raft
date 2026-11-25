@@ -20,14 +20,24 @@
 [![Market-data wire v7](https://img.shields.io/badge/marketdata%20wire-v7-blue.svg)](./docs/MARKET_DATA_PLAN.md)
 [![WAL fsync: configurable](https://img.shields.io/badge/WAL%20fsync-configurable-blue.svg)](./docs/STORAGE.md)
 
-🚀 A Raft-replicated matching engine in Rust for teams that need deterministic execution,
-configurable durability and a live market-data path — without treating the engine as a black box.
+**A complete exchange stack you can inspect, replay and operate — end to end.**
 
-> 📌 **WAL durability is configurable.** `RAFT_WAL_FSYNC_MS` controls WAL fsync:
-> **unset** = no fsync (default, fastest; a crash can lose acknowledged writes and the cluster
-> requires at least 4 voters), **`0`** = fsync every append (strongest durability), **`N > 0`** =
-> periodic fsync every N ms (bounds the loss window to roughly N ms). See
-> [Storage](./docs/STORAGE.md) for the recovery contract.
+At its core is a Raft-replicated matching engine in Rust: deterministic order execution with
+18-decimal precision, a full order-type lifecycle, replicated match events, and WAL durability you
+tune to the deployment rather than inherit by assumption. Every state change is observable — replay
+the log, dump a snapshot, reproduce a fill, or watch the book live in the operational console.
+
+Around that core sits the rest of the exchange. A deterministic market-data path carries trades over
+Aeron multicast or NATS into a Binance-style WebSocket service, backed by exact historical bars in
+TDengine, per-symbol writer leases, and REST tail repair that closes real gaps instead of hiding
+them. A stateless order-system BFF powers a React trading terminal while the book stays
+market-data-fed and clients never poll the engine.
+
+Operations are part of the design, not an afterthought. A CRD-driven Kubernetes control plane elects
+an operator, bootstraps Raft, rolls pods one at a time with wire and snapshot compatibility gates,
+verifies backups by restoring and hashing them, and exposes metrics, logs, alerts and dashboards.
+The result is a system that runs in a single-node lab and scales into a sharded fleet — with no
+black boxes, no hidden state and no guessing about what the engine did.
 
 **✨ Why teams pick it**
 
