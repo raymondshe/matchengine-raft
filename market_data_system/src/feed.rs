@@ -273,6 +273,12 @@ pub struct Stats {
     pub history_dropped_events: AtomicU64,
     /// Bar rows dropped when a failed upsert cannot be requeued.
     pub history_dropped_rows: AtomicU64,
+    /// Flushes skipped because the per-symbol Lease was held by another writer.
+    pub history_lease_skipped_flushes: AtomicU64,
+    /// Feed-position discontinuities recorded in `bar_gaps`.
+    pub history_gaps_detected: AtomicU64,
+    /// Rows recovered from the REST tail.
+    pub history_rest_rows: AtomicU64,
     pub last_ts_ms: AtomicU64,
 }
 
@@ -300,6 +306,11 @@ impl Stats {
             "close_code_policy": self.close_code_policy.load(Ordering::Relaxed),
             "history_dropped_events": self.history_dropped_events.load(Ordering::Relaxed),
             "history_dropped_rows": self.history_dropped_rows.load(Ordering::Relaxed),
+            "history_lease_skipped_flushes": self
+                .history_lease_skipped_flushes
+                .load(Ordering::Relaxed),
+            "history_gaps_detected": self.history_gaps_detected.load(Ordering::Relaxed),
+            "history_rest_rows": self.history_rest_rows.load(Ordering::Relaxed),
             "last_ts_ms": self.last_ts_ms.load(Ordering::Relaxed),
         })
     }

@@ -1,6 +1,7 @@
 # Historical bar generation and query system
 
-Status: **phase P0 implemented in `market_data_system/`; P1–P5 remain design.** This document
+Status: **P0 and the P1 storage foundation are implemented in `market_data_system/`; the rest of
+P1–P5 remain design/work items.** This document
 specifies the historical path added to the existing `market_data_system`: it turns the engine's
 deterministic trade stream into dense, durable, queryable klines and serves them through the same
 process and Binance-compatible API — with the guarantees Binance does not provide (a mutation
@@ -18,10 +19,17 @@ series is materialized by the deterministic owner of that feed rather than once 
 replica. Upserts are keyed by `(symbol, ts)`, so overlapping lifecycle-test symbols remain
 idempotent; the single-Lease writer/failover contract in §4.2 remains the production target.
 
-Deliberately deferred: the trade spool and Lease failover, `bar_gaps` / `bar_revisions` /
-`bar_imports`, `GET /bars`, the archive/REST importers, time-zone and `1w`/`1M` windows, and the
-three-dnode deployment. The sections below describe the complete target; §17 marks which phase each
-piece belongs to.
+Implemented after P0: a rolling local trade spool (`--spool-dir`, `--spool-days`) with cursor-based
+replay on restart, `bar_state` cursor/watermark writes, `bar_gaps` / `bar_revisions` / `bar_imports`
+tables and accessors, late-sealed-window revision auditing, and the native `GET /bars` API with
+`since=<seq>` repair. **Per-symbol Lease coordination** (`--history-lease-prefix`) and the **REST
+tail / gap recovery** path (`--history-rest-tail`) are implemented on top of that foundation: each
+writer acquires one Lease per symbol it serves, pauses flushes and cursor writes per symbol when a
+Lease is lost, records feed-position discontinuities in `bar_gaps`, and backfills closed windows
+with no stored row from a Binance-compatible REST endpoint (source=rest, rate-budgeted). Still
+deferred: the archive importer and reconciler, gap-gated query rejections, time-zone and `1w`/`1M`
+windows, reader HPAs, backup and the three-dnode deployment. The sections below describe the
+complete target; §17 marks which phase each piece belongs to.
 
 The store is **TDengine**. Bars are written as exact `DECIMAL(38,18)` rows and read back as exact
 decimal text; no value in the bar path passes through a binary float or a 96-bit client decimal
@@ -31,7 +39,7 @@ It builds directly on the API investigation in
 [`THIRD_PARTY_INVESTIGATION.md`](./THIRD_PARTY_INVESTIGATION.md) Part VII, which measured the
 reference behaviour and its quirks.
 
-Last updated: 2026-11-23.
+Last updated: 2026-11-25.
 
 Related documents: [`THIRD_PARTY_INVESTIGATION.md`](./THIRD_PARTY_INVESTIGATION.md) Part VII
 (the Binance contract and its gaps), [`MARKET_DATA_PLAN.md`](./MARKET_DATA_PLAN.md) (the engine
@@ -194,6 +202,30 @@ Exactly one process may write bars at a time. The writer holds a Kubernetes `Lea
 control-plane operator already uses. The writer Deployment runs **one** replica, because its spool
 PVC is `ReadWriteOnce`: a second pod cannot mount it while the first is alive. "Failover" therefore
 means "the replacement pod that is created after the old one terminates", not a hot standby.
+
+**Implementation note (2026-11-25):** because the lab assigns one fast writer per symbol/feed
+group, the Lease is scoped **per symbol** — `--history-lease-prefix historical-bars` creates
+`historical-bars-eurusd`, `historical-bars-btcusdt`, … A process serving several symbols acquires
+one Lease per symbol and gates flushes, `bar_state` writes and REST backfill independently, so
+losing one symbol's Lease does not freeze the others. Identity is `POD_NAME` (falling back to
+`HOSTNAME`, then pid). Leases are opt-in: without the prefix the lab's single-writer-per-symbol
+contract needs no Kubernetes API access. The renderer mounts a service-account token only on
+writer Deployments with `spec.history.leasePrefix` and `rbac.yaml` grants that account
+`get/create/update/patch` on `leases` in the data namespace; readers mount no token.
+
+**P1 validation (2026-11-26).** Pausing `fx-eu-02` released its Leases and `me-btcusdt` acquired
+`historical-bars-eurchf` within one renewal tick; after unpausing, `fx-eu-02` stayed paused for that
+symbol, so there was a single writer throughout. For gap recovery, a stored `1m` row was deleted,
+an open `bar_gaps` row was written, and a writer with `--history-rest-tail` pointed at a local mock
+`/api/v3/klines` endpoint restored the row with the exact original values and `source=2`, then
+emitted the closing `bar_gaps` row. The mock and env overrides were removed after the test.
+
+Lab rollout (2026-11-25): all four fast writers run with `leasePrefix: historical-bars`; eight
+per-symbol Leases exist, and `eurchf` (declared by all four services) is held by exactly one writer
+while the other three log `history lease held by another writer; symbol paused`. Two CNI/API details
+are baked into the renderer: the API-server egress rule is unqualified because policy is evaluated
+after service DNAT, and Lease `acquireTime`/`renewTime` use six fractional digits (`metav1.Time`
+layout `2006-01-02T15:04:05.000000Z07:00`).
 
 Failover safety comes from the bar row's own cursor, not from the Lease and not from the spool:
 
@@ -383,6 +415,21 @@ market_data_system/src/
 Removed from the earlier segment-store design: `--bars-dir` (bar data), `--segment-store`,
 `--segment-origin`, `--manifest-poll-secs`, `--checkpoint-*`, `--cache-bytes`, `--warm-days`.
 The only writer-local path left is `--spool-dir`.
+
+Flags actually wired in the current code (the table above is the full design vocabulary):
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `--history-lease-prefix` | off | Enables one Kubernetes Lease per symbol (`<prefix>-<symbol>`), 15 s TTL / 5 s renew by default |
+| `--history-lease-namespace` | `POD_NAMESPACE` / `default` | Namespace for those Leases |
+| `--history-lease-identity` | `POD_NAME` / `HOSTNAME` / pid | Stable holder identity |
+| `--history-lease-ttl-secs`, `--history-lease-renew-ms` | `15` / `5000` | Advisory Lease timing |
+| `--history-rest-tail` | off | Enables the REST backfill task on a writer |
+| `--history-rest-tail-url` | `https://api.binance.com` | Binance-compatible `/api/v3/klines` endpoint |
+| `--history-rest-tail-symbol` | derived | Upstream symbol; empty derives `EURUSD`-style from the local symbol |
+| `--history-rest-tail-poll-secs` | `60` | Backfill cadence |
+| `--history-rest-tail-weight-per-min` | `750` | 25% of the published 6000/min request-weight ceiling |
+| `--history-rest-tail-page-limit` | `1000` | Rows per klines page |
 
 ### 4.7 TDengine as the shared store
 
@@ -1420,6 +1467,17 @@ error (`bar_import_rejected_total`), not a skipped file.
 
 ## 10. Ingest: REST tail
 
+**Implemented (2026-11-25):** `market_data_system/src/history/rest.rs` runs a rate-budgeted
+backfill loop on a writer. It starts with one `repair_window` look-back and then advances a
+per-symbol high-water mark, fetches `/api/v3/klines` pages for `1s`/`1m`/`5m`, skips candles with
+zero trades and windows that already have a stored row, and upserts missing rows as
+`source=rest` with no trade ids or engine sequence. Each contiguous repaired range is bracketed
+by an open/closed pair in `bar_gaps`; a live-position jump in the feed also records an open gap
+and increments `history_gaps_detected`. `429` honours `Retry-After` and `418` disables the source
+for a minute. `/bars` surfaces open gaps overlapping a read as `X-Bar-Open-Gaps` (it does not yet
+refuse them). The archive importer and reconciler that would confirm `source=rest` rows remain
+deferred.
+
 REST is used only for the window between the last archive file and the live feed — typically one
 day, and only when the archive is unavailable or the live feed missed a window.
 
@@ -1664,8 +1722,8 @@ never point at the lab's `market_bars`. The engine's `cargo test` stays DB-free;
 | Phase | Scope | Exit criterion |
 |---|---|---|
 | **P0** | TDengine schema + builder + `1s`/`1m` upserts + `GET /klines` from TDengine + WS snapshot/live | A client (the terminal) reads 500 bars without any `kline_*` frame, and a cold reader that starts at 14:00 answers today's morning |
-| **P1** | Revisions, `bar_gaps`, `bar_state`, restart/catch-up, `GET /bars`, exactness tests | Kill -9 the writer; restart; bars and cursor are identical; a 38-digit value survives the serving path |
-| **P2** | Archive importer, REST tail, reconciler | A month of BTCUSDT `1s` imported, verified against the archive checksums and the CSV |
+| **P1** | Revisions, `bar_gaps`, `bar_state`, restart/catch-up, `GET /bars`, exactness tests, per-symbol Lease failover and REST-tail gap recovery | Kill -9 the writer; restart; bars and cursor are identical; a 38-digit value survives the serving path; a paused Lease holder stops writing until takeover. **Validated 2026-11-26:** per-symbol takeover verified in the lab and a deleted bar restored from the REST tail with `source=2` and a closed gap row |
+| **P2** | Archive importer, reconciler, gap-gated reads | A month of BTCUSDT `1s` imported, verified against the archive checksums and the CSV |
 | **P3** | TDengine 3-replica cluster + reader `Deployment` + HPA + operator rendering | A reader started mid-day answers today's range; two readers serve the same sealed range after a writer restart; no reader touches the writer's spool |
 | **P4** | `KEEP` sizing, backup/restore, export, `MarketDataService.history` GUI status | Restore a dump into a fresh database and serve the same ranges; scale readers 1→4 under load with no writer involvement |
 | **P5** | Offset-anchored intervals (`1d`, `3d`, `1w`, `1M`) with time-zone grouping, CSV/Parquet export | A `+08:00` `1d` request matches a hand-computed fixture, and `+05:45` groups from `15m` |

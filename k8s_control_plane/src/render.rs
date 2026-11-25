@@ -1531,6 +1531,15 @@ fn market_data_container(ctx: &MarketDataCtx<'_>) -> Value {
             json!("--history-seal-lag-ms"),
             json!(history.seal_lag_ms.to_string()),
         ]);
+        // A Lease is per symbol: each fast service acquires only the symbols
+        // in its feed group, and a multi-symbol service pauses writes per
+        // symbol instead of freezing its whole writer.
+        if !history.read_only
+            && let Some(prefix) = &history.lease_prefix
+        {
+            args.push(json!("--history-lease-prefix"));
+            args.push(json!(prefix));
+        }
     }
     let resources = market_data_resources(ctx);
     json!({
@@ -1674,6 +1683,18 @@ fn market_data_deployment(ctx: &MarketDataCtx<'_>, config: &Value) -> Value {
             },
         },
     });
+    // A Lease-guarded writer needs a service-account token; other market-data
+    // pods deliberately do not mount one.
+    if ctx.service.spec.history.as_ref().is_some_and(|history| {
+        !history.read_only
+            && history
+                .lease_prefix
+                .as_deref()
+                .is_some_and(|p| !p.is_empty())
+    }) {
+        deployment["spec"]["template"]["spec"]["automountServiceAccountToken"] = json!(true);
+        deployment["spec"]["template"]["spec"]["serviceAccountName"] = json!("match-marketdata");
+    }
     // The HPA owns the replica count; pin it when the service is paused or when
     // every symbol it serves has been stopped.
     if ctx.service.spec.paused || !ctx.has_active_symbols {
@@ -1879,6 +1900,23 @@ fn market_data_network_policy(ctx: &MarketDataCtx<'_>) -> Value {
         egress.push(json!({
             "to": [{ "podSelector": { "matchLabels": { "app": "tdengine" } } }],
             "ports": [{ "protocol": "TCP", "port": 6041 }],
+        }));
+    }
+    if ctx.service.spec.history.as_ref().is_some_and(|history| {
+        !history.read_only
+            && history
+                .lease_prefix
+                .as_deref()
+                .is_some_and(|p| !p.is_empty())
+    }) {
+        // The Lease API is a Service ClusterIP. In this lab CNI the policy is
+        // evaluated after service DNAT, so neither the ClusterIP nor :443
+        // matches; an unqualified all-destinations rule is required. Only
+        // Lease-guarded writer pods get it, and only egress (the ingress
+        // allow-list is unchanged). A production CNI that evaluates pre-DNAT
+        // should narrow this to the API server endpoint CIDR.
+        egress.push(json!({
+            "to": [{ "ipBlock": { "cidr": "0.0.0.0/0" } }],
         }));
     }
 
@@ -3310,6 +3348,7 @@ mod tests {
             read_only: false,
             database: "market_bars".to_string(),
             seal_lag_ms: 1_500,
+            lease_prefix: None,
         });
         let objects =
             render_market_data_service(&catalog, "btc-marketdata", Some("match-eu-1")).unwrap();
@@ -3359,6 +3398,7 @@ mod tests {
             read_only: true,
             database: "market_bars".to_string(),
             seal_lag_ms: 1_500,
+            lease_prefix: None,
         });
         let objects =
             render_market_data_service(&catalog, "btc-marketdata", Some("match-eu-1")).unwrap();
@@ -3371,6 +3411,50 @@ mod tests {
             .collect();
         assert!(args.contains(&"--history"), "{args:?}");
         assert!(args.contains(&"--history-read-only"), "{args:?}");
+    }
+
+    #[test]
+    fn history_lease_prefix_renders_a_per_writer_token() {
+        use crate::model::MarketDataHistory;
+
+        let mut catalog = demo_catalog();
+        demo_nats_market_data(&mut catalog, "btc-marketdata");
+        catalog
+            .market_data_services
+            .get_mut("btc-marketdata")
+            .unwrap()
+            .spec
+            .history = Some(MarketDataHistory {
+            url: "http://tdengine.match-eu-1.svc.cluster.local:6041".to_string(),
+            read_only: false,
+            database: "market_bars".to_string(),
+            seal_lag_ms: 1_500,
+            lease_prefix: Some("historical-bars".to_string()),
+        });
+        let objects =
+            render_market_data_service(&catalog, "btc-marketdata", Some("match-eu-1")).unwrap();
+        let deployment = object(&objects, "Deployment");
+        let pod = &deployment["spec"]["template"]["spec"];
+        assert_eq!(pod["automountServiceAccountToken"], json!(true));
+        assert_eq!(pod["serviceAccountName"], json!("match-marketdata"));
+        let args: Vec<&str> = pod["containers"][0]["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|arg| arg.as_str().unwrap())
+            .collect();
+        assert!(args.contains(&"--history-lease-prefix"), "{args:?}");
+        assert!(args.contains(&"historical-bars"), "{args:?}");
+        let policy = object(&objects, "NetworkPolicy");
+        let api_egress = policy["spec"]["egress"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|rule| rule["to"][0]["ipBlock"]["cidr"] == "0.0.0.0/0" && rule["ports"].is_null());
+        assert!(
+            api_egress,
+            "Lease writers need HTTPS egress to the API server"
+        );
     }
 
     #[test]

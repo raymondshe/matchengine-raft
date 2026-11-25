@@ -1,4 +1,4 @@
-//! TDengine-backed historical bars (phase P0 of `docs/HISTORICAL_BARS.md`).
+//! TDengine-backed historical bars (`docs/HISTORICAL_BARS.md`).
 //!
 //! The existing feed still owns depth/BBO/live fan-out. This tier taps its
 //! `Trade` bodies, builds sparse traded `1s` rows plus a materialized `1m`
@@ -8,8 +8,12 @@
 
 pub mod builder;
 pub mod decimal;
+pub mod lease;
 pub mod query;
+pub mod rest;
 pub mod runtime;
+pub mod spool;
+pub mod state;
 pub mod tdengine;
 
 pub use runtime::HistoryRuntime;
@@ -26,7 +30,7 @@ pub const MIN_US: u64 = 60 * SEC_US;
 
 /// One stored bar row. Timestamps are microseconds of the window open; the
 /// engine's taker stamp supplies every event time.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BarRow {
     pub ts_us: u64,
     pub open: Fixed,
@@ -106,7 +110,7 @@ impl BarRow {
 }
 
 /// A typed tap from `Feed::apply` — no JSON round-trip and no wall clock.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct HistoryTrade {
     pub symbol: String,
     pub symbol_id: u64,

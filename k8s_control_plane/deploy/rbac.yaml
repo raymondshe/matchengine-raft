@@ -243,3 +243,36 @@ subjects:
   - kind: ServiceAccount
     name: match-backup
     namespace: match-control
+---
+# Per-symbol historical-bar writers. The renderer mounts this token only on
+# writer Deployments with `spec.history.leasePrefix`; readers and all other
+# market-data pods keep automountServiceAccountToken: false.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: match-marketdata
+  namespace: match-eu-1
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: match-marketdata-lease
+  namespace: match-eu-1
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "create", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: match-marketdata-lease
+  namespace: match-eu-1
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: match-marketdata-lease
+subjects:
+  - kind: ServiceAccount
+    name: match-marketdata
+    namespace: match-eu-1

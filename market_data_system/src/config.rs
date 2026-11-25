@@ -73,6 +73,27 @@ pub struct HistoryConfig {
     pub seal_lag_ms: u64,
     /// Bars per interval in a WS subscribe-time replay.
     pub snapshot_bars: usize,
+    /// Writer-local rolling trade spool for restart/revision re-derivation.
+    pub spool_dir: String,
+    pub spool_days: u64,
+    /// How far back `/bars?since=` may repair before requiring a full snapshot.
+    pub repair_window_secs: u64,
+    /// Opt-in single-writer coordination. A non-empty prefix creates one
+    /// Kubernetes Lease per symbol (`<prefix>-<symbol>`).
+    pub lease_name_prefix: Option<String>,
+    pub lease_namespace: String,
+    /// Stable writer identity; empty means derive from POD_NAME/HOSTNAME/pid.
+    pub lease_identity: String,
+    pub lease_ttl_secs: u64,
+    pub lease_renew_ms: u64,
+    /// Opt-in REST tail: backfill closed windows with no stored row.
+    pub rest_tail_enabled: bool,
+    pub rest_tail_url: String,
+    /// Upstream symbol override; empty derives an uppercase symbol.
+    pub rest_tail_symbol: String,
+    pub rest_tail_poll_secs: u64,
+    pub rest_tail_weight_per_min: u32,
+    pub rest_tail_page_limit: usize,
 }
 
 impl Default for HistoryConfig {
@@ -91,6 +112,22 @@ impl Default for HistoryConfig {
             batch_rows: 2_000,
             seal_lag_ms: 2_000,
             snapshot_bars: DEFAULT_HISTORY_SNAPSHOT_BARS,
+            // Containers use a read-only root filesystem with /tmp writable;
+            // production mounts a PVC here if a larger spool is wanted.
+            spool_dir: "/tmp/market-data-spool".to_string(),
+            spool_days: 7,
+            repair_window_secs: 3_600,
+            lease_name_prefix: None,
+            lease_namespace: "default".to_string(),
+            lease_identity: String::new(),
+            lease_ttl_secs: 15,
+            lease_renew_ms: 5_000,
+            rest_tail_enabled: false,
+            rest_tail_url: "https://api.binance.com".to_string(),
+            rest_tail_symbol: String::new(),
+            rest_tail_poll_secs: 60,
+            rest_tail_weight_per_min: 750,
+            rest_tail_page_limit: 1_000,
         }
     }
 }

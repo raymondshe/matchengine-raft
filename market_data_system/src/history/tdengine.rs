@@ -124,9 +124,28 @@ impl HistoryStore {
              ) TAGS (symbol VARCHAR(32))",
         )
         .await?;
+        self.sql(
+            "CREATE STABLE IF NOT EXISTS bar_gaps (\
+             ts TIMESTAMP, gap_start TIMESTAMP, gap_end TIMESTAMP, open BOOL\
+             ) TAGS (symbol VARCHAR(32))",
+        )
+        .await?;
+        self.sql(
+            "CREATE STABLE IF NOT EXISTS bar_revisions (\
+             ts TIMESTAMP, i VARCHAR(16), open_ts TIMESTAMP, rev INT, \
+             old_json VARCHAR(16384), new_json VARCHAR(16384), source VARCHAR(16)\
+             ) TAGS (symbol VARCHAR(32))",
+        )
+        .await?;
+        self.sql(
+            "CREATE STABLE IF NOT EXISTS bar_imports (\
+             ts TIMESTAMP, file_name VARCHAR(256), sha256 VARCHAR(64), row_count BIGINT, status VARCHAR(32)\
+             ) TAGS (symbol VARCHAR(32))",
+        )
+        .await?;
         self.sql("CREATE TABLE IF NOT EXISTS bar_meta (ts TIMESTAMP, schema_version INT, created_at TIMESTAMP, note VARCHAR(256))")
             .await?;
-        self.sql("INSERT INTO bar_meta VALUES (NOW, 1, NOW, 'historical bars P0')")
+        self.sql("INSERT INTO bar_meta VALUES (NOW, 1, NOW, 'historical bars P1')")
             .await?;
 
         for symbol in symbols {
@@ -136,6 +155,12 @@ impl HistoryStore {
                 self.sql(&format!(
                     "CREATE TABLE IF NOT EXISTS bars_{interval}_{name} \
                      USING bars_{interval} TAGS ('{name}')"
+                ))
+                .await?;
+            }
+            for stable in ["bar_state", "bar_gaps", "bar_revisions", "bar_imports"] {
+                self.sql(&format!(
+                    "CREATE TABLE IF NOT EXISTS {stable}_{name} USING {stable} TAGS ('{name}')"
                 ))
                 .await?;
             }
@@ -261,6 +286,26 @@ impl HistoryStore {
             .and_then(|row| row.first())
             .and_then(|value| value.as_str())
             .and_then(decimal::parse))
+    }
+
+    /// Bars whose `seq` is at least `since`, inside a bounded repair slice.
+    /// Ordered by `seq` so a client repairing missed frames gets the current
+    /// state of each affected window, newest first.
+    pub async fn bars_since(
+        &self,
+        interval_ms: u64,
+        symbol: &str,
+        from_us: u64,
+        to_us: u64,
+        since: u64,
+        limit: usize,
+    ) -> io::Result<Vec<BarRow>> {
+        let table = self.bar_table(interval_ms, symbol)?;
+        self.query_bars(&format!(
+            "SELECT {COLUMNS} FROM {table} WHERE ts >= {from_us} AND ts < {to_us} \
+             AND seq >= {since} ORDER BY seq DESC, ts DESC LIMIT {limit}"
+        ))
+        .await
     }
 
     /// Last stored open time, for "most recent N bars" requests.

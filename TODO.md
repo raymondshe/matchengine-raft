@@ -1,6 +1,6 @@
 # TODO
 
-Last reviewed: 2026-11-25. Working roadmap only; completed detail lives in the History section and
+Last reviewed: 2026-11-26. Working roadmap only; completed detail lives in the History section and
 git history — check out an earlier `TODO.md` from git for the full record
 (`git log -- TODO.md`, then `git show <commit>:TODO.md`). Measurements remain in
 [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md). See `AGENTS.md` for commands and the current branch
@@ -53,14 +53,15 @@ operability; **P2** = evidence, scale and important non-blocking work; **P3** = 
 
 ## Top priorities
 
-Last prioritised 2026-11-25. Priority key: **P0** = known correctness/security defect, do next;
+Last prioritised 2026-11-26. Priority key: **P0** = known correctness/security defect, do next;
 **P1** = production safety and operability; **P2** = evidence, scale and important non-blocking
 work; **P3** = later/optional. Ranking rule: impact first, then urgency (is the window for cheap
 prevention open now?), then effort as a tiebreaker. Items blocked by another host, cluster or
 provider stay in this list but are marked as production gates and do not count as queue progress.
-The fan-out/slow-consumer soak is now closed in History; the remaining ranks were re-checked against
-the current OrbStack lab and the passing soak result.
-Nothing is P0: the engine, client and control plane are green on tests and the live lab.
+The fan-out/slow-consumer soak and the historical-bar P1 work (per-symbol Lease failover and
+REST-tail gap recovery) are now closed in History; the remaining ranks were re-checked against the
+current OrbStack lab and those results. Nothing is P0: the engine, client and control plane are
+green on tests and the live lab.
 
 The 2026-11-25 review fix pass closed every concrete bug and performance defect in
 `docs/CODE_REVIEW.md`; the two remaining review findings (lab Grafana default credentials and lab
@@ -103,12 +104,14 @@ semantic risk stays covered by at-least-once retries: `client_order_id` dedupes 
    decision into a pure function with tests for one terminating pod, replacement Ready before the
    next deletion, and no skip when `currentRevision == updateRevision` while old pods remain. Then
    run the nine-phase `scripts/operator-acceptance.sh` in a disposable CI cluster or nightly.
-8. **P2 — Historical bar store, remaining phases (#16).** P0 is implemented in `market_data_system`
-    with TDengine as system of record, exact 18-decimal text I/O, `1s`/`1m`/`5m` materialization,
-    read-time `30m` rollups and `GET /klines`. Remaining: trade spool, Lease failover, revisions,
-    `bar_gaps`/`bar_state`, restart/catch-up and `/bars` (P1); importer, REST tail and reconciler
-    (P2); three-dnode `REPLICA 3`, HPA readers, backup and offset-anchored intervals (P3). Depends on
-    item 1 for Secret-backed DSN, NetworkPolicy and no plaintext edge.
+8. **P2 — Historical bar store, remaining phases (#16).** P0 and all of P1 are shipped and
+    validated (see History): TDengine as system of record, exact 18-decimal text I/O,
+    `1s`/`1m`/`5m` materialization, read-time rollups, `GET /klines`/`GET /bars?since=<seq>`, the
+    rolling trade spool with cursor replay, `bar_state`/`bar_gaps`/`bar_revisions`/`bar_imports`,
+    revision audit, per-symbol Lease failover and REST-tail gap recovery. Remaining: archive
+    importer and reconciler with gap-gated reads (P2); three-dnode `REPLICA 3`, reader HPAs, backup
+    and offset-anchored intervals (P3). Depends on item 1 for Secret-backed DSN, NetworkPolicy and
+    no plaintext edge.
 9. **P2 — Stop and GTD index refactor (#21).** Replace the linear parked-stop `Vec` scans with a
     trigger-ordered index plus sequence map, and the GTD full-book rescan with a min-heap/`BTreeSet`
     keyed by expiry. The 2026-11-25 trailing-stop counter and narrower invalidation are the interim
@@ -166,7 +169,7 @@ semantic risk stays covered by at-least-once retries: `client_order_id` dedupes 
     disaster-recovery runbooks.
 
 The `P0`–`P5` phases inside the historical-bar design are implementation phases, not this file's
-P0 defect priority; item 10 is P2 here.
+P0 defect priority; the historical-bar store (item 8) is P2 here.
 
 ## Open work
 
@@ -376,6 +379,23 @@ Completed work is summarised here; detailed evidence, measurements and implement
 in git history and the linked docs. For the full history, check out `TODO.md` from an earlier commit
 (`git log -- TODO.md`).
 
+- **2026-11-26** — Historical bars P1 completed and validated. `--history-lease-prefix` creates one
+  Kubernetes Lease per symbol (`<prefix>-<symbol>`) and gates flushes, `bar_state` writes and REST
+  backfill per symbol; `--history-rest-tail` backfills missing closed windows from a Binance-compatible
+  `/api/v3/klines` endpoint with a 750 weight/min budget, `Retry-After`/`418` handling, `source=rest`
+  rows and open/closed `bar_gaps` brackets, while feed-position jumps record gaps that `/bars`
+  surfaces as `X-Bar-Open-Gaps`. Added `history/lease.rs`, `history/rest.rs`, CLI and renderer flags
+  (`spec.history.leasePrefix`), a service-account/Role for writer pods, metrics and unit coverage.
+  Rolled to OrbStack with fast writers on `matchengine-marketdata:aeron-arm64-v14`, global read-only
+  querier on `history-arm64-v9` and operator/manager on `matchengine-k8s-control-plane:operator-v104`
+  (superseding the earlier `aeron-arm64-v11`/`history-arm64-v8` foundation roll). The rollout fixed
+  three deployment bugs: a service-account token only on writer pods, an unqualified API-server
+  egress rule because this CNI evaluates NetworkPolicy after service DNAT, and six fractional digits
+  in Lease timestamps for Kubernetes `metav1.Time`. Exit criteria exercised live: pausing `fx-eu-02`
+  moved `historical-bars-eurchf` to `me-btcusdt` within one renewal tick and the returned writer
+  stayed paused; deleting a `1m` bar and pointing a writer at a mock klines endpoint restored it with
+  exact values and `source=2` while closing the gap. The mock and test row were removed; all five
+  pods are Ready with zero restarts, eight Leases held, `/md/bars` and `/klines` 200.
 - **2026-11-25** — Fan-out and slow-consumer soak shipped: `market_data_system/benches/ws_soak.rs`
   and `scripts/market-data-soak.sh` drive local and deployed phases (steady, churn, snapshot storm,
   slow consumers, reconnect) with per-second service/engine metric sampling. Added queue-depth/peak,

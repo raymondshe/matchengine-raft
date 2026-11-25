@@ -168,6 +168,53 @@ struct Opt {
     /// Bars per interval in a WS subscribe-time replay.
     #[clap(long, default_value_t = 500)]
     history_snapshot_bars: usize,
+    /// Writer-local rolling trade spool directory.
+    #[clap(
+        long,
+        env = "MARKET_DATA_SPOOL_DIR",
+        default_value = "/tmp/market-data-spool"
+    )]
+    spool_dir: String,
+    /// Days of raw trades retained in the spool.
+    #[clap(long, env = "MARKET_DATA_SPOOL_DAYS", default_value_t = 7)]
+    spool_days: u64,
+    /// How far back `/bars?since=` may repair.
+    #[clap(long, default_value_t = 3600)]
+    repair_window_secs: u64,
+    /// Enable per-symbol Kubernetes Leases with this name prefix (empty disables).
+    #[clap(long, env = "MARKET_DATA_LEASE_PREFIX")]
+    history_lease_prefix: Option<String>,
+    #[clap(long, env = "MARKET_DATA_LEASE_NAMESPACE")]
+    history_lease_namespace: Option<String>,
+    #[clap(long, env = "MARKET_DATA_LEASE_IDENTITY")]
+    history_lease_identity: Option<String>,
+    #[clap(long, env = "MARKET_DATA_LEASE_TTL_SECS", default_value_t = 15)]
+    history_lease_ttl_secs: u64,
+    #[clap(long, env = "MARKET_DATA_LEASE_RENEW_MS", default_value_t = 5000)]
+    history_lease_renew_ms: u64,
+    /// Enable the REST tail: backfill closed windows with no stored row.
+    #[clap(long, env = "MARKET_DATA_REST_TAIL")]
+    history_rest_tail: bool,
+    /// Upstream REST endpoint (Binance-compatible /api/v3/klines).
+    #[clap(
+        long,
+        env = "MARKET_DATA_REST_TAIL_URL",
+        default_value = "https://api.binance.com"
+    )]
+    history_rest_tail_url: String,
+    /// Upstream symbol; empty derives an uppercase symbol from the local one.
+    #[clap(long, env = "MARKET_DATA_REST_TAIL_SYMBOL", default_value = "")]
+    history_rest_tail_symbol: String,
+    #[clap(long, env = "MARKET_DATA_REST_TAIL_POLL_SECS", default_value_t = 60)]
+    history_rest_tail_poll_secs: u64,
+    #[clap(
+        long,
+        env = "MARKET_DATA_REST_TAIL_WEIGHT_PER_MIN",
+        default_value_t = 750
+    )]
+    history_rest_tail_weight_per_min: u32,
+    #[clap(long, env = "MARKET_DATA_REST_TAIL_PAGE_LIMIT", default_value_t = 1000)]
+    history_rest_tail_page_limit: usize,
 }
 
 fn parse_symbol(raw: &str) -> Result<SymbolSpec, String> {
@@ -279,6 +326,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     config.history.snapshot_bars = opt
         .history_snapshot_bars
         .clamp(1, MAX_HISTORY_SNAPSHOT_BARS);
+    config.history.spool_dir = opt.spool_dir;
+    config.history.spool_days = opt.spool_days.max(1);
+    config.history.repair_window_secs = opt.repair_window_secs.max(60);
+    config.history.lease_name_prefix = opt.history_lease_prefix.filter(|name| !name.is_empty());
+    config.history.lease_namespace = opt
+        .history_lease_namespace
+        .or_else(|| {
+            std::env::var("POD_NAMESPACE")
+                .ok()
+                .filter(|v| !v.is_empty())
+        })
+        .unwrap_or_else(|| "default".to_string());
+    config.history.lease_identity = opt.history_lease_identity.unwrap_or_else(|| {
+        std::env::var("POD_NAME")
+            .or_else(|_| std::env::var("HOSTNAME"))
+            .unwrap_or_else(|_| format!("pid-{}", std::process::id()))
+    });
+    config.history.lease_ttl_secs = opt.history_lease_ttl_secs.max(5);
+    config.history.lease_renew_ms = opt.history_lease_renew_ms.max(1_000);
+    config.history.rest_tail_enabled = opt.history_rest_tail;
+    config.history.rest_tail_url = opt.history_rest_tail_url;
+    config.history.rest_tail_symbol = opt.history_rest_tail_symbol;
+    config.history.rest_tail_poll_secs = opt.history_rest_tail_poll_secs.max(5);
+    config.history.rest_tail_weight_per_min = opt.history_rest_tail_weight_per_min.max(2);
+    config.history.rest_tail_page_limit = opt.history_rest_tail_page_limit.clamp(1, 1_000);
 
     if opt.replay_dir.is_some()
         && (!opt.market_data_log.is_empty()

@@ -1007,6 +1007,10 @@ pub struct MarketDataHistory {
     pub database: String,
     #[serde(default = "default_history_seal_lag_ms")]
     pub seal_lag_ms: u64,
+    /// Opt-in single-writer coordination. A non-empty prefix creates one
+    /// Kubernetes Lease per symbol (`<prefix>-<symbol>`); readers take none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_prefix: Option<String>,
 }
 
 fn default_history_database() -> String {

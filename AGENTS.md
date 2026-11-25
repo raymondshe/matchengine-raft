@@ -246,11 +246,20 @@ CI (`.github/workflows/ci.yml`) runs `cargo fmt --all -- --check` (and the `matc
   local trade spool (TDengine cannot key multiple fills at one microsecond); readers are stateless
   and query TDengine directly. In the current lab Deployment the **per-symbol fast services own the
   writer** (one series each, no duplicate) and the global terminal service is read-only
-  (`--history-read-only`); the single-Lease HA failover contract remains design. Serves a
+  (`--history-read-only`); the per-symbol Lease failover contract is now implemented (opt-in). Serves a
   Binance-compatible `GET /klines` plus a native `GET /bars`
   and a WS snapshot/live cursor with `seq` (engine `market_seq`) and `rev` gap repair. **Phase P0 is
   implemented** in `market_data_system/` (`--history`, `src/history/`, `GET /klines`); the trade
-  spool, Lease failover, revisions/gaps, `/bars`, importers and time-zone anchors remain design.
+  The P1 storage foundation is also implemented: a rolling trade spool with cursor replay,
+  `bar_state`/`bar_gaps`/`bar_revisions`/`bar_imports` tables, late-window revision audit and the
+  native `GET /bars` with `since=<seq>` repair. Per-symbol Lease coordination is implemented with
+  `--history-lease-prefix` (`<prefix>-<symbol>`): a multi-symbol writer gates flushes, cursor writes
+  and REST backfill per symbol, and the renderer mounts a service-account token only on Lease-guarded
+  writers. The REST tail (`--history-rest-tail`) backfills missing closed windows from a
+  Binance-compatible endpoint with a request-weight budget and `bar_gaps` brackets; `/bars` reports
+  open gaps in `X-Bar-Open-Gaps` but does not yet refuse them. Leases and REST tail are opt-in. The
+  archive importer, reconciler, reader HPAs, time-zone anchors and three-dnode HA remain design/work
+  items.
   The OrbStack lab wires it up with `k8s_control_plane/deploy/tdengine.yaml` (single dnode plus an
   IPv4 bridge for `taosadapter`), `MarketDataService.spec.history`, market-data image
   `history-arm64-v4` and terminal image `arm64-v4`, so the terminal chart seeds from TDengine.

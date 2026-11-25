@@ -34,9 +34,12 @@ use crate::history::FIVE_MIN_MS;
 use crate::history::HistoryRuntime;
 use crate::history::MIN_MS;
 use crate::history::SEC_MS;
+use crate::history::is_materialized;
 use crate::history::query;
+use crate::history::query::BarsWindow;
 use crate::history::query::KlineWindow;
 use crate::history::runtime;
+use crate::history::state;
 use crate::history::tdengine::HistoryStore;
 use crate::protocol;
 use crate::session;
@@ -222,6 +225,7 @@ pub async fn start_with_snapshot_requesters(
             .service(ready)
             .service(metrics)
             .service(klines)
+            .service(bars)
             .service(ws_bare)
             .service(ws_single)
             .service(ws_combined)
@@ -512,11 +516,247 @@ async fn klines(state: Data<AppState>, params: web::Query<KlinesQuery>) -> HttpR
         sealed_through_ms,
         initial_close,
     };
-    let bars = query::klines(rows, interval_ms, &window);
+    let kline_rows = query::klines(rows, interval_ms, &window);
     HttpResponse::Ok()
         .insert_header(("X-Bar-Schema", "1"))
         .insert_header(("X-Bar-Sealed-Through", sealed_through_ms.to_string()))
-        .json(bars)
+        .json(kline_rows)
+}
+
+#[derive(Debug, Deserialize)]
+struct BarsQuery {
+    symbol: String,
+    interval: String,
+    #[serde(rename = "startTime")]
+    start_time: Option<u64>,
+    #[serde(rename = "endTime")]
+    end_time: Option<u64>,
+    #[serde(rename = "startTimeUs")]
+    start_time_us: Option<u64>,
+    #[serde(rename = "endTimeUs")]
+    end_time_us: Option<u64>,
+    since: Option<u64>,
+    limit: Option<usize>,
+    #[serde(rename = "includeOpen", default = "default_true")]
+    include_open: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Open gap ranges overlapping a read, surfaced as a header so clients can
+/// tell "no trade in this window" from "a frame was dropped". Queries are not
+/// refused yet: reconciling a gap is the next phase.
+async fn open_gap_header(store: &HistoryStore, symbol: &str, start_us: u64, end_us: u64) -> String {
+    match state::load_gaps(store, symbol).await {
+        Ok(gaps) => gaps
+            .into_iter()
+            .filter(|gap| gap.open && gap.end_us > start_us && gap.start_us < end_us)
+            .take(16)
+            .map(|gap| format!("{}:{}", gap.start_us, gap.end_us))
+            .collect::<Vec<_>>()
+            .join(","),
+        Err(error) => {
+            tracing::warn!(%error, %symbol, "bar_gaps read failed");
+            String::new()
+        }
+    }
+}
+
+/// Native bar API: exact microseconds, trade ids, `rev`, `seq` and `since`
+/// repair. This is the internal counterpart to the Binance-shaped `/klines`.
+#[get("/bars")]
+async fn bars(state: Data<AppState>, params: web::Query<BarsQuery>) -> HttpResponse {
+    let Some(store) = state.history.as_ref() else {
+        return HttpResponse::NotFound().json(json!({"error": "historical store disabled"}));
+    };
+    let Some(spec) = state.config.symbol(&params.symbol) else {
+        return HttpResponse::BadRequest().json(json!({"error": -1121, "msg": "invalid symbol"}));
+    };
+    let Some(interval_ms) = protocol::parse_kline_interval(&params.interval) else {
+        return HttpResponse::BadRequest().json(json!({"error": -1120, "msg": "invalid interval"}));
+    };
+    if interval_ms >= 604_800_000 {
+        return HttpResponse::BadRequest().json(json!({
+            "error": -1120,
+            "msg": "1w/1M are not implemented by the historical store yet"
+        }));
+    }
+    let limit = params.limit.unwrap_or(1_000).clamp(1, 10_000);
+    let durable = match state::read_state(store, &spec.symbol).await {
+        Ok(value) => value.unwrap_or_default(),
+        Err(error) => {
+            tracing::warn!(%error, symbol = %spec.symbol, "bar_state read failed");
+            state::BarState::default()
+        }
+    };
+    let now_us = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros() as u64;
+    let seal_lag_us = state.config.history.seal_lag_ms.saturating_mul(1_000);
+    let sealed_through_us = if durable.sealed_through_us > 0 {
+        durable.sealed_through_us
+    } else {
+        now_us.saturating_sub(seal_lag_us)
+    };
+    let revision = durable.revision;
+
+    if let Some(since) = params.since {
+        if !is_materialized(interval_ms) {
+            return HttpResponse::BadRequest().json(json!({
+                "error": -1120,
+                "msg": "since repair requires a materialized interval (1s/1m/5m)"
+            }));
+        }
+        if since <= durable.repair_floor_seq {
+            return HttpResponse::Gone()
+                .insert_header(("X-Bar-Schema", "2"))
+                .insert_header((
+                    "X-Bar-Oldest-Seq",
+                    (durable.repair_floor_seq + 1).to_string(),
+                ))
+                .json(json!({"error": "repair cursor too old; take a full snapshot"}));
+        }
+        let from_us = sealed_through_us.saturating_sub(
+            state
+                .config
+                .history
+                .repair_window_secs
+                .saturating_mul(1_000_000),
+        );
+        let to_us = sealed_through_us.saturating_add(interval_ms.saturating_mul(1_000));
+        let rows = match store
+            .bars_since(interval_ms, &spec.symbol, from_us, to_us, since, limit)
+            .await
+        {
+            Ok(rows) => rows,
+            Err(error) => {
+                tracing::error!(%error, interval_ms, "bars since query failed");
+                return HttpResponse::ServiceUnavailable()
+                    .json(json!({"error": "store unavailable"}));
+            }
+        };
+        let result_bars: Vec<Value> = rows
+            .iter()
+            .map(|row| {
+                let close_us = row
+                    .ts_us
+                    .saturating_add(interval_ms.saturating_mul(1_000))
+                    .saturating_sub(1);
+                let sealed = close_us <= sealed_through_us;
+                query::native_row(row, interval_ms, false, sealed)
+            })
+            .collect();
+        let sealed_header = sealed_through_us.to_string();
+        let revision_header = revision.to_string();
+        let mut response = HttpResponse::Ok();
+        response.insert_header(("X-Bar-Schema", "2"));
+        response.insert_header(("X-Bar-Sealed-Through", sealed_header));
+        response.insert_header(("X-Bar-Revision", revision_header));
+        let gaps = open_gap_header(store, &spec.symbol, from_us, to_us).await;
+        if !gaps.is_empty() {
+            response.insert_header(("X-Bar-Open-Gaps", gaps));
+        }
+        return response.json(result_bars);
+    }
+
+    let source_interval = if interval_ms <= SEC_MS {
+        SEC_MS
+    } else {
+        query::rollup_source_interval(interval_ms)
+    };
+    let width_us = interval_ms.saturating_mul(1_000).max(1);
+    let (start_us, end_us) = match (
+        params.start_time_us,
+        params.end_time_us,
+        params.start_time,
+        params.end_time,
+    ) {
+        (Some(start), Some(end), _, _) => (start, end.max(start)),
+        (Some(start), None, _, _) => (start, start.saturating_add(width_us * limit as u64)),
+        (None, Some(end), _, _) => (end.saturating_sub(width_us * limit as u64), end),
+        (None, None, Some(start), Some(end)) => (
+            start.saturating_mul(1_000),
+            end.saturating_mul(1_000).max(start * 1_000),
+        ),
+        (None, None, Some(start), None) => {
+            let start = start.saturating_mul(1_000);
+            (start, start.saturating_add(width_us * limit as u64))
+        }
+        (None, None, None, Some(end)) => {
+            let end = end.saturating_mul(1_000);
+            (end.saturating_sub(width_us * limit as u64), end)
+        }
+        (None, None, None, None) => match store.last_ts(source_interval, &spec.symbol).await {
+            Ok(Some(last_us)) => {
+                let end = last_us / 1_000 * 1_000 + width_us;
+                (end.saturating_sub(width_us * limit as u64), end)
+            }
+            Ok(None) => (0, 0),
+            Err(error) => {
+                tracing::error!(%error, "bars last-timestamp query failed");
+                return HttpResponse::ServiceUnavailable()
+                    .json(json!({"error": "store unavailable"}));
+            }
+        },
+    };
+    let end_us = if params.include_open {
+        end_us
+    } else {
+        end_us.min(sealed_through_us.saturating_add(1))
+    };
+    if start_us == 0 && end_us == 0 {
+        return HttpResponse::Ok()
+            .insert_header(("X-Bar-Schema", "2"))
+            .json(Vec::<Value>::new());
+    }
+    let from_us = start_us;
+    let to_us = end_us.saturating_add(width_us);
+    let rows = if source_interval == interval_ms {
+        store.bars(interval_ms, &spec.symbol, from_us, to_us).await
+    } else {
+        store
+            .rollup(interval_ms, source_interval, &spec.symbol, from_us, to_us)
+            .await
+    };
+    let rows = match rows {
+        Ok(rows) => rows,
+        Err(error) => {
+            tracing::error!(%error, interval_ms, "native bar query failed");
+            return HttpResponse::ServiceUnavailable().json(json!({"error": "store unavailable"}));
+        }
+    };
+    let initial_close = match store
+        .previous_close(source_interval, &spec.symbol, start_us)
+        .await
+    {
+        Ok(close) => close,
+        Err(error) => {
+            tracing::warn!(%error, "bars previous-close lookup failed");
+            None
+        }
+    };
+    let window = BarsWindow {
+        start_us,
+        end_us,
+        limit,
+        sealed_through_us,
+        initial_close,
+    };
+    let native = query::native_bars(rows, interval_ms, &window);
+    let sealed_header = sealed_through_us.to_string();
+    let revision_header = revision.to_string();
+    let mut response = HttpResponse::Ok();
+    response.insert_header(("X-Bar-Schema", "2"));
+    response.insert_header(("X-Bar-Sealed-Through", sealed_header));
+    response.insert_header(("X-Bar-Revision", revision_header));
+    let gaps = open_gap_header(store, &spec.symbol, from_us, to_us).await;
+    if !gaps.is_empty() {
+        response.insert_header(("X-Bar-Open-Gaps", gaps));
+    }
+    response.json(native)
 }
 
 #[get("/ws")]

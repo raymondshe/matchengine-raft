@@ -136,6 +136,91 @@ pub fn klines(rows: Vec<BarRow>, interval_ms: u64, window: &KlineWindow) -> Vec<
     result
 }
 
+/// Dense native-shape window used by `GET /bars`.
+#[derive(Clone, Debug)]
+pub struct BarsWindow {
+    pub start_us: u64,
+    pub end_us: u64,
+    pub limit: usize,
+    pub sealed_through_us: u64,
+    pub initial_close: Option<Fixed>,
+}
+
+fn trade_id(log: Option<u64>, ord: Option<u32>) -> Value {
+    match (log, ord) {
+        (Some(log), Some(ord)) => json!([log, ord]),
+        _ => Value::Null,
+    }
+}
+
+/// One native-shape object for a stored or synthetic bar.
+pub fn native_row(bar: &BarRow, interval_ms: u64, synthetic: bool, sealed: bool) -> Value {
+    let width_us = interval_ms.saturating_mul(1_000).max(1);
+    let open_us = bar.ts_us;
+    let close_us = open_us.saturating_add(width_us).saturating_sub(1);
+    let event_us = bar
+        .last_ts_us
+        .unwrap_or(if sealed { close_us } else { open_us });
+    json!({
+        "t": open_us / 1_000,
+        "T": close_us / 1_000,
+        "t_us": open_us,
+        "T_us": close_us,
+        "o": decimal::to_wire(bar.open),
+        "h": decimal::to_wire(bar.high),
+        "l": decimal::to_wire(bar.low),
+        "c": decimal::to_wire(bar.close),
+        "v": decimal::to_wire(bar.volume),
+        "q": decimal::to_wire(bar.quote_volume),
+        "n": bar.trades,
+        "V": decimal::to_wire(bar.taker_base),
+        "Q": decimal::to_wire(bar.taker_quote),
+        "f": trade_id(bar.first_log, bar.first_ord),
+        "L": trade_id(bar.last_log, bar.last_ord),
+        "E": event_us / 1_000,
+        "last_ts_us": bar.last_ts_us,
+        "x": sealed,
+        "rev": bar.rev,
+        "source": bar.source,
+        "synthetic": synthetic,
+        "seq": if synthetic { 0 } else { bar.seq },
+    })
+}
+
+/// Native (non-Binance) bar objects. Unlike `klines`, this shape exposes exact
+/// microsecond boundaries, trade ids, revision, source and `seq` so clients can
+/// verify provenance and repair missed frames.
+pub fn native_bars(rows: Vec<BarRow>, interval_ms: u64, window: &BarsWindow) -> Vec<Value> {
+    let width_us = interval_ms.saturating_mul(1_000).max(1);
+    let by_open: HashMap<u64, BarRow> = rows.into_iter().map(|row| (row.ts_us, row)).collect();
+    let mut previous_close = window.initial_close.unwrap_or(Fixed::ZERO);
+    let mut result = Vec::new();
+    let mut open_us = window.start_us;
+    while open_us <= window.end_us && result.len() < window.limit {
+        let close_us = open_us.saturating_add(width_us).saturating_sub(1);
+        let (bar, synthetic) = match by_open.get(&open_us) {
+            Some(row) => {
+                previous_close = row.close;
+                (row.clone(), false)
+            }
+            None => {
+                let mut flat = BarRow::new(open_us);
+                flat.open = previous_close;
+                flat.high = previous_close;
+                flat.low = previous_close;
+                flat.close = previous_close;
+                (flat, true)
+            }
+        };
+        // Finality follows the event-time watermark, never the child bar's own
+        // `sealed` flag (a sealed 5m child inside an open 30m window).
+        let sealed = close_us <= window.sealed_through_us;
+        result.push(native_row(&bar, interval_ms, synthetic, sealed));
+        open_us = open_us.saturating_add(width_us);
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -143,6 +228,38 @@ mod tests {
     use crate::history::MIN_MS;
     use crate::history::decimal;
     use matchengine_raft::order_book::Fixed;
+
+    #[test]
+    fn native_bars_keep_microseconds_and_trade_ids() {
+        let mut bar = row(1_000, "1.25");
+        bar.first_log = Some(7);
+        bar.first_ord = Some(2);
+        bar.last_log = Some(9);
+        bar.last_ord = Some(4);
+        bar.rev = 3;
+        bar.seq = 884_422;
+        bar.last_ts_us = Some(1_500_000);
+        let window = BarsWindow {
+            start_us: bar.ts_us,
+            end_us: bar.ts_us,
+            limit: 10,
+            sealed_through_us: 1_999_999,
+            initial_close: None,
+        };
+        let values = native_bars(vec![bar], 1_000, &window);
+        assert_eq!(values.len(), 1);
+        let value = &values[0];
+        assert_eq!(value["t_us"], 1_000_000u64);
+        assert_eq!(value["T_us"], 1_999_999u64);
+        assert_eq!(value["o"], "1.000000000000000000");
+        assert_eq!(value["f"], json!([7, 2]));
+        assert_eq!(value["L"], json!([9, 4]));
+        assert_eq!(value["rev"], 3);
+        assert_eq!(value["source"], 0);
+        assert_eq!(value["seq"], 884_422u64);
+        assert_eq!(value["x"], true);
+        assert_eq!(value["synthetic"], false);
+    }
 
     fn row(open_ms: u64, close: &str) -> BarRow {
         let mut bar = BarRow::new(open_ms * 1_000);
