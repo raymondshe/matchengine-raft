@@ -566,7 +566,12 @@ impl EngineBackend {
         self.ensure_order_owner(sequence, request.user_id).await?;
         let mut order = Order::new(request.side, request.price, Fixed::ZERO, sequence);
         order.symbol_id = self.symbol_id().await?;
-        let result = self.write(MatchEngineRequest::Cancel { order }).await?;
+        let result = self
+            .write(MatchEngineRequest::Cancel {
+                order,
+                client_request_id: None,
+            })
+            .await?;
         if result.error.is_none() {
             self.take_leverage(sequence);
         }
@@ -587,6 +592,7 @@ impl EngineBackend {
                 order,
                 price: request.new_price,
                 volume: request.new_volume,
+                client_request_id: None,
             })
             .await;
         self.finish_amend(old_sequence, result)
