@@ -22,9 +22,10 @@ Two data-path gaps remain after the control plane and the four order-system shar
    if the order system becomes stateless with per-user state in a sharded database (§4-F) — that
    is the key alternative this document now weighs.
 
-The TODO item also sets a safety constraint: **do not blind-retry `Cancel`/`Amend`** until the
-engine request-key/typed-redirect work lands (P2 item 8); `Place` retries are safe with
-`client_order_id`.
+The engine now has request keys and a typed leader redirect (P2 item 7): `Place.client_order_id`
+and `Cancel`/`Amend.client_request_id` share one idempotency namespace, and a follower `/write`
+answers `503` with `leader_addr`. A gateway may retry a redirected request **only when it carries one
+of those keys**; unkeyed `Cancel`/`Amend` retries must still be refused.
 
 ## 2. Current state (evidence)
 
@@ -327,7 +328,7 @@ moves the route to `Active`. This is why the gateway reads `previousDeploymentRe
   start with an in-memory implementation for tests and a sharded implementation for production.
   The demo `leverages` map moves behind this interface so an amend/cancel routed to any pod reads
   the same metadata.
-- Idempotency: the engine's `client_order_id` dedupes `Place`; the user-state store needs its own
+- Idempotency: the engine's `client_order_id` and `client_request_id` dedupe `Place` and `Cancel`/`Amend`; the user-state store needs its own
   idempotency key for freeze/settlement side effects, with a saga/outbox to reconcile the two.
 - Never put user account data in CRDs/etcd; back up and restore it with the database's tooling,
   separate from the CRD backup path.

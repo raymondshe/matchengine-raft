@@ -106,9 +106,9 @@ p50/p99 on the 4-node benchmark.
 Lease and local-lease reads assume **bounded clock drift** between nodes. Use NTP or PTP; set
 `--read-policy read_index` unless the deployment guarantees that the leader's lease cannot outlive
 its actual leadership. A local-lease cache hit can overtake an unfinished write; await the write
-response before a read that must observe it. Client retries are **at-least-once**: set
-`client_order_id` on writes that must not duplicate, and the replicated submission map returns the
-original sequence and events. Downstream event consumers are expected to be idempotent: resume from
+response before a read that must observe it. Client retries are **at-least-once**: set `client_order_id` on `Place` and `client_request_id` on
+`Cancel`/`Amend` for writes that must not duplicate. All three keys share one replicated submission
+map, which returns the original sequence and events for a retry. Downstream event consumers are expected to be idempotent: resume from
 `(log_index, ordinal)` and dedupe on `event_id`; local-lease reads do not change either contract.
 The status endpoint reports the mode and, per path, `lease_attempts`, `lease_hits`,
 `lease_fallbacks`, `lease_failures`, `read_index_attempts` and `read_index_failures`.
@@ -118,8 +118,9 @@ The Rust request/response types behind `/write` are:
 ```rust
 pub enum MatchEngineRequest {
     Place { order: Order, client_order_id: Option<String> },
-    Cancel { order: Order },
-    Amend { order: Order, price: Option<Fixed>, volume: Option<Fixed> },
+    Cancel { order: Order, client_request_id: Option<String> },
+    Amend { order: Order, price: Option<Fixed>, volume: Option<Fixed>,
+            client_request_id: Option<String> },
     PurgeExpired { now_ms: u64, day_close_ms: Option<u64> },
     ConfigureSymbol { config: SymbolConfig },
     Batch { requests: Vec<MatchEngineRequest> },
@@ -140,15 +141,16 @@ sequence, while `ConfigureSymbol` does not consume one. The response carries at 
 the full batch is available from `/events`. Fill events carry
 `quote_volume`, `volume_unit`, `taker_fee`/`taker_fee_asset` and `maker_fee`/`maker_fee_asset`;
 the same fields are on market-data `TRADE` and fill `LIFECYCLE` records (wire v7).
-`client_order_id` is optional and only affects `Place`: a retry returns the original sequence and
-events instead of placing a second order. It must be 1–128 bytes from
-`[A-Za-z0-9._:-]`; an empty value is rejected, so omit the field to disable idempotency.
+`client_order_id` (`Place`) and `client_request_id` (`Cancel`/`Amend`) are optional idempotency
+keys sharing one namespace: a retry returns the original sequence and events instead of applying the
+mutation twice. Each key must be 1–128 bytes from `[A-Za-z0-9._:-]`; an empty value is rejected, so
+omit the field to disable idempotency.
 
 `/write_batch` executes sub-requests in order in one `apply` call, so later items see the effects of
 earlier ones. Each item keeps its own sequence and events; all events share the entry's log index
 with continuous ordinals. A rejected sub-request does not abort the rest of the batch. Empty
-batches, nested batches, oversized batches and duplicate `client_order_id`s within one batch are
-rejected before Raft.
+batches, nested batches, oversized batches and duplicate idempotency keys across `Place`/`Cancel`/
+`Amend` within one batch are rejected before Raft.
 
 `/read`, `/linearizable_read` and `/follower_read` accept a JSON string key naming a view of the
 order book:
@@ -270,13 +272,27 @@ Order identity has three separate fields:
 - `sequence` is assigned by the engine on apply; use the returned sequence to key a later
   cancel/amend. A book order is identified by `(side, current price, sequence)`; a parked stop by
   `(side, sequence)`. A client-sent `sequence` on `Place` is ignored.
-- `client_order_id` is a `Place`-only idempotency key, retained for the last 262,144 submissions.
-  A retry inside that window returns the original sequence and events; after eviction it is a new
-  order. It never identifies a resting order for cancel/amend.
+- `client_order_id` and `client_request_id` are bounded idempotency keys for `Place` and
+  `Cancel`/`Amend` respectively, retained for the last 262,144 submissions in one shared map. A retry
+  inside that window returns the original sequence and events; after eviction it is a new mutation.
+  They never identify a resting order for cancel/amend.
 
 A `Cancel` or `Amend` whose key does not match a resting order still consumes one `market_seq` and
 publishes a `Rejected` event with reason `order_not_found`. `/write` returns `200` because the
 request is committed; the event, not the HTTP status, is the authoritative result.
+
+A follower that receives `/write` or `/write_batch` answers **`503 Service Unavailable`** with a
+typed JSON body instead of an opaque error:
+
+```json
+{"error":"not_leader","leader_id":1,"leader_addr":"127.0.0.1:21001","reason":"NotLeader"}
+```
+
+`leader_id`/`leader_addr` are `null` when no leader is known yet (before initialization or during
+an election). The Rust `MatchEngineClient` follows the redirect by re-discovering the leader from
+`/metrics`; a gateway that cannot use it can read `leader_addr` and retry there. Retry only requests
+that carry an idempotency key — an unkeyed `Cancel`/`Amend` retry can duplicate the mutation. A plain
+503 with a non-JSON body (for example the four-voter minimum) is an edge rejection, not a redirect.
 
 ### Schema-v11 order types
 

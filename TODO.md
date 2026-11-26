@@ -58,9 +58,9 @@ Last prioritised 2026-11-26. Priority key: **P0** = known correctness/security d
 work; **P3** = later/optional. Ranking rule: impact first, then urgency (is the window for cheap
 prevention open now?), then effort as a tiebreaker. Items blocked by another host, cluster or
 provider stay in this list but are marked as production gates and do not count as queue progress.
-The fan-out/slow-consumer soak, historical-bar P1, the stop/GTD index refactor (#21) and the
-follow-up order-book performance findings are now closed in History; `docs/ORDER_BOOK_PERFORMANCE_REVIEW.md`
-records what remains deferred. The remaining ranks were re-checked against the current OrbStack lab
+The fan-out/slow-consumer soak, historical-bar P1, the stop/GTD index refactor (#21), the
+follow-up order-book performance findings and the safe-retry/leader-redirect item (#7) are now closed
+in History; the review docs record what remains deferred. The remaining ranks were re-checked against the current OrbStack lab
 and those results. Nothing is P0: the engine, client and control plane are green on tests and the
 live lab.
 
@@ -69,9 +69,10 @@ The 2026-11-25 review fix pass closed every concrete bug and performance defect 
 TDengine REST exposure) are folded into item 1. All images were rebuilt and rolled on OrbStack with
 `VERIFY_OK`. The public gateway remains out of the queue (client-side leader routing, no user-ID
 routing); its design stays in `docs/GATEWAY_ROUTING.md` behind the stated triggers. The local-lease
-semantic risk stays covered by at-least-once retries: `client_order_id` dedupes only `Place`, so
-`Cancel`/`Amend` must not be blind-retried until item 7 lands. `POST /events` consumers resume from
-`(log_index, ordinal)` and dedupe on `event_id`.
+semantic risk stays covered by idempotency keys: `Place.client_order_id` and the new
+`Cancel`/`Amend.client_request_id` share one dedupe namespace, and a follower write returns a typed
+503 with the leader address. Retries without a key must still not be blind-retried. `POST /events`
+consumers resume from `(log_index, ordinal)` and dedupe on `event_id`.
 
 1. **P1 — Control-plane, engine-admin and public-edge security (#1).** Manager OIDC/mTLS,
    authorization, per-route permission bits, test/live mode isolation with a `409` cross-mode
@@ -102,22 +103,16 @@ semantic risk stays covered by at-least-once retries: `client_order_id` dedupes 
 6. **P1 (production gate, blocked here) — Linux supervisor isolation and bare-metal benchmarks.**
    Validate opt-in cgroup v2 delegation and log rotation on a node that delegates a writable subtree,
    and dispatch the pinned-core `bench-linux` workflow on the bare-metal runner.
-7. **P2 — Safe retries for `Cancel`/`Amend` and typed leader redirect (#7).** Promoted: a known
-   client-visible correctness hazard with no host blocker. Add a request key for cancel/amend and a
-   typed `503` carrying the leader address so a follower `/write` can be retried deterministically
-   instead of today's `500`. The Rust `MatchEngineClient::with_members` path already re-discovers the
-   leader from `/metrics` on transport failure, so this is for gateways/non-Rust clients. Until then,
-   document and enforce the no-blind-retry rule so the gateway never duplicates a cancel or amend.
-8. **P2 — Rollout invariants and acceptance-harness automation (#4).** Extract the rollout candidate
+7. **P2 — Rollout invariants and acceptance-harness automation (#4).** Extract the rollout candidate
    decision into a pure function with tests for one terminating pod, replacement Ready before the
    next deletion, and no skip when `currentRevision == updateRevision` while old pods remain. Then
    run the nine-phase `scripts/operator-acceptance.sh` in a disposable CI cluster or nightly. The
    cheap unit tests are the first part; the CI cluster is the larger follow-up.
-9. **P2 — Pre-trade edge policy pipeline (#5).** A fixed ordered first-failure-wins gate with typed
+8. **P2 — Pre-trade edge policy pipeline (#5).** A fixed ordered first-failure-wins gate with typed
    codes — halt, blacklist, notional cap, per-account and per-market flow windows, cancel-ratio and
    cancelled-amount-ratio, then self-trade screening — at the edge/gateway, not in the matching
    core or the order desk's durable state.
-10. **P2 — Historical bar store, remaining phases (#16).** P0 and all of P1 are shipped and
+9. **P2 — Historical bar store, remaining phases (#16).** P0 and all of P1 are shipped and
     validated (see History): TDengine as system of record, exact 18-decimal text I/O,
     `1s`/`1m`/`5m` materialization, read-time rollups, `GET /klines`/`GET /bars?since=<seq>`, the
     rolling trade spool with cursor replay, `bar_state`/`bar_gaps`/`bar_revisions`/`bar_imports`,
@@ -125,57 +120,57 @@ semantic risk stays covered by at-least-once retries: `client_order_id` dedupes 
     importer and reconciler with gap-gated reads (P2); three-dnode `REPLICA 3`, reader HPAs, backup
     and offset-anchored intervals (P3). Depends on item 1 for Secret-backed DSN, NetworkPolicy and
     no plaintext edge.
-11. **P2 — Terminal CRD integration (#17).** `DNS_UPSTREAM` is now resolved from
+10. **P2 — Terminal CRD integration (#17).** `DNS_UPSTREAM` is now resolved from
     `/etc/resolv.conf`, the image `arm64-v5` is in the supply chain and the ladder is market-data
     only. Remaining: the `TradingTerminal` CRD/renderer integration. Never call engine `/write`.
-12. **P2 — Docs synchronization (#8).** Keep `AGENTS.md`, READMEs, `docs/PERFORMANCE.md`,
+11. **P2 — Docs synchronization (#8).** Keep `AGENTS.md`, READMEs, `docs/PERFORMANCE.md`,
     `docs/API.md`, `docs/ETCD_STORAGE.md`, `TODO.md` and the runbooks aligned with storage, wire,
     postcard event pages, BFF caching and control-plane changes. Fix the known Profile A/NATS drift
     first; add a generated-doc diff guard and paired EN/CN updates when the surface exists. The new
     `docs/ORDER_BOOK_PERFORMANCE_REVIEW.md` is part of this surface.
-13. **P2 — Engine bar emission for sparse markets (#11).** `BarAgg::new` seeds `last_live_ms` with
+12. **P2 — Engine bar emission for sparse markets (#11).** `BarAgg::new` seeds `last_live_ms` with
     the trade time, suppressing the opening emit; seed it with `0` and test a single-fill bar. The
     terminal no longer depends on it, but the engine feed is authoritative for other consumers.
-14. **P2 — Stop-the-world incompatible upgrade execution (#6).** Automate the coordinated cutover
+13. **P2 — Stop-the-world incompatible upgrade execution (#6).** Automate the coordinated cutover
     (backup gate, disable routes, stop all symbols, apply image/release, restart, verify, re-enable)
     and record a drill; the release gate and manual runbook already exist.
-15. **P2 — Market-data manager controls (#9).** Add GUI create/edit/scale and a read-only preview
+14. **P2 — Market-data manager controls (#9).** Add GUI create/edit/scale and a read-only preview
     plan for `MarketDataService`, plus a rollback action restoring the previous image. The upsert
     API, image/release update and picker are implemented.
-16. **P2 — Profile A feed hardening (#12).** Characterize the Aeron image-registration race and
+15. **P2 — Profile A feed hardening (#12).** Characterize the Aeron image-registration race and
     single-node multi-subscriber behavior, make source startup readiness-gated (or add a per-source
     generation), and keep the 5–30 s re-subscribe watchdog without restart loops.
-17. **P2 — CRD scale and soak (#13).** Thousands of symbols/CRs across shards and cells, status
+16. **P2 — CRD scale and soak (#13).** Thousands of symbols/CRs across shards and cells, status
     churn, API-server/etcd size, informer memory and operator workqueue latency.
-18. **P2 — Defence-in-depth hardening (#19).** Nonce-valued CSRF guards for console/desk actions,
+17. **P2 — Defence-in-depth hardening (#19).** Nonce-valued CSRF guards for console/desk actions,
     a manager GUI CSP, correlation IDs instead of internal error strings on 500s, and an admission
     gate for concurrent `/events` long-polls. Keep separate from the P1 auth workstream.
-19. **P3 — Deferred performance experiments.** Remaining items from
+18. **P3 — Deferred performance experiments.** Remaining items from
     `docs/ORDER_BOOK_PERFORMANCE_REVIEW.md`: depth aggregates (F4b), per-fill copy/fill-buffer
     reduction and FOK preflight fusion (F6), snapshot-copy and validation micro-costs (F7–F8), plus
     `/klines` query coalescing, WebSocket frame precomputation and catalog snapshot reuse. All need a
     targeted bench first; the 2026-11-26 review already closed the large scans. Remaining apply-path
     findings are tracked separately in `docs/APPLY_PATH_PERFORMANCE_REVIEW.md`.
-20. **P3 — Lab-only hardening.** Remove root usage and iptables from
+19. **P3 — Lab-only hardening.** Remove root usage and iptables from
     `match_engine/docker/linux.Dockerfile`, and scope the ingress-nginx ClusterRole's Secrets access.
     Keep both out of production overlays.
-21. **P3 — GUI follow-ups.** Order-system create/edit and image-rollback actions, migration/promote
+20. **P3 — GUI follow-ups.** Order-system create/edit and image-rollback actions, migration/promote
     forms, approvals, filters/pagination, diff/rollback and SSE/WebSocket updates.
-22. **P3 — Automation surface.** CLI `create-shard`/`create-symbol`/`migrate`, an OpenAPI client and
+21. **P3 — Automation surface.** CLI `create-shard`/`create-symbol`/`migrate`, an OpenAPI client and
     admission validation/defaulting beyond the CRD YAML.
-23. **P3 — Multi-cell federation.** Cell registration/capacity, CR projection and cross-cell
+22. **P3 — Multi-cell federation.** Cell registration/capacity, CR projection and cross-cell
     migration; the demo has one cell.
-24. **P3 — Engine optional work.** Wire-version negotiation, bounded-admission backpressure,
+23. **P3 — Engine optional work.** Wire-version negotiation, bounded-admission backpressure,
     snapshot-policy purge knobs, `STREAM_APPEND_CHANNEL_SIZE` benchmark, leader-change callbacks,
     peer preconnect/larger frames/snapshot compression, async-WAL productionization, Aeron Raft
     transport, binary order entry, ITCH replay, binary/compressed WebSocket payloads only after a
     measured JSON bottleneck, derivative fields, reserve replenishment/collars, protobuf/Avro,
     module renaming and AON/order-mask coverage.
-25. **P3 — Operator documentation.** Metrics, troubleshooting, capacity planning and
+24. **P3 — Operator documentation.** Metrics, troubleshooting, capacity planning and
     disaster-recovery runbooks.
 
 The `P0`–`P5` phases inside the historical-bar design are implementation phases, not this file's
-P0 defect priority; the historical-bar store (item 10) is P2 here.
+P0 defect priority; the historical-bar store (item 9) is P2 here.
 
 ## Open work
 
@@ -202,8 +197,8 @@ P0 defect priority; the historical-bar store (item 10) is P2 here.
   shadow/cutover/drain, retries and a canary path. Deferred by the 2026-11-20 decision in
   `docs/GATEWAY_ROUTING.md` — no public gateway is built until TLS/auth and packaging land, a
   second client that cannot use the Rust client appears, or cutover needs automating. Retry `Place`
-  with `client_order_id`; do not blind-retry `Cancel`/`Amend` until the request-key/typed-redirect
-  item lands (P2).
+  with `client_order_id`; include `client_request_id` on `Cancel`/`Amend` retries now that request
+  keys and the typed leader redirect have landed.
 - [ ] **P1** Order-system public edge: TLS, authentication, rate limits and NetworkPolicy for the
   base-host order desk (`orders.<ingress>/demo/`) and `/demo/api`; the per-shard hosts are migration
   aliases. The demo currently exposes plaintext HTTP with no auth. Keep order entry in the order
@@ -216,7 +211,7 @@ P0 defect priority; the historical-bar store (item 10) is P2 here.
   `scripts/backup-local-lab.sh` PVC path. Remaining: one cycle against a real object-storage
   bucket, confirming retention and alerting, plus the CSI volume drill once a snapshot-capable
   cluster is available.
-- [ ] **P2 (Top priorities #9)** Ordered pre-trade rule pipeline at the edge/gateway (pitlane
+- [ ] **P2 (Top priorities #8)** Ordered pre-trade rule pipeline at the edge/gateway (pitlane
   review): a fixed first-failure-wins gate with typed rejection codes — halt, open/close blacklist,
   notional cap by class, per-account and per-market order flow windows, cancel-ratio and
   cancelled-amount-ratio gates, then self-trade screening — with zero meaning "rule off" and
@@ -281,7 +276,7 @@ shard services and the global terminal service are live; see History. Remaining 
 - [ ] **P2** Manager controls for the market-data tier: add GUI create/edit/scale and a read-only
   preview plan; the upsert API, image/release update and the per-service image picker are
   implemented. Add a rollback action that restores the previous image.
-- [ ] **P2 (Top priorities #11)** Trading terminal hardening: the pure-React client is deployed as
+- [ ] **P2 (Top priorities #10)** Trading terminal hardening: the pure-React client is deployed as
   `arm64-v5` and `DNS_UPSTREAM` is resolved from `/etc/resolv.conf` at pod start. Remaining: add the
   `TradingTerminal` CRD/renderer integration. Keep order entry on the order-system BFF and never
   call engine `/write` directly.
@@ -327,12 +322,10 @@ shard services and the global terminal service are live; see History. Remaining 
 - [ ] **P3 (#21 follow-up)** Deferred order-book experiments: depth aggregates (F4b) and
   per-fill copy/fill-buffer reduction, FOK preflight fusion and snapshot-copy micro-costs (F6–F8).
   Require a targeted bench before any change; see `docs/ORDER_BOOK_PERFORMANCE_REVIEW.md`.
-- [ ] **P2** Make gateway retries safe: add a request key for `Cancel`/`Amend` (the current
-  `client_order_id` dedupes only `Place`) and a typed `503` with the leader address so a follower
-  `/write` can be retried deterministically instead of today's `500`. The Rust
-  `MatchEngineClient::with_members` path already re-discovers the leader from `/metrics` on
-  transport failure, so this is for gateways/non-Rust clients. Until then, document and enforce the
-  no-blind-retry rule so the gateway never duplicates a cancel or amend.
+- [x] **P2** Safe gateway retries: `Cancel`/`Amend` carry `client_request_id` in the shared
+  idempotency namespace, and follower writes return a typed 503 with `leader_id`/`leader_addr`.
+  The Rust client follows the redirect; gateways that cannot use it can parse the JSON body. Unkeyed
+  mutations still must not be blind-retried.
 - [ ] **P2 (blocked on this host)** Validate the default `local_lease` path on a second host and a
   Linux multi-host four-voter cluster: rerun `read_e2e --policy lease|local_lease` plus the
   e2e/cluster write A/B, force a stale lease or cache miss so the `ReadIndex` fallback is observed,
@@ -451,6 +444,14 @@ in git history and the linked docs. For the full history, check out `TODO.md` fr
   macOS. A cold-process blank-row allocation flake on Linux CI (1 call / 15 bytes) is now covered
   by a second uncounted warm-up and a fixed 4-call/128-byte harness allowance; the engine rows keep
   their tight ceilings.
+- **2026-11-26** — Safe retries for Cancel/Amend and typed leader redirect (#7). `client_request_id`
+  on `Cancel` and `Amend` shares the replicated 262,144-record dedupe namespace with
+  `Place.client_order_id`, so a retry returns the original sequence and events without a second
+  mutation. Follower `/write` and `/write_batch` now return `503` with a typed JSON body carrying
+  `leader_id`, `leader_addr` and the forward reason; `MatchEngineClient` follows it through
+  `/metrics` discovery, preserving the `NoLeader` contract before initialization. Edge validation
+  bounds all three key fields and rejects duplicate keys across a batch. New unit and cluster
+  tests cover the keys and the raw follower redirect.
 - **2026-11-26** — Historical bars P1 completed and validated. `--history-lease-prefix` creates one
   Kubernetes Lease per symbol (`<prefix>-<symbol>`) and gates flushes, `bar_state` writes and REST
   backfill per symbol; `--history-rest-tail` backfills missing closed windows from a Binance-compatible
@@ -516,7 +517,7 @@ in git history and the linked docs. For the full history, check out `TODO.md` fr
   `scripts/check-30m-rollup.py` (18/18 traded windows). The open `30m` bar's `x` now comes only
   from the event-time watermark. `scripts/replay-continuous.sh` drove a continuous GBPUSD tape
   through the BFF, and the lab seeder gave each symbol its own price scale. The historical-bar P0
-  checklist item is closed here; its remaining phases stay in Top priorities #10 (ranked #8 at the
+  checklist item is closed here; its remaining phases stay in Top priorities #9 (ranked #8 at the
   time of that entry).
 
 - **2026-11-22** — Market-data lifecycle/topology work: `place_symbol` now attaches a new symbol
