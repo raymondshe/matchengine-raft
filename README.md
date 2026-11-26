@@ -39,17 +39,22 @@ verifies backups by restoring and hashing them, and exposes metrics, logs, alert
 The result is a system that runs in a single-node lab and scales into a sharded fleet — with no
 black boxes, no hidden state and no guessing about what the engine did.
 
-**✨ Why teams pick it**
+**On this page:** [why this stack](#-why-teams-pick-it) · [repository map](#-five-projects-one-stack) ·
+[architecture](#-architecture) · [quick start](#-quick-start) · [capabilities](#-features) ·
+[market data and bars](#-historical-bars-with-tdengine) · [terminal](#-trading-terminal) ·
+[Kubernetes](#-kubernetes-control-plane) · [security](#-security-and-deployment-boundary) ·
+[performance](#-performance) · [observability](#-observability-ui) · [docs](#-documentation-and-testing).
 
-- 🎯 **Deterministic execution** — price-time matching where `apply` reads no wall clock; replaying the log reproduces the book exactly.
-- 🛡️ **Configurable durability** — a hand-written segmented WAL with selectable fsync policy, atomic snapshots and snapshot + WAL-tail recovery, all exercised by restart and failure tests.
-- 🧭 **Raft-native** — OpenRaft 0.10 over gRPC with Pre-Vote, leadership transfer, learner catch-up and chunked snapshot install.
-- 🔢 **Exact 18-decimal fixed point** — no `f64` in the matching path; prices, quantities and fees survive the API, events, snapshots and feeds.
-- 📡 **Live data, not batch** — the deterministic feed is published over Aeron (one exclusive publication per stream) and served as Binance-style WebSocket streams with 100/1000 ms depth conflation and horizontal scale-out.
-- 📈 **Historical bars with exact decimals** — a TDengine-backed sparse `1s` series plus materialized `1m`/`5m` rollups, read-time `INTERVAL` rollups for coarser windows (`30m` from `5m` when present, with a `1m` fallback), one writer and stateless queriers, exposed as Binance-compatible `/klines` and seeded into the trading terminal.
-- 🖥️ **Trading terminal** — a pure React/TS spot terminal that consumes the existing market-data WebSocket and order-system BFF; no Rust and no direct engine writes.
-- 🧰 **Operable** — embedded console, `/health` + `/ready`, metrics, replay tools and a standalone order-desk demo.
-- ☸️ **Kubernetes fleet control** — a reference manager + supervisor for thousands of single-symbol engines, with zero-impact symbol lifecycle, restart guards and storage-aware shard drops.
+## ✨ Why teams pick it
+
+| Layer | What you get | Dive in |
+|---|---|---|
+| ⚡ **Matching** | Deterministic price-time book, full order-type lifecycle, STP and exact 18-decimal arithmetic — `apply` never reads a clock, so replaying the log reproduces the book. | [Features](#-features) · [Matching](./docs/MATCHING.md) |
+| 🛡️ **Durability and consensus** | OpenRaft 0.10 over gRPC with Pre-Vote and leadership transfer, a segmented checksummed WAL with selectable fsync, atomic snapshots and snapshot + WAL-tail recovery. | [Storage](./docs/STORAGE.md) · [API](./docs/API.md) |
+| 📡 **Market data** | A bounded, leader-gated trade feed over Aeron or NATS, Binance-style WebSocket streams with conflation, and exact TDengine historical bars with Lease-guarded writers and REST gap repair. | [Historical bars](#-historical-bars-with-tdengine) · [Market-data system](./market_data_system/README.md) |
+| 🧾 **Clients and APIs** | Leader-aware Rust client, `/events` cursors, batch writes, local-lease reads with `ReadIndex` fallback, and per-node write admission. | [API](./docs/API.md) · [Match results](./docs/MATCH_RESULTS.md) |
+| 🖥️ **Trading surface** | A stateless order-system BFF and a pure React/TS terminal — the book is market-data-fed and the browser never calls engine `/write`. | [Terminal](#-trading-terminal) · [Order desk](./order_system/README.md) |
+| ☸️ **Operations** | Embedded console, probes, metrics, replay tools, CRD-driven fleet control, one-pod-at-a-time rolls, verified backups and a ready observability stack. | [Kubernetes](#-kubernetes-control-plane) · [Observability](#-observability-ui) |
 
 ## 🧩 Five projects, one stack
 
@@ -100,20 +105,11 @@ view of the engine internals, open the
 Peer-to-peer Raft RPCs use gRPC on `port + 1000`. The public application and management API stays
 on the `--http-addr` listener. Raft RPCs are not part of the HTTP JSON API.
 
-Set `RAFT_CORE_WORKERS` to a positive worker count to run OpenRaft's RaftCore and state-machine
-worker on a dedicated multi-threaded runtime, isolated from the HTTP, gRPC and market-data tasks;
-unset or `0` keeps Raft on the shared runtime.
-
-Leader-consistent reads use `local_lease` by default: `/linearizable_read`, `/events`, gRPC
-`StreamEvents` and `/get_linearizer` use OpenRaft's caller-side lease cache, then the core lease
-path, and fall back to `ReadIndex` when the lease is stale. Set `--read-policy read_index` (or
-`MATCHENGINE_READ_POLICY=read_index`) to force a fresh quorum round, or `lease` for the core path.
-Lease reads require bounded clock drift between nodes; `/read` remains a local, possibly stale read.
-
-Market-data egress is off the consensus path: the tap is a bounded `try_send`, so a slow subscriber
-can never block `apply`. The feature-gated `AeronSink` publishes the same wire-v7 messages on
-streams 2001–2007 from a dedicated publisher thread, with one exclusive publication per stream; the
-JSONL sink remains available for debugging.
+**Runtime notes.** `RAFT_CORE_WORKERS` moves RaftCore and the state-machine worker onto a dedicated
+runtime; leader-consistent reads default to `local_lease` with a `ReadIndex` fallback while `/read`
+stays local; and market-data egress uses a bounded `try_send` off the consensus path, so a slow
+subscriber never blocks `apply`. Details live in [Capabilities](#-features) and
+[Storage](./docs/STORAGE.md).
 
 ## 🧪 Features
 
@@ -140,8 +136,7 @@ JSONL sink remains available for debugging.
 - **Durable match-event feed** at `POST /events` with cursor pagination, long-poll (`wait_ms`), retention limits, `client_order_id` idempotency, gRPC `StreamEvents` streaming and a reference MQ bridge sidecar; replay-safe retries.
 - **Deterministic market-data feed** with leader gating, shadow book, BBO, depth snapshots/deltas, lifecycle events, OHLC bars and a compact binary wire format with a reference decoder. The feature-gated **Aeron** egress publishes it on streams 2001–2007 with one exclusive publication per stream, an idle STATUS heartbeat and a stream-2010 snapshot-request path.
 - **Standalone market-data system** at [`market_data_system/`](./market_data_system/): consumes the feed over Aeron or JSONL and serves Binance-style WebSocket streams. One instance serves several symbols from a shared hub; clients hold a per-connection subscription set, switch symbols with live `UNSUBSCRIBE`/`SUBSCRIBE`, and scale horizontally without adding engine work. Late joiners request an immediate snapshot from the engine; `/ready` also expires on a missing frame/heartbeat.
-- **Flexible read consistency**: local reads, linearizable leader reads with local-lease reads by default and `ReadIndex` fallback, and linearizable follower reads; `GET /read-policy/status` reports lease hits and fallbacks.
-- **Local-lease reads by default**: leader-consistent reads use OpenRaft's caller-side lease cache (`local_lease`) for `/linearizable_read`, `/events`, gRPC `StreamEvents` and `/get_linearizer`, falling back to the core lease path and then `ReadIndex` when the lease is stale. The 4-node benchmark measured 11-36% higher read throughput and ~40% lower 64-reader p50/p99 than the core lease path. Set `--read-policy read_index` to force a fresh quorum round, or `lease` for the core path. Lease reads require bounded clock drift (NTP/PTP).
+- **Flexible read consistency**: local `/read`, linearizable leader reads and follower reads. Leader-consistent paths use OpenRaft's caller-side lease cache (`local_lease`) by default, then the core lease path, then `ReadIndex` when the lease is stale; `--read-policy read_index` forces a fresh quorum round and `lease` keeps the core path. The four-node benchmark measured 11–36% higher read throughput and ~40% lower 64-reader p50/p99 than the core lease path. Lease reads require bounded clock drift (NTP/PTP); `/read-policy/status` reports hits and fallbacks.
 - **Leader-aware Rust client** that tracks and forwards requests to the current leader, with configurable timeouts, transient retry/backoff and typed API/no-leader errors; retries are at-least-once, so use `client_order_id` for idempotent write retries.
 - **Operational APIs** for initialization, membership changes, metrics, event status and market-data status.
 - **Batch writes** at `POST /write_batch`: multiple requests in one Raft entry and one WAL append, with per-request sequences and continuous event ordinals.
@@ -175,6 +170,14 @@ contract.
 - **One symbol per process/cluster** for isolated resources and failure domains; scale horizontally by running one deployment per symbol.
 
 ## 🚀 Quick start
+
+| Goal | Start here |
+|---|---|
+| Inspect a single engine and its HTTP API | [Run the engine](#run-the-engine) below |
+| Exercise replication, membership and recovery | [Start a local cluster](#start-a-local-cluster) below |
+| See order entry and market data together | [Run the demos](#run-the-demos) below |
+| Operate a multi-symbol fleet | [Kubernetes control plane](#-kubernetes-control-plane) |
+| Understand the design before running anything | [Architecture](#-architecture) and [Documentation](#-documentation-and-testing) |
 
 ### Run the engine
 
@@ -214,17 +217,19 @@ screenshots and design links. Start both with the scripts above.
 
 `market_data_system --history` adds a durable bar tier inside the existing service — no new crate
 and no new public edge. A single writer folds the deterministic trade tap into sparse traded `1s`
-rows plus a materialized `1m` rollup and upserts them into TDengine as canonical 18-decimal text;
-`3m`…`3d` are read-time `INTERVAL` rollups of `1m`. Reads cast DECIMAL columns to `VARCHAR` and
+rows plus materialized `1m` and `5m` rollups and upserts them into TDengine as canonical 18-decimal
+text; `3m`…`3d` are read-time `INTERVAL` rollups (`30m` prefers `5m` when present, with a `1m`
+fallback). Reads cast DECIMAL columns to `VARCHAR` and
 parse with a strict scale-18 parser, so no `f64` or 96-bit client decimal can round a value. The
 writer row carries the engine `market_seq` and its own trade cursor, which lets a replacement
 resume from the newest row without a hot standby; readers are stateless and query TDengine
 directly. `GET /klines` is Binance-shaped and dense, and the same rows seed the WebSocket
 subscribe replay.
 
-Phase P0 (schema, trade-derived writer, `/klines`, WS replay) is implemented and wired in the
-OrbStack lab. The trade spool, Lease failover, revisions/gaps, `/bars`, importers, time-zone anchors
-and the three-dnode production topology remain in the design.
+P0 and P1 are implemented and validated in the OrbStack lab: schema, trade-derived writer,
+`/klines` and WS replay, plus the rolling trade spool, revisions/gaps, per-symbol Lease failover,
+REST-tail gap repair and native `/bars?since=<seq>`. The archive importer and reconciler, gap-gated
+reads, time-zone anchors and the three-dnode production topology remain open.
 
 [![Historical bars: TDengine as the system of record](./docs/historical-bars-tdengine.png)](./docs/historical-bars-tdengine.html)
 
@@ -365,22 +370,13 @@ to amortize the fsync. Do not use the 10 ms fsync mode, 1 ms batch linger, 1,024
 payload/purge settings, async WAL or thin LTO; none beat the defaults. See
 [production configuration decisions](./docs/PERFORMANCE.md#production-configuration-decisions-2026-11-08).
 
-WAL fsync is controlled by `RAFT_WAL_FSYNC_MS`: unset = no fsync (default; requires at least four
-voters), `0` = every append, `N > 0` = periodic. See [Storage](./docs/STORAGE.md) for the durability
-contract and [production decisions](./docs/PERFORMANCE.md#production-configuration-decisions-2026-11-08)
-for the trade-offs.
-
 ## 📈 Observability UI
 
-The lab's Prometheus and Grafana views show scrape health, alert state, Raft and
-market-data rates, and operator reconcile/rollout counters. Install and verify
-them with [`docs/OBSERVABILITY.md`](./docs/OBSERVABILITY.md).
+One Grafana dashboard covers Raft and market-data rates, scrape health, alerts and operator
+reconcile/rollout counters. Installation, verification and the other views are in
+[`docs/OBSERVABILITY.md`](./docs/OBSERVABILITY.md).
 
 ![Grafana lab observability dashboard](./docs/grafana-observability.png)
-
-![Prometheus target health](./docs/prometheus-targets.png)
-
-![Prometheus alert rules](./docs/prometheus-alerts.png)
 
 ## 📚 Documentation and testing
 

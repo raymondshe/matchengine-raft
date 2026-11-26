@@ -36,17 +36,22 @@ WebSocket 服务，背后是 TDengine 中的精确历史 K 线、按 symbol 分�
 指标、日志、告警和仪表盘。结果是一套能在单机实验室运行、又能扩展到分片集群的系统——没有黑盒，
 没有隐藏状态，也不需要猜测引擎到底做了什么。
 
-**✨ 为什么选择它**
+**本页导航：** [为什么选择它](#-为什么选择它) · [项目地图](#-五个项目一套系统) ·
+[架构](#-架构) · [快速开始](#-快速开始) · [核心能力](#-核心能力) ·
+[历史 K 线](#-基于-tdengine-的历史-k-线) · [交易终端](#-交易终端) ·
+[Kubernetes](#-kubernetes-控制平面) · [安全边界](#-安全与部署边界) ·
+[性能](#-性能) · [可观测性](#-可观测性界面) · [文档](#-文档与测试)。
 
-- 🎯 **确定性执行** — 价格-时间优先撮合，`apply` 不读墙上时钟；重放日志可以精确复现订单簿。
-- 🛡️ **可配置持久化** — 自研分段 WAL（fsync 策略可选，`--max-wal-append-bytes` 按字节切分单次追加）、原子快照和“快照 + WAL 尾部”恢复，均由重启和故障测试覆盖。
-- 🧭 **Raft 原生** — OpenRaft 0.10 + gRPC，支持 Pre-Vote、领导权转移、学习者追赶和分块快照安装。
-- 🔢 **18 位定点数** — 撮合路径不使用 `f64`；价格、数量和费用在 API、事件、快照和 feed 中全程精确。
-- 📡 **实时行情** — 确定性 feed 通过 Aeron 发布（每个流一个独占 publication），再由 Binance 风格 WebSocket 服务分发，支持 100/1000 ms 深度合并和水平扩展。
-- 📈 **精确小数的历史 K 线** — TDengine 存储稀疏 `1s` 成交 K 线和物化的 `1m`/`5m` 汇总，更粗周期在读取时用 `INTERVAL` 汇总（`30m` 优先由 `5m` 生成，缺失时回退 `1m`）；单 writer、无状态查询端，通过 Binance 兼容的 `/klines` 供交易终端冷启动使用。
-- 🖥️ **交易终端** — 纯 React/TS 的 Binance 风格现货终端，复用现有行情 WebSocket 和下单 BFF，不含 Rust，也不会直接调用引擎 `/write`。
-- 🧰 **可运维** — 内置控制台、`/health` + `/ready`、指标、重放工具和独立下单演示。
-- ☸️ **Kubernetes 集群管理** — 参考管理器和 supervisor 可管理数千个单 symbol 引擎，支持零影响 symbol 生命周期、重启保护和带存储决策的 shard 删除。
+## ✨ 为什么选择它
+
+| 层次 | 能力 | 入口 |
+|---|---|---|
+| ⚡ **撮合** | 确定性的价格-时间优先订单簿、完整订单类型、STP 和 18 位定点数；`apply` 不读时钟，重放日志即可复现订单簿。 | [核心能力](#-核心能力) · [撮合](./docs/zh-CN/MATCHING.md) |
+| 🛡️ **持久化与共识** | OpenRaft 0.10 + gRPC、Pre-Vote 与领导权转移、可配置 fsync 的分段校验 WAL、原子快照和快照 + WAL 尾部恢复。 | [存储](./docs/zh-CN/STORAGE.md) · [API](./docs/API.md) |
+| 📡 **行情** | 有界且 leader-gated 的成交 feed，经 Aeron/NATS 分发为 Binance 风格 WebSocket；TDengine 历史 K 线精确到 18 位，按 symbol 的 Lease 保证单 writer，REST 尾部回填真实缺口。 | [历史 K 线](#-基于-tdengine-的历史-k-线) · [行情服务](./market_data_system/README.md) |
+| 🧾 **客户端与 API** | leader 感知客户端、`/events` 游标、批量写入、local-lease 读与 `ReadIndex` 回退、按节点写入准入。 | [API](./docs/API.md) · [撮合结果](./docs/MATCH_RESULTS.md) |
+| 🖥️ **交易界面** | 无状态下单 BFF + 纯 React/TS 终端；订单簿来自行情 feed，浏览器绝不调用引擎 `/write`。 | [终端](#-交易终端) · [下单系统](./order_system/README.md) |
+| ☸️ **运维** | 内置控制台、探针、指标、重放工具、CRD 集群控制、逐 Pod 滚动、可校验备份和现成可观测栈。 | [Kubernetes](#-kubernetes-控制平面) · [可观测性](#-可观测性界面) |
 
 ## 🧩 五个项目，一套系统
 
@@ -116,6 +121,14 @@ publication；JSONL sink 仍可用于调试。
 
 ## 🚀 快速开始
 
+| 目标 | 从哪里开始 |
+|---|---|
+| 检查单节点引擎及其 HTTP API | 下方[运行引擎](#运行引擎) |
+| 验证复制、成员变更与恢复 | 下方[启动本地集群](#启动本地集群) |
+| 一起查看下单与行情 | 下方[运行演示](#运行演示) |
+| 运维多 symbol 集群 | [Kubernetes 控制平面](#-kubernetes-控制平面) |
+| 先理解设计再动手 | [架构](#-架构)与[文档](#-文档与测试) |
+
 ### 运行引擎
 
 ```shell
@@ -152,15 +165,17 @@ README 中。
 ## 🗄️ 基于 TDengine 的历史 K 线
 
 `market_data_system --history` 在现有服务内增加持久化 K 线层——不新建 crate，也不新增对外端口。
-单个 writer 把确定性的成交 tap 折叠成稀疏的 `1s` 成交 K 线和物化的 `1m` 汇总，以规范的 18 位小数
-文本 upsert 到 TDengine；`3m`…`3d` 在读取时由 `1m` 通过 `INTERVAL` 汇总。读取时把 DECIMAL 列
+单个 writer 把确定性的成交 tap 折叠成稀疏的 `1s` 成交 K 线以及物化的 `1m`/`5m` 汇总，以规范的
+18 位小数文本 upsert 到 TDengine；`3m`…`3d` 在读取时通过 `INTERVAL` 汇总（`30m` 优先由 `5m`
+生成，缺失时回退 `1m`）。读取时把 DECIMAL 列
 `CAST` 为 `VARCHAR`，再用严格的 scale-18 解析器处理，因此 `f64` 或 96 位客户端小数都不可能悄悄
 舍入数值。writer 行携带引擎 `market_seq` 和自身成交游标，替换实例可从最新行恢复，无需热备；查询端
 完全无状态，直接读 TDengine。`GET /klines` 为 Binance 兼容的稠密数组，同一批行也用于 WebSocket
 订阅回放。
 
-**阶段 P0**（schema、成交驱动 writer、`/klines`、WS 回放）已实现并在 OrbStack 实验环境接通。
-成交 spool、Lease 故障切换、修订/缺口表、`/bars`、导入器、时区锚定和三节点生产拓扑仍属于设计范围。
+**P0 与 P1** 已在 OrbStack 实验环境实现并验证：schema、成交驱动 writer、`/klines`、WS 回放，
+以及滚动成交 spool、修订/缺口表、按 symbol 的 Lease 故障切换、REST 尾部缺口修复和原生
+`/bars?since=<seq>`。归档导入器与 reconciler、基于缺口的读门禁、时区锚定和三节点生产拓扑仍待完成。
 
 [![历史 K 线：TDengine 作为系统记录层](./docs/historical-bars-tdengine.png)](./docs/historical-bars-tdengine.html)
 
@@ -257,14 +272,10 @@ payload/purge、async WAL 或 thin LTO，它们都没有超过默认配置。详
 
 ## 📈 可观测性界面
 
-实验环境的 Prometheus 与 Grafana 展示抓取状态、告警状态、Raft 与行情速率，以及 operator 的 reconcile/rollout 计数。
-安装与验证见 [`docs/OBSERVABILITY.md`](./docs/OBSERVABILITY.md)。
+一个 Grafana 面板即可查看 Raft 与行情速率、抓取状态、告警以及 operator 的 reconcile/rollout 计数。
+安装、验证和其他视图见 [`docs/OBSERVABILITY.md`](./docs/OBSERVABILITY.md)。
 
 ![Grafana 实验可观测性面板](./docs/grafana-observability.png)
-
-![Prometheus 抓取目标状态](./docs/prometheus-targets.png)
-
-![Prometheus 告警规则](./docs/prometheus-alerts.png)
 
 ## 📚 文档与测试
 
