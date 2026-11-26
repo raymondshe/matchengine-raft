@@ -448,7 +448,9 @@ in git history and the linked docs. For the full history, check out `TODO.md` fr
   `/admission/status` and a gap-free market-data feed; terminal and manager still return 200.
   Inside an OrbStack Linux container the cross-compiled test binaries passed 230 lib + 84 cluster
   tests, `replay_mix --check` and `book_replay --check`. `apply_path --check` passes on Linux and
-  macOS; a cold-process blank-row allocation flake was removed with a second uncounted warm-up.
+  macOS. A cold-process blank-row allocation flake on Linux CI (1 call / 15 bytes) is now covered
+  by a second uncounted warm-up and a fixed 4-call/128-byte harness allowance; the engine rows keep
+  their tight ceilings.
 - **2026-11-26** — Historical bars P1 completed and validated. `--history-lease-prefix` creates one
   Kubernetes Lease per symbol (`<prefix>-<symbol>`) and gates flushes, `bar_state` writes and REST
   backfill per symbol; `--history-rest-tail` backfills missing closed windows from a Binance-compatible

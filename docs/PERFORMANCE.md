@@ -539,7 +539,7 @@ for 50,000 single-entry applications or 1,000 128-request batches:
 
 | Workload | Max allocation calls | Max requested bytes |
 |---|---:|---:|
-| Blank | 0 | 0 |
+| Blank | 4 | 128 |
 | Rest, 1 event | 10,000 | 30,000,000 |
 | Cancel, 1 event | 2,000 | 1,000,000 |
 | Fill, 1 event | 102,000 | 120,000,000 |
@@ -547,7 +547,9 @@ for 50,000 single-entry applications or 1,000 128-request batches:
 | Batch rest, 128 x 1 event | 32,000 | 250,000,000 |
 
 The hot rows were tightened on 2026-11-26: measured totals are 8,335 / 0 / 100,000 / 1,000 /
-27,336, with headroom for allocator differences between hosts. `book_replay --check` enforces warm p50/p99 bounds from
+27,336, with headroom for allocator differences between hosts. The blank row is a harness baseline,
+not an engine workload: Linux CI can show a one-time 1-call/15-byte lazy initialisation, so it has a
+fixed 4-call/128-byte allowance instead of a zero ceiling. `book_replay --check` enforces warm p50/p99 bounds from
 1 ms/5 ms (1k sweep) to 50 ms/100 ms (1M BBO queries), and `replay_mix --check` enforces
 1 s/2 s for the whole warm replay. Those are roughly an order of magnitude above the recorded
 M4 baseline. Cold passes remain reported but are not gated.
