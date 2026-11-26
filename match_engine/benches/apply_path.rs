@@ -316,7 +316,10 @@ async fn cancel_workload() -> anyhow::Result<()> {
         apply_entry(
             &mut store,
             index,
-            EntryPayload::Normal(MatchEngineRequest::Cancel { order }),
+            EntryPayload::Normal(MatchEngineRequest::Cancel {
+                order,
+                client_request_id: None,
+            }),
         )
         .await;
     }

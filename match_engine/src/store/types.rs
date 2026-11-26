@@ -42,7 +42,15 @@ pub enum MatchEngineRequest {
     /// still consumes one market sequence and publishes a `Rejected` event
     /// with `order_not_found`; it is not silently acknowledged and it is not
     /// an HTTP error, because the request is already committed.
-    Cancel { order: Order },
+    ///
+    /// `client_request_id` is optional and shares the idempotency namespace
+    /// with `Place::client_order_id`: a retry with the same key returns the
+    /// original sequence and events without cancelling again.
+    Cancel {
+        order: Order,
+        #[serde(default)]
+        client_request_id: Option<String>,
+    },
     /// Amend a resting limit order, iceberg or parked stop.
     ///
     /// A book order is identified exactly like `Cancel` (side + current price +
@@ -60,6 +68,10 @@ pub enum MatchEngineRequest {
         /// New open volume; omitted/`null` keeps the current one.
         #[serde(default)]
         volume: Option<Fixed>,
+        /// Optional idempotency key, sharing the namespace with
+        /// `Place::client_order_id` and `Cancel::client_request_id`.
+        #[serde(default)]
+        client_request_id: Option<String>,
     },
     /// Explicitly evict orders whose time in force has expired at `now_ms`.
     ///
@@ -98,6 +110,29 @@ impl MatchEngineRequest {
         }
     }
 
+    /// Builds a `Cancel` with a client request key for safe retries.
+    pub fn cancel_with_request_id(order: Order, client_request_id: impl Into<String>) -> Self {
+        Self::Cancel {
+            order,
+            client_request_id: Some(client_request_id.into()),
+        }
+    }
+
+    /// Builds an `Amend` with a client request key for safe retries.
+    pub fn amend_with_request_id(
+        order: Order,
+        price: Option<Fixed>,
+        volume: Option<Fixed>,
+        client_request_id: impl Into<String>,
+    ) -> Self {
+        Self::Amend {
+            order,
+            price,
+            volume,
+            client_request_id: Some(client_request_id.into()),
+        }
+    }
+
     /// Builds a `Place` with a client idempotency key.
     pub fn place_with_client_id(order: Order, client_order_id: impl Into<String>) -> Self {
         Self::Place {
@@ -111,11 +146,14 @@ impl fmt::Display for MatchEngineRequest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             MatchEngineRequest::Place { order, .. } => write!(f, "Place {{ order: {:?} }}", order),
-            MatchEngineRequest::Cancel { order } => write!(f, "Cancel {{ order: {:?} }}", order),
+            MatchEngineRequest::Cancel { order, .. } => {
+                write!(f, "Cancel {{ order: {:?} }}", order)
+            }
             MatchEngineRequest::Amend {
                 order,
                 price,
                 volume,
+                ..
             } => write!(
                 f,
                 "Amend {{ order: {:?}, price: {price:?}, volume: {volume:?} }}",
@@ -136,6 +174,20 @@ impl fmt::Display for MatchEngineRequest {
             }
         }
     }
+}
+
+/// Typed JSON body for a write that must be retried at the current leader.
+///
+/// The HTTP status is `503 Service Unavailable`. Gateways that cannot use the
+/// Rust client can read `leader_addr` and retry there; a null leader means no
+/// leader is known yet and the retry must wait. Cancel/Amend retries must carry
+/// a request key so the retry cannot duplicate the mutation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeaderRedirect {
+    pub error: String,
+    pub leader_id: Option<u64>,
+    pub leader_addr: Option<String>,
+    pub reason: String,
 }
 
 /// Response returned from applying a request to the state machine.

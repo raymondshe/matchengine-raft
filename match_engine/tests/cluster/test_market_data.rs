@@ -126,6 +126,7 @@ fn market_data_feed_publishes_trades_bbo_depth_and_bars() {
         bid_key.sequence = 0;
         let amend_seq = client
             .write(&MatchEngineRequest::Amend {
+                client_request_id: None,
                 order: bid_key,
                 price: None,
                 volume: Some(3.0.into()),
@@ -141,7 +142,10 @@ fn market_data_feed_publishes_trades_bbo_depth_and_bars() {
         let mut ask_key = Order::new(OrderSide::Sell, 101.0, 1.0, 0);
         ask_key.sequence = 4; // the resting ask was the fourth placement
         let cancel_seq = client
-            .write(&MatchEngineRequest::Cancel { order: ask_key })
+            .write(&MatchEngineRequest::Cancel {
+                client_request_id: None,
+                order: ask_key,
+            })
             .await
             .unwrap()
             .unwrap()

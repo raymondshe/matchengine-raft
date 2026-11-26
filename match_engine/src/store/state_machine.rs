@@ -1530,7 +1530,18 @@ where
                 }
                 (response, count)
             }
-            MatchEngineRequest::Cancel { order } => {
+            MatchEngineRequest::Cancel {
+                order,
+                client_request_id,
+            } => {
+                if let Some(key) = client_request_id
+                    && let Some(record) = inner.submissions.get(key.as_str()).cloned()
+                {
+                    return (
+                        Self::response_or_none(respond, || inner.duplicate_response(&record)),
+                        0,
+                    );
+                }
                 let market_seq = inner.orderbook.next_market_sequence();
                 let mut events = EventBuffer::new();
                 let expired_orders = if inner.orderbook.has_gtd_deadlines() {
@@ -1573,6 +1584,15 @@ where
                     &mut events,
                 );
                 inner.record_events(&events);
+                if let Some(key) = client_request_id {
+                    inner.record_submission(
+                        key.as_str(),
+                        market_seq,
+                        log_index,
+                        first_ordinal,
+                        events.len() as u32,
+                    );
+                }
                 let market = self.take_market_frame(
                     inner,
                     log_index,
@@ -1594,7 +1614,16 @@ where
                 order,
                 price,
                 volume,
+                client_request_id,
             } => {
+                if let Some(key) = client_request_id
+                    && let Some(record) = inner.submissions.get(key.as_str()).cloned()
+                {
+                    return (
+                        Self::response_or_none(respond, || inner.duplicate_response(&record)),
+                        0,
+                    );
+                }
                 let market_seq = inner.orderbook.next_market_sequence();
                 let mut events = EventBuffer::new();
                 let expired_orders = if inner.orderbook.has_gtd_deadlines() {
@@ -1639,6 +1668,15 @@ where
                     &mut events,
                 );
                 inner.record_events(&events);
+                if let Some(key) = client_request_id {
+                    inner.record_submission(
+                        key.as_str(),
+                        market_seq,
+                        log_index,
+                        first_ordinal,
+                        events.len() as u32,
+                    );
+                }
                 let market = self.take_market_frame(
                     inner,
                     log_index,

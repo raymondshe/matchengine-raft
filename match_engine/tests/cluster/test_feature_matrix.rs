@@ -97,7 +97,10 @@ fn cancel(
 ) -> MatchEngineRequest {
     let mut order = limit(side, price, volume);
     order.sequence = sequence;
-    MatchEngineRequest::Cancel { order }
+    MatchEngineRequest::Cancel {
+        order,
+        client_request_id: None,
+    }
 }
 
 fn market(side: OrderSide, volume: impl Into<Fixed>) -> Order {
@@ -332,6 +335,7 @@ fn feature_matrix_reaches_engine() {
         let response = apply(
             &client,
             MatchEngineRequest::Amend {
+                client_request_id: None,
                 order: amend_key,
                 price: None,
                 volume: Some(Fixed::from(3)),
@@ -376,6 +380,7 @@ fn event_lifecycle_reconstructs_state() {
         let response = apply(
             &client,
             MatchEngineRequest::Amend {
+                client_request_id: None,
                 order: limit(OrderSide::Buy, 100.0, 5.0),
                 price: None,
                 volume: Some(Fixed::from(3)),
@@ -744,6 +749,7 @@ fn amend_supports_parked_stops_and_icebergs() {
         let response = apply(
             &client,
             MatchEngineRequest::Amend {
+                client_request_id: None,
                 order: stop_key,
                 price: Some(Fixed::from(93)),
                 volume: Some(Fixed::from(7)),
@@ -778,6 +784,7 @@ fn amend_supports_parked_stops_and_icebergs() {
         let response = apply(
             &client,
             MatchEngineRequest::Amend {
+                client_request_id: None,
                 order: iceberg_key,
                 price: None,
                 volume: Some(Fixed::from(6)),
@@ -801,6 +808,7 @@ fn amend_supports_parked_stops_and_icebergs() {
         let response = apply(
             &client,
             MatchEngineRequest::Amend {
+                client_request_id: None,
                 order: iceberg_key,
                 price: None,
                 volume: Some(Fixed::from(12)),

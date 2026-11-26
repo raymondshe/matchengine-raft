@@ -13,5 +13,6 @@ pub use self::state_machine::StagedSnapshot;
 pub use self::state_machine::StateMachineData;
 pub use self::state_machine::StateMachineStore;
 pub use self::state_machine::StoredSnapshot;
+pub use self::types::LeaderRedirect;
 pub use self::types::MatchEngineRequest;
 pub use self::types::MatchEngineResponse;

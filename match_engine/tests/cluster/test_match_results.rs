@@ -97,6 +97,7 @@ fn file_sink_records_rests_fills_and_cancels() {
         // Cancelling the remainder reports the 6 that were still open.
         client
             .write(&MatchEngineRequest::Cancel {
+                client_request_id: None,
                 order: Order::new(OrderSide::Buy, 100.0, 6.0, 0),
             })
             .await
@@ -123,6 +124,7 @@ fn file_sink_records_rests_fills_and_cancels() {
         // and the file sink carry it.
         let response = client
             .write(&MatchEngineRequest::Cancel {
+                client_request_id: None,
                 order: Order::new(OrderSide::Buy, 100.0, 6.0, 0),
             })
             .await

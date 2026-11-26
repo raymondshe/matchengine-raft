@@ -298,6 +298,7 @@ async fn apply_publishes_rests_fills_and_cancels_to_the_sink() {
         entry(
             3,
             EntryPayload::Normal(MatchEngineRequest::Cancel {
+                client_request_id: None,
                 order: Order::new(OrderSide::Buy, 100.0, 3.0, 1),
             }),
         ),
@@ -319,6 +320,7 @@ async fn apply_publishes_rests_fills_and_cancels_to_the_sink() {
         entry(
             4,
             EntryPayload::Normal(MatchEngineRequest::Cancel {
+                client_request_id: None,
                 order: Order::new(OrderSide::Buy, 100.0, 3.0, 1),
             }),
         ),
@@ -384,7 +386,10 @@ async fn apply_rejects_cancel_and_amend_of_a_fully_filled_order() {
         Ok((
             entry(
                 3,
-                EntryPayload::Normal(MatchEngineRequest::Cancel { order: bid }),
+                EntryPayload::Normal(MatchEngineRequest::Cancel {
+                    client_request_id: None,
+                    order: bid,
+                }),
             ),
             None,
         )),
@@ -392,6 +397,7 @@ async fn apply_rejects_cancel_and_amend_of_a_fully_filled_order() {
             entry(
                 4,
                 EntryPayload::Normal(MatchEngineRequest::Amend {
+                    client_request_id: None,
                     order: bid,
                     price: Some(99.0.into()),
                     volume: None,
@@ -495,9 +501,11 @@ async fn batch_ordinals_continue_across_mixed_requests() {
         requests: vec![
             MatchEngineRequest::place(Order::new(OrderSide::Buy, 100.0, 1.0, 0)),
             MatchEngineRequest::Cancel {
+                client_request_id: None,
                 order: Order::new(OrderSide::Buy, 100.0, 1.0, 0),
             },
             MatchEngineRequest::Amend {
+                client_request_id: None,
                 order: Order::new(OrderSide::Buy, 100.0, 1.0, 99),
                 price: Some(101.0.into()),
                 volume: None,
@@ -948,6 +956,7 @@ async fn apply_publishes_market_ioc_fok_post_only_and_iceberg_events() {
             entry(
                 7,
                 EntryPayload::Normal(MatchEngineRequest::Cancel {
+                    client_request_id: None,
                     order: Order::new(OrderSide::Sell, 100.0, 5.0, 4),
                 }),
             ),
@@ -1364,6 +1373,7 @@ async fn apply_amends_parked_stop_and_iceberg() {
             entry(
                 2,
                 EntryPayload::Normal(MatchEngineRequest::Amend {
+                    client_request_id: None,
                     order: stop_key,
                     price: Some(93.0.into()),
                     volume: Some(7.0.into()),
@@ -1379,6 +1389,7 @@ async fn apply_amends_parked_stop_and_iceberg() {
             entry(
                 4,
                 EntryPayload::Normal(MatchEngineRequest::Amend {
+                    client_request_id: None,
                     order: iceberg_key,
                     price: None,
                     volume: Some(12.0.into()),
@@ -1463,6 +1474,7 @@ async fn apply_publishes_amended_and_rejected_events() {
             entry(
                 2,
                 EntryPayload::Normal(MatchEngineRequest::Amend {
+                    client_request_id: None,
                     order: bid,
                     price: None,
                     volume: Some(12.0.into()),
@@ -1474,6 +1486,7 @@ async fn apply_publishes_amended_and_rejected_events() {
             entry(
                 3,
                 EntryPayload::Normal(MatchEngineRequest::Amend {
+                    client_request_id: None,
                     order: Order::new(OrderSide::Buy, 100.0, 1.0, 42),
                     price: Some(99.0.into()),
                     volume: None,
@@ -1812,7 +1825,10 @@ async fn cancel_and_amend_consume_sequences_and_purge_due_gtd() {
         Ok((
             entry(
                 2,
-                EntryPayload::Normal(MatchEngineRequest::Cancel { order: cancel_key }),
+                EntryPayload::Normal(MatchEngineRequest::Cancel {
+                    client_request_id: None,
+                    order: cancel_key,
+                }),
             ),
             None,
         )),
@@ -2468,4 +2484,85 @@ async fn stale_staging_files_are_removed_on_open() {
 
     let _store = StateMachineStore::<MatchEngineTypeConfig>::open(dir.path()).unwrap();
     assert!(!stale.exists(), "startup clears transport staging files");
+}
+
+/// Cancel and Amend accept request keys in the same idempotency namespace as
+/// Place. A retry returns the original response and does not consume another
+/// sequence or append another event.
+#[tokio::test]
+async fn cancel_and_amend_request_keys_make_retries_idempotent() {
+    use crate::match_result::MatchEventKind;
+    use crate::match_result::MemorySink;
+    use crate::order_book::Order;
+    use crate::order_book::OrderSide;
+    use openraft::alias::EntryOf;
+
+    fn entry(
+        index: u64,
+        payload: EntryPayloadOf<MatchEngineTypeConfig>,
+    ) -> EntryOf<MatchEngineTypeConfig> {
+        Entry {
+            log_id: log_id(1, index),
+            payload,
+        }
+    }
+
+    async fn apply_one(
+        store: &mut StateMachineStore<MatchEngineTypeConfig>,
+        index: u64,
+        payload: EntryPayloadOf<MatchEngineTypeConfig>,
+    ) {
+        let entries = futures::stream::iter(vec![Ok((entry(index, payload), None))]);
+        store.apply(entries).await.unwrap();
+    }
+
+    let dir = tempdir();
+    let sink = Arc::new(MemorySink::new());
+    let mut store =
+        StateMachineStore::<MatchEngineTypeConfig>::open_with_sink(dir.path(), sink.clone())
+            .unwrap();
+
+    let first = Order::new(OrderSide::Buy, 100.0, 2.0, 0);
+    let second = Order::new(OrderSide::Buy, 99.0, 3.0, 0);
+    apply_one(
+        &mut store,
+        1,
+        EntryPayload::Normal(MatchEngineRequest::place(first)),
+    )
+    .await;
+    apply_one(
+        &mut store,
+        2,
+        EntryPayload::Normal(MatchEngineRequest::place(second)),
+    )
+    .await;
+
+    let cancel_key = Order::new(OrderSide::Buy, 100.0, 2.0, 0);
+    let cancel = MatchEngineRequest::cancel_with_request_id(cancel_key, "cancel-1");
+    apply_one(&mut store, 3, EntryPayload::Normal(cancel.clone())).await;
+    let events_after_cancel = sink.events().len();
+    apply_one(&mut store, 4, EntryPayload::Normal(cancel)).await;
+    assert_eq!(
+        events_after_cancel,
+        sink.events().len(),
+        "retry adds no events"
+    );
+    assert_eq!(
+        3,
+        store.orderbook_sequence().await,
+        "the cancel consumes one sequence, its retry none"
+    );
+
+    let amend_key = Order::new(OrderSide::Buy, 99.0, 3.0, 1);
+    let amend =
+        MatchEngineRequest::amend_with_request_id(amend_key, None, Some(2.0.into()), "amend-1");
+    apply_one(&mut store, 5, EntryPayload::Normal(amend.clone())).await;
+    let events_after_amend = sink.events().len();
+    apply_one(&mut store, 6, EntryPayload::Normal(amend)).await;
+    assert_eq!(events_after_amend, sink.events().len());
+    assert_eq!(4, store.orderbook_sequence().await);
+
+    let kinds: Vec<_> = sink.events().iter().map(|event| event.kind).collect();
+    assert!(kinds.contains(&MatchEventKind::Cancelled));
+    assert!(kinds.contains(&MatchEventKind::Amended));
 }

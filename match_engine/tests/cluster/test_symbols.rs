@@ -177,11 +177,19 @@ fn symbol_configuration_validates_orders_and_survives_restart() {
         // A cancel or amend keyed for the wrong symbol is also rejected at the
         // edge and must not touch the symbol-0 order.
         let wrong_key = Order::new(OrderSide::Buy, fixed("100.25"), fixed("1.5"), 0).with_symbol(1);
-        let response = raw_write(ADDR, &MatchEngineRequest::Cancel { order: wrong_key }).await;
+        let response = raw_write(
+            ADDR,
+            &MatchEngineRequest::Cancel {
+                client_request_id: None,
+                order: wrong_key,
+            },
+        )
+        .await;
         assert_eq!(StatusCode::BAD_REQUEST, response.status());
         let response = raw_write(
             ADDR,
             &MatchEngineRequest::Amend {
+                client_request_id: None,
                 order: wrong_key,
                 price: Some(fixed("100.20")),
                 volume: Some(fixed("1")),
@@ -347,11 +355,19 @@ fn gateway_symbol_guard_allows_configure_and_place_batch() {
 
         // Wrong-symbol cancel and amend keys do not reach the book.
         let wrong_key = Order::new(OrderSide::Buy, fixed("100.25"), fixed("1.5"), 0);
-        let response = raw_write(ADDR_2, &MatchEngineRequest::Cancel { order: wrong_key }).await;
+        let response = raw_write(
+            ADDR_2,
+            &MatchEngineRequest::Cancel {
+                client_request_id: None,
+                order: wrong_key,
+            },
+        )
+        .await;
         assert_eq!(StatusCode::BAD_REQUEST, response.status());
         let response = raw_write(
             ADDR_2,
             &MatchEngineRequest::Amend {
+                client_request_id: None,
                 order: wrong_key,
                 price: Some(fixed("100.20")),
                 volume: Some(fixed("1")),

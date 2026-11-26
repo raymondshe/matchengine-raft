@@ -21,6 +21,7 @@ use matchengine_raft::client::MatchEngineClient;
 use matchengine_raft::default_raft_config;
 use matchengine_raft::order_book::Order;
 use matchengine_raft::order_book::OrderSide;
+use matchengine_raft::store::LeaderRedirect;
 use matchengine_raft::store::MatchEngineRequest;
 use openraft::Config;
 use openraft::type_config::TypeConfigExt;
@@ -370,5 +371,85 @@ fn client_forwards_after_leader_failover() {
         for node in nodes.into_iter().flatten() {
             node.shutdown().await.unwrap();
         }
+    });
+}
+
+#[test]
+fn follower_write_returns_a_typed_leader_redirect() {
+    C::run(async {
+        let first_dir = TempDir::new("redirect-1");
+        let second_dir = TempDir::new("redirect-2");
+        let first_storage = StorageConfig::new(first_dir.path()).with_instance_prefix("redirect-1");
+        let second_storage =
+            StorageConfig::new(second_dir.path()).with_instance_prefix("redirect-2");
+
+        let leader_addr = TestAddr::new(21970);
+        let peer_addr = TestAddr::new(21971);
+        let node1 = start_node(1, leader_addr, &first_storage).await;
+        let node2 = start_node(2, peer_addr, &second_storage).await;
+        let client = MatchEngineClient::<C>::new(1, leader_addr.to_string());
+        client.init().await.unwrap().unwrap();
+        wait_for_leader(
+            std::slice::from_ref(&client),
+            None,
+            Instant::now() + Duration::from_secs(15),
+        )
+        .await;
+        client
+            .add_learner((2, peer_addr.to_string()))
+            .await
+            .unwrap()
+            .unwrap();
+        client
+            .change_membership(&BTreeSet::from([1, 2]))
+            .await
+            .unwrap()
+            .unwrap();
+        wait_for_leader(
+            std::slice::from_ref(&client),
+            None,
+            Instant::now() + Duration::from_secs(15),
+        )
+        .await;
+
+        let metrics: serde_json::Value = reqwest::get(format!("http://{leader_addr}/metrics"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let leader_id = metrics["Ok"]["current_leader"].as_u64().unwrap();
+        let own_id: serde_json::Value = reqwest::get(format!("http://{leader_addr}/health"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let follower_addr = if own_id["node_id"].as_u64() == Some(leader_id) {
+            peer_addr
+        } else {
+            leader_addr
+        };
+
+        let response = reqwest::Client::new()
+            .post(format!("http://{follower_addr}/write"))
+            .json(&place())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(503, response.status());
+        let redirect: LeaderRedirect = response.json().await.unwrap();
+        assert_eq!("not_leader", redirect.error);
+        assert_eq!(Some(leader_id), redirect.leader_id);
+        assert!(
+            redirect
+                .leader_addr
+                .as_deref()
+                .is_some_and(|addr| !addr.is_empty()),
+            "the body must carry the leader address"
+        );
+
+        node1.shutdown().await.unwrap();
+        node2.shutdown().await.unwrap();
     });
 }

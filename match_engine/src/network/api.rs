@@ -3,15 +3,20 @@ use std::time::Duration;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
+use actix_web::HttpResponse;
 use actix_web::Responder;
 use actix_web::get;
 use actix_web::post;
 use actix_web::web;
 use actix_web::web::Data;
+use openraft::TryAsRef;
 use openraft::async_runtime::WatchReceiver;
+use openraft::errors::ClientWriteError;
+use openraft::errors::ForwardToLeader;
 use openraft::errors::Infallible;
 use openraft::errors::LinearizableReadError;
 use openraft::errors::decompose::DecomposeResult;
+use openraft::raft::ClientWriteResponse;
 use openraft::raft::linearizable_read::Linearizer;
 use serde::Deserialize;
 use serde::Serialize;
@@ -26,6 +31,7 @@ use crate::match_result::EventId;
 use crate::match_result::MatchEvent;
 use crate::network::read_policy::ReadPath;
 use crate::order_book::Order;
+use crate::store::LeaderRedirect;
 use crate::store::MatchEngineRequest;
 use crate::store::MatchEngineResponse;
 use crate::store::state_machine::StateMachineStoreInner;
@@ -144,15 +150,32 @@ fn validate_events_request(req: &EventsRequest) -> Result<(), String> {
     Ok(())
 }
 
-/// Validates one request, including a one-level batch.
-fn validate_request(request: &MatchEngineRequest) -> Result<(), String> {
+/// The idempotency key carried by a request, if any. All three mutating
+/// request types share one namespace so a gateway retry cannot apply a
+/// different operation under the same key.
+fn request_key(request: &MatchEngineRequest) -> Option<&str> {
     match request {
         MatchEngineRequest::Place {
             client_order_id: Some(id),
             ..
-        } => validate_client_order_id(id),
+        }
+        | MatchEngineRequest::Cancel {
+            client_request_id: Some(id),
+            ..
+        }
+        | MatchEngineRequest::Amend {
+            client_request_id: Some(id),
+            ..
+        } => Some(id.as_str()),
+        _ => None,
+    }
+}
+
+/// Validates one request, including a one-level batch.
+fn validate_request(request: &MatchEngineRequest) -> Result<(), String> {
+    match request {
         MatchEngineRequest::Batch { requests } => validate_batch(requests),
-        _ => Ok(()),
+        _ => request_key(request).map_or(Ok(()), validate_client_order_id),
     }
 }
 
@@ -171,11 +194,8 @@ fn validate_batch(requests: &[MatchEngineRequest]) -> Result<(), String> {
             return Err("nested batches are not supported".to_string());
         }
         validate_request(request)?;
-        if let MatchEngineRequest::Place {
-            client_order_id: Some(id),
-            ..
-        } = request
-            && !ids.insert(id.as_str())
+        if let Some(id) = request_key(request)
+            && !ids.insert(id)
         {
             return Err(format!("duplicate client_order_id in batch: {id}"));
         }
@@ -192,7 +212,7 @@ fn validate_batch(requests: &[MatchEngineRequest]) -> Result<(), String> {
 fn validate_request_symbol(request: &MatchEngineRequest, configured: u32) -> Result<(), String> {
     match request {
         MatchEngineRequest::Place { order, .. }
-        | MatchEngineRequest::Cancel { order }
+        | MatchEngineRequest::Cancel { order, .. }
         | MatchEngineRequest::Amend { order, .. } => validate_order_symbol(order, configured),
         MatchEngineRequest::Batch { requests } => {
             for (index, request) in requests.iter().enumerate() {
@@ -301,11 +321,44 @@ pub struct EventsStatus {
 ///
 /// The result of applying the request, or an error if the node is not
 /// the leader or the write fails.
+/// Builds the typed 503 body for a write that must be retried at the leader.
+///
+/// Both `ForwardToLeader` and `LogEntryDiscarded` carry the latest known leader;
+/// the latter additionally requires application-level dedupe, which is why
+/// Cancel/Amend need request keys before a gateway can retry blindly.
+fn write_redirect(
+    app: &MatchEngineApp,
+    error: &ClientWriteError<MatchEngineTypeConfig>,
+) -> Option<LeaderRedirect> {
+    let forward: &ForwardToLeader<MatchEngineTypeConfig> = error.try_as_ref()?;
+    let leader_id = forward.leader_id;
+    let leader_addr = forward
+        .leader_node
+        .as_ref()
+        .map(|node| node.addr.clone())
+        .or_else(|| {
+            let id = leader_id?;
+            let receiver = app.raft.metrics();
+            let metrics = receiver.borrow_watched();
+            metrics
+                .membership_config
+                .membership()
+                .get_node(&id)
+                .map(|node| node.addr.clone())
+        });
+    Some(LeaderRedirect {
+        error: "not_leader".to_string(),
+        leader_id,
+        leader_addr,
+        reason: format!("{:?}", forward.reason),
+    })
+}
+
 #[post("/write")]
 pub async fn write(
     app: Data<MatchEngineApp>,
     req: Json<MatchEngineRequest>,
-) -> actix_web::Result<impl Responder> {
+) -> actix_web::Result<HttpResponse> {
     ensure_min_voters(&app)?;
     let mut request = req.into_inner();
     validate_request(&request).map_err(actix_web::error::ErrorBadRequest)?;
@@ -318,7 +371,15 @@ pub async fn write(
     guard_request_symbol(&app, &request).map_err(actix_web::error::ErrorBadRequest)?;
     stamp_intake_time(&mut request);
     let response = match app.raft.client_write(request).await.decompose() {
-        Ok(response) => response,
+        Ok(Ok(response)) => {
+            HttpResponse::Ok().json(Ok::<_, ClientWriteError<MatchEngineTypeConfig>>(response))
+        }
+        Ok(Err(error)) => match write_redirect(&app, &error) {
+            Some(redirect) => HttpResponse::ServiceUnavailable().json(redirect),
+            None => {
+                HttpResponse::Ok().json(Err::<ClientWriteResponse<MatchEngineTypeConfig>, _>(error))
+            }
+        },
         Err(error) => {
             tracing::error!(%error, "client write failed");
             return Err(actix_web::error::ErrorInternalServerError(
@@ -326,7 +387,7 @@ pub async fn write(
             ));
         }
     };
-    Ok(Json(response))
+    Ok(response)
 }
 
 /// Writes multiple requests in one Raft entry.
@@ -344,7 +405,7 @@ pub async fn write(
 pub async fn write_batch(
     app: Data<MatchEngineApp>,
     req: Json<Vec<MatchEngineRequest>>,
-) -> actix_web::Result<impl Responder> {
+) -> actix_web::Result<HttpResponse> {
     ensure_min_voters(&app)?;
     let requests = req.into_inner();
     validate_batch(&requests).map_err(actix_web::error::ErrorBadRequest)?;
@@ -358,7 +419,15 @@ pub async fn write_batch(
     guard_request_symbol(&app, &request).map_err(actix_web::error::ErrorBadRequest)?;
     stamp_intake_time(&mut request);
     let response = match app.raft.client_write(request).await.decompose() {
-        Ok(response) => response,
+        Ok(Ok(response)) => {
+            HttpResponse::Ok().json(Ok::<_, ClientWriteError<MatchEngineTypeConfig>>(response))
+        }
+        Ok(Err(error)) => match write_redirect(&app, &error) {
+            Some(redirect) => HttpResponse::ServiceUnavailable().json(redirect),
+            None => {
+                HttpResponse::Ok().json(Err::<ClientWriteResponse<MatchEngineTypeConfig>, _>(error))
+            }
+        },
         Err(error) => {
             tracing::error!(%error, "client batch write failed");
             return Err(actix_web::error::ErrorInternalServerError(
@@ -366,7 +435,7 @@ pub async fn write_batch(
             ));
         }
     };
-    Ok(Json(response))
+    Ok(response)
 }
 
 /// Stamps the request with the receiving leader's clock.
@@ -386,7 +455,7 @@ fn stamp_intake_time(request: &mut MatchEngineRequest) {
 fn stamp_request_at(request: &mut MatchEngineRequest, now_ms: u64) {
     match request {
         MatchEngineRequest::Place { order, .. }
-        | MatchEngineRequest::Cancel { order }
+        | MatchEngineRequest::Cancel { order, .. }
         | MatchEngineRequest::Amend { order, .. } => order.timestamp = now_ms,
         MatchEngineRequest::Batch { requests } => {
             for request in requests {
@@ -877,6 +946,33 @@ mod tests {
     }
 
     #[test]
+    fn request_keys_are_validated_across_all_mutating_types() {
+        use crate::order_book::Order;
+        use crate::order_book::OrderSide;
+
+        let order = || Order::new(OrderSide::Buy, 100.0, 1.0, 0);
+        let cancel = |id: &str| MatchEngineRequest::cancel_with_request_id(order(), id);
+        let amend = |id: &str| MatchEngineRequest::amend_with_request_id(order(), None, None, id);
+
+        assert!(validate_request(&cancel("cancel-1")).is_ok());
+        assert!(validate_request(&amend("amend-1")).is_ok());
+        assert!(validate_request(&cancel("")).is_err());
+        assert!(validate_request(&amend("has space")).is_err());
+        assert!(validate_request(&cancel(&"a".repeat(MAX_CLIENT_ORDER_ID_BYTES + 1))).is_err());
+
+        // One namespace: a batch cannot reuse a key across Place/Cancel/Amend.
+        assert!(validate_batch(&[cancel("same"), amend("same")]).is_err());
+        assert!(
+            validate_batch(&[
+                MatchEngineRequest::place_with_client_id(order(), "p"),
+                cancel("c"),
+                amend("a"),
+            ])
+            .is_ok()
+        );
+    }
+
+    #[test]
     fn read_keys_are_bounded_ascii_and_non_empty() {
         assert!(validate_read_key("orderbook_depth:20").is_ok());
         assert!(validate_read_key("").is_err());
@@ -930,11 +1026,19 @@ mod tests {
         assert!(error.contains("configured symbol 0"), "{error}");
 
         assert!(
-            validate_request_symbol(&MatchEngineRequest::Cancel { order: order(1) }, 0).is_err()
+            validate_request_symbol(
+                &MatchEngineRequest::Cancel {
+                    client_request_id: None,
+                    order: order(1)
+                },
+                0
+            )
+            .is_err()
         );
         assert!(
             validate_request_symbol(
                 &MatchEngineRequest::Amend {
+                    client_request_id: None,
                     order: order(1),
                     price: None,
                     volume: None,

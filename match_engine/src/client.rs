@@ -28,6 +28,7 @@ use crate::network::api::EventsResponse;
 use crate::network::api::EventsStatus;
 use crate::network::health::PreTradeStatus;
 use crate::order_book::SymbolConfig;
+use crate::store::LeaderRedirect;
 use crate::store::MatchEngineRequest;
 use crate::store::MatchEngineResponse;
 
@@ -672,7 +673,50 @@ where
         let mut forward_attempts = 0usize;
         loop {
             let addr = self.leader_addr();
-            let res: Result<Resp, Err> = match self.send_to(&addr, uri, req).await {
+            let sent = self.send_to(&addr, uri, req).await;
+            // A typed leader redirect is a routing signal, not a generic 5xx:
+            // update the leader hint and retry at that node exactly like a
+            // `ForwardToLeader` envelope. A null leader is `NoLeader`; a plain
+            // 503 (for example the min-voter guard) stays an API error.
+            let res: Result<Resp, Err> = match sent {
+                Err(ClientError::Api { status: 503, body })
+                    if serde_json::from_str::<LeaderRedirect>(&body).is_ok() =>
+                {
+                    let redirect = serde_json::from_str::<LeaderRedirect>(&body).expect("checked");
+                    if redirect.error != "not_leader" {
+                        return Err(ClientError::Api { status: 503, body });
+                    }
+                    let (Some(_leader_id), Some(leader_addr)) =
+                        (redirect.leader_id, redirect.leader_addr.clone())
+                    else {
+                        return Err(ClientError::NoLeader);
+                    };
+                    // Resolve the typed generic node id from the leader's own
+                    // `/metrics` rather than assuming u64 in this client.
+                    let Some((leader_id, leader_addr)) =
+                        self.discover_from(&leader_addr).await.ok().flatten()
+                    else {
+                        return Err(ClientError::Api { status: 503, body });
+                    };
+                    {
+                        let mut t = self.leader.lock().unwrap();
+                        *t = (leader_id.clone(), leader_addr);
+                    }
+                    if forward && forward_attempts < self.config.max_forward_retries {
+                        forward_attempts += 1;
+                        let delay = self.backoff(forward_attempts);
+                        tracing::warn!(
+                            uri,
+                            attempt = forward_attempts,
+                            timeout = ?delay,
+                            ?leader_id,
+                            "retrying request at leader from typed 503"
+                        );
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
+                    return Err(ClientError::Api { status: 503, body });
+                }
                 Ok(res) => res,
                 Err(error)
                     if error.is_retryable() && transient_attempts < self.config.max_retries =>
