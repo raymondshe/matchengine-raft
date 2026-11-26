@@ -197,6 +197,22 @@ async fn start_single(config: Config, source: BoxedSource) -> RunningService {
     start(config, vec![(spec, source)]).await.unwrap()
 }
 
+/// Wait until the session has registered its connect-time subscriptions. A
+/// subscription that is set up after the first BBO has already updated shared
+/// state emits a cached snapshot frame as well as the live frame; tests that
+/// assert on exact frame counts must not race that setup.
+async fn wait_for_streams(addr: &str, expected: u64) {
+    for _ in 0..100 {
+        let (_, body) = http_get(addr, "/metrics").await;
+        let metrics: Value = serde_json::from_str(&body).unwrap();
+        if metrics["streams"].as_u64().unwrap_or(0) >= expected {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("session did not register {expected} stream(s)");
+}
+
 async fn next_json(ws: &mut Ws) -> Value {
     let frame = tokio::time::timeout(Duration::from_secs(2), ws.next())
         .await
@@ -705,6 +721,11 @@ async fn terminal_conflates_latest_value_streams_but_fast_does_not() {
     ))
     .await
     .expect("connect");
+    wait_for_streams(&running.addr, 1).await;
+    // A subscription established after shared state has a BBO also emits a
+    // cached snapshot frame; drop it so the timed assertions below see only
+    // live frames.
+    let _ = tokio::time::timeout(Duration::from_millis(50), terminal.next()).await;
     tx.send(Ok(bbo(2))).await.unwrap();
     let first = next_json(&mut terminal).await;
     // The feed's BBO update id is market_seq + 1, matching the other tests.
