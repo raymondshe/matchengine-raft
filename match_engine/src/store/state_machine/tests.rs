@@ -1410,9 +1410,15 @@ async fn apply_amends_parked_stop_and_iceberg() {
 
     let inner = store.inner().lock().await;
     assert_eq!(1, inner.orderbook.stops.len());
-    assert_eq!(Fixed::from(96), inner.orderbook.stops[0].stop_price);
-    assert_eq!(Fixed::from(93), inner.orderbook.stops[0].price);
-    assert_eq!(Fixed::from(7), inner.orderbook.stops[0].volume);
+    let parked = inner
+        .orderbook
+        .stops
+        .values()
+        .next()
+        .expect("the stop is parked");
+    assert_eq!(Fixed::from(96), parked.stop_price);
+    assert_eq!(Fixed::from(93), parked.price);
+    assert_eq!(Fixed::from(7), parked.volume);
     let best = inner.orderbook.best_ask().expect("the iceberg rests");
     assert_eq!(Fixed::from(4), best.volume);
     assert_eq!(Fixed::from(8), best.hidden_volume);

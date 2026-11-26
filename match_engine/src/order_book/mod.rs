@@ -2,12 +2,15 @@ use serde::ser::SerializeSeq;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 
 #[cfg(test)]
 mod conformance_tests;
 pub mod fixed;
+mod indexes;
 #[cfg(test)]
 mod property_tests;
+
 pub use fixed::AssetClass;
 pub use fixed::AssetId;
 pub use fixed::FeeAsset;
@@ -18,6 +21,8 @@ pub use fixed::MIN_FEE_RATE;
 pub use fixed::StpMode;
 pub use fixed::SymbolConfig;
 pub use fixed::VolumeUnit;
+use indexes::ExpiryIndex;
+use indexes::StopIndex;
 
 /// Specifies whether an order is a buy (bid) or sell (ask) order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -559,6 +564,39 @@ pub mod vectorize {
     }
 }
 
+/// Serializes the parked stops as a sequence of orders (the same wire shape as
+/// the former `Vec<Order>`) while keeping them keyed by sequence in memory.
+mod stop_orders {
+    use super::Order;
+    use serde::Deserialize;
+    use serde::Deserializer;
+    use serde::Serializer;
+    use serde::ser::SerializeSeq;
+    use std::collections::BTreeMap;
+
+    pub fn serialize<S>(stops: &BTreeMap<u64, Order>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut sequence = serializer.serialize_seq(Some(stops.len()))?;
+        for order in stops.values() {
+            sequence.serialize_element(order)?;
+        }
+        sequence.end()
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<BTreeMap<u64, Order>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let orders = Vec::<Order>::deserialize(deserializer)?;
+        Ok(orders
+            .into_iter()
+            .map(|order| (order.sequence, order))
+            .collect())
+    }
+}
+
 /// The main order book structure containing both bids and asks.
 ///
 /// The order book maintains all active orders in two sorted collections:
@@ -580,14 +618,29 @@ pub struct OrderBook {
     pub asks: BTreeMap<AskKey, Order>,
     /// Sequence counter for assigning order sequence numbers.
     pub sequence: u64,
-    /// Parked stop orders, in admission (sequence) order. Elected stops are
-    /// removed and executed as immediate takers; they never rest.
-    #[serde(default)]
-    pub stops: Vec<Order>,
-    /// Derived count of parked trailing stops. Lets `observe_trade` skip the
-    /// whole parked-stop walk when no trailing stop exists.
+    /// Parked stop orders keyed by their (globally unique) sequence, so
+    /// admission order is the map's key order. Elected stops are removed and
+    /// executed as immediate takers; they never rest.
+    #[serde(default, with = "stop_orders")]
+    pub stops: BTreeMap<u64, Order>,
+    /// Trigger-ordered stop index plus the elected set. Derived from `stops`
+    /// and the last trade price; rebuilt on snapshot restore.
     #[serde(skip)]
-    pub trailing_stop_count: usize,
+    stop_index: StopIndex,
+    /// GTD/Day deadlines keyed by expiry, so a purge never rescans the book.
+    /// Derived from the book and `stops`; rebuilt on snapshot restore.
+    #[serde(skip)]
+    expiries: ExpiryIndex,
+    /// Keys of resting pegged orders, in the same order the two maps walk
+    /// them. Lets `reprice_pegged` skip the ladder entirely when there are no
+    /// pegs and visit only pegs on a deep book. Derived from the maps.
+    #[serde(skip)]
+    pegs: PegIndex,
+    /// Reusable sequence buffer for trailing-stop updates. A print must visit
+    /// trailing stops in trade order; keeping the buffer avoids one allocation
+    /// per print.
+    #[serde(skip)]
+    trailing_scratch: Vec<u64>,
     /// Price of the most recent trade, if there has been one. This is what
     /// elects parked stops, so it is part of the replicated state.
     #[serde(default)]
@@ -601,15 +654,6 @@ pub struct OrderBook {
     /// predictable branch per mutation and nothing else when it is off.
     #[serde(skip)]
     pub record_depth: bool,
-    /// Earliest GTD deadline among resting and parked orders, when known. The
-    /// automatic purge checks this in O(1) and only scans the book when a
-    /// deadline is actually due.
-    #[serde(skip)]
-    pub earliest_gtd_expiry: Option<u64>,
-    /// Set when a GTD order left the book; the earliest deadline is recomputed
-    /// lazily on the next mutation.
-    #[serde(skip)]
-    gtd_scan_dirty: bool,
 }
 
 /// A non-fatal fill reporting problem. These are not matching failures: the
@@ -1085,13 +1129,92 @@ pub struct DepthChange {
     pub delta_orders: i32,
 }
 
+/// Derived index of resting pegged orders.
+///
+/// Keys are held in the same order as the two ladders, so a peg pass produces
+/// exactly the same amendments and cancellations as a full scan would.
+#[derive(Clone, Debug, Default)]
+struct PegIndex {
+    bids: BTreeSet<BidKey>,
+    asks: BTreeSet<AskKey>,
+}
+
+impl PegIndex {
+    fn is_empty(&self) -> bool {
+        self.bids.is_empty() && self.asks.is_empty()
+    }
+
+    fn insert(&mut self, order: &Order) {
+        if !order.is_pegged() {
+            return;
+        }
+        match order.side {
+            OrderSide::Buy => {
+                self.bids.insert(BidKey {
+                    price: order.price,
+                    sequence: order.sequence,
+                });
+            }
+            OrderSide::Sell => {
+                self.asks.insert(AskKey {
+                    price: order.price,
+                    sequence: order.sequence,
+                });
+            }
+        }
+    }
+
+    fn remove(&mut self, order: &Order) {
+        if !order.is_pegged() {
+            return;
+        }
+        match order.side {
+            OrderSide::Buy => {
+                self.bids.remove(&BidKey {
+                    price: order.price,
+                    sequence: order.sequence,
+                });
+            }
+            OrderSide::Sell => {
+                self.asks.remove(&AskKey {
+                    price: order.price,
+                    sequence: order.sequence,
+                });
+            }
+        }
+    }
+
+    /// Moves an order that was re-inserted under a fresh sequence.
+    fn reinsert(&mut self, old: &Order, new: &Order) {
+        self.remove(old);
+        self.insert(new);
+    }
+
+    #[cfg(test)]
+    fn assert_matches(&self, bids: &BTreeMap<BidKey, Order>, asks: &BTreeMap<AskKey, Order>) {
+        let expected_bids: BTreeSet<BidKey> = bids
+            .iter()
+            .filter(|(_, order)| order.is_pegged())
+            .map(|(key, _)| *key)
+            .collect();
+        let expected_asks: BTreeSet<AskKey> = asks
+            .iter()
+            .filter(|(_, order)| order.is_pegged())
+            .map(|(key, _)| *key)
+            .collect();
+        assert_eq!(self.bids, expected_bids, "pegged bid index diverged");
+        assert_eq!(self.asks, expected_asks, "pegged ask index diverged");
+    }
+}
+
 /// Shared mutable state threaded through one sweep of a resting side.
 struct SweepContext<'a> {
     config: &'a SymbolConfig,
     record: bool,
     journal: &'a mut Vec<DepthChange>,
-    track_gtd: bool,
-    gtd_dirty: &'a mut bool,
+    expiries: &'a mut ExpiryIndex,
+    pegs: &'a mut PegIndex,
+    track_expiry: bool,
     stp_cancelled: &'a mut Vec<StpCancel>,
 }
 
@@ -1105,13 +1228,14 @@ impl OrderBook {
             bids: BTreeMap::new(),
             asks: BTreeMap::new(),
             sequence: 0,
-            stops: Vec::new(),
-            trailing_stop_count: 0,
+            stops: BTreeMap::new(),
+            stop_index: StopIndex::default(),
+            expiries: ExpiryIndex::default(),
+            pegs: PegIndex::default(),
+            trailing_scratch: Vec::new(),
             last_trade_price: None,
             depth_journal: Vec::new(),
             record_depth: false,
-            earliest_gtd_expiry: None,
-            gtd_scan_dirty: false,
         }
     }
 
@@ -1133,73 +1257,88 @@ impl OrderBook {
     /// for a buy stop. Updates are internal state (no event); only a later
     /// election publishes a trigger. Prices are positive, so zero is an
     /// unambiguous "not initialised" sentinel.
+    ///
+    /// Only the trailing index is walked, and the trigger index and elected set
+    /// are updated in place: a print never rescans fixed stops or the book.
     fn observe_trade(&mut self, price: Fixed) {
+        let previous = self.last_trade_price;
         self.last_trade_price = Some(price);
-        if self.trailing_stop_count == 0 {
-            return;
-        }
-        for stop in &mut self.stops {
-            if !stop.is_trailing_stop() {
-                continue;
-            }
-            if stop.trail_reference <= Fixed::ZERO {
-                stop.trail_reference = price;
-            } else {
-                match stop.side {
-                    OrderSide::Buy => {
-                        if price < stop.trail_reference {
-                            stop.trail_reference = price;
+        if self.stop_index.has_trailing() {
+            // Reuse the scratch buffer across prints instead of allocating a
+            // fresh sequence list for every trade.
+            let mut trailing = std::mem::take(&mut self.trailing_scratch);
+            trailing.clear();
+            trailing.extend(self.stop_index.trailing_sequences());
+            for sequence in trailing.iter().copied() {
+                let Some(stop) = self.stops.get(&sequence).copied() else {
+                    continue;
+                };
+                let old_trigger = indexes::indexed_trigger(&stop);
+                let mut updated = stop;
+                if updated.trail_reference <= Fixed::ZERO {
+                    updated.trail_reference = price;
+                } else {
+                    match updated.side {
+                        OrderSide::Buy => {
+                            if price < updated.trail_reference {
+                                updated.trail_reference = price;
+                            }
                         }
-                    }
-                    OrderSide::Sell => {
-                        if price > stop.trail_reference {
-                            stop.trail_reference = price;
+                        OrderSide::Sell => {
+                            if price > updated.trail_reference {
+                                updated.trail_reference = price;
+                            }
                         }
                     }
                 }
+                updated.stop_price = updated.trailing_trigger().unwrap_or(Fixed::ZERO);
+                self.stop_index
+                    .retrigger(&updated, old_trigger, self.last_trade_price);
+                self.stops.insert(sequence, updated);
             }
-            stop.stop_price = stop.trailing_trigger().unwrap_or(Fixed::ZERO);
+            self.trailing_scratch = trailing;
         }
-    }
-
-    /// Recomputes the earliest GTD deadline after a GTD order left the book.
-    fn refresh_earliest_gtd(&mut self) {
-        if !self.gtd_scan_dirty {
-            return;
-        }
-        self.gtd_scan_dirty = false;
-        let mut earliest: Option<u64> = None;
-        for order in self
-            .bids
-            .values()
-            .chain(self.asks.values())
-            .chain(self.stops.iter())
-        {
-            if let TimeInForce::Gtd(expiry) = order.tif {
-                earliest = Some(earliest.map_or(expiry, |current| current.min(expiry)));
-            }
-        }
-        self.earliest_gtd_expiry = earliest;
-    }
-
-    /// Note that one GTD order left the book. Only removal of the order that
-    /// currently owns the earliest deadline can invalidate the cached minimum;
-    /// later deadlines leave it intact and avoid a full-book rescan.
-    fn note_gtd_removed(&mut self, expiry: u64) {
-        if self.earliest_gtd_expiry == Some(expiry) {
-            self.gtd_scan_dirty = true;
-        }
+        // Move election membership for the price change itself. The range walk
+        // only touches triggers between the two prints.
+        self.stop_index.on_last_trade(previous, price);
     }
 
     /// Rebuilds the derived indexes after a snapshot restore.
     pub fn rebuild_derived_indexes(&mut self) {
-        self.trailing_stop_count = self
-            .stops
-            .iter()
-            .filter(|stop| stop.is_trailing_stop())
-            .count();
-        self.gtd_scan_dirty = true;
-        self.refresh_earliest_gtd();
+        self.stop_index.clear();
+        self.expiries.clear();
+        let last = self.last_trade_price;
+        for stop in self.stops.values() {
+            self.stop_index.insert(stop, last);
+        }
+        for order in self.bids.values().chain(self.asks.values()) {
+            self.expiries.insert(order, false);
+        }
+        for stop in self.stops.values() {
+            self.expiries.insert(stop, true);
+        }
+        self.pegs = PegIndex::default();
+        for order in self.bids.values().chain(self.asks.values()) {
+            self.pegs.insert(order);
+        }
+    }
+
+    /// Notes that one resting order left the book, removing it from the peg
+    /// index as well.
+    fn note_peg_removed(&mut self, order: &Order) {
+        self.pegs.remove(order);
+    }
+
+    /// Checks the derived indexes against a full recomputation. Test-only.
+    #[cfg(test)]
+    fn assert_indexes_consistent(&self) {
+        self.stop_index
+            .assert_matches(&self.stops, self.last_trade_price);
+        self.expiries.assert_matches(
+            self.bids.values().chain(self.asks.values()).copied(),
+            &self.stops,
+        );
+        self.pegs.assert_matches(&self.bids, &self.asks);
     }
 
     /// Whether any order could be evicted by the automatic GTD purge.
@@ -1208,16 +1347,16 @@ impl OrderBook {
     /// a book without GTD orders pays one predictable branch per mutation.
     #[inline]
     pub fn has_gtd_deadlines(&self) -> bool {
-        self.earliest_gtd_expiry.is_some() || self.gtd_scan_dirty
+        self.expiries.has_gtd()
     }
 
     /// Purges GTD orders due at `now_ms`, doing no book scan when the earliest
     /// deadline is still in the future.
     #[inline]
     pub fn purge_due_gtd(&mut self, now_ms: u64) -> Vec<Order> {
-        self.refresh_earliest_gtd();
         if self
-            .earliest_gtd_expiry
+            .expiries
+            .earliest_gtd()
             .is_some_and(|expiry| now_ms >= expiry)
         {
             self.purge_expired(now_ms, None)
@@ -1315,17 +1454,21 @@ impl OrderBook {
         offset: Fixed,
         side: OrderSide,
     ) -> Result<Fixed, RejectReason> {
-        let bid = self.best_non_pegged_bid();
-        let ask = self.best_non_pegged_ask();
+        // Compute only the reference this peg type actually needs: LastTrade
+        // needs neither BBO, and Primary needs one side. Both were previously
+        // walked on every peg, which is expensive when pegs cluster at the top
+        // of the ladder.
         let reference = match peg {
             PegReference::Primary => match side {
-                OrderSide::Buy => bid.map(|order| order.price),
-                OrderSide::Sell => ask.map(|order| order.price),
+                OrderSide::Buy => self.best_non_pegged_bid().map(|order| order.price),
+                OrderSide::Sell => self.best_non_pegged_ask().map(|order| order.price),
             },
-            PegReference::Midpoint => match (bid, ask) {
-                (Some(bid), Some(ask)) => bid.price.midpoint(ask.price),
-                _ => None,
-            },
+            PegReference::Midpoint => {
+                match (self.best_non_pegged_bid(), self.best_non_pegged_ask()) {
+                    (Some(bid), Some(ask)) => bid.price.midpoint(ask.price),
+                    _ => None,
+                }
+            }
             PegReference::LastTrade => self.last_trade_price,
         };
         let Some(reference) = reference else {
@@ -1352,18 +1495,13 @@ impl OrderBook {
     /// publish. `StateMachineStore::apply` calls it after every mutating
     /// request; direct `OrderBook` callers can invoke it explicitly.
     pub fn reprice_pegged(&mut self) -> Vec<PegUpdate> {
-        let bid_keys: Vec<BidKey> = self
-            .bids
-            .iter()
-            .filter(|(_, order)| order.is_pegged())
-            .map(|(key, _)| *key)
-            .collect();
-        let ask_keys: Vec<AskKey> = self
-            .asks
-            .iter()
-            .filter(|(_, order)| order.is_pegged())
-            .map(|(key, _)| *key)
-            .collect();
+        // The common book has no pegs. Skip the two full-ladder scans instead
+        // of collecting empty key lists on every mutating request.
+        if self.pegs.is_empty() {
+            return Vec::new();
+        }
+        let bid_keys: Vec<BidKey> = self.pegs.bids.iter().copied().collect();
+        let ask_keys: Vec<AskKey> = self.pegs.asks.iter().copied().collect();
 
         let mut updates = Vec::new();
         for key in bid_keys {
@@ -1400,9 +1538,8 @@ impl OrderBook {
                     OrderSide::Buy => self.bids.remove(&BidKey { price, sequence }),
                     OrderSide::Sell => self.asks.remove(&AskKey { price, sequence }),
                 };
-                if let TimeInForce::Gtd(expiry) = order.tif {
-                    self.note_gtd_removed(expiry);
-                }
+                self.expiries.remove(&order);
+                self.note_peg_removed(&order);
                 self.record_depth_change(side, order.price, -order.volume, -1);
                 updates.push(PegUpdate::Cancelled { order, reason });
                 return;
@@ -1421,6 +1558,7 @@ impl OrderBook {
             }
         }
         self.record_depth_change(side, order.price, -order.volume, -1);
+        self.expiries.remove(&order);
 
         let market_seq = self.next_market_sequence();
         let mut updated = order;
@@ -1446,6 +1584,8 @@ impl OrderBook {
                 );
             }
         }
+        self.expiries.insert(&updated, false);
+        self.pegs.reinsert(&order, &updated);
         self.record_depth_change(side, target, updated.volume, 1);
         updates.push(PegUpdate::Amended(Amendment {
             market_seq,
@@ -1468,29 +1608,10 @@ impl OrderBook {
             return depth;
         }
 
-        let orders: Box<dyn Iterator<Item = &Order>> = match side {
-            OrderSide::Buy => Box::new(self.bids.values()),
-            OrderSide::Sell => Box::new(self.asks.values()),
-        };
-
-        for order in orders {
-            let same_level = depth.last().is_some_and(|level| level.price == order.price);
-            if same_level {
-                let level = depth.last_mut().expect("checked above");
-                level.volume += order.volume;
-                level.orders += 1;
-            } else if depth.len() < levels {
-                depth.push(DepthLevel {
-                    price: order.price,
-                    volume: order.volume,
-                    orders: 1,
-                });
-            } else {
-                // A new price level beyond the requested depth ends the walk.
-                break;
-            }
+        match side {
+            OrderSide::Buy => depth_side(self.bids.values(), levels, &mut depth),
+            OrderSide::Sell => depth_side(self.asks.values(), levels, &mut depth),
         }
-
         depth
     }
 
@@ -1523,6 +1644,10 @@ impl OrderBook {
                     *order,
                 );
             }
+        }
+        self.expiries.insert(order, false);
+        if order.is_pegged() {
+            self.pegs.insert(order);
         }
     }
 
@@ -1564,10 +1689,14 @@ impl OrderBook {
     ///
     /// * `order` - The order to process (will have its sequence number set)
     pub fn execute_order(&mut self, order: &mut Order) -> Outcome {
-        self.execute_order_inner(order, SymbolConfig::default())
+        self.execute_order_inner(order, &SymbolConfig::default())
     }
 
     /// Executes an order with the configured symbol's precision configuration.
+    ///
+    /// Accepts either an owned config or a borrow, so the replicated state
+    /// machine can pass its immutable `SymbolConfig` without cloning the two
+    /// owned `AssetId.code` strings on every applied order.
     ///
     /// The configuration is authoritative at apply time: it rejects an
     /// unsupported `symbol_id` and any price/quantity with more fractional
@@ -1576,9 +1705,9 @@ impl OrderBook {
     pub fn execute_order_with_symbol(
         &mut self,
         order: &mut Order,
-        config: SymbolConfig,
+        config: impl std::borrow::Borrow<SymbolConfig>,
     ) -> Outcome {
-        self.execute_order_inner(order, config)
+        self.execute_order_inner(order, config.borrow())
     }
 
     /// Consumes the next sequence and returns a rejected outcome without
@@ -1593,7 +1722,7 @@ impl OrderBook {
         }
     }
 
-    fn execute_order_inner(&mut self, order: &mut Order, config: SymbolConfig) -> Outcome {
+    fn execute_order_inner(&mut self, order: &mut Order, config: &SymbolConfig) -> Outcome {
         order.sequence = self.next_market_sequence();
 
         let mut outcome = Outcome {
@@ -1639,7 +1768,7 @@ impl OrderBook {
             order.volume_unit = VolumeUnit::Base;
         }
         if let Some(reason) =
-            validate_order(order).or_else(|| validate_order_for_symbol(order, &config))
+            validate_order(order).or_else(|| validate_order_for_symbol(order, config))
         {
             outcome.rejected = Some(reason);
             return outcome;
@@ -1681,16 +1810,9 @@ impl OrderBook {
             {
                 outcome.rejected = Some(RejectReason::StopWouldTrigger);
             } else {
-                if let TimeInForce::Gtd(expiry) = order.tif {
-                    self.earliest_gtd_expiry = Some(
-                        self.earliest_gtd_expiry
-                            .map_or(expiry, |current| current.min(expiry)),
-                    );
-                }
-                if order.is_trailing_stop() {
-                    self.trailing_stop_count += 1;
-                }
-                self.stops.push(*order);
+                self.stops.insert(order.sequence, *order);
+                self.stop_index.insert(order, self.last_trade_price);
+                self.expiries.insert(order, true);
                 outcome.parked = true;
             }
             return outcome;
@@ -1718,7 +1840,7 @@ impl OrderBook {
             OrderType::Limit => Some(order.price),
         };
         let (fills, remainder, stp_prevented) =
-            self.sweep(order, limit, &config, &mut outcome.stp_cancelled);
+            self.sweep(order, limit, config, &mut outcome.stp_cancelled);
         outcome.fills = fills;
         if stp_prevented {
             outcome.cancel_reason = Some(RejectReason::SelfTradePrevented);
@@ -1752,7 +1874,7 @@ impl OrderBook {
         for print in &outcome.fills {
             self.observe_trade(print.maker.price);
         }
-        self.run_stops(&mut outcome, &config);
+        self.run_stops(&mut outcome, config);
 
         outcome
     }
@@ -1769,19 +1891,16 @@ impl OrderBook {
     ///
     /// The cancelled order if found, or `None` if no matching order was in the book.
     pub fn cancel(&mut self, order: &Order) -> Option<Order> {
-        // A parked stop is off the book: its sequence identifies it.
-        let parked = self
+        // A parked stop is off the book: side + sequence identifies it.
+        if let Some(stop) = self
             .stops
-            .iter()
-            .position(|stop| stop.side == order.side && stop.sequence == order.sequence);
-        if let Some(index) = parked {
-            let stop = self.stops.remove(index);
-            if stop.is_trailing_stop() {
-                self.trailing_stop_count = self.trailing_stop_count.saturating_sub(1);
-            }
-            if let TimeInForce::Gtd(expiry) = stop.tif {
-                self.note_gtd_removed(expiry);
-            }
+            .get(&order.sequence)
+            .copied()
+            .filter(|stop| stop.side == order.side)
+        {
+            self.stops.remove(&stop.sequence);
+            self.stop_index.remove(&stop);
+            self.expiries.remove(&stop);
             return Some(stop);
         }
 
@@ -1796,9 +1915,8 @@ impl OrderBook {
             }),
         };
         if let Some(cancelled) = removed {
-            if let TimeInForce::Gtd(expiry) = cancelled.tif {
-                self.note_gtd_removed(expiry);
-            }
+            self.expiries.remove(&cancelled);
+            self.note_peg_removed(&cancelled);
             self.record_depth_change(cancelled.side, cancelled.price, -cancelled.volume, -1);
         }
         removed
@@ -1872,12 +1990,12 @@ impl OrderBook {
         // fixed trigger; zero means "leave the trigger unchanged". For a
         // trailing stop the trigger is derived, so `key.trail_offset > 0`
         // carries the new offset and `key.stop_price` must stay zero.
-        if let Some(index) = self
+        if let Some(stop) = self
             .stops
-            .iter()
-            .position(|stop| stop.side == key.side && stop.sequence == key.sequence)
+            .get(&key.sequence)
+            .copied()
+            .filter(|stop| stop.side == key.side)
         {
-            let stop = self.stops[index];
             if stop.live == OrderType::Market && price.is_some() {
                 return Err(AmendError::UnsupportedType);
             }
@@ -1922,6 +2040,7 @@ impl OrderBook {
                 }
             }
 
+            let old_trigger = indexes::indexed_trigger(&stop);
             let mut updated = stop;
             updated.stop_price = new_stop_price;
             if stop.is_trailing_stop() {
@@ -1935,7 +2054,9 @@ impl OrderBook {
                 updated.price = price.unwrap_or(stop.price);
             }
             updated.volume = volume.unwrap_or(stop.volume);
-            self.stops[index] = updated;
+            self.stop_index
+                .retrigger(&updated, old_trigger, self.last_trade_price);
+            self.stops.insert(updated.sequence, updated);
 
             return Ok(Amendment {
                 market_seq,
@@ -2056,6 +2177,8 @@ impl OrderBook {
             ),
         };
         if reinserted {
+            self.expiries.reinsert(&stored, &amendment.order, false);
+            self.pegs.reinsert(&stored, &amendment.order);
             self.record_depth_change(key.side, amendment.previous_price, -previous_visible, -1);
             self.record_depth_change(key.side, amendment.order.price, amendment.order.volume, 1);
         } else if amendment.order.volume != previous_visible {
@@ -2134,11 +2257,9 @@ impl OrderBook {
                 );
             }
         }
-        if let TimeInForce::Gtd(expiry) = order.tif {
-            self.earliest_gtd_expiry = Some(
-                self.earliest_gtd_expiry
-                    .map_or(expiry, |current| current.min(expiry)),
-            );
+        self.expiries.insert(order, false);
+        if order.is_pegged() {
+            self.pegs.insert(order);
         }
         self.record_depth_change(order.side, order.price, visible, 1);
 
@@ -2164,13 +2285,12 @@ impl OrderBook {
         config: &SymbolConfig,
         stp_cancelled: &mut Vec<StpCancel>,
     ) -> (Vec<MatchResult>, Fixed, bool) {
-        // The journal is a separate field, so the resting side and the journal
-        // can be borrowed together without a second pass over the map.
+        // The journal and the expiry index are separate fields, so the resting
+        // side and both can be borrowed together without a second pass.
         let record = self.record_depth;
-        // Books without GTD orders skip the per-fill expiry check entirely.
-        let mut gtd_dirty = self.gtd_scan_dirty;
-        let track_gtd = self.has_gtd_deadlines();
-        let result = match order.side {
+        // Books without expiring orders skip the per-fill index maintenance.
+        let track_expiry = self.expiries.has_any();
+        match order.side {
             OrderSide::Buy => Self::sweep_side(
                 &mut self.asks,
                 order,
@@ -2179,8 +2299,9 @@ impl OrderBook {
                     config,
                     record,
                     journal: &mut self.depth_journal,
-                    track_gtd,
-                    gtd_dirty: &mut gtd_dirty,
+                    expiries: &mut self.expiries,
+                    pegs: &mut self.pegs,
+                    track_expiry,
                     stp_cancelled,
                 },
             ),
@@ -2192,14 +2313,13 @@ impl OrderBook {
                     config,
                     record,
                     journal: &mut self.depth_journal,
-                    track_gtd,
-                    gtd_dirty: &mut gtd_dirty,
+                    expiries: &mut self.expiries,
+                    pegs: &mut self.pegs,
+                    track_expiry,
                     stp_cancelled,
                 },
             ),
-        };
-        self.gtd_scan_dirty = gtd_dirty;
-        result
+        }
     }
 
     /// Shared sweep loop for one resting side; see [`OrderBook::sweep`].
@@ -2252,9 +2372,10 @@ impl OrderBook {
                     StpMode::Off => {}
                     StpMode::CancelResting => {
                         best.remove();
-                        if context.track_gtd && matches!(maker.tif, TimeInForce::Gtd(_)) {
-                            *context.gtd_dirty = true;
+                        if context.track_expiry {
+                            context.expiries.remove(&maker);
                         }
+                        context.pegs.remove(&maker);
                         record_depth_change(
                             context.journal,
                             context.record,
@@ -2275,9 +2396,10 @@ impl OrderBook {
                     }
                     StpMode::CancelBoth => {
                         best.remove();
-                        if context.track_gtd && matches!(maker.tif, TimeInForce::Gtd(_)) {
-                            *context.gtd_dirty = true;
+                        if context.track_expiry {
+                            context.expiries.remove(&maker);
                         }
+                        context.pegs.remove(&maker);
                         record_depth_change(
                             context.journal,
                             context.record,
@@ -2382,9 +2504,10 @@ impl OrderBook {
                 );
             } else {
                 best.remove();
-                if context.track_gtd && matches!(maker.tif, TimeInForce::Gtd(_)) {
-                    *context.gtd_dirty = true;
+                if context.track_expiry {
+                    context.expiries.remove(&maker);
                 }
+                context.pegs.remove(&maker);
                 record_depth_change(
                     context.journal,
                     context.record,
@@ -2413,30 +2536,10 @@ impl OrderBook {
             OrderType::Market => None,
             OrderType::Limit => Some(order.price),
         };
-        let mut total = Fixed::ZERO;
-        let makers: Box<dyn Iterator<Item = &Order>> = match order.side {
-            OrderSide::Buy => Box::new(self.asks.values()),
-            OrderSide::Sell => Box::new(self.bids.values()),
-        };
-        for maker in makers {
-            let crosses = match (limit, order.side) {
-                (Some(limit), OrderSide::Buy) => maker.price <= limit,
-                (Some(limit), OrderSide::Sell) => maker.price >= limit,
-                (None, _) => true,
-            };
-            if !crosses {
-                break;
-            }
-            if same_owner(order, maker) {
-                match stp {
-                    StpMode::Off => {}
-                    StpMode::CancelResting => continue,
-                    StpMode::CancelAggressor | StpMode::CancelBoth => break,
-                }
-            }
-            total = total.saturating_add(maker.open_volume());
+        match order.side {
+            OrderSide::Buy => fillable_side(self.asks.values(), limit, order.side, order, stp),
+            OrderSide::Sell => fillable_side(self.bids.values(), limit, order.side, order, stp),
         }
-        total
     }
 
     /// Whether `order` at its own price would trade against the book right now.
@@ -2460,21 +2563,17 @@ impl OrderBook {
             let Some(last_trade_price) = self.last_trade_price else {
                 return;
             };
-            let Some(index) = self
-                .stops
-                .iter()
-                .position(|stop| stop.stop_elected(last_trade_price))
-            else {
+            // The elected set is ordered by sequence, which is admission order,
+            // so the first sequence is the same stop the Vec scan used to find.
+            let Some(sequence) = self.stop_index.first_elected() else {
                 return;
             };
-
-            let stop = self.stops.remove(index);
-            if stop.is_trailing_stop() {
-                self.trailing_stop_count = self.trailing_stop_count.saturating_sub(1);
-            }
-            if let TimeInForce::Gtd(expiry) = stop.tif {
-                self.note_gtd_removed(expiry);
-            }
+            let stop = self
+                .stops
+                .remove(&sequence)
+                .expect("elected stop is parked");
+            self.stop_index.remove(&stop);
+            self.expiries.remove(&stop);
             let trigger_price = last_trade_price;
             let limit = match stop.live {
                 OrderType::Market => None,
@@ -2500,52 +2599,123 @@ impl OrderBook {
     }
 
     /// Removes every resting and parked order whose time in force has expired,
-    /// returning them in a deterministic order: bids by sequence, then asks by
-    /// sequence, then parked stops by admission.
+    /// returning them in a deterministic order: bids by book key, then asks by
+    /// book key, then parked stops by admission.
     ///
     /// `now_ms` and `day_close_ms` travel in the request and therefore through
     /// the Raft log, so every replica evicts exactly the same orders while the
     /// state machine itself never reads a clock. A `Day` order only expires when
     /// a close is supplied; `GTD` expires at or after its deadline.
+    ///
+    /// The deadline index yields only the orders that are actually due, so a
+    /// book with far-future deadlines pays two map lookups rather than a full
+    /// scan of both sides and the parked stops.
     pub fn purge_expired(&mut self, now_ms: u64, day_close_ms: Option<u64>) -> Vec<Order> {
-        let has_expired = |order: &Order| order.tif.is_expired(now_ms, day_close_ms);
-        let mut removed = Vec::new();
+        let due = self.expiries.take_due(now_ms, day_close_ms);
+        if due.is_empty() {
+            return Vec::new();
+        }
 
-        let bids: Vec<BidKey> = self.bids.keys().copied().collect();
-        for key in bids {
-            if has_expired(&self.bids[&key]) {
-                let order = self.bids.remove(&key).expect("key came from the map");
-                self.record_depth_change(OrderSide::Buy, order.price, -order.volume, -1);
-                removed.push(order);
-            }
-        }
-        let asks: Vec<AskKey> = self.asks.keys().copied().collect();
-        for key in asks {
-            if has_expired(&self.asks[&key]) {
-                let order = self.asks.remove(&key).expect("key came from the map");
-                self.record_depth_change(OrderSide::Sell, order.price, -order.volume, -1);
-                removed.push(order);
-            }
-        }
-        self.stops.retain(|stop| {
-            if has_expired(stop) {
-                removed.push(*stop);
-                false
+        let mut bids = Vec::new();
+        let mut asks = Vec::new();
+        let mut stops = Vec::new();
+        for (sequence, location) in due {
+            if location.parked {
+                if let Some(stop) = self.stops.remove(&sequence) {
+                    self.stop_index.remove(&stop);
+                    stops.push(stop);
+                }
             } else {
-                true
+                let removed = match location.side {
+                    OrderSide::Buy => self.bids.remove(&BidKey {
+                        price: location.price,
+                        sequence,
+                    }),
+                    OrderSide::Sell => self.asks.remove(&AskKey {
+                        price: location.price,
+                        sequence,
+                    }),
+                };
+                if let Some(order) = removed {
+                    self.note_peg_removed(&order);
+                    self.record_depth_change(order.side, order.price, -order.volume, -1);
+                    if location.side == OrderSide::Buy {
+                        bids.push(order);
+                    } else {
+                        asks.push(order);
+                    }
+                }
             }
-        });
-        if !removed.is_empty() {
-            self.gtd_scan_dirty = true;
-            self.trailing_stop_count = self
-                .stops
-                .iter()
-                .filter(|stop| stop.is_trailing_stop())
-                .count();
         }
 
-        removed
+        bids.sort_by_key(|order| BidKey {
+            price: order.price,
+            sequence: order.sequence,
+        });
+        asks.sort_by_key(|order| AskKey {
+            price: order.price,
+            sequence: order.sequence,
+        });
+        stops.sort_by_key(|order| order.sequence);
+        bids.append(&mut asks);
+        bids.append(&mut stops);
+        bids
     }
+}
+
+/// Accumulates visible depth from one side's orders, best price first.
+fn depth_side<'a>(
+    orders: impl Iterator<Item = &'a Order>,
+    levels: usize,
+    depth: &mut Vec<DepthLevel>,
+) {
+    for order in orders {
+        let same_level = depth.last().is_some_and(|level| level.price == order.price);
+        if same_level {
+            let level = depth.last_mut().expect("checked above");
+            level.volume += order.volume;
+            level.orders += 1;
+        } else if depth.len() < levels {
+            depth.push(DepthLevel {
+                price: order.price,
+                volume: order.volume,
+                orders: 1,
+            });
+        } else {
+            // A new price level beyond the requested depth ends the walk.
+            break;
+        }
+    }
+}
+
+/// Sums the volume a taker could execute on one side, with STP screening.
+fn fillable_side<'a>(
+    makers: impl Iterator<Item = &'a Order>,
+    limit: Option<Fixed>,
+    side: OrderSide,
+    order: &Order,
+    stp: StpMode,
+) -> Fixed {
+    let mut total = Fixed::ZERO;
+    for maker in makers {
+        let crosses = match (limit, side) {
+            (Some(limit), OrderSide::Buy) => maker.price <= limit,
+            (Some(limit), OrderSide::Sell) => maker.price >= limit,
+            (None, _) => true,
+        };
+        if !crosses {
+            break;
+        }
+        if same_owner(order, maker) {
+            match stp {
+                StpMode::Off => {}
+                StpMode::CancelResting => continue,
+                StpMode::CancelAggressor | StpMode::CancelBoth => break,
+            }
+        }
+        total = total.saturating_add(maker.open_volume());
+    }
+    total
 }
 
 /// Appends a depth change to the sweep journal when recording is enabled.

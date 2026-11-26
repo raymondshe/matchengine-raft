@@ -901,12 +901,13 @@ fn open_volume(book: &OrderBook) -> Fixed {
         .fold(Fixed::ZERO, |total, order| total + order.open_volume());
     let stops = book
         .stops
-        .iter()
+        .values()
         .fold(Fixed::ZERO, |total, order| total + order.open_volume());
     resting + stops
 }
 
 fn assert_mixed_invariants(book: &OrderBook, counters: &VolumeCounters, context: &str) {
+    book.assert_indexes_consistent();
     if let (Some(bid), Some(ask)) = (book.best_bid(), book.best_ask()) {
         assert!(bid.price < ask.price, "{context}: crossed book");
     }

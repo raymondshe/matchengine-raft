@@ -30,8 +30,11 @@ use std::time::UNIX_EPOCH;
 use futures::stream;
 use matchengine_raft::MatchEngineTypeConfig;
 use matchengine_raft::match_result::NoopSink;
+use matchengine_raft::order_book::Fixed;
 use matchengine_raft::order_book::Order;
 use matchengine_raft::order_book::OrderSide;
+use matchengine_raft::order_book::OrderType;
+use matchengine_raft::order_book::PegReference;
 use matchengine_raft::store::MatchEngineRequest;
 use matchengine_raft::store::state_machine::StateMachineStore;
 use openraft::Entry;
@@ -52,14 +55,29 @@ const MEASURED_ENTRIES: usize = 50_000;
 const BATCH_SIZE: usize = 128;
 const MEASURED_BATCHES: usize = 1_000;
 
-/// Exact allocation ceilings for `--check`. They are the measured 2026-11-10
-/// totals after inlining one response event: allocation calls may not increase,
-/// while a reduction passes.
-const REST_MAX_CALLS: usize = 158_335;
-const CANCEL_MAX_CALLS: usize = 150_000;
-const FILL_MAX_CALLS: usize = 200_000;
+/// `--peg` workload: a deep book of plain bids plus optional pegged bids at
+/// the front of the ladder. `StateMachineStore::apply` calls `reprice_pegged`
+/// after every Place, so this isolates the peg discovery scan (F1a) and the
+/// per-peg non-pegged BBO walk (F1c) without HTTP, Raft or events on the wire.
+const PEG_SETUP: usize = 5_000;
+const PEG_ENTRIES: usize = 5_000;
+const PEG_COUNT: usize = 32;
+
+/// `--trail` workload: parked trailing stops plus repeated prints. Each print
+/// updates every trailing stop; the allocation counter detects the temporary
+/// snapshot vector that `observe_trade` used to allocate per print.
+const TRAIL_COUNT: usize = 8;
+const TRAIL_ENTRIES: usize = 5_000;
+
+/// Allocation ceilings for `--check`. The four hot rows were tightened on
+/// 2026-11-26 after `SymbolConfig` stopped being cloned per applied order:
+/// measured totals are 58,335 / 50,000 / 100,000 / 152,336 and the ceilings
+/// keep a small headroom for allocator differences across hosts.
+const REST_MAX_CALLS: usize = 60_000;
+const CANCEL_MAX_CALLS: usize = 52_000;
+const FILL_MAX_CALLS: usize = 102_000;
 const BATCH_BLANK_MAX_CALLS: usize = 130_000;
-const BATCH_REST_MAX_CALLS: usize = 408_336;
+const BATCH_REST_MAX_CALLS: usize = 155_000;
 
 /// Requested bytes get a small allowance because capacity choices can change
 /// without increasing the allocation count. The batch rows include the larger
@@ -394,8 +412,179 @@ async fn batch_workload(
     Ok(())
 }
 
+async fn peg_workload(label: &str, pegs: usize) -> anyhow::Result<()> {
+    let (mut store, dir) = open_store(label)?;
+    let mut index = 1u64;
+
+    // Plain bids at 100, then an ask far enough away that peg targets at 101
+    // rest without crossing. Pegged bids therefore sit in front of the plain
+    // book in price order, which is the worst case for `best_non_pegged_*`.
+    apply_rests(&mut store, index, PEG_SETUP).await;
+    index += PEG_SETUP as u64;
+    apply_entry(
+        &mut store,
+        index,
+        EntryPayload::Normal(MatchEngineRequest::place(Order::new(
+            OrderSide::Sell,
+            200.0,
+            1.0,
+            0,
+        ))),
+    )
+    .await;
+    index += 1;
+    for _ in 0..pegs {
+        let mut order = Order::new(OrderSide::Buy, 0.0, 1.0, 0);
+        order.peg = Some(PegReference::Primary);
+        order.peg_offset = Fixed::from(1);
+        apply_entry(
+            &mut store,
+            index,
+            EntryPayload::Normal(MatchEngineRequest::place(order)),
+        )
+        .await;
+        index += 1;
+    }
+
+    {
+        let inner = store.inner().lock().await;
+        let pegged = inner
+            .orderbook
+            .bids
+            .values()
+            .chain(inner.orderbook.asks.values())
+            .filter(|order| order.is_pegged())
+            .count();
+        assert_eq!(pegs, pegged, "peg fixture must rest every pegged order");
+    }
+
+    // Each measured Place rests at 99 and triggers the post-apply peg pass.
+    reset_allocations();
+    let started = Instant::now();
+    for _ in 0..PEG_ENTRIES {
+        apply_entry(
+            &mut store,
+            index,
+            EntryPayload::Normal(MatchEngineRequest::place(Order::new(
+                OrderSide::Buy,
+                99.0,
+                1.0,
+                0,
+            ))),
+        )
+        .await;
+        index += 1;
+    }
+    let elapsed = started.elapsed();
+    let alloc = allocation_snapshot();
+    report(label, PEG_ENTRIES, elapsed, alloc, usize::MAX, usize::MAX);
+
+    std::fs::remove_dir_all(&dir).ok();
+    Ok(())
+}
+
+async fn trail_workload() -> anyhow::Result<()> {
+    let (mut store, dir) = open_store("trail")?;
+    let mut index = 1u64;
+
+    // Establish a last trade price so the trailing stops park with a trigger.
+    apply_entry(
+        &mut store,
+        index,
+        EntryPayload::Normal(MatchEngineRequest::place(Order::new(
+            OrderSide::Sell,
+            100.0,
+            1.0,
+            0,
+        ))),
+    )
+    .await;
+    index += 1;
+    apply_entry(
+        &mut store,
+        index,
+        EntryPayload::Normal(MatchEngineRequest::place({
+            let mut order = Order::new(OrderSide::Buy, 0.0, 1.0, 0);
+            order.live = OrderType::Market;
+            order
+        })),
+    )
+    .await;
+    index += 1;
+
+    for _ in 0..TRAIL_COUNT {
+        let mut order = Order::new(OrderSide::Sell, 0.0, 1.0, 0);
+        order.live = OrderType::Market;
+        order.trail_offset = Fixed::from(1);
+        apply_entry(
+            &mut store,
+            index,
+            EntryPayload::Normal(MatchEngineRequest::place(order)),
+        )
+        .await;
+        index += 1;
+    }
+    // One ask per measured print; trailing triggers stay below 101 as the
+    // reference rises, so the stops remain parked.
+    apply_entry(
+        &mut store,
+        index,
+        EntryPayload::Normal(MatchEngineRequest::place(Order::new(
+            OrderSide::Sell,
+            101.0,
+            TRAIL_ENTRIES as f64,
+            0,
+        ))),
+    )
+    .await;
+    index += 1;
+
+    reset_allocations();
+    let started = Instant::now();
+    for _ in 0..TRAIL_ENTRIES {
+        apply_entry(
+            &mut store,
+            index,
+            EntryPayload::Normal(MatchEngineRequest::place({
+                let mut order = Order::new(OrderSide::Buy, 0.0, 1.0, 0);
+                order.live = OrderType::Market;
+                order
+            })),
+        )
+        .await;
+        index += 1;
+    }
+    let elapsed = started.elapsed();
+    let alloc = allocation_snapshot();
+    report(
+        "trailing print (8 stops)",
+        TRAIL_ENTRIES,
+        elapsed,
+        alloc,
+        usize::MAX,
+        usize::MAX,
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let mode = std::env::args().nth(1);
+    match mode.as_deref() {
+        Some("--peg") => {
+            peg_workload("peg scan (0 pegs)", 0).await?;
+            peg_workload("peg scan (32 pegs)", PEG_COUNT).await?;
+            return Ok(());
+        }
+        Some("--trail") => {
+            trail_workload().await?;
+            return Ok(());
+        }
+        _ => {}
+    }
+
     let check = std::env::args().any(|arg| arg == "--check");
     CHECK_MODE.store(check, Ordering::Relaxed);
 

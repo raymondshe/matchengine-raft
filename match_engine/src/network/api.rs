@@ -756,7 +756,7 @@ where
 {
     match key {
         "orderbook_orders" => ReadState::Orders(inner.orders()),
-        "orderbook_stops" => ReadState::Orders(inner.orderbook.stops.clone()),
+        "orderbook_stops" => ReadState::Orders(inner.orderbook.stops.values().copied().collect()),
         "orderbook_depth" => ReadState::Text(depth_json(inner, 10)),
         "orderbook_spread" => ReadState::Text(
             inner

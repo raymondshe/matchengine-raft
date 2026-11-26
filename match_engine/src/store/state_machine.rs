@@ -471,7 +471,9 @@ impl<C: RaftTypeConfig> StateMachineStoreInner<C> {
         for order in &content.orders {
             self.orderbook.insert_order(order);
         }
-        self.orderbook.stops.extend(content.stops.iter().copied());
+        self.orderbook
+            .stops
+            .extend(content.stops.iter().map(|order| (order.sequence, *order)));
         // A restored state starts a new journal; the tap gets a snapshot from
         // the seeder rather than deltas that predate the restore.
         self.orderbook.take_depth_journal();
@@ -712,13 +714,18 @@ impl<C: RaftTypeConfig> StateMachineStoreInner<C> {
         Ok(())
     }
 
-    /// Resolves the configured symbol for an order, rejecting an order routed
+    /// Whether an order is routed to this process's configured symbol.
+    fn symbol_matches(&self, order: &Order) -> bool {
+        order.symbol_id == self.symbol_config.symbol_id
+    }
+
+    /// Resolves the configured symbol for an amendment, rejecting one routed
     /// to a different symbol.
-    fn configured_symbol_for(&self, order: &Order) -> Result<SymbolConfig, RejectReason> {
-        if order.symbol_id != self.symbol_config.symbol_id {
+    fn configured_symbol_for(&self, order: &Order) -> Result<&SymbolConfig, RejectReason> {
+        if !self.symbol_matches(order) {
             return Err(RejectReason::UnsupportedOrder);
         }
-        Ok(self.symbol_config.clone())
+        Ok(&self.symbol_config)
     }
 
     /// Validates the replacement values of an amendment at the configured
@@ -729,7 +736,7 @@ impl<C: RaftTypeConfig> StateMachineStoreInner<C> {
         order: &Order,
         price: Option<Fixed>,
         volume: Option<Fixed>,
-    ) -> Result<SymbolConfig, RejectReason> {
+    ) -> Result<(), RejectReason> {
         let config = self.configured_symbol_for(order)?;
         let price_ok = price.is_none_or(|value| {
             value.has_at_most_decimals(config.price_decimals)
@@ -743,7 +750,7 @@ impl<C: RaftTypeConfig> StateMachineStoreInner<C> {
                 && value.is_multiple_of(config.base_lot)
         });
         if price_ok && stop_price_ok && volume_ok {
-            Ok(config)
+            Ok(())
         } else {
             Err(RejectReason::InvalidOrder)
         }
@@ -754,7 +761,7 @@ impl<C: RaftTypeConfig> StateMachineStoreInner<C> {
         let mut content = StateMachineData {
             orders: Vec::new(),
             sequence: self.orderbook.sequence,
-            stops: self.orderbook.stops.clone(),
+            stops: self.orderbook.stops.values().copied().collect(),
             last_trade_price: self.orderbook.last_trade_price,
             symbol_config: self.symbol_config.clone(),
             symbol_locked: self.symbol_locked,
@@ -1298,9 +1305,13 @@ where
                 }
 
                 let mut o = *order;
-                let outcome = match inner.configured_symbol_for(&o) {
-                    Ok(config) => inner.orderbook.execute_order_with_symbol(&mut o, config),
-                    Err(reason) => inner.orderbook.reject_order(&mut o, reason),
+                let outcome = if inner.symbol_matches(&o) {
+                    let config = &inner.symbol_config;
+                    inner.orderbook.execute_order_with_symbol(&mut o, config)
+                } else {
+                    inner
+                        .orderbook
+                        .reject_order(&mut o, RejectReason::UnsupportedOrder)
                 };
                 if outcome.rejected.is_none() {
                     // One process serves one symbol: lock the provisioned
@@ -1429,7 +1440,7 @@ where
                         &expired,
                     ));
                 }
-                if inner.configured_symbol_for(order).is_ok() {
+                if inner.symbol_matches(order) {
                     match inner.orderbook.cancel(order) {
                         Some(cancelled) => events.push(MatchEvent::for_cancel_at(
                             log_index,

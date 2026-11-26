@@ -517,9 +517,10 @@ fn amend_parked_stop_updates_trigger_limit_and_volume() {
     assert_eq!(Fixed::from(93), amended.order.price);
     assert_eq!(Fixed::from(7), amended.order.volume);
     assert_eq!(1, book.stops.len());
-    assert_eq!(Fixed::from(96), book.stops[0].stop_price);
-    assert_eq!(Fixed::from(93), book.stops[0].price);
-    assert_eq!(Fixed::from(7), book.stops[0].volume);
+    let parked = book.stops.get(&sequence).expect("the stop is parked");
+    assert_eq!(Fixed::from(96), parked.stop_price);
+    assert_eq!(Fixed::from(93), parked.price);
+    assert_eq!(Fixed::from(7), parked.volume);
     assert!(book.bids.is_empty() && book.asks.is_empty());
 }
 
@@ -537,7 +538,7 @@ fn amend_parked_stop_rejects_an_already_crossed_trigger() {
         order.stop_price = Fixed::from(90);
     });
     assert!(book.execute_order(&mut stop).parked);
-    let original = book.stops[0];
+    let original = book.stops[&stop.sequence];
 
     let mut key = stop;
     key.stop_price = Fixed::from(96);
@@ -546,10 +547,10 @@ fn amend_parked_stop_rejects_an_already_crossed_trigger() {
         book.amend(&key, None, Some(Fixed::from(2))).unwrap_err()
     );
     assert_eq!(
-        original.stop_price, book.stops[0].stop_price,
+        original.stop_price, book.stops[&stop.sequence].stop_price,
         "a refused amend must not move the stop"
     );
-    assert_eq!(original.volume, book.stops[0].volume);
+    assert_eq!(original.volume, book.stops[&stop.sequence].volume);
 
     // Zero in the key's stop_price means "keep the trigger", so a volume-only
     // amend still succeeds.
@@ -573,7 +574,7 @@ fn amend_stop_market_rejects_a_limit_price() {
         AmendError::UnsupportedType,
         book.amend(&stop, Some(Fixed::from(94)), None).unwrap_err()
     );
-    assert_eq!(Fixed::from(5), book.stops[0].volume);
+    assert_eq!(Fixed::from(5), book.stops[&stop.sequence].volume);
 }
 
 #[test]
@@ -1110,7 +1111,11 @@ fn trailing_stop_trails_the_print_and_elects_on_a_later_trade() {
     stop.trail_offset = Fixed::from(1);
     let outcome = book.execute_order(&mut stop);
     assert!(outcome.parked);
-    let parked = book.stops.first().expect("the trailing stop is parked");
+    let parked = book
+        .stops
+        .values()
+        .next()
+        .expect("the trailing stop is parked");
     assert_eq!(Fixed::from(100), parked.trail_reference);
     assert_eq!(Fixed::from(99), parked.stop_price);
 
@@ -1121,7 +1126,7 @@ fn trailing_stop_trails_the_print_and_elects_on_a_later_trade() {
     buy.live = OrderType::Market;
     let outcome = book.execute_order(&mut buy);
     assert!(outcome.triggers.is_empty());
-    let parked = book.stops.first().expect("still parked");
+    let parked = book.stops.values().next().expect("still parked");
     assert_eq!(Fixed::from(105), parked.trail_reference);
     assert_eq!(Fixed::from(104), parked.stop_price);
 
@@ -1197,6 +1202,54 @@ fn pegged_order_reprices_against_non_pegged_liquidity() {
         Some(RejectReason::PegReferenceUnavailable),
         empty.execute_order(&mut orphan).rejected
     );
+}
+
+/// The derived peg index must track every way a pegged order leaves or moves
+/// in the ladder: cancel, a bigger-volume amend (fresh sequence) and a fill.
+#[test]
+fn peg_index_tracks_cancel_amend_and_fill() {
+    let mut book = OrderBook::new();
+    let mut bid = Order::new(OrderSide::Buy, 100.0, 5.0, 0);
+    let mut ask = Order::new(OrderSide::Sell, 105.0, 5.0, 0);
+    book.execute_order(&mut bid);
+    book.execute_order(&mut ask);
+
+    let make_peg = || {
+        let mut peg = Order::new(OrderSide::Buy, 0.0, 2.0, 0);
+        peg.peg = Some(PegReference::Primary);
+        peg.peg_offset = Fixed::from(1);
+        peg
+    };
+    let mut first = make_peg();
+    let mut second = make_peg();
+    assert_eq!(None, book.execute_order(&mut first).rejected);
+    assert_eq!(None, book.execute_order(&mut second).rejected);
+    assert_eq!(Fixed::from(101), first.price);
+    book.assert_indexes_consistent();
+
+    // Cancel removes exactly one key.
+    assert!(book.cancel(&first).is_some());
+    book.assert_indexes_consistent();
+
+    // Growing volume re-inserts under a new sequence; the index must move.
+    let amended = book
+        .amend(&second, None, Some(Fixed::from(3)))
+        .expect("peg amend");
+    assert_ne!(second.sequence, amended.order.sequence);
+    book.assert_indexes_consistent();
+    assert!(
+        book.reprice_pegged().is_empty(),
+        "no reprice on a stable book"
+    );
+
+    // A taker that consumes the remaining pegged bid removes its key.
+    let mut taker = Order::new(OrderSide::Sell, 0.0, 3.0, 0);
+    taker.live = OrderType::Market;
+    let outcome = book.execute_order(&mut taker);
+    assert_eq!(1, outcome.fills.len());
+    assert_eq!(amended.order.sequence, outcome.fills[0].maker.sequence);
+    book.assert_indexes_consistent();
+    assert!(book.reprice_pegged().is_empty());
 }
 
 #[test]
@@ -1366,4 +1419,280 @@ fn midpoint_and_last_trade_pegs_use_their_reference() {
     let outcome = book.execute_order(&mut last);
     assert_eq!(None, outcome.rejected);
     assert_eq!(Fixed::from(100), last.price);
+}
+
+/// A cascade must keep admission order even when a later stop has a trigger
+/// closer to the print: the trigger index finds candidates, but the elected
+/// set is ordered by sequence so the same stop fires first as with a Vec scan.
+#[test]
+fn stop_cascade_elects_in_admission_order_not_trigger_order() {
+    let mut book = OrderBook::new();
+    // Sell stops need bids to hit. Rest two bids, then park two sell stops
+    // before any print so both are below the first trade's price.
+    let mut high_bid = Order::new(OrderSide::Buy, 100.0, 1.0, 0);
+    let mut low_bid = Order::new(OrderSide::Buy, 99.0, 1.0, 0);
+    book.execute_order(&mut high_bid);
+    book.execute_order(&mut low_bid);
+
+    // The first stop has the *higher* trigger but the lower sequence.
+    let mut first = order_with(OrderSide::Sell, 0.0, 1.0, |order| {
+        order.live = OrderType::Market;
+        order.stop_price = Fixed::from(102);
+    });
+    let mut second = order_with(OrderSide::Sell, 0.0, 1.0, |order| {
+        order.live = OrderType::Market;
+        order.stop_price = Fixed::from(101);
+    });
+    assert!(book.execute_order(&mut first).parked);
+    assert!(book.execute_order(&mut second).parked);
+    assert!(first.sequence < second.sequence);
+    book.assert_indexes_consistent();
+
+    // An ask at 101 crosses nothing; the buy taker prints at 101 and elects
+    // both stops.
+    let mut ask = Order::new(OrderSide::Sell, 101.0, 1.0, 0);
+    book.execute_order(&mut ask);
+    let mut taker = Order::new(OrderSide::Buy, 101.0, 1.0, 0);
+    let outcome = book.execute_order(&mut taker);
+    assert_eq!(
+        Some(Fixed::from(101)),
+        outcome.fills.first().map(|f| f.maker.price)
+    );
+    assert_eq!(2, outcome.triggers.len());
+    assert_eq!(first.sequence, outcome.triggers[0].stop.sequence);
+    assert_eq!(second.sequence, outcome.triggers[1].stop.sequence);
+    assert_eq!(
+        vec![Fixed::from(100)],
+        outcome.triggers[0]
+            .fills
+            .iter()
+            .map(|fill| fill.maker.price)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        vec![Fixed::from(99)],
+        outcome.triggers[1]
+            .fills
+            .iter()
+            .map(|fill| fill.maker.price)
+            .collect::<Vec<_>>()
+    );
+    assert!(book.stops.is_empty());
+    book.assert_indexes_consistent();
+
+    // A later print must not re-elect either removed stop.
+    let mut ask = Order::new(OrderSide::Sell, 98.0, 1.0, 0);
+    book.execute_order(&mut ask);
+    let mut taker = Order::new(OrderSide::Buy, 98.0, 1.0, 0);
+    assert!(book.execute_order(&mut taker).triggers.is_empty());
+    book.assert_indexes_consistent();
+}
+
+/// The deadline index must advance when the earliest GTD order is cancelled,
+/// and a parked GTD stop must be purged like a resting one.
+#[test]
+fn gtd_expiry_index_advances_past_cancelled_and_parked_orders() {
+    let mut book = OrderBook::new();
+    let mut parked = order_with(OrderSide::Sell, 0.0, 3.0, |order| {
+        order.live = OrderType::Market;
+        order.stop_price = Fixed::from(90);
+        order.tif = TimeInForce::Gtd(1_000);
+    });
+    let mut near = order_with(OrderSide::Buy, 99.0, 3.0, |order| {
+        order.tif = TimeInForce::Gtd(1_500);
+    });
+    let mut bid = order_with(OrderSide::Buy, 100.0, 3.0, |order| {
+        order.tif = TimeInForce::Gtd(2_000);
+    });
+    let mut ask = order_with(OrderSide::Sell, 101.0, 3.0, |order| {
+        order.tif = TimeInForce::Gtd(3_000);
+    });
+    assert!(book.execute_order(&mut parked).parked);
+    book.execute_order(&mut near);
+    book.execute_order(&mut bid);
+    book.execute_order(&mut ask);
+    assert!(book.has_gtd_deadlines());
+    book.assert_indexes_consistent();
+
+    assert!(book.purge_due_gtd(999).is_empty());
+    let expired = book.purge_due_gtd(1_000);
+    assert_eq!(
+        vec![parked.sequence],
+        expired.iter().map(|o| o.sequence).collect::<Vec<_>>()
+    );
+    assert!(book.stops.is_empty());
+    book.assert_indexes_consistent();
+
+    // Removing a later deadline leaves the earliest intact.
+    assert!(book.cancel(&ask).is_some());
+    book.assert_indexes_consistent();
+    assert!(book.purge_due_gtd(1_499).is_empty());
+
+    // Cancelling the current earliest must expose the next deadline without a
+    // full-book rescan; the following purge sees only the 2_000 bid.
+    assert!(book.cancel(&near).is_some());
+    book.assert_indexes_consistent();
+    assert!(book.purge_due_gtd(1_999).is_empty());
+    let expired = book.purge_due_gtd(2_000);
+    assert_eq!(
+        vec![bid.sequence],
+        expired.iter().map(|o| o.sequence).collect::<Vec<_>>()
+    );
+    assert!(!book.has_gtd_deadlines());
+    book.assert_indexes_consistent();
+}
+
+/// Purges keep the legacy deterministic order (bids by book key, asks by book
+/// key, then parked stops by admission) even though the index is keyed by
+/// expiry. Day orders need an explicit close.
+#[test]
+fn gtd_and_day_expiry_keep_the_deterministic_output_order() {
+    let mut book = OrderBook::new();
+    let mut top_bid = order_with(OrderSide::Buy, 101.0, 1.0, |order| {
+        order.tif = TimeInForce::Gtd(1_000);
+    });
+    let mut low_bid = order_with(OrderSide::Buy, 99.0, 1.0, |order| {
+        order.tif = TimeInForce::Day;
+    });
+    let mut ask = order_with(OrderSide::Sell, 102.0, 1.0, |order| {
+        order.tif = TimeInForce::Day;
+    });
+    let mut stop = order_with(OrderSide::Sell, 0.0, 1.0, |order| {
+        order.live = OrderType::Market;
+        order.stop_price = Fixed::from(90);
+        order.tif = TimeInForce::Day;
+    });
+    book.execute_order(&mut top_bid);
+    book.execute_order(&mut low_bid);
+    book.execute_order(&mut ask);
+    assert!(book.execute_order(&mut stop).parked);
+    book.assert_indexes_consistent();
+
+    // Day orders ignore a purge with no close.
+    assert_eq!(1, book.purge_expired(2_000, None).len());
+    book.assert_indexes_consistent();
+    assert_eq!(
+        2,
+        book.bids.len() + book.stops.len(),
+        "the Day bid and stop stay"
+    );
+
+    // With a close, the Day bid and stop join the GTD ask in the legacy order:
+    // bids first (by price), then asks, then parked stops.
+    let expired = book.purge_expired(2_000, Some(2_000));
+    assert_eq!(
+        vec![low_bid.sequence, ask.sequence, stop.sequence],
+        expired.iter().map(|o| o.sequence).collect::<Vec<_>>()
+    );
+    assert!(book.bids.is_empty());
+    assert!(book.stops.is_empty());
+    assert!(!book.has_gtd_deadlines());
+    book.assert_indexes_consistent();
+}
+
+/// Fills, cancellations and re-insertions must all update the deadline index.
+#[test]
+fn gtd_index_survives_fills_amends_and_peg_repricing() {
+    let mut book = OrderBook::new();
+    let mut maker = order_with(OrderSide::Sell, 100.0, 2.0, |order| {
+        order.tif = TimeInForce::Gtd(1_000);
+    });
+    book.execute_order(&mut maker);
+    let mut taker = Order::new(OrderSide::Buy, 100.0, 2.0, 0);
+    assert_eq!(1, book.execute_order(&mut taker).fills.len());
+    assert!(
+        !book.has_gtd_deadlines(),
+        "a filled GTD must leave the index"
+    );
+    book.assert_indexes_consistent();
+
+    // A bigger-volume amend re-inserts under a new sequence; that identity is
+    // the one the deadline index must track.
+    let mut gtd = order_with(OrderSide::Buy, 98.0, 2.0, |order| {
+        order.tif = TimeInForce::Gtd(2_000);
+    });
+    book.execute_order(&mut gtd);
+    let amended = book
+        .amend(&gtd, None, Some(Fixed::from(3)))
+        .expect("same-price growth reinserts");
+    assert_ne!(gtd.sequence, amended.order.sequence);
+    book.assert_indexes_consistent();
+    assert!(book.purge_due_gtd(1_999).is_empty());
+    let expired = book.purge_due_gtd(2_000);
+    assert_eq!(
+        vec![amended.order.sequence],
+        expired.iter().map(|o| o.sequence).collect::<Vec<_>>()
+    );
+    book.assert_indexes_consistent();
+}
+
+/// Several trailing stops share the print: each reference and trigger must be
+/// updated through the trailing index, and a retrace must elect only the stops
+/// whose new trigger is actually crossed.
+#[test]
+fn trailing_stop_index_updates_every_stop_on_a_print() {
+    let mut book = OrderBook::new();
+    let mut ask = Order::new(OrderSide::Sell, 100.0, 1.0, 0);
+    book.execute_order(&mut ask);
+    let mut taker = Order::new(OrderSide::Buy, 0.0, 1.0, 0);
+    taker.live = OrderType::Market;
+    book.execute_order(&mut taker);
+    assert_eq!(Some(Fixed::from(100)), book.last_trade_price);
+
+    let mut near_trail = order_with(OrderSide::Sell, 0.0, 2.0, |order| {
+        order.live = OrderType::Market;
+        order.trail_offset = Fixed::from(1);
+    });
+    let mut far_trail = order_with(OrderSide::Sell, 0.0, 2.0, |order| {
+        order.live = OrderType::Market;
+        order.trail_offset = Fixed::from(3);
+    });
+    let mut fixed = order_with(OrderSide::Sell, 0.0, 2.0, |order| {
+        order.live = OrderType::Market;
+        order.stop_price = Fixed::from(90);
+    });
+    assert!(book.execute_order(&mut near_trail).parked);
+    assert!(book.execute_order(&mut far_trail).parked);
+    assert!(book.execute_order(&mut fixed).parked);
+    book.assert_indexes_consistent();
+
+    // A higher print lifts both sell-stop references (high-water marks); the
+    // triggers follow to 104 and 102, so neither is elected at 105.
+    let mut ask = Order::new(OrderSide::Sell, 105.0, 1.0, 0);
+    book.execute_order(&mut ask);
+    let mut taker = Order::new(OrderSide::Buy, 0.0, 1.0, 0);
+    taker.live = OrderType::Market;
+    assert!(book.execute_order(&mut taker).triggers.is_empty());
+    assert_eq!(
+        Fixed::from(104),
+        book.stops[&near_trail.sequence].stop_price
+    );
+    assert_eq!(Fixed::from(102), book.stops[&far_trail.sequence].stop_price);
+    book.assert_indexes_consistent();
+
+    // A retrace to 103 elects only the near trailing stop (trigger 104). The
+    // far trailing stop (102) and the fixed stop (90) remain parked.
+    let mut ask = Order::new(OrderSide::Sell, 103.0, 1.0, 0);
+    book.execute_order(&mut ask);
+    let mut taker = Order::new(OrderSide::Buy, 0.0, 1.0, 0);
+    taker.live = OrderType::Market;
+    let outcome = book.execute_order(&mut taker);
+    assert_eq!(1, outcome.triggers.len());
+    assert_eq!(near_trail.sequence, outcome.triggers[0].stop.sequence);
+    assert_eq!(Some(Fixed::from(2)), outcome.triggers[0].cancelled);
+    assert_eq!(Fixed::from(103), outcome.triggers[0].trigger_price);
+    assert_eq!(2, book.stops.len());
+    book.assert_indexes_consistent();
+
+    // A deeper print crosses the remaining trailing trigger but not the fixed
+    // one, and the index must still agree with the parked orders.
+    let mut ask = Order::new(OrderSide::Sell, 101.0, 1.0, 0);
+    book.execute_order(&mut ask);
+    let mut taker = Order::new(OrderSide::Buy, 0.0, 1.0, 0);
+    taker.live = OrderType::Market;
+    let outcome = book.execute_order(&mut taker);
+    assert_eq!(1, outcome.triggers.len());
+    assert_eq!(far_trail.sequence, outcome.triggers[0].stop.sequence);
+    assert_eq!(1, book.stops.len());
+    book.assert_indexes_consistent();
 }
