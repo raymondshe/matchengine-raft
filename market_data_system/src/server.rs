@@ -349,20 +349,40 @@ async fn ready(state: Data<AppState>) -> HttpResponse {
 
 #[get("/metrics")]
 async fn metrics(state: Data<AppState>) -> HttpResponse {
-    let registry = state.registry.lock().expect("registry lock");
-    let mut body = state.stats.metrics_json(&registry);
+    // Snapshot registry counters first so the guard is released before we
+    // touch per-symbol state; never nest a std lock inside another on an
+    // Actix worker.
+    let (mut body, registry_counts) = {
+        let registry = state.registry.lock().expect("registry lock");
+        let body = state.stats.metrics_json(&registry);
+        let counts = state
+            .symbols
+            .keys()
+            .map(|name| {
+                (
+                    name.clone(),
+                    registry.symbol_streams(name),
+                    registry.symbol_subscriptions(name),
+                )
+            })
+            .collect::<Vec<_>>();
+        (body, counts)
+    };
     let mut symbols = serde_json::Map::new();
-    for (name, runtime) in state.symbols.iter() {
+    for (name, streams, subscribers) in registry_counts {
+        let Some(runtime) = state.symbols.get(&name) else {
+            continue;
+        };
         let shared = runtime.shared.lock().expect("state lock");
         symbols.insert(
-            name.clone(),
+            name,
             json!({
                 "ready": shared.ready(),
                 "snapshot_seen": shared.snapshot_seen,
                 "depth_stale": shared.depth_stale,
                 "last_ts_ms": shared.last_ts_ms,
-                "streams": registry.symbol_streams(name),
-                "subscribers": registry.symbol_subscriptions(name),
+                "streams": streams,
+                "subscribers": subscribers,
             }),
         );
     }

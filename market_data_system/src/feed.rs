@@ -658,18 +658,24 @@ impl Feed {
         if message.flags & flags::RESET != 0 {
             self.broadcast_resync("reset", 0);
             // Give every depth subscriber a fresh snapshot frame.
-            let payload = {
+            // Copy the levels under the lock, then encode outside it: JSON
+            // building must not hold a std mutex that WebSocket sessions need.
+            let (bids, asks, last_update_id, last_ts_ms) = {
                 let state = self.shared.lock().expect("state lock");
-                let bids = state.depth.top(OrderSide::Buy, self.snapshot_levels);
-                let asks = state.depth.top(OrderSide::Sell, self.snapshot_levels);
-                protocol::depth_snapshot_payload(
-                    &self.symbol,
+                (
+                    state.depth.top(OrderSide::Buy, self.snapshot_levels),
+                    state.depth.top(OrderSide::Sell, self.snapshot_levels),
                     state.last_update_id,
-                    &bids,
-                    &asks,
                     state.last_ts_ms,
                 )
             };
+            let payload = protocol::depth_snapshot_payload(
+                &self.symbol,
+                last_update_id,
+                &bids,
+                &asks,
+                last_ts_ms,
+            );
             let prefix = format!("{}@", self.symbol.symbol);
             let keys: Vec<String> = self
                 .registry
@@ -774,12 +780,15 @@ impl Feed {
             {
                 continue;
             }
-            let payload = {
+            let (bids, asks) = {
                 let state = self.shared.lock().expect("state lock");
-                let bids = state.depth.top(OrderSide::Buy, levels);
-                let asks = state.depth.top(OrderSide::Sell, levels);
-                protocol::depth_partial_payload(&self.symbol, last_update_id, &bids, &asks)
+                (
+                    state.depth.top(OrderSide::Buy, levels),
+                    state.depth.top(OrderSide::Sell, levels),
+                )
             };
+            let payload =
+                protocol::depth_partial_payload(&self.symbol, last_update_id, &bids, &asks);
             self.publish_key(&key, payload);
         }
 

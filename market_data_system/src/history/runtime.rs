@@ -34,6 +34,7 @@ use super::lease::LeaseManager;
 use super::rest;
 use super::rest::RestTail;
 use super::rest::RestTailConfig;
+use super::spool::SpoolCommand;
 use super::spool::TradeSpool;
 use super::state;
 use super::tdengine::HistoryStore;
@@ -42,6 +43,7 @@ pub struct HistoryRuntime {
     pub tx: mpsc::Sender<HistoryEvent>,
     pub store: Arc<HistoryStore>,
     handle: JoinHandle<()>,
+    spool: JoinHandle<()>,
     lease: Option<LeaseManager>,
     rest: Option<JoinHandle<()>>,
     rest_stop: Option<watch::Sender<bool>>,
@@ -54,6 +56,9 @@ impl HistoryRuntime {
         // so the final state cursor is still published by the owner.
         drop(self.tx);
         let _ = self.handle.await;
+        // Dropping the writer drops its spool sender; the blocking actor then
+        // flushes and exits. Join it before releasing the Lease.
+        let _ = self.spool.await;
         if let Some(stop) = self.rest_stop {
             let _ = stop.send(true);
         }
@@ -80,7 +85,7 @@ pub async fn start(
     store.ping().await?;
     store.ensure_schema(&config, symbols).await?;
 
-    let mut spool = TradeSpool::open(&config.spool_dir, config.spool_days)?;
+    let spool = TradeSpool::open(&config.spool_dir, config.spool_days)?;
     let (tx, mut rx) = mpsc::channel::<HistoryEvent>(8_192);
     let batch_rows = config.batch_rows;
     let seal_lag_us = config.seal_lag_ms.saturating_mul(1_000);
@@ -158,12 +163,35 @@ pub async fn start(
             state.as_ref().map_or(0, |v| v.sealed_through_us),
         );
         cursors.insert(spec.symbol.clone(), cursor.unwrap_or((0, 0)));
-        let mut builder = Builder::new(
+        builders.insert(
             spec.symbol.clone(),
-            u64::from(spec.symbol_id),
-            config.seal_lag_ms,
+            Builder::new(
+                spec.symbol.clone(),
+                u64::from(spec.symbol_id),
+                config.seal_lag_ms,
+            ),
         );
-        for trade in spool.replay(&spec.symbol, cursor)? {
+    }
+
+    // Replaying a day of JSONL trades is blocking file I/O; keep it off Tokio
+    // workers and hand the opened spool back for the live blocking actor.
+    let replay_symbols: Vec<String> = symbols.iter().map(|spec| spec.symbol.clone()).collect();
+    let replay_cursors = cursors.clone();
+    let (spool, mut replayed) = tokio::task::spawn_blocking(move || {
+        let mut replayed = HashMap::new();
+        for symbol in replay_symbols {
+            let cursor = replay_cursors.get(&symbol).copied();
+            replayed.insert(symbol.clone(), spool.replay(&symbol, cursor)?);
+        }
+        Ok::<_, io::Error>((spool, replayed))
+    })
+    .await??;
+
+    for spec in symbols {
+        let builder = builders
+            .get_mut(&spec.symbol)
+            .expect("builder inserted above");
+        for trade in replayed.remove(&spec.symbol).unwrap_or_default() {
             for (interval_ms, row) in builder.on_trade(trade) {
                 pending
                     .entry((spec.symbol.clone(), interval_ms))
@@ -171,8 +199,10 @@ pub async fn start(
                     .push(row);
             }
         }
-        builders.insert(spec.symbol.clone(), builder);
     }
+
+    let (spool_tx, spool_task) = super::spool::actor(spool);
+    let task_spool = spool_tx.clone();
 
     let task_store = store.clone();
     let task_epoch = epoch.clone();
@@ -206,8 +236,11 @@ pub async fn start(
                                 && (position.0 > previous.0.saturating_add(1)
                                     || (position.0 == previous.0
                                         && position.1 > previous.1.saturating_add(1)));
-                            if let Err(error) = spool.append(&trade) {
-                                tracing::warn!(%error, %symbol, "trade spool append failed");
+                            if let Err(error) = task_spool
+                                .send(SpoolCommand::Append(trade.clone()))
+                                .await
+                            {
+                                tracing::warn!(%error, %symbol, "trade spool append dropped");
                             }
                             cursors.insert(symbol.clone(), position);
                             let ts_us = trade.ts_ms.saturating_mul(1_000);
@@ -297,13 +330,16 @@ pub async fn start(
                                 .fetch_add(1, Ordering::Relaxed);
                         }
                     }
-                    if let Err(error) = spool.sync() {
-                        tracing::warn!(%error, "trade spool fsync failed");
+                    if let Err(error) = task_spool.send(SpoolCommand::Sync).await {
+                        tracing::warn!(%error, "trade spool sync dropped");
                     }
                     let day = now_us / 86_400_000_000;
                     if day != last_prune_day {
-                        if let Err(error) = spool.prune(now_us / 1_000) {
-                            tracing::warn!(%error, "trade spool prune failed");
+                        if let Err(error) = task_spool
+                            .send(SpoolCommand::Prune(now_us / 1_000))
+                            .await
+                        {
+                            tracing::warn!(%error, "trade spool prune dropped");
                         }
                         last_prune_day = day;
                     }
@@ -351,7 +387,7 @@ pub async fn start(
                 .await;
             }
         }
-        let _ = spool.sync();
+        let _ = task_spool.send(SpoolCommand::Sync).await;
         for (symbol, builder) in &builders {
             if !task_owns
                 .get(symbol)
@@ -396,6 +432,7 @@ pub async fn start(
         tx,
         store,
         handle,
+        spool: spool_task,
         lease,
         rest,
         rest_stop,

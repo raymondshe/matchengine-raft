@@ -14,6 +14,9 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::time::Instant;
 
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+
 use super::HistoryTrade;
 use crate::config::history_table_name;
 
@@ -158,6 +161,43 @@ impl TradeSpool {
         }
         Ok(())
     }
+}
+
+/// Commands for the blocking spool actor. Sending these over a Tokio channel
+/// keeps file writes, fsync and directory pruning off Tokio workers.
+pub enum SpoolCommand {
+    Append(HistoryTrade),
+    Sync,
+    Prune(u64),
+}
+
+/// Takes ownership of an opened spool and runs it on a blocking thread. When
+/// the async writer drops the sender, the actor flushes and exits.
+pub fn actor(mut spool: TradeSpool) -> (mpsc::Sender<SpoolCommand>, JoinHandle<()>) {
+    let (tx, mut rx) = mpsc::channel::<SpoolCommand>(8_192);
+    let handle = tokio::task::spawn_blocking(move || {
+        while let Some(command) = rx.blocking_recv() {
+            match command {
+                SpoolCommand::Append(trade) => {
+                    if let Err(error) = spool.append(&trade) {
+                        tracing::warn!(%error, "trade spool append failed");
+                    }
+                }
+                SpoolCommand::Sync => {
+                    if let Err(error) = spool.sync() {
+                        tracing::warn!(%error, "trade spool fsync failed");
+                    }
+                }
+                SpoolCommand::Prune(now_ms) => {
+                    if let Err(error) = spool.prune(now_ms) {
+                        tracing::warn!(%error, "trade spool prune failed");
+                    }
+                }
+            }
+        }
+        let _ = spool.sync();
+    });
+    (tx, handle)
 }
 
 #[cfg(test)]
