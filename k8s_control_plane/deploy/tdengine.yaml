@@ -3,7 +3,8 @@
 # One dnode / one vgroup / REPLICA 1 is the documented lab profile
 # (docs/HISTORICAL_BARS.md §4.7.2). Production uses three dnodes and three
 # mnodes with REPLICA 3; this manifest is deliberately not that topology.
-# The data is on emptyDir: the lab seed is disposable, not a durable store.
+# Data is on a local-path PVC so a pod eviction (e.g. DiskPressure) does not
+# wipe the whole bar history and force every writer to rebuild its schema.
 apiVersion: v1
 kind: Service
 metadata:
@@ -478,6 +479,21 @@ data:
     enable = true
 
 ---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: tdengine-data
+  namespace: match-eu-1
+  labels:
+    matching.io/role: market-data-history
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 8Gi
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -559,7 +575,8 @@ spec:
               }).listen({ host: '0.0.0.0', port: 6041 }, () => console.log('ipv4 bridge 6041 -> 127.0.0.1:6042'));
       volumes:
         - name: data
-          emptyDir: {}
+          persistentVolumeClaim:
+            claimName: tdengine-data
         - name: adapter-config
           configMap:
             name: tdengine-adapter-config
