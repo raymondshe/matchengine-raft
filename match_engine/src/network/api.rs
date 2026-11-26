@@ -230,15 +230,14 @@ fn validate_order_symbol(order: &Order, configured: u32) -> Result<(), String> {
 /// Followers skip the check so their `/write` response still carries the
 /// forwardable Raft error; the leader that receives the forwarded request
 /// performs the guard. A stale leader view cannot make the state machine
-/// accept a wrong symbol: apply re-checks it.
-async fn guard_request_symbol(
-    app: &MatchEngineApp,
-    request: &MatchEngineRequest,
-) -> Result<(), String> {
+/// accept a wrong symbol: apply re-checks it. The configured id is read from a
+/// node-local atomic mirror updated under the state-machine lock, so the hot
+/// write path does not take that lock a second time.
+fn guard_request_symbol(app: &MatchEngineApp, request: &MatchEngineRequest) -> Result<(), String> {
     if app.raft.metrics().borrow_watched().current_leader != Some(app.id) {
         return Ok(());
     }
-    let configured = app.state_machine_store.symbol_id().await;
+    let configured = app.state_machine_store.configured_symbol_id();
     validate_request_symbol(request, configured)
 }
 
@@ -316,9 +315,7 @@ pub async fn write(
             app.admission.limit()
         )));
     };
-    guard_request_symbol(&app, &request)
-        .await
-        .map_err(actix_web::error::ErrorBadRequest)?;
+    guard_request_symbol(&app, &request).map_err(actix_web::error::ErrorBadRequest)?;
     stamp_intake_time(&mut request);
     let response = match app.raft.client_write(request).await.decompose() {
         Ok(response) => response,
@@ -358,9 +355,7 @@ pub async fn write_batch(
             app.admission.limit()
         )));
     };
-    guard_request_symbol(&app, &request)
-        .await
-        .map_err(actix_web::error::ErrorBadRequest)?;
+    guard_request_symbol(&app, &request).map_err(actix_web::error::ErrorBadRequest)?;
     stamp_intake_time(&mut request);
     let response = match app.raft.client_write(request).await.decompose() {
         Ok(response) => response,

@@ -29,6 +29,8 @@ use std::time::UNIX_EPOCH;
 
 use futures::stream;
 use matchengine_raft::MatchEngineTypeConfig;
+use matchengine_raft::market_data::MarketDataTap;
+use matchengine_raft::match_result::FileLogSink;
 use matchengine_raft::match_result::NoopSink;
 use matchengine_raft::order_book::Fixed;
 use matchengine_raft::order_book::Order;
@@ -69,15 +71,15 @@ const PEG_COUNT: usize = 32;
 const TRAIL_COUNT: usize = 8;
 const TRAIL_ENTRIES: usize = 5_000;
 
-/// Allocation ceilings for `--check`. The four hot rows were tightened on
-/// 2026-11-26 after `SymbolConfig` stopped being cloned per applied order:
-/// measured totals are 58,335 / 50,000 / 100,000 / 152,336 and the ceilings
-/// keep a small headroom for allocator differences across hosts.
-const REST_MAX_CALLS: usize = 60_000;
-const CANCEL_MAX_CALLS: usize = 52_000;
+/// Allocation ceilings for `--check`. Tightened again on 2026-11-26 after
+/// responses stopped being built for follower/replay entries and batch
+/// publishes were coalesced: measured totals are 8,335 / 0 / 100,000 / 1,000 /
+/// 27,336. The ceilings keep headroom for allocator differences across hosts.
+const REST_MAX_CALLS: usize = 10_000;
+const CANCEL_MAX_CALLS: usize = 2_000;
 const FILL_MAX_CALLS: usize = 102_000;
-const BATCH_BLANK_MAX_CALLS: usize = 130_000;
-const BATCH_REST_MAX_CALLS: usize = 155_000;
+const BATCH_BLANK_MAX_CALLS: usize = 2_000;
+const BATCH_REST_MAX_CALLS: usize = 32_000;
 
 /// Requested bytes get a small allowance because capacity choices can change
 /// without increasing the allocation count. The batch rows include the larger
@@ -233,8 +235,14 @@ async fn blank_workload() -> anyhow::Result<()> {
     }
 
     reset_allocations();
+    // Some Linux builds still initialise lazily on the first apply *after* the
+    // counter reset; absorb that in a second, uncounted warm-up.
+    for index in 65..=72 {
+        apply_entry(&mut store, index, EntryPayload::Blank).await;
+    }
+    reset_allocations();
     let started = Instant::now();
-    for index in 65..65 + MEASURED_ENTRIES as u64 {
+    for index in 73..73 + MEASURED_ENTRIES as u64 {
         apply_entry(&mut store, index, EntryPayload::Blank).await;
     }
     let elapsed = started.elapsed();
@@ -569,6 +577,165 @@ async fn trail_workload() -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn ids_workload() -> anyhow::Result<()> {
+    let (mut store, dir) = open_store("ids")?;
+    // Build payloads before the measured window so only apply-time clones count.
+    let payloads: Vec<_> = (0..MEASURED_ENTRIES)
+        .map(|i| {
+            EntryPayload::Normal(MatchEngineRequest::place_with_client_id(
+                Order::new(OrderSide::Buy, 100.0, 1.0, 0),
+                format!("bench-{i}"),
+            ))
+        })
+        .collect();
+
+    reset_allocations();
+    let started = Instant::now();
+    for (offset, payload) in payloads.into_iter().enumerate() {
+        apply_entry(&mut store, 1 + offset as u64, payload).await;
+    }
+    let elapsed = started.elapsed();
+    let alloc = allocation_snapshot();
+    report(
+        "rest with client_order_id",
+        MEASURED_ENTRIES,
+        elapsed,
+        alloc,
+        usize::MAX,
+        usize::MAX,
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+    Ok(())
+}
+
+async fn batch_peg_workload() -> anyhow::Result<()> {
+    let (mut store, dir) = open_store("batch-peg")?;
+    let mut index = 1u64;
+    apply_rests(&mut store, index, PEG_SETUP).await;
+    index += PEG_SETUP as u64;
+    apply_entry(
+        &mut store,
+        index,
+        EntryPayload::Normal(MatchEngineRequest::place(Order::new(
+            OrderSide::Sell,
+            200.0,
+            1.0,
+            0,
+        ))),
+    )
+    .await;
+    index += 1;
+    for _ in 0..PEG_COUNT {
+        let mut order = Order::new(OrderSide::Buy, 0.0, 1.0, 0);
+        order.peg = Some(PegReference::Primary);
+        order.peg_offset = Fixed::from(1);
+        apply_entry(
+            &mut store,
+            index,
+            EntryPayload::Normal(MatchEngineRequest::place(order)),
+        )
+        .await;
+        index += 1;
+    }
+
+    let template = batch_requests(BATCH_SIZE, true);
+    reset_allocations();
+    let started = Instant::now();
+    for _ in 0..MEASURED_BATCHES {
+        let batch = MatchEngineRequest::Batch {
+            requests: template.clone(),
+        };
+        apply_entry(&mut store, index, EntryPayload::Normal(batch)).await;
+        index += 1;
+    }
+    let elapsed = started.elapsed();
+    let alloc = allocation_snapshot();
+    report(
+        "batch rest with 32 pegs",
+        MEASURED_BATCHES * BATCH_SIZE,
+        elapsed,
+        alloc,
+        usize::MAX,
+        usize::MAX,
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+    Ok(())
+}
+
+async fn sink_workload() -> anyhow::Result<()> {
+    let dir = tempdir("sink");
+    let sink = Arc::new(FileLogSink::open(dir.join("events.jsonl"))?);
+    let mut store =
+        StateMachineStore::<C>::open_with_sinks_and_retention(&dir, sink, None, ENTRY_WINDOW)?;
+    apply_rests(&mut store, 1, ENTRY_WINDOW).await;
+    let first = ENTRY_WINDOW as u64 + 1;
+    let template = batch_requests(BATCH_SIZE, true);
+
+    reset_allocations();
+    let started = Instant::now();
+    for index in first..first + MEASURED_BATCHES as u64 {
+        let batch = MatchEngineRequest::Batch {
+            requests: template.clone(),
+        };
+        apply_entry(&mut store, index, EntryPayload::Normal(batch)).await;
+    }
+    let elapsed = started.elapsed();
+    let alloc = allocation_snapshot();
+    report(
+        "batch rest + file sink",
+        MEASURED_BATCHES * BATCH_SIZE,
+        elapsed,
+        alloc,
+        usize::MAX,
+        usize::MAX,
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+    Ok(())
+}
+
+async fn tap_workload() -> anyhow::Result<()> {
+    let dir = tempdir("tap");
+    let (tap, _channels) = MarketDataTap::channel(8_192);
+    let mut store = StateMachineStore::<C>::open_with_sinks_and_retention(
+        &dir,
+        Arc::new(NoopSink),
+        Some(tap),
+        ENTRY_WINDOW,
+    )?;
+
+    reset_allocations();
+    let started = Instant::now();
+    for index in 1..=MEASURED_ENTRIES as u64 {
+        apply_entry(
+            &mut store,
+            index,
+            EntryPayload::Normal(MatchEngineRequest::place(Order::new(
+                OrderSide::Buy,
+                100.0,
+                1.0,
+                0,
+            ))),
+        )
+        .await;
+    }
+    let elapsed = started.elapsed();
+    let alloc = allocation_snapshot();
+    report(
+        "rest with market-data tap",
+        MEASURED_ENTRIES,
+        elapsed,
+        alloc,
+        usize::MAX,
+        usize::MAX,
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let mode = std::env::args().nth(1);
@@ -580,6 +747,22 @@ async fn main() -> anyhow::Result<()> {
         }
         Some("--trail") => {
             trail_workload().await?;
+            return Ok(());
+        }
+        Some("--sink") => {
+            sink_workload().await?;
+            return Ok(());
+        }
+        Some("--tap") => {
+            tap_workload().await?;
+            return Ok(());
+        }
+        Some("--ids") => {
+            ids_workload().await?;
+            return Ok(());
+        }
+        Some("--batch-peg") => {
+            batch_peg_workload().await?;
             return Ok(());
         }
         _ => {}

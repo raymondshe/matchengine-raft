@@ -1620,6 +1620,78 @@ async fn apply_publishes_market_data_frames_and_captures_snapshots() {
     assert_eq!(0, status["dropped_frames"]);
 }
 
+/// A batch produces one sink publish but one tap frame per sub-request. Each
+/// frame must carry only its own events and depth changes now that the event
+/// copy happens after the state-machine lock is released.
+#[tokio::test]
+async fn batch_publishes_one_market_frame_per_sub_request() {
+    use crate::market_data::Ingest;
+    use crate::market_data::MarketDataTap;
+    use crate::match_result::MatchEventKind;
+    use crate::match_result::NoopSink;
+    use crate::order_book::Order;
+    use crate::order_book::OrderSide;
+    use openraft::alias::EntryOf;
+
+    fn entry(
+        index: u64,
+        payload: EntryPayloadOf<MatchEngineTypeConfig>,
+    ) -> EntryOf<MatchEngineTypeConfig> {
+        Entry {
+            log_id: log_id(1, index),
+            payload,
+        }
+    }
+
+    async fn next_frame(
+        receiver: &mut tokio::sync::mpsc::Receiver<Ingest>,
+    ) -> crate::market_data::TapFrame {
+        match receiver.recv().await {
+            Some(Ingest::Frame(frame)) => frame,
+            other => panic!("expected a frame, got {other:?}"),
+        }
+    }
+
+    let dir = tempdir();
+    let (tap, mut channels) = MarketDataTap::channel(16);
+    let mut store = StateMachineStore::<MatchEngineTypeConfig>::open_with_sinks(
+        dir.path(),
+        Arc::new(NoopSink),
+        Some(tap),
+    )
+    .unwrap();
+
+    let requests: Vec<_> = (0..3u64)
+        .map(|i| {
+            let mut bid = Order::new(OrderSide::Buy, 100.0 - i as f64, 2.0, 0);
+            bid.timestamp = 1_000 + i;
+            MatchEngineRequest::place(bid)
+        })
+        .collect();
+    let entries = futures::stream::iter(vec![Ok((
+        entry(
+            7,
+            EntryPayload::Normal(MatchEngineRequest::Batch { requests }),
+        ),
+        None,
+    ))]);
+    store.apply(entries).await.unwrap();
+
+    for i in 0..3u64 {
+        let frame = next_frame(&mut channels.receiver).await;
+        assert_eq!(7, frame.log_index);
+        assert_eq!(i, frame.market_seq);
+        assert_eq!(1_000 + i, frame.ts_ms);
+        assert_eq!(1, frame.events.len());
+        assert_eq!(MatchEventKind::Rested, frame.events[0].kind);
+        assert_eq!(1, frame.depth.len());
+    }
+    assert!(
+        channels.receiver.try_recv().is_err(),
+        "exactly three frames"
+    );
+}
+
 /// A takeover snapshots and enqueues first, and only then opens the tap
 /// gate; a follower's frames never queue ahead of the reset.
 #[tokio::test]
@@ -2052,6 +2124,52 @@ async fn apply_wakes_event_waiters_only_when_events_are_appended() {
         .unwrap();
     assert!(!changed.has_changed().unwrap());
     assert_eq!(watermark, *changed.borrow_and_update());
+}
+
+/// The lock-free symbol mirror used by the HTTP leader guard follows both a
+/// replicated `ConfigureSymbol` and a snapshot restore.
+#[tokio::test]
+async fn configured_symbol_id_mirror_follows_apply_and_restore() {
+    use crate::match_result::MemorySink;
+    use crate::order_book::SymbolConfig;
+    use openraft::alias::EntryOf;
+
+    fn entry(
+        index: u64,
+        payload: EntryPayloadOf<MatchEngineTypeConfig>,
+    ) -> EntryOf<MatchEngineTypeConfig> {
+        Entry {
+            log_id: log_id(1, index),
+            payload,
+        }
+    }
+
+    let dir = tempdir();
+    let mut store = StateMachineStore::<MatchEngineTypeConfig>::open_with_sink(
+        dir.path(),
+        Arc::new(MemorySink::new()),
+    )
+    .unwrap();
+    assert_eq!(0, store.configured_symbol_id());
+
+    let config = SymbolConfig::new(7, 8, 8).unwrap();
+    let entries = futures::stream::iter(vec![Ok((
+        entry(
+            1,
+            EntryPayload::Normal(MatchEngineRequest::ConfigureSymbol { config }),
+        ),
+        None,
+    ))]);
+    store.apply(entries).await.unwrap();
+    assert_eq!(7, store.configured_symbol_id());
+
+    store.persist_snapshot().await.unwrap();
+    let reopened = StateMachineStore::<MatchEngineTypeConfig>::open_with_sink(
+        dir.path(),
+        Arc::new(MemorySink::new()),
+    )
+    .unwrap();
+    assert_eq!(7, reopened.configured_symbol_id());
 }
 
 /// STP maker cancellations are interleaved with fills, and pegged orders are

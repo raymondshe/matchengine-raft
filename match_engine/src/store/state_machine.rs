@@ -15,6 +15,8 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::OnceLock;
+use std::sync::atomic::AtomicU32;
+use std::sync::atomic::Ordering;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
@@ -304,7 +306,7 @@ impl From<StoredMatchEvent> for MatchEvent {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct SubmissionRecord {
     /// The client-supplied idempotency key.
-    pub client_order_id: String,
+    pub client_order_id: Arc<str>,
     /// Sequence assigned to the original placement.
     pub order_sequence: u64,
     /// Log index of the original placement, used to recover its events.
@@ -413,10 +415,10 @@ pub struct StateMachineStoreInner<C: RaftTypeConfig> {
     events_evicted: u64,
 
     /// Client-order-id dedupe lookup.
-    submissions: BTreeMap<String, SubmissionRecord>,
+    submissions: BTreeMap<Arc<str>, Arc<SubmissionRecord>>,
 
     /// Submission lookup order, used to evict the oldest ids first.
-    submission_order: VecDeque<SubmissionRecord>,
+    submission_order: VecDeque<Arc<SubmissionRecord>>,
 
     /// Client-order-id records evicted from the map.
     submissions_evicted: u64,
@@ -426,6 +428,10 @@ pub struct StateMachineStoreInner<C: RaftTypeConfig> {
 
     /// Maximum number of retained client-order-id records.
     max_submissions: usize,
+
+    /// Node-local mirror of the configured symbol id. Updated under this lock
+    /// so the HTTP edge can guard requests without acquiring it.
+    pub(crate) symbol_id_mirror: Arc<AtomicU32>,
 }
 
 impl<C: RaftTypeConfig> Default for StateMachineStoreInner<C> {
@@ -445,6 +451,7 @@ impl<C: RaftTypeConfig> Default for StateMachineStoreInner<C> {
             submissions_evicted: 0,
             max_events: DEFAULT_MAX_EVENTS,
             max_submissions: MAX_SUBMISSIONS,
+            symbol_id_mirror: Arc::new(AtomicU32::new(SymbolConfig::default().symbol_id)),
         }
     }
 }
@@ -466,6 +473,8 @@ impl<C: RaftTypeConfig> StateMachineStoreInner<C> {
         self.orderbook.last_trade_price = content.last_trade_price;
 
         self.symbol_config = content.symbol_config;
+        self.symbol_id_mirror
+            .store(self.symbol_config.symbol_id, Ordering::Release);
         self.symbol_locked = content.symbol_locked;
 
         for order in &content.orders {
@@ -484,8 +493,9 @@ impl<C: RaftTypeConfig> StateMachineStoreInner<C> {
         self.submissions.clear();
         self.submission_order.clear();
         for record in content.submissions {
+            let record = Arc::new(record);
             self.submissions
-                .insert(record.client_order_id.clone(), record.clone());
+                .insert(Arc::clone(&record.client_order_id), Arc::clone(&record));
             self.submission_order.push_back(record);
         }
         self.submissions_evicted = content.submissions_evicted;
@@ -533,20 +543,21 @@ impl<C: RaftTypeConfig> StateMachineStoreInner<C> {
     /// Records a successful (or rejected) `Place` for idempotent retries.
     fn record_submission(
         &mut self,
-        client_order_id: String,
+        client_order_id: &str,
         order_sequence: u64,
         log_index: u64,
         first_ordinal: u32,
         event_count: u32,
     ) {
-        let record = SubmissionRecord {
-            client_order_id: client_order_id.clone(),
+        let key: Arc<str> = Arc::from(client_order_id);
+        let record = Arc::new(SubmissionRecord {
+            client_order_id: Arc::clone(&key),
             order_sequence,
             log_index,
             event_count,
             first_ordinal: Some(first_ordinal),
-        };
-        self.submissions.insert(client_order_id, record.clone());
+        });
+        self.submissions.insert(key, Arc::clone(&record));
         self.submission_order.push_back(record);
         self.trim_submissions();
     }
@@ -708,6 +719,8 @@ impl<C: RaftTypeConfig> StateMachineStoreInner<C> {
             return Err("cannot change the symbol configuration while orders are open".to_string());
         }
         self.symbol_config = config;
+        self.symbol_id_mirror
+            .store(self.symbol_config.symbol_id, Ordering::Release);
         // A later stop must not compare against a print admitted under the
         // previous symbol or precision.
         self.orderbook.last_trade_price = None;
@@ -772,15 +785,21 @@ impl<C: RaftTypeConfig> StateMachineStoreInner<C> {
                 .map(StoredMatchEvent::from)
                 .collect(),
             events_evicted: self.events_evicted,
-            submissions: self.submission_order.iter().cloned().collect(),
+            submissions: self
+                .submission_order
+                .iter()
+                .map(|record| record.as_ref().clone())
+                .collect(),
             submissions_evicted: self.submissions_evicted,
         };
 
-        let mut bids: Vec<Order> = self.orderbook.bids.values().cloned().collect();
-        let mut asks: Vec<Order> = self.orderbook.asks.values().cloned().collect();
-
-        content.orders.append(&mut bids);
-        content.orders.append(&mut asks);
+        // One reserved allocation instead of two temporary Vecs plus their
+        // append churn; this runs under the state-machine lock on snapshot.
+        content
+            .orders
+            .reserve(self.orderbook.bids.len() + self.orderbook.asks.len());
+        content.orders.extend(self.orderbook.bids.values().copied());
+        content.orders.extend(self.orderbook.asks.values().copied());
         content
     }
 }
@@ -802,15 +821,49 @@ pub struct StateMachineStore<C: RaftTypeConfig> {
     /// Last retained event id, updated after every apply that appended events.
     /// Node-local wakeup for long-poll readers; never part of snapshots.
     events_changed: watch::Sender<Option<EventId>>,
+    /// Lock-free view of the configured symbol for the HTTP leader guard.
+    symbol_id_mirror: Arc<AtomicU32>,
 }
 
-/// A sink/tap publication produced while applying one entry.
+/// Metadata captured under the state-machine lock for one market-data frame.
 ///
-/// It is collected under the state-machine lock and published after the guard
-/// is dropped, so a slow sink cannot extend the lock hold time.
-struct PendingPublish {
+/// The event slice is recorded as an offset into the entry's combined event
+/// buffer; the actual `Vec<MatchEvent>` copy happens after the lock is dropped.
+struct MarketFrameMeta {
+    log_index: u64,
+    market_seq: u64,
+    ts_ms: u64,
+    symbol_id: u32,
+    depth: Vec<crate::order_book::DepthChange>,
+    offset: usize,
+    len: usize,
+}
+
+/// All sink and tap work for one applied entry, collected under the lock and
+/// published after the guard is dropped. Sub-request events are appended in
+/// log order and published with one sink call; each market frame keeps its own
+/// slice so frames still carry exactly their sub-request's events.
+struct PendingPublishes {
     events: EventBuffer,
-    market: Option<(MarketDataTap, TapFrame)>,
+    market: SmallVec<[(MarketDataTap, MarketFrameMeta); 1]>,
+}
+
+impl PendingPublishes {
+    fn new() -> Self {
+        Self {
+            events: EventBuffer::new(),
+            market: SmallVec::new(),
+        }
+    }
+
+    fn push(&mut self, events: EventBuffer, market: Option<(MarketDataTap, MarketFrameMeta)>) {
+        if let Some((tap, mut meta)) = market {
+            meta.offset = self.events.len();
+            meta.len = events.len();
+            self.market.push((tap, meta));
+        }
+        self.events.extend(events);
+    }
 }
 
 /// Inline event buffer for the common 1–8 event entry.
@@ -874,8 +927,6 @@ fn append_fills_and_stp(
 }
 
 /// Inline publish list for the common single-request entry.
-type PendingPublishes = SmallVec<[PendingPublish; 1]>;
-
 impl<C: RaftTypeConfig> Clone for StateMachineStore<C> {
     fn clone(&self) -> Self {
         Self {
@@ -884,6 +935,7 @@ impl<C: RaftTypeConfig> Clone for StateMachineStore<C> {
             sink: self.sink.clone(),
             market_data_control: self.market_data_control.clone(),
             events_changed: self.events_changed.clone(),
+            symbol_id_mirror: self.symbol_id_mirror.clone(),
         }
     }
 }
@@ -974,12 +1026,14 @@ impl<C: RaftTypeConfig> StateMachineStore<C> {
 
         let (events_changed, _) = watch::channel(inner.last_event_id());
 
+        let symbol_id_mirror = Arc::clone(&inner.symbol_id_mirror);
         Ok(Self {
             inner: Arc::new(Mutex::new(inner)),
             dir: Arc::new(dir),
             sink,
             market_data_control: Arc::new(OnceLock::new()),
             events_changed,
+            symbol_id_mirror,
         })
     }
 
@@ -1008,6 +1062,12 @@ impl<C: RaftTypeConfig> StateMachineStore<C> {
 
     pub fn inner(&self) -> &Arc<Mutex<StateMachineStoreInner<C>>> {
         &self.inner
+    }
+
+    /// Configured symbol id for the leader-side HTTP guard, without taking the
+    /// state-machine lock. Apply remains authoritative and re-checks the symbol.
+    pub fn configured_symbol_id(&self) -> u32 {
+        self.symbol_id_mirror.load(Ordering::Acquire)
     }
 
     /// Subscribes to retained-event-window changes for long-poll readers.
@@ -1097,13 +1157,14 @@ impl<C: RaftTypeConfig> StateMachineStore<C> {
         }
     }
 
-    /// Builds the market-data frame for one applied entry while the
+    /// Captures market-data metadata for one applied entry while the
     /// state-machine lock is held.
     ///
-    /// The frame is sent by [`Self::publish_pending`] after the lock is
-    /// released. A closed publishing gate drains the depth journal but skips the
-    /// event clone, so followers and deposed leaders do not pay for a frame the
-    /// tap would drop.
+    /// Only the depth journal is moved here. The event vector is copied by
+    /// [`Self::publish_pending`] after the lock is released, so a slow tap can
+    /// never extend the lock hold time. A closed publishing gate still drains
+    /// the depth journal but records no frame, so followers and deposed leaders
+    /// do not pay for a frame the tap would drop.
     fn take_market_frame(
         &self,
         inner: &mut StateMachineStoreInner<C>,
@@ -1112,7 +1173,7 @@ impl<C: RaftTypeConfig> StateMachineStore<C> {
         ts_ms: u64,
         symbol_id: u32,
         events: &[MatchEvent],
-    ) -> Option<(MarketDataTap, TapFrame)> {
+    ) -> Option<(MarketDataTap, MarketFrameMeta)> {
         let tap = inner.market_data.clone()?;
         let depth = inner.orderbook.take_depth_journal();
         if !tap.is_enabled() {
@@ -1123,25 +1184,45 @@ impl<C: RaftTypeConfig> StateMachineStore<C> {
         }
         Some((
             tap,
-            TapFrame {
+            MarketFrameMeta {
                 log_index,
                 market_seq,
                 ts_ms,
                 symbol_id,
-                events: events.to_vec(),
                 depth,
+                offset: 0,
+                len: 0,
             },
         ))
     }
 
     /// Publishes one entry's sink and tap work after the state-machine lock is
-    /// released. Ordering matches the order the entries were applied in.
-    async fn publish_pending(&self, pending: impl IntoIterator<Item = PendingPublish>) {
-        for publish in pending {
-            self.publish_match_events(publish.events).await;
-            if let Some((tap, frame)) = publish.market {
-                tap.publish(frame);
-            }
+    /// released. One sink call covers the entry in log order, then each tap
+    /// frame is sent with its own event slice.
+    async fn publish_pending(&self, mut pending: PendingPublishes) {
+        let mut frames = Vec::with_capacity(pending.market.len());
+        for (tap, meta) in pending.market.drain(..) {
+            let end = meta.offset.saturating_add(meta.len);
+            let events = pending
+                .events
+                .get(meta.offset..end)
+                .unwrap_or_default()
+                .to_vec();
+            frames.push((
+                tap,
+                TapFrame {
+                    log_index: meta.log_index,
+                    market_seq: meta.market_seq,
+                    ts_ms: meta.ts_ms,
+                    symbol_id: meta.symbol_id,
+                    events,
+                    depth: meta.depth,
+                },
+            ));
+        }
+        self.publish_match_events(pending.events).await;
+        for (tap, frame) in frames {
+            tap.publish(frame);
         }
     }
 }
@@ -1282,9 +1363,27 @@ impl<C> StateMachineStore<C>
 where
     C: RaftTypeConfig<D = MatchEngineRequest, R = MatchEngineResponse>,
 {
+    /// Builds a response only when openraft supplied a responder. Follower
+    /// applies and WAL replay have `None` and discard the response unread, so
+    /// allocating a sequence string and up to 512 copied events for them is
+    /// pure waste on the hot apply path.
+    fn response_or_none(
+        respond: bool,
+        build: impl FnOnce() -> MatchEngineResponse,
+    ) -> MatchEngineResponse {
+        if respond {
+            build()
+        } else {
+            MatchEngineResponse::none()
+        }
+    }
+
     /// Applies one non-batch request and returns its response plus the number
     /// of events it produced. Batch callers use the count to keep ordinals
     /// continuous across sub-requests in the same Raft entry.
+    ///
+    /// `respond` is false for follower applies and log replay: the state change
+    /// and event count still happen, but no client response is constructed.
     fn apply_one(
         &self,
         inner: &mut StateMachineStoreInner<C>,
@@ -1292,6 +1391,7 @@ where
         log_index: u64,
         first_ordinal: u32,
         publishes: &mut PendingPublishes,
+        respond: bool,
     ) -> (MatchEngineResponse, usize) {
         match request {
             MatchEngineRequest::Place {
@@ -1299,9 +1399,12 @@ where
                 client_order_id,
             } => {
                 if let Some(client_order_id) = client_order_id
-                    && let Some(record) = inner.submissions.get(client_order_id).cloned()
+                    && let Some(record) = inner.submissions.get(client_order_id.as_str()).cloned()
                 {
-                    return (inner.duplicate_response(&record), 0);
+                    return (
+                        Self::response_or_none(respond, || inner.duplicate_response(&record)),
+                        0,
+                    );
                 }
 
                 let mut o = *order;
@@ -1403,7 +1506,7 @@ where
                 inner.record_events(&events);
                 if let Some(client_order_id) = client_order_id {
                     inner.record_submission(
-                        client_order_id.clone(),
+                        client_order_id.as_str(),
                         o.sequence,
                         log_index,
                         first_ordinal,
@@ -1419,9 +1522,11 @@ where
                     &events,
                 );
                 let count = events.len();
-                let response = MatchEngineResponse::applied(o.sequence, &events);
+                let response = Self::response_or_none(respond, || {
+                    MatchEngineResponse::applied(o.sequence, &events)
+                });
                 if !events.is_empty() || market.is_some() {
-                    publishes.push(PendingPublish { events, market });
+                    publishes.push(events, market);
                 }
                 (response, count)
             }
@@ -1477,9 +1582,11 @@ where
                     &events,
                 );
                 let count = events.len();
-                let response = MatchEngineResponse::applied(market_seq, &events);
+                let response = Self::response_or_none(respond, || {
+                    MatchEngineResponse::applied(market_seq, &events)
+                });
                 if !events.is_empty() || market.is_some() {
-                    publishes.push(PendingPublish { events, market });
+                    publishes.push(events, market);
                 }
                 (response, count)
             }
@@ -1541,9 +1648,11 @@ where
                     &events,
                 );
                 let count = events.len();
-                let response = MatchEngineResponse::applied(market_seq, &events);
+                let response = Self::response_or_none(respond, || {
+                    MatchEngineResponse::applied(market_seq, &events)
+                });
                 if !events.is_empty() || market.is_some() {
-                    publishes.push(PendingPublish { events, market });
+                    publishes.push(events, market);
                 }
                 (response, count)
             }
@@ -1571,23 +1680,35 @@ where
                 let market = self
                     .take_market_frame(inner, log_index, market_seq, *now_ms, symbol_id, &events);
                 let count = events.len();
-                let response = MatchEngineResponse::applied(market_seq, &events);
+                let response = Self::response_or_none(respond, || {
+                    MatchEngineResponse::applied(market_seq, &events)
+                });
                 if !events.is_empty() || market.is_some() {
-                    publishes.push(PendingPublish { events, market });
+                    publishes.push(events, market);
                 }
                 (response, count)
             }
             MatchEngineRequest::ConfigureSymbol { config } => {
                 match self.configure_symbol_locked(inner, config.clone()) {
                     Ok(()) => (
-                        MatchEngineResponse::new(format!("symbol {} configured", config.symbol_id)),
+                        Self::response_or_none(respond, || {
+                            MatchEngineResponse::new(format!(
+                                "symbol {} configured",
+                                config.symbol_id
+                            ))
+                        }),
                         0,
                     ),
-                    Err(error) => (MatchEngineResponse::error(error), 0),
+                    Err(error) => (
+                        Self::response_or_none(respond, || MatchEngineResponse::error(error)),
+                        0,
+                    ),
                 }
             }
             MatchEngineRequest::Batch { .. } => (
-                MatchEngineResponse::error("nested batches are not supported"),
+                Self::response_or_none(respond, || {
+                    MatchEngineResponse::error("nested batches are not supported")
+                }),
                 0,
             ),
         }
@@ -1622,24 +1743,10 @@ where
     {
         while let Some((entry, responder)) = entries.try_next().await? {
             tracing::debug!(log_id = %entry.log_id, "replicate to sm");
-
-            let mut publishes = match &entry.payload {
-                EntryPayload::Normal(MatchEngineRequest::Batch { requests }) => {
-                    // Reserve once when the batch is expected to publish. An
-                    // all-PurgeExpired batch usually produces no events; avoid
-                    // reserving a large publish list for it.
-                    let capacity = if requests
-                        .iter()
-                        .any(|request| !matches!(request, MatchEngineRequest::PurgeExpired { .. }))
-                    {
-                        requests.len()
-                    } else {
-                        0
-                    };
-                    PendingPublishes::with_capacity(capacity)
-                }
-                _ => PendingPublishes::new(),
-            };
+            // Follower applies and log replay have no responder: their response
+            // is discarded, so do not build one under the state-machine lock.
+            let respond = responder.is_some();
+            let mut publishes = PendingPublishes::new();
             let (response, last_event) = {
                 // Lock per entry, not for the whole Apply range: reads and
                 // snapshot capture can interleave between entries, and the log
@@ -1653,7 +1760,11 @@ where
                 let response = match &entry.payload {
                     EntryPayload::Blank => MatchEngineResponse::none(),
                     EntryPayload::Normal(MatchEngineRequest::Batch { requests }) => {
-                        let mut responses = Vec::with_capacity(requests.len());
+                        let mut responses = if respond {
+                            Vec::with_capacity(requests.len())
+                        } else {
+                            Vec::new()
+                        };
                         let mut ordinal = 0u32;
                         for request in requests {
                             let (response, event_count) = self.apply_one(
@@ -1662,15 +1773,28 @@ where
                                 entry.log_id.index,
                                 ordinal,
                                 &mut publishes,
+                                respond,
                             );
                             ordinal = ordinal.saturating_add(event_count as u32);
-                            responses.push(response);
+                            if respond {
+                                responses.push(response);
+                            }
                         }
-                        MatchEngineResponse::batch(responses)
+                        if respond {
+                            MatchEngineResponse::batch(responses)
+                        } else {
+                            MatchEngineResponse::none()
+                        }
                     }
                     EntryPayload::Normal(req) => {
-                        let (response, _) =
-                            self.apply_one(&mut inner, req, entry.log_id.index, 0, &mut publishes);
+                        let (response, _) = self.apply_one(
+                            &mut inner,
+                            req,
+                            entry.log_id.index,
+                            0,
+                            &mut publishes,
+                            respond,
+                        );
                         response
                     }
                     EntryPayload::Membership(mem) => {
