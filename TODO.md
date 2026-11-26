@@ -452,6 +452,27 @@ in git history and the linked docs. For the full history, check out `TODO.md` fr
   `/metrics` discovery, preserving the `NoLeader` contract before initialization. Edge validation
   bounds all three key fields and rejects duplicate keys across a batch. New unit and cluster
   tests cover the keys and the raw follower redirect.
+- **2026-11-26** — OrbStack rollout of the request-key/typed-redirect engine and the order desk.
+  Engine `matchengine-raft@sha256:b67b54a3…` and order-system `matchengine-order-system:arm64-v7`
+  are live; all four shards and the desk are Ready. The roll briefly stalled because the driver
+  shell exited mid-loop, rolling several shards at once: one replica per affected Raft group kept a
+  WAL behind the leader's commit while the leader's stale replication match index prevented log
+  re-replication, so `/ready` (and therefore the operator's one-pod-at-a-time gate) stayed false.
+  Recovery used OpenRaft's own snapshot path only: trigger a snapshot on the lagging group's leader
+  and the intended next leader, purge both logs to that index, then transfer leadership — the new
+  leader's empty progress selects snapshot replication and the lagging node installs it over gRPC.
+  No custom snapshot pull was added. Live checks: follower `/write` returns 503 with
+  `leader_addr`; a Cancel retried with `client_request_id` returns the same sequence and events.
+  Terminal, desk and market-data feed remain healthy with zero gaps.
+- **2026-11-26** — Leader-side automatic recovery for a reverted follower log. `src/log_reversion.rs`
+  samples each peer's `/console/api/node` log tail every 5 s on the leader; two consecutive samples
+  below the leader's replication match index call OpenRaft's one-shot
+  `Raft::trigger().allow_next_revert(peer, true)` and a probe heartbeat. OpenRaft then resets that
+  peer's progress and repairs it with normal append/snapshot replication — no custom pull endpoint,
+  no manual install and no membership change. Opt out with `MATCHENGINE_AUTO_RECOVER_REVERSION=0`.
+  Unit tests cover the detection predicate; full engine tests, fmt and clippy pass. Live pod deletion
+  and forced restarts on `fx-sup-01` recovered through the normal path without triggering a reset.
+- **2026-11-26** — Race hardening for the leader-side reversion watcher. The first version sampled the leader's `matched` before probing peers and compared it to a peer's later view, which is subject to cross-node read skew. It now probes first and re-reads matched, leadership and membership from a single fresh metrics read after the round-trip, re-checks leadership just before the one-shot trigger, and requires two *identical* consecutive observations so a catching-up follower is never treated as reverted. `matched` only moves forward, so a stale leader read is conservative; the action itself is a speculative one-shot hint that OpenRaft consumes only on a real conflict, so a false arm is a no-op and cannot lose data. Four unit tests cover detection and the repeat-count rule; full engine suite, fmt and clippy pass.
 - **2026-11-26** — Historical bars P1 completed and validated. `--history-lease-prefix` creates one
   Kubernetes Lease per symbol (`<prefix>-<symbol>`) and gates flushes, `bar_state` writes and REST
   backfill per symbol; `--history-rest-tail` backfills missing closed windows from a Binance-compatible

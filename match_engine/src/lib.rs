@@ -54,6 +54,9 @@ pub use store::StorageConfig;
 pub mod app;
 /// Smart client module for interacting with the Raft cluster.
 pub mod client;
+
+mod log_reversion;
+
 /// Market-data egress: the deterministic feed pipeline (tap, shadow book, wire format).
 pub mod market_data;
 /// Pluggable processing of the match results (fills, rests, cancels) produced by the state machine.
@@ -87,6 +90,19 @@ openraft::declare_raft_types!(
 pub type LogStore = store::LogStore<MatchEngineTypeConfig>;
 pub type StateMachineStore = store::StateMachineStore<MatchEngineTypeConfig>;
 pub type MatchEngineRaft = openraft::Raft<MatchEngineTypeConfig, StateMachineStore>;
+
+/// Whether the leader watches peer log tails and allows a one-shot replication
+/// reset when a restarted follower reports a reverted tail.
+///
+/// Enabled by default because the no-fsync WAL mode can lose an unsynced tail
+/// on restart. Set `MATCHENGINE_AUTO_RECOVER_REVERSION=0` to disable.
+fn auto_recover_reversion() -> bool {
+    match std::env::var("MATCHENGINE_AUTO_RECOVER_REVERSION") {
+        Ok(value) if value == "0" || value.eq_ignore_ascii_case("false") => false,
+        Ok(_) => true,
+        Err(_) => true,
+    }
+}
 
 /// Number of workers for OpenRaft's dedicated runtime.
 ///
@@ -812,6 +828,18 @@ pub async fn build_match_engine_node(
         transport: transport_metrics,
         console: console::ConsoleState::new(),
     });
+
+    // A restarted no-fsync follower can report a log tail behind the leader's
+    // match index. Let the leader detect that and use OpenRaft's one-shot
+    // reversion reset so normal snapshot replication repairs it.
+    if auto_recover_reversion() {
+        // Detached: the watcher exits when the node's Tokio runtime shuts down.
+        drop(log_reversion::spawn(
+            raft.clone(),
+            node_id,
+            app_data.console.peer_client().clone(),
+        ));
+    }
 
     // Start the actix-web server.
     let server = HttpServer::new(move || {
