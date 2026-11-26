@@ -313,10 +313,20 @@ HTTP API 和 gRPC Raft 监听器（HTTP 端口 + 1000）按设计是**明文且�
 | 纯订单簿真实混合回放（`replay_mix`） | 616k ops/s | **3.09M ops/s**（约 5 倍） |
 | Peg 查找，5k 订单簿、无 peg | ~19 µs/次 apply | **0.41 µs/次**（约 45 倍） |
 | Peg 查找，32 个 peg 订单 | ~16–19 µs/次 apply | **2.3 µs/次** |
-| `apply_path` rest 分配次数 | 3.17/次 | **1.17/次** |
 
-前后数据、新增 benchmark 模式与未完成的条目见
-[订单簿性能审查](./docs/ORDER_BOOK_PERFORMANCE_REVIEW.md)。
+未完成的条目见[订单簿性能审查](./docs/ORDER_BOOK_PERFORMANCE_REVIEW.md)；前后数据见
+[`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md)。
+
+**apply 路径亮点（2026-11-26）。** 现在只在有客户端等待时才构造响应，批量写入也只向 sink 发布一次，而不是每个子请求一次：
+
+| 路径 | 之前 | 之后 |
+|---|---:|---:|
+| `apply_path` rest / cancel / fill 每次 apply 的分配次数 | 3.17 / 3.00 / 4.00 | **0.17 / 0.00 / 1.00** |
+| 批量 rest 每次 apply 的分配次数 / 申请字节 | 1.19 / 1,875 B | **0.21 / 1,141 B** |
+| 带 client_order_id 的 Place 分配次数 | 3.32 | **2.32** |
+
+未完成的条目见[apply 路径性能审查](./docs/APPLY_PATH_PERFORMANCE_REVIEW.md)；实测数据见
+[`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md)。
 
 | 工作负载 | 结果 |
 |---|---:|

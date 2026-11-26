@@ -477,7 +477,7 @@ enabled, and is not covered by this no-tap benchmark.
 The order-book performance review (`docs/ORDER_BOOK_PERFORMANCE_REVIEW.md`) found that every mutating
 apply cloned `SymbolConfig` (two owned `AssetId.code` strings), that `reprice_pegged()` walked the
 whole ladder after every request, and that `observe_trade()` allocated a sequence vector per print.
-All three are fixed in the working tree:
+All three are fixed and committed:
 
 | Workload | 2026-11-10 allocs/entry | 2026-11-26 allocs/entry |
 |---|---:|---:|
@@ -501,6 +501,33 @@ Two new **informational** modes extend the same harness (the six standard rows r
 - `cargo bench --bench apply_path -- --trail` parks eight trailing stops and replays 5,000 prints.
   The reusable `trailing_scratch` buffer removes one allocation per print: 3.00 → 2.00 allocs/entry.
 
+### 2026-11-26 follow-up: apply path
+
+The [apply-path audit](./APPLY_PATH_PERFORMANCE_REVIEW.md) found that responses were built even for
+entries with no openraft responder (every follower apply and WAL replay) and that a batch published
+and flushed once per sub-request. Responses are now built only when a responder exists, batch
+events are combined into one sink publish, and the market-data frame's event copy happens after the
+state-machine lock is released.
+
+| Workload | Before | After |
+|---|---:|---:|
+| Rest allocations/entry | 1.17 | **0.17** |
+| Cancel allocations/entry | 1.00 | **0.00** |
+| Fill allocations/entry | 2.00 | **1.00** |
+| Batch rest allocations/entry | 1.19 | **0.21** |
+| Batch rest requested bytes/entry | 1,875 | **1,141** |
+| Batch blank allocations/entry | 1.02 | **0.01** |
+
+Two more informational modes close measurement gaps: `cargo bench --bench apply_path -- --sink`
+applies 128-request batches through `FileLogSink` (8.22 allocs/entry, 1.75 µs/entry) and
+`--tap` applies entries with the market-data tap installed (3.17 allocs/entry, 0.46 µs/entry).
+The allocation ceilings below were tightened again to protect these reductions. Idempotency keys
+are now shared as `Arc<str>` (`--ids`: 3.32 → 2.32 allocs/entry, 900 → 742 bytes/entry), and
+snapshot capture reserves the order vector once instead of building two temporary Vecs. The new
+`--batch-peg` mode measures the remaining per-sub-request peg pass at 2.21 µs/entry versus
+0.22 µs/entry without pegs; it is documented as open in the review because peg events belong to the
+sub-request that produced them.
+
 ## Benchmark regression gate (2026-11-09)
 
 CI job `bench-regression` runs three no-framework benchmarks in check mode. It is a regression
@@ -513,14 +540,14 @@ for 50,000 single-entry applications or 1,000 128-request batches:
 | Workload | Max allocation calls | Max requested bytes |
 |---|---:|---:|
 | Blank | 0 | 0 |
-| Rest, 1 event | 60,000 | 30,000,000 |
-| Cancel, 1 event | 52,000 | 1,000,000 |
+| Rest, 1 event | 10,000 | 30,000,000 |
+| Cancel, 1 event | 2,000 | 1,000,000 |
 | Fill, 1 event | 102,000 | 120,000,000 |
-| Batch blank, 128 requests | 130,000 | 80,000,000 |
-| Batch rest, 128 x 1 event | 155,000 | 250,000,000 |
+| Batch blank, 128 requests | 2,000 | 80,000,000 |
+| Batch rest, 128 x 1 event | 32,000 | 250,000,000 |
 
-The hot rows were tightened on 2026-11-26: measured totals are 58,335 / 50,000 / 100,000 /
-152,336, and the ceilings keep a small headroom for allocator differences between hosts. `book_replay --check` enforces warm p50/p99 bounds from
+The hot rows were tightened on 2026-11-26: measured totals are 8,335 / 0 / 100,000 / 1,000 /
+27,336, with headroom for allocator differences between hosts. `book_replay --check` enforces warm p50/p99 bounds from
 1 ms/5 ms (1k sweep) to 50 ms/100 ms (1M BBO queries), and `replay_mix --check` enforces
 1 s/2 s for the whole warm replay. Those are roughly an order of magnitude above the recorded
 M4 baseline. Cold passes remain reported but are not gated.

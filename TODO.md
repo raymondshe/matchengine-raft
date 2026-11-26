@@ -154,7 +154,8 @@ semantic risk stays covered by at-least-once retries: `client_order_id` dedupes 
     `docs/ORDER_BOOK_PERFORMANCE_REVIEW.md`: depth aggregates (F4b), per-fill copy/fill-buffer
     reduction and FOK preflight fusion (F6), snapshot-copy and validation micro-costs (F7–F8), plus
     `/klines` query coalescing, WebSocket frame precomputation and catalog snapshot reuse. All need a
-    targeted bench first; the 2026-11-26 review already closed the large scans.
+    targeted bench first; the 2026-11-26 review already closed the large scans. Remaining apply-path
+    findings are tracked separately in `docs/APPLY_PATH_PERFORMANCE_REVIEW.md`.
 20. **P3 — Lab-only hardening.** Remove root usage and iptables from
     `match_engine/docker/linux.Dockerfile`, and scope the ingress-nginx ClusterRole's Secrets access.
     Keep both out of production overlays.
@@ -316,10 +317,16 @@ shard services and the global terminal service are live; see History. Remaining 
   instead of per-apply clone, `PegIndex` instead of a full-ladder peg scan, lazy peg BBO lookup,
   reusable trailing-stop scratch buffer, and boxed-iterator removal in `depth`/FOK preflight.
   `apply_path --peg` and `--trail` are new informational modes; `apply_path --check` ceilings were
-  tightened. Evidence and before/after numbers are in `docs/ORDER_BOOK_PERFORMANCE_REVIEW.md`.
+  tightened. Evidence is in `docs/PERFORMANCE.md`; remaining items are in the review doc.
+- [x] **P2** Apply-path review findings (`docs/APPLY_PATH_PERFORMANCE_REVIEW.md`): responses are
+  built only when openraft supplies a responder, batch publishes are coalesced into one sink call,
+  the tap event copy happens after the lock, and the HTTP symbol guard reads a lock-free mirror.
+  `--sink`/`--tap`/`--ids`/`--batch-peg` apply modes and two conformance tests were added. A5/A6 are
+  also done (shared `Arc<str>` idempotency keys, single-allocation snapshot order copy); A4 is
+  measured but open because hoisting peg events would change which sub-request owns them.
 - [ ] **P3 (#21 follow-up)** Deferred order-book experiments: depth aggregates (F4b) and
   per-fill copy/fill-buffer reduction, FOK preflight fusion and snapshot-copy micro-costs (F6–F8).
-  Require a targeted bench before any change; see `docs/ORDER_BOOK_PERFORMANCE_REVIEW.md` §5.
+  Require a targeted bench before any change; see `docs/ORDER_BOOK_PERFORMANCE_REVIEW.md`.
 - [ ] **P2** Make gateway retries safe: add a request key for `Cancel`/`Amend` (the current
   `client_order_id` dedupes only `Place`) and a typed `503` with the leader address so a follower
   `/write` can be retried deterministically instead of today's `500`. The Rust
@@ -404,9 +411,9 @@ in git history and the linked docs. For the full history, check out `TODO.md` fr
   advancement past cancelled/parked orders, Day/GTD purge ordering, expiry bookkeeping across
   fills/amends, multi-stop trailing updates) plus a test-only index consistency assertion after
   every randomized operation. Full engine `cargo test`, Clippy and fmt pass. A paired `replay_mix`
-  A/B measured ~5x (170 ms → 33.6 ms warm p50); the follow-up audit of remaining order-book
-  opportunities is in `docs/ORDER_BOOK_PERFORMANCE_REVIEW.md`.
-- **2026-11-26** — Order-book review findings implemented from `docs/ORDER_BOOK_PERFORMANCE_REVIEW.md`.
+  A/B measured ~5x (170 ms → 33.6 ms warm p50); remaining order-book opportunities are in
+  `docs/ORDER_BOOK_PERFORMANCE_REVIEW.md`, with measurements in `docs/PERFORMANCE.md`.
+- **2026-11-26** — Order-book review findings implemented (measurements in `docs/PERFORMANCE.md`;
   `SymbolConfig` is borrowed instead of cloned on every apply (rest 3.17 → 1.17 allocs/entry and the
   `apply_path --check` ceilings were tightened); `PegIndex` replaces the full-ladder peg discovery
   scan (zero-peg apply 19 µs → ~0.5 µs, 32-peg apply ~16 µs → 4.3 µs) and `peg_target` computes only
@@ -414,6 +421,34 @@ in git history and the linked docs. For the full history, check out `TODO.md` fr
   allocs/entry); `depth`/FOK preflight no longer box their iterators. Two informational harness modes
   (`apply_path --peg`, `--trail`) and a peg-index conformance test were added. Full engine tests,
   Clippy, fmt and all three CI bench gates pass. F4b depth aggregates and F6–F8 remain open.
+- **2026-11-26** — Apply-path review findings implemented (measurements in `docs/PERFORMANCE.md`;
+  Responses are built only when openraft supplies a responder (follower/replay entries now pay no
+  sequence string or event copy), batch events are published with one sink call and incremental
+  growth, and the market-data frame's event copy happens after the state-machine lock is released.
+  `apply_path` rest/cancel/fill/batch-rest allocations fell from 1.17/1.00/2.00/1.19 to
+  0.17/0.00/1.00/0.21 per entry and the ceilings were tightened; batch-rest bytes fell from 1,875 to
+  1,141 per entry. New `--sink` and `--tap` modes close the sink/tap measurement gaps, and
+  `batch_publishes_one_market_frame_per_sub_request` plus
+  `configured_symbol_id_mirror_follows_apply_and_restore` pin the frame and symbol-mirror semantics.
+  The HTTP leader symbol guard also reads a lock-free mirror instead of taking the state-machine
+  lock. Full engine tests and all three CI bench gates pass.
+- **2026-11-26** — Apply-path follow-ups: idempotency keys are shared as `Arc<str>` with
+  `Arc<SubmissionRecord>` in both dedupe collections (`apply_path --ids` 3.32 → 2.32 allocs/entry),
+  and snapshot `to_content()` reserves the order vector once instead of building two temporary
+  Vecs. New `apply_path --ids` and `--batch-peg` modes close two more measurement gaps: a
+  128-request batch over 32 pegged orders costs 2.21 µs/entry against 0.22 µs/entry without pegs.
+  A4 stays open — removing the per-sub-request peg pass changes which response owns the peg events.
+- **2026-11-26** — OrbStack validation of the index/apply-path changes. Docker Hub was unreachable
+  from the development host, so the engine was cross-compiled for `aarch64-unknown-linux-musl` with
+  `cargo zigbuild` and the static binaries were layered onto the cached runtime image
+  (`matchengine-raft@sha256:eb561d18…`). The manager upgrade API rolled all four shards
+  (`fx-sup-01`, `fx-eu-01`, `fx-eu-02`, `me-btcusdt`) one at a time; every shard returned to Ready
+  with 4/4 updated pods and zero restarts. A live smoke test on `fx-sup-01` verified idempotent
+  `Place` retry, a 2-request `/write_batch` with continuous ordinals, `/read`, `/events`,
+  `/admission/status` and a gap-free market-data feed; terminal and manager still return 200.
+  Inside an OrbStack Linux container the cross-compiled test binaries passed 230 lib + 84 cluster
+  tests, `replay_mix --check` and `book_replay --check`. `apply_path --check` passes on Linux and
+  macOS; a cold-process blank-row allocation flake was removed with a second uncounted warm-up.
 - **2026-11-26** — Historical bars P1 completed and validated. `--history-lease-prefix` creates one
   Kubernetes Lease per symbol (`<prefix>-<symbol>`) and gates flushes, `bar_state` writes and REST
   backfill per symbol; `--history-rest-tail` backfills missing closed windows from a Binance-compatible

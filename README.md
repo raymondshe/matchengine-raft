@@ -341,10 +341,21 @@ removed three scans that previously ran on every request:
 | Book-only realistic replay (`replay_mix`) | 616k ops/s | **3.09M ops/s** (~5x) |
 | Peg discovery, 5k-order book, no pegs | ~19 µs/apply | **0.41 µs/apply** (~45x) |
 | Peg discovery, 32 pegged orders | ~16–19 µs/apply | **2.3 µs/apply** |
-| `apply_path` rest allocations | 3.17/entry | **1.17/entry** |
 
-Before/after evidence, the new benchmark modes and the remaining open items are in the
-[order-book performance review](./docs/ORDER_BOOK_PERFORMANCE_REVIEW.md).
+Remaining open items are in the [order-book performance review](./docs/ORDER_BOOK_PERFORMANCE_REVIEW.md);
+before/after evidence is in [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md).
+
+**Standout apply-path gains (2026-11-26).** Responses are now built only when a client is waiting,
+and a batch publishes through the sink once instead of once per sub-request:
+
+| Path | Before | After |
+|---|---:|---:|
+| `apply_path` rest / cancel / fill allocations per entry | 3.17 / 3.00 / 4.00 | **0.17 / 0.00 / 1.00** |
+| Batch-rest allocations / requested bytes per entry | 1.19 / 1,875 B | **0.21 / 1,141 B** |
+| Id-bearing Place allocations per entry | 3.32 | **2.32** |
+
+Remaining open items are in the [apply-path performance review](./docs/APPLY_PATH_PERFORMANCE_REVIEW.md);
+measurements are in [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md).
 
 | Workload | Result |
 |---|---:|
