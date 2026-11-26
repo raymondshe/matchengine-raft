@@ -262,7 +262,8 @@ CI (`.github/workflows/ci.yml`) runs `cargo fmt --all -- --check` (and the `matc
   archive importer, reconciler, reader HPAs, time-zone anchors and three-dnode HA remain design/work
   items.
   The OrbStack lab wires it up with `k8s_control_plane/deploy/tdengine.yaml` (single dnode plus an
-  IPv4 bridge for `taosadapter`), `MarketDataService.spec.history`, market-data image
+  IPv4 bridge for `taosadapter`, data on an 8 Gi `local-path` PVC so an eviction does not wipe the
+  bar history), `MarketDataService.spec.history`, market-data image
   `history-arm64-v4` and terminal image `arm64-v4`, so the terminal chart seeds from TDengine.
   Measured ingest/query/precision numbers are §12. The reference-API measurements it builds on are
   in `docs/THIRD_PARTY_INVESTIGATION.md` Part VII.

@@ -473,6 +473,14 @@ in git history and the linked docs. For the full history, check out `TODO.md` fr
   Unit tests cover the detection predicate; full engine tests, fmt and clippy pass. Live pod deletion
   and forced restarts on `fx-sup-01` recovered through the normal path without triggering a reset.
 - **2026-11-26** — Race hardening for the leader-side reversion watcher. The first version sampled the leader's `matched` before probing peers and compared it to a peer's later view, which is subject to cross-node read skew. It now probes first and re-reads matched, leadership and membership from a single fresh metrics read after the round-trip, re-checks leadership just before the one-shot trigger, and requires two *identical* consecutive observations so a catching-up follower is never treated as reverted. `matched` only moves forward, so a stale leader read is conservative; the action itself is a speculative one-shot hint that OpenRaft consumes only on a real conflict, so a false arm is a no-op and cannot lose data. Four unit tests cover detection and the repeat-count rule; full engine suite, fmt and clippy pass.
+- **2026-11-26** — Lab TDengine moved from `emptyDir` to an 8 Gi `local-path` PVC in
+  `k8s_control_plane/deploy/tdengine.yaml`. Host disk reached 99%, the node raised DiskPressure and
+  evicted the TDengine pod 192 times in 35 s; because its data was on `emptyDir`, every eviction
+  wiped `market_bars`, and the already-running market-data services kept logging "Database not
+  exist" / "Table does not exist". Recovered by pruning 3.4 GiB of Docker build cache, deleting the
+  evicted pods, and restarting each writer so `ensure_schema` recreated the database, 7 super tables
+  and 57 per-symbol child tables. The PVC change was verified by deleting the TDengine pod again:
+  `bars_1s` stayed at 38 -> 57 (grew, did not reset) and no service logged a missing-table error.
 - **2026-11-26** — Historical bars P1 completed and validated. `--history-lease-prefix` creates one
   Kubernetes Lease per symbol (`<prefix>-<symbol>`) and gates flushes, `bar_state` writes and REST
   backfill per symbol; `--history-rest-tail` backfills missing closed windows from a Binance-compatible
