@@ -30,7 +30,9 @@ references are documentation or reference material only.
 Pitlane is MIT licensed, but its single commit and one-star history give it no independent track
 record — every claim below is treated as self-reported unless the source was checked. The
 performance-specific verdicts (what transfers to matchengine-raft and what does not) live in
-[`docs/PERFORMANCE.md`](./PERFORMANCE.md) ("External optimization notes").
+[`docs/PERFORMANCE.md`](./PERFORMANCE.md) ("External optimization notes"). The code-backed review
+of which order-book opportunities remain open after this survey is in
+[`docs/ORDER_BOOK_PERFORMANCE_REVIEW.md`](./ORDER_BOOK_PERFORMANCE_REVIEW.md).
 
 ## Part I - AsthaMishra/matching-engine
 

@@ -472,6 +472,35 @@ retained-event window growth, the legacy `value` sequence `String`, and harness/
 allocations. The market-data tap path still copies events into `TapFrame.events` when the tap is
 enabled, and is not covered by this no-tap benchmark.
 
+### 2026-11-26 follow-up: symbol config, peg indexes and trailing scratch
+
+The order-book performance review (`docs/ORDER_BOOK_PERFORMANCE_REVIEW.md`) found that every mutating
+apply cloned `SymbolConfig` (two owned `AssetId.code` strings), that `reprice_pegged()` walked the
+whole ladder after every request, and that `observe_trade()` allocated a sequence vector per print.
+All three are fixed in the working tree:
+
+| Workload | 2026-11-10 allocs/entry | 2026-11-26 allocs/entry |
+|---|---:|---:|
+| Rest, 1 event | 3.17 | **1.17** |
+| Cancel, 1 event | 3.00 | **1.00** |
+| Fill, 1 event | 4.00 | **2.00** |
+| Batch rest, 128 x 1 event | 3.19 | **1.19** |
+
+`configured_symbol_for` now returns `&SymbolConfig` and `execute_order_with_symbol` accepts
+`impl Borrow<SymbolConfig>`, so existing callers that pass an owned config still compile without a
+clone. The call ceilings below were tightened accordingly.
+
+Two new **informational** modes extend the same harness (the six standard rows remain the gate):
+
+- `cargo bench --bench apply_path -- --peg` builds a 5,000-bid book and 5,000 measured Places, with
+  0 or 32 pegged bids at the front. Before the fix the 0-peg row cost ~19 µs/entry on the full-ladder
+  scan; after the `PegIndex` early-out it is 0.42–1.02 µs/entry. The 32-peg row fell from ~16–19 µs
+  to 4.3 µs once `reprice_pegged` iterated only pegged keys, and its allocations fell from 5.17 to
+  2.17 per entry. Event order is unchanged because the index keys use the same `BidKey`/`AskKey`
+  ordering as the maps.
+- `cargo bench --bench apply_path -- --trail` parks eight trailing stops and replays 5,000 prints.
+  The reusable `trailing_scratch` buffer removes one allocation per print: 3.00 → 2.00 allocs/entry.
+
 ## Benchmark regression gate (2026-11-09)
 
 CI job `bench-regression` runs three no-framework benchmarks in check mode. It is a regression
@@ -484,14 +513,14 @@ for 50,000 single-entry applications or 1,000 128-request batches:
 | Workload | Max allocation calls | Max requested bytes |
 |---|---:|---:|
 | Blank | 0 | 0 |
-| Rest, 1 event | 158,335 | 30,000,000 |
-| Cancel, 1 event | 150,000 | 1,000,000 |
-| Fill, 1 event | 200,000 | 120,000,000 |
+| Rest, 1 event | 60,000 | 30,000,000 |
+| Cancel, 1 event | 52,000 | 1,000,000 |
+| Fill, 1 event | 102,000 | 120,000,000 |
 | Batch blank, 128 requests | 130,000 | 80,000,000 |
-| Batch rest, 128 x 1 event | 408,336 | 250,000,000 |
+| Batch rest, 128 x 1 event | 155,000 | 250,000,000 |
 
-The call ceilings are exact totals: fewer allocations pass, more fail. Requested bytes get a
-small allowance for capacity choices. `book_replay --check` enforces warm p50/p99 bounds from
+The hot rows were tightened on 2026-11-26: measured totals are 58,335 / 50,000 / 100,000 /
+152,336, and the ceilings keep a small headroom for allocator differences between hosts. `book_replay --check` enforces warm p50/p99 bounds from
 1 ms/5 ms (1k sweep) to 50 ms/100 ms (1M BBO queries), and `replay_mix --check` enforces
 1 s/2 s for the whole warm replay. Those are roughly an order of magnitude above the recorded
 M4 baseline. Cold passes remain reported but are not gated.

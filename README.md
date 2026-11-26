@@ -333,12 +333,25 @@ rows exclude HTTP, Raft and WAL; replicated rows use four in-process loopback vo
 disabled. Methodology, percentiles, durability modes and caveats are in
 [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md).
 
+**Standout order-book gains (2026-11-26).** Indexed parked stops, GTD deadlines and pegged orders
+removed three scans that previously ran on every request:
+
+| Path | Before | After |
+|---|---:|---:|
+| Book-only realistic replay (`replay_mix`) | 616k ops/s | **3.09M ops/s** (~5x) |
+| Peg discovery, 5k-order book, no pegs | ~19 µs/apply | **0.41 µs/apply** (~45x) |
+| Peg discovery, 32 pegged orders | ~16–19 µs/apply | **2.3 µs/apply** |
+| `apply_path` rest allocations | 3.17/entry | **1.17/entry** |
+
+Before/after evidence, the new benchmark modes and the remaining open items are in the
+[order-book performance review](./docs/ORDER_BOOK_PERFORMANCE_REVIEW.md).
+
 | Workload | Result |
 |---|---:|
 | Order-book deep sweep (100 levels) | 11.66M fills/s |
 | Order-book deep cancels | 19.63M cancels/s |
 | BBO advance / BBO query | 20.37M advances/s / 434.5M queries/s |
-| Realistic mixed replay (add/cancel/amend/stop/iceberg/taker) | 968,709 ops/s |
+| Realistic mixed replay (add/cancel/amend/stop/iceberg/taker) | 3.09M ops/s |
 | Replicated writes, 512 in flight (pre-connected) | 114,484 writes/s, p99 5.76 ms |
 | Replicated writes, 1,024 in flight (pre-connected) | 99,330 writes/s, p99 8.74 ms |
 | Replicated sequential 128-order batches | 227,319 orders/s |

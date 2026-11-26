@@ -113,11 +113,59 @@ publication；JSONL sink 仍可用于调试。
 
 ## 🧪 核心能力
 
-- **撮合引擎**：GTC/IOC/FOK/GTD/Day、市价、市价转限价、Post-Only、冰山单、止损市价/限价、移动止损、Peg 和 STP；改单/撤单遵循确定性优先级；按资产扣费、tick/lot 和 quote 预算扫描；端到端 18 位定点数。
-- **持久化与恢复**：Raft 复制状态机、分段校验 WAL、可配置 fsync、原子快照、快照 + WAL 尾部恢复、四投票成员无 fsync 下限、gRPC `stream_append` 和分块快照安装。
-- **API 与行情**：`/write`、`/write_batch`、`/read`、`/linearizable_read`、`/events`、gRPC `StreamEvents`、持久事件游标、`client_order_id` 幂等、Aeron 行情出口和 Binance 风格 WebSocket 服务。
-- **可观测与运维**：内置 `/console/`、`/health`、`/ready`、`/pretrade/status`、metrics、受保护的 Raft 操作、网关/私有网络边界和请求大小限制。
-- **Kubernetes 集群管理**：CRD 期望状态、Lease 选举 operator、四 Pod shard、supervisor 零影响模式、单 Pod 滚动、release/capacity 门禁、PVC 保留和跨 shard cutover/rollback。
+✅ 以下能力均已在本仓库实现并有测试覆盖。
+
+**🧩 撮合引擎**
+- **价格-时间优先订单簿**：支持 GTC、IOC、FOK、GTD、Day、市价、市价转限价、Post-Only、冰山单、止损市价、止损限价、移动止损和 Peg 单，以及 STP 自成交防护。
+- **改单与撤单**：确定性优先级规则——同价减量保留时间优先；价格或数量增加则以新 sequence 重新排队。
+- **按资产扣费**：maker/taker 费率、返佣和精确名义金额核算；加密/FX 默认以 received 资产扣费，ETF/股票始终以 quote 结算。
+- **基础或计价单位量**：tick/lot 校验、quote 限价归一化与 quote 预算市价扫单。
+- **端到端 18 位定点数**：从 API 输入到撮合、事件、快照和行情 feed，撮合路径不使用 `f64`。
+
+**🛡️ 持久化与恢复**
+- **Raft 复制状态机**：成员与应用状态持久化；WAL fsync 可配置。
+- **分段校验 WAL**：`RAFT_WAL_FSYNC_MS` 未设置 = 不 fsync（默认，要求至少 4 个投票成员），`0` = 每次 append，`N > 0` = 每 N ms 定期；支持尾部损坏恢复。`--max-wal-append-bytes`（默认 8 MiB）把一次 apply 批次拆成字节受限写入，共用一个磁盘锁和一次 fsync。
+- **原型异步 WAL**（feature 门控，默认关闭）：`append` 将 fsync 延后到 Tokio worker，仅在持久化后触发 `IOFlushed`；包含待处理条目读取与崩溃恢复测试。用 `--features async-wal` 构建，用 `--async-wal` 与 `RAFT_WAL_FSYNC_MS=0` 运行。
+- **四投票成员无 fsync 下限**：`/init` 与 `/change-membership` 拒绝少于四票，写入在凑齐四票前返回 `503`，确保已提交条目至少在三个节点上。
+- **原子快照**：临时文件 → fsync → rename → 目录 fsync，安装前校验校验和。快照字节以 `Arc<[u8]>` 共享；gRPC 接收的快照写入经过校验的 staging 文件，而非无界内存缓冲。
+- **面向真实负载的快照策略**：每 100,000 条 apply，或有新条目时每 30 分钟一次，可用 `--snapshot-interval-ms` 调整。
+- **快照 + WAL 尾部恢复**：恢复最新快照、事件窗口与幂等 map，仅重放更新的日志条目。
+- **gRPC 复制**：双向 `stream_append`、分块快照传输、Pre-Vote 选举、领导权转移和每 peer 独立通道。
+
+**🔌 API 与行情**
+- **持久撮合事件 feed**：`POST /events` 支持游标分页、长轮询（`wait_ms`）、保留上限、`client_order_id` 幂等、gRPC `StreamEvents` 流和参考 MQ bridge sidecar；重试安全。
+- **确定性行情 feed**：leader 门控、shadow book、BBO、深度快照/增量、生命周期事件、OHLC K 线和紧凑二进制 wire 格式（含参考解码器）。feature 门控的 **Aeron** 出口在 2001–2007 流发布，每流一个独占 publication，带空闲 STATUS 心跳和 stream-2010 快照请求通道。
+- **独立行情系统** [`market_data_system/`](./market_data_system/)：经 Aeron/JSONL 消费 feed，提供 Binance 风格 WebSocket。单实例通过共享 hub 服务多个 symbol；连接维护订阅集合，用实时 `UNSUBSCRIBE`/`SUBSCRIBE` 切换 symbol，可水平扩展而不增加引擎负担。迟到订阅者向引擎请求即时快照；`/ready` 也会因缺少帧/心跳而超时。
+- **灵活读一致性**：本地 `/read`、线性一致 leader 读和 follower 读。leader 一致路径默认使用 OpenRaft 调用侧 lease 缓存（`local_lease`），再走核心 lease 路径，lease 过期时回退 `ReadIndex`；`--read-policy read_index` 强制新的 quorum 往返，`lease` 保留核心路径。四节点实测相较核心 lease 路径，读吞吐高 11–36%，64 读者 p50/p99 低约 40%。lease read 要求时钟漂移有界（NTP/PTP）；`/read-policy/status` 报告命中与回退。
+- **leader 感知 Rust 客户端**：跟踪并转发请求到当前 leader，超时/瞬时重试/退避可配置，错误类型区分 API 与无 leader；重试为 at-least-once，幂等写入请使用 `client_order_id`。
+- **运维 API**：初始化、成员变更、metrics、事件状态与行情状态。
+- **批量写入** `POST /write_batch`：多个请求合并为一个 Raft entry 和一次 WAL append，每个请求独立 sequence，事件 ordinal 连续。
+- **关注 P99 的写入准入**：每节点默认限制 1,024 个并发 `/write` 与 `/write_batch`，超出返回 `429`，并在 `/admission/status` 暴露当前/峰值/准入/拒绝计数。
+
+**📊 运维可见性**
+- **内置 WebUI 控制台** `/console/`：集群健康、Raft 领导与复制、存储/事件/feed 状态、仅 leader 可用的事件查看器和诊断——无需构建步骤或外部资源。页面主标题显示已应用的 `BASE/QUOTE` 交易 symbol。
+- **受保护的 Raft 操作**：通过 gRPC `TransferLeader` 优雅转移领导权、尽力发起 Pre-Vote 选举、触发快照，均需确认、操作锁和审计日志。
+- **独立演示下单台** [`order_system/`](./order_system/)：独立进程与 crate，可真实下单并展示完整订单簿、symbol 配置、游标跟随的 `/events` 记录，以及带标注的订单系统冻结与 maker/taker 手续费结算演示估算，含演示用线性永续/杠杆叠加层；复用控制台主题。
+- **健康与就绪探针**：`/health` 报告 gRPC 监听器、Raft core 和 WAL/状态机前沿；`/ready` 额外要求已知 leader；`/pretrade/status` 报告 symbol/配置就绪原因，适合编排器与 pre-trade 门禁。
+
+**☸️ Kubernetes 集群控制（生产形态）**
+- **一个控制平面管理数千个单 symbol 引擎**——每个 symbol 独立进程和四投票 Raft 组；2,000 symbol 即 8,000 个引擎进程，按每 Pod 20 进程打包为 100 个四 Pod shard（400 Pod），并划分 cell。打包减少 Pod 与 Kubernetes 对象，不改变每 symbol 的 Raft 组。
+- **零影响 supervisor 模式**——每 Pod 一个 supervisor 容器读取 `processes.json` 并启停单个子进程；添加/停止/启动 symbol 不影响其他引擎的 PID、监听与数据目录。OrbStack 验证中，添加和轮转子进程时所有 Pod UID 与重启计数保持不变。
+- **显式 containers 爆炸半径保护**——非空 containers shard 返回 `409 restart_required`；`allowRestart` 才允许一票一 Pod 的滚动，常规添加不会静默重启整个集群。
+- **完整生命周期与存储决策**——优雅停启复用同一 deployment、slot/端口和 PVC，无需重新 `/init` 即可恢复 WAL/snapshot；空闲 shard 可删除，并显式选择保留 PVC 以便恢复或不可逆删除。
+- **CRD 期望状态**——七个 `matching.io` CRD（`TradingSymbol`、`SymbolShard`、`SymbolDeployment`、`SymbolRoute`、`Cell`、`MarketDataService`、`OrderSystem`）带 status subresource；manager 通过 Kubernetes API server 写入，用 informer 重建缓存，使用 `resourceVersion` 并发控制并对 status 写入限流。etcd 保存 CR；manager 从不直接连接 etcd，引擎 WAL/事件也不写入 etcd。
+- **Lease 选举 cell operator**——监听 CRD，server-side apply/prune StatefulSet/Services/PDB/NetworkPolicy/ConfigMap，为 dedicated-shard leader 打标签供 leader Service 使用，写入 shard/deployment/route/symbol 状态与 conditions。watch 触发即时 reconcile；Kubernetes Lease 保证副本间互斥。
+- **期望状态 manager，而非手工 YAML 堆**——目录校验、最低空闲 slot 与 `httpBasePort + slot` 分配、渲染 StatefulSet/Services/PDB/NetworkPolicy/ConfigMap、reconcile bootstrap/upgrade 计划、审计，以及跨 shard/cell 的引擎控制台代理。
+- **生产 Kubernetes 原语**——四投票 shard、每 Pod 一个 PVC、PDB、NetworkPolicy、headless gRPC service、健康/就绪探针、非 root 镜像和 leader 感知路由元数据。参考 manager、supervisor 与 Lease 选举 operator 均已在本仓库实现；operator 还执行 bootstrap/config/membership、quorum 安全的 containers 增删启停滚动、PVC 保留和跨 shard cutover/rollback。
+
+可运行实现见 [Kubernetes 控制平面 demo](./k8s_control_plane/README.md)，生产 operator 契约见[设计文档](./docs/KUBERNETES_CONTROL_PLANE.md)。
+
+**✅ 值得信赖**
+- **有界公共边缘**：请求体、read key、事件页、幂等 key 和快照大小均有限制，畸形输入在进入 Raft 前被拒绝。
+- **明确的内部服务契约**：仅回环或可信私有网络，TLS/认证由网关负责，并对非回环绑定打印启动告警。
+- **传输故障快速失败**：gRPC 监听器退出时 `run()` 停止节点并返回错误，而不是让半健康的 HTTP API 继续服务无法到达的 peer。
+- **正确性证据**：对照参考模型的随机差分测试、显式订单类型 conformance 用例、确定性回放检查和集群恢复测试。
+- **一个进程/集群一个 symbol**：资源与故障域隔离；通过为每个 symbol 部署一套实例实现水平扩展。
 
 ## 🚀 快速开始
 
@@ -230,29 +278,52 @@ WAL/snapshot；空闲 shard 可删除，并显式选择保留 PVC 或不可逆�
 
 ![Kubernetes 控制平面管理器 GUI](./docs/kubernetes-control-plane.png)
 
+manager GUI 的**撮合引擎**视图：在线 `fx-eu-01` shard 托管 `eurusd` 与 `gbpusd`，均为 Ready，展示每 Pod 请求、放置与释放校验、每进程控制台链接和观测到的 leader。manager 还有**行情**（terminal 与 fast WebSocket 层）与**订单系统**（按用户 ID 分片、Demo 下单台链接和镜像选择器）视图。
+
 ## 🔒 安全与部署边界
 
 HTTP API 和 gRPC Raft 监听器（HTTP 端口 + 1000）按设计是**明文且无认证**的。这是内部撮合引擎，
 不是面向公网的网关：只应运行在回环或可信私有网络，防火墙保护两个端口，并在前面的网关终止 TLS
 和客户端认证。TLS/mTLS 和 API 认证刻意不在本进程实现，因为对内部接口只会增加延迟。
 
-节点绑定非回环地址时会打印警告。请求在进入 Raft 前受限：JSON body 1 MiB、`client_order_id`
-1–128 字节、`/read` key 1–128 可打印 ASCII、`/events` 1–1000 条、长轮询 0–1000 ms、
-`/write_batch` 1–128 条且 `client_order_id` 唯一、gRPC 消息 64 MiB、快照流总量 256 MiB。
-畸形 JSON/非法字段返回 `400`，超大请求体返回 `413`；`client_order_id` 去重表最多 262,144 条。
+节点绑定非回环地址时会打印警告。请求在进入 Raft 前在边缘受限：
 
+| 接口 | 限制 |
+|---|---|
+| 应用/管理 JSON body | 1 MiB (`MAX_REQUEST_BODY_BYTES`) |
+| `client_order_id` | 1–128 字节，ASCII 字母数字加 `. _ - :`；空值拒绝 |
+| `/read` key | 1–128 可打印 ASCII 字节 |
+| `/events` 每页 | 1–1000 条 |
+| `/events` 长轮询 | 0–1000 ms (`wait_ms`) |
+| `/write_batch` | 1–128 条非嵌套请求，`client_order_id` 唯一 |
+| gRPC Raft 消息 | 64 MiB (`MAX_MESSAGE_SIZE`) |
+| gRPC 快照流 | 总量 256 MiB (`MAX_SNAPSHOT_BYTES`)，每块 staging 前校验 |
+
+畸形 JSON 与非法字段返回 `400`；超大请求体返回 `413`。复制的 `client_order_id` 去重表最多保留 262,144 条记录，因此 key 长度上限也限制了其内存占用。
 ## 📊 性能
 
 参考机器（Apple M4、Rust 1.93.1、release bench profile）的主要数据。纯订单簿行不含 HTTP、Raft 和 WAL；
 复制行使用四个进程内 loopback 投票成员并关闭 WAL fsync。方法、分位数、持久化模式和 caveat 见
 [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md)。
 
+**订单簿亮点（2026-11-26）。** 停单、GTD 截止时间和 peg 订单改为索引后，三个原本每次请求都执行的全表扫描被消除：
+
+| 路径 | 之前 | 之后 |
+|---|---:|---:|
+| 纯订单簿真实混合回放（`replay_mix`） | 616k ops/s | **3.09M ops/s**（约 5 倍） |
+| Peg 查找，5k 订单簿、无 peg | ~19 µs/次 apply | **0.41 µs/次**（约 45 倍） |
+| Peg 查找，32 个 peg 订单 | ~16–19 µs/次 apply | **2.3 µs/次** |
+| `apply_path` rest 分配次数 | 3.17/次 | **1.17/次** |
+
+前后数据、新增 benchmark 模式与未完成的条目见
+[订单簿性能审查](./docs/ORDER_BOOK_PERFORMANCE_REVIEW.md)。
+
 | 工作负载 | 结果 |
 |---|---:|
 | 订单簿深扫（100 档） | 11.66M fills/s |
 | 订单簿深度撤单 | 19.63M cancels/s |
 | BBO 推进 / 查询 | 20.37M advances/s / 434.5M queries/s |
-| 真实混合回放（add/cancel/amend/stop/iceberg/taker） | 968,709 ops/s |
+| 真实混合回放（add/cancel/amend/stop/iceberg/taker） | 3.09M ops/s |
 | 复制写入，512 并发（预连接） | 114,484 writes/s，p99 5.76 ms |
 | 复制写入，1,024 并发（预连接） | 99,330 writes/s，p99 8.74 ms |
 | 复制顺序 128 单批量 | 227,319 orders/s |
@@ -261,6 +332,9 @@ HTTP API 和 gRPC Raft 监听器（HTTP 端口 + 1000）按设计是**明文且�
 | 本地 lease follower 读（1 / 64 读者） | 12,564 / 39,473 reads/s；p50 78.4 / 198.1 µs |
 | 本地 lease 事件读（1 / 64 读者） | 8,224 / 45,243 reads/s；p50 118.8 µs / 1.34 ms |
 | 行情 feed（null sink） | 495k fills/s，8,192 帧队列 0 丢弃 |
+| WAL append/read，无 fsync（仅存储） | 2.15M / 5.66M entries/s |
+
+纯订单簿数据是单进程订单簿的最优值，不是端到端容量。四节点数据使用同一进程内的 3-of-4 quorum loopback；它们不模拟跨主机网络延迟、独立磁盘竞争或主机故障。预连接写入在 512–1,024 并发处趋于平稳；早期的连接风暴测试包含 TCP 建连，低估了容量。单节点顺序写入在每次 append 都 fsync 时低得多（262 writes/s），但 100 x 32 批量仍可达 180k orders/s；权衡详见 `PERFORMANCE.md`。
 
 **推荐生产配置。** 最大吞吐：保持 `RAFT_WAL_FSYNC_MS` 未设置（要求至少 4 个投票成员），
 `RAFT_CORE_WORKERS` 未设置，OpenRaft `300/1/0` 默认值，使用 `/write_batch` 32–128 单；默认 1,024
@@ -287,6 +361,7 @@ payload/purge、async WAL 或 thin LTO，它们都没有超过默认配置。详
 - [测试](./docs/zh-CN/TESTING.md) — 集群测试、回放矩阵和故障测试。
 - [性能](./docs/PERFORMANCE.md) — 实测基线和测量方法。
 - [Kubernetes 行情消息总线](./docs/AERON_K8S_MESSAGE_BUS.md) — 行情消息总线、multicast 限制和扩展方案。
+- [实验室可观测性](./docs/OBSERVABILITY.md) — HPA CPU 的 metrics-server、Prometheus 桥接、operator 指标、告警、Grafana 面板和 Loki 日志收集。
 - [交易终端](./trading_terminal/README.md) — React/TS 客户端、部署代理和由 TDengine 种子的图表。
 - [历史 K 线](./docs/HISTORICAL_BARS.md) — TDengine schema、精确小数契约、HA 契约和实测数据；[可交互 Archify 导出](./docs/historical-bars-tdengine.html)与 PNG 预览已一并检入。
 - [Runbook](./docs/zh-CN/RUNBOOK.md) — 集群、升级、迁移和恢复流程。
