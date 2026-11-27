@@ -27,11 +27,14 @@ use crate::bundle::ShardBundle;
 use crate::error::ApiError;
 use crate::model::dns_label;
 use crate::model::{
-    Cell, DeploymentState, MarketDataService, OrderSystem, Release, SymbolDeployment, SymbolRoute,
-    SymbolShard, TradingSymbol,
+    Cell, DeploymentState, MarketDataService, MarketDataServiceSpec, OrderSystem, Release,
+    SymbolDeployment, SymbolRoute, SymbolShard, TradingSymbol,
 };
 use crate::provision::{self, CreateSymbolRequest};
-use crate::reconcile::{Action, PlanStep, ReconcilePlan, Scenario, ShardObservation, summarize};
+use crate::reconcile::{
+    Action, MarketDataObservation, MarketDataScenario, PlanStep, ReconcilePlan, Scenario,
+    ShardObservation, summarize,
+};
 use crate::render::{
     Profile, RenderOptions, as_list, render_market_data_service, render_order_system, render_shard,
 };
@@ -96,7 +99,7 @@ pub fn router_with_options(store: Arc<Store>, console: ConsoleOptions) -> Router
         )
         .route(
             "/api/v1/market-data-services/{name}",
-            get(market_data_service_detail),
+            get(market_data_service_detail).put(edit_market_data_service),
         )
         .route(
             "/api/v1/market-data-services/{name}/manifests",
@@ -105,6 +108,18 @@ pub fn router_with_options(store: Arc<Store>, console: ConsoleOptions) -> Router
         .route(
             "/api/v1/market-data-services/{name}/upgrade",
             post(upgrade_market_data),
+        )
+        .route(
+            "/api/v1/market-data-services/{name}/rollback",
+            post(rollback_market_data),
+        )
+        .route(
+            "/api/v1/market-data-services/{name}/scale",
+            post(scale_market_data),
+        )
+        .route(
+            "/api/v1/market-data-services/{name}/plan",
+            get(market_data_plan).post(post_market_data_plan),
         )
         .route(
             "/api/v1/order-systems",
@@ -439,6 +454,272 @@ async fn upgrade_market_data(
         })
         .await?;
     Ok(Json(json!({ "upgrade": upgrade })))
+}
+
+#[derive(Debug, Deserialize)]
+struct EditMarketDataServiceRequest {
+    spec: MarketDataServiceSpec,
+}
+
+/// Edit the desired spec of a market-data service. Image and release are owned by the
+/// upgrade/rollback endpoints and are silently preserved, so a GUI can submit the whole spec it
+/// loaded without accidentally scheduling a rollout.
+async fn edit_market_data_service(
+    State(store): State<Arc<Store>>,
+    Path(name): Path<String>,
+    Json(request): Json<EditMarketDataServiceRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let mut updated = None;
+    store
+        .mutate(|catalog| {
+            let existing = catalog.market_data_services.get(&name).cloned().ok_or_else(|| {
+                ApiError::not_found(
+                    "market_data_not_found",
+                    format!("unknown market-data service {name}"),
+                )
+            })?;
+            let mut spec = request.spec;
+            if spec.replicas == 0 {
+                return Err(ApiError::bad_request(
+                    "invalid_replicas",
+                    "spec.replicas must be greater than zero",
+                ));
+            }
+            let image = existing.spec.image.clone();
+            let release = existing.spec.release.clone();
+            spec.image = image.clone();
+            spec.release = release.clone();
+            let service = MarketDataService {
+                name: existing.name.clone(),
+                namespace: existing.namespace.clone(),
+                spec,
+                status: existing.status,
+            };
+            catalog.market_data_services.insert(name.clone(), service.clone());
+            let mut scope = BTreeSet::new();
+            scope.insert(name.clone());
+            let report = validate_catalog(catalog).scoped(&scope);
+            if !report.is_ok() {
+                return Err(ApiError::unprocessable(report));
+            }
+            catalog.audit(
+                "api",
+                "edit-market-data",
+                &name,
+                format!(
+                    "updated market-data spec; kept image {image} and release wire v{} snapshot v{}",
+                    release.wire_version, release.snapshot_version
+                ),
+            );
+            updated = Some(service);
+            Ok(())
+        })
+        .await?;
+    Ok(Json(json!({ "marketDataService": updated })))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ScaleMarketDataRequest {
+    replicas: u32,
+    #[serde(default)]
+    min_replicas: Option<u32>,
+    #[serde(default)]
+    max_replicas: Option<u32>,
+}
+
+fn bounded_u16(value: u32, field: &str) -> Result<u16, ApiError> {
+    u16::try_from(value).map_err(|_| {
+        ApiError::bad_request(
+            field,
+            format!(
+                "{field} must be between 0 and {} for a Deployment",
+                u16::MAX
+            ),
+        )
+    })
+}
+
+async fn scale_market_data(
+    State(store): State<Arc<Store>>,
+    Path(name): Path<String>,
+    Json(request): Json<ScaleMarketDataRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let mut updated = None;
+    store
+        .mutate(|catalog| {
+            let service = catalog.market_data_services.get(&name).cloned().ok_or_else(|| {
+                ApiError::not_found(
+                    "market_data_not_found",
+                    format!("unknown market-data service {name}"),
+                )
+            })?;
+            let replicas = bounded_u16(request.replicas, "replicas")?;
+            if replicas == 0 && !service.spec.paused {
+                return Err(ApiError::bad_request(
+                    "invalid_replicas",
+                    "replicas must be greater than zero; pause the service to scale to zero",
+                ));
+            }
+            let min_replicas = match request.min_replicas {
+                Some(value) => {
+                    let min = bounded_u16(value, "min_replicas")?;
+                    if min == 0 {
+                        return Err(ApiError::bad_request(
+                            "invalid_min_replicas",
+                            "min_replicas must be greater than zero",
+                        ));
+                    }
+                    min
+                }
+                None => service.spec.autoscaling.min_replicas,
+            };
+            let max_replicas = match request.max_replicas {
+                Some(value) => bounded_u16(value, "max_replicas")?,
+                None => service.spec.autoscaling.max_replicas,
+            };
+            if max_replicas > 0 && (min_replicas > replicas || replicas > max_replicas) {
+                return Err(ApiError::bad_request(
+                    "invalid_replica_bounds",
+                    format!(
+                        "replicas {replicas} must be between minReplicas {min_replicas} and maxReplicas {max_replicas}"
+                    ),
+                ));
+            }
+            let target = catalog.market_data_services.get_mut(&name).ok_or_else(|| {
+                ApiError::not_found(
+                    "market_data_not_found",
+                    format!("unknown market-data service {name}"),
+                )
+            })?;
+            target.spec.replicas = replicas;
+            target.spec.autoscaling.min_replicas = min_replicas;
+            target.spec.autoscaling.max_replicas = max_replicas;
+            let scaled = target.clone();
+            let mut scope = BTreeSet::new();
+            scope.insert(name.clone());
+            let report = validate_catalog(catalog).scoped(&scope);
+            if !report.is_ok() {
+                return Err(ApiError::unprocessable(report));
+            }
+            catalog.audit(
+                "api",
+                "scale-market-data",
+                &name,
+                format!(
+                    "scaled {name} to {replicas} replicas (HPA {min_replicas}..{}); release and image unchanged",
+                    if max_replicas == 0 {
+                        "derived".to_string()
+                    } else {
+                        max_replicas.to_string()
+                    }
+                ),
+            );
+            updated = Some(scaled);
+            Ok(())
+        })
+        .await?;
+    Ok(Json(json!({ "marketDataService": updated })))
+}
+
+/// Roll back a market-data service to the image/release saved by the last update. The response
+/// uses the same `{ "upgrade": ... }` shape as `/upgrade` so callers can share one lifecycle UI.
+async fn rollback_market_data(
+    State(store): State<Arc<Store>>,
+    Path(name): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let mut rollback = None;
+    store
+        .mutate(|catalog| {
+            rollback = Some(provision::rollback_market_data_service(catalog, &name)?);
+            Ok(())
+        })
+        .await?;
+    Ok(Json(json!({ "upgrade": rollback })))
+}
+
+/// Read-only plan preview for a market-data service. `?scenario=` synthesises an observation;
+/// there is no store mutation and no Kubernetes call.
+async fn market_data_plan(
+    State(store): State<Arc<Store>>,
+    Path(name): Path<String>,
+    Query(query): Query<ScenarioQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let catalog = store.snapshot();
+    let scenario = query
+        .scenario
+        .as_deref()
+        .map(MarketDataScenario::parse)
+        .transpose()?
+        .unwrap_or(MarketDataScenario::Ready);
+    let observation = crate::reconcile::simulate_market_data(&catalog, &name, scenario)?;
+    let plan = crate::reconcile::plan_market_data(
+        &catalog,
+        &name,
+        &observation,
+        query.target_image.as_deref(),
+        query.target_release().as_ref(),
+    )?;
+    Ok(Json(plan_value(&plan)))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MarketDataPlanRequest {
+    /// Explicit observation; when absent a scenario is simulated.
+    #[serde(default)]
+    observation: Option<MarketDataObservation>,
+    #[serde(default)]
+    scenario: Option<String>,
+    #[serde(default)]
+    target_image: Option<String>,
+    #[serde(default)]
+    target_release: Option<Release>,
+}
+
+async fn post_market_data_plan(
+    State(store): State<Arc<Store>>,
+    Path(name): Path<String>,
+    Json(request): Json<MarketDataPlanRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let catalog = store.snapshot();
+    let observation = match request.observation {
+        Some(mut observation) => {
+            if !observation.service.is_empty() && observation.service != name {
+                return Err(ApiError::bad_request(
+                    "observation_service",
+                    format!(
+                        "observation is for {} but the path is {name}",
+                        observation.service
+                    ),
+                ));
+            }
+            if observation.service.is_empty() {
+                observation.service = name.clone();
+            }
+            if observation.now == 0 {
+                observation.now = now_epoch();
+            }
+            observation
+        }
+        None => {
+            let scenario = request
+                .scenario
+                .as_deref()
+                .map(MarketDataScenario::parse)
+                .transpose()?
+                .unwrap_or(MarketDataScenario::Ready);
+            crate::reconcile::simulate_market_data(&catalog, &name, scenario)?
+        }
+    };
+    let plan = crate::reconcile::plan_market_data(
+        &catalog,
+        &name,
+        &observation,
+        request.target_image.as_deref(),
+        request.target_release.as_ref(),
+    )?;
+    Ok(Json(plan_value(&plan)))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1728,6 +2009,24 @@ mod tests {
         (status, value)
     }
 
+    async fn put_json_to(app: Router, uri: &str, body: Value) -> (StatusCode, Value) {
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let value: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        (status, value)
+    }
+
     async fn get_json_from(app: Router, uri: &str) -> (StatusCode, Value) {
         let response = app
             .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
@@ -2044,6 +2343,299 @@ mod tests {
                 .iter()
                 .all(|image| image["repository"] == "registry.example.com/matchengine-marketdata")
         );
+    }
+
+    #[tokio::test]
+    async fn market_data_edit_updates_spec_and_preserves_image_release_and_status() {
+        let app = app();
+        create_btc_market_data(app.clone()).await;
+        let (status, _) = post_json_to(
+            app.clone(),
+            "/api/v1/market-data-services/btc-marketdata/upgrade",
+            json!({ "image": "registry.example.com/matchengine-marketdata@sha256:def" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (_, detail) =
+            get_json_from(app.clone(), "/api/v1/market-data-services/btc-marketdata").await;
+        let mut spec = detail["marketDataService"]["spec"].clone();
+        spec["replicas"] = json!(3);
+        spec["image"] = json!("registry.example.com/matchengine-marketdata@sha256:submitted");
+        spec["release"]["wireVersion"] = json!(8);
+        let (status, body) = put_json_to(
+            app.clone(),
+            "/api/v1/market-data-services/btc-marketdata",
+            json!({
+                "name": "wrong-name",
+                "namespace": "other-namespace",
+                "spec": spec,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let service = &body["marketDataService"];
+        assert_eq!(service["name"], "btc-marketdata");
+        assert_eq!(service["namespace"], "match-eu-1");
+        assert_eq!(service["spec"]["replicas"], 3);
+        assert_eq!(
+            service["spec"]["image"],
+            "registry.example.com/matchengine-marketdata@sha256:def"
+        );
+        assert_eq!(service["spec"]["release"]["wireVersion"], 7);
+        assert_eq!(
+            service["status"]["previousImage"],
+            "registry.example.com/matchengine-marketdata@sha256:abc"
+        );
+        assert_eq!(service["status"]["phase"], "Pending");
+    }
+
+    #[tokio::test]
+    async fn market_data_edit_rejects_zero_replicas() {
+        let app = app();
+        create_btc_market_data(app.clone()).await;
+        let (_, detail) =
+            get_json_from(app.clone(), "/api/v1/market-data-services/btc-marketdata").await;
+        let mut spec = detail["marketDataService"]["spec"].clone();
+        spec["replicas"] = json!(0);
+        let (status, body) = put_json_to(
+            app,
+            "/api/v1/market-data-services/btc-marketdata",
+            json!({ "spec": spec }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"], "invalid_replicas");
+    }
+
+    #[tokio::test]
+    async fn market_data_scale_updates_replicas_and_bounds() {
+        let app = app();
+        create_btc_market_data(app.clone()).await;
+        let (status, body) = post_json_to(
+            app.clone(),
+            "/api/v1/market-data-services/btc-marketdata/scale",
+            json!({ "replicas": 4, "minReplicas": 2, "maxReplicas": 6 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["marketDataService"]["spec"]["replicas"], 4);
+        assert_eq!(
+            body["marketDataService"]["spec"]["autoscaling"]["minReplicas"],
+            2
+        );
+        assert_eq!(
+            body["marketDataService"]["spec"]["autoscaling"]["maxReplicas"],
+            6
+        );
+
+        for (request, error) in [
+            (json!({ "replicas": 0 }), "invalid_replicas"),
+            (
+                json!({ "replicas": 4, "minReplicas": 0 }),
+                "invalid_min_replicas",
+            ),
+            (
+                json!({ "replicas": 4, "minReplicas": 2, "maxReplicas": 3 }),
+                "invalid_replica_bounds",
+            ),
+        ] {
+            let (status, body) = post_json_to(
+                app.clone(),
+                "/api/v1/market-data-services/btc-marketdata/scale",
+                request,
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(body["error"], error);
+        }
+        let (_, detail) = get_json_from(app, "/api/v1/market-data-services/btc-marketdata").await;
+        assert_eq!(detail["marketDataService"]["spec"]["replicas"], 4);
+    }
+
+    #[tokio::test]
+    async fn market_data_scale_allows_zero_when_paused() {
+        let app = app();
+        create_btc_market_data(app.clone()).await;
+        let (_, detail) =
+            get_json_from(app.clone(), "/api/v1/market-data-services/btc-marketdata").await;
+        let mut spec = detail["marketDataService"]["spec"].clone();
+        spec["paused"] = json!(true);
+        let (status, body) = put_json_to(
+            app.clone(),
+            "/api/v1/market-data-services/btc-marketdata",
+            json!({ "spec": spec }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let (status, body) = post_json_to(
+            app,
+            "/api/v1/market-data-services/btc-marketdata/scale",
+            json!({ "replicas": 0 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["marketDataService"]["spec"]["replicas"], 0);
+    }
+
+    #[tokio::test]
+    async fn market_data_upgrade_rollback_is_reversible() {
+        let app = app();
+        create_btc_market_data(app.clone()).await;
+        let (status, _) = post_json_to(
+            app.clone(),
+            "/api/v1/market-data-services/btc-marketdata/upgrade",
+            json!({ "image": "registry.example.com/matchengine-marketdata@sha256:def" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, body) = post_json_to(
+            app.clone(),
+            "/api/v1/market-data-services/btc-marketdata/rollback",
+            json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["upgrade"]["image"],
+            "registry.example.com/matchengine-marketdata@sha256:abc"
+        );
+        let (_, detail) =
+            get_json_from(app.clone(), "/api/v1/market-data-services/btc-marketdata").await;
+        assert_eq!(
+            detail["marketDataService"]["spec"]["image"],
+            "registry.example.com/matchengine-marketdata@sha256:abc"
+        );
+        assert_eq!(
+            detail["marketDataService"]["status"]["previousImage"],
+            "registry.example.com/matchengine-marketdata@sha256:def"
+        );
+
+        let (status, body) = post_json_to(
+            app.clone(),
+            "/api/v1/market-data-services/btc-marketdata/rollback",
+            json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["upgrade"]["image"],
+            "registry.example.com/matchengine-marketdata@sha256:def"
+        );
+
+        let (_, audit) = get_json_from(app, "/api/v1/audit?limit=50").await;
+        let rollback = audit["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["action"] == "rollback-market-data")
+            .expect("rollback audit entry");
+        assert!(
+            rollback["detail"].as_str().unwrap().contains("@sha256:def")
+                && rollback["detail"].as_str().unwrap().contains("@sha256:abc")
+        );
+    }
+
+    #[tokio::test]
+    async fn market_data_rollback_without_previous_image_is_rejected() {
+        let app = app();
+        create_btc_market_data(app.clone()).await;
+        let (status, body) = post_json_to(
+            app,
+            "/api/v1/market-data-services/btc-marketdata/rollback",
+            json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"], "previous_image_missing");
+    }
+
+    #[tokio::test]
+    async fn market_data_plan_get_and_post_return_steps_and_summary() {
+        let app = app();
+        create_btc_market_data(app.clone()).await;
+        let (status, body) = get_json_from(
+            app.clone(),
+            "/api/v1/market-data-services/btc-marketdata/plan?scenario=behind",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["plan"]["phase"], "upgrading");
+        assert!(
+            body["plan"]["steps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|step| step["action"] == "roll-deployment")
+        );
+        assert!(
+            body["summary"]
+                .as_str()
+                .unwrap()
+                .contains("roll-deployment")
+        );
+
+        let (status, body) = get_json_from(
+            app.clone(),
+            "/api/v1/market-data-services/btc-marketdata/plan?scenario=fresh",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["plan"]["phase"], "provisioning");
+        assert!(
+            body["plan"]["steps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|step| step["action"] == "render-manifests")
+        );
+
+        let (status, body) = post_json_to(
+            app.clone(),
+            "/api/v1/market-data-services/btc-marketdata/plan",
+            json!({
+                "observation": {
+                    "service": "btc-marketdata",
+                    "cell": "eu-1",
+                    "image": "registry.example.com/matchengine-marketdata@sha256:abc",
+                    "release": { "wireVersion": 7, "snapshotVersion": 11, "mixedVersionSafe": false },
+                    "replicas": 2,
+                    "readyReplicas": 2,
+                    "updatedReplicas": 2,
+                    "available": true,
+                    "deploymentExists": true,
+                    "feedReady": true,
+                    "symbols": [{
+                        "name": "btcusdt",
+                        "ready": true,
+                        "feedLag": 1000,
+                        "lastFrameAgeMs": 1000,
+                        "subscribers": 1,
+                        "drops": 0
+                    }],
+                    "hpaMinReplicas": 1,
+                    "hpaMaxReplicas": 0
+                },
+                "targetImage": "registry.example.com/matchengine-marketdata@sha256:def"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["plan"]["phase"], "upgrading");
+        assert_eq!(
+            body["plan"]["targetImage"],
+            "registry.example.com/matchengine-marketdata@sha256:def"
+        );
+
+        let (status, body) = get_json_from(
+            app,
+            "/api/v1/market-data-services/btc-marketdata/plan?scenario=nope",
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"], "market_data_scenario");
     }
 
     #[tokio::test]

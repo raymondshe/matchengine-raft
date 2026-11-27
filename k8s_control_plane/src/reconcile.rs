@@ -20,11 +20,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::ApiError;
 use crate::model::{
-    Release, SymbolDeployment, SymbolRoute, SymbolShard, TradingSymbol, UpgradeStrategy,
-    desired_config_hash,
+    MarketDataSymbolStatus, Release, SymbolDeployment, SymbolRoute, SymbolShard, TradingSymbol,
+    UpgradeStrategy, desired_config_hash,
 };
-use crate::render::rolling_upgrade_safe;
+use crate::render::{render_market_data_service, rolling_upgrade_safe};
 use crate::store::{Catalog, now_epoch};
+use crate::validate::validate_catalog;
 
 const BACKUP_FRESHNESS_SECS: u64 = 24 * 60 * 60;
 
@@ -90,6 +91,54 @@ impl ShardObservation {
     }
 }
 
+/// Read-only view of one market-data deployment. The operator assembles this from the
+/// Deployment, one running pod and its `/ready` + `/metrics` endpoints; the manager's plan API
+/// accepts the same shape so a human can replay a real observation without touching a cluster.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MarketDataObservation {
+    /// Service name. Empty is allowed in an explicit POST body; the path supplies it.
+    #[serde(default)]
+    pub service: String,
+    #[serde(default)]
+    pub cell: String,
+    /// Image running on the observed pod. Empty when no Deployment exists yet.
+    #[serde(default)]
+    pub image: String,
+    /// Release reported by pod annotations, when the operator could read one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release: Option<Release>,
+    #[serde(default)]
+    pub replicas: u16,
+    #[serde(default)]
+    pub ready_replicas: u16,
+    #[serde(default)]
+    pub updated_replicas: u16,
+    #[serde(default)]
+    pub available: bool,
+    /// False only before the operator has applied the first Deployment.
+    #[serde(default)]
+    pub deployment_exists: bool,
+    #[serde(default)]
+    pub paused: bool,
+    #[serde(default)]
+    pub symbols: Vec<MarketDataSymbolStatus>,
+    #[serde(default)]
+    pub feed_ready: bool,
+    /// Effective HPA bounds observed on the workload; `None` defers to the CRD spec.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hpa_min_replicas: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hpa_max_replicas: Option<u16>,
+    #[serde(default)]
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// Unix seconds for last-frame age checks; `0` defers to the heartbeat timeout only.
+    #[serde(default)]
+    pub now: u64,
+}
+
 /// A concrete step the operator would take. `detail` is human-readable; `voters` carries the
 /// exact `/init` or `/change-membership` payload.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -135,6 +184,18 @@ pub enum Action {
     PauseTraffic,
     /// Patch `SymbolRoute`/`SymbolDeployment` status with the observed leader.
     PublishRoute,
+    /// Preflight the catalog and target release (also used by market-data plans).
+    ValidateCatalog,
+    /// Server-side apply one rendered market-data object (ConfigMap, Deployment, ...).
+    RenderManifests,
+    /// Adjust replicas or HPA bounds on a market-data Deployment.
+    ScaleDeployment,
+    /// Replace market-data pods with the target image under `maxUnavailable: 0`.
+    RollDeployment,
+    /// Probe `/ready` and `/metrics` for every declared symbol.
+    VerifyFeed,
+    /// Write the resulting status back to the CRD.
+    WriteStatus,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -149,6 +210,10 @@ pub enum PlanPhase {
     Configuring,
     Upgrading,
     Ready,
+    /// Market-data: the operator still needs to apply the rendered objects.
+    Provisioning,
+    /// Market-data: observed replicas sit outside the effective HPA bounds.
+    Scaling,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -864,6 +929,414 @@ pub fn simulate(
     })
 }
 
+// ---------------------------------------------------------------------------
+// Market-data service planning (read-only)
+// ---------------------------------------------------------------------------
+
+/// Scenario the market-data plan API can simulate without a cluster.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MarketDataScenario {
+    /// No Deployment applied yet.
+    Fresh,
+    /// Pods ready and every symbol fed.
+    Ready,
+    /// Ready service still running the previous image.
+    Behind,
+    /// Deployment ready but one or more symbol feeds stale.
+    Degraded,
+    /// Service paused by spec; the renderer scales it to zero.
+    Paused,
+}
+
+impl MarketDataScenario {
+    pub fn parse(value: &str) -> Result<Self, ApiError> {
+        match value {
+            "fresh" => Ok(Self::Fresh),
+            "ready" | "healthy" => Ok(Self::Ready),
+            "behind" | "upgrade" => Ok(Self::Behind),
+            "degraded" => Ok(Self::Degraded),
+            "paused" => Ok(Self::Paused),
+            other => Err(ApiError::bad_request(
+                "market_data_scenario",
+                format!("unknown scenario {other:?}; use fresh|ready|behind|degraded|paused"),
+            )),
+        }
+    }
+}
+
+const DEMO_MARKET_DATA_PREVIOUS_IMAGE: &str =
+    "registry.example.com/matchengine-marketdata:arm64-v3";
+
+/// Synthesize a market-data observation for the demo API. No store or Kubernetes call is made.
+pub fn simulate_market_data(
+    catalog: &Catalog,
+    name: &str,
+    scenario: MarketDataScenario,
+) -> Result<MarketDataObservation, ApiError> {
+    let service = catalog.market_data_services.get(name).ok_or_else(|| {
+        ApiError::not_found(
+            "market_data_not_found",
+            format!("unknown market-data service {name}"),
+        )
+    })?;
+    let paused = service.spec.paused || scenario == MarketDataScenario::Paused;
+    let fresh = scenario == MarketDataScenario::Fresh;
+    let degraded = scenario == MarketDataScenario::Degraded;
+    let replicas = if paused || fresh {
+        0
+    } else {
+        service.spec.replicas.max(service.spec.min_replicas())
+    };
+    let ready_replicas = if paused || fresh || degraded {
+        0
+    } else {
+        replicas
+    };
+    let image = match scenario {
+        MarketDataScenario::Fresh => String::new(),
+        MarketDataScenario::Behind => DEMO_MARKET_DATA_PREVIOUS_IMAGE.to_string(),
+        _ => service.spec.image.clone(),
+    };
+    let release = if scenario == MarketDataScenario::Behind {
+        service
+            .status
+            .previous_release
+            .clone()
+            .or_else(|| Some(service.spec.release.clone()))
+    } else {
+        Some(service.spec.release.clone())
+    };
+    let symbols: Vec<MarketDataSymbolStatus> = catalog
+        .market_data_symbols(service)
+        .into_iter()
+        .map(|symbol| MarketDataSymbolStatus {
+            ready: !paused && !fresh && !degraded,
+            last_frame_age_ms: if degraded { 90_000 } else { 1_000 },
+            subscribers: if paused || fresh || degraded { 0 } else { 1 },
+            name: symbol,
+            ..MarketDataSymbolStatus::default()
+        })
+        .collect();
+    let feed_ready = !symbols.is_empty() && symbols.iter().all(|symbol| symbol.ready);
+    let message = match scenario {
+        MarketDataScenario::Fresh => "Deployment has not been created yet".to_string(),
+        MarketDataScenario::Paused => "paused by spec".to_string(),
+        MarketDataScenario::Degraded => "feed not ready".to_string(),
+        MarketDataScenario::Behind => "running an older image".to_string(),
+        MarketDataScenario::Ready => String::new(),
+    };
+    Ok(MarketDataObservation {
+        service: name.to_string(),
+        cell: service.spec.cell.clone(),
+        image,
+        release,
+        replicas,
+        ready_replicas,
+        updated_replicas: if scenario == MarketDataScenario::Behind {
+            0
+        } else {
+            replicas
+        },
+        available: !paused && !fresh,
+        deployment_exists: !fresh,
+        paused,
+        symbols,
+        feed_ready,
+        hpa_min_replicas: Some(service.spec.autoscaling.min_replicas),
+        hpa_max_replicas: Some(service.spec.autoscaling.max_replicas),
+        message,
+        error: None,
+        now: now_epoch(),
+    })
+}
+
+fn market_data_step(
+    action: Action,
+    target: impl Into<String>,
+    detail: impl Into<String>,
+) -> PlanStep {
+    PlanStep {
+        action,
+        target: target.into(),
+        endpoint: String::new(),
+        voters: Vec::new(),
+        detail: detail.into(),
+    }
+}
+
+/// Build a read-only plan for one market-data service from an explicit observation.
+///
+/// `ReconcilePlan.shard` carries the service name so the response shape stays identical to the
+/// shard plan endpoint. The plan follows the operator's real order: validate, render, roll with
+/// `maxUnavailable: 0`, verify each feed and write status.
+pub fn plan_market_data(
+    catalog: &Catalog,
+    name: &str,
+    observation: &MarketDataObservation,
+    target_image: Option<&str>,
+    target_release: Option<&Release>,
+) -> Result<ReconcilePlan, ApiError> {
+    let service = catalog.market_data_services.get(name).ok_or_else(|| {
+        ApiError::not_found(
+            "market_data_not_found",
+            format!("unknown market-data service {name}"),
+        )
+    })?;
+    if !observation.service.is_empty() && observation.service != name {
+        return Err(ApiError::bad_request(
+            "observation_service",
+            format!(
+                "observation is for {} but the path is {name}",
+                observation.service
+            ),
+        ));
+    }
+    let image = target_image
+        .unwrap_or(&service.spec.image)
+        .trim()
+        .to_string();
+    if image.is_empty() {
+        return Err(ApiError::bad_request(
+            "target_image",
+            "target image must not be empty",
+        ));
+    }
+    let release = target_release.unwrap_or(&service.spec.release).clone();
+    if release.wire_version == 0 || release.snapshot_version == 0 {
+        return Err(ApiError::bad_request(
+            "target_release",
+            "wireVersion and snapshotVersion must be greater than zero",
+        ));
+    }
+
+    // Plan against the target spec without mutating the catalog: the same validation and the
+    // same renderer the operator uses decide which objects would be applied.
+    let mut candidate = catalog.clone();
+    if let Some(target) = candidate.market_data_services.get_mut(name) {
+        target.spec.image = image.clone();
+        target.spec.release = release.clone();
+    }
+    let mut scope = BTreeSet::new();
+    scope.insert(name.to_string());
+    let report = validate_catalog(&candidate).scoped(&scope);
+    let mut blocked: Vec<String> = report
+        .errors
+        .iter()
+        .map(|issue| issue.message.clone())
+        .collect();
+    let objects = if blocked.is_empty() {
+        match render_market_data_service(&candidate, name, None) {
+            Ok(objects) => objects,
+            Err(error) => {
+                blocked.push(error.message);
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+
+    let mut plan = ReconcilePlan {
+        shard: name.to_string(),
+        phase: PlanPhase::Blocked,
+        steps: Vec::new(),
+        blocked,
+        notes: vec![
+            "market-data services are stateless: no leader transfer, snapshot install or quorum gate"
+                .to_string(),
+            "the operator rolls the Deployment with maxUnavailable: 0 and maxSurge: 1; the preStop hook drains WebSocket clients"
+                .to_string(),
+        ],
+        target_image: image.clone(),
+    };
+    plan.steps.push(market_data_step(
+        Action::ValidateCatalog,
+        name,
+        if plan.blocked.is_empty() {
+            format!(
+                "validate the catalog and target release (wire v{}, snapshot v{}) before applying objects",
+                release.wire_version, release.snapshot_version
+            )
+        } else {
+            format!("catalog validation failed: {}", plan.blocked.join("; "))
+        },
+    ));
+    if !plan.blocked.is_empty() {
+        return Ok(plan);
+    }
+
+    let kinds: Vec<String> = objects
+        .iter()
+        .map(|object| {
+            object
+                .get("kind")
+                .and_then(|kind| kind.as_str())
+                .unwrap_or("object")
+                .to_string()
+        })
+        .collect();
+    plan.notes
+        .push(format!("rendered objects: {}", kinds.join(", ")));
+
+    let active = catalog.market_data_symbols(service);
+    let write_status = || {
+        market_data_step(
+            Action::WriteStatus,
+            name,
+            format!(
+                "write {name} status with replica, per-symbol readiness and frame ages into the CRD"
+            ),
+        )
+    };
+    if active.is_empty() {
+        plan.phase = PlanPhase::Reserved;
+        plan.notes.push(
+            "no active symbols: the renderer scales the Deployment to zero and omits the HPA"
+                .to_string(),
+        );
+        plan.steps.push(market_data_step(
+            Action::PauseTraffic,
+            name,
+            format!("scale {name} to zero replicas; no feed is expected until a symbol starts"),
+        ));
+        plan.steps.push(write_status());
+        return Ok(plan);
+    }
+
+    if service.spec.paused || observation.paused {
+        plan.phase = PlanPhase::Paused;
+        plan.steps.push(market_data_step(
+            Action::PauseTraffic,
+            name,
+            format!("keep {name} scaled to zero while paused; no image rollout is attempted"),
+        ));
+        plan.steps.push(write_status());
+        return Ok(plan);
+    }
+
+    if !observation.deployment_exists || observation.replicas == 0 {
+        plan.phase = PlanPhase::Provisioning;
+        for (object, kind) in objects.iter().zip(kinds.iter()) {
+            let object_name = object
+                .get("metadata")
+                .and_then(|metadata| metadata.get("name"))
+                .and_then(|value| value.as_str())
+                .unwrap_or(name);
+            plan.steps.push(market_data_step(
+                Action::RenderManifests,
+                format!("{kind}/{object_name}"),
+                format!("server-side apply the {kind} rendered for {name}"),
+            ));
+        }
+        plan.steps.push(market_data_step(
+            Action::WaitForPods,
+            name,
+            format!("wait for a running {name} pod before probing /ready and /metrics"),
+        ));
+    } else {
+        let behind = observation.image != image
+            || observation
+                .release
+                .as_ref()
+                .is_some_and(|observed| observed != &release);
+        let unready = observation.ready_replicas < observation.replicas;
+        let hpa_min = observation
+            .hpa_min_replicas
+            .unwrap_or(service.spec.min_replicas());
+        // `0` is the CRD sentinel for "derive from spec.replicas", not a real upper bound.
+        let hpa_max = observation
+            .hpa_max_replicas
+            .filter(|max| *max > 0)
+            .unwrap_or(service.spec.max_replicas());
+        let scaling = observation.replicas < hpa_min || observation.replicas > hpa_max;
+        if unready {
+            plan.phase = PlanPhase::Blocked;
+            plan.blocked.push(format!(
+                "{} of {} replicas are not ready",
+                observation.replicas - observation.ready_replicas,
+                observation.replicas
+            ));
+            plan.steps.push(market_data_step(
+                Action::WaitForPods,
+                name,
+                format!(
+                    "wait for {} ready replicas before any rollout or scale action",
+                    observation.replicas
+                ),
+            ));
+        } else if behind {
+            plan.phase = PlanPhase::Upgrading;
+            for pod in 0..observation.replicas {
+                plan.steps.push(market_data_step(
+                    Action::RollDeployment,
+                    format!("{name}#{pod}"),
+                    format!(
+                        "replace observed pod {} with image {image} under maxUnavailable: 0 / maxSurge: 1",
+                        pod + 1
+                    ),
+                ));
+            }
+            plan.notes.push(
+                "the preStop hook drains existing WebSocket connections before each replacement"
+                    .to_string(),
+            );
+        } else if scaling {
+            plan.phase = PlanPhase::Scaling;
+            plan.steps.push(market_data_step(
+                Action::ScaleDeployment,
+                name,
+                format!(
+                    "move observed replicas {} into the HPA bounds {hpa_min}..{hpa_max}",
+                    observation.replicas
+                ),
+            ));
+        } else {
+            plan.phase = PlanPhase::Ready;
+        }
+    }
+
+    let heartbeat_ms = service
+        .spec
+        .websocket
+        .heartbeat_timeout_secs
+        .saturating_mul(1_000);
+    let stale: Vec<&str> = observation
+        .symbols
+        .iter()
+        .filter(|symbol| !symbol.ready || symbol.last_frame_age_ms > heartbeat_ms)
+        .map(|symbol| symbol.name.as_str())
+        .collect();
+    let feed_detail = if stale.is_empty() {
+        format!(
+            "probe /ready and /metrics: {} symbols ready within the heartbeat window",
+            observation.symbols.len()
+        )
+    } else {
+        format!(
+            "probe /ready and /metrics: stale or unready feeds for {}",
+            stale.join(", ")
+        )
+    };
+    plan.steps
+        .push(market_data_step(Action::VerifyFeed, name, feed_detail));
+    if !stale.is_empty() || !observation.feed_ready {
+        if plan.phase == PlanPhase::Ready {
+            plan.phase = PlanPhase::Blocked;
+        }
+        plan.blocked.push(format!(
+            "feed not ready for {}",
+            if stale.is_empty() {
+                "no symbol reported ready".to_string()
+            } else {
+                stale.join(", ")
+            }
+        ));
+    }
+    plan.steps.push(write_status());
+    Ok(plan)
+}
+
 /// Patch route status from an observation. The operator does this after a plan's
 /// `PublishRoute` step; the demo API uses it to keep the GUI's leader column honest.
 pub fn apply_observed_routes(catalog: &mut Catalog, observation: &ShardObservation) {
@@ -949,16 +1422,61 @@ pub fn action_name(action: Action) -> &'static str {
         Action::Backup => "backup",
         Action::PauseTraffic => "pause-traffic",
         Action::PublishRoute => "publish-route",
+        Action::ValidateCatalog => "validate-catalog",
+        Action::RenderManifests => "render-manifests",
+        Action::ScaleDeployment => "scale-deployment",
+        Action::RollDeployment => "roll-deployment",
+        Action::VerifyFeed => "verify-feed",
+        Action::WriteStatus => "write-status",
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{MarketDataService, MarketDataServiceSpec, MarketDataTransport};
     use crate::store::demo_catalog;
 
     fn catalog() -> Catalog {
         demo_catalog()
+    }
+
+    fn market_data_catalog() -> Catalog {
+        let mut catalog = catalog();
+        let service = MarketDataService {
+            name: "fx-marketdata".to_string(),
+            namespace: "match-eu-1".to_string(),
+            spec: MarketDataServiceSpec {
+                cell: "eu-1".to_string(),
+                symbols: vec!["eurusd".to_string(), "gbpusd".to_string()],
+                feed_groups: Vec::new(),
+                image: "registry.example.com/matchengine-marketdata@sha256:abc".to_string(),
+                release: Release::default(),
+                replicas: 2,
+                transport: MarketDataTransport {
+                    channel: Some(
+                        "aeron:udp?endpoint=239.1.2.11:24001|interface={pod_ip}|ttl=1".to_string(),
+                    ),
+                    ..MarketDataTransport::default()
+                },
+                websocket: Default::default(),
+                autoscaling: Default::default(),
+                resources: None,
+                paused: false,
+                history: None,
+            },
+            status: Default::default(),
+        };
+        catalog
+            .market_data_services
+            .insert(service.name.clone(), service);
+        catalog
+    }
+
+    fn md_plan(scenario: MarketDataScenario) -> ReconcilePlan {
+        let catalog = market_data_catalog();
+        let observation = simulate_market_data(&catalog, "fx-marketdata", scenario).unwrap();
+        plan_market_data(&catalog, "fx-marketdata", &observation, None, None).unwrap()
     }
 
     fn plan(shard: &str, scenario: Scenario) -> ReconcilePlan {
@@ -1296,5 +1814,181 @@ mod tests {
             Some("fx-eu-01-0.fx-eu-01-headless.match-eu-1.svc.cluster.local:21001")
         );
         assert_eq!(route.status.phase, crate::model::Phase::Ready);
+    }
+
+    #[test]
+    fn market_data_scenarios_produce_matching_observations() {
+        let catalog = market_data_catalog();
+        let fresh =
+            simulate_market_data(&catalog, "fx-marketdata", MarketDataScenario::Fresh).unwrap();
+        assert_eq!(fresh.service, "fx-marketdata");
+        assert_eq!(fresh.cell, "eu-1");
+        assert!(fresh.image.is_empty());
+        assert!(!fresh.deployment_exists);
+        assert_eq!(fresh.replicas, 0);
+        assert!(!fresh.feed_ready);
+
+        let ready =
+            simulate_market_data(&catalog, "fx-marketdata", MarketDataScenario::Ready).unwrap();
+        assert_eq!(
+            ready.image,
+            "registry.example.com/matchengine-marketdata@sha256:abc"
+        );
+        assert_eq!(ready.replicas, 2);
+        assert_eq!(ready.ready_replicas, 2);
+        assert!(ready.deployment_exists);
+        assert!(ready.feed_ready);
+        assert_eq!(ready.symbols.len(), 2);
+
+        let behind =
+            simulate_market_data(&catalog, "fx-marketdata", MarketDataScenario::Behind).unwrap();
+        assert_eq!(behind.image, DEMO_MARKET_DATA_PREVIOUS_IMAGE);
+        assert_eq!(behind.updated_replicas, 0);
+
+        let paused =
+            simulate_market_data(&catalog, "fx-marketdata", MarketDataScenario::Paused).unwrap();
+        assert!(paused.paused);
+        assert_eq!(paused.replicas, 0);
+        assert!(!paused.feed_ready);
+    }
+
+    #[test]
+    fn fresh_market_data_plan_renders_every_object() {
+        let plan = md_plan(MarketDataScenario::Fresh);
+        assert_eq!(plan.phase, PlanPhase::Provisioning);
+        assert_eq!(plan.steps[0].action, Action::ValidateCatalog);
+        let kinds: Vec<&str> = plan
+            .steps
+            .iter()
+            .filter(|step| step.action == Action::RenderManifests)
+            .map(|step| step.target.split('/').next().unwrap())
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                "ConfigMap",
+                "Deployment",
+                "Service",
+                "PodDisruptionBudget",
+                "NetworkPolicy",
+                "HorizontalPodAutoscaler"
+            ]
+        );
+        assert!(
+            plan.steps
+                .iter()
+                .any(|step| step.action == Action::WaitForPods)
+        );
+        assert!(summarize(&plan).contains("render-manifests"));
+    }
+
+    #[test]
+    fn healthy_and_behind_market_data_plans_differ() {
+        let healthy = md_plan(MarketDataScenario::Ready);
+        assert_eq!(healthy.phase, PlanPhase::Ready);
+        assert!(
+            !healthy
+                .steps
+                .iter()
+                .any(|step| step.action == Action::RollDeployment)
+        );
+        assert_eq!(
+            healthy
+                .steps
+                .iter()
+                .filter(|step| step.action == Action::VerifyFeed)
+                .count(),
+            1
+        );
+        assert!(
+            healthy
+                .steps
+                .iter()
+                .any(|step| step.action == Action::WriteStatus)
+        );
+
+        let behind = md_plan(MarketDataScenario::Behind);
+        assert_eq!(behind.phase, PlanPhase::Upgrading);
+        assert_eq!(
+            behind
+                .steps
+                .iter()
+                .filter(|step| step.action == Action::RollDeployment)
+                .count(),
+            2
+        );
+        assert!(
+            behind
+                .notes
+                .iter()
+                .any(|note| note.contains("maxUnavailable: 0"))
+        );
+    }
+
+    #[test]
+    fn paused_market_data_plan_never_rolls() {
+        let mut catalog = market_data_catalog();
+        catalog
+            .market_data_services
+            .get_mut("fx-marketdata")
+            .unwrap()
+            .spec
+            .paused = true;
+        let observation =
+            simulate_market_data(&catalog, "fx-marketdata", MarketDataScenario::Ready).unwrap();
+        let plan = plan_market_data(&catalog, "fx-marketdata", &observation, None, None).unwrap();
+        assert_eq!(plan.phase, PlanPhase::Paused);
+        assert!(
+            plan.steps
+                .iter()
+                .any(|step| step.action == Action::PauseTraffic)
+        );
+        assert!(
+            !plan
+                .steps
+                .iter()
+                .any(|step| step.action == Action::RollDeployment)
+        );
+    }
+
+    #[test]
+    fn degraded_market_data_plan_is_blocked_on_the_feed() {
+        let plan = md_plan(MarketDataScenario::Degraded);
+        assert_eq!(plan.phase, PlanPhase::Blocked);
+        assert!(
+            plan.blocked
+                .iter()
+                .any(|blocked| blocked.contains("feed not ready")),
+            "{:?}",
+            plan.blocked
+        );
+        assert!(
+            plan.steps
+                .iter()
+                .any(|step| step.action == Action::VerifyFeed)
+        );
+    }
+
+    #[test]
+    fn incompatible_market_data_release_blocks_before_render() {
+        let catalog = market_data_catalog();
+        let observation =
+            simulate_market_data(&catalog, "fx-marketdata", MarketDataScenario::Ready).unwrap();
+        let target = Release {
+            wire_version: Release::default().wire_version + 1,
+            ..Release::default()
+        };
+        let plan =
+            plan_market_data(&catalog, "fx-marketdata", &observation, None, Some(&target)).unwrap();
+        assert_eq!(plan.phase, PlanPhase::Blocked);
+        assert_eq!(plan.steps.len(), 1);
+        assert_eq!(plan.steps[0].action, Action::ValidateCatalog);
+        assert!(
+            plan.blocked
+                .iter()
+                .any(|blocked| blocked.contains("wire version")),
+            "{:?}",
+            plan.blocked
+        );
     }
 }

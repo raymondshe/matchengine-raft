@@ -1239,6 +1239,15 @@ pub struct MarketDataServiceStatus {
     pub symbols: Vec<MarketDataSymbolStatus>,
     #[serde(default)]
     pub message: String,
+    /// Image replaced by the last image/release update. The operator writes status from live
+    /// observations, so this is carried forward explicitly; the rollback action swaps it with
+    /// the current image to stay reversible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_image: Option<String>,
+    /// Release replaced by the last image/release update. Older CRs omit it; rollback falls
+    /// back to the current release in that case.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_release: Option<Release>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]

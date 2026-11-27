@@ -432,6 +432,62 @@ pub fn upgrade_market_data_service(
     image: String,
     release: Release,
 ) -> Result<UpgradeMarketDataResult, ApiError> {
+    apply_market_data_image(catalog, service_name, image, release, "upgrade-market-data")
+}
+
+/// Restore the image/release saved by the last upgrade.
+///
+/// This uses the exact same validation, wire-version gate and rolling steps as an upgrade. The
+/// helper that applies the image swaps `previous_image`/`previous_release` with the current
+/// values, so a rollback is itself reversible.
+pub fn rollback_market_data_service(
+    catalog: &mut Catalog,
+    service_name: &str,
+) -> Result<UpgradeMarketDataResult, ApiError> {
+    let service = catalog
+        .market_data_services
+        .get(service_name)
+        .cloned()
+        .ok_or_else(|| {
+            ApiError::not_found(
+                "market_data_not_found",
+                format!("unknown market-data service {service_name}"),
+            )
+        })?;
+    let image = service
+        .status
+        .previous_image
+        .clone()
+        .filter(|image| !image.trim().is_empty())
+        .ok_or_else(|| {
+            ApiError::bad_request(
+                "previous_image_missing",
+                format!("market-data service {service_name} has no previous image to roll back to"),
+            )
+        })?;
+    // Older objects may not carry a previous release; keeping the current release is the only
+    // meaningful default because the image is what actually changes across a stateless roll.
+    let release = service
+        .status
+        .previous_release
+        .clone()
+        .unwrap_or_else(|| service.spec.release.clone());
+    apply_market_data_image(
+        catalog,
+        service_name,
+        image,
+        release,
+        "rollback-market-data",
+    )
+}
+
+fn apply_market_data_image(
+    catalog: &mut Catalog,
+    service_name: &str,
+    image: String,
+    release: Release,
+    action: &str,
+) -> Result<UpgradeMarketDataResult, ApiError> {
     let service = catalog
         .market_data_services
         .get(service_name)
@@ -501,8 +557,12 @@ pub fn upgrade_market_data_service(
         });
     }
 
+    let current_image = service.spec.image.clone();
     let mut candidate = catalog.clone();
     if let Some(target) = candidate.market_data_services.get_mut(service_name) {
+        // Swap semantics: the image/release we are leaving becomes the new rollback target.
+        target.status.previous_image = Some(target.spec.image.clone());
+        target.status.previous_release = Some(target.spec.release.clone());
         target.spec.image = image.clone();
         target.spec.release = release.clone();
         target.status.phase = Phase::Pending;
@@ -516,15 +576,18 @@ pub fn upgrade_market_data_service(
     }
 
     *catalog = candidate;
-    catalog.audit(
-        "api",
-        "upgrade-market-data",
-        service_name,
+    let detail = if action == "rollback-market-data" {
         format!(
-            "{} on market-data service {}; release wire v{} snapshot v{}; rolling update",
-            image, service_name, release.wire_version, release.snapshot_version
-        ),
-    );
+            "rolled back market-data service {service_name} from {current_image} to {image}; release wire v{} snapshot v{}; rolling update",
+            release.wire_version, release.snapshot_version
+        )
+    } else {
+        format!(
+            "{image} on market-data service {service_name}; release wire v{} snapshot v{}; rolling update",
+            release.wire_version, release.snapshot_version
+        )
+    };
+    catalog.audit("api", action, service_name, detail);
 
     Ok(UpgradeMarketDataResult {
         service: service_name.to_string(),

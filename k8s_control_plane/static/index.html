@@ -380,11 +380,14 @@
     <div class="headline">
       <h2>Market data</h2>
       <span class="sub">terminal and fast WebSocket fan-out tiers</span>
+      <button id="newMarketDataBtn" title="Create a MarketDataService">new service</button>
+      <button id="marketDataPlanBtn" title="Preview the operator plan for a market-data service">preview plan</button>
       <button id="marketDataRefresh" title="Reload the market-data service list" style="margin-left:auto">refresh</button>
     </div>
     <div class="tabs md-tabs" role="tablist" aria-label="Market-data tiers">
       <button class="md-tab active" type="button" data-md-tab="terminal" role="tab" aria-selected="true">terminal market data</button>
       <button class="md-tab" type="button" data-md-tab="fast" role="tab" aria-selected="false">fast market data</button>
+      <button class="md-tab" type="button" data-md-tab="plan" role="tab" aria-selected="false">preview plan</button>
     </div>
 
     <div id="marketDataTerminalPanel" class="md-panel active" role="tabpanel" aria-label="Terminal market data">
@@ -418,6 +421,32 @@
           </div>
         </div>
         <div id="fastMarketDataRows"></div>
+      </div>
+    </div>
+
+    <div id="marketDataPlanPanel" class="md-panel" role="tabpanel" aria-label="Market-data preview plan">
+      <p class="advanced-note">Read-only simulation from the CRD catalog and a synthetic observation.
+        It does not contact the cluster or change desired state.</p>
+      <div class="card" style="margin-top:12px">
+        <div class="actions">
+          <label class="field">Service
+            <select id="mdPlanService"></select>
+          </label>
+          <label class="field">Observation
+            <select id="mdPlanScenario">
+              <option value="fresh">fresh (nothing bootstrapped)</option>
+              <option value="ready" selected>ready</option>
+              <option value="healthy">healthy</option>
+              <option value="upgrade">older image</option>
+              <option value="behind">behind desired state</option>
+              <option value="degraded">degraded (one pod unready)</option>
+              <option value="paused">paused</option>
+            </select>
+          </label>
+          <button class="primary" id="mdPlanBtn">Build plan</button>
+        </div>
+        <div class="plan-summary" id="mdPlanSummary">—</div>
+        <div id="mdPlanSteps"><span class="muted">Build a plan to see the operator's next steps.</span></div>
       </div>
     </div>
   </section>
@@ -660,6 +689,76 @@
   </div>
 </div>
 
+<div id="marketDataEditModal" class="modal" aria-hidden="true">
+  <div class="modal-card">
+    <div class="modal-head">
+      <h2 id="mdEditTitle">New market-data service</h2>
+      <button class="close" type="button" data-close="marketDataEditModal" aria-label="Close">×</button>
+    </div>
+    <form id="marketDataEditForm">
+      <p class="muted">Create or edit a <span class="mono">MarketDataService</span>. Image and release
+        are managed by the upgrade and rollback actions, not here.</p>
+      <div class="form-grid">
+        <label class="field">Name<input id="mdEditName" required spellcheck="false"></label>
+        <label class="field">Cell<select id="mdEditCell"></select></label>
+        <label class="field">Image<input id="mdEditImage" required spellcheck="false" placeholder="matchengine-marketdata:aeron-arm64-v14"></label>
+        <label class="field">Replicas<input id="mdEditReplicas" type="number" min="0" value="2"></label>
+        <label class="field">HPA min<input id="mdEditMin" type="number" min="1" value="1"></label>
+        <label class="field">HPA max (0 = derived)<input id="mdEditMax" type="number" min="0" value="0"></label>
+        <label class="field">Target CPU %<input id="mdEditCpu" type="number" min="1" max="100" value="70"></label>
+        <label class="field">Transport<select id="mdEditTransport">
+          <option value="multicast">multicast</option><option value="nats">nats</option>
+        </select></label>
+        <label class="field">Channel (multicast)<input id="mdEditChannel" spellcheck="false"></label>
+        <label class="field">NATS URL<input id="mdEditNatsUrl" spellcheck="false"></label>
+        <label class="field">NATS subject prefix<input id="mdEditNatsPrefix" spellcheck="false"></label>
+        <label class="field">Symbols (comma separated)<input id="mdEditSymbols" spellcheck="false"></label>
+        <label class="field">WebSocket port<input id="mdEditPort" type="number" min="1" value="8080"></label>
+        <label class="field">Ingress host<input id="mdEditIngress" spellcheck="false"></label>
+        <label class="field">History TDengine URL<input id="mdEditHistoryUrl" spellcheck="false" value="http://tdengine.match-eu-1.svc.cluster.local:6041"></label>
+        <label class="field"><span>Feed groups (JSON, optional)</span><input id="mdEditFeedGroups" spellcheck="false" placeholder='[{"name":"default","symbols":["eurusd"]}]'></label>
+      </div>
+      <div class="checks" style="display:flex;gap:18px;margin:10px 0;flex-wrap:wrap">
+        <label><input id="mdEditFastOnly" type="checkbox"> fast only</label>
+        <label><input id="mdEditPaused" type="checkbox"> paused</label>
+        <label><input id="mdEditHistory" type="checkbox"> historical bars</label>
+      </div>
+      <details class="advanced"><summary>Advanced JSON (merged over the form fields)</summary>
+        <textarea id="mdEditJson" rows="6" spellcheck="false" placeholder='{"transport":{"mode":"nats",...}}'></textarea>
+      </details>
+      <p class="muted mono" id="mdEditStatus" style="overflow-wrap:anywhere"></p>
+      <div class="form-actions">
+        <button type="button" data-close="marketDataEditModal">Cancel</button>
+        <button type="submit" class="primary" id="mdEditSubmit">Create</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<div id="marketDataScaleModal" class="modal" aria-hidden="true">
+  <div class="modal-card">
+    <div class="modal-head">
+      <h2>Scale market-data service</h2>
+      <button class="close" type="button" data-close="marketDataScaleModal" aria-label="Close">×</button>
+    </div>
+    <form id="marketDataScaleForm">
+      <p class="muted">Market-data pods are stateless. The HPA bounds must contain the replica count;
+        set <span class="mono">max = 0</span> to derive it from the replica count.</p>
+      <div class="form-grid">
+        <label class="field">Service<input id="mdScaleService" readonly></label>
+        <label class="field">Replicas<input id="mdScaleReplicas" type="number" min="0" required></label>
+        <label class="field">HPA min<input id="mdScaleMin" type="number" min="1" required></label>
+        <label class="field">HPA max (0 = derived)<input id="mdScaleMax" type="number" min="0" required></label>
+      </div>
+      <p class="muted mono" id="mdScaleStatus" style="overflow-wrap:anywhere"></p>
+      <div class="form-actions">
+        <button type="button" data-close="marketDataScaleModal">Cancel</button>
+        <button type="submit" class="primary" id="mdScaleSubmit">Scale</button>
+      </div>
+    </form>
+  </div>
+</div>
+
 <div id="orderSystemUpgradeModal" class="modal" aria-hidden="true">
   <div class="modal-card">
     <div class="modal-head">
@@ -755,7 +854,7 @@ function isMarketDataView(view) {
 }
 
 function setMarketDataTab(tab, updateHash = true) {
-  marketDataTab = tab === "fast" ? "fast" : "terminal";
+  marketDataTab = tab === "fast" || tab === "plan" ? tab : "terminal";
   document.querySelectorAll(".md-tab").forEach((button) => {
     const active = button.dataset.mdTab === marketDataTab;
     button.classList.toggle("active", active);
@@ -763,13 +862,17 @@ function setMarketDataTab(tab, updateHash = true) {
   });
   $("marketDataTerminalPanel").classList.toggle("active", marketDataTab === "terminal");
   $("marketDataFastPanel").classList.toggle("active", marketDataTab === "fast");
+  $("marketDataPlanPanel").classList.toggle("active", marketDataTab === "plan");
+  if (marketDataTab === "plan") refreshMarketDataPlanServices();
   if (updateHash && currentView === "marketdata") {
     history.replaceState(null, "", "#marketdata-" + marketDataTab);
   }
 }
 
 function marketDataTabFromView(view) {
-  return view === "marketdata-fast" ? "fast" : "terminal";
+  if (view === "marketdata-fast") return "fast";
+  if (view === "marketdata-plan") return "plan";
+  return "terminal";
 }
 
 function fastOnlyService(service) {
@@ -785,7 +888,8 @@ function fastMarketDataItems() {
 }
 
 function setView(view) {
-  const marketView = isMarketDataView(view) || view === "marketdata-terminal" || view === "marketdata-fast";
+  const marketView = isMarketDataView(view) || view === "marketdata-terminal" || view === "marketdata-fast"
+    || view === "marketdata-plan";
   if (marketView) {
     if (view !== "marketdata") setMarketDataTab(marketDataTabFromView(view), false);
     currentView = "marketdata";
@@ -917,7 +1021,12 @@ function renderMarketDataTable(items, kind, rowsId) {
         <div class="muted mono">${esc(service.namespace || "")} · ${esc(spec.cell || "—")}</div>
         <a class="mono" href="/api/v1/market-data-services/${encodeURIComponent(service.name)}/manifests" target="_blank">manifests</a>
         ${webUi ? `<div><a class="mono" href="${esc(webUi)}" target="_blank" rel="noopener" title="Open the market-data WebUI">web ui</a></div>` : ""}
-        <div style="margin-top:6px"><button type="button" data-md-upgrade="${esc(service.name)}" style="padding:4px 8px;font:11px/1.2 var(--mono)" title="Roll a new image on this stateless market-data service">upgrade</button></div></td>
+        <div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap">
+          <button type="button" data-md-edit="${esc(service.name)}" style="padding:4px 8px;font:11px/1.2 var(--mono)" title="Edit the desired spec (image and release stay managed by upgrade/rollback)">edit</button>
+          <button type="button" data-md-scale="${esc(service.name)}" style="padding:4px 8px;font:11px/1.2 var(--mono)" title="Change replicas and HPA bounds">scale</button>
+          <button type="button" data-md-upgrade="${esc(service.name)}" style="padding:4px 8px;font:11px/1.2 var(--mono)" title="Roll a new image on this stateless market-data service">upgrade</button>
+          <button type="button" data-md-rollback="${esc(service.name)}" style="padding:4px 8px;font:11px/1.2 var(--mono)" title="Restore the image saved by the last upgrade (reversible)" ${status.previousImage ? "" : "disabled"}>rollback</button>
+        </div></td>
       <td><span class="badge">${esc(mode)}</span>${sourceText}${channelDetails}</td>
       <td>${ready}/${replicas}${hpa}</td>
       <td class="ws-cell">${esc(ws)}${spec.websocket?.ingress ? `<div class="muted mono">${esc(spec.websocket.ingress)}</div>` : ""}${wsPaths}</td>
@@ -946,6 +1055,15 @@ function renderMarketData() {
   renderMarketDataTable(fast, "fast", "fastMarketDataRows");
   document.querySelectorAll("[data-md-upgrade]").forEach((button) => {
     button.addEventListener("click", () => openMarketDataUpgrade(button.dataset.mdUpgrade));
+  });
+  document.querySelectorAll("[data-md-edit]").forEach((button) => {
+    button.addEventListener("click", () => openMarketDataEdit(button.dataset.mdEdit));
+  });
+  document.querySelectorAll("[data-md-scale]").forEach((button) => {
+    button.addEventListener("click", () => openMarketDataScale(button.dataset.mdScale));
+  });
+  document.querySelectorAll("[data-md-rollback]").forEach((button) => {
+    button.addEventListener("click", () => rollbackMarketData(button.dataset.mdRollback));
   });
 }
 
@@ -1053,6 +1171,274 @@ async function submitMarketDataUpgrade(event) {
     $("mdUpgradeStatus").textContent = error.message;
     $("mdUpgradeSubmit").disabled = false;
   }
+}
+
+let marketDataEditName = null;
+
+function mergeJson(base, override) {
+  if (Array.isArray(base) || Array.isArray(override) || typeof base !== "object" || typeof override !== "object"
+    || base === null || override === null) return override;
+  const merged = { ...base };
+  Object.entries(override).forEach(([key, value]) => {
+    merged[key] = key in merged ? mergeJson(merged[key], value) : value;
+  });
+  return merged;
+}
+
+function marketDataSpecFromForm() {
+  const mode = $("mdEditTransport").value;
+  const feedRaw = $("mdEditFeedGroups").value.trim();
+  let feedGroups = [];
+  if (feedRaw) {
+    try {
+      feedGroups = JSON.parse(feedRaw);
+      if (!Array.isArray(feedGroups)) throw new Error("expected a JSON array");
+    } catch (error) {
+      throw new Error(`invalid feed groups JSON: ${error.message}`);
+    }
+  }
+  const spec = {
+    cell: $("mdEditCell").value,
+    symbols: $("mdEditSymbols").value.split(",").map((value) => value.trim()).filter(Boolean),
+    feedGroups,
+    image: $("mdEditImage").value.trim(),
+    release: { wireVersion: 7, snapshotVersion: 11, mixedVersionSafe: false },
+    replicas: Number($("mdEditReplicas").value),
+    transport: {
+      mode,
+      channel: mode === "multicast" ? ($("mdEditChannel").value.trim() || null) : null,
+      natsUrl: mode === "nats" ? ($("mdEditNatsUrl").value.trim() || null) : null,
+      subjectPrefix: $("mdEditNatsPrefix").value.trim(),
+      stream: "",
+    },
+    websocket: {
+      port: Number($("mdEditPort").value),
+      ingress: $("mdEditIngress").value.trim(),
+      tlsSecret: "",
+      fastOnly: $("mdEditFastOnly").checked,
+    },
+    autoscaling: {
+      minReplicas: Number($("mdEditMin").value),
+      maxReplicas: Number($("mdEditMax").value),
+      targetCpuUtilization: Number($("mdEditCpu").value),
+    },
+    paused: $("mdEditPaused").checked,
+  };
+  if ($("mdEditHistory").checked) {
+    spec.history = {
+      url: $("mdEditHistoryUrl").value.trim() || "http://tdengine.match-eu-1.svc.cluster.local:6041",
+      database: "market_bars",
+      readOnly: $("mdEditFastOnly").checked,
+    };
+  }
+  const advanced = $("mdEditJson").value.trim();
+  if (!advanced) return spec;
+  let override;
+  try {
+    override = JSON.parse(advanced);
+  } catch (error) {
+    throw new Error(`invalid advanced JSON: ${error.message}`);
+  }
+  return mergeJson(spec, override);
+}
+
+function openMarketDataEdit(name) {
+  if (!catalog) return;
+  const service = name ? marketDataServiceByName(name) : null;
+  marketDataEditName = service ? name : null;
+  $("marketDataEditForm").reset();
+  $("mdEditTitle").textContent = service ? `Edit ${name}` : "New market-data service";
+  $("mdEditSubmit").textContent = service ? "Save changes" : "Create";
+  if (service) {
+    const spec = service.spec || {};
+    $("mdEditName").value = service.name;
+    $("mdEditImage").value = spec.image || "";
+    $("mdEditReplicas").value = spec.replicas ?? 2;
+    $("mdEditMin").value = spec.autoscaling?.minReplicas ?? 1;
+    $("mdEditMax").value = spec.autoscaling?.maxReplicas ?? 0;
+    $("mdEditCpu").value = spec.autoscaling?.targetCpuUtilization ?? 70;
+    $("mdEditTransport").value = spec.transport?.mode || "multicast";
+    $("mdEditChannel").value = spec.transport?.channel || "";
+    $("mdEditNatsUrl").value = spec.transport?.natsUrl || "";
+    $("mdEditNatsPrefix").value = spec.transport?.subjectPrefix || "";
+    $("mdEditSymbols").value = (spec.symbols || []).join(", ");
+    $("mdEditFeedGroups").value = (spec.feedGroups || []).length ? JSON.stringify(spec.feedGroups) : "";
+    $("mdEditPort").value = spec.websocket?.port ?? 8080;
+    $("mdEditIngress").value = spec.websocket?.ingress || "";
+    $("mdEditFastOnly").checked = Boolean(spec.websocket?.fastOnly);
+    $("mdEditPaused").checked = Boolean(spec.paused);
+    $("mdEditHistory").checked = Boolean(spec.history);
+  } else {
+    const sample = marketDataItems[0]?.spec || {};
+    $("mdEditName").value = "";
+    $("mdEditImage").value = sample.image || "matchengine-marketdata:aeron-arm64-v14";
+    $("mdEditReplicas").value = "2";
+    $("mdEditMin").value = "1";
+    $("mdEditMax").value = "0";
+    $("mdEditCpu").value = "70";
+    $("mdEditTransport").value = "multicast";
+    $("mdEditPort").value = "8080";
+    $("mdEditHistoryUrl").value = "http://tdengine.match-eu-1.svc.cluster.local:6041";
+    $("mdEditFastOnly").checked = false;
+    $("mdEditPaused").checked = false;
+    $("mdEditHistory").checked = false;
+  }
+  $("mdEditName").disabled = Boolean(service);
+  const cells = Object.values(catalog.cells || {});
+  $("mdEditCell").innerHTML = cells.map((cell) =>
+    `<option value="${esc(cell.name)}">${esc(cell.name)} · ${esc(cell.namespace)}</option>`).join("");
+  const wanted = service?.spec?.cell || cells[0]?.name || "";
+  if (wanted) $("mdEditCell").value = wanted;
+  $("mdEditJson").value = "";
+  $("mdEditStatus").textContent = "";
+  openModal("marketDataEditModal");
+  if (!service) $("mdEditName").focus();
+}
+
+async function submitMarketDataEdit(event) {
+  event.preventDefault();
+  try {
+    const name = $("mdEditName").value.trim();
+    if (!name) throw new Error("name is required");
+    const spec = marketDataSpecFromForm();
+    if (!spec.cell) throw new Error("choose a cell");
+    if (!spec.image) throw new Error("image is required");
+    if (!Number.isInteger(spec.replicas) || spec.replicas < 0) throw new Error("replicas must be a non-negative integer");
+    $("mdEditSubmit").disabled = true;
+    $("mdEditStatus").textContent = "saving desired state…";
+    const editing = Boolean(marketDataEditName);
+    const cell = (catalog.cells || {})[spec.cell];
+    const body = editing
+      ? { spec }
+      : { name, namespace: cell?.namespace || "match-eu-1", spec };
+    await api(editing
+      ? `/api/v1/market-data-services/${encodeURIComponent(marketDataEditName)}`
+      : "/api/v1/market-data-services", {
+      method: editing ? "PUT" : "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    closeModal("marketDataEditModal");
+    toast(`${editing ? "updated" : "created"} ${name}`);
+    await loadMarketData();
+    loadAudit();
+  } catch (error) {
+    $("mdEditStatus").textContent = error.message;
+  } finally {
+    $("mdEditSubmit").disabled = false;
+  }
+}
+
+function openMarketDataScale(name) {
+  const service = marketDataServiceByName(name);
+  if (!service) return;
+  const spec = service.spec || {};
+  $("mdScaleService").value = name;
+  $("mdScaleReplicas").value = spec.replicas ?? 2;
+  $("mdScaleMin").value = spec.autoscaling?.minReplicas ?? 1;
+  $("mdScaleMax").value = spec.autoscaling?.maxReplicas ?? 0;
+  $("mdScaleStatus").textContent = "";
+  openModal("marketDataScaleModal");
+}
+
+async function submitMarketDataScale(event) {
+  event.preventDefault();
+  const name = $("mdScaleService").value;
+  if (!name) return;
+  try {
+    $("mdScaleSubmit").disabled = true;
+    $("mdScaleStatus").textContent = "scaling…";
+    await api(`/api/v1/market-data-services/${encodeURIComponent(name)}/scale`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        replicas: Number($("mdScaleReplicas").value),
+        minReplicas: Number($("mdScaleMin").value),
+        maxReplicas: Number($("mdScaleMax").value),
+      }),
+    });
+    closeModal("marketDataScaleModal");
+    toast(`scaled ${name}`);
+    await loadMarketData();
+    loadAudit();
+  } catch (error) {
+    $("mdScaleStatus").textContent = error.message;
+  } finally {
+    $("mdScaleSubmit").disabled = false;
+  }
+}
+
+async function rollbackMarketData(name) {
+  const service = marketDataServiceByName(name);
+  const previous = service?.status?.previousImage;
+  if (!previous) {
+    toast(`${name} has no recorded previous image`, true);
+    return;
+  }
+  if (!confirm(`Roll ${name} back to ${previous}? The current image becomes the new previous image.`)) return;
+  try {
+    const result = await api(`/api/v1/market-data-services/${encodeURIComponent(name)}/rollback`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}",
+    });
+    toast(`rolled ${name} back to ${result.upgrade?.image || previous}`);
+    await loadMarketData();
+    loadAudit();
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+function refreshMarketDataPlanServices() {
+  const select = $("mdPlanService");
+  const previous = select.value;
+  select.innerHTML = marketDataItems.length
+    ? marketDataItems.map((service) => `<option value="${esc(service.name)}">${esc(service.name)}</option>`).join("")
+    : `<option value="">no services</option>`;
+  if (previous && [...select.options].some((option) => option.value === previous)) select.value = previous;
+}
+
+function renderMarketDataPlan(plan) {
+  const data = plan.plan || plan;
+  const steps = data.steps || [];
+  const badgeClass = data.phase === "ready" ? "ok" : data.phase === "blocked" ? "err" : "warn";
+  $("mdPlanSummary").innerHTML = `<span class="badge ${badgeClass}">${esc(data.phase)}</span>
+    &nbsp; ${esc(plan.summary || "")} &nbsp; <span class="muted">target image</span> ${esc(data.targetImage)}`;
+  const blocked = (data.blocked || []).map((item) => `<div class="issue">${esc(item)}</div>`).join("");
+  const notes = (data.notes || []).map((item) => `<div class="issue warning">${esc(item)}</div>`).join("");
+  $("mdPlanSteps").innerHTML = (blocked || notes ? `<div class="issues">${blocked}${notes}</div>` : "") +
+    (steps.length ? steps.map((step, index) => `
+      <div class="step">
+        <div class="num">${String(index + 1).padStart(2, "0")}</div>
+        <div>
+          <div class="action">${esc(step.action)}</div>
+          <div class="target">${esc(step.target)}</div>
+          ${step.endpoint ? `<div class="endpoint">${esc(step.endpoint)}</div>` : ""}
+          <div class="detail">${esc(step.detail)}</div>
+        </div>
+      </div>`).join("") : `<span class="muted">No steps: the service matches desired state.</span>`);
+}
+
+async function loadMarketDataPlan() {
+  const name = $("mdPlanService").value;
+  if (!name) {
+    toast("choose a market-data service", true);
+    return;
+  }
+  const scenario = $("mdPlanScenario").value;
+  try {
+    const result = await api(`/api/v1/market-data-services/${encodeURIComponent(name)}/plan?scenario=${encodeURIComponent(scenario)}`);
+    renderMarketDataPlan(result);
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+function openMarketDataPlan() {
+  setMarketDataTab("plan");
+  refreshMarketDataPlanServices();
+  if ($("mdPlanService").value) loadMarketDataPlan();
 }
 
 async function loadOrderSystems() {
@@ -2155,6 +2541,11 @@ function bind() {
   $("planBtn").addEventListener("click", loadPlan);
   $("backupRefresh").addEventListener("click", loadBackupStatus);
   $("marketDataRefresh").addEventListener("click", loadMarketData);
+  $("newMarketDataBtn").addEventListener("click", () => openMarketDataEdit(null));
+  $("marketDataPlanBtn").addEventListener("click", openMarketDataPlan);
+  $("marketDataEditForm").addEventListener("submit", submitMarketDataEdit);
+  $("marketDataScaleForm").addEventListener("submit", submitMarketDataScale);
+  $("mdPlanBtn").addEventListener("click", loadMarketDataPlan);
   $("orderSystemRefresh").addEventListener("click", loadOrderSystems);
   document.querySelectorAll(".md-tab").forEach((tab) => {
     tab.addEventListener("click", () => setMarketDataTab(tab.dataset.mdTab));

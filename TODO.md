@@ -134,10 +134,7 @@ consumers resume from `(log_index, ordinal)` and dedupe on `event_id`.
 13. **P2 — Stop-the-world incompatible upgrade execution (#6).** Automate the coordinated cutover
     (backup gate, disable routes, stop all symbols, apply image/release, restart, verify, re-enable)
     and record a drill; the release gate and manual runbook already exist.
-14. **P2 — Market-data manager controls (#9).** Add GUI create/edit/scale and a read-only preview
-    plan for `MarketDataService`, plus a rollback action restoring the previous image. The upsert
-    API, image/release update and picker are implemented.
-15. **P2 — Profile A feed hardening (#12).** Characterize the Aeron image-registration race and
+14. **P2 — Profile A feed hardening (#12).** Characterize the Aeron image-registration race and
     single-node multi-subscriber behavior, make source startup readiness-gated (or add a per-source
     generation), and keep the 5–30 s re-subscribe watchdog without restart loops.
 16. **P2 — CRD scale and soak (#13).** Thousands of symbols/CRs across shards and cells, status
@@ -273,9 +270,6 @@ shard services and the global terminal service are live; see History. Remaining 
 - [ ] **P2** Market-data profile extras: all-market aggregate streams (`!miniTicker@arr`), a
   per-connection terminal frame budget, per-profile connection/lag metrics, explicit WebSocket close
   reasons and a ServiceMonitor.
-- [ ] **P2** Manager controls for the market-data tier: add GUI create/edit/scale and a read-only
-  preview plan; the upsert API, image/release update and the per-service image picker are
-  implemented. Add a rollback action that restores the previous image.
 - [ ] **P2 (Top priorities #10)** Trading terminal hardening: the pure-React client is deployed as
   `arm64-v5` and `DNS_UPSTREAM` is resolved from `/etc/resolv.conf` at pod start. Remaining: add the
   `TradingTerminal` CRD/renderer integration. Keep order entry on the order-system BFF and never
@@ -481,6 +475,16 @@ in git history and the linked docs. For the full history, check out `TODO.md` fr
   evicted pods, and restarting each writer so `ensure_schema` recreated the database, 7 super tables
   and 57 per-symbol child tables. The PVC change was verified by deleting the TDengine pod again:
   `bars_1s` stayed at 38 -> 57 (grew, did not reset) and no service logged a missing-table error.
+- **2026-11-27** — Market-data manager controls (#9) completed. New endpoints: `PUT
+  /api/v1/market-data-services/{name}` (edit, image/release preserved), `POST .../scale` (replicas
+  and HPA bounds), `POST .../rollback` (restores the image/release saved by the last update), and
+  read-only `GET,POST .../plan` mirroring the shard preview plan. `MarketDataServiceStatus` now
+  records `previousImage`/`previousRelease`, written by every image update and preserved by the
+  operator's status reconcile; rollback swaps them so the action is reversible. The GUI adds
+  create/edit and scale modals, row edit/scale/rollback buttons and a third "preview plan" tab with
+  scenario select. Verified with 229 lib + 9 other control-plane tests, clippy/fmt, inline JS syntax
+  check and a local file-backed manager smoke test covering create/edit/scale, plan scenarios,
+  upgrade→rollback→rollback and invalid-scale rejection.
 - **2026-11-26** — Historical bars P1 completed and validated. `--history-lease-prefix` creates one
   Kubernetes Lease per symbol (`<prefix>-<symbol>`) and gates flushes, `bar_state` writes and REST
   backfill per symbol; `--history-rest-tail` backfills missing closed windows from a Binance-compatible

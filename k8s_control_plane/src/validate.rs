@@ -204,7 +204,10 @@ fn validate_market_data_services(catalog: &Catalog, report: &mut Report) {
                 "pin the market-data image by digest in production; a mutable tag cannot gate upgrades",
             );
         }
-        if service.spec.replicas == 0 {
+        // A paused service renders zero replicas regardless of the desired count, so zero is a
+        // valid paused state (and the scale endpoint allows it). A running service needs at
+        // least one replica.
+        if service.spec.replicas == 0 && !service.spec.paused {
             report.error(
                 "market_data_replicas",
                 object,

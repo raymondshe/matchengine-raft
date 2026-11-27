@@ -170,6 +170,38 @@ mod tests {
     }
 
     #[test]
+    fn market_data_create_edit_scale_plan_and_rollback_controls_exist() {
+        // Create/edit and scale entry points.
+        assert!(INDEX.contains("id=\"newMarketDataBtn\""));
+        assert!(INDEX.contains("id=\"marketDataEditModal\""));
+        assert!(INDEX.contains("id=\"marketDataEditForm\""));
+        assert!(INDEX.contains("id=\"mdEditName\""));
+        assert!(INDEX.contains("id=\"mdEditCell\""));
+        assert!(INDEX.contains("id=\"mdEditJson\""));
+        assert!(INDEX.contains("function openMarketDataEdit"));
+        assert!(INDEX.contains("function submitMarketDataEdit"));
+        assert!(INDEX.contains("id=\"marketDataScaleModal\""));
+        assert!(INDEX.contains("id=\"mdScaleReplicas\""));
+        assert!(INDEX.contains("function submitMarketDataScale"));
+        assert!(INDEX.contains("data-md-edit="));
+        assert!(INDEX.contains("data-md-scale="));
+        assert!(INDEX.contains("previousImage"));
+        assert!(INDEX.contains("function rollbackMarketData"));
+        assert!(INDEX.contains("/rollback"));
+
+        // Read-only preview plan.
+        assert!(INDEX.contains("data-md-tab=\"plan\""));
+        assert!(INDEX.contains("id=\"marketDataPlanPanel\""));
+        assert!(INDEX.contains("id=\"mdPlanService\""));
+        assert!(INDEX.contains("id=\"mdPlanScenario\""));
+        assert!(INDEX.contains("id=\"mdPlanSteps\""));
+        assert!(INDEX.contains("function loadMarketDataPlan"));
+        assert!(INDEX.contains("function renderMarketDataPlan"));
+        assert!(INDEX.contains("/plan?scenario="));
+        assert!(INDEX.contains("marketdata-plan"));
+    }
+
+    #[test]
     fn order_system_view_lists_user_shards_and_targets() {
         assert!(INDEX.contains("data-view=\"ordersystem\""));
         assert!(INDEX.contains(">order systems</button>"));

@@ -38,6 +38,7 @@ use crate::model::{
     ShardStatus, ShardSymbolStatus, SymbolDeployment, SymbolRoute, SymbolShard, TradingSymbol,
     TradingSymbolStatus, desired_config_hash, dns_label,
 };
+use crate::reconcile::MarketDataObservation;
 use crate::render::{
     MANAGED_BY, MARKET_DATA_LABEL, ORDER_SYSTEM_LABEL, Profile, RenderOptions,
     render_market_data_service, render_order_system, render_shard,
@@ -952,18 +953,6 @@ async fn observe_catalog(catalog: &Catalog, options: &OperatorOptions) -> Observ
     observations
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct MarketDataObservation {
-    pub replicas: u16,
-    pub ready_replicas: u16,
-    pub updated_replicas: u16,
-    pub available: bool,
-    pub symbols: Vec<MarketDataSymbolStatus>,
-    pub feed_ready: bool,
-    pub message: String,
-    pub error: Option<String>,
-}
-
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -991,10 +980,16 @@ async fn observe_market_data(
     let mut observations = BTreeMap::new();
     for service in catalog.market_data_services.values() {
         let namespace = namespace_or_default(&service.namespace);
-        let mut observation = MarketDataObservation::default();
+        let mut observation = MarketDataObservation {
+            service: service.name.clone(),
+            cell: service.spec.cell.clone(),
+            paused: service.spec.paused,
+            ..MarketDataObservation::default()
+        };
         let deployment_api = Api::<Deployment>::namespaced(client.clone(), namespace);
         match deployment_api.get(&service.name).await {
             Ok(deployment) => {
+                observation.deployment_exists = true;
                 if let Some(status) = deployment.status {
                     observation.replicas = status.replicas.unwrap_or(0).max(0) as u16;
                     observation.ready_replicas = status.ready_replicas.unwrap_or(0).max(0) as u16;
@@ -1077,6 +1072,29 @@ async fn observe_market_data(
             observation.message = "market-data pod has no IP".to_string();
             observations.insert(service.name.clone(), observation);
             continue;
+        };
+        observation.image = pod
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.containers.first())
+            .and_then(|container| container.image.clone())
+            .unwrap_or_default();
+        let annotations = pod.metadata.annotations.as_ref();
+        let wire = annotations
+            .and_then(|annotations| annotations.get(RELEASE_WIRE_ANNOTATION))
+            .and_then(|value| value.parse::<u16>().ok());
+        let snapshot = annotations
+            .and_then(|annotations| annotations.get(RELEASE_SNAPSHOT_ANNOTATION))
+            .and_then(|value| value.parse::<u16>().ok());
+        observation.release = if wire.is_some() || snapshot.is_some() {
+            let current = Release::default();
+            Some(Release {
+                wire_version: wire.unwrap_or(current.wire_version),
+                snapshot_version: snapshot.unwrap_or(current.snapshot_version),
+                mixed_version_safe: false,
+            })
+        } else {
+            None
         };
         let port = service.spec.websocket.port;
         let ready = fetch_json(
@@ -3532,6 +3550,8 @@ fn market_data_status(
             ready_replicas: 0,
             symbols: Vec::new(),
             message: "no active symbols; deployment scaled to zero".to_string(),
+            previous_image: service.status.previous_image.clone(),
+            previous_release: service.status.previous_release.clone(),
         };
     }
     let observation = observation.cloned().unwrap_or_default();
@@ -3626,6 +3646,10 @@ fn market_data_status(
         ready_replicas,
         symbols: observation.symbols,
         message,
+        // The live observation carries no rollback history; keep what the last image update
+        // recorded so operator status writes never discard it.
+        previous_image: service.status.previous_image.clone(),
+        previous_release: service.status.previous_release.clone(),
     }
 }
 
@@ -4967,6 +4991,41 @@ mod tests {
             "{:?}",
             status.conditions
         );
+    }
+
+    #[test]
+    fn market_data_status_keeps_rollback_history() {
+        let catalog = demo_catalog();
+        let mut service = market_data_service();
+        service.status.previous_image =
+            Some("registry.example.com/matchengine-marketdata@sha256:abc".to_string());
+        service.status.previous_release = Some(Release {
+            wire_version: 6,
+            snapshot_version: 11,
+            mixed_version_safe: false,
+        });
+        let status = market_data_status(
+            &service,
+            &catalog,
+            Some(&market_data_observation(2, true)),
+            false,
+        );
+        assert_eq!(
+            status.previous_image.as_deref(),
+            Some("registry.example.com/matchengine-marketdata@sha256:abc")
+        );
+        assert_eq!(status.previous_release.unwrap().wire_version, 6);
+
+        let mut stopped = catalog.clone();
+        for deployment in stopped.deployments.values_mut() {
+            deployment.spec.desired_state = DeploymentState::Disabled;
+        }
+        let status = market_data_status(&service, &stopped, None, false);
+        assert_eq!(
+            status.previous_image.as_deref(),
+            Some("registry.example.com/matchengine-marketdata@sha256:abc")
+        );
+        assert_eq!(status.previous_release.unwrap().wire_version, 6);
     }
 
     #[test]
