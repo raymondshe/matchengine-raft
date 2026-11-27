@@ -43,9 +43,25 @@ use crate::MatchEngineRaft;
 use crate::network::console::NodeSnapshot;
 
 /// How often the leader samples peer snapshots.
-const SAMPLE_INTERVAL: Duration = Duration::from_secs(5);
+///
+/// Defaults to 5 s. `MATCHENGINE_REVERSION_SAMPLE_MS` may override it for
+/// deterministic tests; out-of-range or unparsable values fall back to the
+/// default so a bad env value can never make the watcher spin or stall.
+const DEFAULT_SAMPLE_INTERVAL_MS: u64 = 5_000;
+const SAMPLE_INTERVAL_ENV: &str = "MATCHENGINE_REVERSION_SAMPLE_MS";
+const MIN_SAMPLE_INTERVAL_MS: u64 = 10;
+const MAX_SAMPLE_INTERVAL_MS: u64 = 60_000;
+
 /// Consecutive identical samples with a stale peer before acting.
-const REQUIRED_SAMPLES: u8 = 2;
+///
+/// Defaults to 2. `MATCHENGINE_REVERSION_REQUIRED_SAMPLES` may override it for
+/// tests (1..=10); anything else uses the default, preserving production
+/// behavior exactly.
+const DEFAULT_REQUIRED_SAMPLES: u8 = 2;
+const REQUIRED_SAMPLES_ENV: &str = "MATCHENGINE_REVERSION_REQUIRED_SAMPLES";
+const MIN_REQUIRED_SAMPLES: u8 = 1;
+const MAX_REQUIRED_SAMPLES: u8 = 10;
+
 /// Cooldown per peer after a reset attempt.
 const COOLDOWN: Duration = Duration::from_secs(120);
 /// Bound on the read-only peer probe.
@@ -72,6 +88,29 @@ impl Observation {
     }
 }
 
+/// Resolves the sampling interval once per spawned watcher.
+///
+/// Read at `spawn()` time (not in a process-wide lazy static) so a test can set
+/// the env vars before building its nodes and restore them immediately after,
+/// without changing the values used by watchers in other nodes/tests.
+fn sample_interval() -> Duration {
+    let ms = std::env::var(SAMPLE_INTERVAL_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|ms| (MIN_SAMPLE_INTERVAL_MS..=MAX_SAMPLE_INTERVAL_MS).contains(ms))
+        .unwrap_or(DEFAULT_SAMPLE_INTERVAL_MS);
+    Duration::from_millis(ms)
+}
+
+/// Resolves the number of identical samples required before acting.
+fn required_samples() -> u8 {
+    std::env::var(REQUIRED_SAMPLES_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u8>().ok())
+        .filter(|n| (MIN_REQUIRED_SAMPLES..=MAX_REQUIRED_SAMPLES).contains(n))
+        .unwrap_or(DEFAULT_REQUIRED_SAMPLES)
+}
+
 /// Advances the per-peer suspicion counter. Only an *identical* repeat
 /// confirms a reversion: a peer that is catching up reports a different tail
 /// (or a higher match index once it ACKs), which starts over at 1.
@@ -90,8 +129,11 @@ pub(crate) fn spawn(
     node_id: MatchEngineNodeId,
     client: reqwest::Client,
 ) -> JoinHandle<()> {
+    // Captured before the task is spawned: see the env-var docs above.
+    let sample_interval = sample_interval();
+    let required_samples = required_samples();
     tokio::spawn(async move {
-        let mut tick = tokio::time::interval(SAMPLE_INTERVAL);
+        let mut tick = tokio::time::interval(sample_interval);
         let tick = &mut tick;
         let mut suspicions: BTreeMap<MatchEngineNodeId, (u8, Observation)> = BTreeMap::new();
         let mut cooldowns: BTreeMap<MatchEngineNodeId, Instant> = BTreeMap::new();
@@ -205,7 +247,7 @@ pub(crate) fn spawn(
                 let (count, current) = next_count(suspicions.get(&peer).copied(), current);
                 suspicions.insert(peer, (count, current));
 
-                if count < REQUIRED_SAMPLES {
+                if count < required_samples {
                     continue;
                 }
 

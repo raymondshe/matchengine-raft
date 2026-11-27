@@ -475,6 +475,22 @@ in git history and the linked docs. For the full history, check out `TODO.md` fr
   evicted pods, and restarting each writer so `ensure_schema` recreated the database, 7 super tables
   and 57 per-symbol child tables. The PVC change was verified by deleting the TDengine pod again:
   `bars_1s` stayed at 38 -> 57 (grew, did not reset) and no service logged a missing-table error.
+- **2026-11-27** — P0 Raft edge cases from `docs/RAFT_EDGE_CASE_TEST_MATRIX.md` implemented.
+  `test_quorum.rs` proves a 3→1 cluster rejects writes and recovers without divergence;
+  `test_partition.rs` proves a restarted former leader with a stale log cannot disrupt the healthy
+  quorum (PreVote-on-rejoin); `test_log_reversion.rs` drives the `log_reversion::spawn()` watcher end
+  to end using test-only env overrides (5 s / 2 samples by default, 50 ms / 1 in the test) and
+  verifies only the lagging peer is reset; `test_storage.rs` injects a pure middle WAL frame gap;
+  `test_membership.rs` interrupts a membership change and requires convergence to one valid voter
+  set. Engine suite: 236 lib + 91 cluster tests, fmt and clippy pass.
+- **2026-11-27** — Late-join cluster coverage. `tests/cluster/test_late_join.rs` now reads the
+  stopped node's WAL segments directly (`read_wal_file`, extracting `WalRecord::Entry.log_id.index`
+  rather than the byte offset) and asserts the index lag against the leader's commit. The new
+  `late_started_voter_with_persistent_wal_joins_quorum` case keeps the node in the three-voter
+  membership while it is down, restarts the same id on its old snapshot/WAL, verifies its live log
+  and applied index close the observed lag, and proves it is a voting quorum member by committing a
+  further write with a third voter stopped. Full engine suite (236 lib + 86 cluster), fmt and
+  clippy pass.
 - **2026-11-27** — Market-data manager controls (#9) completed. New endpoints: `PUT
   /api/v1/market-data-services/{name}` (edit, image/release preserved), `POST .../scale` (replicas
   and HPA bounds), `POST .../rollback` (restores the image/release saved by the last update), and

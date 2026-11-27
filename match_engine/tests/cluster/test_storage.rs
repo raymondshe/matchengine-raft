@@ -957,3 +957,137 @@ fn a_mid_batch_append_failure_rolls_back_every_chunk() {
         );
     });
 }
+
+/// RAFT-E04 helper: rewrite a segment without `count` consecutive *complete*
+/// frames starting at `first_frame`, keeping the later frames intact. Unlike a
+/// torn tail this leaves a real index gap in the middle of the file.
+///
+/// Returns the log indexes that were removed, so the test can prove the gap was
+/// actually injected.
+fn remove_middle_wal_frames(path: &Path, first_frame: usize, count: usize) -> Vec<u64> {
+    let original = read_wal_file::<C>(path).unwrap();
+    let bytes = std::fs::read(path).unwrap();
+
+    // Same physical frame scan as `test_failure.rs::truncate_last_wal_records`.
+    let mut starts = Vec::with_capacity(original.len());
+    let mut offset = 8; // MRFT header
+    while offset + 8 <= bytes.len() {
+        let len = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
+        let end = offset + 8 + len;
+        if end > bytes.len() {
+            break;
+        }
+        starts.push(offset);
+        offset = end;
+    }
+    assert_eq!(
+        original.len(),
+        starts.len(),
+        "decoded WAL records and physical frames disagree"
+    );
+    assert!(first_frame + count <= starts.len());
+
+    let removed = original[first_frame..first_frame + count]
+        .iter()
+        .filter_map(|(_, record)| match record {
+            WalRecord::Entry(entry) => Some(entry.log_id().index),
+            WalRecord::Committed(_) => None,
+        })
+        .collect::<Vec<_>>();
+
+    // Splice out the middle frames but deliberately keep the suffix.
+    let keep_start = starts[first_frame];
+    let resume = starts[first_frame + count];
+    let mut rewritten = Vec::with_capacity(bytes.len());
+    rewritten.extend_from_slice(&bytes[..keep_start]);
+    rewritten.extend_from_slice(&bytes[resume..]);
+    std::fs::write(path, &rewritten).unwrap();
+
+    let after = read_wal_file::<C>(path).unwrap();
+    assert_eq!(
+        original.len() - count,
+        after.len(),
+        "wrong number of frames removed"
+    );
+    removed
+}
+
+/// A middle index gap must never be exposed as a log with a hole: strict
+/// recovery rejects it, best-effort recovery keeps the valid prefix and drops
+/// the corrupt segment and everything after it, and the log stays appendable.
+#[test]
+fn a_middle_index_gap_truncates_to_the_valid_prefix() {
+    let dir = TempDir::new("middle-gap");
+
+    block_on(async {
+        let store = Store::open_with_segment_size_and_fsync(
+            dir.path(),
+            512,
+            Some(std::time::Duration::ZERO),
+        )
+        .unwrap();
+        for i in 0..40 {
+            append(&store, vec![blank(i)]).await;
+        }
+        assert_eq!(
+            (0..40).collect::<Vec<_>>(),
+            indexes(&read(&store, 0..100).await)
+        );
+        drop(store);
+    });
+
+    let files = wal_files(dir.path());
+    assert!(files.len() > 1, "small segments should have rotated");
+    let first = &files[0];
+    let frame_count = read_wal_file::<C>(first).unwrap().len();
+    assert!(
+        frame_count >= 3,
+        "first segment needs a middle frame to remove"
+    );
+
+    // Remove one complete middle frame (not the tail) from a non-last segment:
+    // that is the documented index-gap path in docs/STORAGE.md.
+    let removed = remove_middle_wal_frames(first, 1, 1);
+    assert_eq!(1, removed.len());
+    println!("removed middle frame with log index {}", removed[0]);
+
+    // Strict recovery rejects a gap in a non-last segment.
+    assert!(
+        Store::open_with_segment_size_and_fsync(dir.path(), 512, Some(std::time::Duration::ZERO))
+            .is_err(),
+        "strict recovery must reject a non-last index gap"
+    );
+
+    // Best-effort recovery keeps a contiguous prefix, deletes the corrupt
+    // segment and all later ones, and can append with contiguous indexes.
+    block_on(async {
+        let store = Store::open_with_segment_size_and_fsync(dir.path(), 512, None).unwrap();
+        let entries = read(&store, 0..100).await;
+        let found = indexes(&entries);
+        assert!(!found.is_empty(), "the valid prefix was discarded");
+        assert!(
+            found.len() < 40,
+            "recovery exposed the log past the injected gap"
+        );
+        assert_eq!(
+            (0..found.len() as u64).collect::<Vec<_>>(),
+            found,
+            "recovery exposed a log with a hole"
+        );
+        assert_eq!(
+            Some(log_id(1, found.len() as u64 - 1)),
+            log_state(&store).await.last_log_id
+        );
+        assert_eq!(
+            1,
+            wal_files(dir.path()).len(),
+            "the corrupt segment and later segments must be removed"
+        );
+
+        append(&store, vec![blank(found.len() as u64)]).await;
+        assert_eq!(
+            (0..=found.len() as u64).collect::<Vec<_>>(),
+            indexes(&read(&store, 0..100).await)
+        );
+    });
+}

@@ -1762,7 +1762,8 @@ function renderOverview() {
   const packing = shard.spec.packing.mode;
   const progressing = (shard.status?.conditions || []).some((condition) =>
     condition.type === "Progressing" && condition.status === "True");
-  const rollout = progressing && (packing === "containers" || (packing === "supervisor" && progress && !progress.complete));
+  const incomplete = !progress || progress.complete !== true;
+  const rollout = progressing && ((packing === "containers" && incomplete) || (packing === "supervisor" && progress && !progress.complete));
   const percent = progress ? Math.min(100, Math.max(0, Number(progress.percent) || 0)) : null;
   const banner = $("rolloutBanner");
   if (rollout) {

@@ -51,13 +51,14 @@ spec:
             readOnlyRootFilesystem: true
             capabilities:
               drop: ["ALL"]
+          # 256Mi OOM-killed the leader as its informer cache grew, which left stale rollout status behind.
           resources:
             requests:
               cpu: 50m
-              memory: 64Mi
+              memory: 128Mi
             limits:
               cpu: 500m
-              memory: 256Mi
+              memory: 512Mi
 ---
 # Reconcile/rollout counters from the operator's Prometheus text endpoint.
 apiVersion: v1

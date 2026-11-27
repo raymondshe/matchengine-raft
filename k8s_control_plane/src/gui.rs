@@ -58,6 +58,21 @@ mod tests {
     }
 
     #[test]
+    fn rollout_banner_requires_an_incomplete_rollout() {
+        assert!(
+            INDEX.contains("const incomplete = !progress || progress.complete !== true;"),
+            "a missing rollout.complete must count as incomplete so the banner still shows"
+        );
+        assert!(INDEX.contains(
+            "const rollout = progressing && ((packing === \"containers\" && incomplete) || (packing === \"supervisor\" && progress && !progress.complete));"
+        ));
+        assert!(
+            !INDEX.contains("(packing === \"containers\" ||"),
+            "a stale Progressing=True with complete=true must not show the banner"
+        );
+    }
+
+    #[test]
     fn upgrade_targets_survive_live_refresh() {
         assert!(INDEX.contains(
             "const shardChanged = $(\"targetImage\").dataset.shard !== detail.shard.name;"

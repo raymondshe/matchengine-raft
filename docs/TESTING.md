@@ -20,8 +20,11 @@
 | `tests/cluster/test_market_data.rs` | A node started with `--market-data-log` publishes a reset snapshot, one trade message per taker, BBO, post-entry depth totals and a closed OHLC bar; the assertions check `market_seq` anchors and `/read marketdata_status` counters |
 | `market_data_system` | Stream parsing and payloads, WebSocket snapshots/conflation/combined streams/control errors, multiple symbols on one connection with live `UNSUBSCRIBE`/`SUBSCRIBE`, and an embedded-Aeron engine→service→WebSocket test (feature `aeron`) |
 | `tests/cluster/test_events.rs` | `/write` returns events, `/events` pages by cursor, `client_order_id` retries do not duplicate an order, `--max-events` eviction is visible in `/events/status`, long-poll wakes on a racing write or returns an empty page at the deadline, gRPC `StreamEvents` streams a fill and an idle heartbeat, and the bridge sidecar publishes events and checkpoints its cursor |
-| `tests/cluster/test_membership.rs` | Kill the elected leader: a surviving voter takes over with the committed book and accepts new writes. A learner added after the writes catches up through normal log replication, is promoted, and writes through its own node |
-| `tests/cluster/test_late_join.rs` | A node with a stale snapshot/WAL is removed, misses 40 writes while the leader snapshots and purges, then rejoins as a learner and catches up from the live cluster |
+| `tests/cluster/test_membership.rs` | Kill the elected leader: a surviving voter takes over with the committed book and accepts new writes. A learner added after the writes catches up through normal log replication, is promoted, and writes through its own node. An interrupted membership change converges to one of the two valid final voter sets, learner retries are idempotent, and a follower change is not applied locally |
+| `tests/cluster/test_late_join.rs` | A node with a stale snapshot/WAL is removed, misses 40 writes while the leader snapshots and purges, then rejoins as a learner and catches up from the live cluster; a second case keeps it in membership and proves a restarted voter with a lagging persisted WAL closes the gap and still commits as a quorum member |
+| `tests/cluster/test_quorum.rs` | Quorum loss with three voters reduced to one: writes and batches are rejected, applied index and sequence stay frozen, then a restarted voter restores quorum with no divergent book or event tape |
+| `tests/cluster/test_partition.rs` | A stopped and restarted former leader with a stale log cannot force a higher term or oust the healthy quorum; after rejoin all four voters converge on one committed history |
+| `tests/cluster/test_log_reversion.rs` | End-to-end `allow_next_revert` watcher: a follower's WAL tail is truncated while it is stopped, the leader detects the reverted tail and grants one reset, and OpenRaft repairs it without a false reset for healthy peers |
 | `tests/cluster/test_exactness.rs` | An 18-fractional-digit price and quantity round-trip through `/write`, `/read`, `/events`, the JSONL market-data feed, snapshot v11 and a restart without passing through `f64` |
 | `tests/cluster/test_symbols.rs` | The HTTP edge rejects wrong-symbol `Place`/`Cancel`/`Amend` and whole batches with `400` before Raft, including sequence/book checks; a batch that configures a new symbol and places in one entry still works. Also covers precision rejection, the symbol lock and snapshot restart, plus `provision_symbol`/`wait_for_pretrade_ready` and `/pretrade/status` |
 | `tests/cluster/test_health.rs` | `/health` reports the gRPC listener, leadership and WAL/state-machine state; `/ready` is `503` before initialization and `200` after a leader is elected; `/pretrade/status` reports symbolic readiness reasons |
@@ -89,3 +92,14 @@ operation, each with `orders.jsonl`, `expected-events.jsonl`, `run.sh` and a sce
 matrix covers GTC, IOC, FOK, GTD, Day, market, post-only, iceberg, stop-market, stop-limit, amend,
 cancel, maker/taker fee deduction, quote-asset fees and fee overflow. Run everything with
 `./match_engine/tests/replay/run-all.sh`, or one case with `./match_engine/tests/replay/<case>/run.sh`.
+
+## Consensus edge-case roadmap
+
+The table above is the inventory of what exists. The design for the remaining
+multi-node Raft cases — quorum loss, partition/heal, automatic log-reversion
+recovery, interrupted membership changes, stale-lease fallback, snapshot
+cancellation and cross-node event determinism — is in
+[`docs/RAFT_EDGE_CASE_TEST_MATRIX.md`](./RAFT_EDGE_CASE_TEST_MATRIX.md). It
+includes priority, fault-injection hooks, invariants and the proposed port
+ranges. The late-join cases it builds on are in
+`tests/cluster/test_late_join.rs`.
