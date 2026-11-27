@@ -1,6 +1,6 @@
 //! CRD-backed desired state.
 //!
-//! The manager never talks to etcd. It writes the seven catalog CRDs through the Kubernetes API
+//! The manager never talks to etcd. It writes the eight catalog CRDs through the Kubernetes API
 //! server, bootstraps its cache from list calls and keeps it fresh with one watcher per kind.
 //! Status is written through the CRD status subresource and is rate-limited; audit history stays
 //! in memory (an external append-only store in production) and is never persisted in etcd.
@@ -23,7 +23,8 @@ use tracing::{debug, warn};
 
 use crate::error::ApiError;
 use crate::model::{
-    Cell, MarketDataService, OrderSystem, SymbolDeployment, SymbolRoute, SymbolShard, TradingSymbol,
+    Cell, MarketDataService, OrderSystem, SymbolDeployment, SymbolRoute, SymbolShard,
+    TradingSymbol, TradingTerminal,
 };
 use crate::store::{Catalog, CatalogStore};
 
@@ -32,7 +33,7 @@ pub const GROUP: &str = "matching.io";
 pub const VERSION: &str = "v1";
 pub const DEFAULT_NAMESPACE: &str = "match-eu-1";
 
-/// One of the seven catalog CRDs.
+/// One of the eight catalog CRDs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum CrdKind {
     Cell,
@@ -42,10 +43,11 @@ pub enum CrdKind {
     Route,
     MarketData,
     OrderSystem,
+    TradingTerminal,
 }
 
 impl CrdKind {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Cell,
         Self::Shard,
         Self::Symbol,
@@ -53,6 +55,7 @@ impl CrdKind {
         Self::Route,
         Self::MarketData,
         Self::OrderSystem,
+        Self::TradingTerminal,
     ];
 
     pub fn kind(self) -> &'static str {
@@ -64,6 +67,7 @@ impl CrdKind {
             Self::Route => "SymbolRoute",
             Self::MarketData => "MarketDataService",
             Self::OrderSystem => "OrderSystem",
+            Self::TradingTerminal => "TradingTerminal",
         }
     }
 
@@ -76,6 +80,7 @@ impl CrdKind {
             Self::Route => "symbolroutes",
             Self::MarketData => "marketdataservices",
             Self::OrderSystem => "ordersystems",
+            Self::TradingTerminal => "tradingterminals",
         }
     }
 
@@ -88,6 +93,7 @@ impl CrdKind {
             Self::Route => "symbolroute",
             Self::MarketData => "marketdataservice",
             Self::OrderSystem => "ordersystem",
+            Self::TradingTerminal => "tradingterminal",
         }
     }
 
@@ -116,7 +122,7 @@ pub fn object_kind(object: &DynamicObject) -> Option<CrdKind> {
         .and_then(|types| CrdKind::from_kind(&types.kind))
 }
 
-/// Generate the seven CustomResourceDefinition manifests.
+/// Generate the eight CustomResourceDefinition manifests.
 ///
 /// The schema deliberately preserves unknown fields inside `spec`/`status`: the manager already
 /// validates the catalog before writing it, and the exact typed CRD schema is a follow-up. The
@@ -301,6 +307,20 @@ pub fn order_system_object(system: &OrderSystem, default_namespace: &str) -> Dyn
     )
 }
 
+pub fn trading_terminal_object(
+    terminal: &TradingTerminal,
+    default_namespace: &str,
+) -> DynamicObject {
+    object_with_spec_status(
+        CrdKind::TradingTerminal,
+        &terminal.name,
+        &terminal.namespace,
+        &terminal.spec,
+        Some(&terminal.status),
+        default_namespace,
+    )
+}
+
 fn metadata_namespace(object: &DynamicObject, default_namespace: &str) -> String {
     object
         .metadata
@@ -388,7 +408,16 @@ pub fn order_system_from_object(object: &DynamicObject) -> Option<OrderSystem> {
     })
 }
 
-/// Convert a catalog to the seven CRD object sets, used for CRD/etcd backup and restore tests.
+pub fn trading_terminal_from_object(object: &DynamicObject) -> Option<TradingTerminal> {
+    Some(TradingTerminal {
+        name: parse_name(object)?,
+        namespace: metadata_namespace(object, DEFAULT_NAMESPACE),
+        spec: parse_spec(object)?,
+        status: parse_status(object),
+    })
+}
+
+/// Convert a catalog to the eight CRD object sets, used for CRD/etcd backup and restore tests.
 pub fn catalog_to_objects(catalog: &Catalog, default_namespace: &str) -> Vec<DynamicObject> {
     let mut objects = Vec::new();
     objects.extend(
@@ -432,6 +461,12 @@ pub fn catalog_to_objects(catalog: &Catalog, default_namespace: &str) -> Vec<Dyn
             .order_systems
             .values()
             .map(|system| order_system_object(system, default_namespace)),
+    );
+    objects.extend(
+        catalog
+            .trading_terminals
+            .values()
+            .map(|terminal| trading_terminal_object(terminal, default_namespace)),
     );
     objects
 }
@@ -507,6 +542,14 @@ fn upsert_object(
                 catalog.order_systems.insert(system.name.clone(), system);
             }
         }
+        CrdKind::TradingTerminal => {
+            if let Some(mut terminal) = trading_terminal_from_object(object) {
+                terminal.namespace = namespace.clone();
+                catalog
+                    .trading_terminals
+                    .insert(terminal.name.clone(), terminal);
+            }
+        }
     }
     debug!(?kind, name = ?object.metadata.name, namespace, "catalog cache upsert");
 }
@@ -537,6 +580,9 @@ fn remove_object(catalog: &mut Catalog, kind: CrdKind, object: &DynamicObject) {
         CrdKind::OrderSystem => {
             catalog.order_systems.remove(name);
         }
+        CrdKind::TradingTerminal => {
+            catalog.trading_terminals.remove(name);
+        }
     }
 }
 
@@ -549,6 +595,7 @@ fn remove_kind(catalog: &mut Catalog, kind: CrdKind) {
         CrdKind::Route => catalog.routes.clear(),
         CrdKind::MarketData => catalog.market_data_services.clear(),
         CrdKind::OrderSystem => catalog.order_systems.clear(),
+        CrdKind::TradingTerminal => catalog.trading_terminals.clear(),
     }
 }
 
@@ -1129,6 +1176,52 @@ mod tests {
     }
 
     #[test]
+    fn trading_terminal_round_trips_through_a_crd_object() {
+        use crate::model::{
+            Condition, Phase, TradingTerminal, TradingTerminalSpec, TradingTerminalStatus,
+        };
+
+        let terminal = TradingTerminal {
+            name: "eu-1-terminal".to_string(),
+            namespace: "match-eu-1".to_string(),
+            spec: TradingTerminalSpec {
+                cell: "eu-1".to_string(),
+                image: "matchengine-trading-terminal:arm64-v5".to_string(),
+                replicas: 2,
+                autoscaling: Default::default(),
+                port: 8080,
+                ingress: "terminal.match-eu-1.example".to_string(),
+                tls_secret: String::new(),
+                md_upstream: "http://global-marketdata.match-eu-1.svc.cluster.local:24804"
+                    .to_string(),
+                desk_upstream: "http://orders.match-eu-1.svc.cluster.local:24300".to_string(),
+                dns_upstream: String::new(),
+                resources: None,
+                paused: false,
+                previous_image: Some("matchengine-trading-terminal:arm64-v4".to_string()),
+            },
+            status: TradingTerminalStatus {
+                phase: Phase::Ready,
+                conditions: vec![Condition::true_("Available")],
+                replicas: 2,
+                ready_replicas: 2,
+                url: "http://terminal.match-eu-1.example/".to_string(),
+                message: String::new(),
+            },
+        };
+        let object = trading_terminal_object(&terminal, DEFAULT_NAMESPACE);
+        assert_eq!(
+            object.types.as_ref().map(|types| types.kind.as_str()),
+            Some("TradingTerminal")
+        );
+        let catalog = catalog_from_objects([object], DEFAULT_NAMESPACE);
+        assert_eq!(
+            catalog.trading_terminals.get("eu-1-terminal"),
+            Some(&terminal)
+        );
+    }
+
+    #[test]
     fn checked_in_crds_match_the_generator() {
         assert_eq!(
             include_str!("../deploy/crds.yaml"),
@@ -1148,6 +1241,7 @@ mod tests {
         assert_eq!(restored.deployments, catalog.deployments);
         assert_eq!(restored.routes, catalog.routes);
         assert_eq!(restored.market_data_services, catalog.market_data_services);
+        assert_eq!(restored.trading_terminals, catalog.trading_terminals);
         // Audit is deliberately outside the CRDs.
         assert!(restored.audit.is_empty());
         assert_eq!(restored.next_audit_id, 0);

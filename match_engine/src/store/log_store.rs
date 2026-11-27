@@ -346,6 +346,10 @@ struct Inner<C: RaftTypeConfig> {
     /// One-shot test fault: fail after this many decoded chunks; 0 = off.
     #[cfg(debug_assertions)]
     append_fault_after_chunks: std::sync::atomic::AtomicUsize,
+    /// One-shot test fault: fail the next `sync_data` that makes a commit
+    /// marker durable on the following append; false = off.
+    #[cfg(debug_assertions)]
+    fsync_fault: AtomicBool,
 }
 
 impl<C: RaftTypeConfig> Drop for Inner<C> {
@@ -382,6 +386,20 @@ impl<C: RaftTypeConfig> Inner<C> {
             2 => Err(io::Error::other("injected WAL append failure (EIO)")),
             _ => Ok(()),
         }
+    }
+
+    /// Consumes the one-shot fsync fault. Unlike `take_injected_append_error`
+    /// this fires after the entry bytes are written, at the `sync_data` that
+    /// also makes a previously appended commit marker durable. The caller's
+    /// rollback removes the unacked entry, so no false ack can be returned.
+    #[cfg(debug_assertions)]
+    fn take_injected_fsync_error(&self) -> io::Result<()> {
+        if self.fsync_fault.swap(false, Ordering::SeqCst) {
+            return Err(io::Error::other(
+                "injected WAL fsync failure at the commit-marker flush",
+            ));
+        }
+        Ok(())
     }
 
     /// Consumes one count from the mid-batch failure hook.
@@ -469,11 +487,10 @@ impl<C: RaftTypeConfig> Inner<C> {
                 self.take_injected_chunk_error()?;
             }
 
-            if self.fsync == FsyncPolicy::EveryAppend
-                && !defer_fsync
-                && let Err(e) = disk.writer.sync_data()
-            {
-                return Err(e);
+            if self.fsync == FsyncPolicy::EveryAppend && !defer_fsync {
+                #[cfg(debug_assertions)]
+                self.take_injected_fsync_error()?;
+                disk.writer.sync_data()?;
             }
             Ok(())
         })();
@@ -997,6 +1014,8 @@ impl<C: RaftTypeConfig> LogStore<C> {
             append_fault: AtomicU8::new(0),
             #[cfg(debug_assertions)]
             append_fault_after_chunks: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(debug_assertions)]
+            fsync_fault: AtomicBool::new(false),
         });
 
         Ok(Self { inner })
@@ -1128,6 +1147,19 @@ impl<C: RaftTypeConfig> LogStore<C> {
         self.inner
             .append_fault
             .store(if storage_full { 1 } else { 2 }, Ordering::SeqCst);
+    }
+
+    /// Arms a one-shot fsync failure for fault-injection tests.
+    ///
+    /// Debug builds only. `save_committed` appends the commit marker without
+    /// its own fsync; the next append's `sync_data` makes both that marker and
+    /// the new entry durable. This hook fails exactly that next `sync_data`,
+    /// after the entry bytes were written but before they are acknowledged, so
+    /// the append rolls back and openraft fail-stops instead of falsely acking.
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn inject_fsync_error(&self) {
+        self.inner.fsync_fault.store(true, Ordering::SeqCst);
     }
 
     /// Test-only mid-batch failure: fail after `chunks` successful chunk writes.

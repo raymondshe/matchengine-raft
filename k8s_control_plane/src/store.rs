@@ -18,7 +18,7 @@ use crate::error::ApiError;
 use crate::images::{ImageChoice, ImageInventory};
 use crate::model::{
     Cell, DeploymentState, MarketDataService, OrderSystem, SymbolDeployment, SymbolRoute,
-    SymbolShard, TradingSymbol,
+    SymbolShard, TradingSymbol, TradingTerminal,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -51,6 +51,8 @@ pub struct Catalog {
     pub market_data_services: BTreeMap<String, MarketDataService>,
     #[serde(default)]
     pub order_systems: BTreeMap<String, OrderSystem>,
+    #[serde(default)]
+    pub trading_terminals: BTreeMap<String, TradingTerminal>,
     #[serde(default)]
     pub audit: Vec<AuditEntry>,
     #[serde(default)]
@@ -152,6 +154,9 @@ impl Catalog {
         }
         for order_system in catalog.order_systems.values_mut() {
             order_system.status = Default::default();
+        }
+        for terminal in catalog.trading_terminals.values_mut() {
+            terminal.status = Default::default();
         }
         for symbol in catalog.symbols.values_mut() {
             symbol.status = Default::default();
@@ -410,6 +415,24 @@ impl Store {
             )
         })?;
         let current = Some(system.spec.image.clone());
+        self.available_images_for(&catalog, current, Some(name))
+            .await
+    }
+
+    /// Trading-terminal images available for an update. The current image is the terminal's
+    /// configured image; running terminal pods are annotated in the same inventory.
+    pub async fn available_trading_terminal_images(
+        &self,
+        name: &str,
+    ) -> Result<ImageInventory, ApiError> {
+        let catalog = self.snapshot();
+        let terminal = catalog.trading_terminals.get(name).ok_or_else(|| {
+            ApiError::not_found(
+                "trading_terminal_not_found",
+                format!("unknown trading terminal {name}"),
+            )
+        })?;
+        let current = Some(terminal.spec.image.clone());
         self.available_images_for(&catalog, current, Some(name))
             .await
     }

@@ -26,6 +26,7 @@ rules:
       - symbolroutes
       - marketdataservices
       - ordersystems
+      - tradingterminals
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   - apiGroups: ["matching.io"]
     resources:
@@ -36,6 +37,7 @@ rules:
       - symbolroutes/status
       - marketdataservices/status
       - ordersystems/status
+      - tradingterminals/status
     verbs: ["get", "update", "patch"]
   # Read-only image inventory for the manager's upgrade picker. The manager lists nodes to read
   # `status.images` (cached tags/digests) and engine-labeled pods to learn what is running.
@@ -103,6 +105,7 @@ rules:
       - symbolroutes
       - marketdataservices
       - ordersystems
+      - tradingterminals
     verbs: ["get", "list", "watch", "patch", "update"]
   - apiGroups: ["matching.io"]
     resources:
@@ -113,6 +116,7 @@ rules:
       - symbolroutes/status
       - marketdataservices/status
       - ordersystems/status
+      - tradingterminals/status
     verbs: ["get", "update", "patch"]
   - apiGroups: [""]
     resources: ["pods"]
@@ -179,6 +183,7 @@ rules:
       - symbolroutes
       - marketdataservices
       - ordersystems
+      - tradingterminals
     verbs: ["get", "list", "watch", "create", "update", "patch"]
   - apiGroups: [""]
     resources: ["persistentvolumeclaims"]

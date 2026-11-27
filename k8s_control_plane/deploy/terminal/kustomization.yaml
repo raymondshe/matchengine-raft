@@ -1,4 +1,6 @@
-# Terminal component shared by both overlays.
+# Legacy standalone terminal component. No overlay includes this by default:
+# the operator renders the terminal from a `TradingTerminal` CR. Kept only for
+# labs that deliberately opt out of the CRD path.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:

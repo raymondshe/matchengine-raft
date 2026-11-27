@@ -970,9 +970,10 @@ The global manager's cluster holds the catalog CRDs (`TradingSymbol`, `Cell`, `C
 Each cell holds the runtime CRDs (`SymbolDeployment`, `SymbolRoute`, `SymbolShard`, `Backup`,
 `Operation`) plus a namespaced projection of the `TradingSymbol` it is allowed to run. The manager
 projects a symbol into a cell and a shard; the cell operator never reaches back into the
-management cluster. The reference implementation currently installs six kinds
+management cluster. The reference implementation currently installs eight kinds
 (`Cell`, `TradingSymbol`, `SymbolShard`, `SymbolDeployment`, `SymbolRoute`,
-`MarketDataService`); `ClusterTemplate`, `Backup` and `Operation` remain design-level contracts. See [`ETCD_STORAGE.md`](./ETCD_STORAGE.md)
+`MarketDataService`, `OrderSystem`, `TradingTerminal`); `ClusterTemplate`, `Backup` and `Operation`
+remain design-level contracts. See [`ETCD_STORAGE.md`](./ETCD_STORAGE.md)
 for the actual etcd key map and live object inventory.
 
 There are two placement facts, and each has exactly one owner:

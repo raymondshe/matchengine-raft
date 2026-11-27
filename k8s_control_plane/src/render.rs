@@ -14,8 +14,8 @@ use crate::error::ApiError;
 use crate::model::{
     Cell, DeploymentState, MarketDataService, MarketDataTransportMode, OrderSystem,
     OrderSystemProduct, PackingMode, RAFT_PORT_OFFSET, Resources, ShardClass, SymbolDeployment,
-    SymbolShard, TradingSymbol, aeron_channel_endpoint, dns_label, fingerprint, is_multicast_ipv4,
-    port_name,
+    SymbolShard, TradingSymbol, TradingTerminal, aeron_channel_endpoint, dns_label, fingerprint,
+    is_multicast_ipv4, port_name,
 };
 use crate::store::Catalog;
 use crate::validate::validate_bundle;
@@ -2652,6 +2652,440 @@ pub fn render_order_system(
     Ok(objects)
 }
 
+// ---------------------------------------------------------------------------
+// Trading terminal
+// ---------------------------------------------------------------------------
+
+/// Label that ties every rendered object to one `TradingTerminal`.
+pub const TRADING_TERMINAL_LABEL: &str = "matching.io/trading-terminal";
+
+struct TradingTerminalCtx<'a> {
+    terminal: &'a TradingTerminal,
+    cell: &'a Cell,
+    namespace: String,
+}
+
+impl TradingTerminalCtx<'_> {
+    fn name(&self) -> String {
+        dns_label(&self.terminal.name)
+    }
+}
+
+fn trading_terminal_labels(ctx: &TradingTerminalCtx<'_>) -> BTreeMap<String, String> {
+    let mut labels = BTreeMap::new();
+    labels.insert(
+        "app.kubernetes.io/name".to_string(),
+        "match-terminal".to_string(),
+    );
+    labels.insert(
+        "app.kubernetes.io/instance".to_string(),
+        ctx.terminal.name.clone(),
+    );
+    labels.insert(
+        TRADING_TERMINAL_LABEL.to_string(),
+        ctx.terminal.name.clone(),
+    );
+    labels.insert("matching.io/cell".to_string(), ctx.cell.name.clone());
+    labels.insert(
+        "matching.io/cluster-id".to_string(),
+        ctx.cell.spec.cluster_id.clone(),
+    );
+    labels
+}
+
+/// Pod labels are also the immutable Deployment/Service selectors. The
+/// managed-by marker belongs in metadata only: adding it to a selector would
+/// be rejected by the API server on an existing Deployment.
+fn trading_terminal_selector(ctx: &TradingTerminalCtx<'_>) -> BTreeMap<String, String> {
+    let mut labels = BTreeMap::new();
+    labels.insert(
+        "app.kubernetes.io/name".to_string(),
+        "match-terminal".to_string(),
+    );
+    labels.insert(
+        TRADING_TERMINAL_LABEL.to_string(),
+        ctx.terminal.name.clone(),
+    );
+    labels
+}
+
+fn trading_terminal_meta_labels(ctx: &TradingTerminalCtx<'_>) -> BTreeMap<String, String> {
+    let mut labels = trading_terminal_labels(ctx);
+    labels.insert(
+        "app.kubernetes.io/managed-by".to_string(),
+        MANAGED_BY.to_string(),
+    );
+    labels
+}
+
+fn trading_terminal_resources(ctx: &TradingTerminalCtx<'_>) -> Resources {
+    ctx.terminal
+        .spec
+        .resources
+        .clone()
+        .unwrap_or_else(|| Resources::new("10m", "32Mi", "200m", "128Mi"))
+}
+
+/// The nginx variable `proxy_pass` needs an IP literal, while the cluster DNS
+/// ClusterIP differs between clusters. Resolve it from `/etc/resolv.conf` at
+/// startup unless the CR pins `dnsUpstream`.
+fn trading_terminal_resolver_script() -> &'static str {
+    concat!(
+        "set -eu\n",
+        "if [ -z \"${DNS_UPSTREAM:-}\" ]; then\n",
+        "  DNS_UPSTREAM=\"$(awk '/^nameserver /{print $2; exit}' /etc/resolv.conf)\"\n",
+        "  export DNS_UPSTREAM\n",
+        "fi\n",
+        "exec /docker-entrypoint.sh nginx -g 'daemon off;'\n"
+    )
+}
+
+fn trading_terminal_upstream_port(upstream: &str, default: u16) -> u16 {
+    let authority = upstream
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(upstream)
+        .split('/')
+        .next()
+        .unwrap_or_default();
+    authority
+        .rsplit_once(':')
+        .and_then(|(_, port)| port.parse::<u16>().ok())
+        .unwrap_or(default)
+}
+
+fn trading_terminal_deployment(ctx: &TradingTerminalCtx<'_>) -> Value {
+    let spec = &ctx.terminal.spec;
+    let labels = trading_terminal_selector(ctx);
+    let meta_labels = trading_terminal_meta_labels(ctx);
+    let resources = trading_terminal_resources(ctx);
+    let mut deployment = json!({
+        "apiVersion": "apps/v1",
+        "kind": "Deployment",
+        "metadata": {
+            "name": ctx.name(),
+            "namespace": ctx.namespace,
+            "labels": labels_value(&meta_labels),
+        },
+        "spec": {
+            "strategy": { "type": "RollingUpdate", "rollingUpdate": { "maxUnavailable": 0, "maxSurge": 1 } },
+            "selector": { "matchLabels": labels_value(&labels) },
+            "template": {
+                "metadata": { "labels": labels_value(&labels) },
+                "spec": {
+                    "automountServiceAccountToken": false,
+                    "securityContext": {
+                        "runAsNonRoot": true,
+                        "runAsUser": 10001,
+                        "runAsGroup": 10001,
+                        "fsGroup": 10001,
+                        "seccompProfile": { "type": "RuntimeDefault" },
+                    },
+                    "containers": [{
+                        "name": "terminal",
+                        "image": spec.image,
+                        "imagePullPolicy": "IfNotPresent",
+                        "command": ["/bin/sh", "-c"],
+                        "args": [trading_terminal_resolver_script()],
+                        "env": [
+                            { "name": "MD_UPSTREAM", "value": spec.md_upstream },
+                            { "name": "DESK_UPSTREAM", "value": spec.desk_upstream },
+                            { "name": "DNS_UPSTREAM", "value": spec.dns_upstream },
+                        ],
+                        "ports": [{ "name": "http", "containerPort": spec.port, "protocol": "TCP" }],
+                        "resources": resources_json(&resources),
+                        "livenessProbe": {
+                            "httpGet": { "path": "/healthz", "port": "http" },
+                            "initialDelaySeconds": 3,
+                            "periodSeconds": 10,
+                        },
+                        "readinessProbe": {
+                            "httpGet": { "path": "/healthz", "port": "http" },
+                            "initialDelaySeconds": 2,
+                            "periodSeconds": 5,
+                        },
+                        "securityContext": {
+                            "allowPrivilegeEscalation": false,
+                            "capabilities": { "drop": ["ALL"] },
+                        },
+                    }],
+                },
+            },
+        },
+    });
+    // The HPA owns the replica count while the terminal is running.
+    if spec.paused {
+        deployment["spec"]["replicas"] = json!(0);
+    }
+    deployment
+}
+
+fn trading_terminal_service(ctx: &TradingTerminalCtx<'_>) -> Value {
+    let labels = trading_terminal_selector(ctx);
+    let meta_labels = trading_terminal_meta_labels(ctx);
+    json!({
+        "apiVersion": "v1",
+        "kind": "Service",
+        "metadata": {
+            "name": ctx.name(),
+            "namespace": ctx.namespace,
+            "labels": labels_value(&meta_labels),
+        },
+        "spec": {
+            "type": "ClusterIP",
+            "selector": labels_value(&labels),
+            "ports": [{
+                "name": "http",
+                "port": 80,
+                "targetPort": "http",
+                "protocol": "TCP",
+                "appProtocol": "http",
+            }],
+        },
+    })
+}
+
+fn trading_terminal_pdb(ctx: &TradingTerminalCtx<'_>) -> Value {
+    let labels = trading_terminal_selector(ctx);
+    let meta_labels = trading_terminal_meta_labels(ctx);
+    json!({
+        "apiVersion": "policy/v1",
+        "kind": "PodDisruptionBudget",
+        "metadata": {
+            "name": ctx.name(),
+            "namespace": ctx.namespace,
+            "labels": labels_value(&meta_labels),
+        },
+        "spec": {
+            "minAvailable": ctx.terminal.spec.min_replicas().saturating_sub(1),
+            "selector": { "matchLabels": labels_value(&labels) },
+        },
+    })
+}
+
+fn trading_terminal_hpa(ctx: &TradingTerminalCtx<'_>) -> Value {
+    let spec = &ctx.terminal.spec;
+    json!({
+        "apiVersion": "autoscaling/v2",
+        "kind": "HorizontalPodAutoscaler",
+        "metadata": {
+            "name": ctx.name(),
+            "namespace": ctx.namespace,
+            "labels": labels_value(&trading_terminal_meta_labels(ctx)),
+        },
+        "spec": {
+            "scaleTargetRef": {
+                "apiVersion": "apps/v1",
+                "kind": "Deployment",
+                "name": ctx.name(),
+            },
+            "minReplicas": spec.min_replicas(),
+            "maxReplicas": spec.max_replicas(),
+            "metrics": [{
+                "type": "Resource",
+                "resource": {
+                    "name": "cpu",
+                    "target": {
+                        "type": "Utilization",
+                        "averageUtilization": spec.autoscaling.target_cpu_utilization,
+                    },
+                },
+            }],
+            "behavior": {
+                "scaleUp": {
+                    "stabilizationWindowSeconds": 30,
+                    "policies": [{ "type": "Percent", "value": 100, "periodSeconds": 30 }],
+                },
+                "scaleDown": {
+                    "stabilizationWindowSeconds": 300,
+                    "policies": [{ "type": "Percent", "value": 50, "periodSeconds": 60 }],
+                },
+            },
+        },
+    })
+}
+
+fn trading_terminal_ingress(ctx: &TradingTerminalCtx<'_>) -> Value {
+    let host = {
+        let configured = ctx.terminal.spec.ingress.trim().trim_end_matches('.');
+        if configured.is_empty() {
+            format!("terminal.{}", ctx.cell.name)
+        } else {
+            configured.to_string()
+        }
+    };
+    let mut spec = json!({
+        "rules": [{
+            "host": host,
+            "http": { "paths": [{
+                "path": "/",
+                "pathType": "Prefix",
+                "backend": { "service": { "name": ctx.name(), "port": { "number": 80 } } },
+            }] },
+        }],
+    });
+    if !ctx.terminal.spec.tls_secret.trim().is_empty() {
+        spec["tls"] = json!([{ "hosts": [host], "secretName": ctx.terminal.spec.tls_secret }]);
+    }
+    json!({
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "Ingress",
+        "metadata": {
+            "name": ctx.name(),
+            "namespace": ctx.namespace,
+            "labels": labels_value(&trading_terminal_meta_labels(ctx)),
+        },
+        "spec": spec,
+    })
+}
+
+fn trading_terminal_network_policies(ctx: &TradingTerminalCtx<'_>) -> Vec<Value> {
+    let labels = trading_terminal_selector(ctx);
+    let meta_labels = trading_terminal_meta_labels(ctx);
+    let md_port = trading_terminal_upstream_port(
+        &ctx.terminal.spec.md_upstream,
+        default_trading_terminal_md_port(),
+    );
+    let desk_port = trading_terminal_upstream_port(
+        &ctx.terminal.spec.desk_upstream,
+        default_trading_terminal_desk_port(),
+    );
+    let policy = json!({
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "NetworkPolicy",
+        "metadata": {
+            "name": ctx.name(),
+            "namespace": ctx.namespace,
+            "labels": labels_value(&meta_labels),
+        },
+        "spec": {
+            "podSelector": { "matchLabels": labels_value(&labels) },
+            "policyTypes": ["Ingress", "Egress"],
+            "ingress": [{
+                "from": [{ "namespaceSelector": { "matchLabels": { "matching.io/role": "gateway" } } }],
+                "ports": [{ "protocol": "TCP", "port": ctx.terminal.spec.port }],
+            }],
+            "egress": [
+                {
+                    "to": [{ "namespaceSelector": { "matchLabels": { "kubernetes.io/metadata.name": "kube-system" } } }],
+                    "ports": [
+                        { "protocol": "UDP", "port": 53 },
+                        { "protocol": "TCP", "port": 53 },
+                    ],
+                },
+                {
+                    "to": [{ "podSelector": { "matchLabels": { "app.kubernetes.io/name": "match-marketdata" } } }],
+                    "ports": [{ "protocol": "TCP", "port": md_port }],
+                },
+                {
+                    "to": [{ "podSelector": { "matchLabels": { "app.kubernetes.io/name": "match-order-system" } } }],
+                    "ports": [{ "protocol": "TCP", "port": desk_port }],
+                },
+            ],
+        },
+    });
+    // The operator-rendered global-marketdata policy admits only gateway,
+    // observability and control-plane namespaces. NetworkPolicies are additive,
+    // so this supplementary rule unions the terminal as one more ingress source.
+    let marketdata_ingress = json!({
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "NetworkPolicy",
+        "metadata": {
+            "name": format!("{}-marketdata-ingress", ctx.name()),
+            "namespace": ctx.namespace,
+            "labels": labels_value(&meta_labels),
+        },
+        "spec": {
+            "podSelector": { "matchLabels": {
+                "app.kubernetes.io/name": "match-marketdata",
+                MARKET_DATA_LABEL: "global-marketdata",
+            } },
+            "policyTypes": ["Ingress"],
+            "ingress": [{
+                "from": [{ "podSelector": { "matchLabels": labels_value(&labels) } }],
+                "ports": [{ "protocol": "TCP", "port": md_port }],
+            }],
+        },
+    });
+    vec![policy, marketdata_ingress]
+}
+
+fn default_trading_terminal_md_port() -> u16 {
+    trading_terminal_upstream_port(&crate::model::default_trading_terminal_md_upstream(), 24804)
+}
+
+fn default_trading_terminal_desk_port() -> u16 {
+    trading_terminal_upstream_port(
+        &crate::model::default_trading_terminal_desk_upstream(),
+        24300,
+    )
+}
+
+/// Render one `TradingTerminal` as a stateless nginx Deployment/Service/PDB/HPA
+/// with an Ingress and the two additive NetworkPolicies. The terminal is only a
+/// client of the market-data WebSocket service and the order-system BFF: no
+/// engine write route or order ticket is ever rendered here.
+pub fn render_trading_terminal(
+    catalog: &Catalog,
+    name: &str,
+    namespace: &str,
+) -> Result<Vec<Value>, ApiError> {
+    let terminal = catalog.trading_terminals.get(name).ok_or_else(|| {
+        ApiError::not_found(
+            "trading_terminal_not_found",
+            format!("unknown trading terminal {name}"),
+        )
+    })?;
+    let cell = catalog.cells.get(&terminal.spec.cell).ok_or_else(|| {
+        market_data_error(
+            "trading_terminal_cell",
+            name,
+            format!("cell {} is not registered", terminal.spec.cell),
+        )
+    })?;
+    if terminal.spec.image.trim().is_empty() {
+        return Err(market_data_error(
+            "trading_terminal_image",
+            name,
+            "spec.image is required",
+        ));
+    }
+    if terminal.spec.port == 0 {
+        return Err(market_data_error(
+            "trading_terminal_port",
+            name,
+            "spec.port must be greater than zero",
+        ));
+    }
+    let namespace = if namespace.trim().is_empty() {
+        if terminal.namespace.trim().is_empty() {
+            cell.namespace.clone()
+        } else {
+            terminal.namespace.clone()
+        }
+    } else {
+        namespace.trim().to_string()
+    };
+    let ctx = TradingTerminalCtx {
+        terminal,
+        cell,
+        namespace,
+    };
+    // There is no config file to mount: the three upstreams are plain env vars
+    // and the resolver script is inline, matching deploy/terminal.yaml. Emit a
+    // ConfigMap only if a future spec adds data that needs one.
+    let mut objects = Vec::new();
+    objects.push(trading_terminal_deployment(&ctx));
+    objects.push(trading_terminal_service(&ctx));
+    objects.push(trading_terminal_pdb(&ctx));
+    if !terminal.spec.paused {
+        objects.push(trading_terminal_hpa(&ctx));
+    }
+    objects.push(trading_terminal_ingress(&ctx));
+    objects.extend(trading_terminal_network_policies(&ctx));
+    Ok(objects)
+}
+
 /// Whether a shard is safe to roll one pod at a time for the target image.
 ///
 /// Same-version restarts are always safe. A different wire/snapshot version is stop-the-world
@@ -2670,6 +3104,164 @@ mod tests {
             .iter()
             .find(|o| o["kind"] == kind)
             .unwrap_or_else(|| panic!("missing {kind}"))
+    }
+
+    fn demo_terminal(catalog: &mut Catalog, name: &str) -> TradingTerminal {
+        use crate::model::{TradingTerminalSpec, TradingTerminalStatus};
+        let terminal = TradingTerminal {
+            name: name.to_string(),
+            namespace: "match-eu-1".to_string(),
+            spec: TradingTerminalSpec {
+                cell: "eu-1".to_string(),
+                image: "matchengine-trading-terminal:arm64-v5".to_string(),
+                replicas: 1,
+                autoscaling: Default::default(),
+                port: 8080,
+                ingress: String::new(),
+                tls_secret: String::new(),
+                md_upstream: crate::model::default_trading_terminal_md_upstream(),
+                desk_upstream: crate::model::default_trading_terminal_desk_upstream(),
+                dns_upstream: String::new(),
+                resources: None,
+                paused: false,
+                previous_image: None,
+            },
+            status: TradingTerminalStatus::default(),
+        };
+        catalog
+            .trading_terminals
+            .insert(terminal.name.clone(), terminal.clone());
+        terminal
+    }
+
+    #[test]
+    fn trading_terminal_renders_a_frontend_only_workload_set() {
+        let mut catalog = demo_catalog();
+        demo_terminal(&mut catalog, "match-terminal");
+        let objects = render_trading_terminal(&catalog, "match-terminal", "").unwrap();
+        let kinds: Vec<&str> = objects
+            .iter()
+            .map(|object| object["kind"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                "Deployment",
+                "Service",
+                "PodDisruptionBudget",
+                "HorizontalPodAutoscaler",
+                "Ingress",
+                "NetworkPolicy",
+                "NetworkPolicy"
+            ]
+        );
+        let deployment = object(&objects, "Deployment");
+        assert_eq!(deployment["metadata"]["name"], "match-terminal");
+        assert_eq!(
+            deployment["spec"]["strategy"]["rollingUpdate"]["maxUnavailable"],
+            0
+        );
+        assert_eq!(
+            deployment["spec"]["strategy"]["rollingUpdate"]["maxSurge"],
+            1
+        );
+        assert!(deployment["spec"].get("replicas").is_none());
+        let selector = &deployment["spec"]["selector"]["matchLabels"];
+        assert_eq!(selector[TRADING_TERMINAL_LABEL], "match-terminal");
+        assert!(
+            selector.get("app.kubernetes.io/managed-by").is_none(),
+            "managed-by must stay in metadata only: {selector:?}"
+        );
+        assert_eq!(
+            deployment["metadata"]["labels"]["app.kubernetes.io/managed-by"],
+            MANAGED_BY
+        );
+        let container = &deployment["spec"]["template"]["spec"]["containers"][0];
+        assert_eq!(container["image"], "matchengine-trading-terminal:arm64-v5");
+        assert_eq!(container["ports"][0]["containerPort"], 8080);
+        let env = container["env"].as_array().unwrap();
+        let value = |name: &str| {
+            env.iter()
+                .find(|entry| entry["name"] == name)
+                .map(|entry| entry["value"].as_str().unwrap())
+                .unwrap_or_else(|| panic!("missing env {name}"))
+        };
+        assert_eq!(
+            value("MD_UPSTREAM"),
+            "http://global-marketdata.match-eu-1.svc.cluster.local:24804"
+        );
+        assert_eq!(
+            value("DESK_UPSTREAM"),
+            "http://orders.match-eu-1.svc.cluster.local:24300"
+        );
+        assert_eq!(value("DNS_UPSTREAM"), "");
+        assert_eq!(container["command"][0], "/bin/sh");
+        assert_eq!(container["command"][1], "-c");
+        let args = container["args"][0].as_str().unwrap();
+        assert!(args.contains("awk '/^nameserver /{print $2; exit}' /etc/resolv.conf"));
+        assert!(args.contains("exec /docker-entrypoint.sh nginx -g 'daemon off;'"));
+        let ingress = object(&objects, "Ingress");
+        assert_eq!(ingress["spec"]["rules"][0]["host"], "terminal.eu-1");
+        assert!(ingress["spec"].get("tls").is_none());
+        let service = object(&objects, "Service");
+        assert_eq!(service["spec"]["ports"][0]["port"], 80);
+        assert_eq!(service["spec"]["ports"][0]["targetPort"], "http");
+        let policies: Vec<&Value> = objects
+            .iter()
+            .filter(|object| object["kind"] == "NetworkPolicy")
+            .collect();
+        assert_eq!(policies.len(), 2);
+        assert_eq!(policies[0]["spec"]["egress"][1]["ports"][0]["port"], 24804);
+        assert_eq!(policies[0]["spec"]["egress"][2]["ports"][0]["port"], 24300);
+        assert_eq!(policies[1]["spec"]["ingress"][0]["ports"][0]["port"], 24804);
+        let rendered = serde_json::to_string(&objects).unwrap();
+        assert!(
+            !rendered.contains("/write"),
+            "no engine write route: {rendered}"
+        );
+        assert!(!rendered.contains("/write_batch"));
+        assert!(
+            !rendered.contains("matchengine-raft"),
+            "the terminal never runs the engine binary: {rendered}"
+        );
+    }
+
+    #[test]
+    fn paused_trading_terminal_scales_to_zero_and_uses_pinned_upstreams() {
+        let mut catalog = demo_catalog();
+        let mut terminal = demo_terminal(&mut catalog, "match-terminal");
+        terminal.spec.paused = true;
+        terminal.spec.ingress = "terminal.example.com.".to_string();
+        terminal.spec.tls_secret = "terminal-tls".to_string();
+        terminal.spec.dns_upstream = "10.0.0.10".to_string();
+        terminal.spec.md_upstream = "http://md.svc.example:24900".to_string();
+        catalog
+            .trading_terminals
+            .insert(terminal.name.clone(), terminal);
+        let objects = render_trading_terminal(&catalog, "match-terminal", "").unwrap();
+        assert!(
+            !objects
+                .iter()
+                .any(|object| object["kind"] == "HorizontalPodAutoscaler")
+        );
+        let deployment = object(&objects, "Deployment");
+        assert_eq!(deployment["spec"]["replicas"], 0);
+        let env = deployment["spec"]["template"]["spec"]["containers"][0]["env"]
+            .as_array()
+            .unwrap();
+        let dns = env
+            .iter()
+            .find(|entry| entry["name"] == "DNS_UPSTREAM")
+            .unwrap();
+        assert_eq!(dns["value"], "10.0.0.10");
+        let ingress = object(&objects, "Ingress");
+        assert_eq!(ingress["spec"]["rules"][0]["host"], "terminal.example.com");
+        assert_eq!(ingress["spec"]["tls"][0]["secretName"], "terminal-tls");
+        let policies: Vec<&Value> = objects
+            .iter()
+            .filter(|object| object["kind"] == "NetworkPolicy")
+            .collect();
+        assert_eq!(policies[0]["spec"]["egress"][1]["ports"][0]["port"], 24900);
     }
 
     #[test]

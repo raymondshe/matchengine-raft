@@ -36,12 +36,13 @@ use crate::model::{
     MarketDataSymbolStatus, OrderSystemShardStatus, OrderSystemStatus, PackingMode, Phase, Release,
     ReleaseBlock, RouteState, RouteStatus, ShardClass, ShardNodeStatus, ShardRolloutStatus,
     ShardStatus, ShardSymbolStatus, SymbolDeployment, SymbolRoute, SymbolShard, TradingSymbol,
-    TradingSymbolStatus, desired_config_hash, dns_label,
+    TradingSymbolStatus, TradingTerminal, TradingTerminalStatus, desired_config_hash, dns_label,
 };
 use crate::reconcile::MarketDataObservation;
 use crate::render::{
     MANAGED_BY, MARKET_DATA_LABEL, ORDER_SYSTEM_LABEL, Profile, RenderOptions,
-    render_market_data_service, render_order_system, render_shard,
+    TRADING_TERMINAL_LABEL, render_market_data_service, render_order_system, render_shard,
+    render_trading_terminal,
 };
 use crate::store::Catalog;
 use crate::validate::{parse_cpu_millis, parse_memory_bytes, per_pod_totals};
@@ -133,6 +134,8 @@ pub async fn run(client: Client, options: OperatorOptions, metrics: Arc<Metrics>
                     shards = stats.shards,
                     market_data_services = stats.market_data_services,
                     order_systems = stats.order_systems,
+                    trading_terminals = stats.trading_terminals,
+                    trading_terminal_statuses = stats.trading_terminal_statuses,
                     desired_objects = stats.desired_objects,
                     applied = stats.applied,
                     pruned = stats.pruned,
@@ -462,6 +465,8 @@ struct ReconcileStats {
     shards: usize,
     market_data_services: usize,
     order_systems: usize,
+    trading_terminals: usize,
+    trading_terminal_statuses: usize,
     desired_objects: usize,
     applied: usize,
     pruned: usize,
@@ -551,12 +556,14 @@ async fn reconcile_once(client: &Client, options: &OperatorOptions) -> Result<Re
         shards: view.catalog.shards.len(),
         market_data_services: view.catalog.market_data_services.len(),
         order_systems: view.catalog.order_systems.len(),
+        trading_terminals: view.catalog.trading_terminals.len(),
         ..ReconcileStats::default()
     };
     let mut desired = BTreeMap::<WorkloadKey, Value>::new();
     let mut failed_shards = BTreeSet::new();
     let mut failed_market_data = BTreeSet::new();
     let mut failed_order_systems = BTreeSet::new();
+    let mut failed_trading_terminals = BTreeSet::new();
 
     for shard in view.catalog.shards.values() {
         match render_shard(&view.catalog, &shard.name, &render_options(shard, options)) {
@@ -608,6 +615,24 @@ async fn reconcile_once(client: &Client, options: &OperatorOptions) -> Result<Re
             }
         }
     }
+    for terminal in view.catalog.trading_terminals.values() {
+        match render_trading_terminal(&view.catalog, &terminal.name, "") {
+            Ok(objects) => {
+                for object in objects.into_iter().filter(|object| !object.is_null()) {
+                    let key = workload_key(&object)?;
+                    desired.insert(key, object);
+                }
+            }
+            Err(error) => {
+                warn!(
+                    terminal = %terminal.name,
+                    error = %format!("{error:?}"),
+                    "cannot render trading terminal; skipping apply/prune"
+                );
+                failed_trading_terminals.insert(terminal.name.clone());
+            }
+        }
+    }
     stats.desired_objects = desired.len();
     let capacity_blocks = if options.dry_run {
         BTreeMap::new()
@@ -630,6 +655,7 @@ async fn reconcile_once(client: &Client, options: &OperatorOptions) -> Result<Re
             &failed_shards,
             &failed_market_data,
             &failed_order_systems,
+            &failed_trading_terminals,
             options.namespace.as_deref(),
         )
         .await?;
@@ -647,6 +673,8 @@ async fn reconcile_once(client: &Client, options: &OperatorOptions) -> Result<Re
     let observations = observe_catalog(&view.catalog, options).await;
     let market_data_observations = observe_market_data(client, &view.catalog, options).await;
     let order_system_statuses = observe_order_systems(client, &view.catalog).await;
+    let trading_terminal_statuses = observe_trading_terminals(client, &view.catalog).await;
+    stats.trading_terminal_statuses = trading_terminal_statuses.len();
     if !options.dry_run {
         let actions = actuate_catalog(&view.catalog, &observations, options).await;
         stats.bootstraps = actions.bootstraps;
@@ -685,12 +713,20 @@ async fn reconcile_once(client: &Client, options: &OperatorOptions) -> Result<Re
             &failed_order_systems,
         )
         .await?;
+        stats.status_writes += write_trading_terminal_statuses(
+            client,
+            &view,
+            &trading_terminal_statuses,
+            &failed_trading_terminals,
+        )
+        .await?;
         label_leaders(client, &view.catalog, &observations).await?;
     } else {
         info!(
             deployments = observations.len(),
             market_data = market_data_observations.len(),
             order_systems = order_system_statuses.len(),
+            trading_terminals = trading_terminal_statuses.len(),
             "dry-run: skipping status writes, leader labels and bootstrap/config actions"
         );
     }
@@ -749,6 +785,7 @@ async fn prune_objects(
     failed_shards: &BTreeSet<String>,
     failed_market_data: &BTreeSet<String>,
     failed_order_systems: &BTreeSet<String>,
+    failed_trading_terminals: &BTreeSet<String>,
     namespace: Option<&str>,
 ) -> Result<usize> {
     let mut pruned = 0;
@@ -805,6 +842,15 @@ async fn prune_objects(
                 .as_ref()
                 .and_then(|labels| labels.get(ORDER_SYSTEM_LABEL))
                 .is_some_and(|system| failed_order_systems.contains(system))
+            {
+                continue;
+            }
+            if object
+                .metadata
+                .labels
+                .as_ref()
+                .and_then(|labels| labels.get(TRADING_TERMINAL_LABEL))
+                .is_some_and(|terminal| failed_trading_terminals.contains(terminal))
             {
                 continue;
             }
@@ -3771,6 +3817,157 @@ async fn write_order_system_statuses(
     Ok(writes)
 }
 
+/// Deployment-level observation of a stateless trading terminal.
+#[derive(Debug, Clone, Default)]
+pub struct TradingTerminalObservation {
+    pub replicas: u16,
+    pub ready_replicas: u16,
+    pub error: Option<String>,
+}
+
+fn trading_terminal_url(terminal: &TradingTerminal) -> String {
+    let configured = terminal.spec.ingress.trim().trim_end_matches('.');
+    let host = if configured.is_empty() {
+        format!("terminal.{}", terminal.spec.cell)
+    } else {
+        configured.to_string()
+    };
+    let scheme = if terminal.spec.tls_secret.trim().is_empty() {
+        "http"
+    } else {
+        "https"
+    };
+    format!("{scheme}://{host}/")
+}
+
+/// Pure status derivation shared by the Kubernetes observation and the unit tests.
+fn trading_terminal_status(
+    terminal: &TradingTerminal,
+    observation: Option<&TradingTerminalObservation>,
+    failed: bool,
+) -> TradingTerminalStatus {
+    let missing = observation.is_none();
+    let observation = observation.cloned().unwrap_or_default();
+    let message = if failed {
+        "render rejected; see operator logs for the validation error".to_string()
+    } else if terminal.spec.paused {
+        "paused by spec".to_string()
+    } else if let Some(error) = observation.error.as_deref() {
+        error.to_string()
+    } else if missing {
+        "Deployment has not been created yet".to_string()
+    } else {
+        format!(
+            "{}/{} replicas ready",
+            observation.ready_replicas, observation.replicas
+        )
+    };
+    let phase = if failed {
+        Phase::Failed
+    } else if terminal.spec.paused {
+        Phase::Disabled
+    } else if missing {
+        Phase::Pending
+    } else if observation.error.is_some() {
+        Phase::Degraded
+    } else if observation.replicas == 0 {
+        Phase::Pending
+    } else if observation.ready_replicas == observation.replicas {
+        Phase::Ready
+    } else if observation.ready_replicas > 0 {
+        Phase::Progressing
+    } else {
+        Phase::Degraded
+    };
+    TradingTerminalStatus {
+        phase,
+        conditions: vec![Condition {
+            kind: "Available".to_string(),
+            status: if phase == Phase::Ready {
+                "True"
+            } else {
+                "False"
+            }
+            .to_string(),
+            reason: if failed {
+                Some("RenderRejected".to_string())
+            } else {
+                (phase != Phase::Ready).then(|| "ReplicasNotReady".to_string())
+            },
+            message: Some(message.clone()),
+        }],
+        replicas: observation.replicas,
+        ready_replicas: observation.ready_replicas,
+        url: trading_terminal_url(terminal),
+        message,
+    }
+}
+
+async fn observe_trading_terminals(
+    client: &Client,
+    catalog: &Catalog,
+) -> BTreeMap<String, TradingTerminalStatus> {
+    let mut statuses = BTreeMap::new();
+    for terminal in catalog.trading_terminals.values() {
+        let namespace = namespace_or_default(&terminal.namespace);
+        let name = dns_label(&terminal.name);
+        let api = Api::<Deployment>::namespaced(client.clone(), namespace);
+        let mut observation = TradingTerminalObservation::default();
+        let observed = match api.get(&name).await {
+            Ok(deployment) => {
+                let state = deployment.status.unwrap_or_default();
+                observation.replicas = state.replicas.unwrap_or(0).max(0) as u16;
+                observation.ready_replicas = state.ready_replicas.unwrap_or(0).max(0) as u16;
+                Some(&observation)
+            }
+            Err(kube::Error::Api(error)) if error.code == 404 => None,
+            Err(error) => {
+                observation.error = Some(format!("{name}: {error}"));
+                Some(&observation)
+            }
+        };
+        statuses.insert(
+            terminal.name.clone(),
+            trading_terminal_status(terminal, observed, false),
+        );
+    }
+    statuses
+}
+
+async fn write_trading_terminal_statuses(
+    client: &Client,
+    view: &CrdView,
+    statuses: &BTreeMap<String, TradingTerminalStatus>,
+    failed: &BTreeSet<String>,
+) -> Result<usize> {
+    let mut writes = 0;
+    for terminal in view.catalog.trading_terminals.values() {
+        let mut status = statuses.get(&terminal.name).cloned().unwrap_or_default();
+        if failed.contains(&terminal.name) {
+            status.phase = Phase::Failed;
+            status.message =
+                "render rejected; see operator logs for the validation error".to_string();
+            if let Some(condition) = status.conditions.first_mut() {
+                condition.status = "False".to_string();
+                condition.reason = Some("RenderRejected".to_string());
+                condition.message = Some(status.message.clone());
+            }
+        }
+        // Status writes replace only `/status`; `spec.previous_image` (the
+        // rollback history written by the image update) is never touched.
+        writes += write_status(
+            client,
+            view,
+            CrdKind::TradingTerminal,
+            &terminal.namespace,
+            &terminal.name,
+            &status,
+        )
+        .await?;
+    }
+    Ok(writes)
+}
+
 async fn write_market_data_statuses(
     client: &Client,
     view: &CrdView,
@@ -5090,5 +5287,113 @@ mod tests {
         assert!(tagged.conditions.iter().any(|condition| {
             condition.kind == "MutableImageTag" && condition.status == "False"
         }));
+    }
+
+    fn trading_terminal() -> TradingTerminal {
+        use crate::model::TradingTerminalSpec;
+        TradingTerminal {
+            name: "match-terminal".to_string(),
+            namespace: "match-eu-1".to_string(),
+            spec: TradingTerminalSpec {
+                cell: "eu-1".to_string(),
+                image: "matchengine-trading-terminal:arm64-v5".to_string(),
+                replicas: 2,
+                autoscaling: Default::default(),
+                port: 8080,
+                ingress: String::new(),
+                tls_secret: String::new(),
+                md_upstream: crate::model::default_trading_terminal_md_upstream(),
+                desk_upstream: crate::model::default_trading_terminal_desk_upstream(),
+                dns_upstream: String::new(),
+                resources: None,
+                paused: false,
+                previous_image: None,
+            },
+            status: Default::default(),
+        }
+    }
+
+    #[test]
+    fn trading_terminal_status_tracks_deployment_observations() {
+        let terminal = trading_terminal();
+        let ready = TradingTerminalObservation {
+            replicas: 2,
+            ready_replicas: 2,
+            error: None,
+        };
+        let status = trading_terminal_status(&terminal, Some(&ready), false);
+        assert_eq!(status.phase, Phase::Ready);
+        assert_eq!(status.replicas, 2);
+        assert_eq!(status.ready_replicas, 2);
+        assert_eq!(status.url, "http://terminal.eu-1/");
+        assert_eq!(status.message, "2/2 replicas ready");
+        assert_eq!(status.conditions.len(), 1);
+        assert_eq!(status.conditions[0].kind, "Available");
+        assert_eq!(status.conditions[0].status, "True");
+        assert!(status.conditions[0].reason.is_none());
+
+        let warming = TradingTerminalObservation {
+            ready_replicas: 1,
+            ..ready.clone()
+        };
+        assert_eq!(
+            trading_terminal_status(&terminal, Some(&warming), false).phase,
+            Phase::Progressing
+        );
+        let stopped = TradingTerminalObservation {
+            ready_replicas: 0,
+            ..ready.clone()
+        };
+        assert_eq!(
+            trading_terminal_status(&terminal, Some(&stopped), false).phase,
+            Phase::Degraded
+        );
+        let scaled_down = TradingTerminalObservation {
+            replicas: 0,
+            ready_replicas: 0,
+            error: None,
+        };
+        assert_eq!(
+            trading_terminal_status(&terminal, Some(&scaled_down), false).phase,
+            Phase::Pending
+        );
+        let pending = trading_terminal_status(&terminal, None, false);
+        assert_eq!(pending.phase, Phase::Pending);
+        assert_eq!(pending.message, "Deployment has not been created yet");
+    }
+
+    #[test]
+    fn trading_terminal_status_reports_render_failure_pause_and_tls_url() {
+        let terminal = trading_terminal();
+        let failed = trading_terminal_status(&terminal, None, true);
+        assert_eq!(failed.phase, Phase::Failed);
+        assert!(failed.message.contains("render rejected"));
+        assert_eq!(
+            failed.conditions[0].reason.as_deref(),
+            Some("RenderRejected")
+        );
+
+        let observation = TradingTerminalObservation {
+            replicas: 2,
+            ready_replicas: 2,
+            error: Some("deployment: forbidden".to_string()),
+        };
+        let degraded = trading_terminal_status(&terminal, Some(&observation), false);
+        assert_eq!(degraded.phase, Phase::Degraded);
+        assert_eq!(degraded.message, "deployment: forbidden");
+
+        let mut paused = terminal.clone();
+        paused.spec.paused = true;
+        let disabled = trading_terminal_status(&paused, None, false);
+        assert_eq!(disabled.phase, Phase::Disabled);
+        assert_eq!(disabled.message, "paused by spec");
+
+        let mut tls = terminal.clone();
+        tls.spec.ingress = "terminal.example.com.".to_string();
+        tls.spec.tls_secret = "terminal-tls".to_string();
+        assert_eq!(
+            trading_terminal_status(&tls, None, false).url,
+            "https://terminal.example.com/"
+        );
     }
 }

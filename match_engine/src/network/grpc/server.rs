@@ -91,6 +91,106 @@ fn next_snapshot_len(received: u64, chunk_len: usize) -> Result<u64, Status> {
 
 static NEXT_STAGING_FILE: AtomicU64 = AtomicU64::new(0);
 
+/// Debug-only gRPC status injection for the Raft append handlers (RAFT-E16).
+///
+/// `MATCHENGINE_TEST_GRPC_STATUS_CODE=<tonic Code as u8>` makes the unary
+/// `AppendEntries` handler return `Status::new(code, "injected")` before
+/// touching Raft, and makes `AppendStream` fail each incoming request with
+/// that status (checking only the handshake would leave an already-open
+/// replication stream healthy). `0` (`OK`) is ignored.
+/// The optional `MATCHENGINE_TEST_GRPC_STATUS_TARGET=<substring>` scopes the
+/// hook to the server whose **own** HTTP address (looked up from Raft
+/// membership) contains the substring; the variable is process-wide, so this
+/// is what lets an in-process test fail exactly one peer. With no target the
+/// hook applies to every serving node. Both variables default to unset/inert
+/// and are compiled out of release builds; production behavior is unchanged.
+///
+/// Only append handlers are injected: on stable openraft replication and
+/// heartbeats both use `AppendStream`, and unary `AppendEntries` is the other
+/// path that exercises the same `RPCTypes::AppendEntries` status mapping on the
+/// client (`Unavailable` -> `Unreachable`, `DeadlineExceeded` -> `Timeout`,
+/// everything else -> `Network`). Vote/PreVote are deliberately left alone so
+/// an injected follower cannot disrupt elections.
+#[cfg(debug_assertions)]
+static INJECTED_STATUS_COUNT: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(debug_assertions)]
+fn debug_code_from_u8(code: u8) -> Option<tonic::Code> {
+    match code {
+        0 => None, // OK is not an error; leave the hook inert.
+        1 => Some(tonic::Code::Cancelled),
+        2 => Some(tonic::Code::Unknown),
+        3 => Some(tonic::Code::InvalidArgument),
+        4 => Some(tonic::Code::DeadlineExceeded),
+        5 => Some(tonic::Code::NotFound),
+        6 => Some(tonic::Code::AlreadyExists),
+        7 => Some(tonic::Code::PermissionDenied),
+        8 => Some(tonic::Code::ResourceExhausted),
+        9 => Some(tonic::Code::FailedPrecondition),
+        10 => Some(tonic::Code::Aborted),
+        11 => Some(tonic::Code::OutOfRange),
+        12 => Some(tonic::Code::Unimplemented),
+        13 => Some(tonic::Code::Internal),
+        14 => Some(tonic::Code::Unavailable),
+        15 => Some(tonic::Code::DataLoss),
+        16 => Some(tonic::Code::Unauthenticated),
+        _ => None,
+    }
+}
+
+fn maybe_injected_status(raft: &MatchEngineRaft, handler: &str) -> Option<Status> {
+    #[cfg(debug_assertions)]
+    {
+        use openraft::async_runtime::WatchReceiver as _;
+
+        let code = std::env::var("MATCHENGINE_TEST_GRPC_STATUS_CODE")
+            .ok()?
+            .parse::<u8>()
+            .ok()
+            .and_then(debug_code_from_u8)?;
+
+        let target = std::env::var("MATCHENGINE_TEST_GRPC_STATUS_TARGET").ok();
+        let metrics = raft.metrics();
+        let metrics = metrics.borrow_watched();
+        let own_addr = metrics
+            .membership_config
+            .membership()
+            .get_node(&metrics.id)
+            .map(|node| node.addr.clone());
+        if let Some(target) = &target
+            && !target.is_empty()
+            && !own_addr
+                .as_deref()
+                .is_some_and(|addr| addr.contains(target.as_str()))
+        {
+            return None;
+        }
+
+        tracing::debug!(
+            node = metrics.id,
+            handler,
+            ?code,
+            ?own_addr,
+            ?target,
+            "injecting gRPC status for edge-case test"
+        );
+        INJECTED_STATUS_COUNT.fetch_add(1, Ordering::Relaxed);
+        Some(Status::new(code, "injected"))
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = raft;
+        None
+    }
+}
+
+/// Debug-only count of statuses injected by [`maybe_injected_status`].
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn injected_status_count() -> u64 {
+    INJECTED_STATUS_COUNT.load(Ordering::Relaxed)
+}
+
 /// At most four snapshot streams may stage at once, bounding disk usage to
 /// 4 × MAX_SNAPSHOT_BYTES even if many peers (or an attacker with gRPC access)
 /// open streams concurrently.
@@ -206,6 +306,9 @@ impl RaftService for RaftGrpcService {
         &self,
         request: Request<AppendRequest>,
     ) -> Result<Response<AppendResponse>, Status> {
+        if let Some(status) = maybe_injected_status(&self.raft, "append_entries") {
+            return Err(status);
+        }
         let req: AppendEntriesRequest<MatchEngineTypeConfig> =
             decode(&request.into_inner().payload)
                 .map_err(|e| Status::invalid_argument(format!("decode AppendEntries: {e}")))?;
@@ -360,30 +463,42 @@ impl RaftService for RaftGrpcService {
         &self,
         request: Request<Streaming<AppendRequest>>,
     ) -> Result<Response<Self::AppendStreamStream>, Status> {
+        // Check the hook on every request of an *already open* stream: rejecting
+        // only the handshake leaves an existing replication stream healthy, so
+        // the leader would keep replicating through it and the status mapping
+        // would never be exercised.
         tracing::debug!("gRPC AppendEntries stream opened");
 
         let raft = self.raft.clone();
+        let hook_raft = self.raft.clone();
         let mut inbound = request.into_inner();
         let (tx, rx) = mpsc::channel(STREAM_APPEND_CHANNEL_SIZE);
-        let decode_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let stream_error: Arc<Mutex<Option<Status>>> = Arc::new(Mutex::new(None));
 
         tokio::spawn(async move {
-            let error_slot = decode_error.clone();
+            let error_slot = stream_error.clone();
 
             let requests = async_stream::stream! {
                 loop {
                     match inbound.message().await {
                         Ok(Some(msg)) => match decode::<AppendEntriesRequest<MatchEngineTypeConfig>>(&msg.payload) {
-                            Ok(req) => yield req,
+                            Ok(req) => {
+                                if let Some(status) = maybe_injected_status(&hook_raft, "append_stream") {
+                                    *error_slot.lock().unwrap() = Some(status);
+                                    break;
+                                }
+                                yield req
+                            }
                             Err(e) => {
                                 *error_slot.lock().unwrap() =
-                                    Some(format!("decode streamed AppendEntries: {e}"));
+                                    Some(Status::invalid_argument(format!("decode streamed AppendEntries: {e}")));
                                 break;
                             }
                         },
                         Ok(None) => break,
                         Err(e) => {
-                            *error_slot.lock().unwrap() = Some(format!("read AppendEntries stream: {e}"));
+                            *error_slot.lock().unwrap() =
+                                Some(Status::invalid_argument(format!("read AppendEntries stream: {e}")));
                             break;
                         }
                     }
@@ -415,9 +530,9 @@ impl RaftService for RaftGrpcService {
                 }
             }
 
-            let error = { decode_error.lock().unwrap().take() };
-            if let Some(e) = error {
-                let _ = tx.send(Err(Status::invalid_argument(e))).await;
+            let error = { stream_error.lock().unwrap().take() };
+            if let Some(status) = error {
+                let _ = tx.send(Err(status)).await;
             }
         });
 

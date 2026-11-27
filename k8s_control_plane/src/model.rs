@@ -1470,6 +1470,154 @@ pub fn default_order_system_target_cpu() -> u16 {
 }
 
 // ---------------------------------------------------------------------------
+// Trading terminal
+// ---------------------------------------------------------------------------
+
+/// A stateless React trading terminal (SPA behind nginx), rendered as a
+/// Deployment/Service/Ingress/HPA by the operator. The terminal is a client of
+/// the market-data WebSocket service and the order-system BFF; it never talks
+/// to an engine directly.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TradingTerminal {
+    pub name: String,
+    #[serde(default)]
+    pub namespace: String,
+    pub spec: TradingTerminalSpec,
+    #[serde(default)]
+    pub status: TradingTerminalStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TradingTerminalSpec {
+    pub cell: String,
+    /// Digest-pinned (or tagged) terminal image.
+    pub image: String,
+    #[serde(default = "default_trading_terminal_replicas")]
+    pub replicas: u16,
+    /// Horizontal Pod Autoscaler policy. Enabled by default with a minimum of one replica.
+    #[serde(default)]
+    pub autoscaling: TradingTerminalAutoscaling,
+    /// Container port inside the terminal pod.
+    #[serde(default = "default_trading_terminal_port")]
+    pub port: u16,
+    /// Optional Ingress host; empty means no Ingress is rendered.
+    #[serde(default)]
+    pub ingress: String,
+    #[serde(default)]
+    pub tls_secret: String,
+    /// Market-data WebSocket service upstream, proxied same-origin at `/md/*`.
+    #[serde(default = "default_trading_terminal_md_upstream")]
+    pub md_upstream: String,
+    /// Order-system BFF upstream, proxied same-origin at `/demo/api/*`.
+    #[serde(default = "default_trading_terminal_desk_upstream")]
+    pub desk_upstream: String,
+    /// DNS resolver for the nginx variable `proxy_pass`. Empty resolves from `/etc/resolv.conf`.
+    #[serde(default)]
+    pub dns_upstream: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resources: Option<Resources>,
+    #[serde(default)]
+    pub paused: bool,
+    /// Image replaced by the last image update; reserved for a future rollback action.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_image: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TradingTerminalAutoscaling {
+    #[serde(default = "default_trading_terminal_min_replicas")]
+    pub min_replicas: u16,
+    /// Upper bound; `0` derives it from `spec.replicas`.
+    #[serde(default)]
+    pub max_replicas: u16,
+    #[serde(default = "default_trading_terminal_target_cpu")]
+    pub target_cpu_utilization: u16,
+}
+
+impl Default for TradingTerminalAutoscaling {
+    fn default() -> Self {
+        Self {
+            min_replicas: default_trading_terminal_min_replicas(),
+            max_replicas: 0,
+            target_cpu_utilization: default_trading_terminal_target_cpu(),
+        }
+    }
+}
+
+impl TradingTerminalSpec {
+    /// Effective HPA minimum, never below one.
+    pub fn min_replicas(&self) -> u16 {
+        self.autoscaling.min_replicas.max(1)
+    }
+
+    /// Effective HPA maximum. `0` means the configured replica count.
+    pub fn max_replicas(&self) -> u16 {
+        if self.autoscaling.max_replicas == 0 {
+            self.replicas.max(self.min_replicas())
+        } else {
+            self.autoscaling.max_replicas.max(self.min_replicas())
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TradingTerminalStatus {
+    #[serde(default)]
+    pub phase: Phase,
+    #[serde(default)]
+    pub conditions: Vec<Condition>,
+    #[serde(default)]
+    pub replicas: u16,
+    #[serde(default)]
+    pub ready_replicas: u16,
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub message: String,
+}
+
+impl Default for TradingTerminalStatus {
+    fn default() -> Self {
+        Self {
+            phase: Phase::Pending,
+            conditions: Vec::new(),
+            replicas: 0,
+            ready_replicas: 0,
+            url: String::new(),
+            message: String::new(),
+        }
+    }
+}
+
+pub fn default_trading_terminal_replicas() -> u16 {
+    1
+}
+
+pub fn default_trading_terminal_port() -> u16 {
+    8080
+}
+
+pub fn default_trading_terminal_md_upstream() -> String {
+    "http://global-marketdata.match-eu-1.svc.cluster.local:24804".to_string()
+}
+
+pub fn default_trading_terminal_desk_upstream() -> String {
+    "http://orders.match-eu-1.svc.cluster.local:24300".to_string()
+}
+
+pub fn default_trading_terminal_min_replicas() -> u16 {
+    1
+}
+
+pub fn default_trading_terminal_target_cpu() -> u16 {
+    70
+}
+
+// ---------------------------------------------------------------------------
 // Operation, Backup, ClusterTemplate
 // ---------------------------------------------------------------------------
 

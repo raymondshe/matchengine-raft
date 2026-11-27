@@ -5,8 +5,9 @@
 
 Date: 2026-11-27 · Baseline: `master` after the late-join coverage work
 
-**Status 2026-11-27:** the five P0 cases (E01–E05) are implemented and pass in
-`cargo test --test cluster`. See §6a for where each one landed.
+**Status 2026-11-27:** all 20 cases E01–E20 are implemented and pass in
+`cargo test --test cluster` (236 lib + 106 cluster; the async-WAL case also
+passes under `--features async-wal`). See §6a–§6c for where each one landed.
 
 ## 1. Purpose and scope
 
@@ -340,6 +341,39 @@ Ports in use: 21711–21713 (quorum), 21714–21717 (partition/rejoin), 21721–
 
 The only production change is the two env-overridable watcher constants in
 `src/log_reversion.rs`; defaults preserve the shipped behavior exactly.
+
+## 6b. Implemented P1 cases (2026-11-27)
+
+| ID | Test | Notes |
+|---|---|---|
+| E06 | `tests/cluster/test_min_voters.rs::live_no_fsync_cluster_rejects_shrink_below_four_voters` | In-process `StorageConfig::with_min_voters(4)`: typed and raw `change-membership` to three voters are rejected with 400, membership stays at four, all nodes Ready, writes keep committing; then one configured voter is stopped and the remaining three still commit. Uses ports 21751–21754. |
+| E07 | `tests/cluster/test_leadership.rs::leader_transfer_under_sustained_write_load` | Transfers via the console action and directly through `Raft::trigger().transfer_leader()` under a continuous write-batch load; asserts unique sequences, one event per committed sequence, original responses on key retries, and identical final state on all nodes. Ports 21741–21744. |
+| E08 | `tests/cluster/test_read_policy.rs::stale_lease_falls_back_to_read_index` | Debug-only `MATCHENGINE_TEST_LEASE_SKEW_MS` models an expired caller-side lease; asserts the `local_lease` path takes a real `ReadIndex` fallback with the expected counters and still observes the latest commit. Ports 21946–21948. |
+| E09 | `tests/cluster/test_snapshot.rs::snapshot_install_preserves_a_followers_event_cursor_contract` | Follower takes an `/events` cursor, falls behind across snapshot/purge, installs the leader's snapshot, and the old cursor must either resume at the boundary or report an explicit eviction gap — never silently skip or duplicate. Ports 21104–21106. |
+| E10 | `tests/cluster/test_concurrent.rs::concurrent_writes_across_failover_have_no_loss_or_duplicates` | Four tasks x 200 keyed writes with the leader killed halfway; 800 contiguous distinct sequences, identical event tapes on all survivors, and a timed-out key retries to its original sequence. Ports 21745–21748. |
+| E11 | `tests/cluster/test_failure.rs::fsync_failure_at_the_commit_marker_is_fatal_without_a_false_ack` | Debug-only `LogStore::inject_fsync_error()` fails the next `sync_data` after the commit marker was appended; the write is not acked, the node fail-stops, and after reopen `/ready` stays 503 until recovery covers the durable tail. Port 21949. |
+| E12 | `tests/cluster/test_snapshot.rs::cancelled_snapshot_install_removes_staging_and_retry_succeeds` | Debug-only `MATCHENGINE_TEST_SNAPSHOT_CANCEL_AFTER_CHUNKS` (+ optional target) drops the snapshot stream mid-transfer; asserts no `current.snap` and no staging file, then a clean retry installs and validates the snapshot. Ports 21107–21108. |
+
+All new hooks are `#[cfg(debug_assertions)]` or test-env-only with inert
+defaults. The only non-gated source edit is an equivalent `sync_data()?`
+rewrite in `append_blocking_inner`. Production behavior is unchanged.
+
+## 6c. Implemented P2 cases (2026-11-27)
+
+| ID | Test | Notes |
+|---|---|---|
+| E13 | `tests/cluster/test_quorum.rs::five_voters_survive_two_then_lose_quorum_and_recover` | 5 voters, 3 needed: two stopped still commit, a third stops writes, restoring two voters recovers exactly the frozen prefix. Ports 21761–21765. |
+| E14 | `tests/cluster/test_determinism.rs::identical_order_stream_yields_identical_event_tapes_after_failover_snapshot_and_truncation` | Two clusters run the same order stream with a failover in one and snapshot/purge plus a WAL truncation in the other; final event tapes, book, sequence and last trade are identical. Ports 21771–21776. |
+| E15 | `tests/cluster/test_determinism.rs::day_close_across_a_leadership_transfer_expires_once_everywhere` | `PurgeExpired` around a leadership transfer expires exactly the same orders once on every replica. Ports 21777–21780. |
+| E16 | `tests/cluster/test_transport.rs::grpc_statuses_map_to_raft_errors_and_recover` | Debug-only `MATCHENGINE_TEST_GRPC_STATUS_CODE`/`_TARGET` injects `Unavailable`, `DeadlineExceeded` and `Unknown` into unary/stream append for one follower; quorum survives, no panic, target catches up after clearing. Ports 21781–21783. |
+| E17 | `tests/cluster/test_client.rs::exhausted_leader_discovery_returns_a_typed_error` and `follower_linearizable_read_auto_forwards_to_the_leader` | Typed error instead of a hang with only dead members; auto-forward read observes the leader's commit while the follower stays a follower. Ports 21785–21788. |
+| E18 | `tests/cluster/test_membership.rs::two_concurrent_learners_catch_up_and_promote_one_at_a_time` | Two learners added before catch-up both install/promote sequentially; five voters, no joint config, identical state. Ports 21789–21793. |
+| E19 | `tests/cluster/test_async_wal.rs::async_wal_pending_tail_is_not_resurrected_and_truncate_flushes_pending` | Feature `async-wal`: delayed fsync drops the pending tail on reopen; `truncate_after`/`purge` fire `IOFlushed` before structural changes. |
+| E20 | `tests/cluster/test_quorum.rs::whole_cluster_restart_with_unsynced_tails_converges_to_one_history` | Four no-fsync nodes stopped at different write counts restart and converge to one committed history with no lost ack. Ports 21766–21769. |
+
+The gRPC status hook is debug-only and inert by default (unset code, optional
+target substring); the per-request injection on `AppendStream` matters because
+rejecting only the handshake would leave an already-open stream healthy.
 
 ## 6. Implementation order and acceptance gates
 

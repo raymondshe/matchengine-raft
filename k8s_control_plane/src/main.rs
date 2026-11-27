@@ -24,7 +24,9 @@ use matchengine_k8s_control_plane::backup;
 use matchengine_k8s_control_plane::bundle::{ShardBundle, demo_bundles};
 use matchengine_k8s_control_plane::model::{BackupMode, Release};
 use matchengine_k8s_control_plane::reconcile::{Scenario, plan_shard, simulate, summarize};
-use matchengine_k8s_control_plane::render::{Profile, RenderOptions, as_list, render_shard};
+use matchengine_k8s_control_plane::render::{
+    Profile, RenderOptions, as_list, render_shard, render_trading_terminal,
+};
 use matchengine_k8s_control_plane::store::{Catalog, Store, demo_catalog};
 use matchengine_k8s_control_plane::validate::{validate_catalog, validate_symbol};
 
@@ -66,7 +68,7 @@ enum Command {
         #[arg(long, env = "ENGINE_CONSOLE_HOST")]
         engine_console_host: Option<String>,
     },
-    /// Print the seven catalog CustomResourceDefinitions as YAML.
+    /// Print the eight catalog CustomResourceDefinitions as YAML.
     Crds {
         /// Write here instead of stdout.
         #[arg(long)]
@@ -181,6 +183,8 @@ enum Command {
         market_data_service: Vec<String>,
         #[arg(long)]
         order_system: Vec<String>,
+        #[arg(long)]
+        trading_terminal: Vec<String>,
         /// Write the selected CRD objects through the manager's CRD store.
         #[arg(long, conflicts_with = "drill")]
         apply_crds: bool,
@@ -223,13 +227,16 @@ enum Command {
         )]
         namespace: String,
     },
-    /// Render one shard (or every shard) as a `v1/List` of Kubernetes objects.
+    /// Render one shard, one trading terminal (or every shard) as a `v1/List` of Kubernetes objects.
     Render {
         #[arg(long)]
         shard: Option<String>,
         /// Render every shard into one `List` (separated in the output).
         #[arg(long)]
         all: bool,
+        /// Render one trading terminal instead of a shard.
+        #[arg(long, conflicts_with_all = ["shard", "all"])]
+        terminal: Option<String>,
         #[arg(long, value_parser = ["production", "local"], default_value = "production")]
         profile: String,
         #[arg(long)]
@@ -577,6 +584,7 @@ async fn main() -> Result<()> {
             symbol,
             market_data_service,
             order_system,
+            trading_terminal,
             apply_crds,
             drill,
             restore_volumes,
@@ -597,15 +605,18 @@ async fn main() -> Result<()> {
                 symbols: symbol.into_iter().collect(),
                 market_data_services: market_data_service.into_iter().collect(),
                 order_systems: order_system.into_iter().collect(),
+                trading_terminals: trading_terminal.into_iter().collect(),
             };
             let plan = backup::plan_restore(&bundle, &selection)?;
             println!(
-                "backup {}: catalog {}, {} cells, {} shards, {} symbols, {} volumes",
+                "backup {}: catalog {}, {} cells, {} shards, {} symbols, {} order systems, {} trading terminals, {} volumes",
                 bundle.manifest.id,
                 plan.crd_sha256,
                 plan.counts.cells,
                 plan.counts.shards,
                 plan.counts.symbols,
+                plan.counts.order_systems,
+                plan.counts.trading_terminals,
                 plan.volumes
             );
             if drill {
@@ -710,6 +721,7 @@ async fn main() -> Result<()> {
         Command::Render {
             shard,
             all,
+            terminal,
             profile,
             namespace,
             storage_class,
@@ -733,16 +745,26 @@ async fn main() -> Result<()> {
                 non_root: Some(!no_non_root),
             };
             let mut items = Vec::new();
-            let names: Vec<String> = if all {
-                catalog.shards.keys().cloned().collect()
-            } else {
-                vec![shard.context("--shard is required unless --all is set")?]
-            };
-            for name in &names {
-                let objects = render_shard(&catalog, name, &options).map_err(|error| {
-                    anyhow::anyhow!("cannot render {name}: {error}{}", issues(&error))
+            if let Some(name) = terminal {
+                let objects = render_trading_terminal(&catalog, &name, "").map_err(|error| {
+                    anyhow::anyhow!(
+                        "cannot render trading terminal {name}: {error}{}",
+                        issues(&error)
+                    )
                 })?;
                 items.extend(objects);
+            } else {
+                let names: Vec<String> = if all {
+                    catalog.shards.keys().cloned().collect()
+                } else {
+                    vec![shard.context("--shard is required unless --all or --terminal is set")?]
+                };
+                for name in &names {
+                    let objects = render_shard(&catalog, name, &options).map_err(|error| {
+                        anyhow::anyhow!("cannot render {name}: {error}{}", issues(&error))
+                    })?;
+                    items.extend(objects);
+                }
             }
             let list = as_list(items);
             let text = serde_json::to_string_pretty(&list)?;
@@ -1076,5 +1098,65 @@ mod tests {
         assert_eq!(some.wire_version, 8);
         assert_eq!(some.snapshot_version, Release::default().snapshot_version);
         assert!(some.mixed_version_safe);
+    }
+
+    #[test]
+    fn render_cli_accepts_a_trading_terminal_name() {
+        let cli = Cli::try_parse_from(["k8s-control-plane", "render", "--terminal", "terminal-eu"])
+            .unwrap();
+        match cli.command {
+            Command::Render {
+                shard,
+                all,
+                terminal,
+                ..
+            } => {
+                assert_eq!(terminal.as_deref(), Some("terminal-eu"));
+                assert!(shard.is_none());
+                assert!(!all);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+        // Existing shard rendering is unchanged, and a terminal is not a shard.
+        let cli =
+            Cli::try_parse_from(["k8s-control-plane", "render", "--shard", "fx-eu-01"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Render { ref terminal, .. } if terminal.is_none()
+        ));
+        assert_eq!(
+            Cli::try_parse_from([
+                "k8s-control-plane",
+                "render",
+                "--shard",
+                "fx-eu-01",
+                "--terminal",
+                "terminal-eu",
+            ])
+            .unwrap_err()
+            .kind(),
+            clap::error::ErrorKind::ArgumentConflict
+        );
+    }
+
+    #[test]
+    fn restore_cli_accepts_a_trading_terminal_selection() {
+        let cli = Cli::try_parse_from([
+            "k8s-control-plane",
+            "restore",
+            "--input",
+            "backups/fx-eu-01",
+            "--trading-terminal",
+            "terminal-eu",
+            "--trading-terminal",
+            "terminal-us",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Restore {
+                trading_terminal, ..
+            } => assert_eq!(trading_terminal, ["terminal-eu", "terminal-us"]),
+            other => panic!("unexpected command: {other:?}"),
+        }
     }
 }

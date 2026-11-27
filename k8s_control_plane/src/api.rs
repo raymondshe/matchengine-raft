@@ -28,7 +28,7 @@ use crate::error::ApiError;
 use crate::model::dns_label;
 use crate::model::{
     Cell, DeploymentState, MarketDataService, MarketDataServiceSpec, OrderSystem, Release,
-    SymbolDeployment, SymbolRoute, SymbolShard, TradingSymbol,
+    SymbolDeployment, SymbolRoute, SymbolShard, TradingSymbol, TradingTerminal,
 };
 use crate::provision::{self, CreateSymbolRequest};
 use crate::reconcile::{
@@ -37,6 +37,7 @@ use crate::reconcile::{
 };
 use crate::render::{
     Profile, RenderOptions, as_list, render_market_data_service, render_order_system, render_shard,
+    render_trading_terminal,
 };
 use crate::store::{AuditEntry, Catalog, Store, now_epoch};
 use crate::validate::{Report, per_pod_totals, validate_bundle, validate_catalog, validate_symbol};
@@ -134,6 +135,22 @@ pub fn router_with_options(store: Arc<Store>, console: ConsoleOptions) -> Router
             "/api/v1/order-systems/{name}/upgrade",
             post(upgrade_order_system),
         )
+        .route(
+            "/api/v1/trading-terminals",
+            get(trading_terminals).post(create_trading_terminal),
+        )
+        .route(
+            "/api/v1/trading-terminals/{name}",
+            get(trading_terminal_detail),
+        )
+        .route(
+            "/api/v1/trading-terminals/{name}/manifests",
+            get(trading_terminal_manifests),
+        )
+        .route(
+            "/api/v1/trading-terminals/{name}/upgrade",
+            post(upgrade_trading_terminal),
+        )
         .route("/api/v1/validate", get(validate))
         .route("/api/v1/bundles", post(upsert_bundle))
         .route("/api/v1/audit", get(audit))
@@ -197,12 +214,14 @@ struct ImagesQuery {
     market_data_service: Option<String>,
     #[serde(default)]
     order_system: Option<String>,
+    #[serde(default)]
+    trading_terminal: Option<String>,
 }
 
-/// Images the engine, market-data or order-system upgrade picker can offer.
+/// Images the engine, market-data, order-system or terminal upgrade picker can offer.
 ///
-/// The CRD backend also lists node-cached images and running engine/market-data/order-system pods
-/// (read-only). Other backends return the references recorded in the catalog.
+/// The CRD backend also lists node-cached images and running workload pods (read-only). Other
+/// backends return the references recorded in the catalog.
 async fn images(
     State(store): State<Arc<Store>>,
     Query(query): Query<ImagesQuery>,
@@ -211,21 +230,24 @@ async fn images(
         query.shard.is_some(),
         query.market_data_service.is_some(),
         query.order_system.is_some(),
+        query.trading_terminal.is_some(),
     ];
     if selectors.iter().filter(|selected| **selected).count() > 1 {
         return Err(ApiError::bad_request(
             "images_query",
-            "pass only one of shard, marketDataService or orderSystem",
+            "pass only one of shard, marketDataService, orderSystem or tradingTerminal",
         ));
     }
     let inventory = match (
         query.shard.as_deref(),
         query.market_data_service.as_deref(),
         query.order_system.as_deref(),
+        query.trading_terminal.as_deref(),
     ) {
-        (_, Some(name), _) => store.available_market_data_images(name).await?,
-        (_, _, Some(name)) => store.available_order_system_images(name).await?,
-        (shard, None, None) => store.available_images(shard).await?,
+        (_, Some(name), _, _) => store.available_market_data_images(name).await?,
+        (_, _, Some(name), _) => store.available_order_system_images(name).await?,
+        (_, _, _, Some(name)) => store.available_trading_terminal_images(name).await?,
+        (shard, None, None, None) => store.available_images(shard).await?,
     };
     Ok(Json(json!(inventory)))
 }
@@ -244,6 +266,7 @@ fn counts(catalog: &Catalog) -> Value {
         "routes": catalog.routes.len(),
         "marketDataServices": catalog.market_data_services.len(),
         "orderSystems": catalog.order_systems.len(),
+        "tradingTerminals": catalog.trading_terminals.len(),
         "processes": active_processes,
     })
 }
@@ -263,6 +286,7 @@ fn catalog_value(catalog: &Catalog, report: &Report) -> Value {
         "routes": catalog.routes,
         "marketDataServices": catalog.market_data_services,
         "orderSystems": catalog.order_systems,
+        "tradingTerminals": catalog.trading_terminals,
         "counts": counts(catalog),
         "validation": report,
     })
@@ -1843,6 +1867,261 @@ async fn upgrade_order_system(
     Ok(Json(json!({ "upgrade": result })))
 }
 
+/// The URL a browser uses to reach the terminal. The terminal proxies market data at `/md/*`
+/// and order entry at `/demo/api/*`; the manager never calls the engine itself.
+fn trading_terminal_url(terminal: &TradingTerminal, cell: Option<&str>) -> String {
+    let configured = terminal.spec.ingress.trim().trim_end_matches('.');
+    let host = if configured.is_empty() {
+        // The renderer advertises `terminal.<cell>` for an unset Ingress host.
+        match cell {
+            Some(cell) => format!("terminal.{cell}"),
+            None => {
+                return format!(
+                    "http://{}.{}.svc.cluster.local:{}/",
+                    dns_label(&terminal.name),
+                    terminal.namespace,
+                    terminal.spec.port
+                );
+            }
+        }
+    } else {
+        configured.to_string()
+    };
+    let scheme = if terminal.spec.tls_secret.trim().is_empty() {
+        "http"
+    } else {
+        "https"
+    };
+    format!("{scheme}://{host}/")
+}
+
+fn trading_terminal_upstreams(terminal: &TradingTerminal) -> Value {
+    json!({
+        "marketData": terminal.spec.md_upstream,
+        "orderDesk": terminal.spec.desk_upstream,
+        "dns": terminal.spec.dns_upstream,
+    })
+}
+
+/// Stateless SPA terminals, with the advertised URL and proxied upstreams for each one.
+async fn trading_terminals(State(store): State<Arc<Store>>) -> Json<Value> {
+    let catalog = store.snapshot();
+    let items: Vec<Value> = catalog
+        .trading_terminals
+        .values()
+        .map(|terminal| {
+            let mut value = serde_json::to_value(terminal).unwrap_or(Value::Null);
+            let cell = catalog
+                .cells
+                .get(&terminal.spec.cell)
+                .map(|cell| cell.name.as_str());
+            value["service"] = Value::String(dns_label(&terminal.name));
+            value["url"] = Value::String(trading_terminal_url(terminal, cell));
+            value["upstreams"] = trading_terminal_upstreams(terminal);
+            value
+        })
+        .collect();
+    Json(json!({ "items": items }))
+}
+
+async fn create_trading_terminal(
+    State(store): State<Arc<Store>>,
+    Json(mut terminal): Json<TradingTerminal>,
+) -> Result<Json<Value>, ApiError> {
+    terminal.name = terminal.name.trim().to_string();
+    if terminal.name.is_empty() {
+        return Err(ApiError::bad_request(
+            "invalid_name",
+            "trading terminal name is required",
+        ));
+    }
+    if terminal.spec.cell.trim().is_empty() {
+        return Err(ApiError::bad_request(
+            "cell_required",
+            "spec.cell is required",
+        ));
+    }
+    if terminal.spec.image.trim().is_empty() {
+        return Err(ApiError::bad_request(
+            "image_required",
+            "spec.image is required",
+        ));
+    }
+    let ingress = terminal
+        .spec
+        .ingress
+        .trim()
+        .trim_end_matches('.')
+        .to_string();
+    // An empty host is allowed: the renderer advertises `terminal.<cell>` as a default.
+    if !ingress.is_empty()
+        && (ingress.contains("://")
+            || ingress.contains('/')
+            || ingress.contains(char::is_whitespace)
+            || !ingress.split('.').all(|label| !label.is_empty()))
+    {
+        return Err(ApiError::bad_request(
+            "invalid_ingress",
+            "spec.ingress must be a bare DNS host, not a URL or a path",
+        ));
+    }
+    terminal.spec.ingress = ingress;
+    let name = terminal.name.clone();
+    store
+        .mutate(|catalog| {
+            if catalog.trading_terminals.contains_key(&name) {
+                return Err(ApiError::bad_request(
+                    "duplicate_name",
+                    format!("trading terminal {name} already exists"),
+                ));
+            }
+            let cell = catalog.cells.get(&terminal.spec.cell).ok_or_else(|| {
+                ApiError::bad_request(
+                    "unknown_cell",
+                    format!("cell {} is not in the catalog", terminal.spec.cell),
+                )
+            })?;
+            if terminal.namespace.is_empty() {
+                terminal.namespace = cell.namespace.clone();
+            }
+            catalog
+                .trading_terminals
+                .insert(name.clone(), terminal.clone());
+            let report = validate_catalog(catalog).scoped(&BTreeSet::from([name.clone()]));
+            if !report.is_ok() {
+                return Err(ApiError::unprocessable(report));
+            }
+            Ok(())
+        })
+        .await?;
+    Ok(Json(json!({ "tradingTerminal": terminal })))
+}
+
+async fn trading_terminal_detail(
+    State(store): State<Arc<Store>>,
+    Path(name): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let catalog = store.snapshot();
+    let terminal = catalog.trading_terminals.get(&name).ok_or_else(|| {
+        ApiError::not_found(
+            "trading_terminal_not_found",
+            format!("unknown trading terminal {name}"),
+        )
+    })?;
+    let report = validate_catalog(&catalog).scoped(&BTreeSet::from([name.clone()]));
+    let cell = catalog
+        .cells
+        .get(&terminal.spec.cell)
+        .map(|cell| cell.name.as_str());
+    Ok(Json(json!({
+        "tradingTerminal": terminal,
+        "service": dns_label(&terminal.name),
+        "url": trading_terminal_url(terminal, cell),
+        "upstreams": trading_terminal_upstreams(terminal),
+        "manifests": {
+            "name": format!("{name}-manifests"),
+            "url": format!("/api/v1/trading-terminals/{name}/manifests"),
+        },
+        "validation": report,
+    })))
+}
+
+async fn trading_terminal_manifests(
+    State(store): State<Arc<Store>>,
+    Path(name): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let catalog = store.snapshot();
+    let objects = render_trading_terminal(&catalog, &name, "")?;
+    let mut list = as_list(objects);
+    list["metadata"] = json!({
+        "name": format!("{name}-manifests"),
+        "annotations": { "matching.io/rendered-by": "k8s_control_plane" },
+    });
+    Ok(Json(list))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpgradeTradingTerminalRequest {
+    image: String,
+}
+
+async fn upgrade_trading_terminal(
+    State(store): State<Arc<Store>>,
+    Path(name): Path<String>,
+    Json(request): Json<UpgradeTradingTerminalRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let image = request.image.trim().to_string();
+    if image.is_empty() {
+        return Err(ApiError::bad_request(
+            "image_required",
+            "target image must not be empty",
+        ));
+    }
+    let mut result = Value::Null;
+    store
+        .mutate(|catalog| {
+            let terminal = catalog.trading_terminals.get(&name).cloned().ok_or_else(|| {
+                ApiError::not_found(
+                    "trading_terminal_not_found",
+                    format!("unknown trading terminal {name}"),
+                )
+            })?;
+            if terminal.spec.paused {
+                return Err(ApiError::conflict(
+                    "trading_terminal_paused",
+                    format!("trading terminal {name} is paused; resume it before changing the image"),
+                ));
+            }
+            if terminal.spec.image == image {
+                result = json!({
+                    "terminal": name,
+                    "image": image,
+                    "changed": false,
+                    "steps": [],
+                    "notes": ["the trading terminal already has this image"],
+                });
+                return Ok(());
+            }
+            if let Some(target) = catalog.trading_terminals.get_mut(&name) {
+                target.spec.previous_image = Some(target.spec.image.clone());
+                target.spec.image = image.clone();
+                target.status.phase = crate::model::Phase::Pending;
+                target.status.message =
+                    "image update requested; operator rolling the terminal Deployment".to_string();
+                target.status.conditions.clear();
+            }
+            let report = validate_catalog(catalog).scoped(&BTreeSet::from([name.clone()]));
+            if !report.is_ok() {
+                return Err(ApiError::unprocessable(report));
+            }
+            catalog.audit(
+                "api",
+                "upgrade-trading-terminal",
+                &name,
+                format!("{image} on trading terminal {name}; rolling the stateless SPA"),
+            );
+            result = json!({
+                "terminal": name,
+                "image": image,
+                "changed": true,
+                "previousImage": terminal.spec.image,
+                "steps": [
+                    { "action": "update-deployment", "detail": "operator writes the new image to the terminal Deployment" },
+                    { "action": "rolling-update", "detail": "the SPA rolls with maxUnavailable: 0 and one surge pod; existing HTTP connections drain" },
+                    { "action": "verify", "detail": "operator reports ready replicas and the advertised URL in TradingTerminal.status" }
+                ],
+                "notes": [
+                    "the terminal is stateless, no quorum: no Raft leader transfer or snapshot is involved",
+                    "the GUI links to the terminal WebUI, which proxies /md/* and /demo/api/* itself"
+                ],
+            });
+            Ok(())
+        })
+        .await?;
+    Ok(Json(json!({ "upgrade": result })))
+}
+
 async fn validate(State(store): State<Arc<Store>>) -> Json<Value> {
     let catalog = store.snapshot();
     let report = validate_catalog(&catalog);
@@ -2743,6 +3022,222 @@ mod tests {
         let (status, body) = get_json_from(app, "/api/v1/images?orderSystem=nope").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body["error"], "order_system_not_found");
+    }
+
+    async fn create_trading_terminal(app: axum::Router) {
+        let (status, body) = post_json_to(
+            app,
+            "/api/v1/trading-terminals",
+            json!({
+                "name": "terminal",
+                "spec": {
+                    "cell": "eu-1",
+                    "image": "registry.example.com/matchengine-trading-terminal:arm64-v5",
+                    "replicas": 1,
+                    "port": 8080,
+                    "ingress": "terminal.match-eu-1.example",
+                    "mdUpstream": "http://global-marketdata.match-eu-1.svc.cluster.local:24804",
+                    "deskUpstream": "http://orders.match-eu-1.svc.cluster.local:24300"
+                }
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    #[tokio::test]
+    async fn trading_terminal_can_be_created_listed_and_described() {
+        let app = app();
+        create_trading_terminal(app.clone()).await;
+
+        let (status, body) = get_json_from(app.clone(), "/api/v1/trading-terminals").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let item = &body["items"][0];
+        assert_eq!(item["name"], "terminal");
+        assert_eq!(item["namespace"], "match-eu-1");
+        assert_eq!(item["url"], "http://terminal.match-eu-1.example/");
+        assert_eq!(
+            item["upstreams"]["marketData"],
+            "http://global-marketdata.match-eu-1.svc.cluster.local:24804"
+        );
+        assert_eq!(
+            item["upstreams"]["orderDesk"],
+            "http://orders.match-eu-1.svc.cluster.local:24300"
+        );
+
+        let (status, body) = get_json_from(app.clone(), "/api/v1/trading-terminals/terminal").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["service"], "terminal");
+        assert_eq!(body["url"], "http://terminal.match-eu-1.example/");
+        assert_eq!(
+            body["manifests"]["url"],
+            "/api/v1/trading-terminals/terminal/manifests"
+        );
+        assert!(body["validation"]["errors"].as_array().unwrap().is_empty());
+
+        let (status, body) = get_json_from(app, "/api/v1/catalog").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["counts"]["tradingTerminals"], 1);
+    }
+
+    #[tokio::test]
+    async fn trading_terminal_create_rejects_invalid_input() {
+        let app = app();
+        let body = json!({
+            "name": "terminal",
+            "spec": { "cell": "nope", "image": "terminal:latest", "ingress": "terminal.example" }
+        });
+        let (status, response) = post_json_to(app.clone(), "/api/v1/trading-terminals", body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
+        assert_eq!(response["error"], "unknown_cell");
+
+        let body = json!({
+            "name": "terminal",
+            "spec": { "cell": "eu-1", "image": "", "ingress": "terminal.example" }
+        });
+        let (status, response) = post_json_to(app.clone(), "/api/v1/trading-terminals", body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
+        assert_eq!(response["error"], "image_required");
+
+        let body = json!({
+            "name": "terminal",
+            "spec": { "cell": "eu-1", "image": "terminal:latest", "ingress": "https://terminal.example/" }
+        });
+        let (status, response) = post_json_to(app.clone(), "/api/v1/trading-terminals", body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
+        assert_eq!(response["error"], "invalid_ingress");
+
+        let body = json!({
+            "name": "terminal",
+            "spec": {
+                "cell": "eu-1", "image": "terminal:latest", "ingress": "terminal.example",
+                "mdUpstream": "not-a-url"
+            }
+        });
+        let (status, response) = post_json_to(app.clone(), "/api/v1/trading-terminals", body).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{response}");
+        assert_eq!(response["error"], "validation_failed");
+
+        create_trading_terminal(app.clone()).await;
+        let (status, response) = post_json_to(
+            app,
+            "/api/v1/trading-terminals",
+            json!({
+                "name": "terminal",
+                "spec": { "cell": "eu-1", "image": "terminal:latest", "ingress": "other.example" }
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
+        assert_eq!(response["error"], "duplicate_name");
+    }
+
+    #[tokio::test]
+    async fn trading_terminal_manifests_render_a_stateless_workload() {
+        let app = app();
+        create_trading_terminal(app.clone()).await;
+        let (status, manifests) =
+            get_json_from(app, "/api/v1/trading-terminals/terminal/manifests").await;
+        assert_eq!(status, StatusCode::OK, "{manifests}");
+        assert_eq!(manifests["kind"], "List");
+        let kinds: Vec<&str> = manifests["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|object| object["kind"].as_str().unwrap())
+            .collect();
+        assert!(kinds.contains(&"Deployment"), "{kinds:?}");
+        assert!(kinds.contains(&"Service"), "{kinds:?}");
+        assert!(kinds.contains(&"Ingress"), "{kinds:?}");
+        assert!(kinds.contains(&"HorizontalPodAutoscaler"), "{kinds:?}");
+    }
+
+    #[tokio::test]
+    async fn trading_terminal_upgrade_rolls_a_stateless_image() {
+        let app = app();
+        create_trading_terminal(app.clone()).await;
+
+        let (status, body) = post_json_to(
+            app.clone(),
+            "/api/v1/trading-terminals/terminal/upgrade",
+            json!({ "image": "" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"], "image_required");
+
+        let (status, body) = post_json_to(
+            app.clone(),
+            "/api/v1/trading-terminals/terminal/upgrade",
+            json!({ "image": "registry.example.com/matchengine-trading-terminal:arm64-v6" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["upgrade"]["changed"], true);
+        assert_eq!(body["upgrade"]["terminal"], "terminal");
+        assert_eq!(
+            body["upgrade"]["previousImage"],
+            "registry.example.com/matchengine-trading-terminal:arm64-v5"
+        );
+        assert!(
+            body["upgrade"]["notes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|note| note.as_str().unwrap().contains("stateless"))
+        );
+        assert!(
+            serde_json::to_string(&body["upgrade"]["steps"])
+                .unwrap()
+                .contains("maxUnavailable: 0")
+        );
+
+        let (status, body) = post_json_to(
+            app.clone(),
+            "/api/v1/trading-terminals/terminal/upgrade",
+            json!({ "image": "registry.example.com/matchengine-trading-terminal:arm64-v6" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["upgrade"]["changed"], false);
+
+        let (status, detail) = get_json_from(app, "/api/v1/trading-terminals/terminal").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            detail["tradingTerminal"]["spec"]["image"],
+            "registry.example.com/matchengine-trading-terminal:arm64-v6"
+        );
+        assert_eq!(
+            detail["tradingTerminal"]["spec"]["previousImage"],
+            "registry.example.com/matchengine-trading-terminal:arm64-v5"
+        );
+    }
+
+    #[tokio::test]
+    async fn trading_terminal_image_inventory_uses_the_terminal_image() {
+        let app = app();
+        create_trading_terminal(app.clone()).await;
+
+        let (status, body) =
+            get_json_from(app.clone(), "/api/v1/images?tradingTerminal=terminal").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["current"],
+            "registry.example.com/matchengine-trading-terminal:arm64-v5"
+        );
+        assert_eq!(
+            body["repository"],
+            "registry.example.com/matchengine-trading-terminal"
+        );
+        assert!(body["items"].as_array().unwrap().iter().any(|image| {
+            image["current"] == true
+                && image["reference"]
+                    == "registry.example.com/matchengine-trading-terminal:arm64-v5"
+        }));
+
+        let (status, body) = get_json_from(app, "/api/v1/images?tradingTerminal=nope").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["error"], "trading_terminal_not_found");
     }
 
     #[tokio::test]

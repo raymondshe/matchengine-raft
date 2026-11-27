@@ -81,4 +81,5 @@ spec:
 # renderer: it now backs the single stateless order desk, and the per-shard
 # users-<n>.<base> hosts are alias Ingresses pointing at the same Service.
 # Do not define an Ingress for orders.<base> here — that would shadow the
-# rendered Ingress and send order entry to the manager again.
+# rendered Ingress and send order entry to the manager again. The terminal host
+# (terminal.<base>) is owned by the TradingTerminal renderer for the same reason.

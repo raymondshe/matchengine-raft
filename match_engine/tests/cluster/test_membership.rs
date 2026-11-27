@@ -25,6 +25,7 @@ use matchengine_raft::store::MatchEngineRequest;
 use openraft::Config;
 use openraft::SnapshotPolicy;
 use openraft::type_config::TypeConfigExt;
+use serde_json::Value;
 
 use crate::common::TempDir;
 use crate::common::TestAddr;
@@ -539,6 +540,289 @@ fn interrupted_membership_change_converges_to_a_valid_config() {
 
 fn client_for(id: u64, addr: TestAddr) -> MatchEngineClient<C> {
     MatchEngineClient::<C>::new(id, addr.to_string())
+}
+
+/// RAFT-E18: two learners added concurrently must both install the purged
+/// snapshot, then be promotable one at a time without a joint config left over.
+#[test]
+fn two_concurrent_learners_catch_up_and_promote_one_at_a_time() {
+    C::run(async {
+        let temp = TempDir::new("concurrent-learners");
+        let storage = StorageConfig::new(temp.path())
+            .with_instance_prefix("concurrent-learners")
+            .with_snapshot_interval(Duration::ZERO);
+        // 21794/21795 belong to E19's storage-only block (no network bind).
+        let addrs = [
+            TestAddr::new(21789),
+            TestAddr::new(21790),
+            TestAddr::new(21791),
+            TestAddr::new(21792),
+            TestAddr::new(21793),
+        ];
+
+        let mut config = default_raft_config();
+        config.heartbeat_interval = 200;
+        config.election_timeout_min = 500;
+        config.election_timeout_max = 1_000;
+        config.heartbeat_min_interval = None;
+        // Ten orders trigger a snapshot and purge of everything it covers, so
+        // the late learners can only catch up through gRPC snapshot install.
+        config.snapshot_policy = SnapshotPolicy::LogsSinceLast(10);
+        config.max_in_snapshot_log_to_keep = 0;
+
+        let mut nodes = Vec::new();
+        for (index, addr) in addrs.iter().enumerate() {
+            nodes.push(Some(
+                build_match_engine_node(
+                    index as u64 + 1,
+                    addr.to_string(),
+                    config.clone(),
+                    storage.clone(),
+                )
+                .await
+                .unwrap(),
+            ));
+        }
+        let clients: Vec<MatchEngineClient<C>> = addrs
+            .iter()
+            .enumerate()
+            .map(|(index, addr)| client_for(index as u64 + 1, *addr))
+            .collect();
+        let http = reqwest::Client::builder().no_proxy().build().unwrap();
+
+        let result = std::panic::AssertUnwindSafe(async {
+            clients[0].init().await.unwrap().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(15);
+            assert_eq!(1, wait_for_leader(&clients[..3], None, deadline).await?);
+            for id in 2..=3u64 {
+                clients[0]
+                    .add_learner((id, addrs[(id - 1) as usize].to_string()))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            }
+            clients[0]
+                .change_membership(&BTreeSet::from([1, 2, 3]))
+                .await
+                .unwrap()
+                .unwrap();
+            for index in 0..10u64 {
+                clients[0]
+                    .write(&MatchEngineRequest::place(Order::new(
+                        OrderSide::Buy,
+                        100.0 - index as f64,
+                        1.0,
+                        0,
+                    )))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            }
+            let deadline = Instant::now() + Duration::from_secs(10);
+            for client in &clients[..3] {
+                wait_for_sequence(client, "10", deadline).await?;
+            }
+
+            // Wait for a snapshot on the leader that covers the purged log.
+            let deadline = Instant::now() + Duration::from_secs(15);
+            let snapshot_index = loop {
+                let metrics = clients[0].metrics().await?;
+                let snapshot = metrics.snapshot.map(|id| id.index);
+                let purged = metrics.purged.map(|id| id.index);
+                if let (Some(snapshot), Some(purged)) = (snapshot, purged)
+                    && purged >= snapshot
+                    && snapshot > 0
+                {
+                    println!("E18: leader snapshot={snapshot} purged={purged}");
+                    break snapshot;
+                }
+                assert!(
+                    Instant::now() <= deadline,
+                    "leader never snapshotted: {metrics:?}"
+                );
+                C::sleep(Duration::from_millis(50)).await;
+            };
+
+            // Both learners are added before either has caught up. OpenRaft
+            // serializes membership changes, so the second call can see a
+            // transient `InProgress` while the first config commits; retry that
+            // without waiting for snapshot catch-up (the race under test).
+            clients[0]
+                .add_learner((4, addrs[3].to_string()))
+                .await
+                .unwrap()
+                .unwrap();
+            let join_deadline = Instant::now() + Duration::from_secs(8);
+            loop {
+                match clients[0].add_learner((5, addrs[4].to_string())).await {
+                    Ok(Ok(_)) => break,
+                    Ok(Err(error)) if format!("{error:?}").contains("InProgress") => {
+                        assert!(
+                            Instant::now() <= join_deadline,
+                            "second learner never joined: {error:?}"
+                        );
+                        C::sleep(Duration::from_millis(50)).await;
+                    }
+                    other => panic!("second add-learner failed: {other:?}"),
+                }
+            }
+
+            let deadline = Instant::now() + Duration::from_secs(20);
+            for id in 4..=5u64 {
+                let client = &clients[(id - 1) as usize];
+                wait_for_sequence(client, "10", deadline).await?;
+                // A learner that installed a snapshot reports it and counts the
+                // gRPC receive in its transport metrics; log replay alone would
+                // be impossible after the leader's purge.
+                let metrics = client.metrics().await?;
+                assert!(
+                    metrics.snapshot.map(|id| id.index).unwrap_or(0) >= snapshot_index,
+                    "learner {id} did not install the snapshot: {metrics:?}"
+                );
+                let body: Value = http
+                    .get(format!("http://{}/metrics", addrs[(id - 1) as usize]))
+                    .send()
+                    .await?
+                    .json()
+                    .await?;
+                let received = body["Ok"]["transport_metrics"]["snapshot_received"]
+                    .as_u64()
+                    .unwrap_or(0);
+                assert!(
+                    received >= 1,
+                    "learner {id} never received a snapshot over gRPC: {body}"
+                );
+                let health: Value = http
+                    .get(format!("http://{}/health", addrs[(id - 1) as usize]))
+                    .send()
+                    .await?
+                    .json()
+                    .await?;
+                assert_eq!(
+                    Some(true),
+                    health["ready"].as_bool(),
+                    "learner {id} did not report ready: {health}"
+                );
+            }
+
+            // Promote the first learner; a fresh write must replicate through it.
+            clients[0]
+                .change_membership(&BTreeSet::from([1, 2, 3, 4]))
+                .await
+                .unwrap()
+                .unwrap();
+            for index in 0..5u64 {
+                clients[0]
+                    .write(&MatchEngineRequest::place(Order::new(
+                        OrderSide::Buy,
+                        50.0 - index as f64,
+                        1.0,
+                        0,
+                    )))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            }
+            let deadline = Instant::now() + Duration::from_secs(15);
+            for client in &clients[..4] {
+                wait_for_sequence(client, "15", deadline).await?;
+            }
+
+            // Promote the second learner once the first is a healthy voter.
+            clients[0]
+                .change_membership(&BTreeSet::from([1, 2, 3, 4, 5]))
+                .await
+                .unwrap()
+                .unwrap();
+            let config_deadline = Instant::now() + Duration::from_secs(20);
+            loop {
+                let mut converged = true;
+                for client in &clients {
+                    let metrics = client.metrics().await?;
+                    let membership = metrics.membership_config.membership();
+                    converged &= membership.voter_ids().count() == 5
+                        && membership.get_joint_config().len() == 1
+                        && membership.get_joint_config()[0] == BTreeSet::from([1, 2, 3, 4, 5]);
+                }
+                if converged {
+                    break;
+                }
+                assert!(
+                    Instant::now() <= config_deadline,
+                    "five-voter config never reached every node"
+                );
+                C::sleep(Duration::from_millis(50)).await;
+            }
+            let deadline = Instant::now() + Duration::from_secs(15);
+            for client in &clients {
+                let metrics = client.metrics().await?;
+                assert_eq!(
+                    5,
+                    metrics.membership_config.membership().voter_ids().count(),
+                    "node does not report exactly five voters"
+                );
+                assert_eq!(
+                    1,
+                    metrics
+                        .membership_config
+                        .membership()
+                        .get_joint_config()
+                        .len(),
+                    "a joint config remained after both promotions"
+                );
+                wait_for_sequence(client, "15", deadline).await?;
+            }
+
+            // One more write reaches all five voters with one identical tape.
+            let response = clients[0]
+                .write(&MatchEngineRequest::place(Order::new(
+                    OrderSide::Buy,
+                    40.0,
+                    1.0,
+                    0,
+                )))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(Some(15), response.data.sequence);
+            let deadline = Instant::now() + Duration::from_secs(15);
+            for client in &clients {
+                wait_for_sequence(client, "16", deadline).await?;
+            }
+            let tape = event_tape(&clients[0]).await;
+            for client in &clients {
+                assert_eq!(
+                    tape,
+                    event_tape(client).await,
+                    "tape diverged across five voters"
+                );
+                assert_eq!(
+                    read_orders(&clients[0]).await?,
+                    read_orders(client).await?,
+                    "book diverged across five voters"
+                );
+            }
+            println!(
+                "E18: five voters converged at sequence 16 with {} events",
+                16
+            );
+
+            Ok::<(), anyhow::Error>(())
+        })
+        .catch_unwind()
+        .await;
+
+        for node in nodes.into_iter().flatten() {
+            if let Err(error) = node.shutdown().await {
+                eprintln!("node shutdown failed: {error}");
+            }
+        }
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => panic!("test failed: {error:?}"),
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    });
 }
 
 async fn event_tape(client: &MatchEngineClient<C>) -> String {

@@ -249,6 +249,47 @@ mod tests {
     }
 
     #[test]
+    fn trading_terminal_view_links_to_the_webui_without_an_order_ticket() {
+        // Fourth top-level view and its panel.
+        assert!(INDEX.contains("data-view=\"tradingterminal\""));
+        assert!(INDEX.contains(">trading terminal</button>"));
+        assert!(INDEX.contains("id=\"tradingTerminalView\""));
+        assert!(INDEX.contains("id=\"tradingTerminalCards\""));
+        assert!(INDEX.contains("id=\"tradingTerminalRows\""));
+        assert!(INDEX.contains("id=\"tradingTerminalRefresh\""));
+        // State, loaders and the table renderer.
+        assert!(INDEX.contains("let tradingTerminalItems = [];"));
+        assert!(INDEX.contains("function loadTradingTerminals"));
+        assert!(INDEX.contains("function renderTradingTerminals"));
+        assert!(INDEX.contains("function tradingTerminalWebuiUrl"));
+        assert!(INDEX.contains("/api/v1/trading-terminals"));
+        assert!(INDEX.contains("data-terminal-upgrade="));
+        assert!(INDEX.contains("/manifests"));
+        assert!(INDEX.contains("Proxied upstreams"));
+        assert!(INDEX.contains("Trading terminal</a>"));
+        assert!(INDEX.contains("/md/*"));
+        assert!(INDEX.contains("/demo/api/*"));
+        // View switching, hash boot mapping and live refresh.
+        assert!(INDEX.contains("currentView === \"tradingterminal\""));
+        assert!(INDEX.contains("view === \"tradingterminal\""));
+        assert!(INDEX.contains("location.hash === \"#tradingterminal\""));
+        assert!(INDEX.contains("requestedView === \"tradingterminal\""));
+        assert!(INDEX.contains("if (currentView === \"tradingterminal\" && liveTicks % 3 === 0) await loadTradingTerminals();"));
+        // Stateless image roll via the scoped image inventory.
+        assert!(INDEX.contains("id=\"tradingTerminalUpgradeModal\""));
+        assert!(INDEX.contains("id=\"ttUpgradeImageSelect\""));
+        assert!(INDEX.contains("function upgradeTradingTerminal"));
+        assert!(INDEX.contains("function submitTradingTerminalUpgrade"));
+        assert!(INDEX.contains("/api/v1/images?tradingTerminal="));
+        assert!(INDEX.contains("maxUnavailable: 0"));
+        // The GUI only links to the terminal WebUI; order entry stays in the terminal/BFF.
+        assert!(!INDEX.contains("/write"));
+        assert!(!INDEX.contains("orderTicketForm"));
+        assert!(!INDEX.contains("submitOrderTicket"));
+        assert!(!INDEX.contains("fetch(\"/api/v1/shards/"));
+    }
+
+    #[test]
     fn market_data_upgrade_uses_the_stateless_rolling_action() {
         assert!(INDEX.contains("id=\"marketDataUpgradeModal\""));
         assert!(INDEX.contains("id=\"marketDataUpgradeForm\""));

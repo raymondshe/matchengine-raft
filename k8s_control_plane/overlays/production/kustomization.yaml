@@ -9,7 +9,8 @@ resources:
   - ../../deploy
   - ../../deploy/ha
   - ../../deploy/alerts
-  - ../../deploy/terminal
+  # The terminal is rendered by the operator from a TradingTerminal CR; do not
+  # add the legacy deploy/terminal component here as well.
 patches:
   - path: images.patch.yaml
   - path: enforce-policy.yaml

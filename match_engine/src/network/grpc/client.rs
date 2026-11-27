@@ -76,6 +76,10 @@ where
     metrics: Arc<TransportMetrics>,
     /// `Err` carries a configuration error; every RPC reports it as unreachable.
     channel: Result<Channel, String>,
+    /// Debug-only target address, used to scope the snapshot cancel hook to
+    /// one learner so concurrent tests cannot interfere.
+    #[cfg(debug_assertions)]
+    api_addr: String,
     _p: PhantomData<C>,
 }
 
@@ -139,6 +143,31 @@ impl GrpcChannelRole {
     }
 }
 
+/// Debug-only snapshot cancellation hook for `full_snapshot`.
+///
+/// `MATCHENGINE_TEST_SNAPSHOT_CANCEL_AFTER_CHUNKS=N` makes the sender drop the
+/// stream after `N` chunks, without the terminal `done` chunk, so the learner
+/// discards its staged snapshot. `MATCHENGINE_TEST_SNAPSHOT_CANCEL_TARGET`
+/// optionally scopes it to one peer's HTTP address (substring match); tests
+/// set it to their learner's port to avoid affecting concurrent tests. Both
+/// variables default to unset/inert and are compiled out of release builds.
+#[cfg(debug_assertions)]
+fn debug_snapshot_cancel_after_chunks(api_addr: &str) -> usize {
+    let Some(chunks) = std::env::var("MATCHENGINE_TEST_SNAPSHOT_CANCEL_AFTER_CHUNKS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+    else {
+        return 0;
+    };
+    if let Ok(target) = std::env::var("MATCHENGINE_TEST_SNAPSHOT_CANCEL_TARGET")
+        && !target.is_empty()
+        && !api_addr.contains(&target)
+    {
+        return 0;
+    }
+    chunks
+}
+
 impl<C> GrpcNetwork<C>
 where
     C: RaftTypeConfig<Node = BasicNode>,
@@ -176,6 +205,8 @@ where
             role,
             metrics,
             channel,
+            #[cfg(debug_assertions)]
+            api_addr: api_addr.to_string(),
             _p: PhantomData,
         }
     }
@@ -409,12 +440,16 @@ where
         let meta = encode(&meta).map_err(|e| StreamingError::Network(NetworkError::new(&e)))?;
 
         let (tx, rx) = mpsc::channel(SNAPSHOT_CHANNEL_SIZE);
+        #[cfg(debug_assertions)]
+        let cancel_after_chunks = debug_snapshot_cancel_after_chunks(&self.api_addr);
 
         let feed = async move {
             let total = data.len();
             let mut pos = 0;
             let mut offset = 0u64;
             let mut first = true;
+            #[cfg(debug_assertions)]
+            let mut chunks_sent = 0usize;
 
             while pos < total {
                 let end = (pos + chunk_size).min(total);
@@ -430,6 +465,20 @@ where
                 if tx.send(chunk).await.is_err() {
                     // The RPC side already failed; its error is the useful one.
                     return;
+                }
+
+                #[cfg(debug_assertions)]
+                {
+                    chunks_sent += 1;
+                    if cancel_after_chunks > 0 && chunks_sent >= cancel_after_chunks {
+                        // Drop the sender explicitly: `join!` keeps this async
+                        // block (and its captured `tx`) alive until the RPC
+                        // resolves, so returning alone would not close the
+                        // stream. Without the terminal `done` chunk the learner
+                        // discards its staged snapshot.
+                        drop(tx);
+                        return;
+                    }
                 }
 
                 offset += (end - pos) as u64;

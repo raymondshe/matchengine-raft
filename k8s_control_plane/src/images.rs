@@ -183,6 +183,11 @@ pub fn catalog_repositories(catalog: &Catalog) -> BTreeSet<String> {
             repositories.insert(image.repository);
         }
     }
+    for terminal in catalog.trading_terminals.values() {
+        if let Some(image) = parse_image(&terminal.spec.image) {
+            repositories.insert(image.repository);
+        }
+    }
     repositories
 }
 
@@ -208,6 +213,9 @@ pub fn merge_catalog(catalog: &Catalog, images: &mut BTreeMap<String, ImageChoic
     }
     for system in catalog.order_systems.values() {
         insert_reference(images, &system.spec.image);
+    }
+    for terminal in catalog.trading_terminals.values() {
+        insert_reference(images, &terminal.spec.image);
     }
 }
 

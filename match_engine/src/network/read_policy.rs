@@ -33,6 +33,14 @@ type C = MatchEngineTypeConfig;
 /// Environment variable accepted by the node binary (`--read-policy`).
 pub const READ_POLICY_ENV: &str = "MATCHENGINE_READ_POLICY";
 
+/// Debug-only clock-skew hook. When set (in milliseconds) at node construction,
+/// the caller-side lease cache is treated as expired and every leader-consistent
+/// read exercises the `ReadIndex` fallback. It is sampled once in
+/// [`ReadPolicyRuntime::new`], so it is per-node and cannot affect another test's
+/// nodes. Release builds do not contain this field and never read the variable.
+#[cfg(debug_assertions)]
+pub const TEST_LEASE_SKEW_ENV: &str = "MATCHENGINE_TEST_LEASE_SKEW_MS";
+
 /// Read policy for leader-consistent reads.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ReadPolicyMode {
@@ -191,6 +199,9 @@ struct ReadPolicyMetrics {
 pub struct ReadPolicyRuntime {
     mode: ReadPolicyMode,
     metrics: Arc<ReadPolicyMetrics>,
+    /// Debug-only perceived clock skew; 0 keeps the shipped lease behavior.
+    #[cfg(debug_assertions)]
+    test_lease_skew_ms: u64,
 }
 
 impl ReadPolicyRuntime {
@@ -199,6 +210,11 @@ impl ReadPolicyRuntime {
         Self {
             mode,
             metrics: Arc::new(ReadPolicyMetrics::default()),
+            #[cfg(debug_assertions)]
+            test_lease_skew_ms: std::env::var(TEST_LEASE_SKEW_ENV)
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0),
         }
     }
 
@@ -250,6 +266,24 @@ impl ReadPolicyRuntime {
         }
 
         counters.lease_attempts.fetch_add(1, Ordering::Relaxed);
+
+        #[cfg(debug_assertions)]
+        if self.test_lease_skew_ms > 0 && self.mode == ReadPolicyMode::LocalLease {
+            // Debug-only clock-skew model: the caller-side lease is considered
+            // expired, so take the exact fallback path a stale lease takes.
+            // A fresh ReadIndex still anchors the read at the latest commit.
+            counters.lease_fallbacks.fetch_add(1, Ordering::Relaxed);
+            counters.read_index_attempts.fetch_add(1, Ordering::Relaxed);
+            let result = raft
+                .get_read_linearizer(ReadPolicy::ReadIndex)
+                .await
+                .decompose();
+            if !matches!(&result, Ok(Ok(_))) {
+                counters.read_index_failures.fetch_add(1, Ordering::Relaxed);
+            }
+            return result;
+        }
+
         let lease = if self.mode == ReadPolicyMode::LocalLease {
             raft.get_local_read_linearizer(ReadPolicy::LeaseRead)
                 .await

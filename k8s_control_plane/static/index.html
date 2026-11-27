@@ -236,6 +236,7 @@
     <button class="view active" type="button" data-view="engine" aria-selected="true">matching engine</button>
     <button class="view" type="button" data-view="marketdata" aria-selected="false" title="Terminal and fast WebSocket fan-out tiers">market data</button>
     <button class="view" type="button" data-view="ordersystem" aria-selected="false" title="User-ID sharded order-entry services">order systems</button>
+    <button class="view" type="button" data-view="tradingterminal" aria-selected="false" title="Stateless React trading terminal behind nginx">trading terminal</button>
   </nav>
   <div class="stats" id="stats"></div>
 </header>
@@ -475,6 +476,32 @@
         </div>
       </div>
       <div id="orderSystemRows"></div>
+    </div>
+  </section>
+</main>
+
+<main id="tradingTerminalView" class="workspace market-view" hidden>
+  <section class="content">
+    <div class="headline">
+      <h2>Trading terminal</h2>
+      <span class="sub">stateless React SPA behind nginx</span>
+      <button id="tradingTerminalRefresh" title="Reload the trading terminal list" style="margin-left:auto">refresh</button>
+    </div>
+    <div class="grid" id="tradingTerminalCards" style="margin-bottom:14px"></div>
+    <div class="card">
+      <div class="aside-head">
+        <div>
+          <h3>Terminal services</h3>
+          <p class="muted" style="margin:0">Each <span class="mono">TradingTerminal</span> renders a
+            Deployment, Service, optional Ingress and HPA. The terminal is a client of the existing
+            services: it proxies market data at <span class="mono">/md/*</span> and order entry at
+            <span class="mono">/demo/api/*</span>. Open the WebUI link to trade there; this manager
+            never submits orders or holds a user session. Upgrades roll the SPA with
+            <span class="mono">maxUnavailable: 0</span> and one surge pod — no quorum and no leader
+            transfer are involved.</p>
+        </div>
+      </div>
+      <div id="tradingTerminalRows"></div>
     </div>
   </section>
 </main>
@@ -786,6 +813,33 @@
   </div>
 </div>
 
+<div id="tradingTerminalUpgradeModal" class="modal" aria-hidden="true">
+  <div class="modal-card">
+    <div class="modal-head">
+      <h2>Update trading terminal image</h2>
+      <button class="close" type="button" data-close="tradingTerminalUpgradeModal" aria-label="Close">×</button>
+    </div>
+    <form id="tradingTerminalUpgradeForm">
+      <p class="muted">The terminal is a stateless SPA, so the operator rolls one Deployment with
+        <span class="mono">maxUnavailable: 0</span> and one surge pod. The dropdown lists images
+        cached on a node, currently running, or recorded in the catalog for this terminal's
+        repository.</p>
+      <div class="form-grid" style="grid-template-columns: repeat(2, minmax(0, 1fr))">
+        <label class="field">Terminal<input id="ttUpgradeName" readonly></label>
+        <label class="field">Current image<input id="ttUpgradeCurrent" readonly></label>
+        <label class="field">Target image<select id="ttUpgradeImageSelect"></select></label>
+        <label class="field">Custom image<input id="ttUpgradeImage" autocomplete="off" spellcheck="false" placeholder="registry/...@sha256:..."></label>
+      </div>
+      <p class="muted mono" id="ttUpgradeHint" style="overflow-wrap:anywhere"></p>
+      <div class="form-actions">
+        <span class="muted" id="ttUpgradeStatus"></span>
+        <button type="button" data-close="tradingTerminalUpgradeModal">Cancel</button>
+        <button type="submit" class="primary" id="ttUpgradeSubmit">Update image</button>
+      </div>
+    </form>
+  </div>
+</div>
+
 <script>
 const $ = (id) => document.getElementById(id);
 const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (c) => ({
@@ -848,6 +902,8 @@ let marketDataLoading = false;
 let marketDataTab = "terminal";
 let orderSystemItems = [];
 let orderSystemLoading = false;
+let tradingTerminalItems = [];
+let tradingTerminalLoading = false;
 
 function isMarketDataView(view) {
   return view === "marketdata";
@@ -895,6 +951,8 @@ function setView(view) {
     currentView = "marketdata";
   } else if (view === "ordersystem") {
     currentView = "ordersystem";
+  } else if (view === "tradingterminal") {
+    currentView = "tradingterminal";
   } else {
     currentView = "engine";
   }
@@ -906,6 +964,7 @@ function setView(view) {
   $("engineView").hidden = currentView !== "engine";
   $("marketDataView").hidden = currentView !== "marketdata";
   $("orderSystemView").hidden = currentView !== "ordersystem";
+  $("tradingTerminalView").hidden = currentView !== "tradingterminal";
   if (currentView === "marketdata") {
     setMarketDataTab(marketDataTab, false);
     history.replaceState(null, "", "#marketdata-" + marketDataTab);
@@ -913,6 +972,9 @@ function setView(view) {
   } else if (currentView === "ordersystem") {
     history.replaceState(null, "", "#ordersystem");
     loadOrderSystems();
+  } else if (currentView === "tradingterminal") {
+    history.replaceState(null, "", "#tradingterminal");
+    loadTradingTerminals();
   } else {
     history.replaceState(null, "", "#engine");
   }
@@ -1612,6 +1674,172 @@ async function submitOrderSystemUpgrade(event) {
   } catch (error) {
     $("osUpgradeStatus").textContent = error.message;
     $("osUpgradeSubmit").disabled = false;
+  }
+}
+
+async function loadTradingTerminals() {
+  if (tradingTerminalLoading) return;
+  tradingTerminalLoading = true;
+  try {
+    const result = await api("/api/v1/trading-terminals");
+    tradingTerminalItems = result.items || [];
+    renderTradingTerminals();
+  } catch (error) {
+    $("tradingTerminalRows").innerHTML = `<div class="issue warning">cannot load trading terminals: ${esc(error.message)}</div>`;
+  } finally {
+    tradingTerminalLoading = false;
+  }
+}
+
+function tradingTerminalWebuiUrl(spec) {
+  const ingress = String(spec?.ingress || "").trim().replace(/\.+$/, "");
+  if (!ingress) return "";
+  const scheme = String(spec?.tlsSecret || "").trim() ? "https" : "http";
+  return `${scheme}://${ingress}/`;
+}
+
+function renderTradingTerminals() {
+  const ready = tradingTerminalItems.filter((terminal) => (terminal.status?.phase || "") === "Ready").length;
+  const replicas = tradingTerminalItems.reduce((count, terminal) =>
+    count + Number(terminal.status?.readyReplicas ?? 0), 0);
+  const cells = new Set(tradingTerminalItems.map((terminal) => terminal.spec?.cell || "")).size;
+  const cards = [
+    ["terminals", tradingTerminalItems.length, `${ready} ready`],
+    ["ready replicas", replicas, "stateless SPA"],
+    ["cells", cells, "deployments"],
+    ["image rolls", tradingTerminalItems.filter((terminal) => terminal.spec?.previousImage).length, "previous image kept"],
+  ];
+  $("tradingTerminalCards").innerHTML = cards.map(([label, value, note]) =>
+    `<div class="card"><h3>${esc(label)}</h3><div style="font:600 22px/1.1 var(--mono)">${esc(value)}</div><div class="muted">${esc(note)}</div></div>`
+  ).join("");
+  const rows = tradingTerminalItems.map((terminal) => {
+    const spec = terminal.spec || {};
+    const status = terminal.status || {};
+    const phase = status.phase || (spec.paused ? "Paused" : "Pending");
+    const phaseClass = phase === "Ready" ? "ok" : phase === "Failed" || phase === "Degraded" ? "err" : "warn";
+    const webuiUrl = terminal.url || tradingTerminalWebuiUrl(spec);
+    const webui = webuiUrl
+      ? `<a class="mono" href="${esc(webuiUrl)}" target="_blank" rel="noreferrer" title="Open the terminal WebUI">Trading terminal</a>`
+      : `<span class="muted">no ingress —</span>`;
+    const upstreams = terminal.upstreams || {};
+    const upstreamRows = `
+      <div class="muted mono" style="overflow-wrap:anywhere">md: ${esc(upstreams.marketData || spec.mdUpstream || "—")}</div>
+      <div class="muted mono" style="overflow-wrap:anywhere">desk: ${esc(upstreams.orderDesk || spec.deskUpstream || "—")}</div>`;
+    const minReplicas = spec.autoscaling?.minReplicas ?? 1;
+    const maxReplicas = spec.autoscaling?.maxReplicas || spec.replicas || minReplicas;
+    const hpa = spec.paused ? "" : `<div class="muted">hpa ${esc(minReplicas)}–${esc(maxReplicas)} @ ${esc(spec.autoscaling?.targetCpuUtilization ?? 70)}% CPU</div>`;
+    return `<tr>
+      <td><div class="service-name">${esc(terminal.name)}</div>
+        <div class="muted mono">${esc(terminal.namespace || "")} · ${esc(spec.cell || "—")}</div>
+        <div class="muted mono" style="overflow-wrap:anywhere">${esc(spec.image || "")}</div>
+        <a class="mono" href="/api/v1/trading-terminals/${encodeURIComponent(terminal.name)}/manifests" target="_blank">manifests</a>
+        <div style="margin-top:6px"><button type="button" data-terminal-upgrade="${esc(terminal.name)}" style="padding:4px 8px;font:11px/1.2 var(--mono)" title="Roll a new stateless terminal image">upgrade</button></div></td>
+      <td>${upstreamRows}</td>
+      <td>${webui}</td>
+      <td>${esc(status.readyReplicas ?? 0)}/${esc(status.replicas ?? spec.replicas ?? 0)}${hpa}</td>
+      <td><span class="badge ${phaseClass}">${esc(phase)}</span>
+        <div class="muted">${esc(status.message || "")}</div></td>
+    </tr>`;
+  }).join("");
+  $("tradingTerminalRows").innerHTML = rows
+    ? `<div class="table-scroll"><table class="market-table"><thead><tr><th>Terminal</th><th>Proxied upstreams</th><th>WebUI</th><th>Ready</th><th>Phase</th></tr></thead><tbody>${rows}</tbody></table></div>`
+    : `<div class="muted" style="padding:18px 0">No <span class="mono">TradingTerminal</span> objects yet. Create one with
+       <span class="mono">POST /api/v1/trading-terminals</span>.</div>`;
+  document.querySelectorAll("[data-terminal-upgrade]").forEach((button) => {
+    button.addEventListener("click", () => upgradeTradingTerminal(button.dataset.terminalUpgrade));
+  });
+}
+
+let tradingTerminalUpgradeName = null;
+
+function tradingTerminalByName(name) {
+  return tradingTerminalItems.find((item) => item.name === name) || null;
+}
+
+function selectTradingTerminalImage(reference) {
+  const select = $("ttUpgradeImageSelect");
+  const custom = $("ttUpgradeImage");
+  const known = [...select.options].some((option) => option.value === reference);
+  select.value = known ? reference : "__custom";
+  custom.value = known ? "" : (reference || "");
+  custom.disabled = select.value !== "__custom";
+}
+
+async function upgradeTradingTerminal(name) {
+  const terminal = tradingTerminalByName(name);
+  if (!terminal) return;
+  tradingTerminalUpgradeName = name;
+  const spec = terminal.spec || {};
+  $("ttUpgradeName").value = name;
+  $("ttUpgradeCurrent").value = spec.image || "";
+  $("ttUpgradeImage").value = "";
+  $("ttUpgradeHint").textContent = "";
+  $("ttUpgradeStatus").textContent = "";
+  $("ttUpgradeSubmit").disabled = false;
+  const select = $("ttUpgradeImageSelect");
+  select.innerHTML = `<option value="">loading images…</option>`;
+  openModal("tradingTerminalUpgradeModal");
+  try {
+    const inventory = await api(`/api/v1/images?tradingTerminal=${encodeURIComponent(name)}`);
+    const items = inventory.items || [];
+    select.innerHTML = items.map((image) => {
+      const labels = [image.tag || image.reference];
+      if (image.current) labels.push("current");
+      if (image.runningHere) labels.push("running here");
+      if (image.nodes) labels.push(`${image.nodes} node${image.nodes === 1 ? "" : "s"}`);
+      return `<option value="${esc(image.reference)}">${esc(labels.join(" · "))}</option>`;
+    }).join("") + `<option value="__custom">custom image…</option>`;
+    selectTradingTerminalImage(items.find((image) => image.current)?.reference || spec.image || "");
+    $("ttUpgradeHint").textContent = inventory.warning
+      ? `cluster inventory warning: ${inventory.warning}`
+      : `repository: ${inventory.repository || "—"}`;
+  } catch (error) {
+    select.innerHTML = `<option value="__custom">custom image…</option>`;
+    select.value = "__custom";
+    $("ttUpgradeImage").disabled = false;
+    $("ttUpgradeImage").value = spec.image || "";
+    $("ttUpgradeHint").textContent = `cannot load image inventory: ${error.message}`;
+  }
+}
+
+function syncTradingTerminalImageSelect() {
+  const custom = $("ttUpgradeImageSelect").value === "__custom";
+  $("ttUpgradeImage").disabled = !custom;
+  if (custom) $("ttUpgradeImage").focus();
+}
+
+function tradingTerminalUpgradeTarget() {
+  const selected = $("ttUpgradeImageSelect").value;
+  return selected === "__custom" ? $("ttUpgradeImage").value.trim() : selected;
+}
+
+async function submitTradingTerminalUpgrade(event) {
+  event.preventDefault();
+  const name = tradingTerminalUpgradeName;
+  if (!name) return;
+  const image = tradingTerminalUpgradeTarget();
+  if (!image) {
+    $("ttUpgradeStatus").textContent = "choose or enter a target image";
+    return;
+  }
+  $("ttUpgradeSubmit").disabled = true;
+  $("ttUpgradeStatus").textContent = "updating desired state…";
+  try {
+    const result = await api(`/api/v1/trading-terminals/${encodeURIComponent(name)}/upgrade`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ image }),
+    });
+    const upgrade = result.upgrade || {};
+    closeModal("tradingTerminalUpgradeModal");
+    toast(upgrade.changed
+      ? `rolling ${name}: stateless SPA, maxUnavailable 0`
+      : `${name} already uses this image`);
+    await loadTradingTerminals();
+    loadAudit();
+  } catch (error) {
+    $("ttUpgradeStatus").textContent = error.message;
+    $("ttUpgradeSubmit").disabled = false;
   }
 }
 
@@ -2548,6 +2776,7 @@ function bind() {
   $("marketDataScaleForm").addEventListener("submit", submitMarketDataScale);
   $("mdPlanBtn").addEventListener("click", loadMarketDataPlan);
   $("orderSystemRefresh").addEventListener("click", loadOrderSystems);
+  $("tradingTerminalRefresh").addEventListener("click", loadTradingTerminals);
   document.querySelectorAll(".md-tab").forEach((tab) => {
     tab.addEventListener("click", () => setMarketDataTab(tab.dataset.mdTab));
   });
@@ -2555,6 +2784,8 @@ function bind() {
   $("marketDataUpgradeForm").addEventListener("submit", submitMarketDataUpgrade);
   $("osUpgradeImageSelect").addEventListener("change", syncOrderSystemImageSelect);
   $("orderSystemUpgradeForm").addEventListener("submit", submitOrderSystemUpgrade);
+  $("ttUpgradeImageSelect").addEventListener("change", syncTradingTerminalImageSelect);
+  $("tradingTerminalUpgradeForm").addEventListener("submit", submitTradingTerminalUpgrade);
   $("upgradeBtn").addEventListener("click", upgradeShard);
   $("targetImageSelect").addEventListener("change", () => {
     const value = $("targetImageSelect").value;
@@ -2602,13 +2833,14 @@ async function boot() {
     renderShards();
     await loadShard();
     const requestedView = new URLSearchParams(location.search).get("view");
-    const initialView = requestedView === "ordersystem" || requestedView === "marketdata-fast"
-      || requestedView === "marketdata-terminal" || requestedView === "engine"
+    const initialView = requestedView === "ordersystem" || requestedView === "tradingterminal"
+      || requestedView === "marketdata-fast" || requestedView === "marketdata-terminal" || requestedView === "engine"
       ? requestedView
       : location.hash === "#marketdata-fast" ? "marketdata-fast"
         : location.hash === "#marketdata-terminal" || location.hash === "#marketdata" ? "marketdata-terminal"
           : location.hash === "#ordersystem" ? "ordersystem"
-            : "engine";
+            : location.hash === "#tradingterminal" ? "tradingterminal"
+              : "engine";
     setView(initialView);
     loadAudit();
   } catch (error) {
@@ -2653,6 +2885,7 @@ async function refreshLive() {
     }
     if (currentView === "marketdata" && liveTicks % 3 === 0) await loadMarketData();
     if (currentView === "ordersystem" && liveTicks % 3 === 0) await loadOrderSystems();
+    if (currentView === "tradingterminal" && liveTicks % 3 === 0) await loadTradingTerminals();
     loadAudit();
     liveTicks += 1;
     setLive(true);

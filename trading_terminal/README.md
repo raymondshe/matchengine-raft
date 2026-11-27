@@ -94,21 +94,25 @@ npm run build        # dist/
 
 ```sh
 npm run build                                     # or let Docker build it
-docker build -t matchengine-trading-terminal:arm64-v2 .
-kubectl apply -f k8s_control_plane/deploy/terminal.yaml
+docker build -t matchengine-trading-terminal:arm64-v5 .
+# create a TradingTerminal CR through the manager (GUI or API):
+curl -X POST http://console.match-eu-1.example/api/v1/trading-terminals \
+  -H 'content-type: application/json' \
+  -d '{"name":"terminal-eu","spec":{"cell":"eu-1","image":"matchengine-trading-terminal:arm64-v5","ingress":"terminal.match-eu-1.example","mdUpstream":"http://global-marketdata.match-eu-1.svc.cluster.local:24804","deskUpstream":"http://orders.match-eu-1.svc.cluster.local:24300"}}'
 open http://terminal.match-eu-1.example/
 ```
 
-`k8s_control_plane/deploy/terminal.yaml` renders Deployment/Service/Ingress
-(`terminal.match-eu-1.example`) plus two NetworkPolicies: the terminal's own
-(ingress from the gateway namespace; egress to DNS, the global market-data
-service on 24804 and the order-system BFF on 24300) and a supplementary
-additive policy admitting terminal pods to the global market-data pods,
-whose operator-rendered policy otherwise only admits gateway/observability/
-control-plane namespaces.
+The operator renders the terminal from the `TradingTerminal` CR: Deployment (nginx with the pinned
+`MD_UPSTREAM`/`DESK_UPSTREAM` and an inline `/etc/resolv.conf` resolver for `DNS_UPSTREAM`), Service,
+Ingress, PDB, HPA and two NetworkPolicies. The policies admit ingress from the gateway namespace and
+egress to DNS, the global market-data service on 24804 and the order-system BFF on 24300, plus a
+supplementary additive policy admitting terminal pods to the operator-rendered global market-data
+pods (whose own policy otherwise only admits gateway/observability/control-plane namespaces). Images
+can be rolled with `POST /api/v1/trading-terminals/{name}/upgrade` using the manager's image picker.
 
-A `TradingTerminal` CRD rendered by the operator (like `MarketDataService`/`OrderSystem`)
-is a deliberate follow-up; this manifest is applied and torn down by hand.
+`k8s_control_plane/deploy/terminal.yaml` is a **legacy fallback** for labs that still bootstrap the
+terminal with `kubectl`; do not apply it while a `TradingTerminal` CR is active, and do not add the
+`deploy/terminal` component to an overlay that relies on the operator.
 
 ## Notes
 

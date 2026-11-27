@@ -1,7 +1,8 @@
 # Market-data fan-out and slow-consumer soak — design
 
 - **Date:** 2026-11-25
-- **Status:** design for TODO Top priorities #8 (P2)
+- **Status:** implemented and validated on OrbStack; see `TODO.md` History (2026-11-26). This
+  design document is retained as the evidence and reproduction guide.
 - **Scope:** `market_data_system` WebSocket fan-out, the engine market-data tap, and the OrbStack
   deployment. Does **not** change matching semantics or prove multi-host Aeron/NATS behaviour.
 

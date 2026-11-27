@@ -172,6 +172,7 @@ pub fn validate_catalog(catalog: &Catalog) -> Report {
     validate_symbol_ids(catalog, &mut report);
     validate_market_data_services(catalog, &mut report);
     validate_order_systems(catalog, &mut report);
+    validate_trading_terminals(catalog, &mut report);
     report
 }
 
@@ -724,6 +725,169 @@ fn validate_order_systems(catalog: &Catalog, report: &mut Report) {
             ranges.push((shard.user_id_min, shard.user_id_max, shard.name.as_str()));
         }
     }
+}
+
+/// A terminal SPA is stateless: no Raft quorum, no leader transfer, no durable volume. The
+/// checks here are the ones that would otherwise surface as a broken Ingress or a silently
+/// unreachable upstream, plus the shared namespace/port convention of the other workloads.
+fn validate_trading_terminals(catalog: &Catalog, report: &mut Report) {
+    // Ports are unique per namespace across the workloads rendered as Services. The engine's
+    // HTTP ports, the market-data WebSocket ports and the order-system port all count.
+    let mut ports: BTreeMap<(&str, u16), &str> = BTreeMap::new();
+    for deployment in catalog.deployments.values() {
+        ports.insert(
+            (
+                deployment.namespace.as_str(),
+                deployment.spec.placement.http_port,
+            ),
+            deployment.name.as_str(),
+        );
+    }
+    for service in catalog.market_data_services.values() {
+        ports.insert(
+            (service.namespace.as_str(), service.spec.websocket.port),
+            service.name.as_str(),
+        );
+    }
+    for system in catalog.order_systems.values() {
+        ports.insert(
+            (system.namespace.as_str(), system.spec.port),
+            system.name.as_str(),
+        );
+    }
+
+    let mut ingress_hosts: BTreeMap<&str, &str> = BTreeMap::new();
+    for terminal in catalog.trading_terminals.values() {
+        let object = &terminal.name;
+        if dns_label(&terminal.name) != terminal.name || terminal.name.len() > 63 {
+            report.error(
+                "trading_terminal_name",
+                object,
+                "name must be a lowercase DNS label of at most 63 characters",
+            );
+        }
+        if !catalog.cells.contains_key(&terminal.spec.cell) {
+            report.error(
+                "trading_terminal_cell",
+                object,
+                format!("cell {} is not in the catalog", terminal.spec.cell),
+            );
+        }
+        if terminal.spec.image.trim().is_empty() {
+            report.error("trading_terminal_image", object, "spec.image is required");
+        } else if !terminal.spec.image.contains("@sha256:") {
+            report.warn(
+                "trading_terminal_image_tag",
+                object,
+                "pin the terminal image by digest in production; a mutable tag cannot gate an image roll",
+            );
+        }
+        if terminal.spec.replicas == 0 && !terminal.spec.paused {
+            report.error(
+                "trading_terminal_replicas",
+                object,
+                "replicas must be greater than zero unless the terminal is paused",
+            );
+        }
+        if terminal.spec.autoscaling.min_replicas == 0 {
+            report.error(
+                "trading_terminal_min_replicas",
+                object,
+                "autoscaling.minReplicas must be at least 1",
+            );
+        }
+        if terminal.spec.autoscaling.max_replicas != 0
+            && terminal.spec.autoscaling.max_replicas < terminal.spec.min_replicas()
+        {
+            report.error(
+                "trading_terminal_max_replicas",
+                object,
+                "autoscaling.maxReplicas must be greater than or equal to minReplicas",
+            );
+        }
+        if !(1..=100).contains(&terminal.spec.autoscaling.target_cpu_utilization) {
+            report.error(
+                "trading_terminal_target_cpu",
+                object,
+                "autoscaling.targetCpuUtilization must be between 1 and 100",
+            );
+        }
+        if terminal.spec.port == 0 {
+            report.error(
+                "trading_terminal_port",
+                object,
+                "port must be greater than zero",
+            );
+        } else if let Some(previous) =
+            ports.insert((terminal.namespace.as_str(), terminal.spec.port), object)
+        {
+            let message = format!(
+                "port {} is already used by {previous} in namespace {}",
+                terminal.spec.port, terminal.namespace
+            );
+            // Report on both objects so a scoped validation of either one sees the conflict.
+            report.error("trading_terminal_port_conflict", object, &message);
+            if previous != object {
+                report.error("trading_terminal_port_conflict", previous, message);
+            }
+        }
+        // An empty host is allowed: the renderer supplies a `terminal.<cell>` default. A
+        // non-empty one must be a bare DNS host (the value used by the Ingress rule).
+        let host = terminal.spec.ingress.trim().trim_end_matches('.');
+        if !host.is_empty() {
+            if !plausible_ingress_host(host) {
+                report.error(
+                    "trading_terminal_ingress",
+                    object,
+                    format!("ingress {host} must be a bare lowercase DNS host"),
+                );
+            } else if let Some(previous) = ingress_hosts.insert(host, object) {
+                let message = format!("ingress host {host} is already served by {previous}");
+                report.error("trading_terminal_ingress_conflict", object, &message);
+                if previous != object {
+                    report.error("trading_terminal_ingress_conflict", previous, message);
+                }
+            }
+        }
+        if !valid_http_upstream(&terminal.spec.md_upstream) {
+            report.error(
+                "trading_terminal_md_upstream",
+                object,
+                "mdUpstream must be an http(s) URL (the market-data WebSocket service)",
+            );
+        }
+        if !valid_http_upstream(&terminal.spec.desk_upstream) {
+            report.error(
+                "trading_terminal_desk_upstream",
+                object,
+                "deskUpstream must be an http(s) URL (the order-system BFF)",
+            );
+        }
+    }
+}
+
+fn plausible_ingress_host(host: &str) -> bool {
+    host.split('.').count() >= 2
+        && host
+            .split('.')
+            .all(|label| !label.is_empty() && dns_label(label) == label)
+}
+
+fn valid_http_upstream(value: &str) -> bool {
+    let Some(rest) = value
+        .strip_prefix("http://")
+        .or_else(|| value.strip_prefix("https://"))
+    else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    !authority.is_empty()
+        && !authority.contains(char::is_whitespace)
+        && !authority.starts_with(':')
+        && authority
+            .split(':')
+            .next()
+            .is_some_and(|host| !host.is_empty())
 }
 
 fn validate_cell(cell: &Cell, shards: &[&SymbolShard], report: &mut Report) {
@@ -1491,6 +1655,163 @@ mod tests {
                 .errors
                 .iter()
                 .any(|error| error.code == "order_system_max_replicas"),
+            "{}",
+            report.to_text()
+        );
+    }
+
+    fn trading_terminal(name: &str, port: u16) -> crate::model::TradingTerminal {
+        use crate::model::{TradingTerminal, TradingTerminalAutoscaling, TradingTerminalSpec};
+        TradingTerminal {
+            name: name.to_string(),
+            namespace: "match-eu-1".to_string(),
+            spec: TradingTerminalSpec {
+                cell: "eu-1".to_string(),
+                image: "registry.example.com/matchengine-trading-terminal@sha256:abc".to_string(),
+                replicas: 1,
+                autoscaling: TradingTerminalAutoscaling {
+                    min_replicas: 1,
+                    max_replicas: 0,
+                    target_cpu_utilization: 70,
+                },
+                port,
+                ingress: format!("{name}.match-eu-1.example"),
+                tls_secret: String::new(),
+                md_upstream: "http://global-marketdata.match-eu-1.svc.cluster.local:24804"
+                    .to_string(),
+                desk_upstream: "http://orders.match-eu-1.svc.cluster.local:24300".to_string(),
+                dns_upstream: String::new(),
+                resources: None,
+                paused: false,
+                previous_image: None,
+            },
+            status: Default::default(),
+        }
+    }
+
+    #[test]
+    fn trading_terminal_shape_is_validated() {
+        let mut catalog = crate::store::demo_catalog();
+        catalog
+            .trading_terminals
+            .insert("terminal".to_string(), trading_terminal("terminal", 8080));
+        let report = validate_catalog(&catalog);
+        assert!(report.is_ok(), "{}", report.to_text());
+
+        let terminal = catalog.trading_terminals.get_mut("terminal").unwrap();
+        terminal.name = "Bad_Name".to_string();
+        terminal.spec.cell = "nope".to_string();
+        terminal.spec.image.clear();
+        terminal.spec.replicas = 0;
+        terminal.spec.autoscaling.min_replicas = 0;
+        terminal.spec.autoscaling.max_replicas = 0;
+        terminal.spec.autoscaling.target_cpu_utilization = 0;
+        terminal.spec.port = 0;
+        let report = validate_catalog(&catalog);
+        for code in [
+            "trading_terminal_name",
+            "trading_terminal_cell",
+            "trading_terminal_image",
+            "trading_terminal_replicas",
+            "trading_terminal_min_replicas",
+            "trading_terminal_target_cpu",
+            "trading_terminal_port",
+        ] {
+            assert!(
+                report.errors.iter().any(|issue| issue.code == code),
+                "missing {code}: {}",
+                report.to_text()
+            );
+        }
+
+        let terminal = catalog.trading_terminals.get_mut("terminal").unwrap();
+        terminal.name = "terminal".to_string();
+        terminal.spec.cell = "eu-1".to_string();
+        terminal.spec.image = "registry.example.com/terminal:latest".to_string();
+        terminal.spec.replicas = 1;
+        terminal.spec.autoscaling.min_replicas = 2;
+        terminal.spec.autoscaling.max_replicas = 1;
+        terminal.spec.autoscaling.target_cpu_utilization = 70;
+        terminal.spec.port = 21001; // already used by an engine deployment in match-eu-1
+        let report = validate_catalog(&catalog);
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|issue| issue.code == "trading_terminal_max_replicas"),
+            "{}",
+            report.to_text()
+        );
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|issue| issue.code == "trading_terminal_port_conflict"),
+            "{}",
+            report.to_text()
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|issue| issue.code == "trading_terminal_image_tag"),
+            "{}",
+            report.to_text()
+        );
+    }
+
+    #[test]
+    fn trading_terminal_ingress_and_upstreams_are_validated() {
+        let mut catalog = crate::store::demo_catalog();
+        catalog
+            .trading_terminals
+            .insert("terminal".to_string(), trading_terminal("terminal", 8080));
+        catalog
+            .trading_terminals
+            .insert("other".to_string(), trading_terminal("other", 8081));
+        // Two terminals must not claim the same Ingress host.
+        catalog
+            .trading_terminals
+            .get_mut("other")
+            .unwrap()
+            .spec
+            .ingress = "terminal.match-eu-1.example".to_string();
+        let report = validate_catalog(&catalog);
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|issue| issue.code == "trading_terminal_ingress_conflict"),
+            "{}",
+            report.to_text()
+        );
+
+        let terminal = catalog.trading_terminals.get_mut("other").unwrap();
+        terminal.spec.ingress = "https://terminal.match-eu-1.example/".to_string();
+        terminal.spec.md_upstream = "not-a-url".to_string();
+        terminal.spec.desk_upstream = "tcp://orders:24300".to_string();
+        let report = validate_catalog(&catalog);
+        for code in [
+            "trading_terminal_ingress",
+            "trading_terminal_md_upstream",
+            "trading_terminal_desk_upstream",
+        ] {
+            assert!(
+                report.errors.iter().any(|issue| issue.code == code),
+                "missing {code}: {}",
+                report.to_text()
+            );
+        }
+
+        // An empty ingress is allowed; the renderer supplies a `terminal.<cell>` default.
+        let terminal = catalog.trading_terminals.get_mut("other").unwrap();
+        terminal.spec.ingress.clear();
+        terminal.spec.md_upstream = "https://md.match-eu-1.svc.cluster.local:24804".to_string();
+        terminal.spec.desk_upstream =
+            "http://orders.match-eu-1.svc.cluster.local:24300".to_string();
+        let report = validate_catalog(&catalog);
+        assert!(
+            !report.errors.iter().any(|issue| issue.object == "other"),
             "{}",
             report.to_text()
         );

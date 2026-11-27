@@ -97,6 +97,8 @@ pub struct BackupCounts {
     pub market_data_services: usize,
     #[serde(default)]
     pub order_systems: usize,
+    #[serde(default)]
+    pub trading_terminals: usize,
 }
 
 impl BackupCounts {
@@ -109,6 +111,7 @@ impl BackupCounts {
             routes: catalog.routes.len(),
             market_data_services: catalog.market_data_services.len(),
             order_systems: catalog.order_systems.len(),
+            trading_terminals: catalog.trading_terminals.len(),
         }
     }
 }
@@ -226,6 +229,7 @@ pub struct RestoreSelection {
     pub symbols: BTreeSet<String>,
     pub market_data_services: BTreeSet<String>,
     pub order_systems: BTreeSet<String>,
+    pub trading_terminals: BTreeSet<String>,
 }
 
 impl RestoreSelection {
@@ -235,6 +239,7 @@ impl RestoreSelection {
             && self.symbols.is_empty()
             && self.market_data_services.is_empty()
             && self.order_systems.is_empty()
+            && self.trading_terminals.is_empty()
     }
 }
 
@@ -1175,9 +1180,9 @@ fn safe_join(root: &Path, name: &str) -> Result<PathBuf> {
 /// Select the requested catalog objects plus their direct dependencies.
 ///
 /// An empty selection copies the whole catalog. A shard selection includes its cell and every
-/// symbol/deployment/route hosted by that shard. Symbol, cell, market-data and order-system
-/// selections expand their direct references so a merge validates without restoring unrelated
-/// shards.
+/// symbol/deployment/route hosted by that shard. Symbol, cell, market-data, order-system and
+/// trading-terminal selections expand their direct references so a merge validates without
+/// restoring unrelated shards.
 pub fn select_catalog(catalog: &Catalog, selection: &RestoreSelection) -> Result<Catalog> {
     if selection.is_empty() {
         return Ok(catalog.clone());
@@ -1207,12 +1212,18 @@ pub fn select_catalog(catalog: &Catalog, selection: &RestoreSelection) -> Result
             bail!("backup has no order system {name}");
         }
     }
+    for name in &selection.trading_terminals {
+        if !catalog.trading_terminals.contains_key(name) {
+            bail!("backup has no trading terminal {name}");
+        }
+    }
 
     let mut cells = selection.cells.clone();
     let mut shards = selection.shards.clone();
     let mut symbols = selection.symbols.clone();
     let mut market_data_services = selection.market_data_services.clone();
     let mut order_systems = selection.order_systems.clone();
+    let mut trading_terminals = selection.trading_terminals.clone();
 
     for name in &selection.symbols {
         if let Some(symbol) = catalog.symbols.get(name) {
@@ -1256,6 +1267,7 @@ pub fn select_catalog(catalog: &Catalog, selection: &RestoreSelection) -> Result
             symbols.len(),
             market_data_services.len(),
             order_systems.len(),
+            trading_terminals.len(),
         );
         for shard_name in shards.clone() {
             if let Some(shard) = catalog.shards.get(&shard_name) {
@@ -1318,12 +1330,21 @@ pub fn select_catalog(catalog: &Catalog, selection: &RestoreSelection) -> Result
                 );
             }
         }
+        for terminal in catalog.trading_terminals.values() {
+            if trading_terminals.contains(&terminal.name)
+                || explicit_cells.contains(&terminal.spec.cell)
+            {
+                trading_terminals.insert(terminal.name.clone());
+                cells.insert(terminal.spec.cell.clone());
+            }
+        }
         if (
             cells.len(),
             shards.len(),
             symbols.len(),
             market_data_services.len(),
             order_systems.len(),
+            trading_terminals.len(),
         ) == before
         {
             break;
@@ -1373,6 +1394,13 @@ pub fn select_catalog(catalog: &Catalog, selection: &RestoreSelection) -> Result
     for (name, system) in &catalog.order_systems {
         if order_systems.contains(name) {
             selected.order_systems.insert(name.clone(), system.clone());
+        }
+    }
+    for (name, terminal) in &catalog.trading_terminals {
+        if trading_terminals.contains(name) {
+            selected
+                .trading_terminals
+                .insert(name.clone(), terminal.clone());
         }
     }
     Ok(selected)
@@ -1426,6 +1454,13 @@ pub fn merge_catalog(current: &Catalog, selected: &Catalog) -> Catalog {
             object.status = existing.status.clone();
         }
         merged.order_systems.insert(name.clone(), object);
+    }
+    for (name, terminal) in &selected.trading_terminals {
+        let mut object = terminal.clone();
+        if let Some(existing) = current.trading_terminals.get(name) {
+            object.status = existing.status.clone();
+        }
+        merged.trading_terminals.insert(name.clone(), object);
     }
     merged
 }
@@ -2189,8 +2224,11 @@ pub fn plan_restore(bundle: &LoadedBundle, selection: &RestoreSelection) -> Resu
         && counts.symbols == 0
         && counts.market_data_services == 0
         && counts.order_systems == 0
+        && counts.trading_terminals == 0
     {
-        bail!("selection does not include a shard, symbol, market-data service or order system");
+        bail!(
+            "selection does not include a shard, symbol, market-data service, order system or trading terminal"
+        );
     }
     let report = validate_catalog(&selected);
     if !report.is_ok() {
@@ -2291,6 +2329,73 @@ mod tests {
         );
         assert!(merged.shards.contains_key("me-btcusdt"));
         assert_eq!(merged.shards.len(), current.shards.len());
+    }
+
+    #[test]
+    fn trading_terminal_survives_bundle_export_and_selective_restore() {
+        use crate::model::{Phase, TradingTerminal, TradingTerminalSpec};
+        let dir = temp_dir("backup-terminal");
+        let mut catalog = demo_catalog();
+        let mut terminal = TradingTerminal {
+            name: "terminal-eu".to_string(),
+            namespace: "match-eu-1".to_string(),
+            spec: TradingTerminalSpec {
+                cell: "eu-1".to_string(),
+                image: "matchengine-trading-terminal:arm64-v5".to_string(),
+                replicas: 1,
+                autoscaling: Default::default(),
+                port: 8080,
+                ingress: String::new(),
+                tls_secret: String::new(),
+                md_upstream: crate::model::default_trading_terminal_md_upstream(),
+                desk_upstream: crate::model::default_trading_terminal_desk_upstream(),
+                dns_upstream: String::new(),
+                resources: None,
+                paused: false,
+                previous_image: None,
+            },
+            status: Default::default(),
+        };
+        catalog
+            .trading_terminals
+            .insert(terminal.name.clone(), terminal.clone());
+
+        let shard = catalog.shards.values().next().unwrap().clone();
+        let manifest = BackupManifest::new(
+            "terminal-backup".to_string(),
+            "match-eu-1",
+            &shard,
+            BackupMode::VolumeGroup,
+            &catalog,
+            "vg-class",
+            "snap-class",
+        );
+        write_bundle(&dir, &catalog, manifest, None, false).unwrap();
+        let bundle = read_bundle(&dir).unwrap();
+        assert_eq!(bundle.manifest.counts.trading_terminals, 1);
+        assert_eq!(bundle.catalog.trading_terminals.len(), 1);
+
+        let mut selection = RestoreSelection::default();
+        selection
+            .trading_terminals
+            .insert("terminal-eu".to_string());
+        let selected = select_catalog(&bundle.catalog, &selection).unwrap();
+        assert!(selected.trading_terminals.contains_key("terminal-eu"));
+        assert!(selected.cells.contains_key("eu-1"));
+        let plan = plan_restore(&bundle, &selection).unwrap();
+        assert_eq!(plan.counts.trading_terminals, 1);
+
+        terminal.status.phase = Phase::Ready;
+        let mut current = catalog.clone();
+        current
+            .trading_terminals
+            .insert(terminal.name.clone(), terminal);
+        let merged = merge_catalog(&current, &selected);
+        assert_eq!(
+            merged.trading_terminals["terminal-eu"].status.phase,
+            Phase::Ready
+        );
+        fs::remove_dir_all(dir).ok();
     }
 
     #[test]

@@ -17,6 +17,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 
+use futures::FutureExt;
 use matchengine_raft::MatchEngineTypeConfig;
 use matchengine_raft::StorageConfig;
 use matchengine_raft::build_match_engine_node;
@@ -30,6 +31,7 @@ use matchengine_raft::store::log_store::read_wal_file;
 #[cfg(debug_assertions)]
 use openraft::SnapshotPolicy;
 use openraft::type_config::TypeConfigExt;
+use reqwest::StatusCode;
 
 use crate::common::TempDir;
 use crate::common::TestAddr;
@@ -107,6 +109,184 @@ async fn assert_wal_failure_stops_the_node(port: u16, storage_full: bool) {
         error.to_string().contains("Raft core stopped"),
         "unexpected error: {error}"
     );
+}
+
+/// E11: a failed fsync at the commit-marker flush must fail the node without
+/// acknowledging the write. `save_committed` appends a `Committed` record with
+/// no fsync of its own; the next append's `sync_data` is what makes both that
+/// marker and the new entry durable. The injected error fires at that sync,
+/// after the entry bytes were written, so the rollback removes them.
+#[cfg(debug_assertions)]
+#[test]
+fn fsync_failure_at_the_commit_marker_is_fatal_without_a_false_ack() {
+    C::run(async {
+        let temp = TempDir::new("commit-fsync");
+        let addr = TestAddr::new(21949).to_string();
+        let storage = StorageConfig::new(temp.path())
+            .with_instance_prefix("commit-fsync")
+            .with_wal_fsync(Some(Duration::ZERO));
+        let node = build_match_engine_node(1, addr.clone(), default_raft_config(), storage.clone())
+            .await
+            .unwrap();
+        let client = MatchEngineClient::<C>::new(1, addr.clone());
+        client.init().await.unwrap().unwrap();
+        wait_for_leader(&client).await;
+
+        let acked = client
+            .write(&MatchEngineRequest::place(Order::new(
+                OrderSide::Buy,
+                100.0,
+                1.0,
+                0,
+            )))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(Some(0), acked.data.sequence);
+
+        // The commit marker is written asynchronously after the response. Wait
+        // until a marker covering the acked write is in the WAL before arming
+        // the hook, so the next sync really flushes a marker plus a new entry.
+        let log_dir = storage.log_dir(1);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let applied = client
+                .metrics()
+                .await
+                .unwrap()
+                .last_applied
+                .map(|id| id.index)
+                .unwrap_or(0);
+            let has_marker = std::fs::read_dir(&log_dir)
+                .unwrap()
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("wal"))
+                .flat_map(|path| read_wal_file::<C>(&path).unwrap())
+                .any(|(_, record)| {
+                    matches!(record, WalRecord::Committed(Some(id)) if id.index >= applied)
+                });
+            if has_marker && applied >= 2 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the acked write never produced a commit marker"
+            );
+            C::sleep(Duration::from_millis(20)).await;
+        }
+
+        node.log_store.inject_fsync_error();
+        let node_run = tokio::spawn(node.run());
+
+        let write = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.write(&MatchEngineRequest::place(Order::new(
+                OrderSide::Buy,
+                99.0,
+                1.0,
+                0,
+            ))),
+        )
+        .await;
+        match write {
+            Ok(Ok(Ok(response))) => panic!("false ack after fsync failure: {response:?}"),
+            Ok(Ok(Err(error))) => println!("write rejected after fsync failure: {error}"),
+            Ok(Err(error)) => println!("write transport error after fsync failure: {error}"),
+            Err(_) => println!("write timed out after fsync failure"),
+        }
+
+        let run_result = tokio::time::timeout(Duration::from_secs(10), node_run)
+            .await
+            .expect("run() did not stop after the fsync failure")
+            .expect("node run task panicked");
+        let error = run_result.expect_err("run() must fail after a fatal WAL fsync error");
+        assert!(
+            error.to_string().contains("Raft core stopped"),
+            "unexpected error: {error}"
+        );
+
+        // Reopen on the same durable state. `/ready` must stay 503 until
+        // `wait_for_recovery` confirms the state machine covers the WAL tail.
+        let reopened =
+            build_match_engine_node(1, addr.clone(), default_raft_config(), storage.clone())
+                .await
+                .unwrap();
+        let result = std::panic::AssertUnwindSafe(async {
+            let http = reqwest::Client::builder().no_proxy().build().unwrap();
+            let base = format!("http://{addr}");
+            let deadline = Instant::now() + Duration::from_secs(15);
+            let mut saw_not_ready = false;
+            loop {
+                let response = http.get(format!("{base}/ready")).send().await.unwrap();
+                let status = response.status();
+                let body: serde_json::Value = response.json().await.unwrap();
+                if status == StatusCode::OK {
+                    assert_eq!(true, body["ready"]);
+                    break;
+                }
+                assert_eq!(StatusCode::SERVICE_UNAVAILABLE, status);
+                assert_eq!(false, body["ready"]);
+                saw_not_ready = true;
+                assert!(Instant::now() < deadline, "node never became ready");
+                C::sleep(Duration::from_millis(10)).await;
+            }
+            assert!(
+                saw_not_ready,
+                "restarted node was ready before wait_for_recovery confirmed the durable tail"
+            );
+            let health: serde_json::Value = http
+                .get(format!("{base}/health"))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(true, health["recovered"], "health: {health}");
+
+            let reader = MatchEngineClient::<C>::new(1, addr.clone());
+            let sequence = reader
+                .read(&"orderbook_sequence".to_string())
+                .await
+                .unwrap();
+            assert_eq!(
+                "1", sequence,
+                "the unacked write was committed after restart"
+            );
+            let page = reader
+                .events(&matchengine_raft::network::api::EventsRequest {
+                    after: None,
+                    limit: Some(100),
+                    wait_ms: None,
+                })
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(1, page.events.len(), "the unacked write left an event");
+            let orders: Vec<Order> =
+                serde_json::from_str(&reader.read(&"orderbook_orders".to_string()).await.unwrap())
+                    .unwrap();
+            assert_eq!(1, orders.len());
+            let acked_price = Order::new(OrderSide::Buy, 100.0, 1.0, 0).price;
+            assert!(
+                orders.iter().all(|order| order.price == acked_price),
+                "the unacked write rested on the book: {orders:?}"
+            );
+
+            Ok::<(), anyhow::Error>(())
+        })
+        .catch_unwind()
+        .await;
+        if let Err(error) = reopened.shutdown().await {
+            eprintln!("node shutdown failed: {error}");
+        }
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => panic!("test failed: {error:?}"),
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    });
 }
 
 #[test]

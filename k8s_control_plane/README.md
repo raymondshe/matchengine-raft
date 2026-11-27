@@ -18,9 +18,11 @@ etcd directly.
 
 ![Kubernetes control plane manager GUI](../docs/kubernetes-control-plane.png)
 
-The reference manager GUI has three top-level views: **matching engine** (shard catalog, packing
+The reference manager GUI has four top-level views: **matching engine** (shard catalog, packing
 mode, validation, preview plan, backup status, image upgrade, manifests, audit and engine-console
-links), **market data**, and **order systems**. The market-data view has **terminal** (multi-symbol
+links), **market data**, **order systems**, and **trading terminal**. The terminal view lists the
+nginx-backed WebUI link, pinned md/desk upstreams, readiness and an image upgrade; it never renders
+an order ticket or calls engine `/write` — order entry stays on the order-system BFF. The market-data view has **terminal** (multi-symbol
 services with `websocket.fastOnly=false`) and **fast** (single-symbol shard services with
 `websocket.fastOnly=true`) second-level tabs. Both market-data tabs are independent of the
 selected shard. The order-systems view lists the capacity ranges, engine targets, readiness and one

@@ -1,7 +1,10 @@
-# Trading terminal (React SPA behind nginx), deployed as plain manifests the
-# same way as deploy/nats.yaml and deploy/ingress-nginx.yaml. A TradingTerminal
-# CRD rendered by the operator is a deliberate follow-up; until then this file
-# is applied with kubectl and torn down by deleting it.
+# Trading terminal (React SPA behind nginx) — LEGACY standalone fallback.
+# The supported path is now a `TradingTerminal` CRD rendered by the operator:
+# create it through `POST /api/v1/trading-terminals` (or the manager GUI) and do
+# not apply this file at the same time, or the two owners will fight over the
+# same Deployment/Service/Ingress/NetworkPolicy names. It is kept for labs that
+# still bootstrap the terminal with kubectl, and is no longer referenced by the
+# production overlay.
 #
 # Frontend-backend separation: the terminal is a third client of the existing
 # services. It proxies only to the global market-data service (public feed)

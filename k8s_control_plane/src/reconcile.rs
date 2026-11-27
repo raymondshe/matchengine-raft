@@ -21,9 +21,9 @@ use serde::{Deserialize, Serialize};
 use crate::error::ApiError;
 use crate::model::{
     MarketDataSymbolStatus, Release, SymbolDeployment, SymbolRoute, SymbolShard, TradingSymbol,
-    UpgradeStrategy, desired_config_hash,
+    TradingTerminal, UpgradeStrategy, desired_config_hash,
 };
-use crate::render::{render_market_data_service, rolling_upgrade_safe};
+use crate::render::{render_market_data_service, render_trading_terminal, rolling_upgrade_safe};
 use crate::store::{Catalog, now_epoch};
 use crate::validate::validate_catalog;
 
@@ -967,6 +967,7 @@ impl MarketDataScenario {
 
 const DEMO_MARKET_DATA_PREVIOUS_IMAGE: &str =
     "registry.example.com/matchengine-marketdata:arm64-v3";
+const DEMO_TERMINAL_PREVIOUS_IMAGE: &str = "matchengine-trading-terminal:arm64-v4";
 
 /// Synthesize a market-data observation for the demo API. No store or Kubernetes call is made.
 pub fn simulate_market_data(
@@ -1334,6 +1335,256 @@ pub fn plan_market_data(
         ));
     }
     plan.steps.push(write_status());
+    Ok(plan)
+}
+
+// ---------------------------------------------------------------------------
+// Trading-terminal planning (read-only)
+// ---------------------------------------------------------------------------
+
+/// Scenario the terminal plan API can simulate without a cluster.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TradingTerminalScenario {
+    Fresh,
+    Ready,
+    Behind,
+    Degraded,
+    Paused,
+}
+
+impl TradingTerminalScenario {
+    pub fn parse(value: &str) -> Result<Self, ApiError> {
+        match value {
+            "fresh" => Ok(Self::Fresh),
+            "ready" | "healthy" => Ok(Self::Ready),
+            "behind" | "upgrade" => Ok(Self::Behind),
+            "degraded" => Ok(Self::Degraded),
+            "paused" => Ok(Self::Paused),
+            other => Err(ApiError::bad_request(
+                "trading_terminal_scenario",
+                format!("unknown scenario {other:?}; use fresh|ready|behind|degraded|paused"),
+            )),
+        }
+    }
+}
+
+/// Read-only view of the terminal's stateless Deployment. The operator assembles this from the
+/// Deployment; the plan API accepts the same shape so a human can replay a real observation.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TradingTerminalObservation {
+    #[serde(default)]
+    pub terminal: String,
+    #[serde(default)]
+    pub cell: String,
+    #[serde(default)]
+    pub image: String,
+    #[serde(default)]
+    pub replicas: u16,
+    #[serde(default)]
+    pub ready_replicas: u16,
+    #[serde(default)]
+    pub deployment_exists: bool,
+    #[serde(default)]
+    pub paused: bool,
+    #[serde(default)]
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Synthesize a terminal observation for the demo/GUI without touching a cluster.
+pub fn simulate_trading_terminal(
+    catalog: &Catalog,
+    name: &str,
+    scenario: TradingTerminalScenario,
+) -> Result<TradingTerminalObservation, ApiError> {
+    let terminal: &TradingTerminal = catalog.trading_terminals.get(name).ok_or_else(|| {
+        ApiError::not_found(
+            "trading_terminal_not_found",
+            format!("unknown trading terminal {name}"),
+        )
+    })?;
+    let paused = terminal.spec.paused || scenario == TradingTerminalScenario::Paused;
+    let fresh = scenario == TradingTerminalScenario::Fresh;
+    let replicas = if paused || fresh {
+        0
+    } else {
+        terminal.spec.replicas.max(terminal.spec.min_replicas())
+    };
+    let ready_replicas = if paused || fresh || scenario == TradingTerminalScenario::Degraded {
+        0
+    } else {
+        replicas
+    };
+    let image = match scenario {
+        TradingTerminalScenario::Fresh => String::new(),
+        TradingTerminalScenario::Behind => DEMO_TERMINAL_PREVIOUS_IMAGE.to_string(),
+        _ => terminal.spec.image.clone(),
+    };
+    Ok(TradingTerminalObservation {
+        terminal: name.to_string(),
+        cell: terminal.spec.cell.clone(),
+        image,
+        replicas,
+        ready_replicas,
+        deployment_exists: !fresh,
+        paused,
+        message: match scenario {
+            TradingTerminalScenario::Fresh => "Deployment has not been created yet".to_string(),
+            TradingTerminalScenario::Paused => "paused by spec".to_string(),
+            TradingTerminalScenario::Degraded => "pod not ready".to_string(),
+            TradingTerminalScenario::Behind => "running an older image".to_string(),
+            TradingTerminalScenario::Ready => String::new(),
+        },
+        error: None,
+    })
+}
+
+/// Build a read-only plan for one terminal. The catalog (including every
+/// `TradingTerminal`) is cloned and validated exactly as the operator would,
+/// then the renderer decides which objects would be applied. No engine write
+/// route or order ticket is part of this plan.
+pub fn plan_trading_terminal(
+    catalog: &Catalog,
+    name: &str,
+    observation: &TradingTerminalObservation,
+    target_image: Option<&str>,
+) -> Result<ReconcilePlan, ApiError> {
+    let terminal = catalog.trading_terminals.get(name).ok_or_else(|| {
+        ApiError::not_found(
+            "trading_terminal_not_found",
+            format!("unknown trading terminal {name}"),
+        )
+    })?;
+    if !observation.terminal.is_empty() && observation.terminal != name {
+        return Err(ApiError::bad_request(
+            "observation_terminal",
+            format!(
+                "observation is for {} but the path is {name}",
+                observation.terminal
+            ),
+        ));
+    }
+    let image = target_image
+        .unwrap_or(&terminal.spec.image)
+        .trim()
+        .to_string();
+    if image.is_empty() {
+        return Err(ApiError::bad_request(
+            "target_image",
+            "target image must not be empty",
+        ));
+    }
+    let mut candidate = catalog.clone();
+    if let Some(target) = candidate.trading_terminals.get_mut(name) {
+        target.spec.image = image.clone();
+    }
+    let mut scope = BTreeSet::new();
+    scope.insert(name.to_string());
+    let report = validate_catalog(&candidate).scoped(&scope);
+    let mut blocked: Vec<String> = report
+        .errors
+        .iter()
+        .map(|issue| issue.message.clone())
+        .collect();
+    let objects = if blocked.is_empty() {
+        match render_trading_terminal(&candidate, name, "") {
+            Ok(objects) => objects,
+            Err(error) => {
+                blocked.push(error.message);
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+    let mut plan = ReconcilePlan {
+        shard: name.to_string(),
+        phase: PlanPhase::Blocked,
+        steps: Vec::new(),
+        blocked,
+        notes: vec![
+            "trading terminals are stateless clients: no leader transfer, snapshot install or quorum gate"
+                .to_string(),
+            "the operator rolls the nginx Deployment with maxUnavailable: 0 and maxSurge: 1; the terminal never renders an engine write route or order ticket"
+                .to_string(),
+        ],
+        target_image: image.clone(),
+    };
+    plan.steps.push(market_data_step(
+        Action::ValidateCatalog,
+        name,
+        "validate the catalog and the target terminal image before applying objects",
+    ));
+    plan.steps.push(market_data_step(
+        Action::RenderManifests,
+        name,
+        format!(
+            "server-side apply {} rendered objects (Deployment/Service/PDB/HPA/Ingress/NetworkPolicies)",
+            objects.len()
+        ),
+    ));
+    if let Some(error) = observation.error.as_deref() {
+        plan.blocked.push(error.to_string());
+    }
+    if terminal.spec.paused || observation.paused {
+        plan.phase = PlanPhase::Paused;
+        plan.steps.push(market_data_step(
+            Action::PauseTraffic,
+            name,
+            "spec.paused scales the Deployment to zero and omits the HPA",
+        ));
+    } else if !observation.deployment_exists {
+        plan.phase = PlanPhase::Provisioning;
+        plan.steps.push(market_data_step(
+            Action::WaitForPods,
+            name,
+            "wait for the first Deployment and Ready pods",
+        ));
+    } else if observation.image != image {
+        plan.phase = PlanPhase::Upgrading;
+        plan.steps.push(market_data_step(
+            Action::RollDeployment,
+            name,
+            "roll nginx pods one at a time with maxUnavailable: 0",
+        ));
+    } else if observation.replicas < terminal.spec.min_replicas()
+        || observation.replicas > terminal.spec.max_replicas()
+    {
+        plan.phase = PlanPhase::Scaling;
+        plan.steps.push(market_data_step(
+            Action::ScaleDeployment,
+            name,
+            format!(
+                "observed {} replicas sit outside HPA bounds {}-{}",
+                observation.replicas,
+                terminal.spec.min_replicas(),
+                terminal.spec.max_replicas()
+            ),
+        ));
+    } else if observation.ready_replicas < observation.replicas {
+        plan.phase = PlanPhase::Provisioning;
+        plan.steps.push(market_data_step(
+            Action::WaitForPods,
+            name,
+            format!(
+                "{}/{} terminal replicas ready",
+                observation.ready_replicas, observation.replicas
+            ),
+        ));
+    } else {
+        plan.phase = PlanPhase::Ready;
+    }
+    if !plan.blocked.is_empty() {
+        plan.phase = PlanPhase::Blocked;
+    }
+    plan.steps.push(market_data_step(
+        Action::WriteStatus,
+        name,
+        "write the terminal Deployment/URL status back to the CRD",
+    ));
     Ok(plan)
 }
 
@@ -1989,6 +2240,103 @@ mod tests {
                 .any(|blocked| blocked.contains("wire version")),
             "{:?}",
             plan.blocked
+        );
+    }
+
+    fn trading_terminal_catalog() -> Catalog {
+        use crate::model::{TradingTerminal, TradingTerminalSpec};
+        let mut catalog = catalog();
+        let terminal = TradingTerminal {
+            name: "terminal-eu".to_string(),
+            namespace: "match-eu-1".to_string(),
+            spec: TradingTerminalSpec {
+                cell: "eu-1".to_string(),
+                image: "matchengine-trading-terminal:arm64-v5".to_string(),
+                replicas: 1,
+                autoscaling: Default::default(),
+                port: 8080,
+                ingress: "terminal.match-eu-1.example".to_string(),
+                tls_secret: String::new(),
+                md_upstream: crate::model::default_trading_terminal_md_upstream(),
+                desk_upstream: crate::model::default_trading_terminal_desk_upstream(),
+                dns_upstream: String::new(),
+                resources: None,
+                paused: false,
+                previous_image: None,
+            },
+            status: Default::default(),
+        };
+        catalog
+            .trading_terminals
+            .insert(terminal.name.clone(), terminal);
+        catalog
+    }
+
+    fn terminal_plan(
+        catalog: &Catalog,
+        scenario: TradingTerminalScenario,
+    ) -> (TradingTerminalObservation, ReconcilePlan) {
+        let observation = simulate_trading_terminal(catalog, "terminal-eu", scenario).unwrap();
+        let plan = plan_trading_terminal(catalog, "terminal-eu", &observation, None).unwrap();
+        (observation, plan)
+    }
+
+    #[test]
+    fn trading_terminal_plan_previews_a_frontend_only_rollout() {
+        let catalog = trading_terminal_catalog();
+        let (observation, ready) = terminal_plan(&catalog, TradingTerminalScenario::Ready);
+        assert!(observation.deployment_exists);
+        assert_eq!(observation.replicas, 1);
+        assert_eq!(observation.ready_replicas, 1);
+        assert_eq!(ready.phase, PlanPhase::Ready);
+        assert!(ready.blocked.is_empty());
+        assert!(ready.steps.iter().any(|step| {
+            step.action == Action::RenderManifests && step.detail.contains("NetworkPolicies")
+        }));
+        assert!(
+            ready
+                .notes
+                .iter()
+                .any(|note| note.contains("never renders an engine write route"))
+        );
+        // Planning is read-only: the catalog, including its terminal, is untouched.
+        assert_eq!(catalog.trading_terminals.len(), 1);
+        assert_eq!(
+            catalog.trading_terminals["terminal-eu"].spec.image,
+            "matchengine-trading-terminal:arm64-v5"
+        );
+        assert!(!ready.steps.iter().any(|step| {
+            matches!(
+                step.action,
+                Action::InitCluster | Action::ConfigureSymbol | Action::ChangeMembership
+            )
+        }));
+
+        let (_, fresh) = terminal_plan(&catalog, TradingTerminalScenario::Fresh);
+        assert_eq!(fresh.phase, PlanPhase::Provisioning);
+        assert!(
+            fresh
+                .steps
+                .iter()
+                .any(|step| step.action == Action::WaitForPods)
+        );
+
+        let (_, behind) = terminal_plan(&catalog, TradingTerminalScenario::Behind);
+        assert_eq!(behind.phase, PlanPhase::Upgrading);
+        assert!(
+            behind
+                .steps
+                .iter()
+                .any(|step| step.action == Action::RollDeployment)
+        );
+
+        let (_, paused) = terminal_plan(&catalog, TradingTerminalScenario::Paused);
+        assert_eq!(paused.phase, PlanPhase::Paused);
+        assert!(
+            paused
+                .steps
+                .iter()
+                .any(|step| step.action == Action::PauseTraffic)
         );
     }
 }
