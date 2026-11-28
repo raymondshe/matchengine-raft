@@ -96,7 +96,9 @@ registry, env_path = sys.argv[1], pathlib.Path(sys.argv[2])
 digests = {}
 if env_path.exists():
     digests = dict(line.strip().split('=', 1) for line in env_path.read_text().splitlines() if '=' in line)
-missing = [n for n in ('matchengine-k8s-control-plane', 'matchengine-trading-terminal') if not digests.get(n)]
+# The terminal is rendered from a TradingTerminal CR, so its digest is not
+# consumed by this Deployment patch — it goes into the CR's spec.image.
+missing = [n for n in ('matchengine-k8s-control-plane',) if not digests.get(n)]
 if missing:
     raise SystemExit('--pin needs pushed digests for: ' + ', '.join(missing) + ' (run with --push first)')
 tpl = pathlib.Path('k8s_control_plane/overlays/production/images.patch.yaml.example')

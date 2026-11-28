@@ -52,15 +52,6 @@ spec:
           containers:
             - name: status
               image: REGISTRY/matchengine-k8s-control-plane@sha256:REPLACE_ME
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: match-terminal
-  namespace: match-eu-1
-spec:
-  template:
-    spec:
-      containers:
-        - name: terminal
-          image: REGISTRY/matchengine-trading-terminal@sha256:REPLACE_ME
+# The terminal is no longer a static Deployment: the operator renders it from
+# a TradingTerminal CR, whose spec.image carries the digest-pinned image. Pin
+# that image in the CR (manager GUI/API) instead of patching a Deployment here.
