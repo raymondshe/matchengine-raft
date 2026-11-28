@@ -1,6 +1,6 @@
 # TODO
 
-Last reviewed: 2026-11-27. Working roadmap only; completed detail lives in the History section and
+Last reviewed: 2026-11-28. Working roadmap only; completed detail lives in the History section and
 git history — check out an earlier `TODO.md` from git for the full record
 (`git log -- TODO.md`, then `git show <commit>:TODO.md`). Measurements remain in
 [`docs/PERFORMANCE.md`](./docs/PERFORMANCE.md). See `AGENTS.md` for commands and the current branch
@@ -10,11 +10,11 @@ state.
 18-scale `Fixed` values, the full v11 order-type set with STP and asset-aware fees, a replicated
 event log, local-lease reads, bounded admission and Aeron/NATS market-data egress. One process or
 cluster trades one symbol; multi-symbol isolation is deployment-level. The control plane manages
-seven `matching.io/v1` CRDs through the API server, with a Lease-elected operator, one-pod-at-a-time
+eight `matching.io/v1` CRDs through the API server, with a Lease-elected operator, one-pod-at-a-time
 rolls, release/capacity gates, cross-shard migration, scheduled signed backups and a manager GUI
-with create/edit/scale/rollback and read-only preview plans for both shards and market-data
-services. Four fast-only market-data services and one global terminal service feed the React
-terminal. The live lab currently has the `match-observability` stack intentionally scaled to zero
+with create/edit/scale/rollback and read-only preview plans for shards, market-data services and the
+terminal. Four fast-only market-data services and one global terminal service feed the React
+terminal, which the operator now renders from a `TradingTerminal` CR. The live lab currently has the `match-observability` stack intentionally scaled to zero
 to save memory requests; restore it before relying on Grafana, Prometheus or Loki.
 
 Priority key: **P0** = known correctness/security defect, do next; **P1** = production safety and
@@ -25,64 +25,67 @@ this lab.
 
 ## Ranked queue (authoritative)
 
-Nothing is P0. The engine, client and control plane are green on tests and the live lab; the five
-P0 consensus edge cases from `docs/RAFT_EDGE_CASE_TEST_MATRIX.md` are closed in History. This is the
-single ranked list; the detail below only explains caveats and deferral decisions.
+Nothing is P0. The engine, client and control plane are green on tests and the live lab; all 20
+consensus edge cases (P0/P1/P2) from `docs/RAFT_EDGE_CASE_TEST_MATRIX.md` are closed in History.
+This is the single ranked list; the detail below only explains caveats and deferral decisions.
 
 | # | Pri | Item | Status | Notes |
 |---:|---|---|---|---|
-| 1 | P1 | Control-plane, engine-admin and public-edge security (#1) | open | Manager OIDC/mTLS, authorization, per-route permission bits, test/live isolation with a `409` cross-mode refusal, console-proxy auth, destructive-action approvals, idempotency keys, namespace-qualified paths, dry-run diffs and audit. Add TLS/auth, rate limits, origin checks, NetworkPolicy and Pod Security to the order-system, market-data and NATS edges; mTLS/shared-secret for engine `/init`, `/add-learner`, `/change-membership` and gRPC; session-bound `user_id` for the order desk; Secret-backed TDengine credentials and no public REST Ingress. Closes Grafana `admin`/`admin` and the plaintext lab TDengine endpoint. Highest impact and the cheapest prevention window. |
-| 2 | P1 | Supply-chain and namespace hardening (#20) | open | Pin Actions to commit SHAs and base images to digests, `permissions: contents: read`, `match-eu-1` restricted with default-deny ingress/egress and a TDengine NetworkPolicy, narrow the bridge ClusterRole and backup pod-create RBAC. Small and self-contained; ride alongside #1. |
-| 3 | P1 | Raft P1 edge cases E06–E12 | done 2026-11-27 | Closed in History; the matrix records each test and hook. E13–E20 remain open at #8. |
-| 4 | P1 | Gateway integration | deferred by decision | Leader-aware routing from `SymbolRoute.status`, shadow/cutover/drain, retries and a canary path. Deferred by `docs/GATEWAY_ROUTING.md`: revisit only when TLS/auth and packaging land, a second client that cannot use the Rust client appears, or cutover needs automating. Retry `Place` with `client_order_id`; include `client_request_id` on `Cancel`/`Amend` retries. |
-| 5 | P1 | Backup, registry and storage close-out | blocked here | One cycle against a real object-storage bucket (upload, retention, alerts), a real registry for digest-pinned images, and one CSI volume-snapshot drill. The local-PVC path, `docker save`/`load` and signed CRD drill are validated. A local `DiskPressure` image GC can otherwise leave a roll with nothing to pull. |
-| 6 | P1 | Multi-node NATS | blocked here | Credentials/NKey in source and sink, a multi-node NATS cluster and optional JetStream retention. The single-node Core NATS path and acceptance `nats` phase pass. |
-| 7 | P1 | Multi-host fabric and bare-metal evidence | blocked here | Second host and Linux four-voter cluster for read/write and lease A/B, forced stale lease to observe the `ReadIndex` fallback, Aeron multicast across hosts, opt-in cgroup v2 supervisor isolation, and the pinned-core `bench-linux` workflow on the bare-metal runner. OrbStack proves the Linux code path but is one host without cgroup delegation. |
-| 8 | P2 | Raft P2 edge cases E13–E20 | done 2026-11-27 | Closed in History; all 20 cases in `docs/RAFT_EDGE_CASE_TEST_MATRIX.md` are now covered. |
-| 9 | P2 | Rollout invariants and acceptance automation (#4) | open | Extract the rollout candidate decision into a pure function (one terminating pod, replacement Ready before the next deletion, no skip while old pods remain), then run the nine-phase `scripts/operator-acceptance.sh` in a disposable CI cluster or nightly. Cheap unit tests first. |
-| 10 | P2 | Ordered pre-trade rule pipeline (#5) | open | Fixed first-failure-wins edge/gateway gate with typed codes: halt, blacklist, notional cap, per-account/per-market flow windows, cancel-ratio, cancelled-amount-ratio, then self-trade screening. Policy-side only; never put user state in the stateless desk or matching core. |
-| 11 | P2 | Historical bar store, remaining phases (#16) | open | P0 and all of P1 are shipped (History). Next: archive importer and reconciler with gap-gated reads; then three-dnode `REPLICA 3`, reader HPAs, backup and offset-anchored intervals. Depends on #1 for Secret-backed DSN and NetworkPolicy. |
-| 12 | P2 | Trading terminal CRD integration (#17) | done 2026-11-27 | Closed in History. The operator renders the terminal from a `TradingTerminal` CR; the static `deploy/terminal.yaml` is now a legacy fallback. Never call engine `/write` directly. |
-| 13 | P2 | Docs synchronization (#8) | open | Keep `AGENTS.md`, READMEs, `docs/API.md`, `docs/ETCD_STORAGE.md`, `docs/TESTING.md`, `docs/RAFT_EDGE_CASE_TEST_MATRIX.md` and runbooks aligned. Fix the known Profile A/NATS drift first (`k8s_control_plane/README.md` still says Profile A is the only rendered transport); add a generated-doc diff guard and paired EN/CN updates when that surface exists. |
-| 14 | P2 | Engine bar emission for sparse markets (#11) | open | `BarAgg::new` seeds `last_live_ms` with the trade time, suppressing the opening emit; seed it with `0` and test a single-fill bar. The terminal no longer depends on it, but the engine feed is authoritative for other consumers. |
-| 15 | P2 | Stop-the-world incompatible upgrade execution (#6) | open | Automate the coordinated cutover (backup gate, disable routes, stop all symbols, apply image/release, restart, verify, re-enable) and record a drill. The release gate and manual runbook exist. |
-| 16 | P2 | Profile A feed hardening (#12) | open | Characterize the Aeron image-registration race and single-node multi-subscriber behavior, make source startup readiness-gated (or add a per-source generation), keep the 5–30 s re-subscribe watchdog without restart loops. |
-| 17 | P2 | CRD scale and soak (#13) | open | Thousands of symbols/CRs across shards and cells, status churn, API-server/etcd size, informer memory and operator workqueue latency. No real engine load required. |
-| 18 | P2 | Defence-in-depth hardening (#19) | open | Nonce-valued CSRF guards for console/desk actions, manager GUI CSP, correlation IDs instead of internal error strings on 500s, and an admission gate for concurrent `/events` long-polls. Keep separate from the #1 auth workstream. |
-| 19 | P2 | Observability extras | open | Expose the soak's queue-depth, encode-CPU and close-reason counters in Prometheus/Grafana and surface alert state in the manager status view. The JSON→text bridge, alerts and dashboard exist; the lab stack is currently scaled to zero (restore first). |
-| 20 | P2 | Optional Aeron profiles | blocked on benchmark | Only if the NATS benchmark misses the latency target: direct multicast where the multi-node CNI/VPC test passes, or the per-pod IPC bridge. Keep unique stream bases per process, a cell-unique `symbol_id`, distinct Aeron directories and no shared `/dev/shm`. |
-| 21 | P3 | Deferred performance experiments | open | `docs/ORDER_BOOK_PERFORMANCE_REVIEW.md`: depth aggregates (F4b), per-fill copy/fill-buffer reduction and FOK preflight fusion (F6), snapshot-copy/validation micro-costs (F7–F8), `/klines` query coalescing, WebSocket frame precomputation and catalog snapshot reuse. Targeted bench first. Apply-path remainders are in `docs/APPLY_PATH_PERFORMANCE_REVIEW.md`. |
-| 22 | P3 | GUI follow-ups | open | Market-data create/edit/scale/plan/rollback is **done**. Remaining: order-system create/edit and image-rollback actions, migration/promote forms, approvals, filters/pagination, diff/rollback and SSE/WebSocket updates. |
-| 23 | P3 | Lab-only hardening | open | Remove root usage and iptables from `match_engine/docker/linux.Dockerfile`; scope the ingress-nginx ClusterRole's Secrets access. Keep both out of production overlays. |
-| 24 | P3 | Automation surface | open | CLI `create-shard`/`create-symbol`/`migrate`, an OpenAPI client, and admission validation/defaulting beyond the CRD YAML. |
-| 25 | P3 | Multi-cell federation | open | Cell registration/capacity, CR projection and cross-cell migration. The demo has one cell. |
-| 26 | P3 | Engine optional work | open | Wire-version negotiation (keep the release gate until then), exposing `purge_batch_size` with `max_in_snapshot_log_to_keep`, a standalone `STREAM_APPEND_CHANNEL_SIZE` benchmark, `on_leader_change` callbacks, peer preconnect/larger frames/snapshot compression, bounded-admission backpressure, async-WAL productionization, Aeron Raft transport, binary order entry, ITCH replay, binary/compressed WebSocket payloads only after a measured JSON bottleneck, derivative fields, reserve replenishment/collars, protobuf/Avro, and AON/order-mask conformance cases. |
-| 27 | P3 | Optional archive and replay | open | Persist feed archives to object storage or a PVC with retention/checksums and replay through the same assembler. Archives are data, never desired state in etcd. |
-| 28 | P3 | Operator documentation | open | Metrics, troubleshooting, capacity planning and disaster-recovery runbooks. |
-| 29 | P3 | Module renaming | open | Decide whether to rename mixed-style modules (`src/match_result/` → `match_events/`) before 1.0. Import-breaking, no functional benefit today. |
+| 1 | P1 | Control-plane, engine-admin and public-edge security | open | Manager OIDC/mTLS, authorization, per-route permission bits, test/live isolation with a `409` cross-mode refusal, console-proxy auth, destructive-action approvals, idempotency keys, namespace-qualified paths, dry-run diffs and audit. Add TLS/auth, rate limits, origin checks, NetworkPolicy and Pod Security to the order-system, market-data and NATS edges; mTLS/shared-secret for engine `/init`, `/add-learner`, `/change-membership` and gRPC; session-bound `user_id` for the order desk; Secret-backed TDengine credentials and no public REST Ingress. Closes Grafana `admin`/`admin` and the plaintext lab TDengine endpoint. Highest impact and the cheapest prevention window. |
+| 2 | P1 | Supply-chain and namespace hardening | open | Pin Actions to commit SHAs and base images to digests, `permissions: contents: read`, `match-eu-1` restricted with default-deny ingress/egress and a TDengine NetworkPolicy, narrow the bridge ClusterRole and backup pod-create RBAC. Small and self-contained; ride alongside #1. |
+| 3 | P1 | Gateway integration | deferred by decision | Leader-aware routing from `SymbolRoute.status`, shadow/cutover/drain, retries and a canary path. Deferred by `docs/GATEWAY_ROUTING.md`: revisit only when TLS/auth and packaging land, a second client that cannot use the Rust client appears, or cutover needs automating. Retry `Place` with `client_order_id`; include `client_request_id` on `Cancel`/`Amend` retries. |
+| 4 | P1 | Backup, registry and storage close-out | blocked here | One cycle against a real object-storage bucket (upload, retention, alerts), a real registry for digest-pinned images, and one CSI volume-snapshot drill. The local-PVC path, `docker save`/`load` and signed CRD drill are validated. A local `DiskPressure` image GC can otherwise leave a roll with nothing to pull. |
+| 5 | P1 | Multi-node NATS | blocked here | Credentials/NKey in source and sink, a multi-node NATS cluster and optional JetStream retention. The single-node Core NATS path and acceptance `nats` phase pass. |
+| 6 | P1 | Multi-host fabric and bare-metal evidence | blocked here | Second host and Linux four-voter cluster for read/write and lease A/B, forced stale lease to observe the `ReadIndex` fallback, Aeron multicast across hosts, opt-in cgroup v2 supervisor isolation, and the pinned-core `bench-linux` workflow on the bare-metal runner. OrbStack proves the Linux code path but is one host without cgroup delegation. |
+| 7 | P2 | Rollout invariants and acceptance automation | open | Extract the rollout candidate decision into a pure function (one terminating pod, replacement Ready before the next deletion, no skip while old pods remain), then run the nine-phase `scripts/operator-acceptance.sh` in a disposable CI cluster or nightly. Cheap unit tests first. |
+| 8 | P2 | Ordered pre-trade rule pipeline | open | Fixed first-failure-wins edge/gateway gate with typed codes: halt, blacklist, notional cap, per-account/per-market flow windows, cancel-ratio, cancelled-amount-ratio, then self-trade screening. Policy-side only; never put user state in the stateless desk or matching core. |
+| 9 | P2 | Historical bar store, remaining phases | open | P0 and all of P1 are shipped (History). Next: archive importer and reconciler with gap-gated reads; then three-dnode `REPLICA 3`, reader HPAs, backup and offset-anchored intervals. Depends on #1 for Secret-backed DSN and NetworkPolicy. |
+| 10 | P2 | Docs synchronization | open | Keep `AGENTS.md`, READMEs, `docs/API.md`, `docs/ETCD_STORAGE.md`, `docs/TESTING.md`, `docs/RAFT_EDGE_CASE_TEST_MATRIX.md` and runbooks aligned. Fix the known Profile A/NATS drift first (`k8s_control_plane/README.md` still says Profile A is the only rendered transport); add a generated-doc diff guard and paired EN/CN updates when that surface exists. |
+| 11 | P2 | Engine bar emission for sparse markets | open | `BarAgg::new` seeds `last_live_ms` with the trade time, suppressing the opening emit; seed it with `0` and test a single-fill bar. The terminal no longer depends on it, but the engine feed is authoritative for other consumers. |
+| 12 | P2 | Stop-the-world incompatible upgrade execution | open | Automate the coordinated cutover (backup gate, disable routes, stop all symbols, apply image/release, restart, verify, re-enable) and record a drill. The release gate and manual runbook exist. |
+| 13 | P2 | Profile A feed hardening | open | Characterize the Aeron image-registration race and single-node multi-subscriber behavior, make source startup readiness-gated (or add a per-source generation), keep the 5–30 s re-subscribe watchdog without restart loops. |
+| 14 | P2 | CRD scale and soak | open | Thousands of symbols/CRs across shards and cells, status churn, API-server/etcd size, informer memory and operator workqueue latency. No real engine load required. |
+| 15 | P2 | Defence-in-depth hardening | open | Nonce-valued CSRF guards for console/desk actions, manager GUI CSP, correlation IDs instead of internal error strings on 500s, and an admission gate for concurrent `/events` long-polls. Keep separate from the #1 auth workstream. |
+| 16 | P2 | Observability extras | open | Expose the soak's queue-depth, encode-CPU and close-reason counters in Prometheus/Grafana and surface alert state in the manager status view. The JSON→text bridge, alerts and dashboard exist; the lab stack is currently scaled to zero (restore first). |
+| 17 | P2 | Optional Aeron profiles | blocked on benchmark | Only if the NATS benchmark misses the latency target: direct multicast where the multi-node CNI/VPC test passes, or the per-pod IPC bridge. Keep unique stream bases per process, a cell-unique `symbol_id`, distinct Aeron directories and no shared `/dev/shm`. |
+| 18 | P3 | Deferred performance experiments | open | `docs/ORDER_BOOK_PERFORMANCE_REVIEW.md`: depth aggregates (F4b), per-fill copy/fill-buffer reduction and FOK preflight fusion (F6), snapshot-copy/validation micro-costs (F7–F8), `/klines` query coalescing, WebSocket frame precomputation and catalog snapshot reuse. Targeted bench first. Apply-path remainders are in `docs/APPLY_PATH_PERFORMANCE_REVIEW.md`. |
+| 19 | P3 | GUI follow-ups | open | Market-data create/edit/scale/plan/rollback is **done**. Remaining: order-system create/edit and image-rollback actions, migration/promote forms, approvals, filters/pagination, diff/rollback and SSE/WebSocket updates. |
+| 20 | P3 | Lab-only hardening | open | Remove root usage and iptables from `match_engine/docker/linux.Dockerfile`; scope the ingress-nginx ClusterRole's Secrets access. Keep both out of production overlays. |
+| 21 | P3 | Automation surface | open | CLI `create-shard`/`create-symbol`/`migrate`, an OpenAPI client, and admission validation/defaulting beyond the CRD YAML. |
+| 22 | P3 | Multi-cell federation | open | Cell registration/capacity, CR projection and cross-cell migration. The demo has one cell. |
+| 23 | P3 | Engine optional work | open | Wire-version negotiation (keep the release gate until then), exposing `purge_batch_size` with `max_in_snapshot_log_to_keep`, a standalone `STREAM_APPEND_CHANNEL_SIZE` benchmark, `on_leader_change` callbacks, peer preconnect/larger frames/snapshot compression, bounded-admission backpressure, async-WAL productionization, Aeron Raft transport, binary order entry, ITCH replay, binary/compressed WebSocket payloads only after a measured JSON bottleneck, derivative fields, reserve replenishment/collars, protobuf/Avro, and AON/order-mask conformance cases. |
+| 24 | P3 | Optional archive and replay | open | Persist feed archives to object storage or a PVC with retention/checksums and replay through the same assembler. Archives are data, never desired state in etcd. |
+| 25 | P3 | Operator documentation | open | Metrics, troubleshooting, capacity planning and disaster-recovery runbooks. |
+| 26 | P3 | Module renaming | open | Decide whether to rename mixed-style modules (`src/match_result/` → `match_events/`) before 1.0. Import-breaking, no functional benefit today. |
 
 The `P0`–`P5` phases inside the historical-bar design are implementation phases, not this file's
-P0 defect priority; the historical-bar store (#11 in this queue) is P2 here.
+P0 defect priority; the historical-bar store (#9 in this queue) is P2 here.
 
 ## Caveats and deferral decisions
 
-- **Gateway (#4):** no public gateway is built until TLS/auth and packaging land, a second client
+- **Gateway (#3):** no public gateway is built until TLS/auth and packaging land, a second client
   that cannot use the Rust client appears, or cutover needs automating. The design stays in
   `docs/GATEWAY_ROUTING.md`.
-- **Local-lease semantics (#3, #7):** idempotency keys cover retries; `Place.client_order_id` and
+- **Local-lease semantics (Raft matrix, #6):** idempotency keys cover retries; `Place.client_order_id` and
   `Cancel`/`Amend.client_request_id` share one dedupe namespace, and a follower write returns a typed
   503 with the leader address. Unkeyed mutations must not be blind-retried. `POST /events` consumers
   resume from `(log_index, ordinal)` and dedupe on `event_id`.
-- **Control-plane truth (#1, #5, #24):** desired state stays in CRDs through the API server; never
+- **Control-plane truth (#1, #4, #22):** desired state stays in CRDs through the API server; never
   connect to etcd directly and never put WAL/snapshot/order-book/events/market data in etcd. Use
   Postgres/object storage only for audit, a query/read model or long-term history.
 - **Observability:** the lab stack is intentionally off to save memory requests; restore it before
   starting observability work or relying on alerts/dashboards.
-- **Raft queue (#3, #8):** the design, hooks, invariants and proposed port ranges are in
-  `docs/RAFT_EDGE_CASE_TEST_MATRIX.md`; P0 cases are already closed in History.
 
 ## History
 
+Completed work is summarised here; detailed evidence, measurements and implementation notes remain
+in git history and the linked docs. For the full history, check out `TODO.md` from an earlier commit
+(`git log -- TODO.md`).
+
+- **2026-11-28** — Quorum-loss test flake fixed: the write that verifies recovery was pinned to the
+  first elected survivor, which could step down before the write landed and return `NoLeader`. It
+  now goes through a member-aware client across nodes 2 and 3. Six full-suite runs (two default, four
+  with `MATCHENGINE_TEST_TIMEOUT_SCALE=2`) pass with 106 cluster tests.
 - **2026-11-28** — Interrupted-membership test flake fixed: after killing the leader it pinned the
   first agreeing survivor for `add_learner` and the follow-up write, which could step down before
   those calls and return `NoLeader`. Both now go through a member-aware client. Five full-suite runs
@@ -103,8 +106,6 @@ P0 defect priority; the historical-bar store (#11 in this queue) is P2 here.
   affect each other. The fsync-failure test no longer requires observing a transient 503 (a fast
   recovery legitimately goes straight to ready). Local runs pass with CI settings and with the
   `async-wal` feature; fmt and clippy clean.
-## History
-
 - **2026-11-27** — P2 Raft edge cases E13–E20 from `docs/RAFT_EDGE_CASE_TEST_MATRIX.md` implemented,
   closing all 20 cases. `test_quorum.rs` covers five voters losing quorum and a whole-cluster
   no-fsync restart with different tails; `test_determinism.rs` compares identical event tapes across
@@ -130,11 +131,7 @@ P0 defect priority; the historical-bar store (#11 in this queue) is P2 here.
   writes across a leader kill produce contiguous unique sequences with no duplicates and identical
   tapes; `test_failure.rs` injects an fsync failure at the commit marker and verifies no false ack
   plus a `/ready` gate until recovery. All hooks are debug-only/inert by default. Engine suite: 236
-  lib + 98 cluster tests, fmt and clippy pass. E13–E20 remain open.
-
-Completed work is summarised here; detailed evidence, measurements and implementation notes remain
-in git history and the linked docs. For the full history, check out `TODO.md` from an earlier commit
-(`git log -- TODO.md`).
+  lib + 98 cluster tests, fmt and clippy pass. E13–E20 were completed the same day (see above).
 
 - **2026-11-26** — Stop and GTD index refactor (#21) shipped. Parked stops moved from a scanned
   `Vec` to a sequence-keyed `BTreeMap` with a trigger-ordered index and an elected set; election

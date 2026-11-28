@@ -265,7 +265,7 @@ fn quorum_loss_rejects_writes_and_recovers_without_divergence() {
             // election completes, so require both live nodes to agree on a
             // leader that is actually one of them.
             let deadline = Instant::now() + crate::common::wait_secs(20);
-            let new_leader = loop {
+            loop {
                 let mut leaders = Vec::new();
                 for client in &live {
                     if let Ok(metrics) = client.metrics().await {
@@ -277,21 +277,32 @@ fn quorum_loss_rejects_writes_and_recovers_without_divergence() {
                     && leaders[0] == leaders[1]
                     && (leaders[0] == Some(2) || leaders[0] == Some(3))
                 {
-                    break leaders[0].unwrap();
+                    break;
                 }
                 assert!(
                     Instant::now() <= deadline,
                     "no live leader after recovery: {leaders:?}"
                 );
                 C::sleep(Duration::from_millis(100)).await;
-            };
+            }
 
             let deadline = Instant::now() + crate::common::wait_secs(20);
             for client in &live {
                 wait_for_sequence(client, "20", deadline).await.unwrap();
             }
-            // A fresh write gets exactly 21 and reaches both live nodes.
-            let leader_client = &live[(new_leader - 2) as usize];
+            // A fresh write gets exactly 21 and reaches both live nodes. The
+            // first elected leader can step down before this write lands, so
+            // follow the current leader through a member-aware client rather
+            // than the id observed by the election loop.
+            let leader_client = MatchEngineClient::<C>::with_members(
+                vec![(2, ADDR2.to_string()), (3, ADDR3.to_string())],
+                ClientConfig {
+                    timeout: Duration::from_millis(1_000),
+                    max_retries: 2,
+                    max_forward_retries: 6,
+                    ..Default::default()
+                },
+            );
             let response = leader_client
                 .write(&MatchEngineRequest::place(Order::new(
                     OrderSide::Buy,

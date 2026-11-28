@@ -221,7 +221,7 @@ manifests, event data or engine payloads in CRs.
 
 ### Backup and restore
 
-`backup` writes one self-verifying bundle: `catalog.json` (all seven CRDs), `backup.json`
+`backup` writes one self-verifying bundle: `catalog.json` (all eight CRDs), `backup.json`
 (snapshot names, per-file SHA-256 checksums, restore tests), `SHA256SUMS`, and an optional
 externally produced etcd snapshot. It creates a CSI `VolumeGroupSnapshot`, or one `VolumeSnapshot`
 per PVC with `--mode volume`, then restores each snapshot into a temporary PVC and hashes every
@@ -295,7 +295,7 @@ for installation and the HPA scale verification.
 
 ## ☸️ Cell operator
 
-`match-operator` is the Lease-elected reconciler for a cell. It watches the seven CRDs, renders
+`match-operator` is the Lease-elected reconciler for a cell. It watches the eight CRDs, renders
 each shard with the same deterministic renderer as the manager, and reconciles the result:
 
 - **Lease election** — `coordination.k8s.io/v1` Lease, default

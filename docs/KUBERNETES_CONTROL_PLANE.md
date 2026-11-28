@@ -1264,7 +1264,7 @@ status:
 ```
 
 The reference CLI writes a self-verifying bundle instead of relying on the `Backup` object alone:
-`catalog.json` (all seven CRD kinds), `backup.json` (snapshot names, per-PVC/process checksums and
+`catalog.json` (all eight CRD kinds), `backup.json` (snapshot names, per-PVC/process checksums and
 restore tests), `SHA256SUMS` and an optional externally produced etcd snapshot. `backup` creates
 one `VolumeGroupSnapshot` (or one `VolumeSnapshot` per PVC), restores each snapshot into a
 temporary PVC, hashes every file and records the result. `backup-verify` checks the bundle, and
@@ -1272,7 +1272,7 @@ temporary PVC, hashes every file and records the result. `backup-verify` checks 
 Snapshots are crash-consistent; the CLI does not quiesce writes, so drain the gateway route first
 when a quiesced point is required.
 
-The desired-state catalog lives in the seven CRDs (etcd via the API server). Postgres stores
+The desired-state catalog lives in the eight CRDs (etcd via the API server). Postgres stores
 approvals, audit events and read-model caches; it is not a second desired-state source of truth.
 
 ### 6.6 Status conditions
