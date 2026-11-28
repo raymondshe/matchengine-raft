@@ -83,6 +83,17 @@ P0 defect priority; the historical-bar store (#11 in this queue) is P2 here.
 
 ## History
 
+- **2026-11-28** — Interrupted-membership test flake fixed: after killing the leader it pinned the
+  first agreeing survivor for `add_learner` and the follow-up write, which could step down before
+  those calls and return `NoLeader`. Both now go through a member-aware client. Five full-suite runs
+  (three default, two with `MATCHENGINE_TEST_TIMEOUT_SCALE=2`) pass with 106 cluster tests.
+- **2026-11-28** — `test_partition::restarted_former_leader_with_stale_log_cannot_disrupt_quorum`
+  flaked on CI with `NoLeader`: after killing the leader it pinned the first agreeing survivor id,
+  which stepped down before the next write burst. The test now waits for a *stable* leader (two
+  agreeing samples 500 ms apart), performs post-failover writes through a member-aware client that
+  follows the current leader, and re-confirms the leader before capturing the term used by the
+  PreVote proof. All final writes also use the member-aware client. Three consecutive CI-setting
+  full-suite runs pass (106 cluster tests).
 - **2026-11-28** — CI cluster-test flakes fixed. GitHub runners are ~2.5x slower than a dev laptop;
   short fixed deadlines failed on five tests (including the supervisor's `children did not start`).
   Cluster wait deadlines now go through `common::wait_secs`, scaled only in CI by

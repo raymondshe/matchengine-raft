@@ -18,6 +18,7 @@ use matchengine_raft::MatchEngineNode;
 use matchengine_raft::MatchEngineTypeConfig;
 use matchengine_raft::StorageConfig;
 use matchengine_raft::build_match_engine_node;
+use matchengine_raft::client::ClientConfig;
 use matchengine_raft::client::MatchEngineClient;
 use matchengine_raft::default_raft_config;
 use matchengine_raft::match_result::MatchEvent;
@@ -80,6 +81,35 @@ async fn wait_for_leader(
             anyhow::bail!("no leader elected (excluded {exclude:?})");
         }
         C::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Waits for all given nodes to report the same, live leader in two samples
+/// separated by half a second. A single agreeing sample is not enough: the
+/// first post-failover leader can step down before the next write.
+async fn wait_for_stable_leader(
+    clients: &[MatchEngineClient<C>],
+    allowed: std::ops::RangeInclusive<u64>,
+    deadline: Instant,
+) -> anyhow::Result<u64> {
+    let mut previous = None;
+    loop {
+        let mut leaders = Vec::new();
+        for client in clients {
+            if let Ok(metrics) = client.metrics().await {
+                leaders.push(metrics.current_leader);
+            }
+        }
+        let agreed = leaders.len() == clients.len()
+            && leaders.iter().all(|leader| *leader == leaders[0])
+            && leaders[0].is_some_and(|id| allowed.contains(&id));
+        let leader = leaders[0].unwrap_or(0);
+        if agreed && previous == Some(leader) {
+            return Ok(leader);
+        }
+        previous = agreed.then_some(leader);
+        anyhow::ensure!(Instant::now() <= deadline, "no stable leader: {leaders:?}");
+        C::sleep(Duration::from_millis(500)).await;
     }
 }
 
@@ -198,35 +228,51 @@ fn restarted_former_leader_with_stale_log_cannot_disrupt_quorum() {
             // Survivors can keep reporting the stale leader id 1 for a while;
             // require all three to agree on a leader that is actually alive.
             let deadline = Instant::now() + crate::common::wait_secs(20);
-            let healthy = loop {
-                let mut leaders = Vec::new();
-                for client in majority {
-                    if let Ok(metrics) = client.metrics().await {
-                        leaders.push(metrics.current_leader);
-                    }
-                }
-                if leaders.len() == majority.len()
-                    && leaders[0].is_some()
-                    && leaders[0] == leaders[1]
-                    && leaders[1] == leaders[2]
-                    && (2..=4).contains(&leaders[0].unwrap())
-                {
-                    break leaders[0].unwrap();
-                }
-                assert!(
-                    Instant::now() <= deadline,
-                    "majority did not agree on a live leader: {leaders:?}"
-                );
-                C::sleep(Duration::from_millis(100)).await;
-            };
-            let healthy_client = &clients[(healthy - 1) as usize];
+            wait_for_stable_leader(majority, 2..=4, deadline)
+                .await
+                .unwrap();
+            // The first post-failover leader can step down before these
+            // writes land on a slow runner. Use a member-aware client so the
+            // write follows whichever survivor is leader at that moment,
+            // rather than pinning the id observed by the agreement loop.
+            let survivor_client = MatchEngineClient::<C>::with_members(
+                addrs[1..]
+                    .iter()
+                    .enumerate()
+                    .map(|(i, addr)| (i as u64 + 2, addr.to_string()))
+                    .collect(),
+                ClientConfig {
+                    timeout: Duration::from_millis(1_000),
+                    max_retries: 2,
+                    max_forward_retries: 6,
+                    ..Default::default()
+                },
+            );
             for i in 0..20u64 {
-                place_buy(healthy_client, 90.0 - i as f64 * 0.1).await;
+                survivor_client
+                    .write(&MatchEngineRequest::place(Order::new(
+                        OrderSide::Buy,
+                        90.0 - i as f64 * 0.1,
+                        1.0,
+                        0,
+                    )))
+                    .await
+                    .unwrap()
+                    .unwrap();
             }
             let deadline = Instant::now() + crate::common::wait_secs(15);
             for client in majority {
                 wait_for_sequence(client, "40", deadline).await.unwrap();
             }
+
+            // Re-confirm the leader after the write burst: a second election
+            // between the initial agreement and here would make the term
+            // comparison below meaningless.
+            let deadline = Instant::now() + crate::common::wait_secs(20);
+            let healthy = wait_for_stable_leader(majority, 2..=4, deadline)
+                .await
+                .unwrap();
+            let healthy_client = &clients[(healthy - 1) as usize];
 
             // Capture the term *before* node 1 returns. PreVote means the
             // rejoin must not bump it even though node 1 carries an older vote
@@ -298,8 +344,9 @@ fn restarted_former_leader_with_stale_log_cannot_disrupt_quorum() {
                 assert_eq!(baseline_orders, orders_json(client).await);
             }
 
-            // A new write commits to 41 on every node.
-            let response = healthy_client
+            // A new write commits to 41 on every node. Use the member-aware
+            // client again in case leadership moved during the observation.
+            let response = survivor_client
                 .write(&MatchEngineRequest::place(Order::new(
                     OrderSide::Buy,
                     80.0,

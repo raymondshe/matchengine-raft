@@ -16,6 +16,7 @@ use matchengine_raft::MatchEngineNode;
 use matchengine_raft::MatchEngineTypeConfig;
 use matchengine_raft::StorageConfig;
 use matchengine_raft::build_match_engine_node;
+use matchengine_raft::client::ClientConfig;
 use matchengine_raft::client::MatchEngineClient;
 use matchengine_raft::default_raft_config;
 use matchengine_raft::network::api::EventsRequest;
@@ -412,6 +413,22 @@ fn interrupted_membership_change_converges_to_a_valid_config() {
             let deadline = Instant::now() + crate::common::wait_secs(20);
             let new_leader = wait_for_leader(survivors, Some(1), deadline).await.unwrap();
             let leader_client = &clients[(new_leader - 1) as usize];
+            // The first post-kill leader can step down during the membership
+            // poll and later writes. Keep a member-aware handle for actions
+            // that must reach whichever survivor is leader at that moment.
+            let member_client = MatchEngineClient::<C>::with_members(
+                addrs[1..]
+                    .iter()
+                    .enumerate()
+                    .map(|(i, addr)| (i as u64 + 2, addr.to_string()))
+                    .collect(),
+                ClientConfig {
+                    timeout: Duration::from_millis(1_000),
+                    max_retries: 2,
+                    max_forward_retries: 6,
+                    ..Default::default()
+                },
+            );
             println!("membership change interrupted; new leader {new_leader}");
 
             // Poll until OpenRaft has finalized a single config set: a joint
@@ -437,7 +454,7 @@ fn interrupted_membership_change_converges_to_a_valid_config() {
             // learner. If 4 was already promoted, it must simply not be added
             // as a learner again.
             if voters == BTreeSet::from([1, 2, 3]) {
-                leader_client
+                member_client
                     .add_learner((4, addrs[3].to_string()))
                     .await
                     .unwrap()
@@ -456,7 +473,7 @@ fn interrupted_membership_change_converges_to_a_valid_config() {
 
             // Writes commit after the interrupted change and every live node
             // sees the same sequence and event tape.
-            let response = leader_client
+            let response = member_client
                 .write(&MatchEngineRequest::place(Order::new(
                     OrderSide::Buy,
                     90.0,
