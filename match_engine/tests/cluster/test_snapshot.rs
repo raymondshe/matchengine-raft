@@ -43,7 +43,7 @@ async fn test_grpc_snapshot_install_inner() -> anyhow::Result<()> {
         config.heartbeat_interval = 200;
         config.election_timeout_min = 500;
         config.heartbeat_min_interval = None;
-        config.election_timeout_max = 1_000;
+        config.election_timeout_max = 1000;
         config.snapshot_policy = SnapshotPolicy::LogsSinceLast(10);
         // Purge every log already covered by a snapshot, so a node that joins
         // later cannot be caught up by log replication alone.
@@ -62,7 +62,7 @@ async fn test_grpc_snapshot_install_inner() -> anyhow::Result<()> {
 
     // `init` only appends the initial membership; the first election still has to
     // happen before client writes can be accepted.
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + crate::common::wait_secs(10);
     loop {
         if let Ok(metrics) = client1.metrics().await
             && metrics.current_leader == Some(1)
@@ -89,7 +89,7 @@ async fn test_grpc_snapshot_install_inner() -> anyhow::Result<()> {
     }
 
     // Wait until a snapshot exists and the log it covers has been purged.
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + crate::common::wait_secs(10);
     loop {
         let metrics = client1.metrics().await?;
         let snapshot = metrics.snapshot.map(|log_id| log_id.index);
@@ -116,7 +116,7 @@ async fn test_grpc_snapshot_install_inner() -> anyhow::Result<()> {
     client1.add_learner((2, addr2.to_string())).await??;
 
     let client2 = MatchEngineClient::<MatchEngineTypeConfig>::new(2, addr2.to_string());
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + crate::common::wait_secs(10);
     loop {
         if let Ok(value) = client2.read(&"orderbook_sequence".to_string()).await
             && value == "30"
@@ -208,7 +208,7 @@ async fn test_periodic_snapshot_timer_inner() -> anyhow::Result<()> {
 
     let client = MatchEngineClient::<MatchEngineTypeConfig>::new(1, addr.to_string());
     client.init().await??;
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + crate::common::wait_secs(10);
     loop {
         if let Ok(metrics) = client.metrics().await
             && metrics.current_leader == Some(1)
@@ -232,7 +232,7 @@ async fn test_periodic_snapshot_timer_inner() -> anyhow::Result<()> {
             .await??;
     }
 
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + crate::common::wait_secs(10);
     loop {
         let metrics = client.metrics().await?;
         if metrics.snapshot.map(|id| id.index).unwrap_or(0) >= 5 {
@@ -271,7 +271,7 @@ fn cursor_config() -> openraft::Config {
     let mut config = default_raft_config();
     config.heartbeat_interval = 200;
     config.election_timeout_min = 500;
-    config.election_timeout_max = 1_000;
+    config.election_timeout_max = 1000;
     config.heartbeat_min_interval = None;
     config.snapshot_policy = SnapshotPolicy::LogsSinceLast(10);
     config.max_in_snapshot_log_to_keep = 0;
@@ -312,7 +312,7 @@ fn snapshot_install_preserves_a_followers_event_cursor_contract() {
 
         let result = std::panic::AssertUnwindSafe(async {
             clients[0].init().await.unwrap().unwrap();
-            let deadline = Instant::now() + Duration::from_secs(20);
+            let deadline = Instant::now() + crate::common::wait_secs(20);
             wait_for_leader_id(&clients[0], 1, deadline).await;
             clients[0]
                 .add_learner((2, CURSOR_ADDRS[1].to_string()))
@@ -546,7 +546,7 @@ fn cancelled_snapshot_install_removes_staging_and_retry_succeeds() {
 
         let result = std::panic::AssertUnwindSafe(async {
             client.init().await.unwrap().unwrap();
-            let deadline = Instant::now() + Duration::from_secs(30);
+            let deadline = Instant::now() + crate::common::wait_secs(30);
             wait_for_leader_id(&client, 1, deadline).await;
             println!(
                 "snapshot-cancel: leader elected after {:?}",
@@ -670,7 +670,7 @@ fn cancelled_snapshot_install_removes_staging_and_retry_succeeds() {
             let learner_storage =
                 StorageConfig::new(temp.path()).with_instance_prefix(learner_prefix);
             let snap_dir = learner_storage.snapshot_dir(2);
-            let cleanup_deadline = Instant::now() + Duration::from_secs(10);
+            let cleanup_deadline = Instant::now() + crate::common::wait_secs(10);
             loop {
                 let leftovers: Vec<_> = std::fs::read_dir(&snap_dir)
                     .unwrap()
@@ -815,7 +815,7 @@ async fn wait_for_sequence_snapshot(
 
 async fn wait_for_health_snapshot(url: &str) {
     let http = reqwest::Client::builder().no_proxy().build().unwrap();
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + crate::common::wait_secs(15);
     loop {
         if let Ok(response) = http.get(url).send().await
             && response.status().is_success()

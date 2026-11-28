@@ -20,6 +20,11 @@ jobs:
       - name: Clippy
         run: cargo clippy --manifest-path match_engine/Cargo.toml --all-targets -- -D warnings
       - name: Test
+        # GitHub runners are slower than dev machines. Relax the cluster
+        # tests' wait deadlines; the scale factor is a test-only helper and
+        # does not change production behavior.
+        env:
+          MATCHENGINE_TEST_TIMEOUT_SCALE: "2"
         run: cargo test --manifest-path match_engine/Cargo.toml
       - name: Demo format
         run: cargo fmt --manifest-path order_system/Cargo.toml -- --check

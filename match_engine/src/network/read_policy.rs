@@ -40,6 +40,12 @@ pub const READ_POLICY_ENV: &str = "MATCHENGINE_READ_POLICY";
 /// nodes. Release builds do not contain this field and never read the variable.
 #[cfg(debug_assertions)]
 pub const TEST_LEASE_SKEW_ENV: &str = "MATCHENGINE_TEST_LEASE_SKEW_MS";
+/// Debug-only target filter: when set, the skew hook applies only to nodes
+/// whose HTTP address contains this substring. Tests run in one process, so
+/// without this filter a skew-setting test could affect every other cluster
+/// test running in parallel.
+#[cfg(debug_assertions)]
+pub const TEST_LEASE_SKEW_TARGET_ENV: &str = "MATCHENGINE_TEST_LEASE_SKEW_TARGET";
 
 /// Read policy for leader-consistent reads.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -211,11 +217,24 @@ impl ReadPolicyRuntime {
             mode,
             metrics: Arc::new(ReadPolicyMetrics::default()),
             #[cfg(debug_assertions)]
-            test_lease_skew_ms: std::env::var(TEST_LEASE_SKEW_ENV)
+            test_lease_skew_ms: 0,
+        }
+    }
+
+    /// Debug-only: scopes the clock-skew hook to one node's HTTP address so
+    /// parallel cluster tests cannot affect each other.
+    #[cfg(debug_assertions)]
+    pub fn with_test_addr(mut self, addr: &str) -> Self {
+        let targeted = std::env::var(TEST_LEASE_SKEW_TARGET_ENV)
+            .map(|target| !target.is_empty() && addr.contains(&target))
+            .unwrap_or(true);
+        if targeted {
+            self.test_lease_skew_ms = std::env::var(TEST_LEASE_SKEW_ENV)
                 .ok()
                 .and_then(|value| value.parse().ok())
-                .unwrap_or(0),
+                .unwrap_or(0);
         }
+        self
     }
 
     /// The configured mode.

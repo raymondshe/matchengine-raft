@@ -56,7 +56,7 @@ pub fn log_panic(panic: &PanicHookInfo) {
 /// Waits until the node reports ready, which includes Raft recovery.
 async fn wait_ready(addr: &str) -> anyhow::Result<()> {
     let http = reqwest::Client::builder().no_proxy().build()?;
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + crate::common::wait_secs(15);
 
     loop {
         if let Ok(response) = http.get(format!("http://{addr}/ready")).send().await
@@ -117,7 +117,7 @@ async fn test_cluster_inner() -> anyhow::Result<()> {
     config.heartbeat_interval = 200;
     config.election_timeout_min = 500;
     config.heartbeat_min_interval = None;
-    config.election_timeout_max = 1_000;
+    config.election_timeout_max = 1000;
 
     let mut nodes: Vec<Option<MatchEngineNode>> = Vec::new();
     for id in 1..=3u64 {
@@ -290,7 +290,7 @@ async fn test_cluster_inner() -> anyhow::Result<()> {
         println!("=== change-membership to 3, ");
         client.change_membership(&btreeset! {3}).await??;
 
-        let deadline = Instant::now() + Duration::from_secs(15);
+        let deadline = Instant::now() + crate::common::wait_secs(15);
         loop {
             let metrics = client3.metrics().await?;
             if metrics.membership_config.membership().get_joint_config() == &vec![btreeset![3]] {
@@ -314,7 +314,7 @@ async fn test_cluster_inner() -> anyhow::Result<()> {
 
         // The shrunk single-node cluster still has to elect node 3 before it
         // can accept a write.
-        let deadline = Instant::now() + Duration::from_secs(15);
+        let deadline = Instant::now() + crate::common::wait_secs(15);
         loop {
             let metrics = client3.metrics().await?;
             if metrics.current_leader == Some(3) {

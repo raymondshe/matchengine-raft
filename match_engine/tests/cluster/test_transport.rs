@@ -97,7 +97,7 @@ fn test_config() -> Config {
     let mut config = default_raft_config();
     config.heartbeat_interval = 200;
     config.election_timeout_min = 500;
-    config.election_timeout_max = 1_000;
+    config.election_timeout_max = 1000;
     config.heartbeat_min_interval = None;
     config.snapshot_policy = SnapshotPolicy::Never;
     config
@@ -226,7 +226,7 @@ fn grpc_statuses_map_to_raft_errors_and_recover() {
 
         let result = std::panic::AssertUnwindSafe(async {
             clients[0].init().await.unwrap().unwrap();
-            let deadline = Instant::now() + Duration::from_secs(15);
+            let deadline = Instant::now() + crate::common::wait_secs(15);
             let leader = wait_for_leader(&clients, deadline).await?;
             assert_eq!(1, leader, "the initialized node should lead");
             for id in 2..=3u64 {
@@ -255,7 +255,7 @@ fn grpc_statuses_map_to_raft_errors_and_recover() {
                     .unwrap()
                     .unwrap();
             }
-            let deadline = Instant::now() + Duration::from_secs(10);
+            let deadline = Instant::now() + crate::common::wait_secs(10);
             for client in &clients {
                 wait_for_sequence(client, 10, deadline).await?;
             }
@@ -291,7 +291,7 @@ fn grpc_statuses_map_to_raft_errors_and_recover() {
                 wait_for_sequence(
                     healthy_client,
                     expected,
-                    Instant::now() + Duration::from_secs(6),
+                    Instant::now() + crate::common::wait_secs(6),
                 )
                 .await?;
                 // Hold the hook while the healthy follower advances so a
@@ -346,7 +346,7 @@ fn grpc_statuses_map_to_raft_errors_and_recover() {
                 );
 
                 env.clear();
-                let deadline = Instant::now() + Duration::from_secs(12);
+                let deadline = Instant::now() + crate::common::wait_secs(12);
                 for client in &clients {
                     wait_for_sequence(client, expected, deadline).await?;
                 }

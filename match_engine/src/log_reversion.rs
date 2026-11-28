@@ -59,6 +59,10 @@ const MAX_SAMPLE_INTERVAL_MS: u64 = 60_000;
 /// behavior exactly.
 const DEFAULT_REQUIRED_SAMPLES: u8 = 2;
 const REQUIRED_SAMPLES_ENV: &str = "MATCHENGINE_REVERSION_REQUIRED_SAMPLES";
+/// Debug-only target filter for the overrides above. Cluster tests share one
+/// process; without a filter a fast-sampling test could arm spurious resets on
+/// leaders belonging to other tests running in parallel.
+const REVERSION_TARGET_ENV: &str = "MATCHENGINE_REVERSION_TARGET";
 const MIN_REQUIRED_SAMPLES: u8 = 1;
 const MAX_REQUIRED_SAMPLES: u8 = 10;
 
@@ -127,11 +131,23 @@ fn next_count(previous: Option<(u8, Observation)>, current: Observation) -> (u8,
 pub(crate) fn spawn(
     raft: MatchEngineRaft,
     node_id: MatchEngineNodeId,
+    http_addr: &str,
     client: reqwest::Client,
 ) -> JoinHandle<()> {
-    // Captured before the task is spawned: see the env-var docs above.
-    let sample_interval = sample_interval();
-    let required_samples = required_samples();
+    // Captured before the task is spawned: see the env-var docs above. The
+    // target filter keeps a test's fast settings away from other watchers.
+    // The address is the one this node was built with (membership is not yet
+    // initialized here).
+    let http_addr = http_addr.to_string();
+    let targeted = std::env::var(REVERSION_TARGET_ENV)
+        .map(|target| target.is_empty() || http_addr.contains(&target))
+        .unwrap_or(true);
+    let sample_interval = if targeted {
+        sample_interval()
+    } else {
+        Duration::from_secs(5)
+    };
+    let required_samples = if targeted { required_samples() } else { 2 };
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(sample_interval);
         let tick = &mut tick;

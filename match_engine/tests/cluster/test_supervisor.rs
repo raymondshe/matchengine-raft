@@ -186,19 +186,25 @@ async fn changing_market_data_restarts_only_the_affected_child() {
 
     let mut supervisor = start_supervisor(&dir, &config, &engine, addr, &[]).await;
     let client = Client::builder()
-        .timeout(Duration::from_secs(2))
+        .timeout(crate::common::wait_secs(2))
         .build()
         .unwrap();
     assert!(
-        wait_for(&client, addr, &["alpha", "beta"], Duration::from_secs(10)).await,
+        wait_for(
+            &client,
+            addr,
+            &["alpha", "beta"],
+            crate::common::wait_secs(10)
+        )
+        .await,
         "children did not start"
     );
     assert!(
-        wait_for_file(&dir.join("alpha.pid"), Duration::from_secs(5)).await,
+        wait_for_file(&dir.join("alpha.pid"), crate::common::wait_secs(5)).await,
         "alpha did not write its pid"
     );
     assert!(
-        wait_for_file(&dir.join("beta.pid"), Duration::from_secs(5)).await,
+        wait_for_file(&dir.join("beta.pid"), crate::common::wait_secs(5)).await,
         "beta did not write its pid"
     );
     let alpha_before = read_pid(&dir.join("alpha.pid")).expect("alpha pid");
@@ -227,7 +233,7 @@ async fn changing_market_data_restarts_only_the_affected_child() {
             break current;
         }
         assert!(
-            start.elapsed() < Duration::from_secs(10),
+            start.elapsed() < crate::common::wait_secs(10),
             "alpha did not restart after its market-data configuration changed"
         );
         sleep(Duration::from_millis(100)).await;
@@ -247,7 +253,7 @@ async fn changing_market_data_restarts_only_the_affected_child() {
     unsafe {
         libc::kill(supervisor.id().unwrap() as i32, libc::SIGTERM);
     }
-    let _ = tokio::time::timeout(Duration::from_secs(10), supervisor.wait()).await;
+    let _ = tokio::time::timeout(crate::common::wait_secs(10), supervisor.wait()).await;
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -261,7 +267,7 @@ async fn adding_a_process_does_not_restart_existing_children() {
 
     let mut supervisor = start_supervisor(&dir, &config, &engine, SUPERVISOR_ADDR, &[]).await;
     let client = Client::builder()
-        .timeout(Duration::from_secs(2))
+        .timeout(crate::common::wait_secs(2))
         .build()
         .unwrap();
 
@@ -270,13 +276,13 @@ async fn adding_a_process_does_not_restart_existing_children() {
             &client,
             SUPERVISOR_ADDR,
             &["alpha"],
-            Duration::from_secs(10)
+            crate::common::wait_secs(10)
         )
         .await,
         "alpha did not start"
     );
     assert!(
-        wait_for_file(&dir.join("alpha.pid"), Duration::from_secs(5)).await,
+        wait_for_file(&dir.join("alpha.pid"), crate::common::wait_secs(5)).await,
         "alpha did not write its pid"
     );
     let alpha_pid = std::fs::read_to_string(dir.join("alpha.pid")).expect("alpha pid");
@@ -288,13 +294,13 @@ async fn adding_a_process_does_not_restart_existing_children() {
             &client,
             SUPERVISOR_ADDR,
             &["alpha", "beta"],
-            Duration::from_secs(10)
+            crate::common::wait_secs(10)
         )
         .await,
         "beta did not start"
     );
     assert!(
-        wait_for_file(&dir.join("beta.pid"), Duration::from_secs(5)).await,
+        wait_for_file(&dir.join("beta.pid"), crate::common::wait_secs(5)).await,
         "beta did not write its pid"
     );
     let alpha_after = std::fs::read_to_string(dir.join("alpha.pid"))
@@ -315,7 +321,13 @@ async fn adding_a_process_does_not_restart_existing_children() {
 
     write_processes(&config, &[("beta", 39102)]);
     assert!(
-        wait_for(&client, SUPERVISOR_ADDR, &["beta"], Duration::from_secs(10)).await,
+        wait_for(
+            &client,
+            SUPERVISOR_ADDR,
+            &["beta"],
+            crate::common::wait_secs(10)
+        )
+        .await,
         "alpha was not removed"
     );
     let beta_after = std::fs::read_to_string(dir.join("beta.pid"))
@@ -336,7 +348,7 @@ async fn adding_a_process_does_not_restart_existing_children() {
     unsafe {
         libc::kill(supervisor.id().unwrap() as i32, libc::SIGTERM);
     }
-    let _ = tokio::time::timeout(Duration::from_secs(10), supervisor.wait()).await;
+    let _ = tokio::time::timeout(crate::common::wait_secs(10), supervisor.wait()).await;
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -396,12 +408,12 @@ async fn max_processes_rejects_excess_children() {
     )
     .await;
     let client = Client::builder()
-        .timeout(Duration::from_secs(2))
+        .timeout(crate::common::wait_secs(2))
         .build()
         .unwrap();
 
     assert!(
-        wait_for(&client, ADDR, &["alpha"], Duration::from_secs(10)).await,
+        wait_for(&client, ADDR, &["alpha"], crate::common::wait_secs(10)).await,
         "alpha did not start"
     );
     sleep(Duration::from_millis(300)).await;
@@ -425,7 +437,7 @@ async fn max_processes_rejects_excess_children() {
     unsafe {
         libc::kill(supervisor.id().unwrap() as i32, libc::SIGTERM);
     }
-    let _ = tokio::time::timeout(Duration::from_secs(10), supervisor.wait()).await;
+    let _ = tokio::time::timeout(crate::common::wait_secs(10), supervisor.wait()).await;
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -454,16 +466,16 @@ async fn crashed_child_restarts_with_a_backoff_count() {
     )
     .await;
     let client = Client::builder()
-        .timeout(Duration::from_secs(2))
+        .timeout(crate::common::wait_secs(2))
         .build()
         .unwrap();
 
     assert!(
-        wait_for(&client, ADDR, &["alpha"], Duration::from_secs(10)).await,
+        wait_for(&client, ADDR, &["alpha"], crate::common::wait_secs(10)).await,
         "alpha did not start"
     );
     assert!(
-        wait_for_file(&dir.join("alpha.pid"), Duration::from_secs(5)).await,
+        wait_for_file(&dir.join("alpha.pid"), crate::common::wait_secs(5)).await,
         "alpha did not write its pid"
     );
     let old_pid = read_pid(&dir.join("alpha.pid")).expect("alpha pid");
@@ -475,7 +487,7 @@ async fn crashed_child_restarts_with_a_backoff_count() {
         ADDR,
         "alpha",
         old_pid as u32,
-        Duration::from_secs(10),
+        crate::common::wait_secs(10),
     )
     .await
     .expect("alpha did not restart");
@@ -485,7 +497,7 @@ async fn crashed_child_restarts_with_a_backoff_count() {
     unsafe {
         libc::kill(supervisor.id().unwrap() as i32, libc::SIGTERM);
     }
-    let _ = tokio::time::timeout(Duration::from_secs(10), supervisor.wait()).await;
+    let _ = tokio::time::timeout(crate::common::wait_secs(10), supervisor.wait()).await;
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -502,15 +514,21 @@ async fn startup_stops_orphans_from_a_killed_supervisor() {
 
     let mut first = start_supervisor(&dir, &config, &engine, FIRST_ADDR, &extra).await;
     let client = Client::builder()
-        .timeout(Duration::from_secs(2))
+        .timeout(crate::common::wait_secs(2))
         .build()
         .unwrap();
     assert!(
-        wait_for(&client, FIRST_ADDR, &["alpha"], Duration::from_secs(10)).await,
+        wait_for(
+            &client,
+            FIRST_ADDR,
+            &["alpha"],
+            crate::common::wait_secs(10)
+        )
+        .await,
         "alpha did not start"
     );
     assert!(
-        wait_for_file(&dir.join("alpha.pid"), Duration::from_secs(5)).await,
+        wait_for_file(&dir.join("alpha.pid"), crate::common::wait_secs(5)).await,
         "alpha did not write its pid"
     );
     let orphan_pid = read_pid(&dir.join("alpha.pid")).expect("alpha pid");
@@ -518,7 +536,7 @@ async fn startup_stops_orphans_from_a_killed_supervisor() {
     unsafe {
         libc::kill(first.id().unwrap() as i32, libc::SIGKILL);
     }
-    let _ = tokio::time::timeout(Duration::from_secs(10), first.wait()).await;
+    let _ = tokio::time::timeout(crate::common::wait_secs(10), first.wait()).await;
     assert!(
         process_alive(orphan_pid),
         "the child should outlive a SIGKILLed supervisor"
@@ -548,6 +566,6 @@ async fn startup_stops_orphans_from_a_killed_supervisor() {
     unsafe {
         libc::kill(second.id().unwrap() as i32, libc::SIGTERM);
     }
-    let _ = tokio::time::timeout(Duration::from_secs(10), second.wait()).await;
+    let _ = tokio::time::timeout(crate::common::wait_secs(10), second.wait()).await;
     let _ = std::fs::remove_dir_all(dir);
 }

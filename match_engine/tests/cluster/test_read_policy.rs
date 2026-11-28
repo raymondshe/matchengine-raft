@@ -16,6 +16,8 @@ use matchengine_raft::network::read_policy::ReadPolicyMode;
 use matchengine_raft::network::read_policy::ReadPolicyStatus;
 #[cfg(debug_assertions)]
 use matchengine_raft::network::read_policy::TEST_LEASE_SKEW_ENV;
+#[cfg(debug_assertions)]
+use matchengine_raft::network::read_policy::TEST_LEASE_SKEW_TARGET_ENV;
 use matchengine_raft::order_book::Order;
 use matchengine_raft::order_book::OrderSide;
 use matchengine_raft::store::MatchEngineRequest;
@@ -194,7 +196,7 @@ async fn run_policy_case(
 }
 
 async fn wait_for_leader(client: &MatchEngineClient<C>) {
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + crate::common::wait_secs(15);
     loop {
         if let Ok(metrics) = client.metrics().await
             && metrics.current_leader == Some(1)
@@ -215,7 +217,7 @@ fn stale_lease_falls_back_to_read_index() {
         // The skew hook is sampled by `ReadPolicyRuntime::new` while each node
         // is built. Install it only for these builds and restore immediately so
         // concurrently running tests never observe it.
-        let skew = LeaseSkewEnv::install("1000");
+        let skew = LeaseSkewEnv::install("1000", &STALE_LEASE_ADDRS[0].http());
         let temp = TempDir::new("stale-lease");
         let storage = StorageConfig::new(temp.path())
             .with_instance_prefix("stale-lease")
@@ -243,7 +245,7 @@ fn stale_lease_falls_back_to_read_index() {
 
         let result = std::panic::AssertUnwindSafe(async {
             clients[0].init().await.unwrap().unwrap();
-            let deadline = Instant::now() + Duration::from_secs(15);
+            let deadline = Instant::now() + crate::common::wait_secs(15);
             loop {
                 if let Ok(metrics) = clients[0].metrics().await
                     && metrics.current_leader == Some(1)
@@ -379,19 +381,24 @@ async fn wait_for_sequence(client: &MatchEngineClient<C>, expected: &str, deadli
 /// Restores `MATCHENGINE_TEST_LEASE_SKEW_MS` on drop so a panic cannot leave a
 /// process-wide hook armed for other tests.
 #[cfg(debug_assertions)]
-struct LeaseSkewEnv(Option<OsString>);
+struct LeaseSkewEnv(Option<OsString>, Option<OsString>);
 
 #[cfg(debug_assertions)]
 impl LeaseSkewEnv {
-    fn install(value: &str) -> Self {
-        let previous = std::env::var_os(TEST_LEASE_SKEW_ENV);
+    fn install(value: &str, target_addr: &str) -> Self {
+        let previous = (
+            std::env::var_os(TEST_LEASE_SKEW_ENV),
+            std::env::var_os(TEST_LEASE_SKEW_TARGET_ENV),
+        );
         // SAFETY: edition 2024 marks process-wide env mutation unsafe. The
-        // variable is set only while the test's nodes are built and restored
-        // before any read, so no other test observes a torn state.
+        // variables are set only while the test's nodes are built and restored
+        // immediately afterwards, and the target filter prevents other nodes
+        // created in that window from taking the fallback path.
         unsafe {
             std::env::set_var(TEST_LEASE_SKEW_ENV, value);
+            std::env::set_var(TEST_LEASE_SKEW_TARGET_ENV, target_addr);
         }
-        Self(previous)
+        Self(previous.0, previous.1)
     }
 }
 
@@ -403,6 +410,10 @@ impl Drop for LeaseSkewEnv {
             match self.0.take() {
                 Some(value) => std::env::set_var(TEST_LEASE_SKEW_ENV, value),
                 None => std::env::remove_var(TEST_LEASE_SKEW_ENV),
+            }
+            match self.1.take() {
+                Some(value) => std::env::set_var(TEST_LEASE_SKEW_TARGET_ENV, value),
+                None => std::env::remove_var(TEST_LEASE_SKEW_TARGET_ENV),
             }
         }
     }

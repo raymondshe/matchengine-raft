@@ -88,7 +88,7 @@ fn async_wal_node_commits_and_recovers() {
 }
 
 async fn wait_for_leader(client: &MatchEngineClient<C>) {
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + crate::common::wait_secs(15);
     loop {
         if let Ok(metrics) = client.metrics().await
             && metrics.current_leader == Some(1)
@@ -184,7 +184,7 @@ fn async_wal_pending_tail_is_not_resurrected_and_truncate_flushes_pending() {
         let store =
             LogStore::open_with_fsync_and_async_wal(&dir, Some(Duration::ZERO), true).unwrap();
         store
-            .start_async_wal_worker_with_delay(Duration::from_secs(60))
+            .start_async_wal_worker_with_delay(crate::common::wait_secs(60))
             .unwrap();
         let (tx, mut rx) = C::oneshot();
         let mut writer = store.clone();

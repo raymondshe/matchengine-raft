@@ -83,6 +83,17 @@ P0 defect priority; the historical-bar store (#11 in this queue) is P2 here.
 
 ## History
 
+- **2026-11-28** — CI cluster-test flakes fixed. GitHub runners are ~2.5x slower than a dev laptop;
+  short fixed deadlines failed on five tests (including the supervisor's `children did not start`).
+  Cluster wait deadlines now go through `common::wait_secs`, scaled only in CI by
+  `MATCHENGINE_TEST_TIMEOUT_SCALE=2`; sleeps and Raft election/heartbeat timeouts stay fixed. The
+  two process-wide test hooks without a target filter (`MATCHENGINE_TEST_LEASE_SKEW_MS` and the
+  reversion watcher overrides) gained `_TARGET` HTTP-address filters so parallel tests cannot
+  affect each other. The fsync-failure test no longer requires observing a transient 503 (a fast
+  recovery legitimately goes straight to ready). Local runs pass with CI settings and with the
+  `async-wal` feature; fmt and clippy clean.
+## History
+
 - **2026-11-27** — P2 Raft edge cases E13–E20 from `docs/RAFT_EDGE_CASE_TEST_MATRIX.md` implemented,
   closing all 20 cases. `test_quorum.rs` covers five voters losing quorum and a whole-cluster
   no-fsync restart with different tails; `test_determinism.rs` compares identical event tapes across

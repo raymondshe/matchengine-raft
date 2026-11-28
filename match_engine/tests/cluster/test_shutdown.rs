@@ -36,7 +36,7 @@ async fn sigterm_stops_the_node_promptly() {
         .expect("start engine binary");
 
     let client = reqwest::Client::new();
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + crate::common::wait_secs(20);
     let mut healthy = false;
     while Instant::now() < deadline {
         if let Ok(response) = client
@@ -56,7 +56,7 @@ async fn sigterm_stops_the_node_promptly() {
     let pid = child.id().expect("child pid") as i32;
     assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
     let started = Instant::now();
-    let status = tokio::time::timeout(Duration::from_secs(10), child.wait())
+    let status = tokio::time::timeout(crate::common::wait_secs(10), child.wait())
         .await
         .expect("engine ignored SIGTERM for 10s")
         .expect("wait for engine");
@@ -65,7 +65,7 @@ async fn sigterm_stops_the_node_promptly() {
         "engine exited with {status:?} instead of a clean shutdown"
     );
     assert!(
-        started.elapsed() < Duration::from_secs(10),
+        started.elapsed() < crate::common::wait_secs(10),
         "engine shutdown took {:?}",
         started.elapsed()
     );
@@ -94,7 +94,7 @@ async fn sigterm_drains_promptly_under_sustained_http_load() {
         .expect("start engine binary");
 
     let client = reqwest::Client::new();
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + crate::common::wait_secs(20);
     let mut healthy = false;
     while Instant::now() < deadline {
         if let Ok(response) = client
@@ -144,7 +144,7 @@ async fn sigterm_drains_promptly_under_sustained_http_load() {
     let pid = child.id().expect("child pid") as i32;
     assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
     let started = Instant::now();
-    let status = tokio::time::timeout(Duration::from_secs(8), child.wait())
+    let status = tokio::time::timeout(crate::common::wait_secs(8), child.wait())
         .await
         .expect("engine ignored SIGTERM for 8s under load")
         .expect("wait for engine");
@@ -154,7 +154,7 @@ async fn sigterm_drains_promptly_under_sustained_http_load() {
         "engine exited with {status:?} instead of a clean shutdown"
     );
     assert!(
-        started.elapsed() < Duration::from_secs(8),
+        started.elapsed() < crate::common::wait_secs(8),
         "engine shutdown under load took {:?}",
         started.elapsed()
     );
@@ -197,7 +197,7 @@ async fn shutdown_drains_promptly_in_a_four_voter_cluster_under_load() {
         .collect();
     clients[0].init().await.unwrap().unwrap();
     // Wait for the single-node election before adding learners.
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + crate::common::wait_secs(15);
     loop {
         if clients[0]
             .metrics()
@@ -242,13 +242,13 @@ async fn shutdown_drains_promptly_in_a_four_voter_cluster_under_load() {
 
     let victim = nodes.remove(3);
     let started = Instant::now();
-    tokio::time::timeout(Duration::from_secs(12), victim.shutdown())
+    tokio::time::timeout(crate::common::wait_secs(12), victim.shutdown())
         .await
         .expect("voter shutdown hung for 12s under cluster load")
         .expect("clean shutdown");
     load.abort();
     assert!(
-        started.elapsed() < Duration::from_secs(12),
+        started.elapsed() < crate::common::wait_secs(12),
         "shutdown took {:?}",
         started.elapsed()
     );
@@ -283,7 +283,7 @@ async fn id_offset_changes_the_raft_id_and_data_directory() {
         .expect("start engine binary");
 
     let client = reqwest::Client::new();
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + crate::common::wait_secs(20);
     let mut node_id = None;
     while Instant::now() < deadline {
         if let Ok(response) = client
@@ -307,7 +307,7 @@ async fn id_offset_changes_the_raft_id_and_data_directory() {
 
     let pid = child.id().expect("child pid") as i32;
     assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
-    let status = tokio::time::timeout(Duration::from_secs(10), child.wait())
+    let status = tokio::time::timeout(crate::common::wait_secs(10), child.wait())
         .await
         .expect("engine ignored SIGTERM for 10s")
         .expect("wait for engine");

@@ -150,7 +150,7 @@ fn hostile_requests_are_rejected_before_raft() {
 }
 
 async fn wait_for_leader(client: &MatchEngineClient<C>) {
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + crate::common::wait_secs(15);
     loop {
         if let Ok(metrics) = client.metrics().await
             && metrics.current_leader == Some(1)

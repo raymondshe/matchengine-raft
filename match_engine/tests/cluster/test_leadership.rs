@@ -55,7 +55,7 @@ fn test_config() -> Config {
     let mut config = default_raft_config();
     config.heartbeat_interval = 150;
     config.election_timeout_min = 500;
-    config.election_timeout_max = 1_000;
+    config.election_timeout_max = 1000;
     config.heartbeat_min_interval = None;
     // Keep every entry in the WAL so the whole event tape is comparable.
     config.snapshot_policy = SnapshotPolicy::Never;
@@ -159,7 +159,7 @@ async fn post_action(
 /// The console action refuses a target that is lagging; under load that can
 /// momentarily be true, so retry within a small bound before failing.
 async fn console_transfer(http: &reqwest::Client, base: &str, target: u64) -> anyhow::Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + crate::common::wait_secs(5);
     loop {
         let response =
             post_action(http, base, "transfer-leader", json!({ "target": target })).await;
@@ -205,7 +205,7 @@ fn leader_transfer_under_sustained_write_load() {
         let outcome = AssertUnwindSafe(async {
             let http = reqwest::Client::builder().no_proxy().build()?;
             init_four_voters(&http).await?;
-            let deadline = Instant::now() + Duration::from_secs(15);
+            let deadline = Instant::now() + crate::common::wait_secs(15);
             let mut leader = 0u64;
             loop {
                 for (index, observer) in observers.iter().enumerate() {
@@ -307,7 +307,12 @@ fn leader_transfer_under_sustained_write_load() {
             let target = (1..=4u64).find(|id| *id != leader).unwrap();
             let base = ADDRS[(leader - 1) as usize].http_url();
             console_transfer(&http, &base, target).await?;
-            wait_for_leader(&observers, target, Instant::now() + Duration::from_secs(10)).await?;
+            wait_for_leader(
+                &observers,
+                target,
+                Instant::now() + crate::common::wait_secs(10),
+            )
+            .await?;
             println!("leadership-load: console transfer {leader} -> {target}");
             leader = target;
             current_leader.store(leader, Ordering::Relaxed);
@@ -331,7 +336,7 @@ fn leader_transfer_under_sustained_write_load() {
             wait_for_leader(
                 &observers,
                 direct_target,
-                Instant::now() + Duration::from_secs(10),
+                Instant::now() + crate::common::wait_secs(10),
             )
             .await?;
             println!("leadership-load: direct transfer {leader} -> {direct_target}");
@@ -387,7 +392,7 @@ fn leader_transfer_under_sustained_write_load() {
             // Wait for every replica to apply the last acknowledged sequence.
             let last = *sequences.iter().max().unwrap();
             let expected = (last + 1).to_string();
-            let deadline = Instant::now() + Duration::from_secs(10);
+            let deadline = Instant::now() + crate::common::wait_secs(10);
             for observer in &observers {
                 loop {
                     if let Ok(value) = observer.read(&"orderbook_sequence".to_string()).await

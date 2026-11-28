@@ -73,7 +73,7 @@ fn test_config(snapshot_policy: SnapshotPolicy) -> Config {
 }
 
 async fn wait_for_leader(client: &MatchEngineClient<C>) -> anyhow::Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + crate::common::wait_secs(15);
     loop {
         if let Ok(metrics) = client.metrics().await
             && metrics.current_leader == Some(1)
@@ -235,7 +235,7 @@ fn restart_recovers_from_snapshot() {
         assert_order_state(&client, 33, "33").await.unwrap();
 
         // Wait until a snapshot exists and the log it covers has been purged.
-        let deadline = Instant::now() + Duration::from_secs(15);
+        let deadline = Instant::now() + crate::common::wait_secs(15);
         loop {
             let metrics = client.metrics().await.unwrap();
             let snapshot = metrics.snapshot.map(|log_id| log_id.index);
@@ -350,7 +350,7 @@ fn restart_recovers_large_snapshot() {
         assert_order_state(&client, 2_000, "2000").await.unwrap();
 
         // Wait until a large snapshot exists and its log is purged.
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + crate::common::wait_secs(30);
         loop {
             let metrics = client.metrics().await.unwrap();
             let snapshot = metrics.snapshot.map(|log_id| log_id.index);
@@ -417,7 +417,7 @@ fn restart_loads_snapshot_then_replays_newer_wal_events() {
         }
 
         node.raft.trigger().snapshot().await.unwrap();
-        let deadline = Instant::now() + Duration::from_secs(15);
+        let deadline = Instant::now() + crate::common::wait_secs(15);
         let snapshot_index = loop {
             let metrics = client.metrics().await.unwrap();
             let snapshot = metrics.snapshot.map(|log_id| log_id.index);
@@ -543,7 +543,7 @@ fn event_cursor_resumes_across_snapshot_and_restart() {
             page.events.iter().map(|event| event.event_id).collect();
 
         node.raft.trigger().snapshot().await.unwrap();
-        let deadline = Instant::now() + Duration::from_secs(15);
+        let deadline = Instant::now() + crate::common::wait_secs(15);
         loop {
             let metrics = client.metrics().await.unwrap();
             let snapshot = metrics.snapshot.map(|log_id| log_id.index);
@@ -728,7 +728,7 @@ fn event_cursor_reports_retention_gap_across_restart() {
         let stale_cursor = page.next_after.expect("tail cursor");
 
         node.raft.trigger().snapshot().await.unwrap();
-        let deadline = Instant::now() + Duration::from_secs(15);
+        let deadline = Instant::now() + crate::common::wait_secs(15);
         loop {
             let metrics = client.metrics().await.unwrap();
             let snapshot = metrics.snapshot.map(|log_id| log_id.index);

@@ -186,7 +186,7 @@ fn maker_and_taker_fees_survive_events_feed_and_snapshot_restart() {
 }
 
 async fn wait_for_leader(client: &MatchEngineClient<C>) {
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + crate::common::wait_secs(15);
     loop {
         if let Ok(metrics) = client.metrics().await
             && metrics.current_leader == Some(1)
@@ -199,7 +199,7 @@ async fn wait_for_leader(client: &MatchEngineClient<C>) {
 }
 
 async fn wait_for_publishing(client: &MatchEngineClient<C>) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + crate::common::wait_secs(10);
     loop {
         let status = client.read(&"marketdata_status".to_string()).await.unwrap();
         if let Ok(status) = serde_json::from_str::<serde_json::Value>(&status)
@@ -227,7 +227,7 @@ async fn wait_for_file(
     path: &Path,
     ready: impl Fn(&[serde_json::Value]) -> bool,
 ) -> Vec<serde_json::Value> {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + crate::common::wait_secs(10);
     loop {
         let events = read_jsonl(path);
         if ready(&events) {

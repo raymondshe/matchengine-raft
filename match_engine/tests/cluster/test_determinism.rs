@@ -62,7 +62,7 @@ fn config(snapshot: &SnapshotPolicy) -> Config {
     let mut config = default_raft_config();
     config.heartbeat_interval = 150;
     config.election_timeout_min = 500;
-    config.election_timeout_max = 1_000;
+    config.election_timeout_max = 1000;
     config.heartbeat_min_interval = None;
     config.snapshot_policy = snapshot.clone();
     config.max_in_snapshot_log_to_keep = 0;
@@ -133,7 +133,7 @@ fn load_client(addrs: &[TestAddr]) -> MatchEngineClient<C> {
 
 async fn init_cluster(cluster: &Cluster, addrs: &[TestAddr]) -> anyhow::Result<u64> {
     cluster.clients[0].init().await??;
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + crate::common::wait_secs(15);
     let leader = leader_among(&cluster.clients, &[1, 2, 3], deadline).await?;
     anyhow::ensure!(
         leader == 1,
@@ -421,7 +421,7 @@ fn truncate_last_wal_entry(log_dir: &Path) -> (u64, u64) {
 }
 
 async fn wait_snapshot_purge(cluster: &Cluster, leader: u64) -> anyhow::Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + crate::common::wait_secs(15);
     loop {
         let metrics = cluster.clients[(leader - 1) as usize].metrics().await?;
         if let (Some(snapshot), Some(purged)) = (metrics.snapshot, metrics.purged)
@@ -455,7 +455,7 @@ fn identical_order_stream_yields_identical_event_tapes_after_failover_snapshot_a
             start_cluster("determinism-b", &ADDR_B, SnapshotPolicy::LogsSinceLast(10)).await;
 
         let outcome = std::panic::AssertUnwindSafe(async {
-            let deadline = Instant::now() + Duration::from_secs(20);
+            let deadline = Instant::now() + crate::common::wait_secs(20);
             let leader_a = init_cluster(&cluster_a, &ADDR_A).await?;
             let leader_b = init_cluster(&cluster_b, &ADDR_B).await?;
             let writer_a = load_client(&ADDR_A);
@@ -592,7 +592,7 @@ fn day_close_across_a_leadership_transfer_expires_once_everywhere() {
         let mut cluster = start_cluster("day-transfer", &ADDR_DAY, SnapshotPolicy::Never).await;
 
         let outcome = std::panic::AssertUnwindSafe(async {
-            let deadline = Instant::now() + Duration::from_secs(20);
+            let deadline = Instant::now() + crate::common::wait_secs(20);
             let leader = init_cluster(&cluster, &ADDR_DAY).await?;
             let writer = load_client(&ADDR_DAY);
 

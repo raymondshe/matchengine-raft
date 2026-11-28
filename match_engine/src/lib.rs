@@ -761,7 +761,12 @@ pub async fn build_match_engine_node(
 
     // Serve the gRPC transport. The listener is already bound, so peers can
     // connect as soon as this node is initialized.
-    let read_policy = ReadPolicyRuntime::new(storage.read_policy);
+    let read_policy = {
+        let runtime = ReadPolicyRuntime::new(storage.read_policy);
+        #[cfg(debug_assertions)]
+        let runtime = runtime.with_test_addr(&http_addr);
+        runtime
+    };
     let grpc_service = RaftGrpcService::new(
         raft.clone(),
         storage.snapshot_dir(node_id),
@@ -837,6 +842,7 @@ pub async fn build_match_engine_node(
         drop(log_reversion::spawn(
             raft.clone(),
             node_id,
+            &http_addr,
             app_data.console.peer_client().clone(),
         ));
     }

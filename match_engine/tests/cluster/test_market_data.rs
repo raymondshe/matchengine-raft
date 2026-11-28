@@ -291,7 +291,7 @@ fn market_data_feed_publishes_trades_bbo_depth_and_bars() {
 }
 
 async fn wait_for_market_seq(client: &MatchEngineClient<C>, minimum: u64) -> serde_json::Value {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + crate::common::wait_secs(10);
     loop {
         let status = client.read(&"marketdata_status".to_string()).await.unwrap();
         let status: serde_json::Value = serde_json::from_str(&status).expect("status json");
@@ -307,7 +307,7 @@ async fn wait_for_market_seq(client: &MatchEngineClient<C>, minimum: u64) -> ser
 }
 
 async fn wait_for_leader(client: &MatchEngineClient<C>) {
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + crate::common::wait_secs(15);
     loop {
         if let Ok(metrics) = client.metrics().await
             && metrics.current_leader == Some(1)
@@ -321,7 +321,7 @@ async fn wait_for_leader(client: &MatchEngineClient<C>) {
 
 /// Waits until the leadership watcher has opened the gate and installed a snapshot.
 async fn wait_for_publishing(client: &MatchEngineClient<C>) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + crate::common::wait_secs(10);
     loop {
         let status = client.read(&"marketdata_status".to_string()).await.unwrap();
         if let Ok(status) = serde_json::from_str::<serde_json::Value>(&status)
@@ -352,7 +352,7 @@ async fn wait_for_events(
     path: &Path,
     ready: impl Fn(&[serde_json::Value]) -> bool,
 ) -> Vec<serde_json::Value> {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + crate::common::wait_secs(10);
     loop {
         let events = read_events(path);
         if ready(&events) {

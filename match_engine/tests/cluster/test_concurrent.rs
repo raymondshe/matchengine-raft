@@ -53,7 +53,7 @@ fn test_config() -> Config {
     let mut config = default_raft_config();
     config.heartbeat_interval = 150;
     config.election_timeout_min = 500;
-    config.election_timeout_max = 1_000;
+    config.election_timeout_max = 1000;
     config.heartbeat_min_interval = None;
     config.snapshot_policy = SnapshotPolicy::Never;
     config
@@ -92,7 +92,7 @@ async fn init_four_voters(http: &reqwest::Client) -> anyhow::Result<()> {
 }
 
 async fn wait_for_leader(clients: &[MatchEngineClient<C>]) -> anyhow::Result<u64> {
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + crate::common::wait_secs(15);
     loop {
         for (index, client) in clients.iter().enumerate() {
             if let Ok(metrics) = client.metrics().await
@@ -213,7 +213,7 @@ fn concurrent_writes_across_failover_have_no_loss_or_duplicates() {
                             ),
                             key.clone(),
                         );
-                        let deadline = Instant::now() + Duration::from_secs(12);
+                        let deadline = Instant::now() + crate::common::wait_secs(12);
                         let mut attempt = 0usize;
                         loop {
                             let detail = match task_client.write(&request).await {
@@ -244,7 +244,7 @@ fn concurrent_writes_across_failover_have_no_loss_or_duplicates() {
             }
 
             // Kill the leader roughly halfway through the stream.
-            let kill_deadline = Instant::now() + Duration::from_secs(10);
+            let kill_deadline = Instant::now() + crate::common::wait_secs(10);
             while progress.load(Ordering::Relaxed) < (TOTAL_WRITES / 2) as usize
                 && Instant::now() <= kill_deadline
             {
@@ -271,7 +271,7 @@ fn concurrent_writes_across_failover_have_no_loss_or_duplicates() {
                 .filter(|(index, _)| *index as u64 + 1 != leader)
                 .map(|(index, addr)| client(index as u64 + 1, *addr, ClientConfig::default()))
                 .collect();
-            let deadline = Instant::now() + Duration::from_secs(15);
+            let deadline = Instant::now() + crate::common::wait_secs(15);
             let mut new_leader = 0u64;
             loop {
                 for observer in &live {
@@ -352,7 +352,7 @@ fn concurrent_writes_across_failover_have_no_loss_or_duplicates() {
             );
 
             let expected = TOTAL_WRITES.to_string();
-            let deadline = Instant::now() + Duration::from_secs(10);
+            let deadline = Instant::now() + crate::common::wait_secs(10);
             for observer in &live {
                 wait_for_sequence(observer, &expected, deadline).await?;
             }

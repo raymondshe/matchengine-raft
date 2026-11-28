@@ -185,7 +185,7 @@ fn events_are_returned_deduped_paged_and_bounded() {
 }
 
 async fn wait_for_leader(client: &MatchEngineClient<C>) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + crate::common::wait_secs(10);
     loop {
         let metrics = client.metrics().await.unwrap();
         if metrics.current_leader == Some(1) {
@@ -270,7 +270,10 @@ fn events_long_poll_returns_new_events_or_an_empty_page_after_the_wait() {
             idle_elapsed >= Duration::from_millis(50),
             "long poll returned before the wait: {idle_elapsed:?}"
         );
-        assert!(idle_elapsed < Duration::from_secs(2), "long poll overran");
+        assert!(
+            idle_elapsed < crate::common::wait_secs(2),
+            "long poll overran"
+        );
 
         // A write racing the long poll wakes it promptly, well before the
         // 1000 ms budget.

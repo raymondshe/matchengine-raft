@@ -152,7 +152,7 @@ fn file_sink_records_rests_fills_and_cancels() {
 }
 
 async fn wait_for_leader(client: &MatchEngineClient<C>) {
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + crate::common::wait_secs(15);
     loop {
         if let Ok(metrics) = client.metrics().await
             && metrics.current_leader == Some(1)
@@ -167,7 +167,7 @@ async fn wait_for_leader(client: &MatchEngineClient<C>) {
 /// The file is flushed after every batch, but the apply is asynchronous with respect to the
 /// client response, so poll briefly instead of assuming the line is there.
 async fn wait_for_events(path: &Path, expected: usize) -> Vec<serde_json::Value> {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + crate::common::wait_secs(10);
     loop {
         let events = read_events(path);
         if events.len() >= expected {

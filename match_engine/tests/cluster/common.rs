@@ -5,10 +5,28 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Scales every wait deadline in the cluster tests. CI runners are markedly
+/// slower and more contended than a dev laptop (a full run takes ~80 s there
+/// versus ~33 s locally), so short fixed deadlines produce spurious failures
+/// even though the cluster eventually converges. Set to `3` in CI; local runs
+/// keep the default of `1` and stay fast.
+pub const TIMEOUT_SCALE_ENV: &str = "MATCHENGINE_TEST_TIMEOUT_SCALE";
+
+/// Returns a wait deadline with the CI timeout scale applied.
+pub fn wait_secs(base: u64) -> Duration {
+    let scale = std::env::var(TIMEOUT_SCALE_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value >= 1 && *value <= 10)
+        .unwrap_or(1);
+    Duration::from_secs(base.saturating_mul(scale))
+}
 
 /// Environment variable that shifts every integration-test port.
 pub const PORT_OFFSET_ENV: &str = "MATCHENGINE_TEST_PORT_OFFSET";

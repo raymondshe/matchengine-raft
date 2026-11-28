@@ -41,7 +41,7 @@ fn console_reports_cluster_and_transfers_leader() {
         config.heartbeat_interval = 200;
         config.election_timeout_min = 500;
         config.heartbeat_min_interval = None;
-        config.election_timeout_max = 1_000;
+        config.election_timeout_max = 1000;
 
         let mut nodes: Vec<Option<MatchEngineNode>> = Vec::new();
         for (index, addr) in ADDRS.iter().enumerate() {
@@ -256,7 +256,7 @@ async fn post_action(
 }
 
 async fn wait_for_leader(client: &MatchEngineClient<C>, expected: u64) {
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + crate::common::wait_secs(15);
     loop {
         if let Ok(metrics) = client.metrics().await
             && metrics.current_leader == Some(expected)
@@ -272,7 +272,7 @@ async fn wait_for_leader(client: &MatchEngineClient<C>, expected: u64) {
 }
 
 async fn wait_for_replication(client: &MatchEngineClient<C>, targets: &[u64]) {
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + crate::common::wait_secs(15);
     loop {
         if let Ok(metrics) = client.metrics().await {
             let last = metrics.last_log_index.unwrap_or(0);
@@ -297,7 +297,7 @@ async fn wait_for_replication(client: &MatchEngineClient<C>, targets: &[u64]) {
 }
 
 async fn wait_for_transport(http: &reqwest::Client, base: &str, field: &str) {
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + crate::common::wait_secs(15);
     loop {
         let (status, body) = get_json(http, &format!("{base}/metrics")).await;
         if status == StatusCode::OK
@@ -316,7 +316,7 @@ async fn wait_for_transport(http: &reqwest::Client, base: &str, field: &str) {
 }
 
 async fn wait_for_snapshot(client: &MatchEngineClient<C>) -> u64 {
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + crate::common::wait_secs(15);
     loop {
         if let Ok(metrics) = client.metrics().await
             && let Some(snapshot) = metrics.snapshot

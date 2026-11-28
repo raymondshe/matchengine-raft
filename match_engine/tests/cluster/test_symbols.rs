@@ -454,7 +454,7 @@ fn provisioning_helper_and_pretrade_readiness() {
         assert_eq!(config, again.symbol_config);
 
         let ready = client
-            .wait_for_pretrade_ready(&config, Duration::from_secs(15))
+            .wait_for_pretrade_ready(&config, crate::common::wait_secs(15))
             .await
             .unwrap()
             .expect("node becomes pre-trade ready");
@@ -501,7 +501,10 @@ fn provisioning_helper_and_pretrade_readiness() {
         assert!(error.contains("locked"), "{error}");
 
         let error = client
-            .wait_for_pretrade_ready(&SymbolConfig::new(8, 2, 2).unwrap(), Duration::from_secs(1))
+            .wait_for_pretrade_ready(
+                &SymbolConfig::new(8, 2, 2).unwrap(),
+                crate::common::wait_secs(1),
+            )
             .await
             .unwrap()
             .expect_err("a different symbol must not report ready");
@@ -542,7 +545,7 @@ async fn raw_write_batch(
 }
 
 async fn wait_for_leader(client: &MatchEngineClient<C>) {
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + crate::common::wait_secs(15);
     loop {
         if let Ok(metrics) = client.metrics().await
             && metrics.current_leader == Some(1)

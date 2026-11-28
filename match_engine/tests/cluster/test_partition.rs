@@ -44,7 +44,7 @@ fn test_config() -> Config {
     let mut config = default_raft_config();
     config.heartbeat_interval = 200;
     config.election_timeout_min = 500;
-    config.election_timeout_max = 1_000;
+    config.election_timeout_max = 1000;
     config.heartbeat_min_interval = None;
     config.snapshot_policy = SnapshotPolicy::Never;
     config
@@ -167,7 +167,7 @@ fn restarted_former_leader_with_stale_log_cannot_disrupt_quorum() {
 
         let result = std::panic::AssertUnwindSafe(async {
             clients[0].init().await.unwrap().unwrap();
-            let deadline = Instant::now() + Duration::from_secs(15);
+            let deadline = Instant::now() + crate::common::wait_secs(15);
             assert_eq!(1, wait_for_leader(&clients, None, deadline).await.unwrap());
             for id in 2..=4u64 {
                 clients[0]
@@ -184,7 +184,7 @@ fn restarted_former_leader_with_stale_log_cannot_disrupt_quorum() {
             for i in 0..20u64 {
                 place_buy(&clients[0], 100.0 - i as f64 * 0.1).await;
             }
-            let deadline = Instant::now() + Duration::from_secs(15);
+            let deadline = Instant::now() + crate::common::wait_secs(15);
             for client in &clients {
                 wait_for_sequence(client, "20", deadline).await.unwrap();
             }
@@ -197,7 +197,7 @@ fn restarted_former_leader_with_stale_log_cannot_disrupt_quorum() {
             let majority = &clients[1..];
             // Survivors can keep reporting the stale leader id 1 for a while;
             // require all three to agree on a leader that is actually alive.
-            let deadline = Instant::now() + Duration::from_secs(20);
+            let deadline = Instant::now() + crate::common::wait_secs(20);
             let healthy = loop {
                 let mut leaders = Vec::new();
                 for client in majority {
@@ -223,7 +223,7 @@ fn restarted_former_leader_with_stale_log_cannot_disrupt_quorum() {
             for i in 0..20u64 {
                 place_buy(healthy_client, 90.0 - i as f64 * 0.1).await;
             }
-            let deadline = Instant::now() + Duration::from_secs(15);
+            let deadline = Instant::now() + crate::common::wait_secs(15);
             for client in majority {
                 wait_for_sequence(client, "40", deadline).await.unwrap();
             }
@@ -246,7 +246,7 @@ fn restarted_former_leader_with_stale_log_cannot_disrupt_quorum() {
             // broken, then pin the term and the single-leader invariant.
             C::sleep(Duration::from_secs(15)).await;
 
-            let deadline = Instant::now() + Duration::from_secs(10);
+            let deadline = Instant::now() + crate::common::wait_secs(10);
             let mut agreed_leader = None;
             while Instant::now() <= deadline {
                 let mut leaders = Vec::new();
@@ -289,7 +289,7 @@ fn restarted_former_leader_with_stale_log_cannot_disrupt_quorum() {
                 "rejoined node's applied index regressed below the pre-rejoin frontier"
             );
 
-            let deadline = Instant::now() + Duration::from_secs(20);
+            let deadline = Instant::now() + crate::common::wait_secs(20);
             for client in &clients {
                 wait_for_sequence(client, "40", deadline).await.unwrap();
             }
@@ -310,7 +310,7 @@ fn restarted_former_leader_with_stale_log_cannot_disrupt_quorum() {
                 .unwrap()
                 .unwrap();
             assert_eq!(Some(40), response.data.sequence);
-            let deadline = Instant::now() + Duration::from_secs(15);
+            let deadline = Instant::now() + crate::common::wait_secs(15);
             for client in &clients {
                 wait_for_sequence(client, "41", deadline).await.unwrap();
             }

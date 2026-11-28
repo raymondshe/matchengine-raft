@@ -51,6 +51,7 @@ const ADDR3: TestAddr = TestAddr::new(21733);
 const SAMPLE_ENV: &str = "MATCHENGINE_REVERSION_SAMPLE_MS";
 const REQUIRED_ENV: &str = "MATCHENGINE_REVERSION_REQUIRED_SAMPLES";
 const AUTO_ENV: &str = "MATCHENGINE_AUTO_RECOVER_REVERSION";
+const TARGET_ENV: &str = "MATCHENGINE_REVERSION_TARGET";
 
 /// Restores the process-wide watcher env vars on drop so other cluster tests
 /// keep the production defaults.
@@ -58,6 +59,7 @@ struct ReversionEnv {
     sample: Option<OsString>,
     required: Option<OsString>,
     auto: Option<OsString>,
+    target: Option<OsString>,
 }
 
 impl ReversionEnv {
@@ -66,6 +68,7 @@ impl ReversionEnv {
             sample: std::env::var_os(SAMPLE_ENV),
             required: std::env::var_os(REQUIRED_ENV),
             auto: std::env::var_os(AUTO_ENV),
+            target: std::env::var_os(TARGET_ENV),
         };
         // SAFETY: edition 2024 marks process-wide env mutation unsafe. These
         // vars are set only while this test builds its nodes and restored
@@ -74,6 +77,9 @@ impl ReversionEnv {
             std::env::set_var(SAMPLE_ENV, "50");
             std::env::set_var(REQUIRED_ENV, "1");
             std::env::set_var(AUTO_ENV, "1");
+            // The watcher runs on the leader (node 1 in this test). Filter by
+            // its HTTP address so other tests' watchers keep production timing.
+            std::env::set_var(TARGET_ENV, ADDR1.http());
         }
         previous
     }
@@ -83,6 +89,7 @@ impl ReversionEnv {
             (SAMPLE_ENV, self.sample.take()),
             (REQUIRED_ENV, self.required.take()),
             (AUTO_ENV, self.auto.take()),
+            (TARGET_ENV, self.target.take()),
         ] {
             // SAFETY: see `install_fast`.
             unsafe {
@@ -142,10 +149,10 @@ fn test_config() -> Config {
     let mut config = default_raft_config();
     // A long heartbeat gives the 50 ms watcher a deterministic head start over
     // the first replication conflict after node 2 returns.
-    config.heartbeat_interval = 5_000;
+    config.heartbeat_interval = 5000;
     config.heartbeat_min_interval = None;
-    config.election_timeout_min = 20_000;
-    config.election_timeout_max = 20_001;
+    config.election_timeout_min = 20000;
+    config.election_timeout_max = 20001;
     config.snapshot_policy = SnapshotPolicy::Never;
     config
 }
@@ -340,7 +347,7 @@ fn automatic_reversion_watcher_repairs_a_truncated_follower_tail() {
             ];
             let body = std::panic::AssertUnwindSafe(async {
                 clients[0].init().await.unwrap().unwrap();
-                let deadline = Instant::now() + Duration::from_secs(15);
+                let deadline = Instant::now() + crate::common::wait_secs(15);
                 assert_eq!(1, wait_for_leader(&clients, deadline).await.unwrap());
                 clients[0]
                     .add_learner((2, ADDR2.to_string()))
@@ -360,7 +367,7 @@ fn automatic_reversion_watcher_repairs_a_truncated_follower_tail() {
                 for i in 0..20u64 {
                     place_buy(&clients[0], 100.0 - i as f64 * 0.1).await;
                 }
-                let deadline = Instant::now() + Duration::from_secs(15);
+                let deadline = Instant::now() + crate::common::wait_secs(15);
                 for client in &clients {
                     wait_for_sequence(client, "20", deadline).await.unwrap();
                 }
@@ -393,7 +400,7 @@ fn automatic_reversion_watcher_repairs_a_truncated_follower_tail() {
                 // the reversion before the first conflict response.
                 nodes[1] = Some(start_node(2, ADDR2, &storage).await.unwrap());
 
-                let deadline = Instant::now() + Duration::from_secs(15);
+                let deadline = Instant::now() + crate::common::wait_secs(15);
                 loop {
                     if logs.contains("follower log reverted; allowing one replication reset") {
                         break;
@@ -437,7 +444,7 @@ fn automatic_reversion_watcher_repairs_a_truncated_follower_tail() {
                     .await?
                     .last_log_index
                     .unwrap_or(0);
-                let deadline = Instant::now() + Duration::from_secs(30);
+                let deadline = Instant::now() + crate::common::wait_secs(30);
                 let recovered = loop {
                     let follower = raw_metrics(ADDR2).await?;
                     let last_log = data_index(&follower, "last_log");
@@ -457,7 +464,7 @@ fn automatic_reversion_watcher_repairs_a_truncated_follower_tail() {
                     recovered
                 );
 
-                let deadline = Instant::now() + Duration::from_secs(15);
+                let deadline = Instant::now() + crate::common::wait_secs(15);
                 for client in &clients {
                     wait_for_sequence(client, "20", deadline).await.unwrap();
                 }
@@ -477,7 +484,7 @@ fn automatic_reversion_watcher_repairs_a_truncated_follower_tail() {
                     .unwrap()
                     .unwrap();
                 assert_eq!(Some(20), response.data.sequence);
-                let deadline = Instant::now() + Duration::from_secs(15);
+                let deadline = Instant::now() + crate::common::wait_secs(15);
                 for client in &clients {
                     wait_for_sequence(client, "21", deadline).await.unwrap();
                 }

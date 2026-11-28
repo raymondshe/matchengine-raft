@@ -37,7 +37,7 @@ fn test_config() -> Config {
     config.heartbeat_interval = 200;
     config.election_timeout_min = 500;
     config.heartbeat_min_interval = None;
-    config.election_timeout_max = 1_000;
+    config.election_timeout_max = 1000;
     config
 }
 
@@ -121,7 +121,7 @@ fn leader_failover_keeps_committed_data() {
         let clients: Vec<MatchEngineClient<C>> = (1..=3u64).map(client).collect();
 
         clients[0].init().await.unwrap().unwrap();
-        let deadline = Instant::now() + Duration::from_secs(15);
+        let deadline = Instant::now() + crate::common::wait_secs(15);
         let leader = wait_for_leader(&clients, None, deadline).await.unwrap();
         assert_eq!(1, leader, "the initialised node should lead");
 
@@ -155,14 +155,14 @@ fn leader_failover_keeps_committed_data() {
         }
 
         // Wait until both followers have applied the committed entries.
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + crate::common::wait_secs(10);
         for id in 2..=3u64 {
             wait_for_sequence(&clients[(id - 1) as usize], "3", deadline)
                 .await
                 .unwrap();
         }
 
-        let leader = wait_for_leader(&clients, None, Instant::now() + Duration::from_secs(5))
+        let leader = wait_for_leader(&clients, None, Instant::now() + crate::common::wait_secs(5))
             .await
             .unwrap();
         let leader_idx = (leader - 1) as usize;
@@ -174,7 +174,7 @@ fn leader_failover_keeps_committed_data() {
             .unwrap();
 
         // Two voters remain; wait for one of them to be elected.
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + crate::common::wait_secs(20);
         let new_leader = wait_for_leader(&clients, Some(leader), deadline)
             .await
             .unwrap();
@@ -196,7 +196,7 @@ fn leader_failover_keeps_committed_data() {
         // The first attempt can still see `LeaseExpired` while the new term
         // settles, so retry until the write is actually accepted.
         let new_client = client(new_leader);
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + crate::common::wait_secs(10);
         let response = loop {
             match new_client
                 .write(&MatchEngineRequest::place(Order::new(
@@ -222,7 +222,7 @@ fn leader_failover_keeps_committed_data() {
         };
         assert_eq!(Some(3), response.data.sequence);
 
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + crate::common::wait_secs(10);
         for id in 1..=3u64 {
             if id == leader {
                 continue;
@@ -255,7 +255,7 @@ fn new_learner_catches_up_from_live_log() {
         let client2 = MatchEngineClient::<C>::new(2, addr2.to_string());
 
         client1.init().await.unwrap().unwrap();
-        let deadline = Instant::now() + Duration::from_secs(15);
+        let deadline = Instant::now() + crate::common::wait_secs(15);
         assert_eq!(
             1,
             wait_for_leader(std::slice::from_ref(&client1), None, deadline)
@@ -334,7 +334,7 @@ fn interrupted_membership_change_converges_to_a_valid_config() {
         let mut config = default_raft_config();
         config.heartbeat_interval = 200;
         config.election_timeout_min = 500;
-        config.election_timeout_max = 1_000;
+        config.election_timeout_max = 1000;
         config.heartbeat_min_interval = None;
         config.snapshot_policy = SnapshotPolicy::Never;
 
@@ -359,7 +359,7 @@ fn interrupted_membership_change_converges_to_a_valid_config() {
 
         let result = std::panic::AssertUnwindSafe(async {
             clients[0].init().await.unwrap().unwrap();
-            let deadline = Instant::now() + Duration::from_secs(15);
+            let deadline = Instant::now() + crate::common::wait_secs(15);
             assert_eq!(
                 1,
                 wait_for_leader(&clients[..3], None, deadline)
@@ -390,7 +390,7 @@ fn interrupted_membership_change_converges_to_a_valid_config() {
                     .unwrap()
                     .unwrap();
             }
-            let deadline = Instant::now() + Duration::from_secs(15);
+            let deadline = Instant::now() + crate::common::wait_secs(15);
             for client in &clients[..3] {
                 wait_for_sequence(client, "10", deadline).await.unwrap();
             }
@@ -409,14 +409,14 @@ fn interrupted_membership_change_converges_to_a_valid_config() {
             nodes[0].take().unwrap().shutdown().await.unwrap();
 
             let survivors = &clients[1..];
-            let deadline = Instant::now() + Duration::from_secs(20);
+            let deadline = Instant::now() + crate::common::wait_secs(20);
             let new_leader = wait_for_leader(survivors, Some(1), deadline).await.unwrap();
             let leader_client = &clients[(new_leader - 1) as usize];
             println!("membership change interrupted; new leader {new_leader}");
 
             // Poll until OpenRaft has finalized a single config set: a joint
             // config is a legitimate transient, but it must not be the result.
-            let deadline = Instant::now() + Duration::from_secs(20);
+            let deadline = Instant::now() + crate::common::wait_secs(20);
             let voters = loop {
                 if let Ok(metrics) = leader_client.metrics().await {
                     let joint = metrics.membership_config.membership().get_joint_config();
@@ -467,7 +467,7 @@ fn interrupted_membership_change_converges_to_a_valid_config() {
                 .unwrap()
                 .unwrap();
             assert_eq!(Some(10), response.data.sequence);
-            let deadline = Instant::now() + Duration::from_secs(15);
+            let deadline = Instant::now() + crate::common::wait_secs(15);
             for client in survivors {
                 wait_for_sequence(client, "11", deadline).await.unwrap();
             }
@@ -515,7 +515,7 @@ fn interrupted_membership_change_converges_to_a_valid_config() {
                 .unwrap()
                 .unwrap();
             assert_eq!(Some(11), response.data.sequence);
-            let deadline = Instant::now() + Duration::from_secs(15);
+            let deadline = Instant::now() + crate::common::wait_secs(15);
             for client in survivors {
                 wait_for_sequence(client, "12", deadline).await.unwrap();
             }
@@ -563,7 +563,7 @@ fn two_concurrent_learners_catch_up_and_promote_one_at_a_time() {
         let mut config = default_raft_config();
         config.heartbeat_interval = 200;
         config.election_timeout_min = 500;
-        config.election_timeout_max = 1_000;
+        config.election_timeout_max = 1000;
         config.heartbeat_min_interval = None;
         // Ten orders trigger a snapshot and purge of everything it covers, so
         // the late learners can only catch up through gRPC snapshot install.
@@ -592,7 +592,7 @@ fn two_concurrent_learners_catch_up_and_promote_one_at_a_time() {
 
         let result = std::panic::AssertUnwindSafe(async {
             clients[0].init().await.unwrap().unwrap();
-            let deadline = Instant::now() + Duration::from_secs(15);
+            let deadline = Instant::now() + crate::common::wait_secs(15);
             assert_eq!(1, wait_for_leader(&clients[..3], None, deadline).await?);
             for id in 2..=3u64 {
                 clients[0]
@@ -618,13 +618,13 @@ fn two_concurrent_learners_catch_up_and_promote_one_at_a_time() {
                     .unwrap()
                     .unwrap();
             }
-            let deadline = Instant::now() + Duration::from_secs(10);
+            let deadline = Instant::now() + crate::common::wait_secs(10);
             for client in &clients[..3] {
                 wait_for_sequence(client, "10", deadline).await?;
             }
 
             // Wait for a snapshot on the leader that covers the purged log.
-            let deadline = Instant::now() + Duration::from_secs(15);
+            let deadline = Instant::now() + crate::common::wait_secs(15);
             let snapshot_index = loop {
                 let metrics = clients[0].metrics().await?;
                 let snapshot = metrics.snapshot.map(|id| id.index);
@@ -652,7 +652,7 @@ fn two_concurrent_learners_catch_up_and_promote_one_at_a_time() {
                 .await
                 .unwrap()
                 .unwrap();
-            let join_deadline = Instant::now() + Duration::from_secs(8);
+            let join_deadline = Instant::now() + crate::common::wait_secs(8);
             loop {
                 match clients[0].add_learner((5, addrs[4].to_string())).await {
                     Ok(Ok(_)) => break,
@@ -667,7 +667,7 @@ fn two_concurrent_learners_catch_up_and_promote_one_at_a_time() {
                 }
             }
 
-            let deadline = Instant::now() + Duration::from_secs(20);
+            let deadline = Instant::now() + crate::common::wait_secs(20);
             for id in 4..=5u64 {
                 let client = &clients[(id - 1) as usize];
                 wait_for_sequence(client, "10", deadline).await?;
@@ -723,7 +723,7 @@ fn two_concurrent_learners_catch_up_and_promote_one_at_a_time() {
                     .unwrap()
                     .unwrap();
             }
-            let deadline = Instant::now() + Duration::from_secs(15);
+            let deadline = Instant::now() + crate::common::wait_secs(15);
             for client in &clients[..4] {
                 wait_for_sequence(client, "15", deadline).await?;
             }
@@ -734,7 +734,7 @@ fn two_concurrent_learners_catch_up_and_promote_one_at_a_time() {
                 .await
                 .unwrap()
                 .unwrap();
-            let config_deadline = Instant::now() + Duration::from_secs(20);
+            let config_deadline = Instant::now() + crate::common::wait_secs(20);
             loop {
                 let mut converged = true;
                 for client in &clients {
@@ -753,7 +753,7 @@ fn two_concurrent_learners_catch_up_and_promote_one_at_a_time() {
                 );
                 C::sleep(Duration::from_millis(50)).await;
             }
-            let deadline = Instant::now() + Duration::from_secs(15);
+            let deadline = Instant::now() + crate::common::wait_secs(15);
             for client in &clients {
                 let metrics = client.metrics().await?;
                 assert_eq!(
@@ -785,7 +785,7 @@ fn two_concurrent_learners_catch_up_and_promote_one_at_a_time() {
                 .unwrap()
                 .unwrap();
             assert_eq!(Some(15), response.data.sequence);
-            let deadline = Instant::now() + Duration::from_secs(15);
+            let deadline = Instant::now() + crate::common::wait_secs(15);
             for client in &clients {
                 wait_for_sequence(client, "16", deadline).await?;
             }

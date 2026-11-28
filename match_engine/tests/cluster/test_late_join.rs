@@ -43,7 +43,7 @@ fn test_config() -> Config {
     config.heartbeat_interval = 200;
     config.election_timeout_min = 500;
     config.heartbeat_min_interval = None;
-    config.election_timeout_max = 1_000;
+    config.election_timeout_max = 1000;
     config.snapshot_policy = SnapshotPolicy::LogsSinceLast(10);
     config.max_in_snapshot_log_to_keep = 0;
     config
@@ -173,7 +173,7 @@ fn stale_follower_catches_up_from_live_members() {
         let clients = [client(1, ADDR1), client(2, ADDR2), client(3, ADDR3)];
 
         clients[0].init().await.unwrap().unwrap();
-        let deadline = Instant::now() + Duration::from_secs(15);
+        let deadline = Instant::now() + crate::common::wait_secs(15);
         assert_eq!(
             1,
             wait_for_leader(&clients, deadline).await.unwrap(),
@@ -231,7 +231,7 @@ fn stale_follower_catches_up_from_live_members() {
         for i in 0..40u64 {
             place_buy(&clients[0], 90.0 - i as f64 * 0.1).await.unwrap();
         }
-        let deadline = Instant::now() + Duration::from_secs(15);
+        let deadline = Instant::now() + crate::common::wait_secs(15);
         loop {
             let metrics = clients[0].metrics().await.unwrap();
             let snapshot = metrics.snapshot.map(|log_id| log_id.index);
@@ -274,7 +274,7 @@ fn stale_follower_catches_up_from_live_members() {
             .unwrap()
             .unwrap();
         let restored = client(2, ADDR2);
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + crate::common::wait_secs(20);
         wait_for_sequence(&restored, "43", deadline).await.unwrap();
         assert_eq!(43, order_count(&restored).await.unwrap());
 
@@ -327,7 +327,7 @@ fn late_started_voter_with_persistent_wal_joins_quorum() {
         let clients = [client(1, ADDR4), client(2, ADDR5), client(3, ADDR6)];
 
         clients[0].init().await.unwrap().unwrap();
-        let deadline = Instant::now() + Duration::from_secs(15);
+        let deadline = Instant::now() + crate::common::wait_secs(15);
         assert_eq!(1, wait_for_leader(&clients, deadline).await.unwrap());
         clients[0]
             .add_learner((2, ADDR5.to_string()))
@@ -377,7 +377,7 @@ fn late_started_voter_with_persistent_wal_joins_quorum() {
         for i in 0..40u64 {
             place_buy(&clients[0], 90.0 - i as f64 * 0.1).await.unwrap();
         }
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + crate::common::wait_secs(20);
         loop {
             let metrics = clients[0].metrics().await.unwrap();
             if let (Some(snapshot), Some(purged)) = (metrics.snapshot, metrics.purged)
@@ -411,7 +411,7 @@ fn late_started_voter_with_persistent_wal_joins_quorum() {
         // no membership rewrite: it must rejoin the existing quorum itself.
         nodes[1] = Some(start_node(2, ADDR5, &storage).await.unwrap());
         let late = client(2, ADDR5);
-        let deadline = Instant::now() + Duration::from_secs(25);
+        let deadline = Instant::now() + crate::common::wait_secs(25);
         wait_for_sequence(&late, "43", deadline).await.unwrap();
         assert_eq!(43, order_count(&late).await.unwrap());
 
@@ -429,13 +429,17 @@ fn late_started_voter_with_persistent_wal_joins_quorum() {
         // committed write must still reach the late starter.
         nodes[2].take().unwrap().shutdown().await.unwrap();
         place_buy(&clients[0], 50.0).await.unwrap();
-        wait_for_sequence(&late, "44", Instant::now() + Duration::from_secs(15))
+        wait_for_sequence(&late, "44", Instant::now() + crate::common::wait_secs(15))
             .await
             .unwrap();
         assert_eq!(44, order_count(&late).await.unwrap());
-        wait_for_sequence(&clients[0], "44", Instant::now() + Duration::from_secs(15))
-            .await
-            .unwrap();
+        wait_for_sequence(
+            &clients[0],
+            "44",
+            Instant::now() + crate::common::wait_secs(15),
+        )
+        .await
+        .unwrap();
 
         if let Some(node) = nodes[0].take() {
             node.shutdown().await.unwrap();

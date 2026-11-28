@@ -60,7 +60,7 @@ fn test_config() -> Config {
     config.heartbeat_interval = 200;
     config.election_timeout_min = 500;
     config.heartbeat_min_interval = None;
-    config.election_timeout_max = 1_000;
+    config.election_timeout_max = 1000;
     config
 }
 
@@ -151,7 +151,7 @@ fn client_reports_typed_no_leader_and_api_errors() {
         wait_for_leader(
             std::slice::from_ref(&client),
             None,
-            Instant::now() + Duration::from_secs(15),
+            Instant::now() + crate::common::wait_secs(15),
         )
         .await;
 
@@ -189,7 +189,7 @@ fn client_retries_a_dropped_connection() {
         wait_for_leader(
             std::slice::from_ref(&direct),
             None,
-            Instant::now() + Duration::from_secs(15),
+            Instant::now() + crate::common::wait_secs(15),
         )
         .await;
 
@@ -237,8 +237,12 @@ fn client_discovers_new_leader_after_target_dies() {
             .collect();
 
         observers[0].init().await.unwrap().unwrap();
-        let leader =
-            wait_for_leader(&observers, None, Instant::now() + Duration::from_secs(15)).await;
+        let leader = wait_for_leader(
+            &observers,
+            None,
+            Instant::now() + crate::common::wait_secs(15),
+        )
+        .await;
         assert_eq!(1, leader);
         observers[0]
             .add_learner((2, addr(2)))
@@ -266,7 +270,7 @@ fn client_discovers_new_leader_after_target_dies() {
         let new_leader = wait_for_leader(
             &observers,
             Some(leader),
-            Instant::now() + Duration::from_secs(20),
+            Instant::now() + crate::common::wait_secs(20),
         )
         .await;
         assert_ne!(leader, new_leader);
@@ -311,7 +315,7 @@ fn client_forwards_after_leader_failover() {
             .collect();
 
         clients[0].init().await.unwrap().unwrap();
-        let deadline = Instant::now() + Duration::from_secs(15);
+        let deadline = Instant::now() + crate::common::wait_secs(15);
         let leader = wait_for_leader(&clients, None, deadline).await;
         assert_eq!(1, leader);
 
@@ -345,7 +349,7 @@ fn client_forwards_after_leader_failover() {
         let new_leader = wait_for_leader(
             &clients,
             Some(leader),
-            Instant::now() + Duration::from_secs(20),
+            Instant::now() + crate::common::wait_secs(20),
         )
         .await;
         assert_ne!(leader, new_leader);
@@ -409,7 +413,7 @@ fn follower_write_returns_a_typed_leader_redirect() {
         wait_for_leader(
             std::slice::from_ref(&client),
             None,
-            Instant::now() + Duration::from_secs(15),
+            Instant::now() + crate::common::wait_secs(15),
         )
         .await;
         client
@@ -425,7 +429,7 @@ fn follower_write_returns_a_typed_leader_redirect() {
         wait_for_leader(
             std::slice::from_ref(&client),
             None,
-            Instant::now() + Duration::from_secs(15),
+            Instant::now() + crate::common::wait_secs(15),
         )
         .await;
 
@@ -493,9 +497,9 @@ fn exhausted_leader_discovery_returns_a_typed_error() {
         );
 
         let started = Instant::now();
-        let metrics = C::timeout(Duration::from_secs(5), client.metrics()).await;
+        let metrics = C::timeout(crate::common::wait_secs(5), client.metrics()).await;
         let read = C::timeout(
-            Duration::from_secs(5),
+            crate::common::wait_secs(5),
             client.read(&"orderbook_sequence".to_string()),
         )
         .await;
@@ -517,7 +521,7 @@ fn exhausted_leader_discovery_returns_a_typed_error() {
             "read against dead members must return a typed error, got {read:?}"
         );
         assert!(
-            started.elapsed() < Duration::from_secs(10),
+            started.elapsed() < crate::common::wait_secs(10),
             "low-retry discovery took too long"
         );
     });
@@ -543,8 +547,12 @@ fn follower_linearizable_read_auto_forwards_to_the_leader() {
 
         let result = std::panic::AssertUnwindSafe(async {
             clients[0].init().await.unwrap().unwrap();
-            let leader =
-                wait_for_leader(&clients, None, Instant::now() + Duration::from_secs(15)).await;
+            let leader = wait_for_leader(
+                &clients,
+                None,
+                Instant::now() + crate::common::wait_secs(15),
+            )
+            .await;
             assert_eq!(1, leader);
             for id in 2..=3u64 {
                 clients[0]
@@ -571,7 +579,7 @@ fn follower_linearizable_read_auto_forwards_to_the_leader() {
                     .unwrap()
                     .unwrap();
             }
-            let deadline = Instant::now() + Duration::from_secs(10);
+            let deadline = Instant::now() + crate::common::wait_secs(10);
             for client in &clients {
                 loop {
                     if client
@@ -608,7 +616,7 @@ fn follower_linearizable_read_auto_forwards_to_the_leader() {
                 },
             );
             let value = C::timeout(
-                Duration::from_secs(8),
+                crate::common::wait_secs(8),
                 forwarding.linearizable_read_auto_forward(&"orderbook_sequence".to_string()),
             )
             .await

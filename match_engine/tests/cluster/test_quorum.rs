@@ -45,7 +45,7 @@ fn test_config() -> Config {
     let mut config = default_raft_config();
     config.heartbeat_interval = 200;
     config.election_timeout_min = 500;
-    config.election_timeout_max = 1_000;
+    config.election_timeout_max = 1000;
     config.heartbeat_min_interval = None;
     // Keep every committed entry in the WAL so the event tape is comparable.
     config.snapshot_policy = SnapshotPolicy::Never;
@@ -159,7 +159,7 @@ fn quorum_loss_rejects_writes_and_recovers_without_divergence() {
 
         let result = std::panic::AssertUnwindSafe(async {
             clients[0].init().await.unwrap().unwrap();
-            let deadline = Instant::now() + Duration::from_secs(15);
+            let deadline = Instant::now() + crate::common::wait_secs(15);
             assert_eq!(1, wait_for_leader(&clients, deadline).await.unwrap());
             clients[0]
                 .add_learner((2, ADDR2.to_string()))
@@ -181,7 +181,7 @@ fn quorum_loss_rejects_writes_and_recovers_without_divergence() {
                 place_buy(&clients[0], 100.0 - i as f64 * 0.1).await;
             }
             {
-                let deadline = Instant::now() + Duration::from_secs(15);
+                let deadline = Instant::now() + crate::common::wait_secs(15);
                 for client in &clients {
                     wait_for_sequence(client, "20", deadline).await.unwrap();
                 }
@@ -264,7 +264,7 @@ fn quorum_loss_rejects_writes_and_recovers_without_divergence() {
             // Node 2 can keep reporting the *stale* leader id 1 until a real
             // election completes, so require both live nodes to agree on a
             // leader that is actually one of them.
-            let deadline = Instant::now() + Duration::from_secs(20);
+            let deadline = Instant::now() + crate::common::wait_secs(20);
             let new_leader = loop {
                 let mut leaders = Vec::new();
                 for client in &live {
@@ -286,7 +286,7 @@ fn quorum_loss_rejects_writes_and_recovers_without_divergence() {
                 C::sleep(Duration::from_millis(100)).await;
             };
 
-            let deadline = Instant::now() + Duration::from_secs(20);
+            let deadline = Instant::now() + crate::common::wait_secs(20);
             for client in &live {
                 wait_for_sequence(client, "20", deadline).await.unwrap();
             }
@@ -303,7 +303,7 @@ fn quorum_loss_rejects_writes_and_recovers_without_divergence() {
                 .unwrap()
                 .unwrap();
             assert_eq!(Some(20), response.data.sequence);
-            let deadline = Instant::now() + Duration::from_secs(15);
+            let deadline = Instant::now() + crate::common::wait_secs(15);
             for client in &live {
                 wait_for_sequence(client, "21", deadline).await.unwrap();
             }
@@ -584,7 +584,7 @@ fn five_voters_survive_two_then_lose_quorum_and_recover() {
             // Library callers default to min_voters=1, so a single-node init
             // followed by learner promotion is enough to form five voters.
             clients[0].init().await.unwrap().unwrap();
-            let deadline = Instant::now() + Duration::from_secs(15);
+            let deadline = Instant::now() + crate::common::wait_secs(15);
             assert_eq!(1, leader_among(&clients, &[1], deadline).await.unwrap());
             for id in 2..=5u64 {
                 clients[0]
@@ -602,7 +602,7 @@ fn five_voters_survive_two_then_lose_quorum_and_recover() {
             for i in 0..20u64 {
                 place_buy(&clients[0], 100.0 - i as f64 * 0.1).await;
             }
-            let deadline = Instant::now() + Duration::from_secs(20);
+            let deadline = Instant::now() + crate::common::wait_secs(20);
             wait_all_sequence(&clients, &[1, 2, 3, 4, 5], "20", deadline)
                 .await
                 .unwrap();
@@ -611,7 +611,7 @@ fn five_voters_survive_two_then_lose_quorum_and_recover() {
             // exactly the quorum needed to keep committing.
             nodes[0].as_ref().unwrap().raft.shutdown().await.unwrap();
             nodes[4].as_ref().unwrap().raft.shutdown().await.unwrap();
-            let deadline = Instant::now() + Duration::from_secs(20);
+            let deadline = Instant::now() + crate::common::wait_secs(20);
             let new_leader = leader_among(&clients, &[2, 3, 4], deadline)
                 .await
                 .unwrap();
@@ -632,7 +632,7 @@ fn five_voters_survive_two_then_lose_quorum_and_recover() {
                 .await
                 .unwrap();
             }
-            let deadline = Instant::now() + Duration::from_secs(20);
+            let deadline = Instant::now() + crate::common::wait_secs(20);
             wait_all_sequence(&clients, &[2, 3, 4], "30", deadline)
                 .await
                 .unwrap();
@@ -709,7 +709,7 @@ fn five_voters_survive_two_then_lose_quorum_and_recover() {
             let mut live = vec![1u64, 5];
             live.extend(survivors.iter().copied());
             live.sort_unstable();
-            let deadline = Instant::now() + Duration::from_secs(20);
+            let deadline = Instant::now() + crate::common::wait_secs(20);
             let recovered_leader = leader_among(&clients, &live, deadline).await.unwrap();
             wait_all_sequence(&clients, &live, "30", deadline)
                 .await
@@ -794,7 +794,7 @@ fn whole_cluster_restart_with_unsynced_tails_converges_to_one_history() {
 
         let result = std::panic::AssertUnwindSafe(async {
             init_all_voters(&ADDR_FOUR).await?;
-            let deadline = Instant::now() + Duration::from_secs(20);
+            let deadline = Instant::now() + crate::common::wait_secs(20);
             let all = [1u64, 2, 3, 4];
             let mut acked: Vec<u64> = Vec::new();
             for sequence in 0..12u64 {
@@ -905,7 +905,7 @@ fn whole_cluster_restart_with_unsynced_tails_converges_to_one_history() {
             for (index, addr) in ADDR_FOUR.iter().enumerate() {
                 nodes[index] = Some(start_node_fast(index as u64 + 1, *addr, &storage).await?);
             }
-            let deadline = Instant::now() + Duration::from_secs(20);
+            let deadline = Instant::now() + crate::common::wait_secs(20);
             let leader = leader_among(&clients, &all, deadline).await?;
             wait_all_sequence(&clients, &all, "21", deadline).await?;
             println!("E20: elected leader {leader} after the whole-cluster restart");

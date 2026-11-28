@@ -72,7 +72,7 @@ fn no_fsync_requires_four_voters() {
             },
         )]);
         node.raft.initialize(nodes).await.unwrap();
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + crate::common::wait_secs(10);
         loop {
             let metrics = node.raft.metrics();
             if metrics.borrow_watched().current_leader == Some(1) {
@@ -124,7 +124,7 @@ fn live_config() -> Config {
     let mut config = default_raft_config();
     config.heartbeat_interval = 200;
     config.election_timeout_min = 500;
-    config.election_timeout_max = 1_000;
+    config.election_timeout_max = 1000;
     config.heartbeat_min_interval = None;
     // Keep every entry in the WAL so the event tapes are comparable.
     config.snapshot_policy = SnapshotPolicy::Never;
@@ -284,7 +284,7 @@ fn live_no_fsync_cluster_rejects_shrink_below_four_voters() {
         let outcome = AssertUnwindSafe(async {
             let http = reqwest::Client::builder().no_proxy().build()?;
             init_four_voters(&http).await?;
-            let deadline = Instant::now() + Duration::from_secs(15);
+            let deadline = Instant::now() + crate::common::wait_secs(15);
             let leader = wait_for_leader(&clients, deadline).await?;
             println!("min-voters-live: initial leader {leader}");
             let leader_client = &clients[(leader - 1) as usize];
@@ -306,7 +306,7 @@ fn live_no_fsync_cluster_rejects_shrink_below_four_voters() {
                     .map_err(|error| anyhow::anyhow!("write {i} failed: {error:?}"))?;
             }
             println!("min-voters-live: 10 writes committed");
-            let deadline = Instant::now() + Duration::from_secs(15);
+            let deadline = Instant::now() + crate::common::wait_secs(15);
             for client in &clients {
                 wait_for_sequence(client, "10", deadline).await?;
             }
@@ -361,7 +361,7 @@ fn live_no_fsync_cluster_rejects_shrink_below_four_voters() {
 
             // Writes keep committing after the rejected change.
             place_buy(leader_client, 90.0).await?;
-            let deadline = Instant::now() + Duration::from_secs(15);
+            let deadline = Instant::now() + crate::common::wait_secs(15);
             for client in &clients {
                 wait_for_sequence(client, "11", deadline).await?;
             }
@@ -387,7 +387,7 @@ fn live_no_fsync_cluster_rejects_shrink_below_four_voters() {
                 "stopping a voter changed membership: {voters:?}"
             );
             place_buy(leader_client, 89.0).await?;
-            let deadline = Instant::now() + Duration::from_secs(15);
+            let deadline = Instant::now() + crate::common::wait_secs(15);
             for (index, client) in clients.iter().enumerate() {
                 if index as u64 + 1 != victim {
                     wait_for_sequence(client, "12", deadline).await?;
